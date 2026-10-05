@@ -174,7 +174,7 @@ export function ComposerDiffBar({
         type="button"
         className="composer-diff-main"
         title="Show all uncommitted changes"
-        onClick={openGitDiff}
+        onClick={() => openGitDiff()}
       >
         <span className="composer-diff-text">
           {files} file{files > 1 ? "s" : ""} changed

@@ -286,6 +286,86 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
   })
 }
 
+/** Launch a platform terminal at `cwd`, optionally running `argv` inside it
+ *  (e.g. [nvim, file]). Best-effort: each candidate is tried until one spawns. */
+function launchTerminal(argv: string[], cwd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const q = (s: string): string => `'${s.replace(/'/g, `'"'"'`)}'`
+    if (process.platform === 'darwin') {
+      if (argv.length === 0) {
+        // Plain "open folder" — Terminal natively opens at the given directory.
+        const c = spawn('open', ['-a', 'Terminal', cwd], { detached: true, stdio: 'ignore' })
+        c.once('error', () => resolve(false))
+        c.once('spawn', () => {
+          c.unref()
+          resolve(true)
+        })
+        return
+      }
+      const shellCmd = `cd ${q(cwd)} && ${argv.map(q).join(' ')}`
+      // Escape for the AppleScript double-quoted string (backslash, then quote).
+      const as = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+      execFile(
+        'osascript',
+        ['-e', `tell application "Terminal" to do script "${as}"`],
+        (err) => resolve(!err),
+      )
+      return
+    }
+    if (process.platform === 'win32') {
+      // `start cmd /k …` opens a NEW console window inheriting the cwd.
+      const args = ['/c', 'start', 'cmd', '/k', ...argv]
+      try {
+        const c = spawn('cmd', args, { cwd, detached: true, stdio: 'ignore' })
+        c.once('error', () => resolve(false))
+        c.once('spawn', () => {
+          c.unref()
+          resolve(true)
+        })
+      } catch {
+        resolve(false)
+      }
+      return
+    }
+    // Linux: walk common terminals — gnome-terminal needs --working-directory
+    // (it does NOT inherit the spawn cwd); the rest honor cwd directly.
+    const execArgs = argv.length > 0 ? ['-e', ...argv] : []
+    const tries: Array<{ bin: string; args: string[] }> = [
+      ...(process.env.TERMINAL
+        ? [{ bin: process.env.TERMINAL, args: argv }]
+        : []),
+      { bin: 'gnome-terminal', args: [`--working-directory=${cwd}`, ...(argv.length > 0 ? ['--', ...argv] : [])] },
+      { bin: 'konsole', args: ['--workdir', cwd, ...execArgs] },
+      { bin: 'x-terminal-emulator', args: argv },
+      { bin: 'kitty', args: argv },
+      { bin: 'alacritty', args: argv.length > 0 ? ['-e', ...argv] : [] },
+      { bin: 'xterm', args: execArgs },
+    ]
+    const attempt = (i: number): void => {
+      if (i >= tries.length) {
+        resolve(false)
+        return
+      }
+      try {
+        const c = spawn(tries[i].bin, tries[i].args, {
+          cwd,
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env, PATH: TOOL_PATH },
+        })
+        c.once('error', () => attempt(i + 1))
+        c.once('spawn', () => {
+          c.unref()
+          resolve(true)
+        })
+      } catch {
+        attempt(i + 1)
+      }
+    }
+    attempt(0)
+  })
+}
+
 /** Ask one nvim instance for the Language-Server diagnostics of its current
  *  buffer (`vim.lsp.diagnostic.get(0)`), encoded as a compact JSON array.
  *
@@ -528,6 +608,77 @@ function registerIpc(): void {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
       await shell.openExternal(url)
     }
+  })
+
+  // --- open the current file in an EXTERNAL editor (nvim / VS Code) ---------
+  // nvim: send `:edit` to the first running instance over its RPC socket
+  // (the app already discovers sockets for the "open in Neovim" label); when
+  // nothing is running, fall back to a terminal that launches nvim.
+  // vscode: try the `code` CLI first, then the registered vscode:// handler.
+  ipcMain.handle('open:file-external', async (_e, absPath: unknown, editor: unknown) => {
+    const abs = typeof absPath === 'string' ? absPath.trim() : ''
+    const which = typeof editor === 'string' ? editor : ''
+    const fail = (error: unknown): { ok: false; error: string } => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    if (!abs || !path.isAbsolute(abs)) return { ok: false, error: 'Not an absolute path.' }
+    try {
+      if (which === 'vscode') {
+        const cli = spawn('code', [abs], {
+          env: { ...process.env, PATH: TOOL_PATH },
+          stdio: 'ignore',
+          detached: true,
+        })
+        const cliOk = await new Promise<boolean>((resolve) => {
+          cli.once('spawn', () => {
+            cli.unref()
+            resolve(true)
+          })
+          cli.once('error', () => resolve(false))
+        })
+        if (cliOk) return { ok: true }
+        const url = abs.startsWith('/')
+          ? `vscode://file${abs}`
+          : `vscode://file/${abs.replace(/\\/g, '/')}`
+        await shell.openExternal(url)
+        return { ok: true }
+      }
+      if (which === 'nvim') {
+        const expr = `execute('edit ' . fnameescape('${abs.replace(/'/g, "''")}'))`
+        const socks = await findNvimSockets().catch(() => [] as string[])
+        for (const s of socks) {
+          const { code } = await runNvimQuery(s, ['--remote-expr', expr])
+          if (code === 0) return { ok: true }
+        }
+        const launched = await launchTerminal(['nvim', abs], path.dirname(abs))
+        if (launched) return { ok: true }
+        return { ok: false, error: 'No running Neovim instance and no terminal found.' }
+      }
+      return { ok: false, error: `Unknown editor: ${which}` }
+    } catch (err) {
+      return fail(err)
+    }
+  })
+
+  // --- reveal the workspace folder in the OS file manager ------------------
+  ipcMain.handle('open:folder', async (_e, dir: unknown) => {
+    const d = typeof dir === 'string' ? dir.trim() : ''
+    if (!d || !path.isAbsolute(d)) return { ok: false, error: 'Not an absolute path.' }
+    try {
+      const err = await shell.openPath(d)
+      return err ? { ok: false, error: err } : { ok: true }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // --- open a terminal in the workspace folder ------------------------------
+  ipcMain.handle('open:terminal', async (_e, dir: unknown) => {
+    const d = typeof dir === 'string' ? dir.trim() : ''
+    if (!d || !path.isAbsolute(d)) return { ok: false, error: 'Not an absolute path.' }
+    const ok = await launchTerminal([], d)
+    return ok ? { ok: true } : { ok: false, error: 'No supported terminal found.' }
   })
 
   // --- app updates (GitHub releases) ---------------------------------------

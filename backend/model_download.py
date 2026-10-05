@@ -1,6 +1,6 @@
 """Download / inspect / remove the on-device ML models.
 
-Three models are managed:
+Two models are managed:
 
 * **Whisper** (voice input) — a faster-whisper / CTranslate2 snapshot in
   ``models/whisper/`` (default repo ``Systran/faster-whisper-medium``).
@@ -8,11 +8,6 @@ Three models are managed:
   HF-cache-style folder ``models/models--<org>--<name>/`` (default
   ``intfloat/multilingual-e5-base``). Every downloaded repo keeps its own
   folder, so several builds can coexist and be removed independently.
-* **Laya** (fast local decisions) — a System 1 decision checkpoint in
-  ``models/laya--<slug>/`` (default ``convaiinnovations/laya``). The laya
-  runtime downloads from the HuggingFace Hub on first ``Router.predict``,
-  so this manager pre-fetches the same snapshot into the data-root folder
-  for fully offline use.
 
 Downloads use ``huggingface_hub.snapshot_download`` (the same mechanism as
 ``download-whisper.py``) and support arbitrary HF mirror endpoints via the
@@ -40,7 +35,6 @@ BACKEND_DIR = _MODULE_DIR
 
 KIND_WHISPER = "whisper"
 KIND_EMBEDDING = "embedding"
-KIND_LAYA = "laya"
 
 # Download tuning for slow / filtered networks (applied in start_download):
 # fewer parallel file workers = steadier per-file speed and less connection
@@ -58,28 +52,8 @@ os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 WHISPER_DEFAULT_REPO = "Systran/faster-whisper-medium"
 EMBEDDING_DEFAULT_REPO = "intfloat/multilingual-e5-base"
-LAYA_DEFAULT_REPO = "convaiinnovations/laya"
-LAYA_MULTILINGUAL_REPO = "convaiinnovations/laya-multilingual"
-LAYA_TYPED_DECISIONS_REPO = "convaiinnovations/laya-typed-decisions"
-# هر سه چک‌پوینت خانواده laya که Router می‌تواند بین آن‌ها انتخاب کند.
-LAYA_KNOWN_REPOS = (
-    LAYA_DEFAULT_REPO,
-    LAYA_MULTILINGUAL_REPO,
-    LAYA_TYPED_DECISIONS_REPO,
-)
-
 # Subfolder of the models root holding huggingface_hub's own cache layout.
-# Laya's Router.predict auto-downloads through HF_HOME, which must point here
-# — never at the shared models/ root, whose ``models--*`` folders are scanned
-# by embedding_dirs() for the Settings Memory card.
 _HUB_CACHE_DIRNAME = "hub-cache"
-
-
-def _is_laya_repo(repo: str) -> bool:
-    """True for laya-family repos, which are decision checkpoints — never
-    embedding models, so embedding_dirs() must skip them."""
-    r = (repo or "").strip()
-    return r in LAYA_KNOWN_REPOS or r.startswith("convaiinnovations/laya")
 
 
 _MIGRATE_LOCK = threading.Lock()
@@ -116,7 +90,7 @@ def _models_dir() -> str:
 
 
 def hub_cache_dir() -> str:
-    """Dedicated huggingface_hub cache dir (laya auto-downloads land here)."""
+    """Dedicated huggingface_hub cache dir."""
     return os.path.join(_models_dir(), _HUB_CACHE_DIRNAME)
 
 
@@ -143,80 +117,9 @@ def whisper_dir() -> str:
     return os.path.join(_models_dir(), f"whisper--{slug}") if slug else os.path.join(_models_dir(), "whisper")
 
 
-def _user_laya_model() -> str:
-    """مدل laya انتخاب‌شده توسط کاربر در تنظیمات (پیش‌فرض مخزن اصلی)."""
-    try:
-        from state_db import get_settings
-
-        settings = get_settings()
-        if isinstance(settings, dict):
-            model = str(settings.get("layaModel") or "").strip()
-            if model:
-                return model
-    except Exception:  # noqa: BLE001, S110 — standalone fallback
-        pass
-    return LAYA_DEFAULT_REPO
-
-
-def _laya_dir(repo: str = "") -> str:
-    """پوشه محلی چک‌پوینت laya برای یک repo مشخص (پیش‌فرض انتخاب کاربر)."""
-    repo = (repo or "").strip() or _user_laya_model()
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
-    return os.path.join(_models_dir(), f"laya--{slug}") if slug else os.path.join(_models_dir(), "laya")
-
-
-def laya_weight_status(repo: str = "") -> dict:
-    """وضعیت آماده‌بودن وزن laya: پوشه، حجم، آماده‌بودن (تفکیک «وزن نیست»)."""
-    target = (repo or "").strip() or _user_laya_model()
-    weight_dir = _laya_dir(target)
-    return {
-        "repo": target,
-        "weight_dir": weight_dir,
-        "ready": laya_ready(target),
-        "size": _dir_size(weight_dir),
-    }
-
-
 def _embedding_dir(repo: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
     return os.path.join(_models_dir(), f"models--{slug}") if slug else ""
-
-
-def _migrate_laya_orphans(target_root: str) -> None:
-    """Move laya HF-cache orphans out of the embedding scan dir.
-
-    Router.predict auto-downloads used to land directly in the shared models/
-    root (HF_HOME pointed there), so embedding_dirs() listed them as
-    "incomplete" rows in the Settings Memory card. Move them into hub-cache/
-    (top-level scan never recurses there; HF resumes the partial download).
-    Never deletes: when the dest already holds that repo, the stale copy is
-    left alone (invisible to the UI after the embedding_dirs filter).
-
-    Never calls _models_dir()/hub_cache_dir(): this runs under _MIGRATE_LOCK,
-    which is non-reentrant — re-entering _models_dir hung the sidecar at
-    startup. Everything derives from target_root (always the models dir).
-    """
-    dest_root = os.path.join(target_root, _HUB_CACHE_DIRNAME)
-    try:
-        names = os.listdir(target_root)
-    except OSError:
-        return
-    for name in names:
-        if not name.startswith("models--"):
-            continue
-        if not _is_laya_repo(name[len("models--"):].replace("--", "/")):
-            continue
-        src = os.path.join(target_root, name)
-        if not os.path.isdir(src):
-            continue
-        dest = os.path.join(dest_root, name)
-        if os.path.isdir(dest):
-            continue
-        try:
-            os.makedirs(dest_root, exist_ok=True)
-            shutil.move(src, dest)
-        except Exception:  # noqa: BLE001, S112 — migration must never crash startup
-            continue
 
 
 def _migrate_legacy_models(target_root: str | None = None) -> None:
@@ -248,7 +151,6 @@ def _migrate_legacy_models(target_root: str | None = None) -> None:
             shutil.move(src, dest)
         except Exception:  # noqa: BLE001, S112 — migration must never crash startup
             continue
-    _migrate_laya_orphans(target_root)
 
 
 # --- live download state (one entry per kind) --------------------------- #
@@ -605,8 +507,6 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
 
     if kind == KIND_WHISPER:
         dest = whisper_dir()
-    elif kind == KIND_LAYA:
-        dest = _laya_dir(repo)
     else:
         dest = _embedding_dir(repo)
     _set_downloading(kind, repo, base_url, _dir_size(dest))
@@ -706,8 +606,6 @@ def remove(kind: str, repo: str) -> bool:
             controls["pause"].clear()
     if kind == KIND_WHISPER:
         target = whisper_dir()
-    elif kind == KIND_LAYA:
-        target = _laya_dir(repo)
     else:
         target = _embedding_dir(repo)
     if not os.path.isdir(target):
@@ -758,45 +656,6 @@ def whisper_ready() -> bool:
     return False
 
 
-def laya_ready(repo: str = "") -> bool:
-    """True وقتی پوشه چک‌پوینت laya ناخالی باشد (قابل استفاده آفلاین)."""
-    ldir = _laya_dir(repo)
-    if not os.path.isdir(ldir):
-        return False
-    try:
-        return any(
-            os.path.isfile(os.path.join(ldir, f))
-            and os.path.getsize(os.path.join(ldir, f)) > 0
-            for f in os.listdir(ldir)
-        )
-    except OSError:
-        return False
-
-
-def laya_dirs() -> list[dict]:
-    """همه پوشه‌های دانلودشده laya، جدیدترین اول."""
-    out: list[dict] = []
-    root_dir = _models_dir()
-    if not os.path.isdir(root_dir):
-        return out
-    for name in sorted(os.listdir(root_dir), reverse=True):
-        if not name.startswith("laya--"):
-            continue
-        root = os.path.join(root_dir, name)
-        if not os.path.isdir(root):
-            continue
-        repo = name[len("laya--") :].replace("--", "/")
-        out.append(
-            {
-                "repo": repo,
-                "dir": name,
-                "size": _dir_size(root),
-                "ready": laya_ready(repo),
-            }
-        )
-    return out
-
-
 def _embed_ready(root: str) -> bool:
     """True when ``root`` holds a usable e5 ONNX model (snapshots or flat)."""
     snapshots = os.path.join(root, "snapshots")
@@ -813,11 +672,7 @@ def _embed_ready(root: str) -> bool:
 
 
 def embedding_dirs() -> list[dict]:
-    """All downloaded embedding model dirs, newest first.
-
-    Laya-family ``models--*`` folders (left by old HF auto-downloads) are
-    skipped — they are decision checkpoints, never embedding models.
-    """
+    """All downloaded embedding model dirs, newest first."""
     out: list[dict] = []
     root_dir = _models_dir()
     if not os.path.isdir(root_dir):
@@ -829,8 +684,6 @@ def embedding_dirs() -> list[dict]:
         if not os.path.isdir(root):
             continue
         repo = name[len("models--") :].replace("--", "/")
-        if _is_laya_repo(repo):
-            continue
         out.append(
             {
                 "repo": repo,
@@ -863,10 +716,7 @@ def status() -> dict:
                 "ready": whisper_ready(),
             }
         ]
-    laya: dict = {"dirs": laya_dirs()}
-    if download_state(KIND_LAYA):
-        laya["running"] = download_state(KIND_LAYA)
-    out = {"whisper": whisper, "embedding": embed, "laya": laya}
+    out = {"whisper": whisper, "embedding": embed}
     try:
         _tripwire_external_deletion(out)
     except Exception:  # noqa: BLE001, S110 — diagnostics never break status
@@ -896,7 +746,7 @@ def _tripwire_external_deletion(status_out: dict) -> None:
     the app (system cleaner, another process, manual delete).
     """
     ready_now: set[str] = set()
-    for _section in (status_out.get("embedding") or {}, status_out.get("laya") or {}):
+    for _section in (status_out.get("embedding") or {},):
         for _d in (_section.get("dirs") or []):
             _name = str((_d or {}).get("dir") or "")
             if _name and (_d or {}).get("ready"):

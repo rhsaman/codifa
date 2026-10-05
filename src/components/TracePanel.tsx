@@ -8,13 +8,11 @@ import { clearChatTraces, getChatTraces } from "../lib/api";
 import { copyToClipboard } from "../lib/clipboard";
 import type { TraceEntry } from "../types";
 import { countOccurrences, countTraceEntryHits, stepHitIndex } from "../lib/diffSearch";
-import { layaConfidencePct, layaReasonLabel, layaRouteLabel } from "./LayaLabels";
 
 type ActiveRef = { current: HTMLElement | null };
 
 const TABS: Array<[TraceTab, string]> = [
   ["all", "All"],
-  ["laya", "Laya"],
   ["llm", "LLM"],
   ["prompt", "Prompts"],
   ["tool", "Tools"],
@@ -31,7 +29,7 @@ export function isSubToolTrace(entry: TraceEntry): boolean {
 
 /** Pure tab counts for tests: All counts every entry, Tools counts only top-level tool calls. */
 export function getTraceTabCounts(entries: TraceEntry[]): Record<string, number> {
-  const c: Record<string, number> = { all: entries.length, laya: 0, llm: 0, prompt: 0, tool: 0 };
+  const c: Record<string, number> = { all: entries.length, llm: 0, prompt: 0, tool: 0 };
   for (const e of entries) {
     const raw = e.kind as string;
     if (raw === "tool") {
@@ -53,7 +51,7 @@ export function traceRowTitle(entry: TraceEntry): string {
     const name = String((entry.detail as Record<string, unknown> | undefined)?.name || entry.model || "tool");
     return name;
   }
-  return "laya decision";
+  return "trace entry";
 }
 
 /** فیلتر لاگ‌ها با کوئری جست‌وجو (خلاصه + پرامپت + پاسخ + جزئیات). خالص برای تست. */
@@ -408,26 +406,6 @@ export function TraceRow({
       </button>
       {open && (
         <div className="trace-row-body trace-panel-body">
-          {entry.kind === "laya" && (
-            <div className="trace-laya-meta">
-              <span className={`laya-route-badge route-${String(detail.route || "normal").toLowerCase()}`}>
-                {layaRouteLabel(String(detail.route || "normal"))}
-              </span>
-              <span className="trace-meta-chip">{layaConfidencePct(Number(detail.confidence ?? 0))}٪</span>
-              <span className={`trace-status-chip ${detail.handled ? "status-done" : "status-error"}`}>
-                {detail.handled ? "handled" : "fallback"}
-              </span>
-              {detail.reason ? (
-                <span className="trace-meta-reason" title={String(detail.reason)}>
-                  {layaReasonLabel(String(detail.reason)) || String(detail.reason)}
-                </span>
-              ) : null}
-              {detail.model ? <span className="trace-meta-chip">{String(detail.model)}</span> : null}
-              {typeof detail.elapsed_ms === "number" ? (
-                <span className="trace-meta-chip">{Number(detail.elapsed_ms)}ms</span>
-              ) : null}
-            </div>
-          )}
           {entry.kind === "llm" && (
             <div className="trace-llm-meta">
               {entry.model ? <span className="trace-meta-chip">{entry.model}</span> : null}
@@ -576,6 +554,10 @@ export function TracePanel(props?: {
   initialTab?: TraceTab
   docked?: boolean
   onClose?: () => void
+  /** Background sub-agent job id: when set, shows only that job's trace. */
+  taskId?: string
+  /** Short label for a sub-agent trace tab (job description). */
+  traceTitle?: string
 }) {
   const docked = props?.docked ?? false
   const store = useTracePanel();
@@ -588,6 +570,8 @@ export function TracePanel(props?: {
   const close = props?.onClose ?? storeClose
   const storeActiveChatId = useStore((s) => s.activeChatId);
   const activeChatId = props?.chatId ?? storeActiveChatId;
+  const taskId = (props?.taskId ?? "").trim();
+  const traceTitle = (props?.traceTitle ?? "").trim();
   const [fullscreen, setFullscreen] = useState(false);
   const [width, setWidth] = useState(() => {
     if (typeof window === "undefined") return 720;
@@ -675,7 +659,7 @@ export function TracePanel(props?: {
       setError(null);
     }
     try {
-      const out = await getChatTraces(activeChatId);
+      const out = await getChatTraces(activeChatId, undefined, taskId || undefined);
       if (mySeq !== fetchSeqRef.current) return;
       if (Array.isArray(out)) {
         setEntries(out);
@@ -694,7 +678,7 @@ export function TracePanel(props?: {
       if (mySeq !== fetchSeqRef.current) return;
       if (!silent) setLoading(false);
     }
-  }, [activeChatId]);
+  }, [activeChatId, taskId]);
 
   useEffect(() => {
     if (!activeChatId) {
@@ -854,6 +838,7 @@ export function TracePanel(props?: {
         </div>
         <div className="trace-subheader">
           <span className="trace-subheader-text">
+            {taskId ? `Sub-agent ${traceTitle || taskId.slice(0, 8)} · ` : ""}
             {entries.length} events{totalTokens > 0 ? ` · ${totalTokens} tokens` : ""}
           </span>
         </div>

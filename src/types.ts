@@ -154,13 +154,6 @@ export interface Settings {
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
-  /** مدل تصمیم محلی laya: شناسه ریپوی هاگینگ‌فیس + آینه اختیاری. */
-  layaModel?: string
-  layaBaseUrl?: string
-  /** منبع تصمیم سریع laya: 'local' یعنی روتر محلی، غیر آن شناسه پروایدر (مثل STT). */
-  layaProviderId?: string
-  /** مدل تصمیم سریع روی پروایدر انتخاب‌شده (مثل انتخاب مدل در Tools)؛ خالی = مدل پیش‌فرض همان پروایدر. */
-  layaProviderModel?: string
   /** TTL for web/fetch text cache + RAG storage (days). Default: 90. */
   ragWebTtlDays?: number
   /** How many top web_search results get their page content auto-fetched
@@ -207,6 +200,11 @@ export interface Settings {
   /** Schedule run ids already seen in the inbox (badge state). Persisted so
    *  read runs stay read across restarts. */
   scheduleRunsSeen?: string[]
+  /** Persisted hard switch for desktop control (the `computer` tool). Like an
+   *  MCP connector: when false the backend never binds the tool — the agent
+   *  cannot touch the desktop even if the prompt asks for it. When true the
+   *  tool binds and per-action runtime permission prompting still applies. */
+  computerUse?: boolean
 }
 
 /** A first-class workspace in the sidebar. ``root`` is the project folder; may
@@ -303,9 +301,6 @@ export interface ChatUsageEntry {
   output: number
   cacheRead?: number
   cacheWrite?: number
-  /** True برای ردیف تصمیم سریع laya (لوکال صفرتوکنی یا پروایدر خارجی) —
-   *  ردیف صفرتوکنی laya در model usage نگه داشته می‌شود تا لوکال هم قابل‌مشاهده بماند. */
-  laya?: boolean
   /** Epoch ms of the last token accrual for this model — used to sort "most
    *  recently used" first in the sidebar usage panel. */
   lastUsed?: number
@@ -465,8 +460,6 @@ export interface Chat {
   messages: ChatMessage[]
   /** Cumulative per-model token usage for this chat (session totals). */
   usage?: ChatUsage
-  /** تاریخچه تصمیم‌های سریع laya همین چت (آخرین ~۲۰ تا) برای پنل راست. */
-  layaRuns?: LayaRun[]
   draft?: ChatDraft
   /** Messages typed while this chat's agent was working, sent/steered later. */
   queued?: QueuedMessage[]
@@ -506,12 +499,14 @@ export interface Chat {
 }
 
 /** یک ورودی لاگ چت جاری برای پنل Trace (لایا / LLM / پرامپت / ابزار) — مثل لنگ‌اسمیت. */
-export type TraceKind = 'laya' | 'llm' | 'prompt' | 'tool'
+export type TraceKind = 'llm' | 'prompt' | 'tool'
 
 export interface TraceEntry {
   id: string
   /** زمان ثبت (epoch ثانیه). */
   at: number
+  /** Background sub-agent job id (empty for main-agent entries). */
+  task_id?: string
   kind: TraceKind
   /** Chat turn number (1-based, from backend). 0/missing = legacy entry. */
   turn?: number
@@ -528,21 +523,8 @@ export interface TraceEntry {
   result?: string
 }
 
-/** یک تصمیم سریع laya برای نمایش زنده زیر todos (فقط چت فعال، آخرین ~۲۰ تا). */
-export interface LayaRun {
-  route: string
-  confidence: number
-  abstained: boolean
-  reason: string
-  handled: boolean
-  providerId: string
-  model: string
-  elapsedMs: number
-  at: number
-}
-
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive' | 'laya'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -644,15 +626,6 @@ export interface SidecarEvent {
    *  tool fell back to the MAIN model — the UI renders a distinct
    *  'sub-agent failed — using main model' banner instead of a spinner. */
   fallback?: boolean
-  /** True روی رویداد usage تصمیم سریع laya (لوکال صفرتوکنی یا پروایدر خارجی) —
-   *  مثل tools با sub=True در جمع چت ثبت می‌شود ولی بج پیام را به‌هم نمی‌ریزد. */
-  laya?: boolean
-  /** فیلدهای رویداد فعالیت laya (kind: 'laya'): مسیر، اطمینان، انصراف، دلیل، زمان. */
-  route?: string
-  confidence?: number
-  abstained?: boolean
-  handled?: boolean
-  elapsed_ms?: number
   /** Thinking signal: true when the model starts reasoning, false when it
    *  stops. The backend emits this instead of streaming raw thinking text
    *  (which slowed the UI); the frontend uses it to glow the composer. */

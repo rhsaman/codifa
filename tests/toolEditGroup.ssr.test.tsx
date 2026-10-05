@@ -83,6 +83,20 @@ console.log('2) ویرایش تکی → کارت تکی (بدون گروه وی�
   const html = renderToString(<ChatMessageView message={msg} />)
   check('گروه ویرایش ساخته نشد', !html.includes('tool-edit-group'))
   check('کارت تکی ویرایش هست', html.includes('solo.ts'))
+
+  // آیکن فایل باید کنار «نام فایل» باشد، نه قبل از فعل Edited/Wrote.
+  const verbIdx = html.indexOf('tool-verb')
+  const fileIdx = html.indexOf('class="tool-file"')
+  const nameIdx = html.indexOf('tool-file-name')
+  check('فعل Edited قبل از بخش فایل است', verbIdx >= 0 && verbIdx < fileIdx,
+    { verbIdx, fileIdx })
+  // title حاوی نام فایل است و قبل از آیکن می‌آید — بعد از tool-file-name بگرد.
+  const iconChunk = html.slice(fileIdx, nameIdx > 0 ? nameIdx : html.length)
+  check('آیکن svg داخل tool-file و قبل از نام فایل است',
+    fileIdx >= 0 && nameIdx > fileIdx && iconChunk.includes('<svg'),
+    iconChunk.slice(0, 200))
+  check('نام فایل بعد از آیکن می‌آید',
+    nameIdx > 0 && html.indexOf('solo.ts', nameIdx) > nameIdx)
 }
 
 console.log('3) ویرایش + ابزار فقط‌خواندنی → دو گروه جدا:')

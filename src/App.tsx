@@ -6,7 +6,7 @@ import { CodeMapPanel } from './components/CodeMapPanel'
 import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerContent } from './components/ViewerContent'
-import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
+import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs, visibleTabs } from './lib/viewerTabs'
 import { RightPanel } from './components/TodosPanel'
 import { ScheduleInboxButton } from './components/ScheduleInbox'
 import { SettingsModal } from './components/SettingsModal'
@@ -19,6 +19,8 @@ import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
 import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
+import { openWorkspaceFile } from './components/FileIcon'
+import { api } from './lib/fs'
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -35,9 +37,13 @@ export default function App() {
   const viewerActiveId = useViewerTabs((s) => s.activeId)
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const chatFull = useStore((s) => s.chatFullscreen)
-  const viewerHasGit = viewerTabs.some((t) => t.kind === 'review')
-  const viewerHasTrace = viewerTabs.some((t) => t.kind === 'trace')
-  const viewerHasBrowser = viewerTabs.some((t) => t.kind === 'browser')
+  // Viewer tabs are chat-scoped (browser/git/trace/plan): show only this chat's set.
+  const visibleViewerTabs = visibleTabs(viewerTabs, activeChatId)
+  const viewerHasGit = visibleViewerTabs.some((t) => t.kind === 'review')
+  const viewerHasTrace = visibleViewerTabs.some((t) => t.kind === 'trace')
+  const viewerHasBrowser = visibleViewerTabs.some((t) => t.kind === 'browser')
+  const viewerActive =
+    visibleViewerTabs.find((t) => t.id === viewerActiveId) ?? visibleViewerTabs[0] ?? null
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
@@ -88,6 +94,21 @@ export default function App() {
     const openSearch = () => setSearchOpen(true)
     window.addEventListener('coder:search', openSearch)
     return () => window.removeEventListener('coder:search', openSearch)
+  }, [])
+
+  // `coder:open-file` is the app-wide "open this workspace file" event (fired
+  // by file chips, the code map, and any future external-editor hook). Opening
+  // happens here once so every dispatcher shares the same right-panel path.
+  useEffect(() => {
+    const onOpenFile = (e: Event) => {
+      const detail = (e as CustomEvent<{ path?: string; line?: number }>).detail
+      if (!detail?.path) return
+      const st = useStore.getState()
+      const root = st.chats.find((c) => c.id === st.activeChatId)?.root ?? st.root
+      useViewerTabs.getState().openFile(detail.path, detail.line, root)
+    }
+    window.addEventListener('coder:open-file', onOpenFile)
+    return () => window.removeEventListener('coder:open-file', onOpenFile)
   }, [])
 
   const openWorkspace = (dir: string) => {
@@ -328,12 +349,12 @@ export default function App() {
           <ScheduleInboxButton />
           <button
             className="titlebar-icon-btn"
-            title="Chat traces — laya / LLM / prompts"
-            aria-label="Chat traces — laya / LLM / prompts"
+            title="Chat traces — LLM / prompts"
+            aria-label="Chat traces — LLM / prompts"
             aria-pressed={viewerHasTrace}
             onClick={() => {
               const vt = useViewerTabs.getState();
-              const existing = vt.tabs.find((t) => t.kind === 'trace');
+              const existing = visibleViewerTabs.find((t) => t.kind === 'trace');
               if (existing) vt.closeViewer(existing.id);
               else vt.openTraces(activeChatId || undefined);
             }}
@@ -350,7 +371,7 @@ export default function App() {
             aria-pressed={viewerHasGit}
             onClick={() => {
               const vt = useViewerTabs.getState();
-              const existing = vt.tabs.find((t) => t.kind === 'review');
+              const existing = visibleViewerTabs.find((t) => t.kind === 'review');
               if (existing) vt.closeViewer(existing.id);
               else vt.openGitDiff();
             }}
@@ -369,7 +390,7 @@ export default function App() {
             aria-pressed={viewerHasBrowser}
             onClick={() => {
               const vt = useViewerTabs.getState();
-              const existing = vt.tabs.find((t) => t.kind === 'browser');
+              const existing = visibleViewerTabs.find((t) => t.kind === 'browser');
               if (existing) vt.closeViewer(existing.id);
               else vt.openBrowser();
             }}
@@ -377,6 +398,31 @@ export default function App() {
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <circle cx="12" cy="12" r="9" />
               <path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z" />
+            </svg>
+          </button>
+          <button
+            className="titlebar-icon-btn"
+            aria-label="Reveal workspace in file manager"
+            title={activeChatRoot ? `Reveal ${activeChatRoot} in Finder / Explorer` : 'No workspace open — pick a folder first'}
+            disabled={!activeChatRoot}
+            onClick={() => activeChatRoot && void api.openWorkspaceFolder(activeChatRoot).then((res) => { if (!res.ok) console.warn('[workspace] reveal failed:', res.error) })}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+              <path d="M3 13h18" opacity="0.6" />
+            </svg>
+          </button>
+          <button
+            className="titlebar-icon-btn"
+            aria-label="Open terminal in workspace"
+            title={activeChatRoot ? `Open terminal in ${activeChatRoot}` : 'No workspace open — pick a folder first'}
+            disabled={!activeChatRoot}
+            onClick={() => activeChatRoot && void api.openWorkspaceTerminal(activeChatRoot).then((res) => { if (!res.ok) console.warn('[workspace] terminal failed:', res.error) })}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="2.5" />
+              <path d="M7 9l3 3-3 3" />
+              <path d="M12 15h5" />
             </svg>
           </button>
           <span className="titlebar-divider" aria-hidden="true" />
@@ -402,7 +448,7 @@ export default function App() {
           <Sidebar />
           <div className={
             "editor-area" +
-            (viewerFull && viewerTabs.length > 0 && !chatFull ? " viewer-full" : "") +
+            (viewerFull && visibleViewerTabs.length > 0 && !chatFull ? " viewer-full" : "") +
             (chatFull ? " chat-full" : "")
           }>
             <section className="chat-group" aria-label="Chats">
@@ -416,7 +462,7 @@ export default function App() {
                 <ChatPanel />
               </main>
             </section>
-            {viewerTabs.length > 0 && !chatFull && (
+            {visibleViewerTabs.length > 0 && !chatFull && (
               <>
                 {!viewerFull && (
                   <div
@@ -431,7 +477,7 @@ export default function App() {
                   aria-label="Viewers"
                 >
                   <ViewerTabBar />
-                  <div className="viewer-content" key={viewerActiveId ?? 'empty'}>
+                  <div className="viewer-content" key={viewerActive?.id ?? 'empty'}>
                     <ViewerContent />
                   </div>
                 </section>
@@ -441,11 +487,10 @@ export default function App() {
           {codeMapPanelOpen && (
             <CodeMapPanel
               onJumpToFile={(path, line) => {
-                // فعلاً: یه CustomEvent می‌فرستیم که هر listener (مثل editor آینده)
-                // بتونه فایل رو در خط دلخواه باز کنه. این نقطه‌ی توسعه‌ست.
-                window.dispatchEvent(
-                  new CustomEvent('coder:open-file', { detail: { path, line } }),
-                )
+                // Opens the file in its own viewer tab (FileViewerPanel) and
+                // also dispatches the `coder:open-file` CustomEvent so any
+                // future listener (e.g. an external editor hook) still works.
+                openWorkspaceFile(path, line)
               }}
             />
           )}

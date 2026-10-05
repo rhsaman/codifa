@@ -112,9 +112,15 @@ export function formatTokens(n: number): string {
   return String(n)
 }
 
-/** Compact thousands-separated form for big cumulative chips: 2365.1 -> "2,365K". */
+/** Compact thousands-separated form: 824100 -> "824K". Megabyte-scale windows
+ *  keep up to two decimals (1048576 -> "1.05M", not "1.0M") so the denominator
+ *  stays arithmetically consistent with the usage percentage shown next to it
+ *  in the popover header. */
 export function formatTokensK(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000
+    return `${m.toFixed(2).replace(/\.?0+$/, '')}M`
+  }
   if (n >= 1_000) return `${Math.round(n / 1_000).toLocaleString("en-US")}K`
   return Math.round(n).toLocaleString("en-US")
 }
@@ -188,11 +194,13 @@ export function computeContextUsed(
   // measured context: it already encodes whether cache is additive (Anthropic)
   // or a subset of input (OpenAI / OpenRouter / Google). Once it has arrived
   // and is positive it WINS — even when smaller than the local estimate, since
-  // the estimate's builtin-prompt floor over-estimates tiny turns. When it is
-  // omitted, fall back to just inputTokens (not the hand-sum of breakdown
-  // fields, which can double-count cache for subset providers).
+  // the estimate's builtin-prompt floor over-estimates tiny turns. It can never
+  // be smaller than the input itself, though (total = input + output, with the
+  // cache either folded into input or added on top): a total below inputTokens
+  // means the router dropped the cached portion from its total, so clamp up to
+  // the real input instead of under-reporting the meter.
   if (last && (last.inputTokens ?? 0) > 0) {
-    const providerTotal = last.totalTokens ?? last.inputTokens ?? 0
+    const providerTotal = Math.max(last.totalTokens ?? 0, last.inputTokens ?? 0)
     if (providerTotal > 0) return providerTotal
   }
 
@@ -400,24 +408,44 @@ const CONTEXT_BREAKDOWN_ORDER: ContextBreakdownKey[] = [
 ]
 
 /** Weighted average prompt-cache hit rate (0-100) across per-turn usages.
- *  Each turn contributes cache / denominator where denominator is the input
- *  footprint: subset-convention providers fold cache into input, so the
- *  denominator is input; additive providers keep cache outside input, so the
- *  denominator is input + cache. Distinguish by whether input covers cache. */
+ *  Only cache READS are hits — cache WRITES are misses that fill the cache, so
+ *  a cold turn (all writes, no reads) correctly rates 0%. Each turn contributes
+ *  reads / denominator where the denominator is the full input footprint:
+ *  subset-convention providers fold cache into input, so the denominator is
+ *  input; additive providers keep cache outside input, so the denominator is
+ *  input + reads + writes. Distinguish by whether input covers the cache. */
 export function averageCacheHitRate(usages: TokenUsage[]): number | null {
   let hit = 0
   let denom = 0
   for (const u of usages) {
-    const cache = (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+    const read = u.cacheReadTokens ?? 0
+    const write = u.cacheWriteTokens ?? 0
+    const cache = read + write
     const input = u.inputTokens ?? 0
     if (input <= 0 && cache <= 0) continue
     const base = input >= cache ? Math.max(0, input) : input + cache
     if (base <= 0) continue
-    hit += cache
+    hit += read
     denom += base
   }
   if (denom <= 0) return null
   return Math.min(100, Math.max(0, (hit / denom) * 100))
+}
+
+/** Width (%) of one breakdown-bar segment in the popover. Segments are sized
+ *  against the WINDOW so the filled portion of the bar equals the usage
+ *  percentage shown in the header, with each row's composition visible inside
+ *  that fill — sizing them against the used total instead would make the bar
+ *  read as 100% full at every usage level. Without a known window the bar
+ *  degrades to pure composition (segments sum to 100%). */
+export function contextBarSegmentPercent(
+  rowTokens: number,
+  total: number,
+  window: number | null,
+): number {
+  if (window != null && window > 0) return Math.max(0, (rowTokens / window) * 100)
+  if (total > 0) return Math.max(0, (rowTokens / total) * 100)
+  return 0
 }
 
 /** Split an estimated total into labeled rows with percentages summing to 100.
@@ -450,6 +478,9 @@ export function computeContextBreakdown(
 }
 
 export interface BreakdownEstimateOptions {
+  /** Real system-prompt size (chars) reported by the backend's ctx_parts
+   *  event — wins over the base prompt string used for the meter estimate. */
+  systemPromptChars?: number
   skillsChars?: number
   mcpChars?: number
   systemToolsChars?: number
@@ -498,7 +529,10 @@ export function estimateBreakdownParts(
     }
   }
   const messages = Math.round(msgChars / CHARS_PER_TOKEN)
-  const systemPromptTokens = Math.round(systemPrompt.length / CHARS_PER_TOKEN)
+  const systemPromptTokens =
+    opts.systemPromptChars != null
+      ? Math.round(opts.systemPromptChars / CHARS_PER_TOKEN)
+      : Math.round(systemPrompt.length / CHARS_PER_TOKEN)
   const systemToolsTokens =
     opts.systemToolsChars != null
       ? Math.round(opts.systemToolsChars / CHARS_PER_TOKEN)
@@ -548,22 +582,40 @@ export function buildContextBreakdown(
       // see: attribute it to System tools so rows add up to the real total.
       scaled = { ...parts, systemTools: parts.systemTools + (actual - known) }
     } else {
-      // The local estimate overshoots the provider total (cache/history diff):
-      // shrink every part proportionally so rows still sum to the real total.
-      const k = actual / known
-      scaled = {
-        messages: Math.round(parts.messages * k),
-        systemTools: Math.round(parts.systemTools * k),
-        systemPrompt: Math.round(parts.systemPrompt * k),
-        skills: Math.round(parts.skills * k),
-        mcpTools: Math.round(parts.mcpTools * k),
-        meta: Math.round(parts.meta * k),
-      }
-      // Fix rounding drift so rows sum exactly to the meter total.
-      const sum = Object.values(scaled).reduce((s, v) => s + v, 0)
-      const drift = actual - sum
-      if (drift !== 0) {
-        scaled = { ...scaled, systemTools: Math.max(0, scaled.systemTools + drift) }
+      // The local estimate overshoots the provider total (cache/history diff).
+      // Absorb the excess from the ESTIMATED parts first (messages/meta) so
+      // real reported sizes (system prompt / skills / MCP) keep their value;
+      // scale everything only when the estimates cannot cover the gap.
+      const estSum = parts.messages + parts.meta
+      const excess = known - actual
+      if (estSum > 0 && excess <= estSum) {
+        const keep = estSum - excess
+        const k = keep / estSum
+        scaled = {
+          ...parts,
+          messages: Math.round(parts.messages * k),
+          meta: Math.round(parts.meta * k),
+        }
+        const estDrift = keep - (scaled.messages + scaled.meta)
+        if (estDrift !== 0) {
+          scaled = { ...scaled, messages: Math.max(0, scaled.messages + estDrift) }
+        }
+      } else {
+        const k = known > 0 ? actual / known : 0
+        scaled = {
+          messages: Math.round(parts.messages * k),
+          systemTools: Math.round(parts.systemTools * k),
+          systemPrompt: Math.round(parts.systemPrompt * k),
+          skills: Math.round(parts.skills * k),
+          mcpTools: Math.round(parts.mcpTools * k),
+          meta: Math.round(parts.meta * k),
+        }
+        // Fix rounding drift so rows sum exactly to the meter total.
+        const sum = Object.values(scaled).reduce((s, v) => s + v, 0)
+        const drift = actual - sum
+        if (drift !== 0) {
+          scaled = { ...scaled, systemTools: Math.max(0, scaled.systemTools + drift) }
+        }
       }
     }
   }

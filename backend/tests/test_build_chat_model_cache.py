@@ -169,9 +169,10 @@ def test_build_chat_model_anthropic_gets_cache_control(monkeypatch):
     assert captured.get("extra_body") == {"cache_control": {"type": "ephemeral"}}
 
 
-def test_build_chat_model_non_anthropic_no_cache_control(monkeypatch):
-    """Non-Anthropic models on openrouter must NOT receive cache_control —
-    it is an Anthropic-only param and other models may 400 on it."""
+def test_build_chat_model_non_anthropic_gets_cache_control(monkeypatch):
+    """Non-Anthropic models on openrouter also get the top-level breakpoint
+    so OpenRouter's automatic prefix caching can anchor on it (gateways that
+    ignore the field are unaffected)."""
     captured = _capture_model(monkeypatch)
 
     build_chat_model(
@@ -181,7 +182,7 @@ def test_build_chat_model_non_anthropic_no_cache_control(monkeypatch):
         cache=True,
     )
 
-    assert "extra_body" not in captured
+    assert captured.get("extra_body") == {"cache_control": {"type": "ephemeral"}}
 
 
 def test_build_chat_model_anthropic_cache_disabled_no_cache_control(monkeypatch):
@@ -299,7 +300,7 @@ if __name__ == "__main__":
     test_build_chat_model_no_cache_header_when_disabled()
     test_build_chat_model_forwards_session_id()
     test_build_chat_model_anthropic_gets_cache_control()
-    test_build_chat_model_non_anthropic_no_cache_control()
+    test_build_chat_model_non_anthropic_gets_cache_control()
     test_build_chat_model_anthropic_cache_disabled_no_cache_control()
     test_provider_prompt_cache_flags()
     test_build_chat_model_direct_anthropic_gets_cache_control()

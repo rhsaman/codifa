@@ -20,6 +20,7 @@ import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
 import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
+import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 
 const TOOL_LABEL: Record<string, string> = {
   write_file: "Write File",
@@ -44,7 +45,6 @@ const TOOL_LABEL: Record<string, string> = {
   git_commit: "Git Commit",
   git_log: "Git Log",
   current_time: "Current Time",
-  laya: "Laya",
   computer: "Computer",
   search_console: "Search Console",
 };
@@ -73,7 +73,6 @@ const TOOL_ICON: Record<string, string> = {
   git_commit: "✅",
   git_log: "🕘",
   current_time: "🕒",
-  laya: "⚡",
   computer: "🖥",
   search_console: "🔎",
 };
@@ -105,7 +104,6 @@ const TOOL_NOUN: Record<string, [string, string]> = {
   git_commit: ["commit", "commits"],
   git_log: ["log lookup", "log lookups"],
   current_time: ["time check", "time checks"],
-  laya: ["decision", "decisions"],
   computer: ["desktop action", "desktop actions"],
   search_console: ["console query", "console queries"],
 };
@@ -120,9 +118,14 @@ function groupSummary(activities: ToolActivity[]): string {
     .join(", ");
 }
 
-/** A task card running the explore agent (opencode-style subagent). */
-export const isExploreCard = (a: ToolActivity) =>
-  a.tool === "task" && a.args?.subagent_type === "explore";
+/** A task card running the background sub-agent (opencode-style subagent;
+ *  "explore" is the legacy pre-rename type the backend still accepts). */
+export const isSubagentCard = (a: ToolActivity) =>
+  a.tool === "task" &&
+  (a.args?.subagent_type === "subagent" || a.args?.subagent_type === "explore");
+
+/** Legacy alias kept for existing tests/callers. */
+export const isExploreCard = isSubagentCard;
 
 /** ابزارهای ویرایش فایل — ران‌های پشت‌سرهم آن‌ها در یک گروه ویرایش جدا
  *  (ToolEditGroupView) جمع می‌شوند و هرگز با گروه ابزارهای فقط‌خواندنی
@@ -461,10 +464,18 @@ export const TerminalResultText = function TerminalResultText({
 }) {
   const text = terminalOutputText(items);
   if (!text) return null;
+  // Long output is clipped here anyway — open the full text in the side panel.
+  const long = text.length > 600;
   return (
     <pre
-      className="trace-expand-val trace-expand-pre trace-terminal-output"
+      className={`trace-expand-val trace-expand-pre trace-terminal-output${long ? " clickable" : ""}`}
       dir="ltr"
+      title={long ? "Open the full output in the side panel" : undefined}
+      onClick={
+        long
+          ? () => useViewerTabs.getState().openText("Terminal output", text)
+          : undefined
+      }
     >
       {text}
     </pre>
@@ -496,30 +507,39 @@ export const FileResultLinks = memo(function FileResultLinks({
         const text = String(it.text ?? "");
         return (
           <li key={i} className="file-result">
-            <span className="file-result-glyph" aria-hidden="true">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <path d="M14 2v6h6" />
-              </svg>
-            </span>
-            <span className="file-result-path">
-              {file}
-              {line ? `:${line}` : ""}
-            </span>
+            <FileChip
+              path={file}
+              line={line ? Number(line) : undefined}
+              display={`${file}${line ? `:${line}` : ""}`}
+            />
             {text && <span className="file-result-text">{text}</span>}
           </li>
         );
       })}
       {extra > 0 && (
         <li className="file-result-more" key="more">
-          +{extra} more
+          <button
+            type="button"
+            className="file-result-more-btn"
+            title="Open all results in the side panel"
+            onClick={() =>
+              useViewerTabs
+                .getState()
+                .openText(
+                  `${tool} results`,
+                  items
+                    .map((it) => {
+                      const f = String(it.file ?? it.path ?? "");
+                      const ln = it.line != null ? `:${String(it.line)}` : "";
+                      const tx = String(it.text ?? "");
+                      return `${f}${ln}${tx ? `  ${tx}` : ""}`;
+                    })
+                    .join("\n"),
+                )
+            }
+          >
+            +{extra} more
+          </button>
         </li>
       )}
     </ul>
@@ -1094,6 +1114,15 @@ export const ToolGroupView = memo(function ToolGroupView({
  *  full card head shows (command/path/pattern/description/memory text/url…),
  *  so a collapsed preview never shows an empty row for tools whose args the
  *  old path-only summary missed (run_terminal, memory, fetch_url, task…). */
+/** Cap a raw arg string for sub-row display: merged grep regexes and shell
+ *  commands otherwise dump a wall of `|`-joined noise into every row. The
+ *  full text stays in the row's title tooltip. */
+function shortArg(s: string, max: number): string {
+  const t = s.trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1).trimEnd()}…`;
+}
+
 function subArgSummary(activity: ToolActivity): string {
   const args = activity.args;
   if (!args) return "";
@@ -1101,7 +1130,7 @@ function subArgSummary(activity: ToolActivity): string {
 
   // run_terminal: the shell command
   if (args.command !== undefined && args.command !== "") {
-    parts.push(String(args.command));
+    parts.push(shortArg(String(args.command), 80));
   }
 
   // read/write/edit/list_files: path + real line range (mirrors the card head)
@@ -1140,27 +1169,28 @@ function subArgSummary(activity: ToolActivity): string {
     parts.push(p);
   }
 
-  // grep/glob/web_search: pattern or query
+  // grep/glob/web_search: pattern or query — capped: the sub-agent merges
+  // alternatives into one big `a|b|c` regex, which as raw text is unreadable.
   const pattern = String(args.pattern ?? args.query ?? "");
-  if (pattern) parts.push(pattern);
+  if (pattern) parts.push(shortArg(pattern, 48));
 
   // task: the short description (the full card shows it as the task chip)
   const description = String(args.description ?? "");
-  if (description) parts.push(description);
+  if (description) parts.push(shortArg(description, 60));
 
   // memory: the remembered text / subject
   const memText = String(args.text ?? args.subject ?? "");
-  if (memText) parts.push(memText);
+  if (memText) parts.push(shortArg(memText, 48));
 
   // fetch_url: the URL
   const url = String(args.url ?? "");
-  if (url) parts.push(url);
+  if (url) parts.push(shortArg(url, 60));
 
   // web_search: engine badge
   const engine = String(args.engine ?? "");
   if (engine) parts.push(engine);
 
-  // explore fan-out: parallel read args (filePaths / paths / ranges).
+  // sub-agent fan-out: parallel read args (filePaths / paths / ranges).
   // Prefer ranges (already "file:offset:limit") over raw filePaths to
   // avoid the duplicated "filePaths:a,b ranges:a:1:200,b:350:70" line.
   const rangesRaw = (args as Record<string, unknown>).ranges;
@@ -1256,6 +1286,25 @@ export const ToolSubRow = memo(function ToolSubRow({
   );
 });
 
+/** Minimum output length (chars) for a tool row to open its full output as a
+ *  text tab in the side panel instead of expanding inline — long outputs read
+ *  like diff/plan on the right; short ones stay a quick inline peek. */
+const TRACE_TEXT_PANEL_MIN = 600;
+
+/** Plain-text dump of a tool row's output (summary/args/diff/terminal) — the
+ *  body the side panel opens for long rows. */
+function traceRowOutputText(activity: ToolActivity, argsText: string): string {
+  const parts: string[] = [];
+  if (activity.summary) parts.push(`Summary\n${fixZwsp(activity.summary)}`);
+  if (argsText) parts.push(`Args\n${argsText}`);
+  if (activity.diff) parts.push(`Diff\n${activity.diff}`);
+  if (activity.tool === "run_terminal") {
+    const out = terminalOutputText(activity.items ?? activity.results);
+    if (out) parts.push(`Output\n${out}`);
+  }
+  return parts.join("\n\n");
+}
+
 /** One row in a Claude-style trace group: a single quiet line per call with
  *  a tool icon, a short description (the model's arg summary or activity
  *  summary), and a right-side chevron `›` so the row reads as a list item you
@@ -1297,6 +1346,17 @@ const TraceRow = memo(function TraceRow({
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
+  // Long outputs open as a text tab in the side panel (like diff/plan);
+  // short ones keep the quick inline expand.
+  const outputText = traceRowOutputText(activity, argsText);
+  const sideTitle = `${label} — ${detail.slice(0, 40)}`;
+  const onHeadClick = () => {
+    if (!isEdit && outputText.length > TRACE_TEXT_PANEL_MIN) {
+      useViewerTabs.getState().openText(sideTitle, outputText);
+      return;
+    }
+    setExpanded((e) => !e);
+  };
 
   return (
     <div
@@ -1304,7 +1364,7 @@ const TraceRow = memo(function TraceRow({
     >
       <button
         className="trace-row-head"
-        onClick={() => setExpanded((e) => !e)}
+        onClick={onHeadClick}
       >
         <span className="trace-row-bullet" aria-hidden="true">
           {running ? <span className="spinner" /> : "•"}
@@ -1575,6 +1635,21 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
   const openReview = useViewerTabs((s) => s.openReview);
+  // Long outputs open as a text tab in the side panel (like diff/plan);
+  // short ones keep the quick inline expand.
+  const outputText = traceRowOutputText(activity, argsText);
+  const sideTitle = `${label} — ${detail.slice(0, 40)}`;
+  const onHeadClick = () => {
+    if (isEdit) {
+      if (messageId) openReview(messageId, reviewPathOf(activity));
+      return;
+    }
+    if (outputText.length > TRACE_TEXT_PANEL_MIN) {
+      useViewerTabs.getState().openText(sideTitle, outputText);
+      return;
+    }
+    setExpanded((e) => !e);
+  };
 
   /** Compute +/- stats from diff — از مقدار ذخیره‌شده روی event در Chat.tsx
    *  استفاده می‌کند وگرنه خودش از روی متن حساب می‌کند. */
@@ -1592,11 +1667,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
         className="trace-row-head"
         /* کارت ویرایش دیف را در چت باز نمی‌کند — کلیک، ترن را در پنل Review
            سمت راست نشان می‌دهد (سبک کدکس). بقیهٔ ردیف‌ها مثل قبل باز/بسته. */
-        onClick={
-          isEdit
-            ? () => messageId && openReview(messageId, reviewPathOf(activity))
-            : () => setExpanded((e) => !e)
-        }
+        onClick={onHeadClick}
         title={isEdit ? "Review changes in the side panel" : undefined}
       >
         <StatusIcon status={activity.status} />
@@ -1699,6 +1770,34 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   );
 });
 
+/** Clickable file path in the tool-card head: opens the file in the side
+ *  panel without toggling the card itself (stopPropagation on click/key). */
+function ToolPathSpan({ path }: { path: string }) {
+  const open = (e: { stopPropagation: () => void; preventDefault?: () => void }) => {
+    e.stopPropagation();
+    openWorkspaceFile(path);
+  };
+  return (
+    <span
+      className="tool-path tool-path-open"
+      dir="ltr"
+      role="button"
+      tabIndex={0}
+      title={`${path} — open in the side panel`}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open(e);
+        }
+      }}
+    >
+      <FileIcon path={path} size={18} />
+      {path}
+    </span>
+  );
+}
+
 export const ToolCallView = memo(function ToolCallView({
   activity,
   chatId,
@@ -1719,10 +1818,10 @@ export const ToolCallView = memo(function ToolCallView({
   const root = useStore((s) => s.root);
   // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
   const activeChatId = useStore((s) => s.activeChatId);
-  // Task cards (explore/general sub-agents) are collapsible and start
+  // Task cards (background sub-agents) are collapsible and start
   // collapsed: the nested read/grep/glob sub-list is noisy, so it stays
   // hidden until clicked.
-  const [collapsed, setCollapsed] = useState(isExploreCard(activity));
+  const [collapsed, setCollapsed] = useState(isSubagentCard(activity));
   const collapsible =
     activity.tool === "task" &&
     ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary));
@@ -1783,7 +1882,7 @@ export const ToolCallView = memo(function ToolCallView({
 
   return (
     <div
-      className={`tool-card ${activity.status}${isExploreCard(activity) ? " explore" : ""}`}
+      className={`tool-card ${activity.status}${isSubagentCard(activity) ? " explore" : ""}`}
     >
       <div
         className={`tool-card-head${collapsible ? " collapsible" : ""}${isWrite ? " write-head" : ""}`}
@@ -1815,11 +1914,23 @@ export const ToolCallView = memo(function ToolCallView({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-name">
-          {isWrite
-            ? `${activity.tool === "write_file" ? "Wrote" : "Edited"} ${writePath.split("/").pop() ?? writePath}`
-            : isExploreCard(activity)
-              ? "explore"
-              : (TOOL_LABEL[activity.tool] ?? activity.tool)}
+          {isWrite ? (
+            <>
+              <span className="tool-verb">
+                {activity.tool === "write_file" ? "Wrote" : "Edited"}
+              </span>
+              <span className="tool-file" title={writePath}>
+                <FileIcon path={writePath} size={18} />
+                <span className="tool-file-name" dir="ltr">
+                  {writePath.split("/").pop() ?? writePath}
+                </span>
+              </span>
+            </>
+          ) : isSubagentCard(activity) ? (
+            "sub-agent"
+          ) : (
+            (TOOL_LABEL[activity.tool] ?? activity.tool)
+          )}
         </span>
         {activity.tool === "task" && !!activity.args?.subagent_type && (
           <span className="tool-badge">
@@ -1835,12 +1946,10 @@ export const ToolCallView = memo(function ToolCallView({
           <span className="tool-cmd">{String(activity.args.command)}</span>
         )}
         {activity.args && activity.args.path !== undefined && !isWrite && (
-          <span className="tool-path">{String(activity.args.path)}</span>
+          <ToolPathSpan path={String(activity.args.path)} />
         )}
         {activity.args && activity.args.filePath !== undefined && (
-          <span className="tool-path" title={String(activity.args.filePath)}>
-            {String(activity.args.filePath)}
-          </span>
+          <ToolPathSpan path={String(activity.args.filePath)} />
         )}
         {activity.args &&
           activity.args.filePath !== undefined &&
@@ -1892,9 +2001,7 @@ export const ToolCallView = memo(function ToolCallView({
         {readPaths.length > 0 && (
           <>
             {readPaths.slice(0, 2).map((p, i) => (
-              <span key={i} className="tool-path" title={p}>
-                {p}
-              </span>
+              <ToolPathSpan key={i} path={p} />
             ))}
             {readPaths.length > 2 && (
               <span className="tool-path tool-more">

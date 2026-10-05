@@ -4,6 +4,9 @@ These cover the deterministic parts of the agent — keyword extraction, the
 picked-skills injection, and the sub-agent model resolver. They run in
 milliseconds and are the fastest feedback loop in the suite.
 """
+import json
+from types import SimpleNamespace
+
 import agents
 import graph
 from agents import (
@@ -243,3 +246,36 @@ def test_is_test_task_still_detects_test_prompts():
     assert _is_test_task("تست بنویس")
     assert _is_test_task("add unit tests for the parser")
     assert not _is_test_task("fix the login bug")
+
+
+# ---------------------------------------------------------------------------
+# ctx_parts_event / mcp_schema_chars (real per-turn sizes for the popover)
+# ---------------------------------------------------------------------------
+
+
+def test_ctx_parts_event_splits_skills_out_of_system_prompt():
+    """Skills section is reported separately; systemChars excludes it."""
+    section = "=== SKILLS ===\n- Alpha: desc"
+    event = graph.ctx_parts_event("coder", "PROMPT-BODY" + section, section, [])
+    assert event["kind"] == "ctx_parts"
+    assert event["mode"] == "coder"
+    assert event["systemChars"] == len("PROMPT-BODY")
+    assert event["skillsChars"] == len(section)
+    assert event["mcpChars"] == 0
+
+
+def test_mcp_schema_chars_counts_name_description_and_schema():
+    """Bound MCP tools count as name + description + args JSON schema."""
+    tool = SimpleNamespace(
+        name="browser_navigate",
+        description="Open a URL",
+        args={"url": {"type": "string", "description": "absolute URL"}},
+    )
+    filler = SimpleNamespace(name="", description="", args=None)
+    expected = (
+        len("browser_navigate")
+        + len("Open a URL")
+        + len(json.dumps(tool.args, ensure_ascii=False, default=str))
+        + len(json.dumps({}, ensure_ascii=False))  # filler: empty args schema
+    )
+    assert graph.mcp_schema_chars([tool, filler]) == expected

@@ -264,36 +264,6 @@ console.log("۱۷) پنل راست هرگز خودکار باز نمی‌شود:
   check("Chat.tsx پنل را خودکار باز نمی‌کند", !chatSrc.includes("setRightPanelOpen(true)"))
 }
 
-console.log("۱۹) سکشن Laya — برچسب مسیر، لحن کارت و درصد اطمینان:")
-{
-  const { layaRouteLabel, layaCardTone, layaConfidencePct } = await import("../src/components/LayaLabels")
-  check("مسیر computer فارسی می‌شود", layaRouteLabel("computer") === "کامپیوتر")
-  check("مسیر browser فارسی می‌شود", layaRouteLabel("browser") === "مرورگر")
-  check("مسیر normal فارسی می‌شود", layaRouteLabel("normal") === "معمولی")
-  check("لوکال موفق لحن local می‌گیرد", layaCardTone({ route: "browser", confidence: 0.9, abstained: false, reason: "", handled: true, providerId: "local", model: "m", elapsedMs: 120, at: 1 } as any) === "local")
-  check("خارجی موفق لحن external می‌گیرد", layaCardTone({ route: "browser", confidence: 0.9, abstained: false, reason: "", handled: true, providerId: "openrouter", model: "m", elapsedMs: 120, at: 1 } as any) === "external")
-  check("واگذاری لحن fallback می‌گیرد", layaCardTone({ route: "normal", confidence: 0.1, abstained: true, reason: "", handled: false, providerId: "local", model: "m", elapsedMs: 5, at: 1 } as any) === "fallback")
-  check("اطمینان ۰٫۹ می‌شود ۹۰", layaConfidencePct(0.9) === 90)
-  check("اطمینان نامعتبر می‌شود ۰", layaConfidencePct(NaN) === 0)
-  check("اطمینان بالای یک clamp می‌شود", layaConfidencePct(9) === 100)
-}
-
-console.log("۲۰) تاریخچه laya — per-chat با سقف ~۲۰ تا:")
-{
-  const { useStore, appendLayaRun } = await import("../src/lib/store")
-  const chatId = useStore.getState().newChat("ask")
-  const mk = (i: number) => ({ route: "browser", confidence: 0.8, abstained: false, reason: "r", handled: true, providerId: "local", model: "m", elapsedMs: 10 + i })
-  for (let i = 0; i < 25; i++) useStore.getState().appendLayaRun(chatId, mk(i))
-  const runs = useStore.getState().chats.find((c) => c.id === chatId)?.layaRuns ?? []
-  check("سقف تاریخچه ۲۰ تاست", runs.length === 20, runs.length)
-  check("تازه‌ترین آخر می‌ماند", runs[runs.length - 1].elapsedMs === 34, runs[runs.length - 1])
-  const otherId = useStore.getState().newChat("ask")
-  const otherRuns = useStore.getState().chats.find((c) => c.id === otherId)?.layaRuns ?? []
-  check("تاریخچه چت دیگر قاطی نمی‌شود", otherRuns.length === 0)
-  const capped = appendLayaRun(undefined, mk(0))
-  check("append خالص روی undefined کار می‌کند", capped.length === 1 && capped[0].route === "browser")
-}
-
 console.log("۱۸) چت جدید — پنل راست دیفالت بسته است:")
 {
   const { useStore } = await import("../src/lib/store")
@@ -309,9 +279,9 @@ console.log("۲۱) پنل Trace — عنوان ردیف و فیلتر جست‌�
 {
   const { traceRowTitle, filterTraces } = await import("../src/components/TracePanel")
   check("summary خالی llm از مدل+توکن ساخته می‌شود", traceRowTitle({ id: "a", at: 1, kind: "llm", summary: "", model: "m", tokens: { total: 42 } } as any) === "m · 42 tokens")
-  check("summary موجود دست نمی‌خورد", traceRowTitle({ id: "b", at: 1, kind: "laya", summary: "normal · 90٪" } as any) === "normal · 90٪")
+  check("summary موجود دست نمی‌خورد", traceRowTitle({ id: "b", at: 1, kind: "llm", summary: "normal · 90٪" } as any) === "normal · 90٪")
   const rows = [
-    { id: "1", at: 1, kind: "laya", summary: "browser · 90٪", prompt: "open site" },
+    { id: "1", at: 1, kind: "llm", summary: "browser · 90٪", prompt: "open site" },
     { id: "2", at: 2, kind: "llm", summary: "m · 10 tokens", model: "gpt" },
     { id: "3", at: 3, kind: "tool", summary: "read", prompt: '{"path": "secret-file"}', result: "file-ok" },
   ] as any
@@ -320,6 +290,86 @@ console.log("۲۱) پنل Trace — عنوان ردیف و فیلتر جست‌�
   check("جست‌وجو داخل نتیجه ابزار را پیدا می‌کند", filterTraces(rows, "file-ok").length === 1)
   check("جست‌وجوی خالی همه را برمی‌گرداند", filterTraces(rows, "").length === 3)
   check("عنوان ابزار از نام ابزار ساخته می‌شود", traceRowTitle({ id: "t", at: 1, kind: "tool", summary: "", detail: { name: "read" } } as any) === "read")
+}
+
+console.log("۲۲) ساب‌ایجنت‌ها — توابع خالص پنل و کارت تسک بعد از rename:")
+{
+  const { subagentAge, subagentStatusLabel } = await import("../src/components/TodosPanel")
+  const now = 1700000000
+  check("عمر ۵۹ ثانیه → 0:59", subagentAge(now - 59, now) === "0:59", subagentAge(now - 59, now))
+  check("عمر ۱۲۵ ثانیه → 2:05", subagentAge(now - 125, now) === "2:05", subagentAge(now - 125, now))
+  check("created_at در آینده → 0:00", subagentAge(now + 30, now) === "0:00")
+  check("running برچسب running", subagentStatusLabel("running") === "running")
+  check("completed برچسب done", subagentStatusLabel("completed") === "done")
+  check("failed برچسب failed", subagentStatusLabel("failed") === "failed")
+  check("stopped برچسب stopped", subagentStatusLabel("stopped") === "stopped")
+  check("وضعیت ناشناخته خودش برمی‌گردد", subagentStatusLabel("weird") === "weird")
+
+  // rename explore → subagent: کارت‌های تسک با هر دو نام باید کارت ساب‌ایجنت
+  // بمانند (کارتِ با نام جدید قبلاً به کارت عمومی می‌افتاد — باگ).
+  const { isSubagentCard } = await import("../src/components/ToolCallView")
+  check("نوع جدید subagent کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "subagent" } } as any))
+  check("نوع legacy explore هم کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "explore" } } as any))
+  check("general کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "task", args: { subagent_type: "general" } } as any))
+  check("ابزار غیر task کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "grep", args: { subagent_type: "subagent" } } as any))
+}
+
+console.log("۲۳) دکمهٔ نمایش پلن در هدر Todos:")
+{
+  // NOTE: zustand v4 freezes the SSR server snapshot at store-creation time
+  // (see sidebar test header), so seeded state cannot drive renderToString —
+  // the button's wiring is locked in source instead, matching the
+  // schedule-inbox tests' pattern.
+  const { readFileSync } = await import("node:fs")
+  const src = readFileSync("src/components/TodosPanel.tsx", "utf8")
+  check("دکمه در هدر Todos هست", src.includes('className="sidebar-panel-plan-btn"'))
+  check("برچسب دکمه پلن ذخیره‌شده است", src.includes('aria-label="View saved plan"'))
+  check("دکمه با openPlan(چت فعال) وصل است", src.includes("openPlan(activeChatId)"))
+  // The head is itself a role="button" toggle (click + Enter/Space): the
+  // inner button must stop the event so opening the plan never collapses
+  // the section.
+  check("کلیک/کیبورد head را قطع می‌کند", src.includes("e.stopPropagation()"))
+  // Placement: between the title and the count, so the counter stays right.
+  const titleIdx = src.indexOf('className="sidebar-panel-title">Todos')
+  const btnIdx = src.indexOf('className="sidebar-panel-plan-btn"', titleIdx)
+  const countIdx = src.indexOf('className="sidebar-panel-count"', titleIdx)
+  check(
+    "جای دکمه: بعد از عنوان و قبل از شمارنده",
+    titleIdx !== -1 && btnIdx > titleIdx && countIdx > btnIdx,
+    { titleIdx, btnIdx, countIdx },
+  )
+
+  // Same-source guarantee: the todos the section lists and the plan the
+  // button opens must both come from the same newest message — otherwise the
+  // button would open a plan that does not match the visible checklist.
+  const { useStore } = await import("../src/lib/store")
+  const { latestPlanDoc } = await import("../src/lib/planDoc")
+  const chatId = useStore.getState().newChat("plan")
+  useStore.getState().addMessage(chatId, {
+    role: "assistant",
+    content: "## Plan\n1. A",
+    plan: [{ content: "A", status: "pending" }],
+    planDoc: { title: "", body: "## Plan\n1. A" },
+  } as any)
+  useStore.getState().addMessage(chatId, {
+    role: "assistant",
+    content: "trailing prose without plan",
+  } as any)
+  const live = useStore.getState()
+  const msgs = live.chats.find((c) => c.id === chatId)?.messages ?? []
+  let seeded: any = null
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].plan && msgs[i].plan.length) {
+      seeded = msgs[i]
+      break
+    }
+  }
+  const planDoc = latestPlanDoc(live.chats, chatId)
+  check(
+    "تودوز و دکمهٔ پلن از یک پیام می‌خوانند",
+    !!seeded?.planDoc && seeded.planDoc.body === planDoc?.body,
+    { hasDoc: !!seeded?.planDoc, body: planDoc?.body },
+  )
 }
 
 if (failed > 0) {

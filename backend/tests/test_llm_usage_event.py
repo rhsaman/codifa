@@ -80,3 +80,30 @@ def test_usage_event_surfaces_cache_and_reasoning():
     assert ev is not None
     assert ev["cache_read_tokens"] == 300
     assert ev["reasoning_tokens"] == 25
+
+
+def test_usage_event_ignores_total_below_input_plus_output():
+    """Router bug: total_tokens excludes the cached subset of the prompt
+    (286.6K in, 40.7K cached -> 245.9K total). The context meter must never
+    report less context than the input actually sent, so hand-sum instead."""
+    meta = {
+        "input_tokens": 286600,
+        "output_tokens": 6700,
+        "total_tokens": 245900,
+        "input_token_details": {"cached_tokens": 40700},
+    }
+    ev = usage_event(meta, model="router/muse")
+    assert ev is not None
+    assert ev["total_tokens"] == 293300
+
+
+def test_usage_event_trusts_total_covering_input_and_output():
+    """A provider-consistent total (covers input + output) stays trusted."""
+    meta = {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "total_tokens": 1250,
+    }
+    ev = usage_event(meta, model="m")
+    assert ev is not None
+    assert ev["total_tokens"] == 1250

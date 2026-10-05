@@ -12,13 +12,7 @@ import { useViewerTabs } from "../lib/viewerTabs";
 import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { gitDiff, gitLog, gitShow, gitStatus, type GitCommitInfo } from "../lib/api";
 import { DiffView } from "./ToolCallView";
-
-/** پسوند فایل برای بج کدکس (`css`, `tsx`, …) — فایل بدون پسوند «file». */
-function extLabel(path: string): string {
-  const base = path.split("/").pop() ?? path;
-  const i = base.lastIndexOf(".");
-  return i > 0 ? base.slice(i + 1).toLowerCase() : "file";
-}
+import { FileIcon } from "./FileIcon";
 
 /** فایل تغییرکرده با دیف و آمار — برای لیست پنل. */
 export interface ReviewFileItem {
@@ -67,7 +61,9 @@ export function ReviewFileAccordion({
               aria-expanded={isOpen}
               onClick={() => onSelect(isOpen ? "" : f.path)}
             >
-              <span className="review-file-ext">{extLabel(f.path)}</span>
+              <span className="review-file-ext">
+                <FileIcon path={f.path} size={18} />
+              </span>
               <span className="review-file-path">{f.path}</span>
               <span className="review-file-counts">
                 <span className="review-count-add">+{f.adds}</span>

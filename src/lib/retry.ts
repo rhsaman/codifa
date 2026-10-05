@@ -2,6 +2,32 @@ import type { ChatMessage, MessageSegment } from '../types'
 
 export type RetrySource = 'message' | 'banner'
 
+/**
+ * Resolve the OWNING user message for a restart-from-scratch retry.
+ *
+ * - `id` on a user message → that message itself (empty content → null).
+ * - `id` on a non-user message → the nearest preceding user message.
+ * - unknown `id` or empty content → null (caller must do nothing).
+ *
+ * The caller must truncate to the RETURNED user message's id (never to the
+ * raw `id`): truncating to an assistant `id` keeps the user prompt above,
+ * and the follow-up send() would then append a second identical user bubble.
+ */
+export function resolveRestartUser(
+  messages: ChatMessage[],
+  id: string,
+): ChatMessage | null {
+  const msg = messages.find((m) => m.id === id)
+  if (!msg) return null
+  if (msg.role === 'user') return msg.content.trim() ? msg : null
+  const idx = messages.findIndex((m) => m.id === id)
+  const prev = [...messages.slice(0, idx)]
+    .reverse()
+    .find((m) => m.role === 'user')
+  if (!prev || !prev.content.trim()) return null
+  return prev
+}
+
 export interface RetryTarget {
   userMsgId: string
   /** Assistant bubble to continue streaming into on resume. Undefined on restart (fresh bubble). */

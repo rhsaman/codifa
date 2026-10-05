@@ -1,13 +1,13 @@
 """Unit test: the parent search cache is shared between the main agent and the
-explore sub-agent (and across parallel explore agents).
+background sub-agent (and across parallel sub-agents).
 
 ``_parent_search_cache`` lives at module scope in ``tools.py`` (not in a
 closure), so every tool callback built from that module -- the main agent's
 and every sub-agent's -- reads and writes the SAME dict. That means:
 
 - A grep/glob the main agent already ran is returned from cache when the
-  explore sub-agent issues the identical search (no second disk scan).
-- Two parallel explore agents issuing the same search share the cache too.
+  background sub-agent issues the identical search (no second disk scan).
+- Two parallel sub-agents issuing the same search share the cache too.
 
 This is the mechanism that keeps tool-call counts down (fewer redundant
 grep/glob calls) without any quality loss -- the cached result is byte-for-byte
@@ -74,12 +74,12 @@ async def test_search_cache_shared_main_then_explore():
         )
         await _run_grep_via(main_cbs, pattern="def make_tool_callbacks")
 
-        # Explore sub-agent issues the IDENTICAL grep.
-        explore_cbs = make_tool_callbacks(
+        # Background sub-agent issues the IDENTICAL grep.
+        subagent_cbs = make_tool_callbacks(
             root=os.getcwd(), emit=lambda ev: None, context_window=0,
             main_model=_RecordingModel(),
         )
-        await _run_grep_via(explore_cbs, pattern="def make_tool_callbacks")
+        await _run_grep_via(subagent_cbs, pattern="def make_tool_callbacks")
 
         # The disk scan must have run exactly ONCE -- the second call hit the
         # shared module-level cache.
@@ -89,7 +89,7 @@ async def test_search_cache_shared_main_then_explore():
         _tools._parent_search_cache.clear()
 
 
-async def test_search_cache_shared_across_sequential_explore():
+async def test_search_cache_shared_across_sequential_subagents():
     real_scans = {"n": 0}
     _orig_search = _tools.search_in_files
 
@@ -100,7 +100,7 @@ async def test_search_cache_shared_across_sequential_explore():
     _tools.search_in_files = _counting_search
     _tools._parent_search_cache.clear()
     try:
-        # Two explore agents built independently, run sequentially, same search.
+        # Two sub-agents built independently, run sequentially, same search.
         a = make_tool_callbacks(root=os.getcwd(), emit=lambda ev: None, context_window=0, main_model=_RecordingModel())
         b = make_tool_callbacks(root=os.getcwd(), emit=lambda ev: None, context_window=0, main_model=_RecordingModel())
 
@@ -116,8 +116,8 @@ async def test_search_cache_shared_across_sequential_explore():
 
 def main():
     asyncio.run(test_search_cache_shared_main_then_explore())
-    asyncio.run(test_search_cache_shared_across_sequential_explore())
-    print("OK: parent search cache is shared across main agent and explore sub-agents")
+    asyncio.run(test_search_cache_shared_across_sequential_subagents())
+    print("OK: parent search cache is shared across main agent and sub-agents")
 
 
 if __name__ == "__main__":

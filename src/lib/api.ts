@@ -915,6 +915,86 @@ export async function cancelSteer(chatId: string, id: string): Promise<void> {
   }
 }
 
+/** One live-activity entry of a sub-agent job (rendered like a tool call). */
+export interface SubagentEvent {
+  text: string
+  tool: string
+  kind: 'tool' | 'tool_result' | 'status' | string
+}
+
+/** One background sub-agent job (per-chat), as returned by the sidecar. */
+export interface SubagentJob {
+  task_id: string
+  branch: number
+  description: string
+  subagent_type: string
+  status: 'running' | 'completed' | 'failed' | 'stopped' | string
+  created_at: number
+  steering: boolean
+  stop_requested: boolean
+  report: string
+  /** Bounded live activity trail (tool-call-like rows, oldest first). */
+  events: SubagentEvent[]
+}
+
+/** List this chat's background sub-agent jobs (running + finished), newest first. */
+export async function listSubagents(chatId: string): Promise<SubagentJob[]> {
+  const url = await ensureSidecar()
+  if (!url || !chatId) return []
+  try {
+    const res = await fetch(
+      `${url}/chats/${encodeURIComponent(chatId)}/subagents`,
+    )
+    if (!res.ok) return []
+    const body = (await res.json().catch(() => ({}))) as {
+      jobs?: SubagentJob[]
+    }
+    return Array.isArray(body.jobs) ? body.jobs : []
+  } catch {
+    return []
+  }
+}
+
+/** Stop one background sub-agent of a chat. */
+export async function stopSubagent(
+  chatId: string,
+  taskId: string,
+): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(
+      `${url}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(taskId)}/stop`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    )
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Send a follow-up message to one running background sub-agent. */
+export async function steerSubagent(
+  chatId: string,
+  taskId: string,
+  message: string,
+): Promise<boolean> {
+  const url = await ensureSidecar()
+  if (!url) return false
+  try {
+    const res = await fetch(
+      `${url}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(taskId)}/steer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      },
+    )
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 /** Answer a pending outside-workspace permission / confirm_action request from the agent. */
 export async function respondPermission(
   id: string,
@@ -948,9 +1028,9 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
   }
 }
 
-// ---- Managed on-device models (whisper / embedding / laya) ------------ //
+// ---- Managed on-device models (whisper / embedding) ------------ //
 
-export type ManagedModelKind = "whisper" | "embedding" | "laya"
+export type ManagedModelKind = "whisper" | "embedding"
 
 export interface ModelDirInfo {
   repo: string
@@ -981,7 +1061,6 @@ export interface ModelKindStatus {
 export interface ModelsStatus {
   whisper: ModelKindStatus
   embedding: ModelKindStatus
-  laya?: ModelKindStatus
 }
 
 /** Kick off a background model download (Settings → Models). */
@@ -1002,43 +1081,13 @@ export async function downloadModel(
 /** Poll the current download state + on-disk model dirs. */
 export async function getModelsStatus(): Promise<ModelsStatus> {
   const url = await ensureSidecar()
-  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] }, laya: { dirs: [] } }
+  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
   const res = await fetch(`${url}/models/status`)
-  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] }, laya: { dirs: [] } }
+  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
   const data = (await res.json()) as ModelsStatus
   return {
     whisper: data.whisper ?? { dirs: [] },
     embedding: data.embedding ?? { dirs: [] },
-    laya: data.laya ?? { dirs: [] },
-  }
-}
-
-/** وضعیت تصمیم‌گیر محلی laya (نصب/آماده/ریپو/پروایدر + دلیل دقیق + وزن + پروگرس) برای Settings → Models. */
-export interface LayaStatus {
-  available: boolean
-  ready: boolean
-  repo: string
-  provider?: string
-  /** دلیل دقیق آماده‌نبودن: laya-not-installed | laya-weights-missing | laya-error… */
-  reason?: string
-  /** پوشه وزن محلی + حجم بایت. */
-  weight_dir?: string
-  size?: number
-  /** پروگرس دانلود در حال اجرا (همان شکل ModelRunState). */
-  running?: ModelRunState
-}
-
-/** خواندن وضعیت laya از سایدکار؛ در صورت قطعی، پیش‌فرض خاموش برمی‌گردد. */
-export async function getLayaStatus(): Promise<LayaStatus> {
-  const url = await ensureSidecar()
-  const empty: LayaStatus = { available: false, ready: false, repo: '' }
-  if (!url) return empty
-  try {
-    const res = await fetch(`${url}/models/laya-status`)
-    if (!res.ok) return empty
-    return { ...empty, ...((await res.json()) as Partial<LayaStatus>) }
-  } catch {
-    return empty
   }
 }
 
@@ -1146,6 +1195,27 @@ export async function listSkills(): Promise<SkillRow[]> {
   }
 }
 
+/** Legacy backend mode keys -> canonical ids, mirroring the backend's
+ *  MODE_ALIASES and store's migrateModePrompts: older servers answer
+ *  /system-prompts with only {"chat", "codewriter"}. Canonical keys win when
+ *  both spellings are present; the legacy key is dropped. */
+const LEGACY_PROMPT_KEYS: Record<string, string> = {
+  chat: 'ask',
+  codewriter: 'coder',
+}
+
+export function normalizeSystemPromptKeys(
+  prompts: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...prompts }
+  for (const [legacy, canonical] of Object.entries(LEGACY_PROMPT_KEYS)) {
+    const value = out[legacy]
+    delete out[legacy]
+    if (value !== undefined && out[canonical] === undefined) out[canonical] = value
+  }
+  return out
+}
+
 /** Fetch the backend's built-in system prompt for each chat mode so the
  *  context popover can show what is actually sent (the user's per-mode
  *  override, when set, takes precedence upstream). */
@@ -1155,7 +1225,7 @@ export async function fetchSystemPrompts(): Promise<Record<string, string>> {
   try {
     const res = await fetch(`${url}/system-prompts`)
     if (!res.ok) return {}
-    return (await res.json()) as Record<string, string>
+    return normalizeSystemPromptKeys((await res.json()) as Record<string, string>)
   } catch (err) {
     console.error("[prompts] fetchSystemPrompts: fetch failed", err)
     return {}
@@ -1707,15 +1777,19 @@ export async function deleteScheduleRun(
   }
 }
 
-/** لاگ‌های چت جاری برای پنل Trace (لایا / LLM / پرامپت) با فیلتر اختیاری نوع. */
+/** لاگ‌های چت جاری برای پنل Trace (لایا / LLM / پرامپت) با فیلتر اختیاری نوع و ساب‌ایجنت. */
 export async function getChatTraces(
   chatId: string,
   kind?: TraceKind,
+  taskId?: string,
 ): Promise<TraceEntry[] | { error: string }> {
   if (!chatId) return []
-  const q = kind ? `?kind=${encodeURIComponent(kind)}` : ''
+  const params = new URLSearchParams()
+  if (kind) params.set('kind', kind)
+  if (taskId) params.set('task_id', taskId)
+  const qs = params.toString()
   const out = await sidecarGet<{ traces: TraceEntry[] }>(
-    `/chats/${encodeURIComponent(chatId)}/traces${q}`,
+    `/chats/${encodeURIComponent(chatId)}/traces${qs ? `?${qs}` : ''}`,
   )
   if ('error' in out) return out
   return out.traces ?? []

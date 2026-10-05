@@ -143,10 +143,9 @@ async def test_agent_emits_usage_event_with_true_counts(run_events, mock_server)
     mock.script = [text_reply("تمام شد.")]
     events = await run_events("سلام", mode="ask")
 
-    usage = [e for e in events if e.get("kind") == "usage" and not e.get("laya")]
+    usage = [e for e in events if e.get("kind") == "usage"]
     assert usage, f"no usage event emitted; kinds={[e.get('kind') for e in events]}"
-    # Exactly one NON-laya model call for a single-turn reply (laya emits
-    # its own zero-token observability usage event separately).
+    # Exactly one model call for a single-turn reply.
     assert len(usage) == 1, f"expected 1 usage event, got {len(usage)}"
     ev = usage[0]
     # Recompute the true counts the mock derived from the actual request it
@@ -279,6 +278,47 @@ def test_plan_output_contract_requires_summary():
         "plan contract must require the summary in the plan's own language"
 
 
+def test_coder_output_contract_executes_plan_not_replans():
+    """Coder mode must EXECUTE an existing plan instead of emitting a new
+    '## Plan' document, revise it only on explicit request, and plan-then-
+    execute only when none exists — the 'coder wrote a plan instead of
+    implementing' bug."""
+    from agents import _MODE_OUTPUT, _mode_declare
+
+    contract = _MODE_OUTPUT["coder"]
+    assert contract, "coder must declare an output contract"
+    low = contract.lower()
+    assert "## plan" in low, "contract must name the plan document form"
+    assert "implement" in low or "execute" in low, "contract must demand doing the work"
+    assert "only when the user" in low, "revision must be gated on an explicit ask"
+    assert "no plan" in low, "contract must cover the plan-less case"
+    # The contract ships inside the per-turn mode declaration.
+    assert contract in _mode_declare("coder")
+
+
+def test_followup_edits_plan_and_never_restarts_it():
+    """A follow-up request ('do X too') must EDIT the existing plan in BOTH plan
+    and coder mode — keep the old items, add the new one — and a fresh plan may
+    replace it ONLY on an explicit 'discard the old plan' instruction (the
+    'follow-up wiped the previous plan' bug)."""
+    from agents import _MODE_OUTPUT, _mode_declare
+
+    for mode in ("plan", "coder"):
+        contract = _MODE_OUTPUT[mode]
+        low = contract.lower()
+        assert "only when the user explicitly" in low, (
+            f"{mode}: replacing the plan must be gated on an explicit user instruction"
+        )
+        assert "discard" in low, (
+            f"{mode}: contract must spell out the explicit discard-the-old-plan gate"
+        )
+        assert contract in _mode_declare(mode), (
+            f"{mode}: contract must ship in the per-turn mode declaration"
+        )
+    assert "keep every existing item" in _MODE_OUTPUT["coder"].lower()
+    assert "keep every still-valid item" in _MODE_OUTPUT["plan"].lower()
+
+
 async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace):
     """The Coder must be told the exact frontend test command (e.g.
     `npm run test:frontend`) for a JS/TS workspace so it runs the tests itself —
@@ -314,3 +354,17 @@ async def test_agent_runs_flutter_test_gate(run_events, mock_server, workspace):
         "coder must be instructed to run flutter test; "
         f"messages did not contain it: {joined[:500]}"
     )
+
+
+def test_plan_prompt_mandates_web_research_on_explicit_request():
+    """When the user explicitly asks to research the web, plan mode must treat
+    web_search as MANDATORY before writing ## Plan — the model was scouting
+    the codebase only and skipping web research entirely."""
+    plan = agents.SYSTEM_PROMPTS["plan"]
+    assert "EXPLICITLY asks to research the web" in plan, (
+        "plan prompt must gate web research on the user's explicit request"
+    )
+    assert "BEFORE writing ## Plan" in plan, (
+        "web research must happen before the plan is written"
+    )
+    assert "web_search" in plan, "plan prompt must name the web_search tool"

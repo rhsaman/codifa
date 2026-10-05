@@ -74,45 +74,34 @@ def test_computer_filtered_without_grant_or_intent():
 
 
 def test_computer_kept_with_allow_computer():
+    """The toggle ON keeps the tool bound regardless of prompt content."""
     tools = {"computer": lambda: None, "read": lambda: None}
     out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False, prompt="fix the bug", allow_computer=True,
+        "coder", dict(tools), {}, set(), True, False,
+        prompt="fix the database table", allow_computer=True,
     )
     assert "computer" in out
 
 
-def test_computer_kept_with_desktop_intent():
+def test_computer_hard_toggle_prompt_intent_does_not_bind():
+    """Computer use is a hard switch (like a built-in MCP connector): prompt
+    intent alone must NOT bind the tool — only the explicit user toggle
+    (allow_computer) does. When the toggle is off, the agent never sees the
+    tool even for an explicit desktop request."""
     tools = {"computer": lambda: None, "read": lambda: None}
     out = graph.filter_tools_for_mode(
         "coder", dict(tools), {}, set(), True, False, prompt="take a screenshot of the desktop app",
     )
-    assert "computer" in out
-
-
-def test_computer_kept_with_chrome_tab_intent():
-    tools = {"computer": lambda: None, "read": lambda: None}
-    out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False,
-        prompt="look at my open chrome tabs and check the tradingview chart",
-    )
-    assert "computer" in out
-
-
-def test_computer_tab_hint_needs_word_boundary():
-    tools = {"computer": lambda: None, "read": lambda: None}
-    out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False, prompt="fix the database table",
-    )
     assert "computer" not in out
 
 
-def test_computer_kept_via_history_intent():
+def test_computer_hard_toggle_history_intent_does_not_bind():
     tools = {"computer": lambda: None, "read": lambda: None}
     history = [{"role": "user", "content": "look at my open chrome tabs"}]
     out = graph.filter_tools_for_mode(
         "coder", dict(tools), {}, set(), True, False, prompt="continue", history=history,
     )
-    assert "computer" in out
+    assert "computer" not in out
 
 
 def test_checkpoint_throttled_and_forced():

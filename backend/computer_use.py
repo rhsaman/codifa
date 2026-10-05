@@ -59,11 +59,6 @@ INTERACTIVE_ROLES = (
 # سقف آیتم‌های targets — کنترل مصرف توکن در اپ‌های شلوغ
 MAX_TARGETS = 60
 
-# پرچم آزمایشی گیت read_screen در برابر see (بعد از تست روی نمونه واقعی بازبینی شود).
-# True یعنی prefer_tree_over_see واقعاً از laya می‌پرسد؛ False یعنی همیشه None
-# (رفتار قبلی: انتخاب کاملاً با مدل، فقط راهنمای متنی). خاموش‌کردن هیچ مسیر دیگری را عوض نمی‌کند.
-LAYA_SEE_GATE_ENABLED = True
-
 # عمق هوشمند درخت: اپ‌های شلوغ (مرورگر/IDE) با عمق کم شروع می‌کنند تا توکن
 # و زمان پیمایش کم شود؛ درخت خالی/کم‌گره با عمق کامل خوانده می‌شود.
 _BUSY_APP_HINTS = (
@@ -611,45 +606,14 @@ def _actionable_targets(
 
 
 def suggest_tree_depth(app_name: str = "", task: str = "", chat_id: str = "", emit: Any = None) -> int:
-    """عمق پیشنهادی درخت با laya: اپ شلوغ → کم‌عمق، بقیه → کامل.
+    """Suggested tree depth: busy app -> shallow, otherwise full.
 
-    خروجی همیشه یک عدد معتبر است (واگذاری امن = DEFAULT_MAX_DEPTH).
-    هرگز استثنا نمی‌دهد تا مسیر اصلی read نشکند.
+    Always returns a valid depth (safe default = DEFAULT_MAX_DEPTH).
+    Never raises so the main read path never breaks.
     """
     try:
         low = (app_name or "").strip().lower()
         if low and any(h in low for h in _BUSY_APP_HINTS):
-            return _SHALLOW_TREE_DEPTH
-        try:
-            import laya_decide
-        except Exception:  # noqa: BLE001 — laya اختیاری است
-            return DEFAULT_MAX_DEPTH
-        try:
-            decision = laya_decide.choice(
-                {
-                    "task": (task or "")[:300],
-                    "app": (app_name or "")[:120],
-                },
-                ["shallow", "full"],
-                threshold=laya_decide.SHALLOW_CONFIDENCE_THRESHOLD,
-                timeout=laya_decide.SECONDARY_PREDICT_TIMEOUT,
-                chat_id=str(chat_id or ""),
-            )
-        except Exception:  # noqa: BLE001
-            return DEFAULT_MAX_DEPTH
-        try:
-            laya_decide.report_secondary(
-                decision,
-                route="computer",
-                sub="suggest_tree_depth",
-                chat_id=chat_id,
-                emit=emit,
-                prompt=str(task or ""),
-                options=["shallow", "full"],
-            )
-        except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
-            pass
-        if getattr(decision, "handled", False) and str(getattr(decision, "value", "")).strip() == "shallow":
             return _SHALLOW_TREE_DEPTH
     except Exception:  # noqa: BLE001
         return DEFAULT_MAX_DEPTH
@@ -657,29 +621,12 @@ def suggest_tree_depth(app_name: str = "", task: str = "", chat_id: str = "", em
 
 
 def rank_actionable_targets(task: str, targets: list[str], top_k: int = 5, chat_id: str = "", emit: Any = None) -> list[str]:
-    """مرتب‌سازی targets خروجی read بر اساس احتمال تطبیق با تسک.
+    """Return read targets in input order (ranking removed).
 
-    ورودی همان خط‌های ``selector -> center`` است؛ خروجی همان خط‌ها به ترتیب
-    رتبه laya است. بدون سیگنال (laya خاموش/خطا) ترتیب ورودی حفظ می‌شود.
-    هرگز استثنا نمی‌دهد.
+    Keeps the same signature so callers need no change. Never raises.
     """
     try:
-        items = [str(t or "") for t in (targets or []) if str(t or "").strip()]
-        if not items or not (task or "").strip():
-            return list(targets or [])
-        try:
-            import laya_decide
-        except Exception:  # noqa: BLE001
-            return list(targets or [])
-        try:
-            ranked = laya_decide.rank_selectors(task, items, top_k=len(items), chat_id=chat_id, emit=emit)
-        except Exception:  # noqa: BLE001
-            return list(targets or [])
-        if not ranked:
-            return list(targets or [])
-        order = [str(r.get("name", "")) for r in ranked if isinstance(r, dict)]
-        pos = {name: i for i, name in enumerate(order)}
-        return sorted(items, key=lambda t: pos.get(t, len(order)))
+        return list(targets or [])
     except Exception:  # noqa: BLE001
         return list(targets or [])
 
@@ -723,55 +670,11 @@ def read_screen(app_name: str = "", max_depth: int = DEFAULT_MAX_DEPTH) -> dict[
 
 
 def prefer_tree_over_see(question: str = "", app_name: str = "", chat_id: str = "", emit: Any = None) -> bool | None:
-    """گیت آزمایشی: آیا درخت Accessibility به‌احتمال زیاد برای این سؤال کافی است؟
+    """Tree-vs-see gate (decision engine removed).
 
-    سؤال دودویی ``choice`` از laya (``prefer_tree`` در برابر ``prefer_see``) با
-    آستانه اطمینان و واگذاری امن. خروجی True یعنی اول read_screen/read_element
-    بزن (مسیر کند see: اسکرین‌شات + مدل بینایی)؛ False یعنی see لازم است؛ None
-    یعنی laya نتوانست تصمیم بگیرد (نصب نیست / وزن نیست / اطمینان پایین / پرچم
-    خاموش) و فراخواننده باید رفتار قبلی (see) را ادامه دهد. هرگز استثنا بیرون
-    نمی‌دهد تا مسیر اصلی ابزار نشکند.
+    Always returns None so the caller continues with its previous behaviour
+    (see). Never raises so the main tool path never breaks.
     """
-    if not LAYA_SEE_GATE_ENABLED:
-        return None
-    try:
-        import laya_decide
-    except Exception:  # noqa: BLE001 — laya اختیاری است
-        return None
-    try:
-        decision = laya_decide.choice(
-            {
-                "question": (question or "")[:500],
-                "app": (app_name or "")[:120],
-            },
-            ["prefer_tree", "prefer_see"],
-            timeout=laya_decide.SECONDARY_PREDICT_TIMEOUT,
-            chat_id=str(chat_id or ""),
-        )
-    except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
-        return None
-    try:
-        laya_decide.report_secondary(
-            decision,
-            route="computer",
-            sub="prefer_tree_over_see",
-            chat_id=chat_id,
-            emit=emit,
-            prompt=str(question or ""),
-            options=["prefer_tree", "prefer_see"],
-        )
-    except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
-        pass
-    try:
-        if not decision.handled:
-            return None
-        value = str(decision.value or "").strip().lower()
-        if value == "prefer_tree":
-            return True
-        if value == "prefer_see":
-            return False
-    except Exception:  # noqa: BLE001
-        return None
     return None
 
 

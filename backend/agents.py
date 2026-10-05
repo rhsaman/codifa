@@ -89,8 +89,8 @@ async def _remove_steer(chat_id: str, steer_id: str) -> None:
 # discovery. Code search/discovery (ls/find/cat/sed/awk/head/tail/wc/grep and
 # git history) is rejected by the inner `_wrap_no_search_bypass` — and we also
 # don't even allowlist it here, so a planner in plan/ask mode physically cannot
-# shell out to `ls`/`cat`/`sed`/`wc` to hunt for files (it must use the explore
-# context or ask_user instead).
+# shell out to `ls`/`cat`/`sed`/`wc` to hunt for files (it must use the
+# sub-agent context or ask_user instead).
 _READONLY_TERMINAL_PATTERNS = [
     r"^\s*git\s+(status|diff)\b",  # git status + plain git diff (working-tree review)
     r"^\s*pwd\b",
@@ -250,6 +250,50 @@ def _wrap_scoped_read(fn: Callable, scoped_paths: set[str]):
         out = await _call_scoped_read(
             fn, _fp, offset, limit, _rest, _kept_ranges, **kwargs
         )
+        if rejected:
+            out += (
+                "\n\n[scope] skipped out-of-scope paths: "
+                + ", ".join(rejected)
+                + ". In-scope files: "
+                + ", ".join(sorted(scoped_paths))
+            )
+        return out
+
+    return wrapped
+
+
+def _wrap_scoped_glob(fn: Callable, scoped_paths: set[str]):
+    """Wrap glob so it only lists inside the explicitly scoped paths.
+
+    Removed entirely before, which surfaced as ``ERROR: unknown tool 'glob'``
+    in scoped chats. Staying bound with a clear scoped error keeps the
+    contract stable: the model gets an actionable message instead of an
+    unknown-tool failure.
+    """
+
+    async def wrapped(
+        pattern: str,
+        patterns: list[str] | None = None,
+        path: str = "",
+        paths: list[str] | None = None,
+        max_results: int = 100,
+        **kwargs,
+    ) -> str:
+        batch = [path, *(paths or [])]
+        for p in batch:
+            if not str(p or "").strip():
+                return (
+                    "ERROR: this request is scoped to specific files — glob "
+                    "requires a `path`. In-scope files: " + ", ".join(sorted(scoped_paths))
+                )
+        in_scope = [p for p in batch if str(p or "").strip().lstrip("/") in scoped_paths]
+        rejected = [str(p) for p in batch if str(p or "").strip().lstrip("/") not in scoped_paths]
+        if not in_scope:
+            return (
+                "ERROR: none of the requested paths are in scope for this "
+                "request. In-scope files: " + ", ".join(sorted(scoped_paths))
+            )
+        out = await fn(pattern, patterns, in_scope[0], in_scope[1:] or None, max_results, **kwargs)
         if rejected:
             out += (
                 "\n\n[scope] skipped out-of-scope paths: "
@@ -511,7 +555,7 @@ _SEARCH_BYPASS_PROGS = {"rg", "grep", "egrep", "fgrep", "ag", "ack", "ack-grep"}
 _SEARCH_BYPASS_MSG = (
     "ERROR: {prog} via run_terminal is not allowed — it bypasses the search-call "
     "cap and isolation that grep gives you. Use grep "
-    "for a targeted look, or the task tool (subagent_type='general') for anything "
+    "for a targeted look, or the task tool (subagent_type='subagent') for anything "
     "broader."
 )
 # A python one-liner doing its own file-walk-and-match is the same bypass in
@@ -626,7 +670,7 @@ def _wrap_no_search_bypass(fn: Callable):
         if reason:
             return reason
         # Block ANY code-search/inspection command run through run_terminal.
-        # The dedicated search tools (grep/glob/read) and the explore sub-agent
+        # The dedicated search tools (grep/glob/read) and the background sub-agent
         # are the only sanctioned ways to search the codebase — running searches
         # through run_terminal is slow, token-heavy, and bypasses the search path.
         # git working-tree inspection (status/diff/log/show/blame) stays allowed
@@ -637,8 +681,8 @@ def _wrap_no_search_bypass(fn: Callable):
             return (
                 "ERROR: code search/inspection via run_terminal is not allowed — "
                 "it is slow and wastes tokens. Use grep/glob/read for targeted "
-                "lookups, or delegate broad/multi-file work to the explore "
-                "sub-agent via task(subagent_type='explore')."
+                "lookups, or delegate broad/multi-file work to the "
+                "sub-agent via task(subagent_type='subagent')."
             )
         return await fn(command)
 
@@ -646,8 +690,8 @@ def _wrap_no_search_bypass(fn: Callable):
 
 
 # ---------------------------------------------------------------------------
-# NOTE: there is intentionally NO auto-router. The explore sub-agent is ONLY
-# triggered when the agent explicitly calls task(subagent_type='explore').
+# NOTE: there is intentionally NO auto-router. The background sub-agent is ONLY
+# triggered when the agent explicitly calls task(subagent_type='subagent').
 # The model is free to use grep/glob/read/web_search/fetch_url directly for
 # any search — broad or targeted — without being steered/blocked.
 # ---------------------------------------------------------------------------
@@ -782,7 +826,7 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "coder": (
         "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it. Do just-in-time discovery yourself following the SEARCH STRATEGY rule: nothing is pre-read, so grep/glob/read a file's contents, symbols or calling convention right before you edit it. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus the search tools.\n"
         "CHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. A solo update_plan is allowed only when marking steps completed with no further tool work (e.g. the final tick); otherwise batch it with your next tool calls. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\n"
-        "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits to DIFFERENT files go as parallel edit_file calls in the SAME turn. Do not repeatedly edit the same code or modify unrelated code.\n"
+        "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits to DIFFERENT files go as parallel edit_file calls in the SAME turn. Do not repeatedly edit the same code or modify unrelated code.\n"
         "HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\n"
         "AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\n"
         "CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions: small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean.\n"
@@ -790,7 +834,7 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "plan": (
         "You are a planning agent inside a desktop IDE. Produce a SHORT, scannable IMPLEMENTATION PLAN -- you never implement it.\n"
-        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with grep/glob/read (or task explore for broad areas) to find the files, functions and lines the plan will touch -- never plan from memory. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all discovery (glob + grep) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop scouting the moment every file the plan will touch is identified.\n"
+        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with grep/glob/read (or task(subagent_type='subagent') for broad areas) to find the files, functions and lines the plan will touch -- never plan from memory. When the user EXPLICITLY asks to research the web ('research this on the web', 'search online', 'look it up'), that request is MANDATORY: call web_search -- and fetch_url to open the promising hits -- BEFORE writing ## Plan and cite the real URLs in the plan; a codebase-only answer never satisfies an explicit web-research request. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all discovery (glob + grep) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop scouting the moment every file the plan will touch is identified.\n"
         "TERMINAL: read-only inspection only -- git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint. Never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep).\n"
         "CHECKLIST: call update_plan ONCE, after writing '## Plan', with the final checklist Coder will execute (every item status='pending': one item per file/group below plus a 'write and run tests' item); never while scouting.\n"
         "PREVIOUS PLAN: your finished plan is saved automatically (one per workspace), OVERWRITING the previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block), REVISE it instead of starting over: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed.\n"
@@ -904,7 +948,7 @@ _TEST_STYLE_RULE = (
 # via graph.py so the agent behaves consistently across ask/coder/plan.
 _DOING_TASKS = (
     "\n\nDOING TASKS (every implementation/search mode):\n"
-    "1. Follow the SEARCH STRATEGY rule above (broad → explore subagent; "
+    "1. Follow the SEARCH STRATEGY rule above (broad → subagent; "
     "targeted → grep/glob/read).\n"
     "2. Implement the solution using all tools available to you.\n"
     "3. Verify with tests when the change alters behavior/logic (see TEST "
@@ -924,25 +968,24 @@ _SEARCH_RULE = (
     "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
     "Choose the search tool by the BREADTH of what you need:\n"
     "1. TARGETED lookup of a known file/symbol/keyword: use grep / glob / read / web_search / fetch_url DIRECTLY (inline, single-shot; before AND after any explore call). Locate with grep/glob first (grep with context), then read only the lines/files it points to; read a file only when you know its exact path; never pull a whole large file into context just to find one symbol.\n"
-    "2. BROAD / multi-file exploration: use task with subagent_type='explore'. It runs grep/glob/read (and web_search/fetch_url for external docs) in an ISOLATED context and returns a compact report, so delegate wide searches instead of reading many files yourself. Split independent areas across multiple explore agents and launch them IN PARALLEL -- this is the PRIMARY meaning of 'parallel' here (multiple sub-agents, NOT multiple direct reads); use as many as meaningfully reduce search time, no redundant ones. Explore runs ONLY when YOU call task(subagent_type='explore'): the system does NOT auto-route.\n"
-    "3. NON-exploration delegation (summarize, reformat, generate from a report): use task with subagent_type='general'.\n"
-    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- never a way to avoid delegating a BROAD search; firing many direct reads in parallel is still this clause and still floods your context):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']).\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- NEVER re-read the same OR an overlapping window (e.g. 640-879 then 630-649), single or batch: reuse the earlier result and read ONLY the still-missing lines.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- Batch update_plan with your next tool calls in the SAME step whenever there IS next work (a solo update_plan burns a full round-trip for a checklist tick). A solo update_plan is allowed when creating the initial checklist or marking steps completed with no further tool work (e.g. the final tick).\n"
+    "2. BROAD / multi-file exploration: use task with subagent_type='subagent'. It runs grep/glob/read (and web_search/fetch_url for external docs) in an ISOLATED context and returns a compact report, so delegate wide searches instead of reading many files yourself. Split independent areas across multiple sub-agents and launch them IN PARALLEL -- this is the PRIMARY meaning of 'parallel' here (multiple sub-agents, NOT multiple direct reads); use as many as meaningfully reduce search time, no redundant ones. Sub-agents run ONLY when YOU call task(subagent_type='subagent'): the system does NOT auto-route.\n"
+    "3. NON-exploration delegation (summarize, reformat, generate from a report): use task with subagent_type='subagent'.\n"
+    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- never a way to avoid delegating a BROAD search; firing many direct reads in parallel is still this clause and still floods your context):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']).\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- Batch update_plan with your next tool calls in the SAME step whenever there IS next work (a solo update_plan burns a full round-trip for a checklist tick). A solo update_plan is allowed when creating the initial checklist or marking steps completed with no further tool work (e.g. the final tick).\n"
     "5. CONTEXT BUDGET: only a subagent's compact report enters your context, so delegate multi-file research. When you read yourself, make the FIRST read decisive -- never open with a narrow slice and page forward (WRONG: read 1-200, then 217-350, then symbols = 3 round-trips). If you know the definition NAME, read symbols=[...] (exact range, one call, even for small files: a 250-line file is served whole, so symbols saves ~200 lines). To survey a large file read offset=1 limit=400+: you get a FILE MAP (head + full definition list) instead of a bulk dump, then fetch definitions via symbols=[...] in ONE call. Use offset/limit only for one small raw region, and never read file heads (offset=1, small limit) to explore a large file: check the CODE MAP or grep first, then symbols=[...].\n"
     "5b. CODE MAP: the live symbol index (CODE MAP above) lists every function/class with its file and line. Check it before grepping: if the symbol/file is there, go straight to read (1 call); grep only when the map doesn't cover it (a string/comment, or an unindexed symbol). When you know a function/class/method NAME (from the map or a grep `in Name (L..)` hit), read symbols=[...] (e.g. filePath='a.ts', symbols=['DiffView']) instead of guessing offset/limit.\n"
     "NEVER search or read project files with run_terminal or scripts -- only the file tools (grep / glob / read).\n"
-    "6. PROGRESSIVE BATCHING: each turn, fire ALL the targeted searches you need (each with explicit scope: path + include) as ONE batch of parallel tool calls; each batch narrows toward the answer using the previous results. Goal: UNDER 10 total grep/glob/read calls per task. Never fire one search at a time when you already know several.\n"
-    "7. LEDGER FIRST (HARD RULE, before EVERY read/grep): the loop injects coverage lines after the tool results — `[already in context — do NOT re-read: path 1-200 | ...]` and `[already searched — do NOT re-search: scope ...]` — and they repeat on later steps while coverage holds. If the window, file or search scope you were about to request is listed there, that content is ALREADY in this context: do NOT issue the call, reuse it in place. A covered call still burns a full round-trip (it comes back as a DUPLICATE/REUSED/SKIPPED stub), and 3 ignored coverage warnings hard-stop the turn. Treat these ledger lines as a rule, not a suggestion — only NEW content (lines outside the listed windows, files changed since, or scopes never searched) may be requested.\n"
+    "6. PROGRESSIVE BATCHING: each turn, fire ALL the targeted searches you need (each with explicit scope: path + include) as ONE batch of parallel tool calls; each batch narrows toward the answer using the previous results. Batch efficiently but there is no fixed call cap — keep searching until you hold what the task needs. Never fire one search at a time when you already know several. grep/glob/read are always bound — never claim direct search is unavailable; if a call fails, report the exact ERROR instead of falling back with an excuse.\n"
 )
 
 # The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict
 # _SEARCH_RULE above: broad / multi-file exploration is delegated to the
-# explore sub-agent (which runs in an isolated context and returns a compact
+# background sub-agent (which runs in an isolated context and returns a compact
 # report), so the parent never floods its own context with raw grep/glob hits.
 # grep/glob/read are the TARGETED path only. This mirrors opencode's design
 # where discovery is the agent's job but wide searches are fanned out to
 # isolated sub-agents instead of being done inline.
 _DISCOVERY_BLOCK = (
-    "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded into this message. When the question touches the project, explore JUST-IN-TIME per the SEARCH STRATEGY rule above (grep/glob/read for targeted lookups; broad/multi-file search goes to the explore sub-agent). web_search / fetch_url / vision / skills are available on demand; MCP connector tools are live when their chip is toggled on."
+    "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded into this message. When the question touches the project, explore JUST-IN-TIME per the SEARCH STRATEGY rule above (grep/glob/read for targeted lookups; broad/multi-file search goes to the subagent). web_search / fetch_url / vision / skills are available on demand; MCP connector tools are live when their chip is toggled on."
 )
 
 # Hard guardrail injected on the FINAL allowed step (mirrors opencode's
@@ -1262,6 +1305,12 @@ _QUOTA_EXHAUSTED_PHRASES = (
     "quota exceeded",
     "daily limit",
     "monthly limit",
+    # Billing locks: the identical error repeats until the user pays, so the
+    # 30s backoff only burns the retry budget (seen in practice: a 429
+    # ``model_requires_purchase`` / ``insufficient_quota`` retried after 30s).
+    "requires_purchase",
+    "insufficient_quota",
+    "insufficient balance",
 )
 
 # Class names / messages that *look* like a hard quota cap but are actually a
@@ -2610,11 +2659,9 @@ def _scope_contains(text: str, hint: str) -> bool:
 
 
 def _detect_scope(prompt: str) -> str:
-    """تشخیص دامنه سؤال (broad/narrow) با کیورد + مرز کلمه؛ laya فقط در ابهام.
+    """Detect question scope (broad/narrow) with keyword + word boundaries.
 
-    اول قانون کیورد (تقریباً صفر میلی‌ثانیه)؛ laya فقط وقتی پرسیده می‌شود که
-    کیوردها چیزی نگفتند (نتیجه ``""``)، تا حلقه رویداد برای همه نوبت‌ها بلوکه
-    نشود. هرگز استثنا بیرون نمی‌دهد.
+    Keyword rules only (near-zero milliseconds). Never raises.
     """
     if not prompt:
         return ""
@@ -2741,10 +2788,8 @@ def _detect_scope(prompt: str) -> str:
     )
     if any(_scope_contains(low, k) for k in _narrow_hits):
         return "narrow"
-    # ابهام واقعی → بودجه کامل ("") بدون صدازدن laya: این تابع همگام داخل
-    # مسیر async صدا زده می‌شود و حتی یک predict نادر (۷۰ تا ۵۰۰ms) حلقه را
-    # برای همه نوبت‌ها بلوکه می‌کرد؛ سقف توکن فقط راهنماست پس امن‌ترین
-    # پیش‌فرض بودجه کامل است.
+    # Ambiguous input returns full budget (""): this sync helper runs inside
+    # the async path, so the safest default is the full budget.
     return ""
 
 
@@ -3848,6 +3893,9 @@ _MODE_OUTPUT = {
         "• If you cannot find a verified URL, say so honestly instead of fabricating one."
     ),
     "plan": (
+        "EXISTING PLAN: a follow-up message REVISES it — keep every still-valid item, add/update/remove only what "
+        "the new message affects, and open with 1-2 lines saying what changed; write a fresh plan replacing the old "
+        "one ONLY when the user explicitly says to discard it ('delete the old plan', 'start over'). "
         "Your reply MUST be a SHORT implementation plan: open with '## Plan', then goal (1-2 lines), one bullet "
         "per file (`path` + change + why), and 1-3 verification commands — never do the work. Snippets: at most "
         "one tiny snippet per file and ONLY when the bullet alone is ambiguous. End the plan with a 'Files: "
@@ -3855,7 +3903,20 @@ _MODE_OUTPUT = {
         "bullets in the SAME language as the plan (e.g. '## خلاصه' for Persian, '## Summary' for English) — "
         "never repeat step text there. Close with one sentence offering to switch to Coder mode, and one sentence inviting corrections (e.g. 'بگو کجاش ایراد داره یا چی اضافه/کم بشه تا پلن رو اصلاح کنم')."
     ),
-    "coder": "",
+    "coder": (
+        "PLAN HANDLING: implement, don't re-plan. When the conversation already has an "
+        "implementation plan (a '## Plan' document or the plan checklist), execute it — "
+        "never reply with a new '## Plan' document instead of doing the work. A follow-up "
+        "request ('do X too', 'also Y', 'change Z') EDITS the existing plan: keep every "
+        "existing item and add/update only what the new message affects, then implement — "
+        "when the plan text is written out, output the FULL revised plan (all previous "
+        "items plus the new one), never dropping earlier items. Replace it with a fresh "
+        "'## Plan' ONLY when the user explicitly says to discard the old plan ('delete the "
+        "old plan', 'start over', 'write a new plan'). If NO plan exists yet, write a "
+        "SHORT '## Plan' first and immediately continue implementing it in the same turn — "
+        "never stop at the plan. The deliverable is the edited files (plus tests when "
+        "behavior changes), not a plan document."
+    ),
     "reader": (
         "Your reply MUST explain the pointed-at code with exact file:line references and the WHY — "
         "concise, scoped to the referenced files, never a full rewrite."
@@ -3938,57 +3999,7 @@ def _append_app_log(line: str) -> None:
         pass
 
 
-def laya_precheck(
-    prompt: str,
-    mode: str = "",
-    history_len: int = 0,
-    chat_id: str = "",
-    emit: object = None,
-) -> dict | None:
-    """تلاش سریع محلی با laya قبل از صدازدن مدل بزرگ (best-effort).
 
-    سؤال تایپ‌دار ``choice`` می‌سازد (ادامه محلی در برابر مدل بزرگ) و اگر
-    laya با اطمینان بالا «ادامه محلی» را انتخاب کرد، نتیجه را به‌صورت دیکشنری
-    برمی‌گرداند؛ در غیر این صورت ``None`` تا فراخواننده فقط همان مورد سخت را
-    به مدل بزرگ بفرستد. هرگز استثنا بیرون نمی‌دهد تا مسیر اصلی چت نشکند.
-    هر مشورت (حتی واگذاری) در trace/رویداد زنده ثبت می‌شود تا در chat trace دیده شود.
-    """
-    try:
-        import laya_decide
-
-        decision = laya_decide.decide(
-            {"prompt": prompt or "", "mode": mode or "", "history_len": int(history_len or 0)},
-            {"type": "choice", "options": ["handle_locally", "needs_big_model"]},
-            chat_id=str(chat_id or ""),
-        )
-    except Exception:  # noqa: BLE001 — laya اختیاری است
-        return None
-    try:
-        import laya_decide as _laya_mod
-
-        _laya_mod.report_secondary(
-            decision,
-            route="normal",
-            sub="precheck",
-            chat_id=str(chat_id or ""),
-            emit=emit,
-            prompt=str(prompt or "")[:2000],
-            options=["handle_locally", "needs_big_model"],
-        )
-    except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
-        pass
-    try:
-        if decision.handled and str(decision.value or "") == "handle_locally":
-            return {
-                "handled": True,
-                "kind": decision.kind,
-                "value": decision.value,
-                "confidence": decision.confidence,
-                "reason": decision.reason,
-            }
-    except Exception:  # noqa: BLE001, S110
-        pass
-    return None
 
 
 async def run_agent(

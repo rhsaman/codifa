@@ -55,19 +55,11 @@ from providers import (
     qualify_model_id,
 )
 from tool_batching import (
-    drop_ledger_path,
     execute_readonly_calls,
-    has_served_map,
     merge_same_scope_greps,
-    note_fetched_window,
-    reset_cross_turn,
-    reset_read_ledger,
-    reset_turn_seen_calls,
 )
 from tool_message_projection import (
-    context_ledger_line,
     project_tool_results,
-    search_ledger_line,
     stable_tool_order,
 )
 
@@ -534,11 +526,11 @@ def build_chat_model(
     # cacheable block and moves forward as the conversation converges — no
     # per-message markers needed. Only enabled for openrouter+anthropic so
     # local/custom (Qwen, llama.cpp) and Google models are untouched.
-    if (
-        cache
-        and model_class == "openrouter"
-        and _is_anthropic_model(model)
-    ):
+    # Non-Anthropic OpenRouter models still benefit from OpenRouter's
+    # automatic prefix caching when the x-openrouter-cache header is set
+    # (see _extra_headers): send the same top-level breakpoint so the
+    # gateway can anchor it. Harmless on models that ignore the field.
+    if cache and model_class == "openrouter":
         lc_kwargs["extra_body"] = {"cache_control": {"type": "ephemeral"}}
     # Use the reasoning-normalizing subclass so gateways that stream thinking
     # under delta.reasoning (opencode) don't leak it into the visible content.
@@ -728,13 +720,27 @@ def bind_tools_parallel(model: Any, lc_tools: list, enabled: bool = True) -> Any
     ``enabled=False`` is the strip-on-400 fallback. Without this most
     gateways return ONE tool call per step, so N independent reads/greps cost
     N full-context round trips (the root cause of read/grep round-trip bloat
-    in both the main agent and the explore sub-agent).
+    in both the main agent and the background sub-agent).
+    Also DEDUPLICATES the list by tool name (first wins): the same MCP tool
+    can enter ``lc_tools`` twice (turn build + a mid-run steer rebuild), and
+    providers reject duplicate declarations with HTTP 400 ("tool ... is
+    declared more than once in `tools`").
     Opt-OUT, not opt-in: every provider gets ``parallel_tool_calls=True``
     unless its providers.py meta flag is explicitly ``parallel_calls=False``
     (a gateway known to reject the field). A 400 rejection still strips the
     field and retries once (see ``_is_parallel_calls_error``), so default-on
     never kills a turn — it just lets capable models batch N calls in ONE
     round-trip instead of N."""
+    seen_names: set[str] = set()
+    unique_tools: list = []
+    for _t in lc_tools:
+        _n = str(getattr(_t, "name", "") or "")
+        if _n:
+            if _n in seen_names:
+                continue
+            seen_names.add(_n)
+        unique_tools.append(_t)
+
     kind, _ = model_provider(model)
     if enabled:
         try:
@@ -743,12 +749,12 @@ def bind_tools_parallel(model: Any, lc_tools: list, enabled: bool = True) -> Any
             meta_off = False
         if not meta_off:
             try:
-                return model.bind_tools(lc_tools, parallel_tool_calls=True)
+                return model.bind_tools(unique_tools, parallel_tool_calls=True)
             except TypeError:
-                # مدل‌هایی که پارامتر parallel_tool_calls را نمی‌شناسند (مثل ماک‌های تست
-                # یا نسخه‌های قدیمی لن‌گ‌چین) — بدون آن ادامه می‌دهیم.
-                return model.bind_tools(lc_tools)
-    return model.bind_tools(lc_tools)
+                # Fallback for models/gateway mocks that do not accept
+                # parallel_tool_calls (older LangChain versions): retry without it.
+                return model.bind_tools(unique_tools)
+    return model.bind_tools(unique_tools)
 
 
 # opencode's OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts):
@@ -1193,7 +1199,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
 )
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool
 
 # The hard step-limit prompt is defined once in agents.py (kept in English on
 # purpose) and reused here so the sub-agent loop mirrors the main loop's
@@ -2144,15 +2150,6 @@ class _RevisitStreakTracker:
         )
 
 
-# ── Re-read detection (shared by both tool loops) ─────────────────────────
-# A newly requested read window whose lines are mostly already fetched this
-# turn counts as "already read" at or above this coverage ratio.
-_READ_WINDOW_OVERLAP_MIN = 0.8
-# A requested window this many lines (or fewer) past a fetched region counts
-# as paging the same region — worth one reminder per path per turn.
-_READ_ADJACENT_GAP = 100
-
-
 def _read_windows(args: dict) -> list[tuple[str, int, int]]:
     """Concrete (path, start1, end1) windows a read call will fetch.
 
@@ -2189,180 +2186,6 @@ def _read_windows(args: dict) -> list[tuple[str, int, int]]:
             o = max(1, offset)
             wins.append((str(p), o, o + max(1, limit) - 1))
     return wins
-
-
-class _SeenWindows:
-    """Per-turn record of fetched read windows; nudges on re-reads.
-
-    The model re-reads the same file windows across steps (the #1 observed
-    round-trip waste): head re-reads after symbol reads, broadcast
-    offset/limit across files, paging loops. This tracker records every
-    requested read window and, when a newly requested window is mostly
-    (>= _READ_WINDOW_OVERLAP_MIN) covered by already-fetched lines,
-    returns a reminder naming the covered range so the model reuses it.
-    A requested window that merely CONTINUES a fetched region (small gap,
-    <= _READ_ADJACENT_GAP) gets a one-per-path paging reminder instead.
-    Advisory only — never blocks a call.
-
-    edit_file/write_file invalidate a path's record (post-edit re-reads are
-    legitimate). clear() drops everything (compaction may have discarded
-    the content). Every repeat warns while coverage holds, so ignoring the
-    hint is never free.
-    """
-
-    __slots__ = ("_adjacent_nudged", "_edited", "_seen")
-
-    def __init__(self) -> None:
-        self._seen: dict[str, list[tuple[int, int]]] = {}
-        self._adjacent_nudged: set[str] = set()
-        self._edited: set[str] = set()
-
-    def clear(self) -> None:
-        self._seen.clear()
-        self._adjacent_nudged.clear()
-        self._edited.clear()
-        reset_read_ledger()
-        reset_turn_seen_calls()
-        # Compaction may have evicted previous turns' content from history:
-        # cross-turn pointers would dangle, so forget them too.
-        reset_cross_turn()
-
-    def mark_edited(self, path: str) -> None:
-        if path:
-            self._seen.pop(str(path), None)
-            self._edited.add(str(path))
-            drop_ledger_path(str(path))
-
-    @staticmethod
-    def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
-        return max(0, min(a1, b1) - max(a0, b0) + 1)
-
-    @staticmethod
-    def _separation(
-        start: int, end: int, have: list[tuple[int, int]]
-    ) -> int | None:
-        """Min line-gap between [start, end] and seen windows.
-
-        Returns None when the window overlaps any seen interval (the
-        overlap rule owns that case) or when there is nothing seen.
-        """
-        gaps: list[int] = []
-        for s0, s1 in have:
-            if s0 <= end and start <= s1:
-                return None
-            gaps.append((s0 - end - 1) if s0 > end else (start - s1 - 1))
-        return min(gaps) if gaps else None
-
-    def check_covered(self, tcs: list) -> dict[str, str]:
-        """Tool-call ids whose single read window is fully already fetched.
-
-        Call BEFORE observe() each step. A fully covered window means every
-        requested line is already in context and the file is unedited, so
-        re-sending its content is pure token waste — the caller substitutes
-        the stub for the tool result in the transcript (execution still runs,
-        so UI events and caches stay intact). Batches (multi-path reads),
-        symbols= reads, and edited paths always keep their content.
-        """
-        stubs: dict[str, str] = {}
-        for tc in tcs or []:
-            if (tc.get("name") or "").lower() != "read":
-                continue
-            args = tc.get("args") or {}
-            if args.get("symbols"):
-                continue
-            wins = _read_windows(args)
-            if len(wins) != 1:
-                continue
-            path, start, end = wins[0]
-            if path in self._edited:
-                continue
-            if has_served_map(path):
-                # A file map was served instead of the requested window:
-                # coverage is untrusted, so never stub — serve real content.
-                continue
-            have = self._seen.get(path, [])
-            if not have:
-                continue
-            total = max(1, end - start + 1)
-            covered = sum(self._overlap(start, end, s0, s1) for s0, s1 in have)
-            if covered >= total:
-                stubs[str(tc.get("id") or "")] = (
-                    f"SKIPPED (already in context): {path} lines {start}-{end} "
-                    "were already fetched this turn — reusing that content; "
-                    "full text omitted to save tokens."
-                )
-        return stubs
-
-    def observe(self, tcs: list) -> str:
-        """Record this step's calls; remind on re-reads and paging.
-
-        Call once per step with ALL of that step's tool calls (before
-        execution, like _BatchStreakTracker.observe). Returns "" most steps.
-        """
-        # Register edits first: a re-read after an edit is legitimate.
-        edited_now: set[str] = set()
-        for tc in tcs or []:
-            if (tc.get("name") or "").lower() in ("edit_file", "write_file"):
-                _p = (tc.get("args") or {}).get("path") or ""
-                self.mark_edited(_p)
-                if _p:
-                    edited_now.add(str(_p))
-        notes: list[str] = []
-        fresh: list[tuple[str, int, int]] = []
-        for tc in tcs or []:
-            if (tc.get("name") or "").lower() != "read":
-                continue
-            for path, start, end in _read_windows(tc.get("args") or {}):
-                key = (path, start, end)
-                # A served file map leaves phantom coverage in _seen (the
-                # requested head window was never content-served): nudge
-                # logic must not reference it, though fresh fetches still
-                # record normally below.
-                have = [] if has_served_map(path) else self._seen.get(path, [])
-                covered = sum(
-                    self._overlap(start, end, s0, s1) for s0, s1 in have
-                )
-                total = max(1, end - start + 1)
-                if have and covered / total >= _READ_WINDOW_OVERLAP_MIN:
-                    lo = min([s0 for s0, _ in have] + [start])
-                    hi = max([s1 for _, s1 in have] + [end])
-                    notes.append(
-                        f"- {path}: you already fetched lines {lo}-{hi} this turn, "
-                        f"covering {covered}/{total} of the requested "
-                        f"{start}-{end}. Reuse that content — do NOT re-read it."
-                    )
-                elif have and path not in self._adjacent_nudged:
-                    gap = self._separation(start, end, have)
-                    if gap is not None and 0 < gap <= _READ_ADJACENT_GAP:
-                        self._adjacent_nudged.add(path)
-                        ulo = min([s0 for s0, _ in have] + [start])
-                        uhi = max([s1 for _, s1 in have] + [end])
-                        notes.append(
-                            f"- {path}: lines "
-                            f"{min(s0 for s0, _ in have)}-"
-                            f"{max(s1 for _, s1 in have)} are already in "
-                            f"context and the requested {start}-{end} starts "
-                            f"only {gap} lines later — you now hold {ulo}-{uhi} "
-                            "in pieces. Do NOT page this file again; for "
-                            "further lines here read ONE wide window."
-                        )
-                fresh.append(key)
-        for path, start, end in fresh:
-            self._seen.setdefault(path, []).append((start, end))
-            note_fetched_window(path, start, end)
-            # A fresh fetch heals the post-edit caution for this path — unless
-            # the same step also edits it (reads execute BEFORE sequential
-            # edits, so that content is already stale).
-            if path not in edited_now:
-                self._edited.discard(path)
-        if not notes:
-            return ""
-        return (
-            "\n\n🔁 REREAD NOTE: the requested read window is already in your context:\n"
-            + "\n".join(notes[:3])
-            + "\nIf you need lines OUTSIDE the fetched range, read ONLY the missing "
-            "part — via symbols=[...] or ranges=[\"path:start:count\", ...] in ONE call."
-        )
 
 
 # ── Plan-only step detection (shared by both tool loops) ─────────────────
@@ -2426,15 +2249,19 @@ async def langchain_tool_loop(
     """Run a bounded tool-calling loop on a LangChain model.
 
     ``tools`` is a ``{name: callable}`` mapping (sync or async). Returns the
-    final textual reply. Used by sub-agents (general/task) that need tools.
+    final textual reply. Used by sub-agents (task) that need tools.
 
     Read-only tool calls requested in the same step run CONCURRENTLY via
     ``asyncio.gather`` (matching opencode's Promise.all); mutating/blocking
     tools run sequentially. See ``_SEQUENTIAL_TOOLS``.
     """
     lc_tools = [
-        StructuredTool.from_function(
-            func=fn, name=name, description=(fn.__doc__ or name)
+        (
+            fn
+            if isinstance(fn, BaseTool)
+            else StructuredTool.from_function(
+                func=fn, name=name, description=(fn.__doc__ or name)
+            )
         )
         for name, fn in tools.items()
     ]
@@ -2445,9 +2272,22 @@ async def langchain_tool_loop(
         args = tc.get("args") or {}
         fn = tools.get(name)
         if fn is None:
-            return f"ERROR: unknown tool {name!r}"
+            return (
+                f"ERROR: unknown tool {name!r}. "
+                f"Bound tools: {', '.join(sorted(tools.keys())) or '(none)'}. "
+                "Never claim a listed tool is unavailable — call it directly "
+                "and report this exact ERROR if it fails."
+            )
         try:
-            r = fn(**(args or {}))
+            if isinstance(fn, BaseTool):
+                # MCP tools arrive as ready-made BaseTool instances (their
+                # .name IS the dict key). Calling fn(**args) would resolve
+                # BaseTool.__call__ -> type.__call__ and crash with
+                # "descriptor '__call__' for 'type' objects..."; the Runnable
+                # API is the correct invocation path.
+                r = fn.ainvoke(args or {})
+            else:
+                r = fn(**(args or {}))
             if inspect.isawaitable(r):
                 r = await r
             return r
@@ -2474,26 +2314,10 @@ async def langchain_tool_loop(
     _last_call_sig = None
     _same_call_streak = 0
     _DOOM_LOOP_LIMIT = 3
-    _TOOL_CALL_SOFT_LIMIT = 8
-    _tool_call_count = 0
-    # Ignored-coverage hard stop: a fully covered read still burns a full
-    # round-trip (the stub comes back AFTER the call). Warning every time
-    # is not enough — after N ignored coverage warnings the turn must stop
-    # calling tools and summarize, like the doom-loop guard above.
-    _COVER_IGNORE_LIMIT = 3
-    _cover_ignore_count = 0
     # Cross-step batching tracker: catches the model firing ONE batchable
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
     _streak = _BatchStreakTracker()
-    # Re-read tracker: records fetched read windows per turn and reminds the
-    # model when a requested window is already in context (same mechanism as
-    # the batching streak above).
-    _reread = _SeenWindows()
-    # Revisit streak: same file/scope re-touched step after step.
-    _revisit = _RevisitStreakTracker()
-    reset_read_ledger()
-    reset_turn_seen_calls()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
     # Reminders / steering are TRANSIENT: sent with the very next request only,
     # never stored in msgs. Stored copies were re-sent on every later step (one
@@ -2502,13 +2326,35 @@ async def langchain_tool_loop(
     while steps < max_steps:
         steps += 1
         _step_t0 = time.monotonic()
+        # Mid-run steer: a follow-up the main agent queued via task_steer for
+        # the job driving this loop (tools.py sets RUNNING_TASK_CTX). Drained
+        # BETWEEN steps so the steer lands while the sub-agent is still
+        # running, instead of only after its whole run; tools.py's post-run
+        # follow-up loop then finds an empty inbox and needs no extra round.
+        # Best-effort: a steer must never break the loop.
+        try:
+            import subagent_jobs as _sj
+
+            _steer_tid = _sj.RUNNING_TASK_CTX.get()
+            if _steer_tid:
+                for _steer_msg in _sj.drain_steer(_steer_tid):
+                    msgs.append(
+                        HumanMessage(
+                            content=(
+                                "[steer from the main agent - continue the same "
+                                f"task, incorporating this]\n{_steer_msg}"
+                            )
+                        )
+                    )
+        except Exception:  # noqa: BLE001, S110 — steer injection is best-effort
+            pass
         if emit is not None:
             try:
                 emit(
                     {
                         "kind": "status",
-                        "stage": "explore",
-                        "content": f"explore step {steps}/{max_steps}",
+                        "stage": "subagent",
+                        "content": f"sub-agent step {steps}/{max_steps}",
                     }
                 )
             except Exception:  # noqa: BLE001, S110 — progress never breaks loop
@@ -2636,11 +2482,6 @@ async def langchain_tool_loop(
         _step_hint = ""
         _streak_hint = _streak.observe(tcs)
         _batch_hint = _step_hint or _streak_hint
-        # Coverage check BEFORE observe records this step: fully covered
-        # reads get a stub in the transcript instead of re-sent content.
-        _cover_stubs = _reread.check_covered(tcs)
-        _reread_hint = _reread.observe(tcs)
-        _revisit_hint = _revisit.observe(tcs)
         # Partition this step's tool calls: read-only tools (grep/glob/read/
         # web/vision/...) run CONCURRENTLY via gather -- they cannot race each
         # other since none mutate anything. Mutating/blocking calls
@@ -2660,19 +2501,47 @@ async def langchain_tool_loop(
         _exec_calls, _expand_merged = merge_same_scope_greps(_parallel)
         _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
         _batch_hint = _step_hint or _streak_hint
+        # Per-step tool activity line: the right-panel sub-agent trail tees
+        # status events, so naming the tools here gives it live progress even
+        # though the tools themselves emit through the parent's emit.
+        if emit is not None and tcs:
+            try:
+                emit(
+                    {
+                        "kind": "status",
+                        "stage": "subagent",
+                        "content": "→ "
+                        + ", ".join(
+                            str(tc.get("name") or "?") for tc in ([*_exec_calls, *_sequential])
+                        ),
+                    }
+                )
+            except Exception:  # noqa: BLE001, S110 — progress never breaks loop
+                pass
         _results = await execute_readonly_calls(_exec_calls, _exec)
         _expanded = _expand_merged(_results)
         for tc, result in zip(_parallel, _expanded):
             _cid = tc.get("id", "")
-            if _cid in _cover_stubs:
-                result = _cover_stubs[_cid]
             append_tool_result(msgs, str(result), _cid)
         for tc in _sequential:
             result = await _exec(tc)
             _cid = tc.get("id", "")
-            if _cid in _cover_stubs:
-                result = _cover_stubs[_cid]
             append_tool_result(msgs, str(result), _cid)
+        # Completion counterpart of the in-flight line above: one event per
+        # executed call so the right-panel sub-agent trail renders → / ✓
+        # pairs per tool, like the chat's tool cards.
+        if emit is not None and tcs:
+            for _done_tc in (*_exec_calls, *_sequential):
+                try:
+                    emit(
+                        {
+                            "kind": "status",
+                            "stage": "subagent",
+                            "content": f"✓ {_done_tc.get('name') or '?'}",
+                        }
+                    )
+                except Exception:  # noqa: BLE001, S110 — progress never breaks loop
+                    pass
         # Emit ToolMessages for duplicate tool calls that were deduped above so
         # the LLM sees a result for every tool_call_id it originally sent.
         if _dup_ids:
@@ -2689,67 +2558,10 @@ async def langchain_tool_loop(
         # standalone message is impossible to miss, unlike a suffix at the
         # end of a huge result.
         _transient.clear()
-        _ledger_line = context_ledger_line(msgs)
-        if _ledger_line:
-            _transient.append(HumanMessage(content=_ledger_line))
-        _search_line = search_ledger_line(msgs)
-        if _search_line:
-            _transient.append(HumanMessage(content=_search_line))
         if _batch_hint:
             _transient.append(HumanMessage(content=_batch_hint.strip()))
-        if _reread_hint:
-            _transient.append(HumanMessage(content=_reread_hint.strip()))
-        if _revisit_hint:
-            _transient.append(HumanMessage(content=_revisit_hint.strip()))
-        # Ignored-coverage escalation: a covered read still burns a full
-        # round-trip (stub comes back AFTER the call). After N ignored
-        # coverage warnings the stop order rides the TRANSIENT channel so the
-        # model actually sees it on the next request (a message appended to
-        # msgs right before a break is never delivered). If it re-requests
-        # covered content once more, the loop hard-stops like the doom-loop
-        # guard below instead of burning further round-trips.
-        if _cover_stubs:
-            _cover_ignore_count += 1
-            if _cover_ignore_count == _COVER_IGNORE_LIMIT:
-                _transient.append(
-                    HumanMessage(
-                        content=(
-                            "[steering] You re-requested content already in context "
-                            f"{_cover_ignore_count} times in a row (covered reads "
-                            "return a stub AFTER burning a round-trip). Do NOT call "
-                            "read/grep again — report your findings in text now."
-                        )
-                    )
-                )
-            elif _cover_ignore_count > _COVER_IGNORE_LIMIT:
-                break
         if _is_plan_only_step(tcs) and not _plan_only_step_marks_progress(tcs):
             _transient.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
-        # --- soft tool-call budget nudge ---
-        # After _TOOL_CALL_SOFT_LIMIT calls, steer the model toward batching or
-        # summarizing — mirrors the doom-loop guard but for "too many calls" rather
-        # than "same call repeated". The model can still call tools if genuinely
-        # needed; this just breaks the habit of fire-one-at-a-time greps.
-        _tool_call_count += len(tcs)
-        if _tool_call_count >= _TOOL_CALL_SOFT_LIMIT and steps < max_steps - 1:
-            # Inject as HumanMessage (not SystemMessage) so it lands mid-list
-            # without violating chat templates that require SystemMessage only
-            # at position 0 (e.g. Qwen3.5 / llama.cpp). This mirrors the same
-            # fix applied in graph.py for plan/tool-reuse notes.
-            _transient.append(
-                HumanMessage(
-                    content=(
-                        f"[steering] You have made {_tool_call_count} tool calls so far "
-                        f"(soft limit: {_TOOL_CALL_SOFT_LIMIT}). "
-                        "If you have enough information, STOP calling tools and "
-                        "summarize your findings now. "
-                        "If not, batch remaining searches: pass all terms via "
-                        "patterns=[...] in a single grep, use filePaths=[...] or "
-                        "ranges=['path:offset:limit', ...] for multiple reads, "
-                        "and fire them all in ONE parallel turn."
-                    )
-                )
-            )
         # --- doom-loop guard (opencode's repeated-call detector) ---
         # Build a signature of THIS step's tool calls; if it matches the previous
         # step exactly N times in a row, the model is looping — inject a hard
@@ -2785,10 +2597,7 @@ async def langchain_tool_loop(
         # simply retries with the uncompacted transcript).
         if ctx > 0:
             with contextlib.suppress(Exception):
-                if await _auto_compact_subagent(msgs, model, ctx, reserved, emit):
-                    # Compaction may have discarded fetched content — drop the
-                    # seen-window record so re-reads are not wrongly nagged.
-                    _reread.clear()
+                await _auto_compact_subagent(msgs, model, ctx, reserved, emit)
     # The loop ended by hitting max_steps (not by the model returning a
     # final text reply). Recover the last textual answer the sub-agent
     # produced so it never returns an empty result to the parent.
@@ -2931,14 +2740,21 @@ def usage_event(
             # input_tokens, so total_tokens already counts the cache. Trust the
             # provider's own total_tokens when present; only hand-sum (adding
             # reasoning_tokens) when it is absent.
-            provided_total = (
-                metadata.get("total_tokens")
-                if isinstance(metadata, dict)
-                else getattr(metadata, "total_tokens", 0)
+            provided_total = int(
+                (
+                    metadata.get("total_tokens")
+                    if isinstance(metadata, dict)
+                    else getattr(metadata, "total_tokens", 0)
+                )
+                or 0
             )
+            # Trust the provider total only when it covers input + output: some
+            # routers report a total that excludes the cached subset of the
+            # prompt, which would under-count the context meter by exactly the
+            # cached portion. Inconsistent totals fall back to the hand-sum.
             total = (
-                (provided_total or 0)
-                if (provided_total or 0)
+                provided_total
+                if provided_total >= input_tokens + output_tokens
                 else input_tokens + output_tokens + reasoning_tokens
             )
         if total <= 0:

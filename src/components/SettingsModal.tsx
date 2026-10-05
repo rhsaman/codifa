@@ -2,14 +2,13 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
-import { cancelModelDownload, downloadModel, getLayaStatus, getModelsStatus, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type LayaStatus, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
+import { cancelModelDownload, downloadModel, getModelsStatus, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
 import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
-import { layaReasonLabel } from './LayaLabels'
 import { ModelTestButton } from './ModelTestButton'
 import { ProviderTestButton } from './ProviderTestButton'
 import { THEMES } from '../lib/themes'
@@ -106,13 +105,16 @@ export function toolModelTarget(
 }
 
 function ToolModelSelect({
-  agent, label, desc, current, onSelect,
+  agent, label, desc, current, onSelect, noneLabel = 'Main model',
 }: {
   agent: string
   label: string
   desc: string
   current: string
   onSelect: (agent: string, model: string) => void
+  /** Label for the empty-value option (stores ''). Slots where empty means
+   * "disabled" (e.g. step) pass an "Off" label instead of "Main model". */
+  noneLabel?: string
 }) {
   const providers = useStore((s) => s.settings.providers)
   const activeProviderId = useStore((s) => s.settings.activeProviderId)
@@ -252,7 +254,7 @@ function ToolModelSelect({
             ref={inputRef}
             className="model-select-combo-input"
             value={search}
-            placeholder={open ? 'Search models…' : currentLabel}
+            placeholder={open ? 'Search models…' : (current ? currentLabel : noneLabel)}
             dir="ltr"
             onFocus={openMenu}
             onClick={openMenu}
@@ -285,7 +287,7 @@ function ToolModelSelect({
                 onMouseDown={(e) => { e.preventDefault(); onSelect(agent, ''); closeMenu(); inputRef.current?.blur() }}
                 type="button"
               >
-                Main model
+                {noneLabel}
               </button>
               {visibleProviders.map(({ p, models }) => {
                 const isOpen = q ? true : expanded.has(p.id)
@@ -550,14 +552,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
   const setWhisperModel = useStore((s) => s.setWhisperModel)
   const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
-  const layaModel = useStore((s) => s.layaModel)
-  const layaBaseUrl = useStore((s) => s.layaBaseUrl)
-  const setLayaModel = useStore((s) => s.setLayaModel)
-  const setLayaBaseUrl = useStore((s) => s.setLayaBaseUrl)
-  const layaProviderId = useStore((s) => s.layaProviderId)
-  const setLayaProviderId = useStore((s) => s.setLayaProviderId)
-  const layaProviderModel = useStore((s) => s.layaProviderModel)
-  const setLayaProviderModel = useStore((s) => s.setLayaProviderModel)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -665,7 +659,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // ---- Managed on-device models (Settings → Models) ----
   const [mStatus, setMStatus] = useState<ModelsStatus | null>(null)
   const [modelsMsg, setModelsMsg] = useState('')
-  const [layaStatus, setLayaStatus] = useState<LayaStatus | null>(null)
   // ---- Data path (Settings → Memory) ----
   const [dataMsg, setDataMsg] = useState('')
   const [migrating, setMigrating] = useState(false)
@@ -709,7 +702,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const refreshModels = useCallback(async () => {
     setMStatus(await getModelsStatus())
-    setLayaStatus(await getLayaStatus())
   }, [])
 
   // Poll while the modal is open so download progress / completion shows live.
@@ -719,28 +711,23 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     void refreshModels()
     const id = setInterval(
       () => void refreshModels(),
-      mStatus?.whisper?.running || mStatus?.embedding?.running || mStatus?.laya?.running ? 1000 : 2500,
+      mStatus?.whisper?.running || mStatus?.embedding?.running ? 1000 : 2500,
     )
     return () => clearInterval(id)
-  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running, mStatus?.laya?.running])
+  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running])
 
-  const isRunning = (kind: 'whisper' | 'embedding' | 'laya') =>
-    (kind === 'whisper' ? mStatus?.whisper : kind === 'laya' ? mStatus?.laya : mStatus?.embedding)?.running?.state ===
+  const isRunning = (kind: 'whisper' | 'embedding') =>
+    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
     'downloading'
 
   const runState = (kind: ManagedModelKind): ModelRunState | undefined =>
-    (kind === 'whisper' ? mStatus?.whisper : kind === 'laya' ? mStatus?.laya : mStatus?.embedding)?.running
+    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running
 
-  // Laya checkpoints are decision models, not embeddings: an old HF
-  // auto-download could leave a `models--convaiinnovations--laya` folder that
-  // used to surface here as an "incomplete" row. The backend filters those
-  // now; this keeps them out even if one slips through (stale sidecar).
-  const embeddingDirs = (mStatus?.embedding?.dirs ?? []).filter((d) => !isLayaRepo(d.repo))
-  const embeddingStatus = mStatus?.embedding ? { ...mStatus.embedding, dirs: embeddingDirs } : mStatus?.embedding
+  const embeddingStatus = mStatus?.embedding
 
-  const actDownload = async (kind: 'whisper' | 'embedding' | 'laya') => {
-    const repo = kind === 'whisper' ? whisperModel : kind === 'laya' ? layaModel : 'intfloat/multilingual-e5-base'
-    const base = kind === 'whisper' ? whisperBaseUrl : kind === 'laya' ? layaBaseUrl : ''
+  const actDownload = async (kind: 'whisper' | 'embedding') => {
+    const repo = kind === 'whisper' ? whisperModel : 'intfloat/multilingual-e5-base'
+    const base = kind === 'whisper' ? whisperBaseUrl : ''
     setModelsMsg('')
     try {
       await downloadModel(kind, repo, base)
@@ -785,7 +772,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
   }
 
-  const actRemove = async (kind: 'whisper' | 'embedding' | 'laya', repo: string) => {
+  const actRemove = async (kind: 'whisper' | 'embedding', repo: string) => {
     setModelsMsg('')
     try {
       await removeModel(kind, repo)
@@ -2163,7 +2150,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
             <div className="hint">
               Pick separate models for the built-in tools (web, vision,
-              compact, step, explore, schedule). Leave a field empty to use the main model (the one chosen in the
+              compact, explore, schedule). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
@@ -2191,17 +2178,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               onSelect={setSubagentModel}
             />
             <ToolModelSelect
-              agent="step"
-              label="Step model"
-              desc="Small fast model for mechanical agent steps (e.g. repeated browser clicks) when a local Laya gate flags them as routine. Empty = the compact model if set, otherwise off."
-              current={subagentModels.step || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
-              agent="explore"
-              label="Explore model"
-              desc="Read-only research sub-agent (grep/glob/read over the codebase). Falls back to the main model."
-              current={subagentModels.explore || ''}
+              agent="subagent"
+              label="Sub-agent model"
+              desc="Background sub-agent spawned via the task tool (research, code search, delegated work). Falls back to the main model."
+              current={subagentModels.subagent || subagentModels.explore || ''}
               onSelect={setSubagentModel}
             />
             <ToolModelSelect
@@ -2268,105 +2248,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   <ModelStatusCard status={embeddingStatus} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
                   <ModelControls
                     running={runState('embedding')}
-                    canDownload={!embeddingDirs.some((d) => d.ready)}
+                    canDownload={!(embeddingStatus?.dirs ?? []).some((d) => d.ready)}
                     onDownload={() => actDownload('embedding')}
                     onPause={() => actPause('embedding')}
                     onResume={() => actResume('embedding')}
                     onCancel={() => actCancel('embedding')}
                   />
-                </div>
-              </div>
-
-              <div className="model-card model-card-laya">
-                <div className="model-card-head">
-                  <div className="model-card-titles">
-                    <span className="model-card-title">Fast Local Decision</span>
-                    <span className="model-card-desc">Small on-device model for quick decisions</span>
-                  </div>
-                  {layaProviderId === 'local' && <ModelBadge status={mStatus?.laya} />}
-                </div>
-                <div className="model-card-body">
-                  <label className="field-label">Decision provider</label>
-                  <div className="laya-switch" role="group" aria-label="Decision provider">
-                    <button
-                      type="button"
-                      className={`laya-switch-btn${layaProviderId === 'local' ? ' active' : ''}`}
-                      onClick={() => setLayaProviderId('local')}
-                    >
-                      Local Laya — Offline
-                    </button>
-                    <button
-                      type="button"
-                      className={`laya-switch-btn${layaProviderId !== 'local' ? ' active' : ''}`}
-                      onClick={() => {
-                        if (layaProviderId === 'local') {
-                          const fallback = settings.activeProviderId || providers[0]?.id || 'local'
-                          setLayaProviderId(fallback)
-                        }
-                      }}
-                    >
-                      External provider
-                    </button>
-                  </div>
-                  {layaProviderId === 'local' ? (
-                    <>
-                  <div className="hint">
-                    {layaStatus && (
-                      <>
-                        Status: {layaStatus.available ? 'Installed' : 'Not installed'}
-                        {layaStatus.ready ? ' · Ready offline' : ' · Not downloaded'}
-                        {layaStatus.repo ? <> · <code>{layaStatus.repo}</code></> : null}
-                        {layaStatus.reason ? <> · <span title={layaStatus.reason}>{layaReasonLabel(layaStatus.reason)}</span></> : null}
-                      </>
-                    )}
-                  </div>
-                  <label className="field-label">Model (HF repo id)</label>
-                  <input value={layaModel} onChange={(e) => setLayaModel(e.target.value)} dir="ltr" placeholder="convaiinnovations/laya" />
-                  <label className="field-label">Mirror base URL (optional)</label>
-                  <input value={layaBaseUrl} onChange={(e) => setLayaBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
-                  <div className="hint">
-                    Local runs the on-device checkpoint (fast, offline). A provider sends the same
-                    choice/score question to that provider's chat model and falls back to the big
-                    model on low confidence — same pattern as STT.
-                  </div>
-                  <ModelProgress running={runState('laya')} />
-                  <ModelStatusCard status={mStatus?.laya} running={isRunning('laya')} onRemove={(repo) => actRemove('laya', repo)} />
-                  <ModelControls
-                    running={runState('laya')}
-                    canDownload={!(mStatus?.laya?.dirs ?? []).some((d) => d.ready)}
-                    onDownload={() => actDownload('laya')}
-                    onPause={() => actPause('laya')}
-                    onResume={() => actResume('laya')}
-                    onCancel={() => actCancel('laya')}
-                  />
-                    </>
-                  ) : (
-                    <>
-                  <ToolModelSelect
-                    agent="laya"
-                    label="Provider model"
-                    desc="Which chat model answers the fast choice/score question. Empty = this provider's default model."
-                    current={layaProviderModel ? `${layaProviderId}/${layaProviderModel}` : ''}
-                    onSelect={(_agent, val) => {
-                      if (!val) {
-                        setLayaProviderModel('')
-                        return
-                      }
-                      const slash = val.indexOf('/')
-                      if (slash > 0) {
-                        setLayaProviderId(val.slice(0, slash))
-                        setLayaProviderModel(val.slice(slash + 1))
-                      } else {
-                        setLayaProviderModel(val)
-                      }
-                    }}
-                  />
-                  <div className="hint">
-                    A provider sends the same choice/score question to that provider's chat model
-                    and falls back to the big model on low confidence — same pattern as STT.
-                  </div>
-                    </>
-                  )}
                 </div>
               </div>
 
@@ -2538,11 +2425,6 @@ function fmtSpeed(bps?: number): string {
   if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB/s`
   if (v >= 1024) return `${Math.round(v / 1024)} KB/s`
   return `${Math.round(v)} B/s`
-}
-
-/** Laya repos are decision checkpoints, never embedding models. */
-function isLayaRepo(repo?: string): boolean {
-  return !!repo && (repo === 'convaiinnovations/laya' || repo.startsWith('convaiinnovations/laya-'))
 }
 
 /** Card status badge: Not downloaded · Downloading · Paused · Error · Ready. */

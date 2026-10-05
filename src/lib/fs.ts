@@ -55,6 +55,48 @@ export const api = {
   flushPersistDone: (): void => window.coder.flushPersistDone(),
   onMigrateProgress: (cb: (evt: { label: string; pct: number }) => void): (() => void) =>
     window.coder.onMigrateProgress(cb),
+  openFileExternal: async (
+    absPath: string,
+    editor: 'nvim' | 'vscode',
+  ): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const fn = (window as unknown as { coder?: { openFileExternal?: unknown } }).coder?.openFileExternal
+      if (typeof fn !== 'function') {
+        return { ok: false, error: 'External open is unavailable (preload outdated — rebuild the app).' }
+      }
+      const res = await (fn as (a: string, e: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, absPath, editor)
+      if (res && typeof res.ok === 'boolean') return res
+      return { ok: false, error: 'External open is unavailable in this environment.' }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  },
+  openWorkspaceFolder: async (dir: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const fn = (window as unknown as { coder?: { openWorkspaceFolder?: unknown } }).coder?.openWorkspaceFolder
+      if (typeof fn !== 'function') {
+        return { ok: false, error: 'Reveal in file manager is unavailable (preload outdated — rebuild the app).' }
+      }
+      const res = await (fn as (d: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, dir)
+      if (res && typeof res.ok === 'boolean') return res
+      return { ok: false, error: 'Reveal in file manager is unavailable in this environment.' }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  },
+  openWorkspaceTerminal: async (dir: string): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const fn = (window as unknown as { coder?: { openWorkspaceTerminal?: unknown } }).coder?.openWorkspaceTerminal
+      if (typeof fn !== 'function') {
+        return { ok: false, error: 'Terminal open is unavailable (preload outdated — rebuild the app).' }
+      }
+      const res = await (fn as (d: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, dir)
+      if (res && typeof res.ok === 'boolean') return res
+      return { ok: false, error: 'Terminal open is unavailable in this environment.' }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  },
   getNvimFile: (): Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }> =>
     window.coder.getNvimFile() as Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }>,
   onNvimFile: (

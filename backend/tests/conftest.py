@@ -83,8 +83,8 @@ def _reset_tool_contextvars():
     ``tools._PARENT_TOOLS_CTX`` as a side effect. Sync tests that call it
     directly (e.g. test_perf_fixes) run in the shared thread context, so the
     fake ``{"computer": ..., "read": ...}`` dict would otherwise leak into
-    later tests — a general sub-agent would then inherit lambdas instead of
-    real tools and emit no ``sub=True`` read events (test_task_general_agent).
+    later tests — a sub-agent would then inherit lambdas instead of
+    real tools and emit no ``sub=True`` read events (test_task_subagent_tool).
     Production sets this fresh every turn, so resetting per test is safe.
     """
     try:
@@ -209,3 +209,32 @@ def run_events(mock_server, workspace):
         return events
 
     return _run
+
+
+async def await_task_report(ack: object, timeout: float = 15.0) -> str:
+    """Await a background-dispatched ``task`` job and return its final report.
+
+    ``task`` returns a spawn acknowledgement immediately while the sub-agent
+    loop runs as an asyncio.Task on the registry job. Tests that assert on the
+    report — or on side effects recorded while the loop runs (captured model,
+    reserved budget, emitted events) — must await it first. Returns ``ack``
+    unchanged when it carries no ``task_id`` (sync dispatch returns the
+    report directly).
+    """
+    text = str(ack or "")
+    if "task_id=" not in text:
+        return text
+    import subagent_jobs as _jobs
+
+    tid = text.split("task_id=", 1)[1].split(",", 1)[0].split(")", 1)[0].strip()
+    job = _jobs.get_job(tid)
+    running = job.get("task") if job else None
+    if running is not None:
+        try:
+            await asyncio.wait_for(running, timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:  # noqa: BLE001, S110 — report is stored on the job
+            pass
+    job = _jobs.get_job(tid)
+    return str((job or {}).get("report") or "")

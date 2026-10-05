@@ -116,8 +116,6 @@ from llm import (
     _is_temperature_error,
     _plan_only_step_marks_progress,
     _remap_reasoning_effort,
-    _RevisitStreakTracker,
-    _SeenWindows,
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
@@ -130,17 +128,13 @@ from llm import (
     model_key_fallback,
     normalize_tool_transcript,
 )
-from mcp_bridge import build_mcp_tools, describe_tools, is_browser_mcp_tool
+from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
 from tool_batching import (
     execute_readonly_calls,
     merge_same_scope_greps,
-    reset_read_ledger,
-    reset_turn_seen_calls,
 )
 from tool_message_projection import (
-    context_ledger_line,
     project_tool_results,
-    search_ledger_line,
     stable_tool_order,
 )
 
@@ -754,10 +748,6 @@ class AgentState(TypedDict, total=False):
     # lose grants made via "Always allow" / an in-turn Allow-once, re-prompting
     # the user on every agent step.
     _permit: dict
-    # Laya precheck flag: True when laya confidently said "answer directly
-    # without tools" (handle_locally). Set in build_turn_context; read in
-    # _run_mode_turn to skip the tool loop for simple answers.
-    laya_no_tools: bool
     # Explicit user restart (message retry icon / truncate-and-restart). When
     # True the run MUST NOT resume from the interrupted-turn checkpoint — it
     # starts fresh and clears any stale checkpoint so the next resume does
@@ -963,64 +953,6 @@ def history_to_langchain_messages(
 # Per-mode tool filtering (faithful port of agents.py's data-driven gating)
 # ---------------------------------------------------------------------------
 
-
-_COMPUTER_INTENT_HINTS = (
-    "computer", "desktop", "application", "windows", "macos", "linux",
-    "chrome", "tab", "window",
-    "screenshot", "screen", "click", "keyboard", "mouse",
-    "اپ دسکتاپ", "دسکتاپ", "ویندوز", "لینوکس", "صفحه", "کلیک",
-    "کروم", "کامپیوتر", "پنجره", "تب",
-)
-
-
-def _computer_hint_hit(text: str, hint: str) -> bool:
-    """Word-boundary match for a computer-intent hint (mirrors laya's rule).
-
-    Short hints like ``tab``/``تب`` must not fire inside other words
-    (``table``/``database``/``تبلیغ``) — so alnum hints match on word
-    boundaries; non-alnum hints fall back to substring."""
-    hint = (hint or "").strip().lower()
-    if not hint:
-        return False
-    if any(ch.isalnum() or ch == "_" for ch in hint):
-        try:
-            return re.search(r"(?<!\w)" + re.escape(hint) + r"(?!\w)", text) is not None
-        except re.error:
-            return hint in text
-    return hint in text
-
-
-def _wants_computer(prompt: str) -> bool:
-    """True when the prompt shows desktop-control intent.
-
-    Cheap keyword gate (same safety-net pattern as ``wants_skill_or_mcp`` in
-    server.py): keeps the ~2k-token `computer` schema out of every turn unless
-    the user actually asks for desktop work. The laya fast-route decision
-    still runs when the tool IS bound and can steer the model precisely."""
-    text = (prompt or "").strip().lower()
-    if not text:
-        return False
-    return any(_computer_hint_hit(text, h) for h in _COMPUTER_INTENT_HINTS)
-
-
-def _history_wants_computer(history: list | None) -> bool:
-    """True when any of the last few user turns shows desktop-control intent.
-
-    Mirrors the ``allow_create`` safety net in ``server.chat_stream``: a
-    follow-up like "continue" keeps the grant when an earlier turn asked
-    for desktop work (e.g. "look at my open Chrome")."""
-    if not history:
-        return False
-    for turn in list(history)[-6:]:
-        if (
-            isinstance(turn, dict)
-            and turn.get("role") == "user"
-            and _wants_computer(str(turn.get("content", "")))
-        ):
-            return True
-    return False
-
-
 def filter_tools_for_mode(
     mode: str,
     tools: dict[str, Callable],
@@ -1099,8 +1031,8 @@ def filter_tools_for_mode(
     # LLM decides iteratively which to call — there is NO mandatory
     # glob->grep->read order (this matches OpenCode). Write/terminal tools stay
     # coder-only (handled in the blocks above); non-coder modes therefore keep
-    # only read/search/web/vision capabilities. The Explore subagent reuses the
-    # same tool runtime in an isolated context.
+    # only read/search/web/vision capabilities. The background sub-agent reuses
+    # the same tool runtime in an isolated context.
     if mode == "ask" and _agents._trivial_prompt(prompt):
         for n in (
             "update_plan",
@@ -1113,25 +1045,26 @@ def filter_tools_for_mode(
             n: fn for n, fn in tools.items() if n not in ("create_skill", "create_mcp")
         }
     # The `computer` tool (~2k tokens of schema) is only bound when the user
-    # pre-approved desktop control (allow_computer) or the prompt/history
-    # shows desktop intent (same safety-net pattern as allow_create in
-    # server.chat_stream). Otherwise it is stripped here so it never reaches
-    # the model — and the laya fast-route decision below is skipped too.
-    # Runtime permission prompting still applies when the tool IS bound.
-    if "computer" in tools and not (
-        allow_computer or _wants_computer(prompt) or _history_wants_computer(history)
-    ):
+    # explicitly enabled desktop control (allow_computer — the Settings →
+    # Tools "Computer use" toggle, persisted like an MCP connector). It is a
+    # hard switch, not a hint: when OFF the tool never reaches the model —
+    # no prompt-intent auto-binding, no schema tokens —
+    # so the agent cannot touch the desktop at all. When ON, per-action
+    # runtime permission prompting still applies until "Always allow".
+    if "computer" in tools and not allow_computer:
         tools = {n: fn for n, fn in tools.items() if n != "computer"}
 
     scoped = bool(scoped_paths)
     if scoped:
-        # در حالت اسکوپ‌دار فقط glob حذف می‌شود (لیست کل workspace خارج از
-        # اسکوپ است). task نگه داشته می‌شود تا جست‌وجوی گسترده به ساب‌ایجنت
-        # ایزوله تفویض شود — ساب‌ایجنت همان grep/read اسکوپ‌شده والد را به ارث
-        # می‌برد، پس حلقه دستی grep در کانتکست اصلی شکل نمی‌گیرد.
-        tools = {n: fn for n, fn in tools.items() if n not in ("glob",)}
+        # Scoped requests keep grep/glob/read bound but limited to the scope.
+        # Dropping glob entirely surfaced as "unknown tool 'glob'"; instead
+        # wrap it like grep/read so out-of-scope calls get an actionable
+        # scoped error. The sub-agent inherits these same scoped tools, so no
+        # manual grep loop forms in the main context.
         if "grep" in tools:
             tools["grep"] = _agents._wrap_scoped_search(tools["grep"], scoped_paths)
+        if "glob" in tools:
+            tools["glob"] = _agents._wrap_scoped_glob(tools["glob"], scoped_paths)
         if "read" in tools:
             tools["read"] = _agents._wrap_scoped_read(tools["read"], scoped_paths)
         if (
@@ -1145,7 +1078,7 @@ def filter_tools_for_mode(
             )
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
-    # what closes the read-only bypass: an explore/plan-mode `task` call can no
+    # what closes the read-only bypass: a plan-mode `task` call can no
     # longer hand the sub-agent write tools. tools.py reads this contextvar in
     # _run_subagent_task and falls back to the full registry only when it is
     # unset (which should never happen now).
@@ -1220,37 +1153,44 @@ def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     return note
 
 
-# Confidence floor for the CODE MAP laya gate. Kept high on purpose:
-# a wrongly skipped map costs MORE tokens (extra grep/read rounds to find
-# the file) than sending it, so only high-confidence "no_code_map" skips.
-_CODE_MAP_GATE_THRESHOLD = 0.8
-_CODE_MAP_GATE_OPTIONS = ["needs_code_map", "no_code_map"]
+def mcp_schema_chars(tools: list | None) -> int:
+    """Characters of the bound MCP tool definitions (name + description + args
+    JSON schema).
 
-
-def _code_map_gate_skips(
-    mentioned_fnames: set[str],
-    mentioned_idents: set[str],
-    gate_decision: object,
-) -> bool:
-    """Pure predicate behind the CODE MAP laya gate (fail-open).
-
-    Returns True only when ALL hold: no file/code mentions in the history,
-    and the laya choice decision is a high-confidence "no_code_map".
-    Every other input — abstain, low confidence, timeout/busy (handled=False),
-    malformed decision, unexpected exception — returns False so the caller
-    sends the map exactly as before the gate existed.
+    This is the MCP footprint the provider counts as tool definitions —
+    separate from the connector config JSON the frontend can already see.
     """
-    try:
-        if mentioned_fnames or mentioned_idents:
-            return False
-        return bool(
-            getattr(gate_decision, "handled", False)
-            and str(getattr(gate_decision, "value", "") or "") == "no_code_map"
-            and float(getattr(gate_decision, "confidence", 0.0) or 0.0)
-            >= _CODE_MAP_GATE_THRESHOLD
-        )
-    except Exception:  # noqa: BLE001 — doubt sends the map
-        return False
+    total = 0
+    for t in tools or []:
+        total += len(str(getattr(t, "name", "") or ""))
+        total += len(str(getattr(t, "description", "") or ""))
+        args = getattr(t, "args", None)
+        if not isinstance(args, dict):
+            args = {}
+        total += len(json.dumps(args, ensure_ascii=False, default=str))
+    return total
+
+
+def ctx_parts_event(
+    mode: str, system_final: str, skill_section: str, tools: list | None
+) -> dict:
+    """Frontend-facing report of the real per-turn context part sizes.
+
+    ``systemChars`` excludes the skills section (reported separately in
+    ``skillsChars``) so the popover rows never double-count it.
+    """
+    system = str(system_final or "")
+    section = str(skill_section or "")
+    return {
+        "kind": "ctx_parts",
+        "mode": str(mode or ""),
+        "systemChars": max(0, len(system) - len(section)),
+        "skillsChars": len(section),
+        "mcpChars": mcp_schema_chars(tools),
+    }
+
+
+
 
 
 def _mcp_note_for_turn(mcp_tools: list, browser_live: bool, chat_id: str) -> str:
@@ -1554,118 +1494,20 @@ async def _vision_analyze_cached(
     return result
 
 
-def _rank_candidates(
-    query: str,
-    candidates: list[dict],
-    top_k: int,
-    chat_id: str = "",
-    emit: Callable[[dict], None] | None = None,
-    sub: str = "rank",
-    route: str = "normal",
-    prompt: str = "",
-) -> list[dict]:
-    """Best-effort relevance ranking via laya_decide.rank (never raises).
-
-    Returns ranked [{name, confidence, ...}] or [] on no-signal — callers must
-    keep their previous behaviour (full list, original order) when empty.
-    Every non-empty rank is logged to chat trace via report_secondary so laya
-    rows are visible in the Trace panel even for pre-ranks.
-    """
-    try:
-        import laya_decide
-
-        out = laya_decide.rank(query or "", candidates or [], top_k=top_k)
-    except Exception:  # noqa: BLE001 — ranking is best-effort
-        return []
-    if out:
-        try:
-            laya_decide.report_secondary(
-                None,
-                route=route,
-                sub=sub,
-                chat_id=str(chat_id or ""),
-                emit=emit,
-                prompt=str(prompt or query or "")[:2000],
-                ranked=out,
-            )
-        except Exception:  # noqa: BLE001, S110 — observability never breaks ranking
-            pass
-    return out
-
-
 # Code/file token pattern: an English identifier, path or filename means the
 # turn plausibly needs code tools/symbols. Used by ``_obvious_non_code_turn``
 # to fast-skip the symbol map on obvious chit-chat. Skill selection does NOT
-# key on it: the AVAILABLE SKILLS catalog is always present and laya
-# re-ranks it every turn, so short non-English task prompts are covered
-# without any hard-coded keyword list.
+# key on it: the AVAILABLE SKILLS catalog is always present, so short
+# non-English task prompts are covered without any hard-coded keyword list.
 _TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}"
-
-
-# Auto-inline bar: minimum laya confidence for a skill body the model never
-# asked for, how much the best pick must stand out over the strongest
-# non-pick (flat chit-chat noise scores everything ~0.7x — without a margin
-# any greeting "matches" some skill), and how many bodies one turn may
-# inline (a task can legitimately need several skills at once). The bar is
-# deliberately 0.9: only a very strong match is inlined uninvited; anything
-# weaker stays in the catalog for the model to self-serve via load_skill.
-_SKILL_AUTO_CONF = 0.9
-_SKILL_AUTO_MARGIN = 0.05
-_SKILL_AUTO_MAX = 3
-
-
-def _skill_auto_picks(ranked: list[dict]) -> list[str]:
-    """Pure predicate: names of skill bodies to auto-inline this turn (0..N).
-
-    Every ranked skill whose laya confidence clears ``_SKILL_AUTO_CONF`` is
-    picked, up to ``_SKILL_AUTO_MAX`` — one turn may legitimately need
-    several skills. Flat noise (a greeting scoring everything ~0.7x) fails
-    the distinctiveness margin and picks nothing; the model still
-    self-serves via load_skill + the always-present catalog.
-    """
-    try:
-        scored: list[tuple[float, str]] = []
-        for r in ranked or []:
-            if not isinstance(r, dict):
-                continue
-            try:
-                conf = float(r.get("confidence", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                continue
-            name = str(r.get("name") or "").strip()
-            if name:
-                scored.append((conf, name))
-        if not scored:
-            return []
-        above = sorted((p for p in scored if p[0] >= _SKILL_AUTO_CONF), reverse=True)
-        if not above:
-            return []
-        # Distinctiveness: the best pick must stand out over the strongest
-        # non-pick. When every skill clears the bar (small catalog), the
-        # weakest pick plays the background role so an all-flat ~0.7x rank
-        # still inlines nothing; a lone pick has nothing to stand out over.
-        below = [c for c, _ in scored if c < _SKILL_AUTO_CONF]
-        if below:
-            background = max(below)
-        elif len(above) > 1:
-            background = min(c for c, _ in above)
-        else:
-            background = 0.0
-        if above[0][0] - background < _SKILL_AUTO_MARGIN:
-            return []
-        return [name for _, name in above[:_SKILL_AUTO_MAX]]
-    except Exception:  # noqa: BLE001 — doubt inlines nothing
-        return []
 
 
 def _obvious_non_code_turn(prompt: str, history: list) -> bool:
     """Pure predicate: chit-chat turn that cannot need the symbol map.
 
     Short prompt, no code/file tokens in it, and history (if any) with no
-    tool activity and no code tokens. The caller skips the map AND the laya
-    consult entirely — this also removes the laya-timeout stalls seen on
-    greetings. Anything doubtful returns False (fail-open: laya gate, then
-    the map as before).
+    tool activity and no code tokens. The caller skips the map entirely.
+    Anything doubtful returns False (fail-open: the map as before).
     """
     try:
         p = (prompt or "").strip()
@@ -1691,7 +1533,6 @@ def _build_skills_section(
     root: str,
     emit: Callable[[dict], None] | None = None,
     catalog: bool = True,
-    rank_order: list[str] | None = None,
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
@@ -1711,10 +1552,7 @@ def _build_skills_section(
     This is intentionally independent of ``_skill_names_to_strip``: stripping a
     skill's *name* out of the search-keyword derivation must never prevent its
     *body* from being inlined here — the skill is still fully used.
-
-    ``rank_order`` (laya pre-rank, most relevant first) only REORDERS the
-    catalog — it never hides a skill; unknown names keep their relative order
-    at the end, and an empty/None order keeps the original order."""
+    """
     manual_names = list(dict.fromkeys(
         n.strip().casefold() for n in picked_names if n and n.strip()
     ))
@@ -1726,23 +1564,19 @@ def _build_skills_section(
     out = ""
     if catalog and all_skills:
         ordered = list(all_skills)
-        if rank_order:
-            _pos = {str(n or "").casefold(): i for i, n in enumerate(rank_order)}
-            _base = len(_pos)
-            ordered = [
-                s for _, s in sorted(
-                    enumerate(ordered),
-                    key=lambda pair: (
-                        _pos.get(str(pair[1].get("name", "") or "").casefold(), _base),
-                        pair[0],
-                    ),
-                )
-            ]
         lines = [
             f"- {s['name']}"
-            + (f": {s['description']}" if s.get("description") else "")
+            + (
+                f": {desc}"
+                if (desc := (s.get("description") or "").strip())
+                else ""
+            )
             for s in ordered
         ]
+        # Cap each description: a user-written essay in one skill's
+        # description must not bloat every turn's prompt (catalog is
+        # re-sent every turn; the load_skill body carries the detail).
+        lines = [ln if len(ln) <= 200 else ln[:197] + "..." for ln in lines]
         out += (
             "\n\n=== AVAILABLE SKILLS ===\n"
             "Skills are reusable instruction bundles. When the user's task "
@@ -1803,6 +1637,54 @@ def _build_skills_section(
         for s in picked
     )
     return out + "\n\n=== ATTACHED SKILLS ===\n" + bodies
+
+
+def skills_catalog_block(max_chars: int = 1800) -> str:
+    """Compact ``AVAILABLE SKILLS`` catalog for a sub-agent's first message.
+
+    The main agent gets the catalog in its system prompt; a sub-agent runs
+    on the registry prompt only, so without this it cannot see (and cannot
+    ``load_skill``) any user skill. Returns "" when no skills exist — zero
+    tokens for the common no-skills case. The names+descriptions order is
+    the store's.
+
+    ``max_chars`` hard-caps the whole block (catalog-only budget): the
+    newest skills win, a huge store silently truncates instead of eating
+    the delegation context.
+    """
+    try:
+        all_skills = _agents._load_skills("")
+    except Exception:  # noqa: BLE001 — catalog is best-effort
+        return ""
+    if not all_skills:
+        return ""
+    header = (
+        "\n\n=== AVAILABLE SKILLS ===\n"
+        "When the delegated task matches one of the descriptions below, "
+        "call the load_skill tool with that skill's name and follow its "
+        "instructions; when nothing matches, load none.\n"
+    )
+    body = ""
+    for s in all_skills:
+        desc = (s.get("description") or "").strip()
+        line = f"- {s.get('name', '')}" + (f": {desc}" if desc else "")
+        if len(line) > 200:
+            line = line[:197] + "..."
+        body += line + "\n"
+    block = header + body
+    if len(block) > max_chars:
+        # Keep the header + the newest entries that fit.
+        kept = ""
+        for s in reversed(all_skills):
+            desc = (s.get("description") or "").strip()
+            line = f"- {s.get('name', '')}" + (f": {desc}" if desc else "")
+            if len(line) > 200:
+                line = line[:197] + "..."
+            if len(header) + len(line) + 1 + len(kept) > max_chars:
+                break
+            kept = line + "\n" + kept
+        block = header + kept
+    return block
 
 
 def _dedup_code_map(
@@ -1953,8 +1835,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     small_ctx = _agents.is_small_context(ctx)
 
     cap = state.get("cap")
-    # All sub-agents (search / web / explore / vision / compact distills) and the
-    # PARENT LLM loop run on LangChain models built from ``build_chat_model``.
+    # All sub-agents (search / web / subagent / vision / compact distills) and
+    # the PARENT LLM loop run on LangChain models built from ``build_chat_model``.
     subagent_models = state.get("subagent_models") or {}
     # Cross-provider routing: a "providerId/model" sub-agent entry must run on
     # that provider's OWN base URL / key. The frontend sends the full provider
@@ -2006,7 +1888,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     )
     explore_model = resolve_subagent_model(
         state["provider"],
-        subagent_models.get("explore"),
+        subagent_models.get("subagent", subagent_models.get("explore")),
         state["base_url"],
         state["api_key"],
         state["env_var"],
@@ -2016,29 +1898,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
     )
-    # Step-model slot for mid-loop cheap routing: a mechanical follow-up step
-    # (e.g. the Nth browser click in a row) can run on this small model
-    # instead of the main one, gated by laya_decide.step_route. Unset (or
-    # resolving to the same model as the main one) disables the feature.
-    # Falls back to the compact ENTRY so a user who only configured a compact
-    # model still gets cheap steps; default_to_parent=False keeps it None
-    # when neither slot is configured.
-    step_model = resolve_subagent_model(
-        state["provider"],
-        subagent_models.get("step") or subagent_models.get("compact"),
-        state["base_url"],
-        state["api_key"],
-        state["env_var"],
-        state["model_name"],
-        default_to_parent=False,
-        provider_lookup=_provider_lookup,
-        # Bounded so an unreachable step-model provider fails the step (and
-        # the escalation guard takes over) instead of hanging the turn.
-        timeout=60,
-        parent_provider_id=state.get("provider_id", ""),
-        parent_api_keys=state.get("api_keys"),
-    )
-
     settings = await chat_model_settings(
         mode,
         ctx,
@@ -2138,38 +1997,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # keep the lines relevant to what was actually asked.
             task=str(prompt or ""),
         )
-    if mcp_tools and prompt:
-        # Laya MCP pre-rank: most relevant server tools first (reorder-only;
-        # on no-signal the original order is kept — full fallback). Only the
-        # composer-enabled servers in state["mcp_servers"] are ranked, never
-        # the whole connector store.
-        try:
-            from mcp_bridge import describe_tools as _describe_mcp_tools
-
-            _mcp_ranked = await asyncio.to_thread(
-                _rank_candidates,
-                prompt,
-                _describe_mcp_tools(mcp_tools),
-                len(mcp_tools),
-                str(chat_id or ""),
-                lambda ev: queue.put_nowait(ev),
-                "mcp_rank",
-                "normal",
-                prompt,
-            )
-            if _mcp_ranked:
-                _mcp_order = {
-                    str(r.get("name") or ""): i for i, r in enumerate(_mcp_ranked)
-                }
-                _mcp_base = len(_mcp_order)
-                mcp_tools = sorted(
-                    mcp_tools,
-                    key=lambda t: _mcp_order.get(
-                        str(getattr(t, "name", "") or ""), _mcp_base
-                    ),
-                )
-        except Exception:  # noqa: BLE001, S110 — ranking is best-effort
-            pass
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     _tctx_mark("mcp")
     # Whether the `vision` tool survived mode filtering (e.g. coder mode
@@ -2292,62 +2119,16 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
     # (name + description) is ALWAYS in the prompt (except small-context
     # models) so the model can auto-trigger skills via load_skill; @mentioned
-    # bodies are inlined in full. Laya re-ranks the catalog by relevance on
-    # EVERY turn (reorder-only, full fallback) so the most relevant skills
-    # come first whatever language the prompt is in — no keyword gates.
-    # Every distinctive match above the confidence bar auto-inlines: zero
-    # bodies on a greeting's flat scores, several when the task needs them.
-    _skill_rank_order: list[str] | None = None
-    _skill_ranked: list[dict] = []
-    if prompt:
-        try:
-            _rank_skills = _agents._load_skills(root) or []
-            if len(_rank_skills) > 1:
-                _skill_ranked = await _bounded_to_thread(
-                    "skill-rank",
-                    str(chat_id or ""),
-                    _env_timeout("CODIFA_SKILL_RANK_TIMEOUT", 60.0),
-                    _rank_candidates,
-                    prompt,
-                    [
-                        {"name": s.get("name", ""), "description": s.get("description") or ""}
-                        for s in _rank_skills
-                    ],
-                    len(_rank_skills),
-                    str(chat_id or ""),
-                    lambda ev: queue.put_nowait(ev),
-                    "skill_rank",
-                    "normal",
-                    prompt,
-                )
-                if _skill_ranked:
-                    _skill_rank_order = [
-                        str(r.get("name") or "")
-                        for r in _skill_ranked
-                        if str(r.get("name") or "").strip()
-                    ] or None
-        except Exception:  # noqa: BLE001 — ranking is best-effort
-            _skill_rank_order = None
-            _skill_ranked = []
-    # Auto-inline: every distinctive laya match above the bar (0..N bodies);
-    # flat chit-chat noise inlines nothing.
-    try:
-        for _auto_name in _skill_auto_picks(_skill_ranked):
-            _picked = list(skills or [])
-            if not any(str(n or "").strip().casefold() == _auto_name.casefold() for n in _picked):
-                _picked.append(_auto_name)
-                skills = _picked
-    except Exception:  # noqa: BLE001, S110 — auto-picks never break the turn
-        pass
-    if small_ctx:
-        _skill_rank_order = None
-    system_final += _build_skills_section(
+    # bodies are inlined in full. Every distinctive match above the
+    # confidence bar auto-inlines: zero bodies on a greeting's flat scores,
+    # several when the task needs them.
+    _skill_section = _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
         catalog=not small_ctx,
-        rank_order=_skill_rank_order,
     )
+    system_final += _skill_section
 
     if mode in ("plan", "coder"):
         try:
@@ -2362,34 +2143,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # فقط برای مودهای کد تزریق می‌شه (ask/reader/chat نماد نمی‌خوان) و
     # به user turn اضافه می‌شه (نه سیستم‌پرامپت) تا کشِ پیشوند نشکنه.
     code_map_block = ""
-    # Fast path: obvious chit-chat skips the map AND the laya consult (no
-    # laya-timeout stalls on greetings either). A trace row is still emitted
-    # so the skip stays visible in the Laya panel.
+    # Fast path: obvious chit-chat skips the map.
     _map_fast_skip = _obvious_non_code_turn(prompt, state.get("history") or [])
-    if _map_fast_skip:
-        with contextlib.suppress(Exception):
-            import types as _skip_types
-
-            import laya_decide as _laya_skip_mod
-
-            _laya_skip_mod.report_secondary(
-                _skip_types.SimpleNamespace(
-                    handled=True,
-                    value="no_code_map",
-                    confidence=1.0,
-                    abstained=False,
-                    reason="deterministic-fast-path",
-                    kind="choice",
-                    provider_id="local",
-                    model="",
-                ),
-                route="normal",
-                sub="code_map_gate",
-                chat_id=str(chat_id or ""),
-                emit=lambda ev: queue.put_nowait(ev),
-                prompt=str(prompt or "")[:2000],
-                options=list(_CODE_MAP_GATE_OPTIONS),
-            )
     if mode in ("coder", "plan", "ask") and not _map_fast_skip:
         _tctx_status("codemap", "Building code map")
         try:
@@ -2433,53 +2188,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
             # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
             # تکراری کم بشه.
-            # Laya gate for CODE MAP injection (save input tokens without
-            # quality loss): skip building/injecting the map when the turn
-            # clearly needs no code symbols (greetings, general Q&A).
-            # Fail-open — ALL conditions must hold to skip, any doubt sends
-            # the map as before. (1) no file/code mentions anywhere in the
-            # history; (2) laya choice "no_code_map" with high confidence.
-            # The laya consult runs only when (1) already holds, so
-            # code-heavy turns pay zero extra latency. Under-injecting would
-            # cost MORE tokens (extra grep/read rounds to find the file), so
-            # the threshold stays high (0.8) and every laya failure mode
-            # (timeout/busy/abstain/bad-question) falls through to sending.
-            _skip_code_map = False
-            if not _mentioned_fnames and not _mentioned_idents:
-                try:
-                    import laya_decide as _laya_gate_mod
-
-                    _gate_decision = await asyncio.to_thread(
-                        _laya_gate_mod.decide,
-                        {"prompt": prompt or "", "mode": mode or ""},
-                        {
-                            "type": "choice",
-                            "options": list(_CODE_MAP_GATE_OPTIONS),
-                        },
-                        _CODE_MAP_GATE_THRESHOLD,
-                        "",
-                        str(chat_id or ""),
-                    )
-                    try:
-                        _laya_gate_mod.report_secondary(
-                            _gate_decision,
-                            route="normal",
-                            sub="code_map_gate",
-                            chat_id=str(chat_id or ""),
-                            emit=lambda ev: queue.put_nowait(ev),
-                            prompt=str(prompt or "")[:2000],
-                            options=list(_CODE_MAP_GATE_OPTIONS),
-                        )
-                    except Exception:  # noqa: BLE001, S110 — trace is optional
-                        pass
-                    try:
-                        _skip_code_map = _code_map_gate_skips(
-                            _mentioned_fnames, _mentioned_idents, _gate_decision
-                        )
-                    except Exception:  # noqa: BLE001 — doubt sends the map
-                        _skip_code_map = False
-                except Exception:  # noqa: BLE001 — gate is optional, send map
-                    _skip_code_map = False
             _map_rank_info: dict = {}
             code_map_block = (
                 await _bounded_to_thread(
@@ -2494,36 +2202,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     query=prompt,
                     rank_info=_map_rank_info,
                 )
-                if root and not _skip_code_map
+                if root
                 else ""
             )
-            if _skip_code_map:
-                # A skipped turn leaves no map in the transcript, so drop the
-                # cached hash: the next turn must send the full map, never a
-                # "see previous turn" marker pointing at this gap.
-                with contextlib.suppress(Exception):
-                    _gate_hash_cache = getattr(
-                        build_turn_context, "_code_map_hash_cache", None
-                    )
-                    if isinstance(_gate_hash_cache, dict):
-                        _gate_hash_cache.pop(chat_id, None)
-            try:
-                import laya_decide as _laya_mod
-
-                _ranked = _map_rank_info.get("ranked") if isinstance(_map_rank_info, dict) else None
-                if isinstance(_ranked, list) and _ranked:
-                    _laya_mod.report_secondary(
-                        None,
-                        route="normal",
-                        sub="code_map_rank",
-                        chat_id=chat_id,
-                        emit=lambda ev: queue.put_nowait(ev),
-                        elapsed_ms=int(_map_rank_info.get("elapsed_ms") or 0),
-                        prompt=str(_map_rank_info.get("query") or prompt or ""),
-                        ranked=_ranked,
-                    )
-            except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
-                pass
         except Exception:  # noqa: BLE001
             code_map_block = ""
     _tctx_mark("codemap")
@@ -2750,167 +2431,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         user_parts.append(
             _mcp_note_for_turn(mcp_tools, browser_mcp_live, str(chat_id or ""))
         )
-    # پیش‌بررسی laya: پاسخ ساده بدون ابزار (handle_locally) — قبل از هر کار
-    # گران (مدل‌ها، RAG، رتبه‌بندی) تا پاسخ ساده وارد حلقه ابزار نشود.
-    # فقط وقتی handle_locally با اطمینان برگشت، پرچم روی state می‌ماند تا
-    # _run_mode_turn حلقه ابزار را رد کند؛ در غیر این صورت رفتار قبلی ادامه می‌یابد.
-    try:
-        _pre = await asyncio.to_thread(
-            _agents.laya_precheck,
-            prompt or "",
-            mode or "",
-            len(state.get("history") or []),
-            str(chat_id or ""),
-            queue.put_nowait,
-        )
-    except Exception:  # noqa: BLE001 — پیش‌بررسی اختیاری است
-        _pre = None
-    try:
-        if isinstance(_pre, dict) and _pre.get("handled"):
-            state["laya_no_tools"] = True
-    except Exception:  # noqa: BLE001, S110
-        pass
-    # مسیر سریع laya: برای همه چت‌ها اجرا می‌شود تا چت معمولی هم رویداد
-    # laya بگیرد و پنل خالی نماند؛ decide همگام در نخ جدا (to_thread) تا حلقه بلوکه نشود.
-    # مصرف laya (لوکال صفرتوکنی یا توکن واقعی پروایدر) مثل tools با sub=True
-    # در صف رویداد منتشر می‌شود تا در جمع چت ثبت شود و بج پیام به‌هم نریزد.
-    # نکته FAST ROUTE فقط وقتی به پرامپت اضافه می‌شود که ابزار مقصد واقعاً زنده باشد.
-    _computer_live = filtered.get("computer") is not None
-    _tctx_status("laya", "Deciding route")
-    try:
-        import time as _laya_time
-
-        import laya_decide
-
-        _laya_start = _laya_time.monotonic()
-        _fast_route = laya_decide.fast_route(prompt)
-        _fast_decision = await asyncio.to_thread(
-            laya_decide.decide,
-            {"prompt": prompt or "", "mode": mode or ""},
-            {"type": "choice", "options": list(laya_decide.FAST_ROUTE_OPTIONS)},
-            laya_decide.DEFAULT_CONFIDENCE_THRESHOLD,
-            "",
-            str(chat_id or ""),
-        )
-        if _fast_decision.handled and _fast_decision.value in laya_decide.FAST_ROUTE_OPTIONS:
-            _fast_route = str(_fast_decision.value)
-        _laya_usage = getattr(_fast_decision, "usage", None)
-        if isinstance(_laya_usage, dict) and _laya_usage.get("kind") == "usage":
-            _laya_ev = dict(_laya_usage)
-            _laya_ev["sub"] = True
-            _laya_ev["laya"] = True
-            if not _laya_ev.get("provider_id"):
-                _laya_ev["provider_id"] = getattr(_fast_decision, "provider_id", "") or "local"
-            if not _laya_ev.get("model"):
-                _laya_ev["model"] = getattr(_fast_decision, "model", "") or ""
-            with contextlib.suppress(Exception):
-                queue.put_nowait(_laya_ev)
-        # رویداد فعالیت زنده laya برای پنل راست (زیر todos، فقط چت فعال):
-        # مسیر، اطمینان، انصراف، دلیل و زمان تصمیم — جدا از رویداد usage.
-        try:
-            _laya_elapsed = int((_laya_time.monotonic() - _laya_start) * 1000)
-        except Exception:  # noqa: BLE001 — تایمر اختیاری است
-            _laya_elapsed = 0
-        try:
-            _laya_display = _fast_decision.display(_fast_route) if hasattr(_fast_decision, "display") else {}
-        except Exception:  # noqa: BLE001 — نمایش اختیاری است
-            _laya_display = {}
-        if isinstance(_laya_display, dict):
-            _laya_act = {
-                "kind": "laya",
-                "route": str(_laya_display.get("route") or _fast_route or "normal"),
-                "confidence": float(_laya_display.get("confidence") or 0.0),
-                "abstained": bool(_laya_display.get("abstained", False)),
-                "reason": str(_laya_display.get("reason") or ""),
-                "handled": bool(_laya_display.get("handled", False)),
-                "provider_id": str(_laya_display.get("provider_id") or getattr(_fast_decision, "provider_id", "") or "local"),
-                "model": str(_laya_display.get("model") or getattr(_fast_decision, "model", "") or ""),
-                "elapsed_ms": _laya_elapsed,
-            }
-            with contextlib.suppress(Exception):
-                queue.put_nowait(_laya_act)
-            # ثبت در trace_store برای پنل Trace (لایا) — best-effort.
-            with contextlib.suppress(Exception):
-                import trace_store
-
-                _laya_value = getattr(_fast_decision, "value", None)
-                _laya_kind = getattr(_fast_decision, "kind", "choice")
-                trace_store.append(
-                    str(chat_id or ""),
-                    "laya",
-                    f"{(_laya_act.get('route') or 'normal')!s} · {int(float(_laya_act.get('confidence') or 0.0) * 100)}٪",
-                    detail={
-                        "route": _laya_act.get("route"),
-                        "confidence": _laya_act.get("confidence"),
-                        "abstained": _laya_act.get("abstained"),
-                        "reason": _laya_act.get("reason"),
-                        "handled": _laya_act.get("handled"),
-                        "provider_id": _laya_act.get("provider_id"),
-                        "model": _laya_act.get("model"),
-                        "elapsed_ms": _laya_act.get("elapsed_ms"),
-                        "value": _laya_value,
-                        "kind": _laya_kind,
-                        "options": list(laya_decide.FAST_ROUTE_OPTIONS),
-                    },
-                    model=str(_laya_act.get("model") or ""),
-                    prompt=str(prompt or ""),
-                    result=str(_laya_value or "") + (f"\nreason: {_laya_act.get('reason')}" if _laya_act.get("reason") else ""),
-                )
-        if _fast_route == laya_decide.FAST_ROUTE_COMPUTER and _computer_live:
-            try:
-                _cu_step = laya_decide.computer_next_step(prompt or "", "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
-            except Exception:  # noqa: BLE001 — میان‌بر اختیاری است
-                _cu_step = None
-            try:
-                _cu_mode = laya_decide.computer_act_mode(prompt or "", "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
-            except Exception:  # noqa: BLE001 — میان‌بر اختیاری است
-                _cu_mode = None
-            _cu_tail = " Prefer action='act' over 'input'." if _cu_mode == "act" else (" Batch into ONE action='sequence' call." if _cu_mode == "sequence" else "")
-            if _cu_step == "act_direct":
-                user_parts.append(
-                    "FAST ROUTE: computer — call `computer` action='act' DIRECTLY "
-                    "with a selector (no read first); batch multi-step flows into "
-                    f"ONE action='sequence' call.{_cu_tail}"
-                )
-            else:
-                user_parts.append(
-                    "FAST ROUTE: computer — ONE `computer` action='read_screen' "
-                    "(shallow tree is enough), then ONE action='sequence' call. "
-                    "Never re-read after every step; never use 'see' when the "
-                    f"tree answers.{_cu_tail}"
-                )
-        elif _fast_route == laya_decide.FAST_ROUTE_BROWSER and browser_mcp_live:
-            try:
-                _br_step = laya_decide.browser_next_step(prompt or "", chat_id=str(chat_id or ""), emit=queue.put_nowait)
-            except Exception:  # noqa: BLE001
-                _br_step = None
-            try:
-                _br_ranked = laya_decide.rank_browser_tools(
-                    prompt or "", describe_tools(mcp_tools), top_k=3,
-                    chat_id=str(chat_id or ""), emit=queue.put_nowait,
-                )
-            except Exception:  # noqa: BLE001
-                _br_ranked = []
-            _br_hint = ""
-            try:
-                _names = [str(r.get("name", "")) for r in (_br_ranked or []) if isinstance(r, dict) and str(r.get("name", "")).strip()]
-                if _names:
-                    _br_hint = f" Prefer order: {', '.join(_names[:3])}."
-            except Exception:  # noqa: BLE001
-                _br_hint = ""
-            if _br_step == "act_direct":
-                user_parts.append(
-                    "FAST ROUTE: browser — act DIRECTLY with the ranked browser "
-                    f"MCP tool (no snapshot first, avoid web_search).{_br_hint}"
-                )
-            else:
-                user_parts.append(
-                    "FAST ROUTE: browser — ONE snapshot/read first, then act with "
-                    f"the ranked browser MCP tools (avoid web_search).{_br_hint}"
-                )
-    except Exception:  # noqa: BLE001, S110 — مسیر سریع اختیاری است
-        pass
-    _tctx_mark("laya")
     # ابزار computer (کنترل اپ‌های دسکتاپ از طریق Accessibility Tree) فقط وقتی
     # از فیلتر مود عبور کرده به ایجنت اصلی note می‌شود — راهنمای استراتژی استفاده.
     if filtered.get("computer") is not None:
@@ -3047,7 +2567,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         _tctx_total = _tctx_marks.get("done", 0.0)
         _tctx_parts = []
         _tctx_prev = 0.0
-        for _k in ("mcp", "codemap", "laya", "done"):
+        for _k in ("mcp", "codemap", "done"):
             _v = float(_tctx_marks.get(_k, 0.0))
             _tctx_parts.append(f"{_k}={_v - _tctx_prev:.1f}s")
             _tctx_prev = _v
@@ -3061,6 +2581,19 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     except Exception:  # noqa: BLE001, S110 — timing never breaks the turn
         pass
 
+    # Report the REAL per-turn part sizes to the popover (ctx_parts): the
+    # system prompt tail actually sent (mode prompt + workspace note + saved
+    # plan + ...), the skills section, and the bound MCP tool schemas.
+    with contextlib.suppress(Exception):
+        queue.put_nowait(
+            ctx_parts_event(
+                mode,
+                str(system_final),
+                _skill_section,
+                [t for t in filtered.values() if _mcp_server_of(t)],
+            )
+        )
+
     return {
         "model": model,
         "messages": messages,
@@ -3072,7 +2605,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "web_model": web_model,
         "compact_model": compact_model,
         "vision_model": vision_model,
-        "step_model": step_model,
         "main_model": model,
         "prompt": prompt,
         "mcp_cleanup": mcp_cleanup,
@@ -3181,13 +2713,16 @@ def _usage_event_from_ai(
         )
     else:
         # Subset convention: cache_read/write is already folded into input_tokens,
-        # so total_tokens already counts the cache. If the provider reports its own
-        # total_tokens we trust it (it already includes cache + reasoning); only
-        # when absent do we hand-sum, adding reasoning_tokens back in.
-        provided_total = um.get("total_tokens") or 0
+        # so total_tokens already counts the cache. Trust the provider's own
+        # total_tokens — but ONLY when it actually covers input + output: some
+        # routers report a total that EXCLUDES the cached subset of the prompt
+        # (input 286.6K with 40.7K cached -> total 245.9K), and trusting that
+        # made the context meter under-report by exactly the cached portion.
+        # An inconsistent total falls back to the hand-sum.
+        provided_total = int(um.get("total_tokens") or 0)
         total_tokens = (
             provided_total
-            if provided_total
+            if provided_total >= input_tokens + output_tokens
             else input_tokens + output_tokens + reasoning_tokens
         )
     import json as _json
@@ -3477,6 +3012,107 @@ def _steer_to_human_message(steers: list[dict], steps_taken: int = 0) -> HumanMe
 # post-turn backstop still runs once at the end.
 _MAX_COMPACT_PER_TURN = 6
 
+# How long the turn blocks waiting for this chat's background sub-agents to
+# finish before it proceeds anyway (their report is then picked up on a later
+# step/turn instead of stalling the stream forever). Module-level so tests can
+# shrink it to milliseconds rather than sleeping on real time.
+_SUBAGENT_WAIT_TIMEOUT_S = 300.0
+
+
+def _subagent_report_text(task_id: str, report: str, status: str) -> str:
+    """Format one finished background sub-agent's report for the main agent."""
+    label = {
+        "completed": "finished",
+        "failed": "failed",
+        "stopped": "stopped by the main agent",
+    }.get(status, status)
+    body = (report or "").strip() or "(no report produced)"
+    return (
+        f"[background sub-agent report - task_id={task_id}, status={label}]\n"
+        f"{body}"
+    )
+
+
+async def _drain_subagent_reports(
+    msgs: list, chat_id: str, queue: asyncio.Queue
+) -> int:
+    """Inject every finished sub-agent report for this chat into ``msgs``.
+
+    Reports are claimed exactly once (``pop_completed_reports`` flips
+    ``delivered``), so a later turn never re-injects the same report. Returns
+    how many reports were delivered.
+    """
+    if not chat_id:
+        return 0
+    try:
+        import subagent_jobs
+    except Exception:  # noqa: BLE001 — optional module, never break the turn
+        return 0
+    try:
+        done = subagent_jobs.pop_completed_reports(chat_id)
+    except Exception:  # noqa: BLE001 — bookkeeping must not kill the turn
+        return 0
+    delivered = 0
+    for task_id, report, status in done:
+        msgs.append(
+            HumanMessage(content=_subagent_report_text(task_id, report, status))
+        )
+        try:
+            queue.put_nowait(
+                {
+                    "kind": "subagent_report",
+                    "task_id": task_id,
+                    "status": status,
+                    "content": report,
+                }
+            )
+        except Exception:  # noqa: BLE001, S110 — UI event is best-effort
+            pass
+        delivered += 1
+    return delivered
+
+
+async def _await_subagent_jobs(chat_id: str, queue: asyncio.Queue) -> bool:
+    """Block until this chat's running sub-agents finish. True if it waited.
+
+    Bounded by ``_SUBAGENT_WAIT_TIMEOUT_S`` so one hung sub-agent can never
+    stall the turn forever: after the timeout the turn proceeds and any report
+    that lands later is picked up by ``_drain_subagent_reports``.
+    """
+    if not chat_id:
+        return False
+    try:
+        import subagent_jobs
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        pending = [
+            j for j in subagent_jobs.pending_jobs(chat_id) if j.get("task") is not None
+        ]
+    except Exception:  # noqa: BLE001
+        return False
+    if not pending:
+        return False
+    try:
+        queue.put_nowait(
+            {
+                "kind": "status",
+                "stage": "subagent_wait",
+                "content": (
+                    f"Waiting for {len(pending)} background sub-agent(s) to finish"
+                ),
+            }
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        await asyncio.wait(
+            [j["task"] for j in pending], timeout=_SUBAGENT_WAIT_TIMEOUT_S
+        )
+    except Exception:  # noqa: BLE001, S110 — waiting must never break the turn
+        pass
+    return True
+
 
 async def _maybe_auto_compact(
     state: AgentState,
@@ -3559,9 +3195,12 @@ async def _maybe_auto_compact(
     # the transcript regrows significantly, so the message prefix stays
     # stable for prompt caching (truncating one more message every step
     # would rewrite the prefix each step and force full-price reprocessing).
-    _cheap_pct = _pct // 2  # e.g. 80 → 40
+    # Cheap truncation fires at 25% of the compaction threshold (e.g. 80 →
+    # 20): old ToolMessages are the dominant per-step cost (every byte is
+    # re-sent on every following step), so shed them early. LLM summarization
+    # still fires at the full threshold.
+    _cheap_pct = max(5, _pct // 4)  # e.g. 80 → 20
     cheap_threshold = int(ctx * _cheap_pct / 100)
-    _truncated_any = False
     if total >= cheap_threshold:
         _last_cheap = state.get("_cheap_truncated_at")
         _regrow = max(10_000, int(ctx * 5 / 100))
@@ -3667,11 +3306,7 @@ async def _maybe_auto_compact(
                     state["_cheap_truncated_at"] = total
     # --- end cheap truncation -------------------------------------------
     if total < threshold:
-        # Cheap truncation discarded old tool contents but left the turn
-        # ledgers claiming coverage. Signal a compaction so the caller
-        # clears seen-windows/cross-turn reuse; otherwise the next repeat
-        # stubs with "already in context" while the content is gone.
-        return 1 if _truncated_any else 0
+        return 0
     # opencode prune: clear old tool outputs (not the whole turn) before the
     # heavier summarization pass, so a large-but-not-overflowing transcript
     # still sheds context. Runs in place on the serialized history.
@@ -3715,30 +3350,7 @@ async def _maybe_auto_compact(
     return 1
 
 
-def _prev_step_tool_summary(msgs: list) -> tuple[str, bool] | None:
-    """``(tool names, any_error)`` of the most recent tool step, or ``None``.
 
-    Input for the laya ``step_route`` gate: only a transcript whose tail is
-    tool results (the model just acted) is a continuation candidate. A
-    text-only reply, a steer message, or an empty transcript returns ``None``
-    so the gate is skipped and the step stays on the main model.
-    """
-    if not msgs or not isinstance(msgs[-1], ToolMessage):
-        return None
-    names: list[str] = []
-    any_error = False
-    for message in reversed(msgs):
-        if isinstance(message, ToolMessage):
-            if getattr(message, "status", "success") != "success":
-                any_error = True
-            continue
-        if isinstance(message, AIMessage):
-            calls = getattr(message, "tool_calls", None) or []
-            names = [str(tc.get("name") or "") for tc in calls if tc.get("name")]
-        break
-    if not names:
-        return None
-    return (", ".join(names), any_error)
 
 
 async def _run_mode_turn(
@@ -3782,26 +3394,6 @@ async def _run_mode_turn(
         queue.put_nowait({"kind": "status", "stage": "thinking", "content": "Contacting model"})
     except Exception:  # noqa: BLE001, S110 — progress must never break the turn
         pass
-    # Laya precheck: simple answer without tools — bind no tools and tell
-    # the model to answer directly. Best-effort: any failure falls back to
-    # the normal tool loop below.
-    if state.get("laya_no_tools"):
-        try:
-            tctx["lc_tools"] = []
-            tctx["tools"] = {}
-            messages_no_tools: list[BaseMessage] = list(tctx["messages"])
-            messages_no_tools.append(
-                HumanMessage(
-                    content=(
-                        "[laya precheck: this request can be answered directly "
-                        "from the conversation context — answer in text now "
-                        "without calling any tool.]"
-                    )
-                )
-            )
-            tctx["messages"] = messages_no_tools
-        except Exception:  # noqa: BLE001, S110 — fallback to normal loop
-            pass
     model = tctx["model"]
     # The real model id the LangChain client will hit (e.g. a sub-agent model
     # resolved for web/compact/vision), used to attribute usage correctly.
@@ -3844,22 +3436,6 @@ async def _run_mode_turn(
     # None when the user hasn't configured a compact/subagent model — in that
     # case obsolete tool results are dropped outright instead of summarized.
     compact_model = tctx.get("compact_model")
-    # Step model for mid-loop cheap routing (laya step_route gate). Disabled
-    # unless the user configured a step/compact model that is DIFFERENT from
-    # the main model — routing a step to the same model would only add a
-    # gate round-trip for nothing.
-    step_model_slot = tctx.get("step_model")
-    if (
-        step_model_slot is not None
-        and str(getattr(step_model_slot, "model_name", "") or "")
-        == str(getattr(model, "model_name", "") or "")
-    ):
-        step_model_slot = None
-    # Flipped off for the rest of the turn the first time the step model
-    # fails (provider error / empty response) — see the escalation guards in
-    # the step loop below. Survives _inner retries on purpose: one broken
-    # step model must not keep re-breaking an otherwise working turn.
-    _cheap_steps_ok = True
 
     if extra_instruction:
         # Inject as HumanMessage (not SystemMessage) so it lands mid-list
@@ -3891,14 +3467,22 @@ async def _run_mode_turn(
     if _max_steps_override > 0:
         MAX_STEPS = max(5, min(_max_steps_override, 200))
     else:
-        MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 40))
-
+        # Tighter auto budget: each step re-sends the full transcript, so
+        # fewer steps is the cheapest token saving. 12–40 was generous for
+        # mechanical browser/computer loops; 8–24 keeps room for real work
+        # while cutting the worst-case round-trips nearly in half.
+        MAX_STEPS = max(8, min(int(ctx) // 6000 if ctx else 16, 24))
     async def _execute_tool(name: str, args: dict, call_id: str = "", step: int = 0) -> str:
         import inspect
 
         fn = filtered.get(name)
         if fn is None:
-            return f"ERROR: unknown tool {name!r}"
+            return (
+                f"ERROR: unknown tool {name!r}. "
+                f"Bound tools: {', '.join(sorted(filtered.keys())) or '(none)'}. "
+                "Never claim a listed tool is unavailable — call it directly "
+                "and report this exact ERROR if it fails."
+            )
         # Trace every tool call with its prompt/args so the Trace panel shows
         # the full request like LangSmith (best-effort, never breaks the turn).
         _tool_entry = None
@@ -4054,7 +3638,7 @@ async def _run_mode_turn(
     _step_progress = 0
 
     async def _inner() -> str:
-        nonlocal model, _step_progress, mcp_cleanup, _cheap_steps_ok
+        nonlocal model, _step_progress, mcp_cleanup
         # NOTE: `msgs` aliases the OUTER `messages` list so completed tool work
         # (tool calls + their results) survives a retry. On a transient throttle
         # we re-run the loop from the SAME accumulated transcript -- the model
@@ -4092,21 +3676,6 @@ async def _run_mode_turn(
         # sent) and reminds it to batch after a few consecutive same-scope
         # steps — the per-step detector alone never sees those.
         _streak = _BatchStreakTracker()
-        # Re-read tracker: records fetched read windows per turn and reminds
-        # the model when a requested window is already in context.
-        _reread = _SeenWindows()
-        reset_read_ledger()
-        # Revisit streak: same file/scope re-touched step after step.
-        _revisit = _RevisitStreakTracker()
-        # Ignored-coverage hard stop: a covered read or a duplicate/reused
-        # search stub still burns a full round-trip (the stub comes back AFTER
-        # the call). Warning every time is not enough — after N such steps the
-        # turn must stop read/grep-calling and summarize, like the doom-loop
-        # guard below. Mirrors llm.py's _COVER_IGNORE_LIMIT so both loops
-        # escalate the same way.
-        _COVER_IGNORE_LIMIT = 3
-        _cover_ignore_count = 0
-        reset_turn_seen_calls()
         # When a recoverable repetition is detected (same tool+args, but still
         # below the hard-stop threshold), we queue a nudge and set this flag so
         # the HumanMessage is appended AFTER the tool results (keeping the
@@ -4124,8 +3693,7 @@ async def _run_mode_turn(
         # رویداد warn تذکر batching فقط یک بار در هر نوبت به UI می‌رود.
         _batch_warned = False
         # Set when a step ended in a provider exception / escalation, so the
-        # NEXT iteration re-binds the (possibly param-stripped) main model
-        # and skips the cheap-routing gate for that retry.
+        # NEXT iteration re-binds the (possibly param-stripped) main model.
         _prev_step_failed = False
         # Auto-continue guard for max-output truncation (mirrors opencode, which
         # treats finish_reason=="length" as a normal partial stop and keeps
@@ -4146,6 +3714,9 @@ async def _run_mode_turn(
             # model never learns it should stop and tends to spam reads first.
             if steps >= MAX_STEPS:
                 msgs.append(AIMessage(content=_agents._MAX_STEPS_PROMPT))
+            # Deliver any background sub-agent report that finished since the
+            # previous step so the main agent reads it before its next call.
+            await _drain_subagent_reports(msgs, chat_id, queue)
             # Live steer injection: user messages typed mid-run.
             steers = await _agents._drain_steer(chat_id)
             if steers:
@@ -4173,7 +3744,8 @@ async def _run_mode_turn(
                         if _new_tools:
                             _browser_live = merge_mcp_tools(filtered, _new_tools, cap)
                             for _t in _new_tools:
-                                lc_tools.append(_t)
+                                if _t.name not in {getattr(_x, "name", "") for _x in lc_tools}:
+                                    lc_tools.append(_t)
                             msgs.append(
                                 HumanMessage(
                                     content=_mcp_tools_note(_new_tools, _browser_live)
@@ -4210,38 +3782,8 @@ async def _run_mode_turn(
                 queue.put_nowait(
                     {"kind": "steer_applied", "ids": [s.get("id", "") for s in steers]}
                 )
-            # ── Per-step cheap routing (laya step_route) ────────────────────
-            # A mechanical follow-up (the model just ran tools and the gate
-            # expects another routine call) can run on the small step model;
-            # everything else stays on the main model. Laya only PICKS the
-            # route — the chosen model still generates every tool call.
+            # Every step runs on the main model (cheap step routing removed).
             _bind_model = model
-            _cheap_step_active = False
-            if (
-                step_model_slot is not None
-                and _cheap_steps_ok
-                and steps >= 2
-                and not _prev_step_failed
-            ):
-                _prev = _prev_step_tool_summary(msgs)
-                if _prev is not None:
-                    try:
-                        import laya_decide as _laya_step
-
-                        _route = await asyncio.to_thread(
-                            _laya_step.step_route,
-                            str(state.get("request") or state.get("prompt") or ""),
-                            _prev[0],
-                            _prev[1],
-                            steps,
-                            chat_id=str(chat_id or ""),
-                            emit=queue.put_nowait,
-                        )
-                    except Exception:  # noqa: BLE001 — routing is optional
-                        _route = None
-                    if _route == "cheap_step":
-                        _bind_model = step_model_slot
-                        _cheap_step_active = True
             _prev_step_failed = False
             # Usage/trace rows must name the model that ACTUALLY ran.
             model_id = getattr(_bind_model, "model_name", None) or state.get(
@@ -4587,19 +4129,6 @@ async def _run_mode_turn(
                     str(exc),
                 )
                 _prev_step_failed = True
-                if _cheap_step_active:
-                    # The step model failed (context overflow, auth, 5xx…):
-                    # re-run THIS step on the main model and stop cheap
-                    # routing for the rest of the turn — a broken step model
-                    # must never break the turn.
-                    _cheap_steps_ok = False
-                    _cheap_step_active = False
-                    logger.warning(
-                        "[run_graph] step model failed; escalating step %s "
-                        "to the main model",
-                        steps,
-                    )
-                    continue
                 # A few local OpenAI-compatible servers (old llama.cpp / custom
                 # builds) reject `stream_options` even though most accept or
                 # ignore it. Retry the current step once with a model built
@@ -4750,14 +4279,6 @@ async def _run_mode_turn(
                 # a bounded number of times so the model can actually produce
                 # output, and only warn+break if it keeps returning nothing.
                 if not _partial.strip() and not (reply or "").strip():
-                    if _cheap_step_active:
-                        # A cheap step that produced NOTHING is the classic
-                        # small-model failure: escalate this step to the main
-                        # model, then stop cheap routing for the turn.
-                        _cheap_steps_ok = False
-                        _cheap_step_active = False
-                        _prev_step_failed = True
-                        continue
                     if _auto_cont < _MAX_AUTO_CONT:
                         _auto_cont += 1
                         msgs.append(HumanMessage(content="ادامه بده."))
@@ -4772,6 +4293,16 @@ async def _run_mode_turn(
                         }
                     )
                     break
+                # Hold the turn open while background sub-agents are still
+                # running: their reports must reach the main agent before it
+                # writes its final answer. Keep the partial reply in the
+                # transcript (valid - an AI message with no tool_calls), wait
+                # for the jobs, deliver their reports, then let the model
+                # continue from them on the next step.
+                if await _await_subagent_jobs(chat_id, queue):
+                    msgs.append(AIMessage(content=_partial))
+                    await _drain_subagent_reports(msgs, chat_id, queue)
+                    continue
                 reply = (reply or "") + _partial
                 break
             # --- Repetition-loop detection (tool-call signature) -------------
@@ -4944,31 +4475,17 @@ async def _run_mode_turn(
             _step_hint = _batchable_nudge([*_exec_calls, *_sequential])
             _streak_hint = _streak.observe(_pending)
             _batch_hint = _step_hint or _streak_hint
-            # Coverage check BEFORE observe records this step: fully covered
-            # reads get a stub in the transcript instead of re-sent content.
-            _cover_stubs = _reread.check_covered(_pending)
-            _reread_hint = _reread.observe(_pending)
-            _revisit_hint = _revisit.observe(_pending)
             async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
                 )
 
             _tool_t0 = time.monotonic()
-            _results = await execute_readonly_calls(_exec_calls, _run_readonly, query=state.get("request") or "")
+            _results = await execute_readonly_calls(_exec_calls, _run_readonly)
             _expanded = _expand_merged(_results)
-            # A stubbed (covered) read OR a duplicate/reused search means this
-            # step re-requested content the model already holds — count it for
-            # the ignored-coverage escalation below.
-            _coverage_stub_step = bool(_cover_stubs)
             for tc, result in zip(_parallel, _expanded):
                 _cid = tc.get("id", "")
-                if _cid in _cover_stubs:
-                    result = _cover_stubs[_cid]
-                _res_txt = str(result)
-                if _res_txt.startswith(("DUPLICATE ", "REUSED ", "SKIPPED ")):
-                    _coverage_stub_step = True
-                append_tool_result(msgs, _res_txt, _cid)
+                append_tool_result(msgs, str(result), _cid)
             # Persist the completed parallel tool work ATOMICALLY — save once
             # after ALL results are appended so a crash never leaves a
             # half-finished checkpoint that orphans tool_calls on resume.
@@ -4988,12 +4505,7 @@ async def _run_mode_turn(
                 # only execute it and feed the result back to the model.
                 result = await _execute_tool(name, args, tc.get("id") or "", steps)
                 _cid = tc.get("id", "")
-                if _cid in _cover_stubs:
-                    result = _cover_stubs[_cid]
-                _res_txt = str(result)
-                if _res_txt.startswith(("DUPLICATE ", "REUSED ", "SKIPPED ")):
-                    _coverage_stub_step = True
-                append_tool_result(msgs, _res_txt, _cid)
+                append_tool_result(msgs, str(result), _cid)
                 # Persist this completed (mutating) tool result too — the
                 # remaining sequential calls of this step get placeholders.
                 # Force the save on the LAST sequential call so the turn-end
@@ -5018,13 +4530,6 @@ async def _run_mode_turn(
             # a standalone message is impossible to miss, unlike a suffix at
             # the end of a huge result. Surfaced to the user once per turn so
             # the UI shows the nudge is actually firing.
-            _transient_msgs.clear()
-            _ledger_line = context_ledger_line(msgs)
-            if _ledger_line:
-                _transient_msgs.append(HumanMessage(content=_ledger_line))
-            _search_line = search_ledger_line(msgs)
-            if _search_line:
-                _transient_msgs.append(HumanMessage(content=_search_line))
             if _batch_hint:
                 if not _batch_warned:
                     _batch_warned = True
@@ -5032,53 +4537,6 @@ async def _run_mode_turn(
                         {"kind": "warn", "content": _batch_hint.strip()}
                     )
                 _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
-            if _reread_hint:
-                _transient_msgs.append(HumanMessage(content=_reread_hint.strip()))
-            if _revisit_hint:
-                _transient_msgs.append(HumanMessage(content=_revisit_hint.strip()))
-            # Ignored-coverage escalation: a covered read (stub) or a
-            # duplicate/reused search stub means the model re-requested content
-            # it already holds — the round-trip is already burned, so warn the
-            # user once and put the stop order on the TRANSIENT channel (a
-            # message appended right before a break is never delivered to the
-            # model). A further ignored step hard-stops the loop.
-            if _coverage_stub_step:
-                _cover_ignore_count += 1
-                if _cover_ignore_count == _COVER_IGNORE_LIMIT:
-                    _transient_msgs.append(
-                        HumanMessage(
-                            content=(
-                                "[steering] You re-requested content already in "
-                                f"context {_cover_ignore_count} times in a row "
-                                "(covered or duplicate reads/searches return a "
-                                "stub AFTER burning a round-trip). Do NOT call "
-                                "read/grep again — write a text summary of what "
-                                "you already know."
-                            )
-                        )
-                    )
-                    queue.put_nowait(
-                        {
-                            "kind": "warn",
-                            "content": (
-                                "The model requested content that is ALREADY in "
-                                "context (covered or duplicate read/search) — the "
-                                "stub saves tokens but the round-trip is spent, so "
-                                "the stop order was sent."
-                            ),
-                        }
-                    )
-                elif _cover_ignore_count > _COVER_IGNORE_LIMIT:
-                    queue.put_nowait(
-                        {
-                            "kind": "warn",
-                            "content": (
-                                f"Stopped {_cover_ignore_count} covered/duplicate "
-                                "tool calls — reuse the content already in context."
-                            ),
-                        }
-                    )
-                    break
             if _is_plan_only_step(_pending):
                 # Plan mode's required checklist call and any tick that marks
                 # step(s) completed (final tick has no following work by
@@ -5137,10 +4595,6 @@ async def _run_mode_turn(
                     compact_at_percent=state.get("compact_at_percent", 80),
                 )
                 _compact_count += _compacted
-                if _compacted:
-                    # Compaction may have discarded fetched content — drop the
-                    # seen-window record so re-reads are not wrongly nagged.
-                    _reread.clear()
             # This step completed (the model responded and any tool calls
             # ran) — record the progress so the retry wrapper can tell a
             # mid-work failure from an idle one.
@@ -5165,6 +4619,11 @@ async def _run_mode_turn(
             except Exception:  # noqa: BLE001, S110 — timing never breaks turn
                 pass
             _step_progress += 1
+        # Final delivery: a report that landed while the last step ran, or a
+        # turn that hit MAX_STEPS with jobs still in flight, must never be
+        # silently dropped. Wait once more, then inject whatever arrived.
+        await _await_subagent_jobs(chat_id, queue)
+        await _drain_subagent_reports(msgs, chat_id, queue)
         return reply
 
     # Unified retry: ANY transient provider failure (429 throttle, 5xx, timeout,
@@ -5173,12 +4632,12 @@ async def _run_mode_turn(
     # of giving up on the first blip. Hard failures
     # (bad request / quota exhausted / auth) surface as a fatal error event
     # without burning the retry budget.
-    # Subagent runs use mode "explore"/"general"; the main turn uses
+    # Subagent runs use mode "subagent"; the main turn uses
     # ask/coder/plan/reader. Tag retry events only for subagents so the UI can
     # show "Sub-agent failed — using main model" instead of a generic hiccup.
     def _retry_event_agent(state):
         mode = state.get("mode")
-        return mode if mode in ("explore", "general") else ""
+        return mode if mode in ("subagent",) else ""
 
     reply = ""
     # Whole-turn wall: counts IDLE failures only (attempts that made no
@@ -5652,9 +5111,41 @@ def _route_coder_entry(state: AgentState) -> str:
 
 async def coder_node(state: AgentState) -> dict:
     queue = state["_queue"]
+    recorder = _RecordingQueue(queue)
+    # Same-run approved plan: plan_build ran just before in this graph run,
+    # so the plan lives in state (not yet in history, and disk lookup alone
+    # is not enough to orient the model). Hand it explicitly so Coder
+    # implements instead of writing a new '## Plan' document.
+    approved_plan = state.get("plan") or ""
+    extra = ""
+    if isinstance(approved_plan, str) and approved_plan.strip():
+        import re as _re_approved
+
+        if _re_approved.search(r"#{1,3}\s*plan\b", approved_plan, _re_approved.IGNORECASE):
+            extra = (
+                "[APPROVED PLAN — implement now, do not re-plan]\n"
+                "An approved implementation plan already exists for this task "
+                "(saved below). Execute it now with edit_file/write_file — "
+                "never reply with a new '## Plan' document.\n\n"
+                f"{approved_plan.strip()}"
+            )
     reply = await _run_mode_turn(
-        state, "coder", queue, run_flags=state.get("_run_flags")
+        state, "coder", recorder, extra_instruction=extra, run_flags=state.get("_run_flags")
     )
+    if not isinstance(reply, str):
+        reply = "" if reply is None else str(reply)
+    # A '## Plan' written in Coder mode (plan-then-execute when none exists)
+    # must produce the same clickable Plan card as plan mode — otherwise it
+    # renders as plain chat text and never reaches the right-side viewer.
+    turn_text = recorder.text() or reply
+    if isinstance(turn_text, str) and turn_text.strip():
+        import re as _re_coder_plan
+
+        if _re_coder_plan.search(r"#{1,3}\s*plan\b", turn_text, _re_coder_plan.IGNORECASE):
+            try:
+                _persist_plan_text(queue, state.get("root", ""), state.get("chat_id", ""), turn_text)
+            except Exception:  # noqa: BLE001, S110 — the card must never break the run
+                pass
     return {"coder_result": reply, "final_response": reply}
 
 
@@ -7010,6 +6501,11 @@ def _split_plan_reply(reply: str) -> tuple[str, str]:
         return "", ""
     m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
     if not m:
+        # Streamed chunks concatenate without a newline (e.g. "scouting… " +
+        # "## Plan"), so the header may sit mid-line. Fall back to an
+        # unanchored match so the scouting prose still splits off as preamble.
+        m = re.search(r"#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE)
+    if not m:
         return "", text
     return text[: m.start()].strip(), text[m.start() :]
 
@@ -7071,6 +6567,39 @@ def _plan_title(plan_body: str) -> str:
     return ""
 
 
+def _persist_plan_text(queue: asyncio.Queue, root: str, chat_id: str, text: str) -> str:
+    """Persist plan text, emit plan_card + todos sync, return the body."""
+    preamble, plan_body = _split_plan_reply(text)
+    try:
+        ws = state_db.workspace_slug_for_root(root)
+    except Exception:  # noqa: BLE001 — slug must never break the run
+        ws = "workspace"
+    if not ws:
+        ws = "workspace"
+    try:
+        state_db.save_plan(ws, "plan", plan_body, chat_id=chat_id)
+    except Exception:
+        logging.getLogger(__name__).exception("persist_plan: save_plan failed")
+    try:
+        queue.put_nowait(
+            {
+                "kind": "plan_card",
+                "title": _plan_title(plan_body),
+                "body": plan_body,
+                "preamble": preamble,
+            }
+        )
+    except Exception:  # noqa: BLE001, S110 — the card must never break the run
+        pass
+    try:
+        derived = _plan_items_from_body(plan_body)
+        if derived:
+            queue.put_nowait({"kind": "plan", "items": derived})
+    except Exception:  # noqa: BLE001, S110 — todos sync never breaks the run
+        pass
+    return plan_body
+
+
 async def _request_plan_approval(queue: asyncio.Queue, gate: dict) -> str:
     """Ask the user to approve / edit / dismiss the finished plan and WAIT.
 
@@ -7104,59 +6633,97 @@ async def _request_plan_approval(queue: asyncio.Queue, gate: dict) -> str:
     return answer if isinstance(answer, str) else ""
 
 
+class _RecordingQueue:
+    """Queue proxy that records streamed text while forwarding every event.
+
+    ``_run_mode_turn`` returns only the FINAL message of a turn, but the
+    planner writes the ``## Plan`` body in an earlier step — the same message
+    that carries its ``update_plan`` tool call — and text from tool-carrying
+    steps never reaches that reply. Saving from the reply alone therefore
+    stored only the closing prose as the plan (the "wrong text saved" bug).
+    The full turn text is exactly what the queue streams, so plan_build
+    records it here and splits the plan out of the concatenated text,
+    falling back to the reply when the turn emitted no text events (tests
+    that fake the turn entirely).
+    """
+
+    def __init__(self, queue: asyncio.Queue) -> None:
+        self._queue = queue
+        self._parts: list[str] = []
+
+    def put_nowait(self, event: object) -> None:
+        if isinstance(event, dict) and event.get("kind") == "text":
+            content = event.get("content")
+            if isinstance(content, str):
+                self._parts.append(content)
+        self._queue.put_nowait(event)
+
+    def text(self) -> str:
+        """All streamed text of the turn (stripped; "" when nothing streamed)."""
+        return "".join(self._parts).strip()
+
+    def __getattr__(self, name: str) -> Any:
+        # Everything else (get/empty/…) is the real queue's — plan_build and
+        # _run_mode_turn only need put_nowait, which is recorded above.
+        return getattr(self._queue, name)
+
+
+def _without_trailing_reply(turn_text: str, reply: str) -> str:
+    """Drop the final closing message from the streamed turn text.
+
+    The turn ends with a short closing prose ("plan written, ready for
+    review") that is NOT part of the plan — the plan itself (``## Plan`` …
+    ``Files:`` … summary) was streamed earlier. Since the closing message is
+    also streamed, the concatenated turn text ends with it; stripping that
+    suffix leaves just scouting + plan so ``_split_plan_reply`` persists the
+    plan without the preamble prefix or the closing suffix. Falls back to the
+    full text when there is no suffix match (e.g. single-message turns where
+    the reply IS the whole turn).
+    """
+    import re
+
+    text = (turn_text or "").strip()
+    tail = (reply or "").strip()
+    if tail and text.endswith(tail) and len(text) > len(tail):
+        stripped = text[: -len(tail)].strip()
+        # Never cut the plan itself: the reply CARRIES the plan when the model
+        # wrote '## Plan' in a message without a tool call. Stripping that
+        # suffix would delete the plan and leave only the scouting narration —
+        # which then gets saved as the whole plan (the "narration saved as the
+        # plan" bug). Keep the full text and let _split_plan_reply cut at the
+        # header instead; the closing prose stays inside the body.
+        header = re.compile(r"#{1,3}\s*plan\b", re.IGNORECASE)
+        if header.search(text) and not header.search(stripped):
+            return text
+        return stripped
+    return text
+
+
 async def plan_build(state: AgentState) -> dict:
     queue = state["_queue"]
     chat_id = state.get("chat_id", "")
     attempts = int(state.get("plan_attempts", 0))
     approved = False
 
-    def _save_and_emit(reply: str) -> str:
-        """Persist the plan, emit the Plan card event, return the plan body."""
-        from tools import slugify
+    def _save_and_emit(text: str) -> str:
+        """Persist the plan text, emit the Plan card event, return the body."""
+        return _persist_plan_text(queue, state["root"], chat_id, text)
 
-        ws = (
-            slugify(os.path.basename(os.path.realpath(state["root"]).rstrip(os.sep)))
-            or "workspace"
-        )
-        preamble, plan_body = _split_plan_reply(reply)
-        try:
-            state_db.save_plan(ws, "plan", plan_body, chat_id=chat_id)
-        except Exception:
-            # Surface the failure instead of swallowing it: a silent drop is
-            # exactly the "plan sometimes isn't saved" bug.
-            logging.getLogger(__name__).exception("plan_build: save_plan failed")
-        try:
-            queue.put_nowait(
-                {
-                    "kind": "plan_card",
-                    "title": _plan_title(plan_body),
-                    "body": plan_body,
-                    "preamble": preamble,
-                }
-            )
-        except Exception:  # noqa: BLE001, S110 — the card must never break the run
-            pass
-        # Keep todos in sync with the plan document: a revised plan replaces
-        # the previous checklist so the right panel never shows stale steps.
-        # Skipped when no steps parse so an empty parse never wipes todos.
-        try:
-            derived = _plan_items_from_body(plan_body)
-            if derived:
-                queue.put_nowait({"kind": "plan", "items": derived})
-        except Exception:  # noqa: BLE001, S110 — todos sync never breaks the run
-            pass
-        return plan_body
-
+    recorder = _RecordingQueue(queue)
     reply = await _run_mode_turn(
-        state, "plan", queue, run_flags=state.get("_run_flags")
+        state, "plan", recorder, run_flags=state.get("_run_flags")
     )
     # Guard against a non-string reply (e.g. None when the turn fails) so we
     # don't crash on .strip() — and never silently swallow a save failure.
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
     attempts += 1
-    if reply.strip():
-        reply = _save_and_emit(reply)
+    # Prefer the STREAMED turn text: the reply only carries the final message,
+    # while the '## Plan' body was written in an earlier (tool-carrying) step.
+    # The trailing closing message is stripped so only scouting + plan remain.
+    turn_text = _without_trailing_reply(recorder.text() or reply, reply)
+    if turn_text.strip():
+        reply = _save_and_emit(turn_text)
         # Approval gate — but NOT when the planner just had a clarifying
         # question answered mid-turn: _route_plan_build re-runs the planner
         # against that fresh answer first, and the finalized plan gets its own
@@ -7188,10 +6755,11 @@ async def plan_build(state: AgentState) -> dict:
                     break
                 # Edit request: revise the plan with the planner, then re-ask.
                 attempts += 1
+                rev_recorder = _RecordingQueue(queue)
                 revision = await _run_mode_turn(
                     state,
                     "plan",
-                    queue,
+                    rev_recorder,
                     extra_instruction=(
                         "[PLAN REVISION REQUEST — non-user directive]\n"
                         "The user reviewed your plan and asked for this change:\n"
@@ -7204,9 +6772,14 @@ async def plan_build(state: AgentState) -> dict:
                     ),
                     run_flags=state.get("_run_flags"),
                 )
-                if not isinstance(revision, str) or not revision.strip():
+                rev_text = _without_trailing_reply(
+                    rev_recorder.text()
+                    or (revision if isinstance(revision, str) else ""),
+                    revision if isinstance(revision, str) else "",
+                )
+                if not rev_text.strip():
                     break
-                reply = _save_and_emit(revision)
+                reply = _save_and_emit(rev_text)
     return {
         "plan": reply,
         "plan_attempts": attempts,

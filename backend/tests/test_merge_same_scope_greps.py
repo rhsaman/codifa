@@ -80,6 +80,20 @@ def test_max_results_takes_max_and_order_preserved():
     assert "merged grep" in out[2] and "merged grep" in out[3], out
 
 
+def test_same_file_reads_merge_into_ranges():
+    tcs = [
+        _tc("read", {"filePath": "a.py", "offset": 1, "limit": 60}, "1"),
+        _tc("read", {"filePath": "a.py", "offset": 200, "limit": 60}, "2"),
+    ]
+    ex, expand = merge_same_scope_greps(tcs)
+    assert len(ex) == 1, ex
+    assert ex[0]["args"]["ranges"] == ["a.py:1:60", "a.py:200:60"], ex
+    big = "R" * 2000
+    out = expand([big])
+    assert out[0] == big, out
+    assert "merged read" in out[1], out
+
+
 async def test_execute_readonly_calls_runs_merged_once():
     from tool_batching import execute_readonly_calls
 

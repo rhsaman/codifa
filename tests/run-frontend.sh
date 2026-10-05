@@ -105,7 +105,10 @@ compactDedupe|tests/compactDedupe.test.ts|--packages=external --external:electro
 sidebar|tests/sidebar.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:src/lib/store=./src/lib/store --external:electron
 usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
+fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
+viewerTabs|src/lib/viewerTabs.test.ts|--packages=external --external:electron
+fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolNesting|tests/toolNesting.test.ts|
@@ -115,7 +118,8 @@ watchdog|tests/watchdog.test.ts|-
 fetchAndPersist|tests/fetchAndPersist.test.ts|--packages=external --external:electron
 usageChip|tests/usageChip.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 traceNarration|tests/traceNarration.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
-planApproval|tests/planApproval.test.ts|--packages=external --external:electron
+planApproval|tests/planApproval.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+resumeNote|tests/resumeNote.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolEditGroup|tests/toolEditGroup.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
@@ -128,7 +132,7 @@ reviewAccordion|tests/reviewAccordion.ssr.test.tsx|--jsx=automatic --packages=ex
 diffSearch|tests/diffSearch.test.ts|-
 uncommitted|tests/uncommitted.test.ts|--packages=external --external:electron
 tts|src/lib/tts.test.ts|--packages=external --external:electron
-schedule|tests/schedule.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+schedule|tests/schedule.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --loader:.mp3=file --external:electron
 fetchModels|src/components/SettingsModal.fetchModels.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chatLag|tests/chatLag.test.ts|--packages=external --external:electron
 diffResponsive|tests/diffResponsive.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron

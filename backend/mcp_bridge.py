@@ -253,9 +253,12 @@ def _tool_input_schema(tool: Any) -> dict | None:
 _DESC_MAX_CHARS = 300
 _FIELD_DESC_MAX_CHARS = 80
 
-# سقف snapshot مرورگر قبل از رسیدن به مدل — هر کاراکتر اضافه با هر turn
-# دوباره فرستاده می‌شود؛ snapshotهای Playwright به‌راحتی ده‌ها هزار کاراکترند.
-_BROWSER_SNAPSHOT_MAX_CHARS = 12_000
+# Browser snapshot cap before reaching the model — every extra char is
+# re-sent on every following step; Playwright snapshots easily reach tens
+# of thousands of chars. 6000 keeps refs + task-relevant lines (the
+# compaction keeps ref/task lines first) while halving the per-step cost
+# of the heaviest browser result.
+_BROWSER_SNAPSHOT_MAX_CHARS = 6_000
 
 
 def _compact_description(text: str, max_chars: int = _DESC_MAX_CHARS) -> str:
@@ -412,19 +415,12 @@ async def _with_image_analysis(
 
 
 def suggest_browser_snapshot_mode(task: str = "", chat_id: str = "", emit: Any = None) -> str | None:
-    """حالت snapshot مرورگر با laya: مستقیم act بزن یا اول snapshot بخوان؟
+    """Browser snapshot mode hint (decision engine removed).
 
-    خروجی یکی از BROWSER_STEP_OPTIONS در laya_decide یا None (واگذاری).
-    هرگز استثنا نمی‌دهد تا مسیر اصلی ابزار نشکند.
+    Always returns None (defer to previous behaviour). Never raises so the
+    main tool path never breaks.
     """
-    try:
-        import laya_decide
-    except Exception:  # noqa: BLE001 — laya اختیاری است
-        return None
-    try:
-        return laya_decide.browser_next_step(task or "", chat_id=chat_id, emit=emit)
-    except Exception:  # noqa: BLE001
-        return None
+    return None
 
 
 def compact_browser_snapshot(text: str, task: str = "", max_chars: int = _BROWSER_SNAPSHOT_MAX_CHARS) -> str:
@@ -642,11 +638,10 @@ def is_browser_mcp_tool(name: str) -> bool:
 
 
 def describe_tools(mcp_tools: list | None) -> list[dict]:
-    """نام و توضیح کوتاه ابزارهای زنده MCP برای ورودی laya.
+    """Short names and descriptions of live MCP tools.
 
-    رتبه‌بندی/انتخاب ابزار (پیش‌فیلتر graph، عملیات rank تول laya) به همین
-    فهرست نیاز دارد؛ توضیح از همان description فشرده‌شده StructuredTool
-    می‌آید. هرگز استثنا نمی‌دهد (خالی = بدون سیگنال، فراخواننده رفتار قبلی).
+    Description comes from the compacted StructuredTool description.
+    Never raises (empty = no signal, caller keeps previous behaviour).
     """
     out: list[dict] = []
     try:
@@ -901,6 +896,7 @@ async def build_mcp_tools(
                 for t in cached.raw_tools
             ]
             tools.extend(new_tools)
+            reserved.update(t.name for t in new_tools)
             print(
                 f"[coder] MCP server {name!r}: reused session ({len(new_tools)} tool(s))",
                 flush=True,
@@ -924,6 +920,7 @@ async def build_mcp_tools(
                     for t in cached.raw_tools
                 ]
                 tools.extend(new_tools)
+                reserved.update(t.name for t in new_tools)
                 print(
                     f"[coder] MCP server {name!r}: reused session ({len(new_tools)} tool(s))",
                     flush=True,

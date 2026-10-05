@@ -404,3 +404,39 @@ def test_usage_event_from_llm_generate_includes_provider():
     assert ev["model"] == "gpt-4o"
     # provider_id defaults to "" (legacy callers) — never absent.
     assert ev["provider_id"] == ""
+
+
+def test_usage_event_ignores_total_below_input_plus_output():
+    """Some routers report a total_tokens that EXCLUDES the cached subset of the
+    prompt (input 286.6K with 40.7K cached -> total 245.9K). Trusting it made
+    the context meter under-report by exactly the cached portion, so an
+    inconsistent native total must be replaced with the hand-sum."""
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 286600,
+            "output_tokens": 6700,
+            "total_tokens": 245900,
+            "input_token_details": {"cached_tokens": 40700},
+        },
+    )
+    ev = _usage_event_from_ai(ai, "router/muse")
+    assert ev is not None
+    # 286600 + 6700 = 293300 — never below the input actually sent.
+    assert ev["total_tokens"] == 293300
+
+
+def test_usage_event_trusts_total_covering_input_and_output():
+    """A native total that covers input + output (provider-consistent) stays
+    trusted as-is, including reasoning the provider folds into its total."""
+    ai = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "total_tokens": 1250,
+        },
+    )
+    ev = _usage_event_from_ai(ai, "m")
+    assert ev is not None
+    assert ev["total_tokens"] == 1250

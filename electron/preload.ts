@@ -64,6 +64,12 @@ const api = {
   getDataPath: () => ipcRenderer.invoke('data:path'),
   hasSettingsFile: (): Promise<boolean> => ipcRenderer.invoke('data:has-settings'),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('open:external', url),
+  openFileExternal: (absPath: string, editor: 'nvim' | 'vscode'): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('open:file-external', absPath, editor),
+  openWorkspaceFolder: (dir: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('open:folder', dir),
+  openWorkspaceTerminal: (dir: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('open:terminal', dir),
   moveDataPath: (p: string): Promise<string> => ipcRenderer.invoke('data:move', p),
   onSidecarChanged: (cb: () => void): (() => void) => {
     const listener = (): void => cb()

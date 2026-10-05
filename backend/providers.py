@@ -1118,7 +1118,7 @@ async def fetch_credits(
     try:
         from llm import resolve_keys as _resolve_keys
         keys = _resolve_keys(provider, api_key, env_var, api_keys)
-    except Exception:
+    except Exception:  # noqa: BLE001 — any resolver failure falls back to raw keys
         keys = [k for k in [api_key, env_key(provider, env_var)] if k]
     if not keys:
         keys = [""]
@@ -1142,7 +1142,7 @@ async def fetch_credits(
                     "total_credits": total,
                     "total_usage": usage,
                 }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — try the next key/route
             last_exc = exc
             continue
     raise ProviderError(f"credits lookup failed: {last_exc}") from last_exc
@@ -1177,7 +1177,7 @@ async def list_models(
     try:
         from llm import resolve_keys as _resolve_keys2
         _keys = _resolve_keys2(provider, api_key, env_var, api_keys)
-    except Exception:
+    except Exception:  # noqa: BLE001 — any resolver failure falls back to raw keys
         _keys = [k for k in [api_key, env_key(provider, env_var)] if k]
     if not _keys:
         _keys = [""]

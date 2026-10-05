@@ -19,15 +19,23 @@ export function taskTokenTotals(runs: ScheduleRun[]): Record<string, number> {
   return out;
 }
 
-/** ران‌های واقعاً جدید: در لیست قبلی نبودند و دیده هم نشده‌اند. خالص برای تست. */
-export function findNewScheduleRuns(
-  prevIds: ReadonlySet<string> | readonly string[],
+/** Runs that just REACHED a terminal status since the previous poll: either a
+ *  previously-running run finished, or a run finished entirely between two
+ *  polls (its id was not in the previous snapshot). A run that was already
+ *  terminal in the previous snapshot is never re-notified, and the baseline
+ *  poll (prev === null) never notifies — old runs must stay silent. Pure for
+ *  tests. */
+export function findFinishedScheduleRuns(
+  prev: ReadonlyMap<string, ScheduleRun["status"]> | null,
   runs: ScheduleRun[],
-  seen: readonly string[],
 ): ScheduleRun[] {
-  const prev = prevIds instanceof Set ? prevIds : new Set(prevIds);
-  const seenSet = new Set(seen ?? []);
-  return (runs ?? []).filter((r) => r && !prev.has(r.id) && !seenSet.has(r.id));
+  if (!prev) return [];
+  return (runs ?? []).filter((r) => {
+    if (!r) return false;
+    if (r.status !== "done" && r.status !== "error") return false;
+    const before = prev.get(r.id);
+    return before === undefined || before === "running";
+  });
 }
 
 /** اجازه اعلان سیستم‌عامل را در صورت نیاز می‌گیرد؛ false یعنی اعلان ممکن نیست. */

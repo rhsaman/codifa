@@ -15,7 +15,6 @@ import glob as _pyglob
 import json
 import logging
 import os
-import posixpath
 import re
 import shutil
 import signal
@@ -29,23 +28,20 @@ from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
+from langchain_core.tools import BaseTool
+
 logger = logging.getLogger(__name__)
 
 import checkpoints as _checkpoints
 import git_tools as _git
 import providers as _providers
 import state_db as _state_db
-from agent_registry import AGENTS, agent_system, agent_tools, resolve_agent
+import subagent_jobs as _subagent_jobs
+from agent_registry import AGENTS, agent_names, agent_system, agent_tools, resolve_agent
 from cache import Cache, cache_path_for
 from secret_utils import decrypt_secret
 from tool_batching import (
     coalesce_io,
-    drop_ledger_path,
-    fetched_windows,
-    has_served_map,
-    note_fetched_window,
-    note_served_map,
-    note_turn_call,
 )
 from vector_store import (
     KIND_WEB,
@@ -175,18 +171,18 @@ _SCOUT_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 # Sub-agent depth limit (opencode's `subagent_depth`, default 1): the parent can
 # spawn a sub-agent, but a sub-agent cannot spawn another. The `task` tool
-# checks this before running; the general sub-agent's tools exclude `task` so
+# checks this before running; the sub-agent's tools exclude `task` so
 # nesting is impossible anyway — this is a belt-and-suspenders guard.
 _SUBAGENT_DEPTH_LIMIT = 1
 _TASK_DEPTH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
     "coder_task_depth", default=0
 )
 
-# Set while a GENERAL sub-agent runs: its tool calls reuse the PARENT's tool
-# functions (which emit into the same stream), and these flags make `_emit` tag
-# them `sub=True` and stamp the task card's branch id on them, so they nest
-# under the task card and never count against the parent's deterministic
-# tool-step budget (they run in an isolated transcript, like explore's).
+# Set while a background sub-agent runs: its tool calls reuse the PARENT's
+# tool functions (which emit into the same stream), and these flags make
+# `_emit` tag them `sub=True` and stamp the task card's branch id on them, so
+# they nest under the task card and never count against the parent's
+# deterministic tool-step budget (they run in an isolated transcript).
 _SUB_AGENT_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "coder_sub_agent_ctx", default=False
 )
@@ -196,7 +192,7 @@ _SUB_AGENT_BRANCH_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 # Set by agents.py after per-mode capability filtering: the parent agent's
 # ACTUAL toolset for this run (write tools stripped in plan/ask, read-only
-# terminal, etc.). The general sub-agent builds its tools from THIS instead of
+# terminal, etc.). The sub-agent builds its tools from THIS instead of
 # the full registry, so a `task` call can never hand a read-only mode's
 # sub-agent write_file/edit_file/confirm_action (the "edited files while in
 # plan mode" bypass). None = fall back to the full registry (task invoked
@@ -433,7 +429,7 @@ async def _subagent_max_tokens(model, *, narrow: bool = True):
     """Bounded-but-safe max_tokens for a sub-agent run.
 
     `narrow=True` for cheap sub-agents (distillers) that only need a short
-    answer; `narrow=False` for general/vision sub-agents whose prompt is larger.
+    answer; `narrow=False` for sub-agents whose prompt is larger.
     Returns None when the model's window is unknown (caller then sends no cap).
     """
     key = id(model)
@@ -506,18 +502,21 @@ def _subagent_fail_note(agent: str, model: str, exc: Exception) -> str:
     return ""
 
 
-def _explore_fail_note(agent: str, model: str, exc: Exception) -> str:
-    """A structured failure note for the explore sub-agent that steers the Main
-    Agent AWAY from reading the whole codebase manually. Instead of a raw error
-    that triggers 'find the bug yourself' behavior, it tells the Main Agent to
-    re-delegate with a NARROWER scope (a specific folder/pattern/symbol) so the
-    explore agent can succeed cheaply on the retry."""
+def _subagent_fail_scope_note(agent: str, model: str, exc: Exception) -> str:
+    """A structured failure note for the background sub-agent that steers the
+    Main Agent AWAY from reading the whole codebase manually. Instead of a raw
+    error that triggers 'find the bug yourself' behavior, it tells the Main
+    Agent to re-delegate with a NARROWER scope (a specific folder/pattern/symbol)
+    so the sub-agent can succeed cheaply on the retry."""
     text = str(exc).strip()
     return (
         f"ERROR: the {agent} sub-agent failed ({model}): {text}. "
         "Do NOT read the whole codebase manually. Re-delegate with a NARROWER "
         "scope (name the folder/pattern/symbol) via task(subagent_type='subagent')."
     )
+
+
+_explore_fail_note = _subagent_fail_scope_note
 
 
 # Web-search backends are pluggable via Settings → Plugins. Each engine is a
@@ -1373,91 +1372,6 @@ def _web_search_auto_fetch() -> int:
     return max(0, min(10, n))
 
 
-def _laya_tool_gate(tool_name: str, query: str, chat_id: str = "", emit: Any = None) -> bool | None:
-    """Score gate for expensive tools (web_search / vision / fetch_url).
-
-    Returns True when laya confidently says the call is worthwhile, False
-    when it confidently says skip, None on no-signal (caller keeps old
-    behaviour). Never raises. Every handled decision is logged to chat
-    trace via report_secondary so laya rows stay visible.
-    """
-    try:
-        import laya_decide
-    except Exception:  # noqa: BLE001 — laya is optional
-        return None
-    try:
-        decision = laya_decide.score(
-            {"tool": (tool_name or "")[:80], "query": (query or "")[:500]},
-            f"call-{tool_name or 'tool'}",
-            chat_id=str(chat_id or ""),
-        )
-    except Exception:  # noqa: BLE001 — gate is best-effort
-        return None
-    try:
-        laya_decide.report_secondary(
-            decision,
-            route="normal",
-            sub=f"tool_gate:{tool_name or 'tool'}",
-            chat_id=str(chat_id or ""),
-            emit=emit,
-            prompt=str(query or "")[:2000],
-            options=[f"call-{tool_name or 'tool'}", "skip"],
-        )
-    except Exception:  # noqa: BLE001, S110 — observability never breaks the gate
-        pass
-    try:
-        if getattr(decision, "handled", False):
-            return str(getattr(decision, "value", "") or "").startswith("call-")
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def _laya_distill_choice(query: str, num_results: int, total_chars: int = 0, chat_id: str = "", emit: Any = None) -> str | None:
-    """گیت laya روی خلاصه‌سازی وب: «distill» / «raw» / None.
-
-    فقط تصمیم اطراف distill (لزوم خلاصه) گرفته می‌شود، نه تولید متن.
-    خروجی ``"raw"`` یعنی laya با اطمینان بالا می‌گوید نتایج خام کافی است و
-    فراخواننده باید distill را رد کند؛ هر چیز دیگر یعنی رفتار قبلی ادامه یابد.
-    ``total_chars`` طول کل نتایج خام است تا laya با دید کامل تصمیم بگیرد.
-    هرگز استثنا بیرون نمی‌دهد.
-    """
-    try:
-        import laya_decide
-    except Exception:  # noqa: BLE001 — laya اختیاری است
-        return None
-    try:
-        decision = laya_decide.choice(
-            {
-                "query": (query or "")[:300],
-                "num_results": int(num_results or 0),
-                "total_chars": int(total_chars or 0),
-            },
-            ["distill", "raw"],
-            chat_id=str(chat_id or ""),
-        )
-    except Exception:  # noqa: BLE001 — خطا = ادامه رفتار قبلی
-        return None
-    try:
-        laya_decide.report_secondary(
-            decision,
-            route="normal",
-            sub="web_distill",
-            chat_id=str(chat_id or ""),
-            emit=emit,
-            prompt=str(query or "")[:2000],
-            options=["distill", "raw"],
-        )
-    except Exception:  # noqa: BLE001, S110 — observability never breaks the gate
-        pass
-    try:
-        if decision.handled and str(decision.value or "") in ("distill", "raw"):
-            return str(decision.value)
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
 def _rag_web_enabled() -> bool:
     """آیا RAG برای وب/fetch فعاله؟ (مدل embedding دانلود شده باشه)."""
     try:
@@ -2043,6 +1957,286 @@ class EditAmbiguousError(ValueError):
     """Raised when ``old_string`` matches zero or multiple times unexpectedly."""
 
 
+# --------------------------------------------------------------------------- #
+# Tolerant old_string matching
+# --------------------------------------------------------------------------- #
+# The read tool renders every line as "2096 | text" (grep as "path:123: text")
+# and wraps output in <path>/<content> with trailing notes like
+# "(End of file - total N lines)". The model often copies those decorations —
+# or stray trailing whitespace / CRLF — into old_string, so a byte-exact
+# search misses and the edit fails with "old_string not found" even though the
+# target is right there. The helpers below retry with the decorations removed
+# and map the hit back to the ORIGINAL byte offsets, so the replacement still
+# lands byte-precisely.
+
+_TOOL_LINE_PREFIX_RE = re.compile(r"[ \t>]*?(?:[^\s:<>]+:\s*\d+|\d+)[ \t]*[:|][ \t]?")
+_TOOL_GREP_ANNOTATION_RE = re.compile(r"^\s*in\s+\S.*\(L\d+(?:-\d+)?\)\s*[:|]?\s*")
+_TOOL_WRAP_RE = re.compile(
+    r"^<(?:path>.*</path|type>.*</type|content|entries)>$|^</(?:content|entries)>$"
+)
+_TOOL_NOTE_RE = re.compile(
+    r"^\((?:End of file|Output capped|Joined to|file map:|Batch complete|"
+    r"symbols not found|offset\s+\d+\s+is\s+past|empty directory|"
+    r"Per-file cap|\d+\s+definition\s+bodies?\s+omitted|\d+\s+matches\s+found|"
+    r"\d+\s+pattern\(s\)\s+failed|\d+\s+entries?|"
+    r"Showing\s+(?:lines|the first|\d+|\d+\s+of)).*\)$"
+)
+_TOOL_PAREN_POS_RE = re.compile(r"^\([^()]*:\s*lines\s+\d+-\d+\s+of\s+\d+[^()]*\)$")
+_TOOL_SQUARE_MARKER_RE = re.compile(
+    r"^\[(?:lines?\s+\d+-\d+\s+identical\s+to\s+an\s+earlier\s+read|"
+    r"identical\s+to\s+an\s+earlier\s+read|line\s+read\s+above)[^]]*\]$",
+    re.IGNORECASE,
+)
+_TOOL_HISTORY_PREFIX_RE = re.compile(r"^[^\s:<>]+:\s*\d+\s*\|\s?")
+_TOOL_DUP_REF_RE = re.compile("عیناً با پاسخ ابزار|متن کامل همان پاسخ")
+_TOOL_HEADER_LINE_RE = re.compile(
+    r"^(?:MATCHES\s+for\s+|GLOB\s+MATCHES\s+for\s+|No\s+(?:matches|files\s+match)\s+"
+    r"|Found\s+\d+\s+matches?\.|Showing\s+the\s+first\s+\d+"
+    r"|Use\s+a\s+narrower\s+|Use\s+(?:'offset'|grep|offset)\s"
+    r"|Read\s+(?:them\s+directly|all\s+needed|the\s+needed|any\s+definition)"
+    r"|The\s+`in\s+Name|\[batch\]\s"
+    r"|Successfully\s+edited\s|ERROR\s+(?:reading|searching|running|editing)\s"
+    r"|\s*\.\.\.\s*\(\+\d+\s+more\s+lines"
+    r"|\s*-\s*\w+\s+\S+\s*\(L\d+(?:-\d+)?\)"
+    r"|\s*-?\s*\(\+\d+\s+more\s+definitions\)"
+    r"|\s*[│├└─].*)"
+)
+
+
+def _undecorate_tool_text(text: str) -> str:
+    """Strip read/grep tool decorations a model copied into an edit string.
+
+    Drops wrapper/note/header lines anywhere in ``text`` and removes the
+    leading ``2096 | `` / ``> 2096 | `` / ``path:2096: `` prefix (plus an
+    optional grep ``in Name (L..)`` annotation) from every line carrying
+    one; undecorated lines pass through untouched. Blank lines that only
+    separated kept content from dropped decorations at the very start/end
+    are removed too — otherwise a copied window ending in
+    ``\n\n(path: lines X-Y of N)`` would match with one extra trailing
+    newline and glue the last kept line onto the following one.
+    """
+    rows: list[str | None] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            rows.append(line)
+            continue
+        if (
+            _TOOL_WRAP_RE.match(stripped)
+            or _TOOL_NOTE_RE.match(stripped)
+            or _TOOL_PAREN_POS_RE.match(stripped)
+            or _TOOL_HEADER_LINE_RE.match(stripped)
+            or _TOOL_SQUARE_MARKER_RE.match(stripped)
+            or _TOOL_DUP_REF_RE.search(stripped)
+        ):
+            rows.append(None)
+            continue
+        work = line
+        # A collapsed single-line grep head ("path:12:[line read above]")
+        # carries no code text — drop the marker suffix; a bare head left
+        # behind is dropped below like any other pure-decoration line.
+        if work.rstrip().endswith("[line read above]"):
+            work = work.rstrip()[: -len("[line read above]")].rstrip()
+        saw_prefix = False
+        while True:
+            m = _TOOL_LINE_PREFIX_RE.match(work)
+            if m:
+                work = work[m.end():]
+                saw_prefix = True
+                continue
+            m = _TOOL_HISTORY_PREFIX_RE.match(work)
+            if m:
+                work = work[m.end():]
+                saw_prefix = True
+                continue
+            # A grep "in Name (L..)" annotation only ever follows a
+            # "path:line:" / "N | " prefix — never strip it from a plain
+            # code line that happens to start with "in ...".
+            if saw_prefix:
+                a = _TOOL_GREP_ANNOTATION_RE.match(work)
+                if a:
+                    work = work[a.end():]
+                    continue
+            break
+        # A line that was pure decoration once stripped (e.g. a grep entry
+        # header "path:12:in foo (L1-3):") is dropped, not kept as blank.
+        rows.append(None if (work is not line and not work.strip()) else work)
+    if any(r is None for r in rows):
+        start, end = 0, len(rows)
+        if rows[0] is None:
+            while start < end and rows[start] is None:
+                start += 1
+            while start < end and not (rows[start] or "").strip():
+                start += 1
+        if rows[end - 1] is None:
+            while end > start and rows[end - 1] is None:
+                end -= 1
+            while end > start and not (rows[end - 1] or "").strip():
+                end -= 1
+        rows = rows[start:end]
+    return "\n".join(r for r in rows if r is not None)
+
+
+def _normalize_for_match(text: str) -> tuple[str, list[int]]:
+    """Comparison view of ``text``: CRLF reduced to LF, per-line trailing
+    whitespace dropped. Returns ``(normalized, origin)`` where ``origin[i]``
+    is the offset of ``normalized[i]`` in the original string."""
+    norm: list[str] = []
+    origin: list[int] = []
+    pos = 0
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            norm.append("\n")
+            origin.append(pos - 1)
+        body = line.rstrip()
+        norm.append(body)
+        origin.extend(range(pos, pos + len(body)))
+        pos += len(line) + 1
+    return "".join(norm), origin
+
+
+def _at_line_start(norm: str, j: int) -> bool:
+    """True when only whitespace separates position ``j`` from its line start."""
+    k = j
+    while k > 0 and norm[k - 1] in " \t":
+        k -= 1
+    return k == 0 or norm[k - 1] == "\n"
+
+
+def _spans_in(
+    norm: str, origin: list[int], needle: str, *, line_anchored: bool
+) -> list[tuple[int, int]]:
+    """Original byte spans of every non-overlapping hit of ``needle`` in the
+    normalized view, mapped back through ``origin``."""
+    spans: list[tuple[int, int]] = []
+    if not needle:
+        return spans
+    i = 0
+    while True:
+        j = norm.find(needle, i)
+        if j < 0:
+            break
+        if not line_anchored or _at_line_start(norm, j):
+            spans.append((origin[j], origin[j + len(needle) - 1] + 1))
+        i = j + len(needle)
+    return spans
+
+
+def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], bool]:
+    """Locate ``old`` inside ``content``, tolerating copied tool decorations.
+
+    Returns ``(spans, decorated)``: byte spans in the original ``content``
+    (empty when not found) and whether decorations were stripped from ``old``.
+    When ``decorated`` is True the caller must strip the same decorations from
+    ``new_string`` before splicing, so the file does not grow "2096 | " junk.
+    Tiers: byte-exact, then CRLF/trailing-whitespace tolerant, then with
+    read/grep prefixes and wrapper/note lines removed (line-anchored so a
+    stripped fragment can never match mid-line).
+    """
+    if not old:
+        return [], False
+    # 1) byte-exact — the common path.
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while True:
+        j = content.find(old, i)
+        if j < 0:
+            break
+        spans.append((j, j + len(old)))
+        i = j + len(old)
+    if spans:
+        return spans, False
+    # 2) same text modulo CRLF / trailing whitespace.
+    c_norm, c_origin = _normalize_for_match(content)
+    o_norm, _ = _normalize_for_match(old)
+    spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=False)
+    if spans:
+        return spans, False
+    # 3) decorations stripped — only runs when stripping changed something.
+    decorated = _undecorate_tool_text(old)
+    if decorated != old:
+        o_norm, _ = _normalize_for_match(decorated)
+        spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=True)
+        if spans:
+            return spans, True
+    return [], False
+
+
+def _edit_copy_hints(old: str) -> list[str]:
+    """Short actionable hints for an old_string carrying tool output."""
+    hints: list[str] = []
+    if "identical to an earlier read" in old:
+        hints.append(
+            "parts of the copied window were collapsed to "
+            "'[lines X-Y identical to an earlier read ...; omitted]' — that "
+            "sentence is not in the file; re-read the omitted line range and "
+            "copy it verbatim"
+        )
+    if "[line read above]" in old:
+        hints.append(
+            "'[line read above]' is a pointer, not file content — re-read the "
+            "file and copy the actual code lines"
+        )
+    if "\u2026" in old or "... (+" in old:
+        hints.append(
+            "the copied text is truncated ('…' / '... (+N more lines ...)'); "
+            "read the full lines with symbols=[...] or ranges=[...] and copy "
+            "them completely"
+        )
+    if _TOOL_DUP_REF_RE.search(old):
+        hints.append(
+            "a duplicate-reference note is not file content — copy the actual "
+            "code from the original tool result"
+        )
+    return hints
+
+
+def _edit_not_found_error(path: str, old: str, content: str, *, prefix: str = "") -> dict:
+    """Actionable old_string-not-found error with a real file excerpt."""
+    file_lines = content.split("\n")
+    if file_lines and file_lines[-1] == "":
+        file_lines = file_lines[:-1]
+    total = len(file_lines)
+    first = next(
+        (ln.strip() for ln in _undecorate_tool_text(old).split("\n") if ln.strip()),
+        "",
+    )
+    start = 0
+    if first:
+        matches = difflib.get_close_matches(
+            first, [ln.strip() for ln in file_lines], n=1, cutoff=0.4
+        )
+        if matches:
+            idx = next(
+                (i for i, ln in enumerate(file_lines) if ln.strip() == matches[0]),
+                0,
+            )
+            start = max(0, idx - 2)
+    window = file_lines[start : start + 8]
+    excerpt = "\n".join(window)[:800]
+    head = (
+        f"{prefix}old_string not found — it must match the file's current "
+        "content exactly (whitespace included). Copy clean text from read: "
+        "no 'NNN | ' prefixes, no 'path:NN:' heads, no <path>/<content> "
+        "wrappers, no '(... lines X-Y of N)' or '[...]' markers."
+    )
+    hints = _edit_copy_hints(old)
+    detail = f" {'; '.join(hints)}." if hints else ""
+    where = (
+        f" File '{path}' has {total} lines; actual content around line "
+        f"{start + 1} (copy verbatim, without adding line numbers):\n{excerpt}"
+    )
+    return {"path": path, "error": head + detail + where}
+
+
+def _splice_spans(content: str, spans: list[tuple[int, int]], replacement: str) -> str:
+    """Replace every ``spans`` region of ``content`` with ``replacement``
+    (applied right-to-left so earlier offsets stay valid)."""
+    for start, end in reversed(spans):
+        content = content[:start] + replacement + content[end:]
+    return content
+
+
 def edit_file(
     root: str,
     path: str,
@@ -2054,14 +2248,17 @@ def edit_file(
     """Replace an exact substring in ``path`` (relative to root).
 
     Unlike ``write_file`` (which overwrites the whole file), this performs a
-    targeted patch: read, verify ``old_string`` appears exactly once (unless
-    ``replace_all``), swap it for ``new_string``, write back. This is far
-    cheaper on tokens for large files and removes the failure mode where a
-    full-file rewrite silently drops unrelated content.
+    targeted patch: locate ``old_string``, swap it for ``new_string``, write
+    back. This is far cheaper on tokens for large files and removes the
+    failure mode where a full-file rewrite silently drops unrelated content.
 
-    Raises ``EditAmbiguousError`` if ``old_string`` is not found, or is found
-    more than once while ``replace_all`` is False (the caller must supply
-    enough surrounding context to make the match unique).
+    ``old_string`` is matched byte-exact first; when the model copied
+    decorations from a read/grep result (``2096 | `` line prefixes, wrapper
+    or note lines, CRLF, trailing spaces) the match is retried with those
+    removed and mapped back to the original offsets — see
+    ``_match_old_string``. Returns an error dict when nothing matches, or
+    when the match is not unique while ``replace_all`` is False (the caller
+    must supply enough surrounding context to make the match unique).
     """
     target = resolve_safe(root, path, permit=permit)
     if _is_workspace_coder_dir(root, target):
@@ -2088,24 +2285,21 @@ def edit_file(
             "error": "file too large to edit safely (use read with offset/limit to inspect it in parts instead)",
         }
 
-    count = content.count(old_string)
-    if count == 0:
+    spans, decorated = _match_old_string(content, old_string)
+    if not spans:
+        return _edit_not_found_error(path, old_string, content)
+    if len(spans) > 1 and not replace_all:
         return {
             "path": path,
-            "error": "old_string not found — it must match the file's current content exactly "
-            "(whitespace included). Re-read the file (or the relevant lines) and copy the exact text.",
-        }
-    if count > 1 and not replace_all:
-        return {
-            "path": path,
-            "error": f"old_string is not unique ({count} occurrences) — include more surrounding "
+            "error": f"old_string is not unique ({len(spans)} occurrences) — include more surrounding "
             "context to make it unique, or pass replace_all=true to replace every occurrence.",
         }
 
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
-    else:
-        new_content = content.replace(old_string, new_string, 1)
+    _clean_new = _undecorate_tool_text(new_string)
+    replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
+    apply = spans if replace_all else spans[:1]
+    new_content = _splice_spans(content, apply, replacement)
+    count = len(apply)
 
     try:
         with open(target, "w", encoding="utf-8") as fh:
@@ -2135,6 +2329,10 @@ def edit_file_batch(
     checkpoint, one diff and one verify instead of N sequential read/write
     cycles. Either every edit applies or nothing is written (atomic).
     Each item is ``{"old_string": ..., "new_string": ..., "replace_all": bool}``.
+    Matching is tolerant per edit like ``edit_file`` (copied read/grep
+    decorations are stripped and mapped back); when an edit fails because an
+    earlier edit in the same batch rewrote its target, the error says so
+    instead of a bare "old_string not found".
     """
     # The model sometimes sends `edits` as a JSON-encoded STRING
     # ('[{...}, {...}]') instead of a real list — calling list() on that
@@ -2199,25 +2397,30 @@ def edit_file_batch(
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string is empty"}
         if old_string == new_string:
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string and new_string are identical"}
-        count = new_content.count(old_string)
-        if count == 0:
+        spans, decorated = _match_old_string(new_content, old_string)
+        if not spans:
+            if _match_old_string(content, old_string)[0]:
+                return {
+                    "path": path,
+                    "error": f"edit {idx + 1}/{len(edits)}: old_string was already changed by an earlier edit in this "
+                    "same batch (the edits overlap). Re-read the file after the earlier edits, or apply "
+                    "overlapping edits in separate calls.",
+                }
+            return _edit_not_found_error(
+                path, old_string, new_content,
+                prefix=f"edit {idx + 1}/{len(edits)}: ",
+            )
+        if len(spans) > 1 and not replace_all:
             return {
                 "path": path,
-                "error": f"edit {idx + 1}/{len(edits)}: old_string not found — it must match the file's current content exactly "
-                "(whitespace included). Re-read the file (or the relevant lines) and copy the exact text.",
-            }
-        if count > 1 and not replace_all:
-            return {
-                "path": path,
-                "error": f"edit {idx + 1}/{len(edits)}: old_string is not unique ({count} occurrences) — include more surrounding "
+                "error": f"edit {idx + 1}/{len(edits)}: old_string is not unique ({len(spans)} occurrences) — include more surrounding "
                 "context to make it unique, or pass replace_all=true to replace every occurrence.",
             }
-        if replace_all:
-            new_content = new_content.replace(old_string, new_string)
-            total_occ += count
-        else:
-            new_content = new_content.replace(old_string, new_string, 1)
-            total_occ += 1
+        _clean_new = _undecorate_tool_text(new_string)
+        replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
+        apply = spans if replace_all else spans[:1]
+        new_content = _splice_spans(new_content, apply, replacement)
+        total_occ += len(apply)
     if new_content == content:
         return {"path": path, "error": "edits leave the file unchanged"}
     try:
@@ -3259,10 +3462,10 @@ def _is_terminal_search(command: str) -> bool:
     return False
 
 
-# Commands that MUTATE the filesystem / system state. Used to keep the explore
-# sub-agent read-only: it may inspect the codebase but must never write, delete,
-# move, install, or otherwise change state (matching opencode's explore agent,
-# which is allowed to run bash only for read-only inspection).
+# Commands that MUTATE the filesystem / system state. Used to keep the
+# background sub-agent read-only: it may inspect the codebase but must never
+# write, delete, move, install, or otherwise change state (matching opencode's
+# explore agent, which is allowed to run bash only for read-only inspection).
 _TERMINAL_WRITE = {
     "rm", "mv", "cp", "dd", "mkfs", "touch", "mkdir", "rmdir", "chmod", "chown",
     "chgrp", "ln", "truncate", "shred", "install", "rename", "tee", "sudo", "su",
@@ -3293,7 +3496,7 @@ def _is_terminal_write(command: str) -> bool:
 
     Scans every ``&&``/``;``/``|``/newline segment; if any *meaningful* command
     is a write/mutate operation (or a shell/interpreter that could write), the
-    whole command is treated as a write. Used to keep the explore sub-agent
+    whole command is treated as a write. Used to keep the background sub-agent
     strictly read-only.
     """
     cmd = (command or "").strip()
@@ -3335,13 +3538,13 @@ def _tool_event(ev: dict) -> dict:
     task call's sub-events to ITS OWN card by this id (Chat.tsx). When it was
     missing, ``branch`` was stripped from every event, and the frontend fell
     back to nesting every sub-event into EVERY running task card — three
-    parallel explores all showed the same stats ("116 calls · 109.5s" on each
-    card)."""
+    parallel sub-agents all showed the same stats ("116 calls · 109.5s" on
+    each card)."""
     kind = ev.get("kind", "tool_result")
     if kind == "usage":
         # Usage events carry token/cost/model fields the UI needs verbatim —
         # they are NOT tool activity, so pass them through untouched (the
-        # explore sub-agent emits them through the same emit callback).
+        # background sub-agent emits them through the same emit callback).
         return dict(ev)
     if kind not in ("tool", "tool_result", "diff", "plan", "permission", "ask"):
         kind = "tool_result"
@@ -3383,196 +3586,6 @@ def _load_skills_for_tool() -> list[dict]:
     from agents import _load_skills
 
     return _load_skills("")
-
-
-def _duplicate_stub(emit: Callable[[dict], None], tool: str, args: dict, main_name: str, desc: str) -> str:
-    """Short-circuit a byte-identical repeat inside one turn (see note_turn_call).
-
-    The full result is already in this turn's transcript, so re-sending it is
-    pure token waste. UI events still fire (summary "duplicate") so the trace
-    stays intact.
-    """
-    emit({"kind": "tool", "tool": tool, "args": args, "model": main_name})
-    emit(
-        {
-            "kind": "tool_result",
-            "tool": tool,
-            "summary": "duplicate (already in context)",
-            "model": main_name,
-        }
-    )
-    return (
-        f"DUPLICATE of this turn's earlier `{tool}` call ({desc}) — "
-        "the full result is already in context above and is NOT re-sent (tokens saved). "
-        "Do NOT repeat this call — continue the task."
-    )
-
-
-def _cross_turn_stub(emit: Callable[[dict], None], tool: str, args: dict, main_name: str, desc: str, hint: str) -> str:
-    """Short-circuit a repeat of a PREVIOUS turn's call (cross-turn reuse).
-
-    The full result is in the conversation history and every file behind it
-    is byte-unchanged since, so re-sending it is pure token waste. UI events
-    still fire (summary "reused") so the trace stays intact.
-    """
-    emit({"kind": "tool", "tool": tool, "args": args, "model": main_name})
-    emit(
-        {
-            "kind": "tool_result",
-            "tool": tool,
-            "summary": "reused (previous turn, unchanged)",
-            "model": main_name,
-        }
-    )
-    return (
-        f"REUSED from an earlier `{tool}` call ({desc}) — files unchanged "
-        f"since, so the full result is NOT re-sent; reuse the rows in history above. {hint} "
-        "Do NOT repeat this call — continue the task."
-    )
-
-
-async def _grep_served_rows_stub(
-    root: str, scope: str, matches: list[dict], permit,
-) -> str:
-    """Pointer when every match of a single-file grep is already served.
-
-    Back-to-back greps on one file (grep, read the body, grep a narrower
-    term, ...) re-send rows the model already holds: the match lines sit
-    inside windows served earlier this turn or in a previous turn
-    (byte-unchanged). The disk scan above still ran (cheap); only the
-    re-send is skipped here.
-
-    Soundness: single-file scopes only; every match must be in that file;
-    every match line ±SNIPPET_CONTEXT must be covered by served spans; a
-    match on a definition's first line additionally requires its inlined
-    body span to be covered (otherwise the stub would hide a body never
-    shown). Tool edits drop the ledger and external edits trip the
-    signature guard, so changed files always serve whole. Map-served
-    paths are untrusted and never stub. Returns "" when the grep must
-    serve normally. Never raises.
-    """
-    try:
-        if not matches or not (scope or "").strip():
-            return ""
-        if has_served_map(scope):
-            return ""
-        try:
-            _target = resolve_safe(root, scope, allow_coder=True, permit=permit)
-        except PathEscapeError:
-            return ""
-        if not os.path.isfile(_target):
-            return ""
-        try:
-            from tool_batching import cross_turn_served_spans as _spans
-            from tool_batching import cross_turn_sig_changed as _changed
-        except ImportError:
-            return ""
-        try:
-            _stale = bool(_changed(root, scope))
-        except Exception:  # noqa: BLE001
-            _stale = False
-        if _stale:
-            try:
-                drop_ledger_path(scope)
-            except Exception:  # noqa: BLE001, S110
-                pass
-            return ""
-        _spans_now: list[tuple[int, int]] = []
-        try:
-            for _a, _b in fetched_windows(scope) or []:
-                _spans_now.append((int(_a), int(_b)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            for _a, _b in (_spans(root, scope) or []):
-                _spans_now.append((int(_a), int(_b)))
-        except (TypeError, ValueError):
-            pass
-        if not _spans_now:
-            return ""
-        # Merge to a disjoint union first: summing raw spans double-counts
-        # their overlaps and could claim coverage of lines never served.
-        try:
-            _spans_now.sort()
-            _merged: list[list[int]] = []
-            for _a, _b in _spans_now:
-                if _merged and _a <= _merged[-1][1] + 1:
-                    _merged[-1][1] = max(_merged[-1][1], _b)
-                else:
-                    _merged.append([_a, _b])
-            _spans_now = [(int(_a), int(_b)) for _a, _b in _merged]
-        except (TypeError, ValueError):
-            pass
-        try:
-            _want = posixpath.normpath(str(scope))
-        except Exception:  # noqa: BLE001
-            return ""
-        _lines: list[int] = []
-        for _m in matches:
-            try:
-                if not isinstance(_m, dict):
-                    return ""
-                if posixpath.normpath(str(_m.get("file") or "")) != _want:
-                    return ""  # a hit outside the single file — serve
-                _ln = int(_m.get("line") or 0)
-                if _ln <= 0:
-                    return ""
-                _lines.append(_ln)
-            except (TypeError, ValueError):
-                return ""
-        if not _lines or len(_lines) > 200:
-            return ""
-
-        def _covered(_lo: int, _hi: int) -> bool:
-            try:
-                _lo = max(1, int(_lo))
-                _need = max(1, int(_hi)) - _lo + 1
-                _got = sum(
-                    max(0, min(int(_hi), _b) - max(_lo, _a) + 1)
-                    for _a, _b in _spans_now
-                )
-                return _got >= _need
-            except (TypeError, ValueError):
-                return False
-
-        for _ln in _lines:
-            if not _covered(_ln - SNIPPET_CONTEXT, _ln + SNIPPET_CONTEXT):
-                return ""
-        # Matches on a definition's first line would inline the body: hide
-        # nothing unless that body span was served before too. The symbol
-        # parse is mtime-cached (grammar compiles once per process).
-        try:
-            from symbol_index import enclosing_symbol as _enclosing
-        except ImportError:
-            return ""
-        if _enclosing is not None:
-            try:
-                _hits = await asyncio.gather(
-                    *(asyncio.to_thread(_enclosing, _target, _ln) for _ln in _lines)
-                )
-            except Exception:  # noqa: BLE001
-                return ""
-            for _ln, _hit in zip(_lines, _hits):
-                try:
-                    if _hit is None:
-                        continue
-                    _hs, _he = int(_hit[1]), int(_hit[2])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                if _hs == _ln and not _covered(
-                    _hs, min(_he, _hs + _DEF_BODY_MAX_LINES - 1)
-                ):
-                    return ""
-        _n = len(_lines)
-        return (
-            f"All {_n} match{'es' if _n != 1 else ''} for this grep under "
-            f"{scope or '/'} sit on lines already served in context above — "
-            f"full rows NOT re-sent; reuse them. (If those rows are no longer "
-            f"in context, re-grep with a wider pattern or read exact "
-            f"ranges/symbols — otherwise do NOT re-grep; continue the task.)"
-        )
-    except Exception:  # noqa: BLE001 — coverage never breaks a search
-        return ""
 
 
 def _def_body_text(abs_path: str, match_line: int, start: int, end: int) -> str | None:
@@ -3653,32 +3666,29 @@ def make_tool_callbacks(
     # Correlate every tool call with its result via a per-invocation `call_id`.
     # The UI previously matched tool_results to running cards by (tool name +
     # status) alone, which breaks when the SAME tool runs multiple times in a
-    # turn (e.g. 8× grep) or when explore's sub-agent emits identically-named
+    # turn (e.g. 8× grep) or when the sub-agent emits identically-named
     # tool events into the same stream — results could resolve the wrong card,
     # leaving a genuinely-started card stuck on "running" forever.
     #
-    # Parent tools carry their pairing through a `contextvars.ContextVar` set per
-    # invocation: LangGraph runs parallel same-name tool calls as SEPARATE
-    # async tasks (each with a copied context), and each task emits its own
-    # `tool` then its own `tool_result`. Threading the id through the context
-    # keeps tool→result correct even when parallel calls finish OUT of order — a
-    # name-based FIFO (pop the oldest pending id) would otherwise swap the
-    # results and, on a Stop, make the retried model think work was never done,
-    # re-running duplicate tools.
+    # Parent AND sub-agent tools carry their pairing through a
+    # `contextvars.ContextVar` set per invocation: LangGraph runs parallel
+    # same-name tool calls as SEPARATE async tasks (each with a copied
+    # context), and each task emits its own `tool` then its own
+    # `tool_result`. Threading the id through the context keeps tool→result
+    # correct even when parallel calls finish OUT of order — a name-based
+    # FIFO (pop the oldest pending id) would otherwise swap the results
+    # and, on a Stop, make the retried model think work was never done,
+    # re-running duplicate tools. Sub-agent tools use the same mechanism
+    # (their functions are `_invoke`-wrapped too), so no FIFO is needed.
     _call_seq = 0
-    # Unique id per explore CALL: stamped on the explore card, its tool_result
+    # Unique id per task CALL: stamped on the task card, its tool_result
     # and every sub-event so the frontend routes a call's sub-events to ITS OWN
     # card even when two task calls run concurrently (the parent can issue
     # several in one parallel-tool-calls response). Without it, both calls'
-    # sub-events nest into the first running task card ("all parallel explores
-    # show the same sub-searches"). One id per call — there is no fan-out into
-    # multiple sub-agents anymore.
+    # sub-events nest into the first running task card ("all parallel
+    # sub-agents show the same sub-searches"). One id per call — each call
+    # spawns its own background sub-agent job.
     _task_call_seq = 0
-    # Sub-agent tool→result correlation: name-based FIFO keyed per
-    # (parent call id, tool). Concurrent explore calls each get their own queue,
-    # so out-of-order completion across calls can't swap call_ids (call 2's
-    # grep result popping call 1's id would resolve the wrong child row).
-    _pending_sub_calls: dict[tuple[object, str], list[int]] = {}
     _cur_call_id: contextvars.ContextVar[int] = contextvars.ContextVar(
         "coder_tool_call_id", default=0
     )
@@ -3690,7 +3700,7 @@ def make_tool_callbacks(
     # (مثلاً مدل دوباره وضعیت صفحه را می‌پرسد بی‌آنکه اکشنی زده باشد)،
     # فراخوانی vision (تا چند ثانیه) رد می‌شود. تغییر پیکسل → کلید جدید.
     _see_cache: dict[str, Any] = {"key": None, "result": None}
-    # راه فرار دروازه laya روی see: بعد از یک رد، همان سؤال+اپ در همین نوبت
+    # راه فرار دروازه see: بعد از یک رد، همان سؤال+اپ در همین نوبت
     # از دروازه معاف است تا بینایی برای آن سؤال قفل نشود.
     _see_gate_rejected: set[str] = set()
 
@@ -3744,7 +3754,7 @@ def make_tool_callbacks(
         tool = ev.get("tool") or ""
         if kind == "usage":
             # Every usage event emitted from tools.py is a SUB-AGENT model call
-            # (search/web/explore distill + summarizers) — the parent's own
+            # (search/web/subagent distill + summarizers) — the parent's own
             # usage is emitted from agents.py, never here. Tag it `sub=True` so
             # the frontend keeps sub-agent usage out of the message badge /
             # context meter (it runs in isolated transcripts that never enter
@@ -3752,7 +3762,7 @@ def make_tool_callbacks(
             # session totals.
             ev["sub"] = True
         if _SUB_AGENT_CTX.get():
-            # A GENERAL sub-agent is running: its tool calls reuse the PARENT's
+            # A sub-agent is running: its tool calls reuse the PARENT's
             # tool functions, so tag them `sub=True` (they run in an isolated
             # transcript — never count against the parent's tool-step budget)
             # and stamp the task card's branch id so the frontend nests them
@@ -3761,39 +3771,31 @@ def make_tool_callbacks(
             _br = _SUB_AGENT_BRANCH_CTX.get()
             if _br:
                 ev["branch"] = _br
-        is_sub = bool(ev.get("sub"))
-        if not is_sub:
-            # Parent tool invocation: read the per-invocation id. The wrapper
-            # below reset it to 0 so the first `tool` emit allocates a fresh id
-            # and the matching `tool_result` (same invocation/context) reuses it.
-            if kind == "tool":
-                cid = _cur_call_id.get()
-                if not cid:
-                    _call_seq += 1
-                    cid = _call_seq
-                    _cur_call_id.set(cid)
-                ev["call_id"] = cid
-            elif kind == "tool_result":
-                cid = _cur_call_id.get()
-                if cid:
-                    ev["call_id"] = cid
-        else:
-            # Sub-agent events flowed through `_sub_emit` (tagged `sub=True`),
-            # they can't be threaded per-invocation from here, so keep the
-            # name-based FIFO correlation for those — keyed per (parent call id,
-            # tool) so TWO concurrent explore calls (the parent can issue several
-            # in one parallel-tool-calls response) don't share one FIFO
-            # (out-of-order completion would otherwise swap call_ids across
-            # calls). `_cur_call_id` is the explore card's own id (set when the
-            # parent `tool` event was emitted in THIS call's task context).
-            _fifo_key = (_cur_call_id.get() or ev.get("branch"), tool)
-            if kind == "tool":
+            # Stamp the background job id so trace entries can be filtered
+            # per sub-agent (Trace viewer opens one filtered view per task).
+            try:
+                _tid = str(_subagent_jobs.RUNNING_TASK_CTX.get() or "").strip()
+            except Exception:  # noqa: BLE001 — trace tagging never breaks tools
+                _tid = ""
+            if _tid:
+                ev["task_id"] = _tid
+        # Tool→result pairing: read the per-invocation id. The `_invoke`
+        # wrapper below reset it to 0 so the first `tool` emit allocates a
+        # fresh id and the matching `tool_result` (same invocation/context)
+        # reuses it. Parallel same-name calls run as separate async tasks
+        # with copied contexts, so out-of-order completion can never swap
+        # ids — for parent and sub-agent calls alike.
+        if kind == "tool":
+            cid = _cur_call_id.get()
+            if not cid:
                 _call_seq += 1
-                ev["call_id"] = _call_seq
-                _pending_sub_calls.setdefault(_fifo_key, []).append(_call_seq)
-            elif kind == "tool_result":
-                if _pending_sub_calls.get(_fifo_key):
-                    ev["call_id"] = _pending_sub_calls[_fifo_key].pop(0)
+                cid = _call_seq
+                _cur_call_id.set(cid)
+            ev["call_id"] = cid
+        elif kind == "tool_result":
+            cid = _cur_call_id.get()
+            if cid:
+                ev["call_id"] = cid
         orig_emit(ev)
         # Live Trace panel log (LangSmith-style) — best-effort, never breaks tools.
         try:
@@ -3808,6 +3810,7 @@ def make_tool_callbacks(
                     _args_text = str(ev.get("args") or "")[:8000]
                 # The main loop already appended a running entry with the step
                 # number for this same call — claim it instead of logging twice.
+                _ev_tid = str(ev.get("task_id") or "").strip()
                 _claimed = _trace_store.claim_running_tool(
                     str(_chat_id or ""),
                     str(tool or ""),
@@ -3816,6 +3819,7 @@ def make_tool_callbacks(
                         "ev_call_id": str(ev.get("call_id") or ""),
                         "branch": str(ev.get("branch") or ""),
                         "sub": bool(ev.get("sub")),
+                        "task_id": _ev_tid,
                     },
                 )
                 if _claimed is None:
@@ -3831,10 +3835,12 @@ def make_tool_callbacks(
                             "model": str(ev.get("model") or ""),
                             "branch": str(ev.get("branch") or ""),
                             "sub": bool(ev.get("sub")),
+                            "task_id": _ev_tid,
                             "status": "running",
                         },
                         model=str(ev.get("model") or ""),
                         prompt=_args_text,
+                        task_id=_ev_tid,
                     )
             elif kind == "tool_result":
                 _res = ev.get("results")
@@ -4116,13 +4122,7 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
-        # Also drop per-turn served windows: same-turn omission must not omit
-        # lines served BEFORE this edit (they are stale now).
         _invalidate_read_cache_for(path, root)
-        try:
-            drop_ledger_path(path)
-        except Exception:  # noqa: BLE001, S110 — invalidation never breaks edit
-            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -4567,7 +4567,7 @@ def make_tool_callbacks(
         replace_all: bool = False,
         edits: list[dict] | None = None,
     ) -> str:
-        """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite.
+        """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite. Decorations copied from read/grep output (`2096 | ` line prefixes, trailing spaces, wrapper notes) are stripped automatically when they block the match — copying clean text still works best.
 
         BATCH: to apply several changes to the SAME file, pass `edits` (a list of {"old_string","new_string","replace_all"} objects) instead of firing one edit_file call per change — all edits apply atomically in list order with ONE checkpoint/diff/verify. Either every edit applies or nothing is written."""
         emit(
@@ -4631,13 +4631,7 @@ def make_tool_callbacks(
         )
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
-        # Also drop per-turn served windows: same-turn omission must not omit
-        # lines served BEFORE this edit (they are stale now).
         _invalidate_read_cache_for(path, root)
-        try:
-            drop_ledger_path(path)
-        except Exception:  # noqa: BLE001, S110 — invalidation never breaks edit
-            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         _n_edits = int(result.get("edits_applied", 0) or 0)
         _head = (
@@ -4704,23 +4698,6 @@ def make_tool_callbacks(
                 out.append(p)
         return out or [""]
 
-    def _grep_word_set(combined: str) -> frozenset:
-        """Significant words of a combined grep pattern for overlap checks.
-
-        Splits on non-word characters, lowercases, drops short tokens and
-        pure numbers (regex operators like ``\\s`` / ``.*`` carry no signal).
-        A later grep whose word set is a subset of a complete earlier search
-        on the same scope can only repeat rows already in context.
-        """
-        try:
-            return frozenset(
-                w.lower()
-                for w in re.split(r"[^A-Za-z0-9_]+", str(combined or ""))
-                if len(w) >= 3 and not w.isdigit()
-            )
-        except Exception:  # noqa: BLE001 — overlap never breaks a search
-            return frozenset()
-
     async def grep_tool(
         pattern: str,
         patterns: list[str] | None = None,
@@ -4749,57 +4726,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         inc_disp = "|".join(all_includes) if len(all_includes) > 1 else include
         generation = _search_generations.get(root, 0)
         cache_key = ("grep", combined, scope, inc_disp, root, str(max_results), str(tool_out_chars))
-        # Exact repeat inside this turn (generation folds in edits, so a
-        # post-edit repeat re-executes): stub it, the content is in context.
-        if note_turn_call(("dup", "grep", generation, combined, scope, inc_disp, str(max_results))):
-            return _duplicate_stub(
-                emit, "grep",
-                {"pattern": combined, "path": scope, "include": inc_disp},
-                _main_name, f"pattern={combined!r} under {scope or '/'}",
-            )
-        # Same-turn subset repeat: an earlier COMPLETE grep on this scope
-        # already showed every row these words can match (subset of its
-        # alternatives = subset of its rows). Stub it — re-scanning and
-        # re-sending is pure token waste. Broader patterns, other scopes,
-        # larger max_results, and post-edit generations still execute.
-        from tool_batching import grep_cover_check as _grep_cover_check
-        from tool_batching import grep_cover_note as _grep_cover_note
-
-        _words = _grep_word_set(combined)
-        _scope_key = (scope, inc_disp)
-        _cover = _grep_cover_check(
-            generation, _scope_key, _words, max_results, combined
-        )
-        if _words and _cover:
-            return _duplicate_stub(
-                emit, "grep",
-                {"pattern": combined, "path": scope, "include": inc_disp},
-                _main_name,
-                f"pattern={combined!r} under {scope or '/'} is covered by "
-                f"this turn's earlier grep ({_cover}) — those rows are "
-                "already in context above; read exact ranges/symbols instead "
-                "of re-grepping",
-            )
-        # Cross-turn subset repeat: a PREVIOUS turn's COMPLETE grep on this
-        # scope already showed every row these words can match, and the
-        # matched files are byte-unchanged since (same generation + mtimes).
-        # Stub it — the rows are in history. Wider patterns, larger
-        # max_results, and edits (ours or external) still execute.
-        from tool_batching import cross_turn_grep_check as _cross_grep_check
-
-        _cross_cover = (
-            _cross_grep_check(root, generation, _scope_key, _words, max_results)
-            if _words else ""
-        )
-        if _cross_cover:
-            return _cross_turn_stub(
-                emit, "grep",
-                {"pattern": combined, "path": scope, "include": inc_disp},
-                _main_name,
-                f"pattern={combined!r} under {scope or '/'} was already "
-                f"searched ({_cross_cover})",
-                "To force a fresh scan, repeat with a wider pattern or larger max_results.",
-            )
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -4871,34 +4797,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            # A no-match search is trivially complete: a later subset
-            # pattern on this scope can match nothing either.
-            _grep_cover_note(
-                generation, _scope_key, _words, max_results, combined, combined
-            )
             return f"No matches for {combined!r} under {scope or '/'}"
-        # Single-file repeat of already-served rows (the back-to-back grep
-        # ping-pong: grep, read the body, grep a narrower term on the same
-        # file). The scan above ran; when every match sits on served lines,
-        # only the re-send is skipped. A `tool` event already fired above,
-        # so only the result event fires here (same as the cached path).
-        if len(all_paths) == 1 and len(all_includes) == 1:
-            try:
-                _served_stub = await _grep_served_rows_stub(
-                    root, all_paths[0], matches, permit,
-                )
-            except Exception:  # noqa: BLE001 — coverage never breaks a search
-                _served_stub = ""
-            if _served_stub:
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "grep",
-                        "summary": "duplicate (already in context)",
-                        "model": _main_name,
-                    }
-                )
-                return _served_stub        # Output contract (spec §3, revised): each hit shows the match line plus
+        # Output contract (spec §3, revised): each hit shows the match line plus
         # surrounding code (already computed by search_in_files above).
         # Adaptive context: full ±3 lines for up to 5 results, ±1 line when
         # more are shown, so a broad search stays within the char budget
@@ -4963,28 +4863,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             lines.append(entry)
             total += len(entry) + 2
             _shown_n += 1
-        # Served truth for later repeats: the shown rows are now in context.
-        # Record their spans (same-turn + cross-turn) so a later read/grep of
-        # the same lines omits them instead of re-sending. Only SHOWN matches
-        # (hidden ones were never served). Definition bodies are recorded in
-        # Phase 3 where their served extents are known.
-        try:
-            from tool_batching import note_cross_turn_read as _note_cross_snip
-
-            for _sm in _shown_ms:
-                try:
-                    _sf = str(_sm.get("file") or "")
-                    _sl = int(_sm.get("line") or 0)
-                    if not _sf or _sl <= 0:
-                        continue
-                    _slo, _shi = max(1, _sl - _adaptive), _sl + _adaptive
-                    note_fetched_window(_sf, _slo, _shi)
-                    _sabs = _sf if os.path.isabs(_sf) else os.path.join(root, _sf)
-                    _note_cross_snip(root, _sf, _slo, _shi, _sabs, 0)
-                except (TypeError, ValueError):
-                    continue
-        except Exception:  # noqa: BLE001, S110 — ledger never breaks a search
-            pass
         # Phase 2: enclosing-symbol annotations off the event loop. The first
         # parse of a file compiles the grammar (~seconds once), later hits
         # are mtime-cached (~ms) — either way never block the tool loop.
@@ -5049,31 +4927,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     lines[_i] = lines[_i] + "\n" + _dbody
                 total += len(_dbody) + 2 - len(_old_body)
                 _expanded += 1
-                # The inlined body is now served: record its span so later
-                # repeats know these lines are in context (powers the
-                # single-file served-rows stub above).
-                try:
-                    _bm = re.search(r"\(L(\d+)-(\d+)\)", _suffix or "")
-                    _bf = str(_mm.get("file") or "")
-                    if _bm and _bf:
-                        _bs, _be = int(_bm.group(1)), int(_bm.group(2))
-                        _bl = min(_be, _bs + _DEF_BODY_MAX_LINES - 1)
-                        if _bl >= _bs:
-                            note_fetched_window(_bf, _bs, _bl)
-                            _babs = (
-                                _bf
-                                if os.path.isabs(_bf)
-                                else os.path.join(root, _bf)
-                            )
-                            from tool_batching import (
-                                note_cross_turn_read as _note_cross_body,
-                            )
-
-                            _note_cross_body(root, _bf, _bs, _bl, _babs, 0)
-                except (TypeError, ValueError):
-                    pass
-                except Exception:  # noqa: BLE001, S110 — ledger never breaks search
-                    pass
         _shown = len(lines)
         _hidden = len(matches) - _shown
         if _hidden > 0:
@@ -5120,38 +4973,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         raw = f"MATCHES for {combined!r}\n" + "\n\n".join(lines) + note
         if _search_generations.get(root, 0) == generation:
             _parent_search_cache[cache_key] = raw
-        # Complete searches (nothing hidden, no per-file cap hid hits) cover
-        # later subset greps on this scope — record the word set so they stub
-        # out instead of re-sending the same rows.
-        if _hidden == 0 and not _capped_files:
-            _grep_cover_note(
-                generation, _scope_key, _words, max_results, combined, combined
-            )
-            # Cross-turn reuse: remember the matched files' signatures so a
-            # later turn's repeat stubs out while they are unchanged.
-            from tool_batching import note_cross_turn_grep as _cross_grep_note
-
-            try:
-                _cross_files: list[str] = []
-                for _m in matches:
-                    _mf = _m.get("file") if isinstance(_m, dict) else None
-                    if not _mf:
-                        continue
-                    _ma = (
-                        str(_mf)
-                        if os.path.isabs(str(_mf))
-                        else os.path.join(root, str(_mf))
-                    )
-                    if _ma not in _cross_files:
-                        _cross_files.append(_ma)
-                _cross_grep_note(
-                    root, generation, _scope_key, _words, max_results, combined,
-                    f"{len(matches)} matches in "
-                    f"{len({_m.get('file') for _m in matches if isinstance(_m, dict)})} files",
-                    _cross_files,
-                )
-            except Exception:  # noqa: BLE001, S110 — reuse never breaks a search
-                pass
         # Send the structured results too (not just the summary) so a reconnect
         # can replay the tool without re-executing it (re-execution wastes
         # context). `items` carries the actual rows the model needs to see.
@@ -5260,12 +5081,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         scope = "|".join(all_paths) if len(all_paths) > 1 else path
         generation = _search_generations.get(root, 0)
         cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
-        if note_turn_call(("dup", "glob", generation, cache_key)):
-            return _duplicate_stub(
-                emit, "glob",
-                {"pattern": disp, "path": scope},
-                _main_name, f"pattern={disp!r} under {scope or '/'}",
-            )
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             emit(
@@ -5392,9 +5207,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """File map instead of a blind head dump (see _HEAD_MAP_* above).
 
-        Envelope matches normal read blocks so the projection and the
-        step-level ledger parse it; only the shown head rows count as
-        fetched (note_served_map keeps coverage checks honest).
+        Envelope matches normal read blocks.
         """
         try:
             from symbol_index import get_symbol_ranges as _get_sym_ranges
@@ -5441,8 +5254,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
             _summary = f"file map · {total} lines"
         _last = int(_rows[-1]["line"])
-        note_served_map(filePath)
-        note_fetched_window(filePath, 1, _last)
         if not quiet:
             emit(
                 {
@@ -5464,7 +5275,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         filePath: str, offset: int, limit: int, _main_name: str,
         quiet: bool = False, allow_head_map: bool = True,
         _cache_hits: list[str] | None = None,
-        _exclude: list[tuple[int, int]] | None = None,
     ) -> str:
         """Read ONE file/dir path and emit its own tool_result/error event.
         Shared by the single-path and batch branches of read_tool below so
@@ -5474,8 +5284,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         time. `quiet=True` suppresses the per-file events: the batch branch
         emits ONE aggregate card instead, so a fast-failing missing file can
         no longer hijack the whole batch card to red "file not found" while
-        the other files succeeded. `_exclude` (sig-validated already-served
-        spans) omits those lines from the body instead of re-sending them."""
+        the other files succeeded."""
         try:
             target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
         except PathEscapeError as exc:
@@ -5488,18 +5297,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # returns the cached bytes instead of re-scanning the file — no CPU
         # cost, just a cache hit. Normalizing means the key matches regardless
         # of how the model spelled the path, and lines up with the key
-        # _invalidate_read_cache_for() computes after edit/write. The omission
-        # set changes the bytes, so it joins the key (empty omission keeps the
-        # legacy 3-tuple key).
+        # _invalidate_read_cache_for() computes after edit/write.
         cache_key = ("read", target, str(offset), str(limit))
-        if _exclude:
-            try:
-                cache_key = (
-                    "read", target, str(offset), str(limit),
-                    repr(sorted((int(_a), int(_b)) for _a, _b in _exclude)),
-                )
-            except Exception:  # noqa: BLE001, S110 — key never breaks a read
-                pass
         cached = _parent_search_cache.get(cache_key)
         if cached is not None:
             if _cache_hits is not None:
@@ -5530,51 +5329,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             return f"ERROR reading {filePath}: {msg}"
         offset = int(offset or 1)
         limit = int(limit or 2000)
-        # Paging auto-join: bridge a small gap (<= _READ_JOIN_GAP) between the
-        # requested window and an already-fetched window of the same file, so
-        # no sliver is left behind to page. Nearest prior window per side only
-        # (provably disjoint from every recorded window, so coverage checks
-        # never double-count). Bounded, disclosed below, and only the gap
-        # itself is ledger-recorded here (the requested window is recorded by
-        # the agent loop as usual).
-        _join_note = ""
-        try:
-            from tool_batching import fetched_windows as _fetched_windows
-
-            _prior_all = _fetched_windows(filePath) or []
-        except Exception:  # noqa: BLE001 — join never breaks a read
-            _prior_all = []
-        if _prior_all:
-            _ns, _ne = offset, offset + limit - 1
-            _best_back: tuple[int, int] | None = None  # (gap, win_end)
-            _best_fwd: tuple[int, int] | None = None  # (gap, win_start)
-            for _s0, _s1 in _prior_all:
-                try:
-                    _s0, _s1 = int(_s0), int(_s1)
-                except (TypeError, ValueError):
-                    continue
-                _gb = _ns - _s1 - 1
-                if 0 < _gb <= _READ_JOIN_GAP and (
-                    _best_back is None or _gb < _best_back[0]
-                ):
-                    _best_back = (_gb, _s1)
-                _gf = _s0 - _ne - 1
-                if 0 < _gf <= _READ_JOIN_GAP and (
-                    _best_fwd is None or _gf < _best_fwd[0]
-                ):
-                    _best_fwd = (_gf, _s0)
-            if _best_back is not None:
-                note_fetched_window(filePath, _best_back[1] + 1, offset - 1)
-                _ns = _best_back[1] + 1
-            if _best_fwd is not None:
-                note_fetched_window(filePath, offset + limit, _best_fwd[1] - 1)
-                _ne = _best_fwd[1] - 1
-            if (_ns, _ne) != (offset, offset + limit - 1):
-                _join_note = (
-                    f"(Joined to lines fetched earlier this turn — returning "
-                    f"lines {_ns}-{_ne} with no gap left to page.)"
-                )
-                offset, limit = _ns, _ne - _ns + 1
         # Block-snapped over-read: fetch up to _SNAP_LOOKAHEAD lines past the
         # requested limit (bulk reads >= 1000 lines are exempt — they already
         # cover whole regions) so the window can end on a block boundary
@@ -5641,53 +5395,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     cut = bool(tail.get("cut"))
         else:
             lines = _snap_end(lines, limit)
-        # Sliver-serve: omit already-served lines (sig-validated spans passed
-        # as _exclude) instead of re-sending them inside a partially
-        # overlapping window. The `line |` rows keep their numbers, so the
-        # gapped body stays coherent; the note names the omitted ranges.
-        _extent_last = lines[-1]["line"]
-        _omit_note = ""
-        if _exclude:
-            try:
-                _excl_set: set[int] = set()
-                for _ea, _eb in _exclude:
-                    _ea, _eb = int(_ea), int(_eb)
-                    if _ea > _eb or _eb - _ea > 200000:
-                        continue
-                    _excl_set.update(range(max(1, _ea), _eb + 1))
-            except Exception:  # noqa: BLE001 — omission never breaks a read
-                _excl_set = set()
-            if _excl_set:
-                _shown = [
-                    ln for ln in lines
-                    if int(ln.get("line", -1)) not in _excl_set
-                ]
-                if _shown and len(_shown) < len(lines):
-                    _runs: list[str] = []
-                    _n = int(start)
-                    while _n <= int(_extent_last):
-                        if _n in _excl_set:
-                            _r0 = _n
-                            while _n + 1 <= int(_extent_last) and (_n + 1) in _excl_set:
-                                _n += 1
-                            _runs.append(f"{_r0}-{_n}" if _n > _r0 else f"{_r0}")
-                        _n += 1
-                    _omit_note = (
-                        "\n\n(lines " + ", ".join(_runs) + " already in "
-                        "context above — omitted; showing only new lines.)"
-                    )
-                    lines = _shown
-                    start = int(lines[0]["line"])
-                elif not _shown:
-                    # Fully covered but missed member-drop (ledger quirk):
-                    # stub instead of an empty body, never break the batch.
-                    return (
-                        f"({filePath}: lines {start}-{_extent_last} already "
-                        "in context above — omitted.)"
-                    )
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
-        more = _extent_last < total
+        more = last < total
         if quiet:
             # Batch member: one compact position marker. The batch call
             # carries the paging guidance once at the end, so per-block
@@ -5708,14 +5418,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         else:
             body += f"\n\n(End of file - total {total} lines)"
-        if _join_note:
-            body += f"\n\n{_join_note}"
-        if _omit_note:
-            body += _omit_note
-        # NOTE: the per-file "already fetched" reminder used to live here.
-        # It is now consolidated into one step-level line (context_ledger_line,
-        # sent transiently with the next request) so N blocks no longer repeat
-        # N reminders.
         if not quiet:
             emit(
                 {
@@ -5728,25 +5430,6 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
         _parent_search_cache[cache_key] = raw
-        # Record what was ACTUALLY served (post-snap extents, not the request).
-        # observe() records requested windows pre-execution and records nothing
-        # for symbols= calls — without this, a symbols/ranges batch leaves no
-        # trace and the next read of the same lines re-serves them ("duplicate
-        # files"). Served truth here makes member-coverage exact. Errors and
-        # cache hits return before this point (nothing new served).
-        try:
-            note_fetched_window(filePath, start, last)
-        except Exception:  # noqa: BLE001, S110 — ledger never breaks a read
-            pass
-        # Cross-turn reuse: remember the served extent + file signature so a
-        # repeat in a LATER turn stubs out when the file is unchanged (only
-        # a changed file re-serves). Served maps return before this point.
-        try:
-            from tool_batching import note_cross_turn_read as _note_cross_read
-
-            _note_cross_read(root, filePath, start, last, target, total)
-        except Exception:  # noqa: BLE001, S110 — reuse never breaks a read
-            pass
         return raw
 
     async def read_tool(
@@ -5759,7 +5442,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (already-fetched members are skipped, one position marker per file, one guidance footer). Lines served before are omitted from bodies (named in a pointer note), never re-sent.
+        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer).
 
 SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
@@ -5770,21 +5453,6 @@ When you need to read several files, read multiple independent files in parallel
         filePaths = _coerce_str_list(filePaths)
         ranges = _coerce_str_list(ranges)
         symbols = _coerce_str_list(symbols)
-        # Exact repeat inside this turn: stub it, the content is in context.
-        # Generation folds in edits, so the standard post-edit re-read (same
-        # args, bumped generation) always re-executes.
-        if note_turn_call(
-            (
-                "dup", "read", _search_generations.get(root, 0), filePath,
-                str(offset), str(limit),
-                tuple(filePaths or []), tuple(ranges or []), tuple(symbols or []),
-            )
-        ):
-            return _duplicate_stub(
-                emit, "read",
-                {"filePath": filePath, "offset": offset, "limit": limit},
-                _main_name, f"{filePath} offset={offset} limit={limit}",
-            )
         # بازه‌های per-path ("path:offset:limit") → پنجره‌ی اختصاصی هر فایل.
         # offset/limit سراسری همچنان برای مسیرهای بدون بازه‌ی اختصاصی اعمال می‌شود.
         # jobs فهرست است (نه dict روی path) تا ranges تکراری هم‌فایل
@@ -5832,11 +5500,10 @@ When you need to read several files, read multiple independent files in parallel
         if not base_paths and not jobs:
             return "ERROR reading: no file specified — pass `filePath` (single file), `filePaths` (batch), or `ranges` (per-file windows)."
         # No single fast-path: EVERY read — even one file, one window — runs
-        # the batch pipeline below (member coverage-drop, widen+merge,
-        # quiet position markers, EOF refill, one aggregate card + footer).
-        # A separate single branch kept re-growing its own one-off behaviors
-        # (own footers, own events, no coverage-drop); uniformity kills that
-        # whole class of drift.
+        # the batch pipeline below (widen+merge, quiet position markers, EOF
+        # refill, one aggregate card + footer). A separate single branch kept
+        # re-growing its own one-off behaviors (own footers, own events);
+        # uniformity kills that whole class of drift.
         job_paths = {p for p, _, _ in jobs}
         tasks: list[tuple[str, int, int]] = [
             (p, offset, limit) for p in base_paths if p not in job_paths
@@ -5853,148 +5520,7 @@ When you need to read several files, read multiple independent files in parallel
             _seen_tasks.add(_t)
             _uniq_tasks.append(_t)
         tasks = _uniq_tasks
-        # Member-level coverage: drop batch members already served this turn.
-        # Loop-side stubs cover only single-window reads; a batch re-fetching
-        # one covered window among fresh ones would otherwise re-send it.
-        # Runs BEFORE widening: pre-widen tasks ARE the requested windows, so
-        # coverage is judged on exactly what was asked (widening only ever
-        # adds bonus context past the request).
-        # Requested windows were recorded pre-execution by observe(), so
-        # subtract this call's own requests first — coverage must come from
-        # EARLIER serving. Served windows are additionally recorded tool-side
-        # post-serve (with true snapped extents), which is what makes
-        # symbols=/ranges members droppable even though observe() records
-        # nothing for symbols= calls. Map-served paths are untrusted: never
-        # drop.
-        _requested: dict[str, list[tuple[int, int]]] = {}
-        if not symbols:
-            for _rp, _ro, _rl in tasks:
-                try:
-                    _requested.setdefault(str(_rp), []).append(
-                        (max(1, int(_ro)), max(1, int(_ro)) + max(1, int(_rl)) - 1)
-                    )
-                except (TypeError, ValueError):
-                    continue
-
-        # Members covered by a PREVIOUS turn (cross-turn keys): routed to the
-        # "previous turn, unchanged" message below instead of "this turn".
-        _cross_covered_keys: set[tuple[str, int, int]] = set()
-
-        def _member_covered(_mp: str, _mo: int, _ml: int) -> bool:
-            try:
-                if has_served_map(_mp):
-                    return False
-                # External-edit guard (same as omission below): stale
-                # per-turn spans must not stub a re-serve after an outside
-                # edit. Healed here so later members see the dropped ledger.
-                try:
-                    from tool_batching import cross_turn_sig_changed as _chg
-
-                    if bool(_chg(root, _mp)):
-                        try:
-                            drop_ledger_path(_mp)
-                        except Exception:  # noqa: BLE001, S110 — never breaks
-                            pass
-                        return False
-                except Exception:  # noqa: BLE001, S110 — guard never breaks coverage
-                    pass
-                _have = fetched_windows(_mp)
-                if _have:
-                    _rest = [(int(_a), int(_b)) for _a, _b in _have]
-                    for _w in _requested.get(_mp, []):
-                        try:
-                            _rest.remove((int(_w[0]), int(_w[1])))
-                        except (ValueError, TypeError):
-                            pass
-                    _ms, _me = int(_mo), int(_mo) + int(_ml) - 1
-                    _got = sum(
-                        max(0, min(_me, _b) - max(_ms, _a) + 1) for _a, _b in _rest
-                    )
-                    if _got >= _me - _ms + 1:
-                        return True
-                # Cross-turn fallback: served in a PREVIOUS turn and the file
-                # is byte-unchanged since (any edit — ours or external —
-                # misses and re-serves). observe() only records into the
-                # per-turn ledger, so no self-subtraction is needed here.
-                from tool_batching import cross_turn_read_covers as _cross_covers
-
-                try:
-                    _cs, _ce = int(_mo), int(_mo) + int(_ml) - 1
-                except (TypeError, ValueError):
-                    return False
-                if _cross_covers(root, _mp, _cs, _ce):
-                    _cross_covered_keys.add((str(_mp), int(_mo), int(_ml)))
-                    return True
-                return False
-            except Exception:  # noqa: BLE001 — coverage never breaks a read
-                return False
-
-        _dropped: list[str] = []
-        _dropped_cross: list[str] = []
-        _live: list[tuple[str, int, int]] = []
-        for _tp, _to, _tl in tasks:
-            if _member_covered(_tp, _to, _tl):
-                _label = f"{_tp} lines {_to}-{_to + _tl - 1}"
-                if (_tp, _to, _tl) in _cross_covered_keys:
-                    _dropped_cross.append(_label)
-                else:
-                    _dropped.append(_label)
-            else:
-                _live.append((_tp, _to, _tl))
-        _drop_note = ""
-        if _dropped or _dropped_cross:
-            _served_desc: list[str] = []
-            if _dropped:
-                _served_desc.append(
-                    ", ".join(_dropped) + " were already fetched this turn"
-                )
-            if _dropped_cross:
-                _served_desc.append(
-                    ", ".join(_dropped_cross)
-                    + " were fetched before and the file is "
-                    "unchanged since"
-                )
-            if not _live:
-                _msg = (
-                    "SKIPPED (already in context): "
-                    + "; ".join(_served_desc)
-                    + " — reusing that content; full text omitted to save tokens. "
-                    "Do NOT re-issue this read — continue the task with the content above."
-                    + (
-                        " (If those rows are no longer in context, re-read a "
-                        "WIDER window to re-serve them.)"
-                        if _dropped_cross and not _dropped else ""
-                    )
-                )
-                emit(
-                    {
-                        "kind": "tool",
-                        "tool": "read",
-                        "args": {
-                            "filePaths": base_paths,
-                            "offset": offset,
-                            "limit": limit,
-                            **({"ranges": list(ranges)} if ranges else {}),
-                            **({"symbols": list(symbols)} if symbols else {}),
-                        },
-                        "model": _main_name,
-                    }
-                )
-                emit(
-                    {
-                        "kind": "tool_result",
-                        "tool": "read",
-                        "summary": "skipped (already in context)",
-                        "model": _main_name,
-                    }
-                )
-                return _msg
-            tasks = _live
-            _drop_note = (
-                "(already in context, skipped: "
-                + "; ".join(_served_desc)
-                + " — serving the rest below)"
-            )
+        # Every requested window is served in full; re-reads re-serve.
         tasks = _widen_and_merge_windows(tasks)
         emit(
             {
@@ -6021,75 +5547,11 @@ When you need to read several files, read multiple independent files in parallel
         # quiet) so a fully-cached batch can report one "cached" card, the
         # same signal the old single branch emitted per read.
         _cache_hit_paths: list[str] = []
-        # Sliver-serve: per-path already-served spans (sig-validated, so an
-        # edited file yields none and serves whole). Each target omits those
-        # lines from its body instead of re-sending them. Map-served paths
-        # stay unfiltered (map coverage is untrusted).
-        from tool_batching import cross_turn_served_spans as _served_spans
-        from tool_batching import cross_turn_sig_changed as _sig_changed
-        from tool_batching import fetched_windows as _fetched_windows_fn
-
-        _excl_by_path: dict[str, list[tuple[int, int]]] = {}
-        _sig_changed_paths: set[str] = set()
-        for _ep, _eo, _el in tasks:
-            if _ep in _excl_by_path or has_served_map(_ep):
-                continue
-            try:
-                # External-edit guard: the per-turn ledger carries no
-                # signature, so without this an edit made OUTSIDE edit_file
-                # (IDE, git, test) leaves stale same-turn spans that omit
-                # lines served BEFORE the edit. The cross-turn store recorded
-                # the signature at serve time — a mismatch means changed.
-                try:
-                    _changed = bool(_sig_changed(root, _ep))
-                except Exception:  # noqa: BLE001 — validation never breaks read
-                    _changed = False
-                if _changed:
-                    _sig_changed_paths.add(_ep)
-                    try:
-                        drop_ledger_path(_ep)
-                    except Exception:  # noqa: BLE001, S110 — never breaks read
-                        pass
-                    continue
-                _combined: list[tuple[int, int]] = []
-                _sp = _served_spans(root, _ep) or []
-                for _a, _b in _sp:
-                    try:
-                        _combined.append((int(_a), int(_b)))
-                    except (TypeError, ValueError):
-                        continue
-                # Same-turn spans: omit lines already served earlier this
-                # turn (e.g. step-2 640-879, step-3 asks 630-649 -> omit
-                # 640-649, serve only the 630-639 sliver). observe() records
-                # this call's own windows pre-execution, so subtract them
-                # first — coverage must come from EARLIER serving only.
-                try:
-                    _prior = _fetched_windows_fn(_ep) or []
-                except Exception:  # noqa: BLE001 — omission never breaks a read
-                    _prior = []
-                if _prior:
-                    _rest: list[tuple[int, int]] = []
-                    for _w in _prior:
-                        try:
-                            _rest.append((int(_w[0]), int(_w[1])))
-                        except (TypeError, ValueError, IndexError):
-                            continue
-                    for _w in _requested.get(_ep, []):
-                        try:
-                            _rest.remove((int(_w[0]), int(_w[1])))
-                        except (ValueError, TypeError):
-                            pass
-                    _combined.extend(_rest)
-                if _combined:
-                    _excl_by_path[_ep] = _combined
-            except Exception:  # noqa: BLE001, S112 — omission never breaks a read
-                continue
         results = await asyncio.gather(
             *(
                 _read_target(p, o, l, _main_name, quiet=True,
                              allow_head_map=(p not in job_paths),
-                             _cache_hits=_cache_hit_paths,
-                             _exclude=_excl_by_path.get(p))
+                             _cache_hits=_cache_hit_paths)
                 for p, o, l in tasks
             )
         )
@@ -6109,8 +5571,7 @@ When you need to read several files, read multiple independent files in parallel
             _refills = await asyncio.gather(
                 *(
                     _read_target(p, 1, l, _main_name, quiet=True,
-                                 allow_head_map=False,
-                                 _exclude=_excl_by_path.get(p))
+                                 allow_head_map=False)
                     for _, p, l in _eof_tasks
                 )
             )
@@ -6162,17 +5623,14 @@ When you need to read several files, read multiple independent files in parallel
                 }
             )
             _partial = "\n\n".join(r for _, r in _oks) + "\n\n" + _foot
-            return f"{_drop_note}\n\n{_partial}" if _drop_note else _partial
+            return _partial
         if not _errs:
             # One assembly point for fresh and fully-cached serves: the cache
             # holds pre-footer member bytes, so rebuilding identically keeps
             # r1 == r2 for repeats (the cache contract the tests pin).
             _out = "\n\n".join(results)
-            if _drop_note:
-                _out = f"{_drop_note}\n\n{_out}"
             _out += (
-                "\n\n(Batch complete — reuse this content, do NOT re-read "
-                "these windows. Page further windows with "
+                "\n\n(Batch complete — page further windows with "
                 "ranges=[\"path:start:count\", ...] in one call.)"
             )
             if _symbol_missing:
@@ -6265,21 +5723,22 @@ When you need to read several files, read multiple independent files in parallel
     async def task_tool(
         description: str, prompt: str, subagent_type: str, task_id: str = ""
     ) -> str:
-        """Delegate a task to a specialized sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with its own tools and returns a single result. Use this for parallelizable work, complex research, or when a task needs a different tool set than you have. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — 'general' (general-purpose research / multi-step tasks) or 'subagent' (broad, read-only repository research that returns a compact summary of relevant files + findings). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use this for parallelizable work, research, or multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: the specialized agent to use — only 'subagent' is supported. `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same
         # branch (via _SUB_AGENT_BRANCH_CTX) and the frontend nests them under
         # THIS card. Without it the card has branch=undefined while its children
-        # carry branch=1, so the frontend drops them and the explore card shows
+        # carry branch=1, so the frontend drops them and the sub-agent card shows
         # nothing but "N chars".
         nonlocal _task_call_seq
         _ecall = _task_call_seq + 1
         _task_call_seq = _ecall
         # Validate the subagent_type against the agent registry (opencode:
         # "Unknown agent type: X is not a valid agent type").
-        subagent_type = resolve_agent(subagent_type)  # legacy 'explore' alias
+        subagent_type = resolve_agent(subagent_type)
         if subagent_type not in AGENTS:
+            _valid = ", ".join(repr(n) for n in agent_names())
             emit(
                 {
                     "kind": "tool",
@@ -6295,11 +5754,11 @@ When you need to read several files, read multiple independent files in parallel
             emit(
                 _error_result(
                     "task",
-                    f"Unknown agent type: {subagent_type} is not a valid agent type",
+                    f"Unknown agent type: {subagent_type} is not a valid agent type. Valid types: {_valid}",
                 )
             )
             return (
-                f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
+                f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type. Valid types: {_valid}"
             )
         # Sub-agent depth limit (opencode's subagent_depth, default 1): a
         # sub-agent cannot spawn another sub-agent.
@@ -6321,12 +5780,72 @@ When you need to read several files, read multiple independent files in parallel
                 f"ERROR: subagent depth limit reached ({_SUBAGENT_DEPTH_LIMIT}) — "
                 "a sub-agent cannot spawn another sub-agent."
             )
-        # Dispatch to the registered sub-agent runner. `general` and `explore`
-        # are the two opencode-style sub-agents; the runner pulls each one's
-        # system prompt + tool set from the registry.
+        # Background dispatch: register the job, emit the task card with its
+        # task_id/branch, then run the isolated sub-agent loop as an
+        # asyncio.Task so the main agent keeps working in parallel. The final
+        # report is stored on the job and injected into the main transcript
+        # when done (graph.py holds the turn open until every job for the
+        # chat ends). The returned string only acknowledges the spawn — it is
+        # NOT the report. Steer via task_steer(task_id=...), stop via
+        # task_stop(task_id=...). The legacy `task_id` argument (resume id)
+        # is ignored: every spawn gets a fresh registry id for steer/stop.
         if subagent_type in AGENTS:
-            return await _run_subagent_task(description, prompt, task_id, subagent_type, _ecall)
+            job = _subagent_jobs.create_job(_chat_id, _ecall, description, subagent_type)
+            _new_tid = str(job.get("task_id") or "")
+            emit(
+                {
+                    "kind": "tool",
+                    "tool": "task",
+                    "args": {
+                        "description": description,
+                        "subagent_type": subagent_type,
+                        "task_id": _new_tid,
+                    },
+                    "model": "",
+                    "branch": _ecall,
+                    "task_id": _new_tid,
+                    "status": "running",
+                }
+            )
+            coro = _run_subagent_task(description, prompt, _new_tid, subagent_type, _ecall)
+            try:
+                _bg = asyncio.create_task(coro)
+            except RuntimeError:
+                # No running loop (synchronous unit-test context): run inline
+                # so callers that await task() still get the final report.
+                _report = await coro
+                return str(_report)
+            _subagent_jobs.set_task(_new_tid, _bg)
+
+            def _done_cb(done: asyncio.Task, _cb_tid: str = _new_tid) -> None:
+                try:
+                    _rep = (
+                        done.result()
+                        if not done.cancelled()
+                        else "Stopped by the main agent before producing a report."
+                    )
+                except Exception:  # noqa: BLE001 — result already stored by runner
+                    _rep = ""
+                try:
+                    _j = _subagent_jobs.get_job(_cb_tid)
+                    if _j is not None and _j.get("status") == "running":
+                        _subagent_jobs.finish_job(
+                            _cb_tid, "stopped" if done.cancelled() else "completed", str(_rep or "")
+                        )
+                except Exception:  # noqa: BLE001, S110 — bookkeeping only
+                    pass
+
+            _bg.add_done_callback(_done_cb)
+            return (
+                f"Sub-agent started in background (task_id={_new_tid}, branch={_ecall}, "
+                f"type={subagent_type}): {str(description or '')[:120]}. "
+                "Continue your own work in parallel — its compact report will be "
+                "delivered automatically when it finishes. Use "
+                f"task_steer(task_id='{_new_tid}', message='...') to send a follow-up "
+                f"or task_stop(task_id='{_new_tid}') to stop it."
+            )
         # No other subagent types supported
+        _valid = ", ".join(repr(n) for n in agent_names())
         emit(
             {
                 "kind": "tool",
@@ -6342,12 +5861,41 @@ When you need to read several files, read multiple independent files in parallel
         emit(
             _error_result(
                 "task",
-                f"Unknown agent type: {subagent_type} is not a valid agent type",
+                f"Unknown agent type: {subagent_type} is not a valid agent type. Valid types: {_valid}",
             )
         )
         return (
-            f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type"
+            f"ERROR: Unknown agent type: {subagent_type} is not a valid agent type. Valid types: {_valid}"
         )
+
+    async def task_steer_tool(task_id: str, message: str) -> str:
+        """Send a follow-up message to a RUNNING background sub-agent. The sub-agent picks it up between rounds and its next report reflects it. `task_id`: the id from the task spawn acknowledgement. `message`: the follow-up instruction (1-2 sentences)."""
+        emit({"kind": "tool", "tool": "task_steer", "args": {"task_id": task_id}})
+        job = _subagent_jobs.enqueue_steer(task_id, message)
+        if job is None:
+            emit(_error_result("task_steer", f"no such sub-agent: {task_id!r}"))
+            return f"ERROR: no such background sub-agent task_id={task_id!r}."
+        if job.get("status") != "running":
+            emit(_error_result("task_steer", f"task {task_id} already {job.get('status')}"))
+            return f"Task {task_id} is already {job.get('status')} — steer ignored."
+        if not str(message or "").strip():
+            emit(_error_result("task_steer", "empty message"))
+            return "ERROR: steer message is empty."
+        emit({"kind": "tool_result", "tool": "task_steer", "summary": f"steered {task_id}"})
+        return f"Steered {task_id}: follow-up queued; the sub-agent will reflect it in its report."
+
+    async def task_stop_tool(task_id: str) -> str:
+        """Stop a RUNNING background sub-agent. `task_id`: the id from the task spawn acknowledgement. The sub-agent ends as stopped and a short note is delivered instead of a report."""
+        emit({"kind": "tool", "tool": "task_stop", "args": {"task_id": task_id}})
+        job = _subagent_jobs.get_job(task_id)
+        if job is None:
+            emit(_error_result("task_stop", f"no such sub-agent: {task_id!r}"))
+            return f"ERROR: no such background sub-agent task_id={task_id!r}."
+        if job.get("status") != "running":
+            return f"Task {task_id} is already {job.get('status')} — nothing to stop."
+        _subagent_jobs.request_stop(task_id)
+        emit({"kind": "tool_result", "tool": "task_stop", "summary": f"stopped {task_id}"})
+        return f"Stopping {task_id}: it will end as stopped and deliver a short note."
 
     async def _run_subagent_task(
         description: str, prompt: str, task_id: str, subagent_type: str, branch: int = 0
@@ -6367,57 +5915,114 @@ When you need to read several files, read multiple independent files in parallel
         """
         from llm import langchain_tool_loop
 
+        # Tee: every event this loop emits also lands on the job registry's
+        # bounded activity trail so the per-chat right-panel view can show
+        # live progress as tool-call-like rows. The parent stream contract is
+        # untouched. Built in a factory so the enclosing ``emit`` is captured
+        # cleanly (no local rebinding of the captured name).
+        def _make_tee_emit(parent_emit, tid):
+            def tee_emit(ev: dict) -> None:
+                parent_emit(ev)
+                try:
+                    _kind = str((ev or {}).get("kind") or "")
+                    _tool = str(ev.get("tool") or "")
+                    if _kind == "tool":
+                        _subagent_jobs.append_event(
+                            str(tid or ""), _tool, tool=_tool, kind="tool"
+                        )
+                    elif _kind == "tool_result":
+                        _subagent_jobs.append_event(
+                            str(tid or ""),
+                            str(ev.get("summary") or "")[:120],
+                            tool=_tool,
+                            kind="tool_result",
+                        )
+                    elif _kind == "status":
+                        # Drop per-step heartbeat noise ("sub-agent started:",
+                        # "sub-agent step N/M") — retries repeat them and the
+                        # panel renders tool rows, not progress spam. The
+                        # loop's → / ✓ activity markers become tool rows.
+                        _c = str(ev.get("content") or "")[:120]
+                        if _c.startswith(("sub-agent started:", "sub-agent step ")):
+                            return
+                        if _c.startswith(("→ ", "✓ ")):
+                            _done = _c.startswith("✓ ")
+                            _name = _c[2:].strip()
+                            if _name:
+                                _subagent_jobs.append_event(
+                                    str(tid or ""),
+                                    "done" if _done else _name,
+                                    tool=_name,
+                                    kind="tool_result" if _done else "tool",
+                                )
+                        else:
+                            _subagent_jobs.append_event(
+                                str(tid or ""), _c, tool=_tool, kind="status"
+                            )
+                except Exception:  # noqa: BLE001, S110 — tee must never break the stream
+                    pass
+
+            return tee_emit
+
+        _tee_emit = _make_tee_emit(emit, task_id)
+
         _model = main_model
         if resolve_agent(subagent_type) == "subagent" and explore_model is not None:
             _model = explore_model
         if _model is None:
-            emit(
-                {
-                    "kind": "tool",
-                    "tool": "task",
-                    "args": {"description": description, "subagent_type": subagent_type},
-                    "branch": branch,
-                    "model": "",
-                }
-            )
-            emit(_error_result("task", "unavailable"))
+            _tee_emit(_error_result("task", "unavailable"))
+            try:
+                _subagent_jobs.finish_job(
+                    str(task_id or ""), "failed",
+                    "ERROR: the sub-agent is unavailable (no model configured for this session).",
+                )
+            except Exception:  # noqa: BLE001, S110 — bookkeeping only
+                pass
             return "ERROR: the sub-agent is unavailable (no model configured for this session)."
         _model_name = str(getattr(_model, "model_name", "") or "")
-        # `branch` (the branch id assigned up-front in task_tool) is passed in so
-        # the task card and its sub-events share the same branch; the frontend
-        # nests the sub-events under THIS card.
-        _tid = task_id or f"task-{uuid.uuid4().hex[:8]}"
-        emit(
-            {
-                "kind": "tool",
-                "tool": "task",
-                "args": {"description": description, "subagent_type": subagent_type},
-                "model": _model_name,
-                "branch": branch,
-            }
-        )
+        # Background job: `task_id` is the registry id created up-front in
+        # task_tool (the card was already emitted there with branch/task_id),
+        # so only emit a status line here — never a second task card.
+        _tid = str(task_id or "")
+        try:
+            _early = _subagent_jobs.get_job(_tid)
+            if _early is not None and _early.get("stop_requested"):
+                _subagent_jobs.finish_job(_tid, "stopped", "Stopped before start.")
+                _tee_emit(_error_result("task", f"sub-agent {_tid} stopped before start"))
+                return f'<task id="{_tid}" state="stopped">\n<task_result>\nStopped before start.\n</task_result>\n</task>'
+        except Exception:  # noqa: BLE001, S110 — stop check never breaks spawn
+            pass
         # Inherit the PARENT's actual (mode-filtered) toolset — set by agents.py
         # after capability filtering — so a plan/ask-mode `task` call cannot hand
         # the sub-agent write tools (the read-only bypass). Fall back to the full
-        # registry only when no parent toolset was recorded.
+        # registry only when no parent toolset was recorded. The source mixes
+        # plain callbacks with live MCP tools (ready BaseTool instances merged
+        # into the parent dict by merge_mcp_tools): BaseTool instances must be
+        # passed through UNWRAPPED — _invoke's functools.wraps would copy the
+        # instance __dict__ and langchain_tool_loop would then try to rebuild a
+        # StructuredTool from a BaseTool, crashing with "descriptor '__call__'
+        # for 'type' objects doesn't apply to a 'StructuredTool' object".
+        def _sub_wrap(name: str, fn: Any):
+            return fn if isinstance(fn, BaseTool) else _invoke(fn)
+
         _parent_tools = _PARENT_TOOLS_CTX.get()
         _tool_source = _parent_tools if _parent_tools is not None else _tools
         _reg_tools = agent_tools(subagent_type)
         if _reg_tools is not None:
             _allowed = set(_reg_tools)
             _sub_tools = {
-                name: _invoke(fn)
+                name: _sub_wrap(name, fn)
                 for name, fn in _tool_source.items()
                 if name in _allowed
             }
         else:
             _sub_tools = {
-                name: _invoke(fn)
+                name: _sub_wrap(name, fn)
                 for name, fn in _tool_source.items()
                 if name not in ("task", "update_plan", "vision")
             }
-        # Keep the explore sub-agent strictly read-only: wrap run_terminal so any
-        # command that would mutate the filesystem / system state is rejected
+        # Keep the background sub-agent strictly read-only: wrap run_terminal so
+        # any command that would mutate the filesystem / system state is rejected
         # before it runs (opencode's explore agent is bash-read-only).
         if resolve_agent(subagent_type) == "subagent" and "run_terminal" in _sub_tools:
             _orig_terminal = _tool_source.get("run_terminal")
@@ -6427,13 +6032,13 @@ When you need to read several files, read multiple independent files in parallel
             ) -> str:
                 if _is_terminal_write(command):
                     return (
-                        "ERROR: the explore agent is read-only and may not run "
+                        "ERROR: the sub-agent is read-only and may not run "
                         "commands that modify the filesystem or system state "
                         f"(blocked: {command!r}). Use grep/glob/read for "
                         "inspection, or delegate mutating work to the main agent "
                         "via the task tool."
                     )
-                # The explore agent must search via grep/glob/read, not by
+                # The sub-agent must search via grep/glob/read, not by
                 # shelling out through run_terminal (slow + token-heavy).
                 # git working-tree inspection stays allowed (read-only).
                 _first = (
@@ -6444,8 +6049,8 @@ When you need to read several files, read multiple independent files in parallel
                 if _first != "git" and _is_terminal_search(command):
                     return (
                         "ERROR: code search/inspection via run_terminal is not "
-                        "allowed in the explore agent — use grep/glob/read for "
-                        "targeted lookups, or fan out parallel explore calls."
+                        "allowed in the sub-agent — use grep/glob/read for "
+                        "targeted lookups, or fan out parallel sub-agent calls."
                     )
                 return await _orig_terminal(command=command, timeout=timeout)
 
@@ -6467,6 +6072,27 @@ When you need to read several files, read multiple independent files in parallel
         # تاریخچه از حافظه (از graph.py پاس داده شد) — نه از دیسک. فقط برای
         # استخراج mentioned_fnames/idents جهت رتبه‌بندی CODE MAP کافیه.
         _hist_for_map: list[dict] = _history_for_map
+        # Route mid-run steers (task_steer) to THIS job: llm.py drains
+        # RUNNING_TASK_CTX between steps so a follow-up lands while the
+        # sub-agent is still working, not only after its whole run.
+        _steer_token = _subagent_jobs.RUNNING_TASK_CTX.set(_tid)
+        # Skills: the sub-agent's registry prompt has no skills catalog, so
+        # it could neither see nor load_skill any user skill — a delegation
+        # like "apply the X skill to ..." made it stall or guess. Append the
+        # compact catalog (once — the retry loop below must not re-append)
+        # and make sure load_skill is bound: a general agent inherits it
+        # from the parent toolset, but an explicit registry tool list may
+        # omit it. Capped block; "" when no skills exist.
+        try:
+            from graph import skills_catalog_block as _skills_catalog
+
+            _catalog_block = _skills_catalog()
+        except Exception:  # noqa: BLE001 — catalog is best-effort
+            _catalog_block = ""
+        if _catalog_block:
+            prompt = prompt + _catalog_block
+        if "load_skill" not in _sub_tools and "load_skill" in _tool_source:
+            _sub_tools["load_skill"] = _invoke(_tool_source["load_skill"])
         while _attempts < _SUBAGENT_MAX_ATTEMPTS:
             _attempts += 1
             try:
@@ -6524,23 +6150,6 @@ When you need to read several files, read multiple independent files in parallel
                                 )
                         except Exception:  # noqa: BLE001, S110 — timing never breaks explore
                             pass
-                        try:
-                            import laya_decide as _laya_mod
-
-                            _ranked = _map_rank_info.get("ranked") if isinstance(_map_rank_info, dict) else None
-                            if isinstance(_ranked, list) and _ranked:
-                                _laya_mod.report_secondary(
-                                    None,
-                                    route="normal",
-                                    sub="code_map_rank",
-                                    chat_id=str(_chat_id or ""),
-                                    emit=emit,
-                                    elapsed_ms=int(_map_rank_info.get("elapsed_ms") or 0),
-                                    prompt=str(_map_rank_info.get("query") or prompt or ""),
-                                    ranked=_ranked,
-                                )
-                        except Exception:  # noqa: BLE001, S110 — گزارش اختیاری است
-                            pass
                     except Exception:  # noqa: BLE001
                         _code_map = ""
                     if _code_map:
@@ -6557,14 +6166,14 @@ When you need to read several files, read multiple independent files in parallel
                         # نمی‌خورد. این دقیقاً همون الگوی main agent تو graph.py هست.
                         prompt = prompt + _code_map_block
                 try:
-                    emit(
+                    _tee_emit(
                         {
                             "kind": "status",
-                            "stage": "explore",
-                            "content": f"explore started: {str(description or '')[:80]}",
+                            "stage": "subagent",
+                            "content": f"sub-agent started: {str(description or '')[:80]}",
                         }
                     )
-                except Exception:  # noqa: BLE001, S110 — progress never breaks explore
+                except Exception:  # noqa: BLE001, S110 — progress never breaks subagent
                     pass
                 _explore_t0 = time.monotonic()
                 _output = await langchain_tool_loop(
@@ -6576,15 +6185,15 @@ When you need to read several files, read multiple independent files in parallel
                     ctx=_ctx,
                     compact_model=_model,
                     reserved=reserved if reserved is not None else 20_000,
-                    emit=emit,
+                    emit=_tee_emit,
                 )
                 try:
                     logger.info(
-                        "[explore-timing] done explore=%.1fs desc=%s",
+                        "[subagent-timing] done subagent=%.1fs desc=%s",
                         time.monotonic() - _explore_t0,
                         str(description or "")[:80],
                     )
-                except Exception:  # noqa: BLE001, S110 — timing never breaks explore
+                except Exception:  # noqa: BLE001, S110 — timing never breaks subagent
                     pass
                 break
             except Exception as exc:  # noqa: BLE001 — degrade instead of killing the turn
@@ -6593,20 +6202,20 @@ When you need to read several files, read multiple independent files in parallel
                     # Already on the main model (or no fallback) — give up.
                     break
                 if _attempts < _SUBAGENT_MAX_ATTEMPTS:
-                    # Transient blip on the explore model: retry on the same
+                    # Transient blip on the sub-agent model: retry on the same
                     # model before falling back to the main model. Emit a
                     # retry event so the UI shows a banner instead of silence
                     # during the backoff sleep.
                     try:
-                        emit(
+                        _tee_emit(
                             {
                                 "kind": "retry",
                                 "attempt": _attempts,
                                 "max_attempts": _SUBAGENT_MAX_ATTEMPTS,
                                 "delay": _SUBAGENT_RETRY_SECONDS,
-                                "reason": f"explore model ({_model_name}) failed: {exc} — retrying",
+                                "reason": f"sub-agent model ({_model_name}) failed: {exc} — retrying",
                                 "model": _model_name,
-                                "agent": "explore",
+                                "agent": "subagent",
                                 "fallback": False,
                                 "reconnecting": True,
                             }
@@ -6615,9 +6224,9 @@ When you need to read several files, read multiple independent files in parallel
                         pass
                     await asyncio.sleep(_SUBAGENT_RETRY_SECONDS)
                     continue
-                # Retries on the explore model are exhausted: fall back to the
+                # Retries on the sub-agent model are exhausted: fall back to the
                 # main model for one final attempt (sticky, like _run_distill).
-                _emit_fallback("explore", "explore", _model, main_model, exc)
+                _emit_fallback("subagent", "subagent", _model, main_model, exc)
                 _model = main_model
                 _model_name = str(getattr(_model, "model_name", "") or "")
                 try:
@@ -6633,7 +6242,7 @@ When you need to read several files, read multiple independent files in parallel
                         ctx=_ctx,
                         compact_model=_model,
                         reserved=reserved if reserved is not None else 20_000,
-                        emit=emit,
+                        emit=_tee_emit,
                     )
                     _last_exc = None  # fallback succeeded — clear the prior error
                     break
@@ -6644,27 +6253,97 @@ When you need to read several files, read multiple independent files in parallel
             # Either the main model also failed, or we exhausted retries and
             # fell back but still failed. Return a structured note that steers
             # the Main Agent to re-delegate with a narrower scope instead of
-            # reading the whole codebase manually.
-            emit(_error_result("task", f"sub-agent failed: {_last_exc}"))
+            # reading the whole codebase manually. Direct grep/glob/read stay
+            # available — the note only suggests a cheaper retry, it never
+            # claims direct search is unavailable.
+            _tee_emit(_error_result("task", f"sub-agent failed: {_last_exc}"))
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
-            return _explore_fail_note(subagent_type, _model_name, _last_exc)
+            _note = _explore_fail_note(subagent_type, _model_name, _last_exc)
+            try:
+                _subagent_jobs.finish_job(_tid, "failed", _note)
+            except Exception:  # noqa: BLE001, S110 — bookkeeping only
+                pass
+            return _note
         _SUB_AGENT_CTX.reset(_token)
         _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
         _TASK_DEPTH_CTX.reset(_depth_token)
+        _subagent_jobs.RUNNING_TASK_CTX.reset(_steer_token)
         _output = (_output or "").strip()
-        emit(
+        # Steer follow-ups: messages the main agent queued via task_steer
+        # while this job ran are answered as extra rounds (bounded) so a
+        # steer is reflected instead of dropped. Stop wins immediately.
+        try:
+            _follow = 0
+            while _follow < 3:
+                _j = _subagent_jobs.get_job(_tid)
+                if _j is None or _j.get("stop_requested"):
+                    break
+                _inbox = list(_j.get("steer_inbox") or [])
+                _j["steer_inbox"] = []
+                if not _inbox:
+                    break
+                _follow += 1
+                _steer_text = "\n\n".join(str(s.get("message") or "") for s in _inbox if str(s.get("message") or "").strip())
+                if not _steer_text.strip():
+                    break
+                _extra = await langchain_tool_loop(
+                    _model,
+                    system=_sys,
+                    user=f"Follow-up from the main agent (task {_tid}):\n{_steer_text}\n\nOriginal task: {prompt}\n\nPrevious report:\n{_output}\n\nUpdate the report to reflect the follow-up.",
+                    tools=_sub_tools,
+                    max_steps=_agent_steps if _agent_steps else 24,
+                    ctx=_ctx,
+                    compact_model=_model,
+                    reserved=reserved if reserved is not None else 20_000,
+                    emit=_tee_emit,
+                )
+                _extra = (_extra or "").strip()
+                if _extra:
+                    _output = f"{_output}\n\n[follow-up {_follow}:\n{_extra}]" if _output else _extra
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001, S110 — follow-ups are best-effort
+            pass
+        try:
+            _j = _subagent_jobs.get_job(_tid)
+            if _j is not None and _j.get("stop_requested"):
+                _subagent_jobs.finish_job(_tid, "stopped", (_output or "Stopped.")[:8000])
+                _tee_emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "task",
+                        "summary": "stopped",
+                        "model": _model_name,
+                        "branch": branch,
+                        "task_id": _tid,
+                    }
+                )
+                return f'<task id="{_tid}" state="stopped">\n<task_result>\n{(_output or "Stopped.")}\n</task_result>\n</task>'
+        except Exception:  # noqa: BLE001, S110 — stop check never breaks delivery
+            pass
+        _tee_emit(
             {
                 "kind": "tool_result",
                 "tool": "task",
-                "summary": f"{len(_output)} chars",
+                "summary": (
+                    f"report {len(_output) / 1000:.1f}K chars"
+                    if len(_output) >= 1000
+                    else f"report {len(_output)} chars"
+                ),
                 "model": _model_name,
                 "branch": branch,
+                "task_id": _tid,
                 "results": [{"content": _output[:8000]}],
             }
         )
-        return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
+        _final = f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
+        try:
+            _subagent_jobs.finish_job(_tid, "completed", _final)
+        except Exception:  # noqa: BLE001, S110 — bookkeeping only
+            pass
+        return _final
 
     def _is_vision_image_rejection(exc: BaseException) -> bool:
         """True when the provider rejected the image content parts (a text-only
@@ -6926,16 +6605,7 @@ When you need to read several files, read multiple independent files in parallel
         # (Claude-Code-style). Otherwise return the raw results as before. On a
         # hard sub-agent failure the call falls back to the MAIN model (see
         # _run_distill) — raw results are only returned when BOTH models fail.
-        # گیت laya همگام است؛ در نخ جدا تا حلقه بلوکه نشود. ورودی‌اش طول کل
-        # نتایج خام هم هست تا تصمیم با دید کامل گرفته شود.
-        try:
-            _raw_total = sum(len(ln) for ln in lines)
-            _laya_skip_distill = await asyncio.to_thread(
-                _laya_distill_choice, query, len(results), _raw_total, str(_chat_id or ""), emit
-            ) == "raw"
-        except Exception:  # noqa: BLE001 — گیت اختیاری است
-            _laya_skip_distill = False
-        if _web_runner is not None and not _laya_skip_distill:
+        if _web_runner is not None:
             try:
                 res, ran_model = await _run_distill(
                     "web",
@@ -7825,109 +7495,6 @@ When you need to read several files, read multiple independent files in parallel
         emit({"kind": "tool_result", "tool": "current_time", "summary": now.strftime("%Y-%m-%d %H:%M UTC"), "status": "done"})
         return text
 
-    async def laya_tool(
-        operation: str = "choice",
-        state: str | dict | None = None,
-        options: list[str] | None = None,
-        candidate: str = "",
-        candidates: list | None = None,
-        top_k: int = 5,
-        instructions: str = "",
-        threshold: float = 0.65,
-    ) -> str:
-        """Fast local decision/classification/ranking via laya (System 1 router, not a chatbot). Use for any quick decision with caller-supplied labels — triage, routing, ranking — without hard-coding any domain. `operation` is 'choice' (pick one of `options` given `state` context), 'score' (rate `candidate` 0-1 given `state` context), 'rank' (order `candidates` — names or {name, description} dicts — by relevance to `state` text, at most `top_k`; e.g. to pick which skill or MCP tool fits the task, pass their names+descriptions as candidates and take the top entries; an empty ranked list means no signal — fall back to the full list yourself), or 'status' (laya readiness). `state` is free-form context (text or dict); `threshold` is the confidence cutoff for choice/score (below it the result is not handled — do the task with the main model instead). Returns JSON with handled/value/confidence/abstained/reason (rank returns handled/ranked/count/reason)."""
-        op = (operation or "choice").strip().lower()
-        emit(
-            {
-                "kind": "tool",
-                "tool": "laya",
-                "args": {"operation": op},
-            }
-        )
-        try:
-            import laya_decide as _laya
-        except Exception as exc:  # noqa: BLE001 — laya is optional
-            msg = f"laya unavailable: {exc}"
-            emit(_error_result("laya", msg))
-            return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "laya-not-installed"}, ensure_ascii=False)
-        try:
-            try:
-                thr = float(threshold)
-            except (TypeError, ValueError):
-                thr = 0.65
-            if not 0.0 <= thr <= 1.0:
-                thr = 0.65
-            if op == "status":
-                result = await asyncio.to_thread(_laya.status)
-                text = json.dumps({"operation": op, **result}, ensure_ascii=False, default=str)
-                emit({"kind": "tool_result", "tool": "laya", "summary": str(result.get("reason") or ("ready" if result.get("ready") else "not-ready"))[:400]})
-                return text
-            if isinstance(state, dict):
-                state_dict = dict(state)
-            elif state is None or (isinstance(state, str) and not state.strip()):
-                state_dict = {}
-            elif isinstance(state, str):
-                state_dict = {"text": state[:4000]}
-            else:
-                state_dict = {"text": str(state)[:4000]}
-            if op == "rank":
-                cands = list(candidates or [])
-                try:
-                    topk = int(top_k)
-                except (TypeError, ValueError):
-                    topk = 5
-                rtext = state_dict.get("text", "") if isinstance(state_dict, dict) else ""
-                if not rtext and isinstance(state_dict, dict):
-                    try:
-                        rtext = json.dumps(state_dict, ensure_ascii=False, default=str)[:4000]
-                    except Exception:  # noqa: BLE001 — empty text means no signal
-                        rtext = ""
-                ranked = await asyncio.to_thread(
-                    _laya.rank, rtext, cands, topk, instructions or ""
-                )
-                payload = {
-                    "operation": op,
-                    "handled": bool(ranked),
-                    "ranked": ranked,
-                    "count": len(ranked),
-                    "reason": "rank-ok" if ranked else "rank-no-signal",
-                }
-                text = json.dumps(payload, ensure_ascii=False, default=str)
-                emit({"kind": "tool_result", "tool": "laya", "summary": (text[:400] + "…") if len(text) > 400 else text, "status": "done"})
-                return text
-            if op == "score":
-                decision = await asyncio.to_thread(_laya.score, state_dict, candidate, thr)
-            elif op == "choice":
-                opts = [str(o) for o in (options or []) if str(o or "").strip()]
-                decision = await asyncio.to_thread(_laya.choice, state_dict, opts, thr)
-            else:
-                msg = f"Unknown operation {operation!r} — use 'choice', 'score', 'rank' or 'status'."
-                emit(_error_result("laya", msg))
-                return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "unknown-operation"}, ensure_ascii=False)
-        except Exception as exc:  # noqa: BLE001 — never break the main turn
-            msg = f"laya tool failed: {exc}"
-            emit(_error_result("laya", msg))
-            return json.dumps({"operation": op, "handled": False, "value": None, "confidence": 0.0, "abstained": True, "reason": "laya-error"}, ensure_ascii=False)
-        usage = getattr(decision, "usage", None)
-        if isinstance(usage, dict) and usage.get("kind") == "usage":
-            try:
-                emit(dict(usage))
-            except Exception:  # noqa: BLE001, S110 — usage is best-effort
-                pass
-        payload = {
-            "operation": op,
-            "handled": bool(getattr(decision, "handled", False)),
-            "value": getattr(decision, "value", None),
-            "confidence": float(getattr(decision, "confidence", 0.0) or 0.0),
-            "abstained": bool(getattr(decision, "abstained", False)),
-            "reason": str(getattr(decision, "reason", "") or ""),
-            "provider_id": str(getattr(decision, "provider_id", "") or ""),
-            "model": str(getattr(decision, "model", "") or ""),
-        }
-        text = json.dumps(payload, ensure_ascii=False, default=str)
-        emit({"kind": "tool_result", "tool": "laya", "summary": (text[:400] + "…") if len(text) > 400 else text, "status": "done"})
-        return text
-
     async def computer_tool(
         action: str,
         app: str = "",
@@ -8197,11 +7764,6 @@ When you need to read several files, read multiple independent files in parallel
                     or "Describe this screen precisely: visible text, UI "
                     "elements, their approximate positions."
                 )
-                # گیت آزمایشی laya: وقتی درخت به‌احتمال زیاد کافی است، see (کندترین
-                # مسیر: اسکرین‌شات + مدل بینایی) را زود رد کن تا هزینه دورریخته نشود.
-                # None یعنی laya تصمیم نگرفت → رفتار قبلی ادامه می‌یابد.
-                # راه فرار: کپچر هدفمند (selector/region) و سؤالِ یک‌بار-ردشده در
-                # همین نوبت از دروازه معاف‌اند تا بینایی قفل نشود.
                 _gate_key = f"{app}|{value or ''}"
                 try:
                     if selector or region or _gate_key in _see_gate_rejected:
@@ -8210,22 +7772,13 @@ When you need to read several files, read multiple independent files in parallel
                         _tree_first = await asyncio.to_thread(
                             cu.prefer_tree_over_see, value or "", app, _chat_id, emit
                         )
-                        if _tree_first is None:
-                            try:
-                                import laya_decide as _laya_mod
-
-                                _step = _laya_mod.computer_next_step(value or "", app, chat_id=_chat_id, emit=emit)
-                                if _step == "read_first":
-                                    _tree_first = True
-                            except Exception:  # noqa: BLE001, S110 — میان‌بر اختیاری است
-                                pass
                 except Exception:  # noqa: BLE001 — گیت اختیاری است
                     _tree_first = None
                 if _tree_first is True:
                     _see_gate_rejected.add(_gate_key)
                     result = {
                         "error": (
-                            "laya suggests the accessibility tree is enough for this "
+                            "The accessibility tree is enough for this "
                             "question — call read_screen (or read_element) first; use "
                             "see only if the tree cannot answer (terminals, canvases, "
                             "images, video)."
@@ -8556,12 +8109,13 @@ When you need to read several files, read multiple independent files in parallel
         "glob": glob_tool,
         "read": read_tool,
         "task": task_tool,
+        "task_steer": task_steer_tool,
+        "task_stop": task_stop_tool,
         "web_search": web_search_tool,
         "search_console": search_console_tool,
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
         "current_time": current_time_tool,
-        "laya": laya_tool,
         "computer": computer_tool,
         "git_status": git_status_tool,
         "git_diff": git_diff_tool,

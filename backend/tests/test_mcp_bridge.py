@@ -205,6 +205,14 @@ async def test_cross_server_short_name_collision(monkeypatch):
     assert by_name["mcp__b__greet"].metadata["mcp_server"] == "b"
     await cleanup()
 
+    # Cache-hit rebuild (a mid-run steer rebuild reuses the live sessions):
+    # BOTH cache-hit branches must re-register their bound names into
+    # `reserved`, or server b re-binds its short name too and the provider
+    # rejects the list ("declared more than once").
+    tools2, cleanup2 = await build_mcp_tools(servers, lambda ev: None)
+    assert sorted(t.name for t in tools2) == ["greet", "mcp__b__greet"]
+    await cleanup2()
+
 
 @pytest.mark.asyncio
 async def test_tool_schema_uses_snake_case_input_schema(monkeypatch):

@@ -156,6 +156,35 @@ console.log('۹) computeUsageCost clamps fresh input to 0 when cacheRead > input
   check('fresh input خالی می‌شود (نه منفی)', Math.abs(got - expected) < 1e-9, { got, expected })
 }
 
+console.log('10) provider total below input clamps up to the real input:')
+{
+  // Router bug seen in the wild: total_tokens excludes the cached subset of
+  // the prompt (286.6K in, 40.7K cached -> 245.9K total). The context meter
+  // must never sit below the input the turn actually sent.
+  const chat = {
+    messages: [
+      mkMsg('user', null, 'hi'),
+      mkMsg(
+        'assistant',
+        { inputTokens: 286600, outputTokens: 6700, totalTokens: 245900 },
+        'ok',
+      ),
+    ],
+  }
+  const used = computeContextUsed(chat as any, '', 1000000)
+  check('total 245.9K < input 286.6K -> meter shows 286.6K', used === 286600, used)
+
+  const sane = {
+    messages: [
+      mkMsg('assistant', { inputTokens: 100, outputTokens: 50, totalTokens: 150 }, 'ok'),
+    ],
+  }
+  check(
+    'consistent provider total stays as-is (150)',
+    computeContextUsed(sane as any, '', 1000000) === 150,
+  )
+}
+
 if ((globalThis as any).__FAILED) {
   console.error('\nFAILED')
   process.exit(1)

@@ -72,23 +72,70 @@ export function scrollPosForFlush(
   return pinned ? atBottomScrollPos() : captured
 }
 
+/** Fingerprint of a chat transcript for "did anything change while away?"
+ *  comparisons. Covers a new message, a message that grew in place (streamed
+ *  text or tool output appended under the SAME id — the common case for an
+ *  agent turn that kept running in a background chat), and added segments or
+ *  tool-activity entries. Empty transcript → empty string. */
+export function messageFingerprint(
+  messages: ReadonlyArray<{
+    id: string
+    content?: string | null
+    segments?: ReadonlyArray<unknown>
+    toolActivity?: ReadonlyArray<unknown>
+  }>,
+): string {
+  if (messages.length === 0) return ''
+  const last = messages[messages.length - 1]
+  const contentLen = typeof last.content === 'string' ? last.content.length : 0
+  const segCount = Array.isArray(last.segments) ? last.segments.length : 0
+  const toolCount = Array.isArray(last.toolActivity) ? last.toolActivity.length : 0
+  return `${messages.length}:${last.id}:${contentLen}+${segCount}+${toolCount}`
+}
+
 /** Should opening a chat land on the NEWEST messages instead of restoring
  *  the saved scroll anchor?
- *  - `streaming` — the agent is live in this chat: the user comes back to
- *    watch the turn, so the view must follow it, not a position saved before
- *    they left.
- *  - a `lastMessageId` different from `seenLastMessageId` (recorded when the
- *    user last LEFT this chat) — the agent posted while they were away, and
- *    restoring the old anchor would hide exactly the reply they came back to
- *    read.
+ *  - `agentActive` — the agent is live in this chat (streaming, marked busy,
+ *    or waiting on the user): the user comes back to watch the turn, so the
+ *    view must follow it, not a position saved before they left.
+ *  - a `fingerprint` different from `seenFingerprint` (recorded when the user
+ *    last LEFT this chat) — the agent posted or updated a message while they
+ *    were away, and restoring the old anchor would hide exactly the reply
+ *    they came back to read.
  *  No leave record (never viewed this session) or an empty chat → keep the
  *  persisted anchor. */
 export function shouldLandOnLatest(input: {
-  streaming: boolean
-  lastMessageId: string
-  seenLastMessageId: string | undefined
+  agentActive: boolean
+  fingerprint: string
+  seenFingerprint: string | undefined
 }): boolean {
-  if (input.streaming) return true
-  if (!input.lastMessageId || input.seenLastMessageId === undefined) return false
-  return input.seenLastMessageId !== input.lastMessageId
+  if (input.agentActive) return true
+  if (!input.fingerprint || input.seenFingerprint === undefined) return false
+  return input.seenFingerprint !== input.fingerprint
+}
+
+/** Pixel tolerance when comparing a scroll event's position against the last
+ *  programmatic pin: sub-pixel rounding can leave scrollTop a fraction off. */
+export const PIN_TOP_EPS = 1
+
+/** Freshness window for a recorded programmatic pin (ms). Late-dispatched
+ *  scroll events from a pin arrive within a frame or two; after this window
+ *  an identical scrollTop is a coincidence, so the event counts as the user's. */
+export const PIN_FRESH_MS = 500
+
+/** True when a scroll event sits exactly where the last programmatic pin put
+ *  it (and the pin is still fresh): the event is the pin's own
+ *  late-dispatched event or content growth under a pinned viewport — never a
+ *  manual scroll-up — so it must not unpin auto-scroll. Compare against the
+ *  CLAMPED value read back after the set, never the requested value: the
+ *  browser clamps the request to the scroll range, which is what broke the old
+ *  value-comparison approach. */
+export function scrollMatchesPin(
+  scrollTop: number,
+  pin: { top: number; at: number } | null,
+  now: number = Date.now(),
+): boolean {
+  if (!pin) return false
+  if (now - pin.at > PIN_FRESH_MS) return false
+  return Math.abs(scrollTop - pin.top) <= PIN_TOP_EPS
 }

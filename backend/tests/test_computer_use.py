@@ -867,10 +867,8 @@ def test_open_app_macos(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cu, "_is_foreground_app", lambda name: False)
     result = cu.open_app("Google Chrome")
     assert result["ok"] is True
-    # osascript با نام اپ درست صدا زده شود
-    assert any(
-        "osascript" in r[0] and "Google Chrome" in r[2] for r in runs
-    )
+    # Primary macOS path: `open -a <canonical>` — osascript is only the fallback.
+    assert any(r[:2] == ["open", "-a"] and "Chrome" in r[2] for r in runs)
 
 
 def test_open_app_skips_when_already_foreground(monkeypatch: pytest.MonkeyPatch):
@@ -890,7 +888,7 @@ def test_open_app_skips_when_already_foreground(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_open_app_activates_when_background(monkeypatch: pytest.MonkeyPatch):
-    """اپ جلو نیست → همچنان osascript فعال می‌شود (رفتار قبل حفظ شود)."""
+    """Background app -> the primary macOS `open -a` path runs (no fallback needed)."""
     fg = _FakeApp("Notes")
     target = _FakeApp("Google Chrome")
     monkeypatch.setattr(
@@ -908,7 +906,7 @@ def test_open_app_activates_when_background(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cu, "_wait_foreground", lambda name, timeout=None: True)
     result = cu.open_app("Google Chrome")
     assert result["ok"] is True
-    assert any("osascript" in r[0] for r in runs)
+    assert any(r[:2] == ["open", "-a"] for r in runs)
 
 
 def test_sequence_no_double_foreground_wait(monkeypatch: pytest.MonkeyPatch):
@@ -1427,7 +1425,7 @@ def test_downscale_png_returns_ratio():
     assert abs(small.width - 2 * cu.MAX_IMAGE_WIDTH * ratio2) <= 1
 
 
-def test_see_no_vision_model_hint(tool_env):
+def test_see_no_vision_model_hint(tool_env, monkeypatch: pytest.MonkeyPatch):
     cbs, _events, _gates, _permit = tool_env
     # بدون vision model → پیام راهنما
     result = asyncio.run(

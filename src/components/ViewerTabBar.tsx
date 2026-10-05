@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
-import { useViewerTabs, type ViewerKind } from "../lib/viewerTabs";
+import { useViewerTabs, visibleTabs, type ViewerKind } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
+import { FileIcon } from "./FileIcon";
 
 function ReviewIcon() {
   return (
@@ -58,6 +59,10 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   inbox: InboxIcon,
   plan: PlanIcon,
   browser: BrowserIcon,
+  // File tabs render their own per-path icon (see the map below); this
+  // placeholder only satisfies the Record type.
+  file: () => <ReviewIcon />,
+  text: PlanIcon,
 };
 
 const KIND_LABEL: Record<ViewerKind, string> = {
@@ -66,6 +71,9 @@ const KIND_LABEL: Record<ViewerKind, string> = {
   inbox: 'Inbox',
   plan: 'Plan',
   browser: 'Browser',
+  // Unused: file tabs keep their per-path title (the file name).
+  file: 'File',
+  text: 'Text',
 };
 
 function CloseIcon() {
@@ -79,9 +87,13 @@ function CloseIcon() {
 /** VSCode-style tab bar for the right editor group (diff / trace / inbox).
  *  Tabs can be reordered with drag & drop; order persists across restarts. */
 export function ViewerTabBar() {
-  const tabs = useViewerTabs((s) => s.tabs);
+  const allTabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
+  const activeChatId = useStore((s) => s.activeChatId);
   const viewerFull = useViewerTabs((s) => s.fullscreen);
+  // Chat-scoped tabs: only the active chat's group is rendered in this bar.
+  const tabs = visibleTabs(allTabs, activeChatId);
+  const shownActiveId = tabs.find((t) => t.id === activeId)?.id ?? tabs[0]?.id ?? null;
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -91,7 +103,7 @@ export function ViewerTabBar() {
     barRef.current
       ?.querySelector<HTMLElement>('[aria-selected="true"]')
       ?.scrollIntoView({ inline: "nearest", block: "nearest" });
-  }, [activeId]);
+  }, [shownActiveId]);
 
   const clearDrag = () => {
     setDragId(null);
@@ -131,8 +143,13 @@ export function ViewerTabBar() {
       }}
     >
       {tabs.map((t) => {
-        const active = t.id === activeId;
-        const title = prepareContent(KIND_LABEL[t.kind] ?? t.title, "ltr");
+        const active = t.id === shownActiveId;
+        // File/text tabs show their own title (file name / message caption),
+        // not the kind label.
+        const title = prepareContent(
+          t.kind === "file" || t.kind === "text" ? t.title : (KIND_LABEL[t.kind] ?? t.title),
+          "ltr",
+        );
         const dropCls =
           dropTarget?.id === t.id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
         const Icon = KIND_ICON[t.kind];
@@ -192,7 +209,11 @@ export function ViewerTabBar() {
             onDragEnd={clearDrag}
           >
             <span className="viewer-tab-icon" aria-hidden="true">
-              <Icon />
+              {t.kind === "file" ? (
+                <FileIcon path={t.filePath ?? t.title} size={18} />
+              ) : (
+                <Icon />
+              )}
             </span>
             <span className="editor-tab-label" dir="ltr">{title}</span>
             <button

@@ -1,12 +1,13 @@
-"""Unit tests: soft tool-call budget nudge in ``langchain_tool_loop``.
+"""Unit tests: no soft tool-call budget ceiling in ``langchain_tool_loop``.
 
-After ``_TOOL_CALL_SOFT_LIMIT`` (8) tool calls, ``langchain_tool_loop`` injects a
-``SystemMessage`` nudge that steers the model toward batching or summarizing.
-Unlike the doom-loop guard (which breaks the loop), the nudge is advisory — the
-model CAN keep calling tools. These tests verify:
+There is intentionally no fixed search-usage cap: the model may keep calling
+grep/glob/read until it holds what the task needs. Batching is still steered
+via prompts (patterns/filePaths/ranges), but no steering message is injected
+after N calls. Unlike the doom-loop guard (which breaks identical-repeat
+loops), search volume alone never stops the loop. These tests verify:
 
-1. The nudge SystemMessage appears in ``msgs`` after 8+ calls.
-2. A model that finishes in <8 calls never sees the nudge.
+1. No "soft limit" nudge appears even after 10+ calls.
+2. A model that finishes in few calls still completes normally.
 """
 
 import asyncio
@@ -22,7 +23,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage
 
 import llm as _llm
 
@@ -34,6 +35,7 @@ class _ManyCallModel:
 
     def __init__(self):
         self.call_count = 0
+        self.saw_nudge = False
 
     def bind_tools(self, tools):
         class _Bound:
@@ -42,11 +44,12 @@ class _ManyCallModel:
 
             async def ainvoke(self, msgs):
                 self._model.call_count += 1
-                # Check if a nudge was injected in previous messages
+                # Detect any soft-limit nudge in prior messages.
                 for m in msgs:
-                    if isinstance(m, SystemMessage) and "soft limit" in getattr(m, "content", ""):
-                        # After seeing the nudge, stop calling tools
-                        return AIMessage(content="summarized findings")
+                    if "soft limit" in getattr(m, "content", ""):
+                        self._model.saw_nudge = True
+                if self._model.call_count >= 12:
+                    return AIMessage(content="summarized findings")
                 return AIMessage(
                     content="",
                     tool_calls=[
@@ -127,13 +130,11 @@ async def _run_few():
     return model, result
 
 
-def test_nudge_injected_after_soft_limit():
-    """After 8+ tool calls, a SystemMessage nudge must appear in msgs."""
+def test_no_nudge_after_many_calls():
+    """After 12 tool calls, no soft-limit nudge must appear in msgs."""
     model, result = asyncio.run(_run_many())
-    # The model should have been called at least 8 times before the nudge
-    # kicked in (the nudge appears as a SystemMessage, and the model sees it
-    # and stops on the next step).
-    assert model.call_count >= 8, f"expected >= 8 calls, got {model.call_count}"
+    assert model.call_count >= 12, f"expected >= 12 calls, got {model.call_count}"
+    assert model.saw_nudge is False, "soft-limit nudge must not be injected"
     assert isinstance(result, str)
     assert len(result) > 0
 
@@ -146,6 +147,6 @@ def test_no_nudge_when_few_calls():
 
 
 if __name__ == "__main__":
-    test_nudge_injected_after_soft_limit()
+    test_no_nudge_after_many_calls()
     test_no_nudge_when_few_calls()
     print("OK")

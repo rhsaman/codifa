@@ -111,84 +111,10 @@ def test_looks_like_code_ident_filter():
     assert _looks_like_code_ident("cache_manager")
 
 
-def test_rank_with_laya_empty_query_fallback():
-    """وقتی query خالی است باید بدون خطا [] برگردد (fallback)."""
-    from symbol_index import rank_with_laya
-
-    assert rank_with_laya("", [{"name": "a.py", "description": "foo"}]) == []
-    assert rank_with_laya("   ", [{"name": "a.py"}]) == []
-
-
-def test_rank_with_laya_no_signal_fallback(monkeypatch):
-    """وقتی laya سیگنالی ندارد، ترتیب قبلی حفظ شود."""
-    import symbol_index
-
-    monkeypatch.setattr(symbol_index, "rank_with_laya", lambda q, c, top_k=None: [])
+def test_format_symbol_map_mentioned_and_referenced_order():
+    """Code map order is pure PageRank + personalization (no rerank step)."""
     with tempfile.TemporaryDirectory() as d:
         _write(d, "a.py", "def foo():\n    pass\n")
-        _write(d, "b.py", "def bar():\n    pass\n")
-        out = format_symbol_map(d, query="something unrelated xyz")
+        _write(d, "b.py", "def bar():\n    return foo()\n")
+        out = format_symbol_map(d, mentioned_fnames={"b.py"})
         assert "a.py" in out and "b.py" in out
-
-
-def test_rank_with_laya_reorders(monkeypatch):
-    """وقتی laya سیگنال دارد، فایل مرتبط باید اول بیاید."""
-    import symbol_index
-
-    def fake_rank(query, candidates, top_k=None):
-        # b.py را مرتبط‌تر نشان بده
-        ordered = sorted(candidates, key=lambda c: 0 if c["name"] == "b.py" else 1)
-        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in ordered]
-
-    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
-    with tempfile.TemporaryDirectory() as d:
-        _write(d, "a.py", "def foo():\n    pass\n")
-        _write(d, "b.py", "def bar():\n    pass\n")
-        out = format_symbol_map(d, query="bar feature")
-        assert out.find("b.py") < out.find("a.py")
-
-
-def test_rerank_cache_reuses_result_for_repeat_query(monkeypatch):
-    # Repeat turns with the same query over unchanged files must reuse the
-    # cached order instead of paying the embedding cost again.
-    import symbol_index
-
-    calls: list[str] = []
-
-    def fake_rank(query, candidates, top_k=None):
-        calls.append(query)
-        ordered = sorted(candidates, key=lambda c: 0 if c["name"] == "b.py" else 1)
-        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in ordered]
-
-    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
-    symbol_index._RERANK_CACHE.clear()
-    with tempfile.TemporaryDirectory() as d:
-        _write(d, "a.py", "def foo():\n    pass\n")
-        _write(d, "b.py", "def bar():\n    pass\n")
-        out1 = format_symbol_map(d, query="repeat-query-cache-probe-xyz")
-        out2 = format_symbol_map(d, query="repeat-query-cache-probe-xyz")
-    assert len(calls) == 1
-    assert out1 == out2
-    assert out1.find("b.py") < out1.find("a.py")
-
-
-def test_rerank_cache_miss_on_new_query_or_new_file(monkeypatch):
-    import symbol_index
-
-    calls: list[str] = []
-
-    def fake_rank(query, candidates, top_k=None):
-        calls.append(query)
-        return [{"name": c["name"], "confidence": 0.9, "score": 1.0, "reason": "embedding-rank"} for c in candidates]
-
-    monkeypatch.setattr(symbol_index, "rank_with_laya", fake_rank)
-    symbol_index._RERANK_CACHE.clear()
-    with tempfile.TemporaryDirectory() as d:
-        _write(d, "a.py", "def foo():\n    pass\n")
-        _write(d, "b.py", "def bar():\n    pass\n")
-        format_symbol_map(d, query="first-cache-miss-probe-xyz")
-        format_symbol_map(d, query="second-cache-miss-probe-xyz")
-        assert len(calls) == 2
-        _write(d, "c.py", "def baz():\n    pass\n")
-        format_symbol_map(d, query="second-cache-miss-probe-xyz")
-        assert len(calls) == 3

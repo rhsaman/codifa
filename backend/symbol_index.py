@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import re
 import threading
@@ -45,115 +46,7 @@ def _looks_like_code_ident(ident: str) -> bool:
     return len(ident) >= 8 and ("_" in ident or "-" in ident or ident != ident.lower())
 
 
-def rank_with_laya(query: str, candidates: list[dict] | list[str], top_k: int | None = None) -> list[dict]:
-    """رتبه‌بندی معنایی با laya rank — امن با fallback به [] در نبود سیگنال."""
-    if not query or not str(query).strip() or not candidates:
-        return []
-    try:
-        from laya_decide import rank as _laya_rank
-
-        k = int(top_k) if top_k is not None else len(candidates)  # type: ignore[arg-type]
-        return _laya_rank(str(query), candidates, top_k=k)
-    except Exception:  # noqa: BLE001 — ranking is best-effort
-        return []
-
-
-# Rerank result cache: (query, files fingerprint) -> (timestamp, file order).
-# Repeat turns ("continue", retries) re-rank the same files with the same
-# query — without this every one of those turns pays the full ONNX embedding
-# cost again (~15s seen in traces). Nothing is ever hidden by the cache: on a
-# miss the ranking is recomputed exactly as before. Staleness is bounded by
-# _RERANK_CACHE_TTL and by the fingerprint (file add/remove or symbol-count
-# changes miss immediately).
-_RERANK_CACHE: dict[tuple[str, tuple], tuple[float, list[str]]] = {}
-_RERANK_CACHE_LOCK = threading.Lock()
-_RERANK_CACHE_TTL = 120.0
-# The TTL alone cannot bound size: a days-long sidecar serving many distinct
-# queries would grow this dict without limit. Cap entries (oldest-first
-# eviction); a miss only recomputes the ranking, never changes it.
-_RERANK_CACHE_MAX = 100
-
-
-def _apply_laya_rerank(
-    query: str,
-    ranked_tags: list[Tag],
-    root_real: str = "",
-    rank_info: dict | None = None,
-) -> list[Tag]:
-    """اعمال laya rank روی فایل‌ها — در نبود سیگنال ترتیب قبلی حفظ می‌شود.
-
-    The embedding rerank runs before the LLM call on every turn, so it must
-    stay off the slow path: only the top files by PageRank order are embedded
-    (bounded work regardless of repo size) and the rest keep their order.
-    Embedding the whole repo (hundreds of files through ONNX on CPU) is what
-    made the first token take 10s+ on large workspaces.
-    """
-    if not query or not str(query).strip() or not ranked_tags:
-        return ranked_tags
-    # Bound embedding work: rerank at most this many top files, keep the tail
-    # in PageRank order. 80 files ≈ 3 ONNX batches; the visible map holds ~60
-    # files at most (1024-token budget), so 80 covers every promotion candidate
-    # with margin — ranking deeper only burns CPU for files that never display.
-    # Measured on CPU: 120 descs ≈ 5s, 80 ≈ 1.2s (short descs; real tag lists
-    # with long names cost more via batch padding, so the saving is larger).
-    _RERANK_MAX_FILES = 80
-    try:
-        by_file: dict[str, list[Tag]] = defaultdict(list)
-        for t in ranked_tags:
-            by_file[t.rel_fname].append(t)
-        # by_file preserves first-occurrence order of the PageRank-sorted tags,
-        # so candidates are already best-first: head gets embedded, tail stays.
-        all_rels = list(by_file.keys())
-        head_rels = all_rels[:_RERANK_MAX_FILES]
-        candidates: list[dict] = []
-        for rel in head_rels:
-            tags = by_file[rel]
-            # Keep the head names only (capped chars): batch inference pads every
-            # row to the longest description, so one symbol-heavy file (900+
-            # chars here) slows the whole batch. Head names carry the signal.
-            desc = " ".join(t.name for t in tags[:12])[:300]
-            candidates.append({"name": rel, "description": desc})
-        _fingerprint = (str(query), tuple(sorted((r, len(by_file[r])) for r in all_rels)))
-        with _RERANK_CACHE_LOCK:
-            _cached = _RERANK_CACHE.get(_fingerprint)
-            if _cached is not None and (time.monotonic() - _cached[0]) < _RERANK_CACHE_TTL:
-                _order_names = _cached[1]
-                _elapsed = 0
-                ranked = [{"name": _n} for _n in _order_names]
-            else:
-                _cached = None
-        if _cached is None:
-            _start = time.monotonic()
-            ranked = rank_with_laya(str(query), candidates, top_k=len(candidates))
-            try:
-                _elapsed = int((time.monotonic() - _start) * 1000)
-            except Exception:  # noqa: BLE001
-                _elapsed = 0
-            if ranked:
-                with _RERANK_CACHE_LOCK:
-                    _RERANK_CACHE[_fingerprint] = (
-                        time.monotonic(),
-                        [str(r.get("name") or "") for r in ranked],
-                    )
-                    while len(_RERANK_CACHE) > _RERANK_CACHE_MAX:
-                        _oldest = min(_RERANK_CACHE, key=lambda k: _RERANK_CACHE[k][0])
-                        _RERANK_CACHE.pop(_oldest, None)
-        if rank_info is not None:
-            try:
-                rank_info["ranked"] = ranked
-                rank_info["elapsed_ms"] = _elapsed
-                rank_info["query"] = str(query)
-                rank_info["candidates"] = [str(c.get("name") or "") for c in candidates]
-                rank_info["total_files"] = len(all_rels)
-            except Exception:  # noqa: BLE001, S110
-                pass
-        if not ranked:
-            return ranked_tags
-        order = {str(r.get("name") or ""): i for i, r in enumerate(ranked)}
-        base = len(order)
-        return sorted(ranked_tags, key=lambda t: (order.get(t.rel_fname, base), ranked_tags.index(t)))
-    except Exception:  # noqa: BLE001 — ranking is best-effort
-        return ranked_tags
+# Code map order is pure PageRank + personalization (chat/mentioned files first).
 
 
 # لیست پسوندهای متنی که نماد استخراج می‌کنیم (مطابق با ابزارهای فایل).
@@ -280,7 +173,12 @@ _GENERIC_PATTERNS = [
 ]
 
 # Cache: root -> (timestamp, map, signature)
-_CACHE: dict[str, tuple[float, dict, tuple[float, int]]] = {}
+_CACHE: dict[str, tuple[float, dict, tuple]] = {}
+
+# abs_path -> (mtime_ns, size, syms, tags): نتیجهٔ parse هر فایل. وقتی signature
+# درخت عوض می‌شه (مثلاً بعد از یک edit ایجنت) فقط فایل‌هایی که (mtime, size)
+# شون تغییر کرده دوباره parse می‌شن، نه کل پروژه.
+_FILE_CACHE: dict[str, tuple[int, int, list, list]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 300.0  # Signature-based invalidation (mtime + file count) keeps
 # raising this safe: slow multi-minute turns reuse a warm map instead of
@@ -683,6 +581,134 @@ def _extract_symbols(rel_path: str, text: str) -> list[tuple[str, int, str]]:
 # گراف ارجاع + PageRank (مشابه aider.get_ranked_tags)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Boost lexical بر اساس متن درخواست (بدون مدل/embedding)
+# --------------------------------------------------------------------------
+# متن درخواست/تسک (query) تعیین می‌کنه کدوم تعریف‌ها بالای نقشه بیان. فقط
+# ترتیب عوض می‌شه — هیچ فایل/نمادی حذف نمی‌شه (برخلاف فیلتر سخت قبلی).
+
+_QUERY_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_WORD_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+")
+_QUERY_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "this", "that", "from", "into", "when", "not",
+    "are", "was", "has", "have", "use", "used", "using", "fix", "bug", "error",
+    "get", "set", "add", "new", "all", "any", "how", "why", "what", "where",
+    "should", "does", "doesn", "per", "its", "can", "but", "out", "off", "too",
+    "make", "makes", "check", "keep", "instead", "after", "before", "then",
+    "none", "null", "true", "false", "self", "inside", "causes", "cause",
+})
+# حداقل امتیاز برای اینکه یه تعریف «hit» حساب بشه (زیرش فقط رتبهٔ PageRank).
+_QUERY_HIT_MIN = 2.0
+_QUERY_EXACT_SCORE = 1000.0
+_QUERY_STEM_SCORE = 8.0
+
+
+def _split_words(text: str) -> list[str]:
+    """snake_case / camelCase / PascalCase / مسیر → زیرکلمه‌های lowercase (طول >= 3)."""
+    out: list[str] = []
+    for part in re.split(r"[_\W\d]+", text):
+        for w in _WORD_SPLIT_RE.findall(part):
+            w = w.lower()
+            if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+                w = w[:-1]  # attempts -> attempt (روی هر دو طرف یکسان اعمال می‌شه)
+            if len(w) >= 3:
+                out.append(w)
+    return out
+
+
+def _words_match(a: str, b: str) -> bool:
+    """تطبیق دو زیرکلمه: برابر، یا یکی پیشوند دیگری (طول >= 4): dedup ~ deduplicated."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) >= 4:
+        return a.startswith(b) or b.startswith(a)
+    return False
+
+
+def _query_terms(query: str | None) -> tuple[set[str], set[str], set[str]]:
+    """(exact, words, stems) از متن درخواست.
+
+    exact: توکن‌های «شبیه کد» (snake/camel/طول>=6) به‌صورت lowercase بدون _ ابتدا/انتها.
+    words: زیرکلمه‌های غیر stopword (برای تطبیق جزئی با نام تعریف).
+    stems: همهٔ توکن‌ها (lowercase، بدون _) برای تطبیق با نام فایل (بدون پسوند).
+    """
+    if not query:
+        return set(), set(), set()
+    exact: set[str] = set()
+    words: set[str] = set()
+    stems: set[str] = set()
+    for tok in _QUERY_TOKEN_RE.findall(str(query)[:4000]):
+        low = tok.lower().strip("_")
+        if not low:
+            continue
+        stems.add(low)
+        sub = [w for w in _split_words(tok) if w not in _QUERY_STOPWORDS]
+        words.update(sub)
+        code_shaped = "_" in tok or tok != tok.lower() and tok != tok.capitalize() or len(low) >= 6
+        if code_shaped and low not in _QUERY_STOPWORDS:
+            exact.add(low)
+    return exact, words, stems
+
+
+def _query_boosts(definitions: dict, query: str | None) -> dict[tuple[str, str], float]:
+    """{(rel_fname, tag_name): score} برای تعریف‌هایی که به متن درخواست می‌خورن.
+
+    * نام دقیق (مثلاً ``_apply_compaction_in_place`` در متن) → امتیاز خیلی بالا.
+    * هم‌پوشانی زیرکلمه‌ها (idf-weighted: کلمهٔ نادر وزن بیشتری داره) → امتیاز متوسط.
+    * نام فایل (بدون پسوند) در متن → همهٔ تعریف‌های اون فایل بالا میان.
+    """
+    exact, words, stems = _query_terms(query)
+    if not (exact or words or stems):
+        return {}
+    df: dict[str, int] = defaultdict(int)
+    name_words: dict[tuple[str, str], frozenset] = {}
+    for rel, tags in definitions.items():
+        for t in tags:
+            key = (rel, t.name)
+            if key not in name_words:
+                ws = frozenset(_split_words(str(t.name)))
+                name_words[key] = ws
+                for w in ws:
+                    df[w] += 1
+
+    def _idf(w: str) -> float:
+        return 1.0 / (1.0 + math.log1p(df.get(w, 0)))
+
+    _hit_cache: dict[str, int] = {}
+
+    def _hit(w: str) -> int:
+        """طول تطبیق (کوتاه‌ترین طرف) یا 0؛ کلمهٔ بلندتر = اختصاصی‌تر."""
+        r = _hit_cache.get(w)
+        if r is None:
+            r = _hit_cache[w] = max(
+                (min(len(w), len(q)) for q in words if _words_match(w, q)), default=0
+            )
+        return r
+
+    boosts: dict[tuple[str, str], float] = {}
+    for rel, tags in definitions.items():
+        stem = os.path.splitext(os.path.basename(rel))[0].lower().strip("_")
+        file_hit = len(stem) >= 3 and stem in stems
+        for t in tags:
+            key = (rel, t.name)
+            score = 0.0
+            if str(t.name).lower().strip("_") in exact:
+                score += _QUERY_EXACT_SCORE
+            ws = name_words.get(key) or frozenset()
+            ov = [w for w in ws if _hit(w)]
+            if ov and (len(ov) >= 2 or max(_hit(w) for w in ov) >= 5):
+                score += (
+                    sum(_idf(w) * min(_hit(w), 10) / 6.0 for w in ov)
+                    * (0.5 + 0.5 * len(ov) / len(ws))
+                    * 10.0
+                )
+            if file_hit:
+                score += _QUERY_STEM_SCORE
+            if score >= _QUERY_HIT_MIN:
+                boosts[key] = max(boosts.get(key, 0.0), score)
+    return boosts
+
+
 def _get_ranked_tags(
     chat_fnames,
     other_fnames,
@@ -692,7 +718,7 @@ def _get_ranked_tags(
     query: str | None = None,
     rank_info: dict | None = None,
 ):
-    """رتبه‌بندی تگ‌ها با PageRank + personalization (مثل aider) + laya rank اختیاری."""
+    """Rank tags with PageRank + personalization (aider-style)."""
     defines = defaultdict(set)
     references = defaultdict(list)
     definitions = defaultdict(set)
@@ -771,15 +797,24 @@ def _get_ranked_tags(
 
     # مرتب‌سازی نهایی تگ‌ها: همهٔ defها رو نگه می‌داریم، فقط رتبه‌شون رو
     # بر اساس گراف ارجاع تنظیم می‌کنیم (تگ‌های بدون ref رتبهٔ پایه می‌گیرن).
+    # امتیاز تطبیق با متن درخواست: تعریف‌های «hit» جلوتر از همه (tier اول)،
+    # بقیه با همون رتبهٔ PageRank قبلی. اگه query خالی/بی‌تطبیق باشه رفتار قبلی.
+    try:
+        boosts = _query_boosts(definitions, query)
+    except Exception:  # noqa: BLE001 — boost best-effort، نقشه نباید بشکنه
+        boosts = {}
     ranked_tags = []
     for fname, tags in definitions.items():
         for t in tags:
             rank = ranked_definitions.get((fname, t.name), 0.0)
-            ranked_tags.append((rank, t))
-    ranked_tags.sort(key=lambda x: -x[0])
-    out = [t for _, t in ranked_tags]
-    if query and str(query).strip():
-        out = _apply_laya_rerank(str(query), out, root_real, rank_info=rank_info)
+            ranked_tags.append((boosts.get((fname, t.name), 0.0), rank, t))
+    # tie-break قطعی (فایل، خط): تگ‌های بدون ref همه rank=0 دارن و ترتیب set
+    # (hash-randomized) باعث می‌شد نقشه‌ی یک پروژه‌ی ثابت بین اجراها فرق کنه.
+    ranked_tags.sort(key=lambda x: (-x[0], -x[1], x[2].rel_fname, x[2].line if isinstance(x[2].line, int) else 0))
+    if rank_info is not None:
+        # نام تعریف‌های hit برای نمایش اولویت‌دار در _to_tree (حتی تو فایل‌های بزرگ).
+        rank_info["query_hits"] = {str(t.name).lower() for _, _, t in ranked_tags if boosts.get((t.rel_fname, t.name))}
+    out = [t for _, _, t in ranked_tags]
     return out
 
 
@@ -796,7 +831,8 @@ def _read_file_tags(fname: str) -> list[Tag]:
 # --------------------------------------------------------------------------
 
 def _to_tree(tags, chat_rel_fnames, root_real: str = "",
-             mentioned: set[str] | None = None) -> str:
+             mentioned: set[str] | None = None,
+             force_show: set[str] | None = None) -> str:
     """ساخت نمایش درختی از تگ‌های رتبه‌بندی‌شده (مثل aider.to_tree).
 
     فقط امضا (نام + خط + نوع) رو نشون می‌ده — نه بدنهٔ تابع. aider همین‌کار
@@ -818,10 +854,11 @@ def _to_tree(tags, chat_rel_fnames, root_real: str = "",
     # گروه‌بندی بر اساس فایل — ترتیب رو از tags (که قبلاً رتبه‌بندی شد) حفظ می‌کنیم
     by_file: dict[str, list[Tag]] = defaultdict(list)
     file_order: list[str] = []
+    _force = {str(n).lower() for n in (force_show or ())}
     for t in tags:
         try:
-            if not getattr(t, "top_level", True):
-                continue  # nested helper: resolvable, not displayable
+            if not getattr(t, "top_level", True) and str(t.name or "").lower() not in _force:
+                continue  # nested helper: resolvable, not displayable (مگر hit مستقیم درخواست)
         except Exception:  # noqa: BLE001, S110
             pass
         if t.rel_fname not in by_file:
@@ -879,11 +916,15 @@ def _get_ranked_tags_map(
     rank_info: dict | None = None,
 ) -> str:
     """ساخت نقشه با بودجه توکنی پویا (binary search روی تعداد تگ‌ها)."""
+    if rank_info is None:
+        rank_info = {}  # hitهای query همیشه برگردن، حتی وقتی caller dict نداده
     ranked_tags = _get_ranked_tags(
         chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, root_real, query=query, rank_info=rank_info
     )
     if not ranked_tags:
         return ""
+    _hits = set((rank_info or {}).get("query_hits") or ())
+    _display_mentioned = set(mentioned_idents or ()) | _hits
 
     # binary search: چند تا از بالاترین تگ‌ها رو بگیریم تا نزدیک max_map_tokens بشیم
     lo, hi = 1, len(ranked_tags)
@@ -891,13 +932,13 @@ def _get_ranked_tags_map(
     while lo <= hi:
         mid = (lo + hi) // 2
         candidate = ranked_tags[:mid]
-        tree = _to_tree(candidate, set(), root_real, mentioned_idents)
+        tree = _to_tree(candidate, set(), root_real, _display_mentioned, _hits)
         if _token_count(tree) <= max_map_tokens:
             best = candidate
             lo = mid + 1
         else:
             hi = mid - 1
-    return _to_tree(best, set(), root_real, mentioned_idents)
+    return _to_tree(best, set(), root_real, _display_mentioned, _hits)
 
 
 # --------------------------------------------------------------------------
@@ -908,31 +949,16 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
     """بساز نقشه‌ی نمادها برای کل درخت ``root``.
 
     برمی‌گردونه ``{rel_path: [(name, line, type), ...]}``. فقط فایل‌های متنی
-    زیر ۲ مگابایت رو می‌خونه تا سریع بمونه. نتیجه ۱۰ ثانیه کش می‌شه.
+    زیر ۲ مگابایت رو می‌خونه تا سریع بمونه.
+
+    یک پیمایش واحد هم signature (برای کش) و هم فهرست فایل‌های قابل‌ایندکس رو
+    می‌سازه؛ فقط فایل‌های کد در signature حساب می‌شن (تغییر لاگ/تصویر/md نقشه رو
+    باطل نمی‌کنه). وقتی signature عوض شد فقط فایل‌هایی که (mtime, size)شون
+    تغییر کرده دوباره parse می‌شن (``_FILE_CACHE``)، نه کل پروژه.
     """
     root_real = os.path.realpath(os.path.abspath(root))
+    candidates: list[tuple[str, str, int, int]] = []  # (abs, rel, mtime_ns, size)
     tree_mtime = 0.0
-    file_count = 0
-    for dirpath, dirnames, filenames in os.walk(root_real):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
-        for name in filenames:
-            file_count += 1
-            try:
-                tree_mtime = max(tree_mtime, os.path.getmtime(os.path.join(dirpath, name)))
-            except OSError:
-                pass
-    signature = (tree_mtime, file_count)
-
-    with _CACHE_LOCK:
-        cached = _CACHE.get(root_real)
-        if (
-            cached is not None
-            and cached[2] == signature
-            and (time.time() - cached[0]) < _CACHE_TTL
-        ):
-            return cached[1]
-
-    result: dict[str, list[tuple[str, int, str]]] = {}
     for dirpath, dirnames, filenames in os.walk(root_real):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
@@ -944,7 +970,37 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
             if ".out." in name or name.endswith((".min.js", ".min.mjs")):
                 continue
             abs_path = os.path.join(dirpath, name)
+            try:
+                st = os.stat(abs_path)
+            except OSError:
+                continue
+            tree_mtime = max(tree_mtime, st.st_mtime)
             rel = os.path.relpath(abs_path, root_real).replace(os.sep, "/")
+            candidates.append((abs_path, rel, st.st_mtime_ns, st.st_size))
+    # مسیر/mtime/size همه‌ی فایل‌ها در hash: rename/حذف+اضافه هم signature رو عوض می‌کنه.
+    signature = (
+        tree_mtime,
+        len(candidates),
+        hash(tuple(sorted((rel, mt, sz) for _, rel, mt, sz in candidates))),
+    )
+
+    with _CACHE_LOCK:
+        cached = _CACHE.get(root_real)
+        if (
+            cached is not None
+            and cached[2] == signature
+            and (time.time() - cached[0]) < _CACHE_TTL
+        ):
+            return cached[1]
+        file_cache = dict(_FILE_CACHE)
+
+    result: dict[str, list[tuple[str, int, str]]] = {}
+    new_file_cache: dict[str, tuple[int, int, list, list]] = {}
+    for abs_path, rel, mt, size in candidates:
+        hit = file_cache.get(abs_path)
+        if hit is not None and hit[0] == mt and hit[1] == size:
+            syms, tags = hit[2], hit[3]
+        else:
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                     text = fh.read(_MAX_SYMBOL_BYTES)
@@ -952,15 +1008,23 @@ def build_symbol_map(root: str) -> dict[str, list[tuple[str, int, str]]]:
                 continue
             first = text.split("\n", 1)[0]
             if len(first) > 600 and " " not in first[:300]:
-                continue
-            syms = _extract_symbols(rel, text)
-            if syms:
-                result[rel] = syms
+                syms, tags = [], []  # minified/bundled: ایندکس نمی‌شه (ولی کش می‌شه)
+            else:
+                syms = _extract_symbols(rel, text)
                 # کش تگ‌های کامل (با ref) برای گراف ارجاع
-                with _CACHE_LOCK:
-                    _CACHE[abs_path] = (time.time(), _tags_for_file(rel, abs_path, text), signature)
+                tags = _tags_for_file(rel, abs_path, text) if syms else []
+        new_file_cache[abs_path] = (mt, size, syms, tags)
+        if syms:
+            result[rel] = syms
+            with _CACHE_LOCK:
+                _CACHE[abs_path] = (time.time(), tags, signature)
 
+    _prefix = root_real + os.sep
     with _CACHE_LOCK:
+        for _k in [k for k in _FILE_CACHE if k.startswith(_prefix) and k not in new_file_cache]:
+            _FILE_CACHE.pop(_k, None)
+            _CACHE.pop(_k, None)  # فایل حذف‌شده: تگ‌های کهنه‌اش هم پاک بشه
+        _FILE_CACHE.update(new_file_cache)
         _CACHE[root_real] = (time.time(), result, signature)
     return result
 
@@ -1215,8 +1279,12 @@ def clear_symbol_cache(root: str | None = None) -> None:
     with _CACHE_LOCK:
         if root is None:
             _CACHE.clear()
+            _FILE_CACHE.clear()
         else:
-            _CACHE.pop(os.path.realpath(os.path.abspath(root)), None)
+            _root_real = os.path.realpath(os.path.abspath(root))
+            _CACHE.pop(_root_real, None)
+            for _k in [k for k in _FILE_CACHE if k.startswith(_root_real + os.sep)]:
+                _FILE_CACHE.pop(_k, None)
     with _SYMBOL_RANGE_LOCK:
         if root is None:
             _SYMBOL_RANGE_CACHE.clear()

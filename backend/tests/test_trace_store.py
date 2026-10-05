@@ -10,21 +10,21 @@ import trace_store
 
 def test_append_and_list():
     trace_store.clear("c1")
-    entry = trace_store.append("c1", "laya", "normal · 90٪", detail={"route": "normal"})
+    entry = trace_store.append("c1", "llm", "model · 10 tokens", detail={"route": "normal"})
     assert entry is not None
     items = trace_store.list_traces("c1")
     assert len(items) == 1
-    assert items[0]["kind"] == "laya"
-    assert items[0]["summary"] == "normal · 90٪"
+    assert items[0]["kind"] == "llm"
+    assert items[0]["summary"] == "model · 10 tokens"
 
 
 def test_kind_filter():
     trace_store.clear("c2")
-    trace_store.append("c2", "laya", "a")
+    trace_store.append("c2", "llm", "a")
     trace_store.append("c2", "llm", "b")
     trace_store.append("c2", "prompt", "c")
     trace_store.append("c2", "tool", "d", prompt='{"x": 1}')
-    assert len(trace_store.list_traces("c2", "llm")) == 1
+    assert len(trace_store.list_traces("c2", "llm")) == 2
     assert len(trace_store.list_traces("c2", "tool")) == 1
     assert len(trace_store.list_traces("c2")) == 4
 
@@ -99,6 +99,37 @@ def test_tool_claim_miss_on_different_name_sub_or_turn():
     assert len(trace_store.list_traces("c7", "tool")) == 1
 
 
+def test_tool_claim_parallel_same_name_keeps_order():
+    trace_store.clear("c8")
+    trace_store.next_turn("c8")
+    first = trace_store.append(
+        "c8",
+        "tool",
+        "grep · step 1",
+        detail={"name": "grep", "args": {"pattern": "aaa"}, "call_id": "lc-1", "step": 1, "status": "running"},
+    )
+    second = trace_store.append(
+        "c8",
+        "tool",
+        "grep · step 1",
+        detail={"name": "grep", "args": {"pattern": "bbb"}, "call_id": "lc-2", "step": 1, "status": "running"},
+    )
+    assert first is not None and second is not None
+    # Wrapper emits run in start order: first claim must take the first entry.
+    c1 = trace_store.claim_running_tool("c8", "grep", False, {"ev_call_id": "ev-1"})
+    c2 = trace_store.claim_running_tool("c8", "grep", False, {"ev_call_id": "ev-2"})
+    assert c1 is not None and c2 is not None
+    assert c1["id"] == first["id"], "first claim took the wrong entry"
+    assert c2["id"] == second["id"], "second claim took the wrong entry"
+    # Results resolve via the wrapper event ids onto the right entries.
+    d1 = trace_store.finish_tool("c8", "ev-1", "AAA")
+    d2 = trace_store.finish_tool("c8", "ev-2", "BBB")
+    assert d1 is not None and d2 is not None
+    assert d1["id"] == first["id"] and d1["result"] == "AAA"
+    assert d2["id"] == second["id"] and d2["result"] == "BBB"
+    assert len(trace_store.list_traces("c8", "tool")) == 2
+
+
 def test_cap_and_invalid():
     trace_store.clear("c3")
     assert trace_store.append("", "llm", "x") is None
@@ -109,3 +140,15 @@ def test_cap_and_invalid():
     assert len(items) == trace_store.MAX_ENTRIES_PER_CHAT
     assert trace_store.clear("c3") == trace_store.MAX_ENTRIES_PER_CHAT
     assert trace_store.list_traces("c3") == []
+
+
+def test_task_id_filter_isolates_subagent_trace():
+    trace_store.clear("c9")
+    trace_store.append("c9", "tool", "main call", detail={"name": "read"})
+    trace_store.append("c9", "tool", "sub call", detail={"name": "grep"}, task_id="task-abc")
+    assert len(trace_store.list_traces("c9")) == 2
+    only_sub = trace_store.list_traces("c9", task_id="task-abc")
+    assert len(only_sub) == 1
+    assert only_sub[0]["summary"] == "sub call"
+    assert only_sub[0]["task_id"] == "task-abc"
+    assert trace_store.list_traces("c9", task_id="task-other") == []

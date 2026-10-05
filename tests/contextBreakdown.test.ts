@@ -9,6 +9,8 @@ import {
   buildContextBreakdown,
   isContextPopoverOpen,
   formatBreakdownPercent,
+  formatTokensK,
+  contextBarSegmentPercent,
 } from '../src/lib/context.ts'
 import type { Chat } from '../src/types.ts'
 
@@ -105,6 +107,33 @@ console.log('۳) averageCacheHitRate: subset vs additive convention + empty:')
   check('zero-usage turn skipped', mixed != null && Math.abs(mixed - 50) < 1e-9, mixed)
 
   check('no usages -> null', averageCacheHitRate([]) === null)
+
+  // Cache WRITES are misses that fill the cache, not hits: a cold additive
+  // turn (all writes, no reads) must rate 0%, not write/footprint.
+  const coldWrite = averageCacheHitRate([
+    { inputTokens: 3000, outputTokens: 0, totalTokens: 9000, cacheWriteTokens: 6000 },
+  ])
+  check('additive cold write-only turn -> 0% hit', coldWrite === 0, coldWrite)
+
+  // Warm turn with a write: reads are the hits, writes widen the footprint.
+  const warmWrite = averageCacheHitRate([
+    { inputTokens: 3000, outputTokens: 0, totalTokens: 9500, cacheReadTokens: 6000, cacheWriteTokens: 500 },
+  ])
+  check(
+    'additive warm: 6000/(3000+6000+500)',
+    warmWrite != null && Math.abs(warmWrite - (6000 / 9500) * 100) < 1e-9,
+    warmWrite,
+  )
+
+  // Subset convention with a write still divides by input (cache inside it).
+  const subsetWrite = averageCacheHitRate([
+    { inputTokens: 90000, outputTokens: 0, totalTokens: 90000, cacheReadTokens: 87000, cacheWriteTokens: 2000 },
+  ])
+  check(
+    'subset with write: 87000/90000',
+    subsetWrite != null && Math.abs(subsetWrite - (87000 / 90000) * 100) < 1e-9,
+    subsetWrite,
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +234,74 @@ console.log('۷) formatBreakdownPercent: at most one decimal:')
   check('0.6 -> "0.6%"', formatBreakdownPercent(0.6) === '0.6%', formatBreakdownPercent(0.6))
   check('0.04 -> "0%"', formatBreakdownPercent(0.04) === '0%', formatBreakdownPercent(0.04))
   check('100 -> "100%"', formatBreakdownPercent(100) === '100%', formatBreakdownPercent(100))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('۸) real reported parts (ctx_parts) beat estimates:')
+{
+  const chat = mkChat([{ role: 'user', content: 'hi' }])
+  const bd = buildContextBreakdown(chat, 'sys', 10000, {
+    systemPromptChars: 8000,
+    skillsChars: 1200,
+    mcpChars: 400,
+  })
+  const find = (k: string) => bd.rows.find((r) => r.key === k)?.tokens
+  check('system prompt = 8000/4 = 2000', find('systemPrompt') === 2000, find('systemPrompt'))
+  check('skills = 1200/4 = 300', find('skills') === 300, find('skills'))
+  check('mcp = 400/4 = 100', find('mcpTools') === 100, find('mcpTools'))
+  const sum = bd.rows.reduce((s, r) => s + r.tokens, 0)
+  check('rows still sum to the meter total', sum === bd.total, { sum, total: bd.total })
+
+  // Overshoot: reported real parts keep their size (only estimates shrink).
+  const chat2 = mkChat([
+    { role: 'user', content: 'x'.repeat(4000) },
+    { role: 'assistant', content: 'ok', usage: { inputTokens: 800, outputTokens: 200, totalTokens: 1000 } },
+  ])
+  const bd2 = buildContextBreakdown(chat2, 'sys', 10000, { systemPromptChars: 800 })
+  const sp2 = bd2.rows.find((r) => r.key === 'systemPrompt')?.tokens
+  check('real system prompt preserved on overshoot', sp2 === 200, sp2)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('9) contextBarSegmentPercent: fill-scaled against the window:')
+{
+  const total = 108124
+  const window = 1048576
+  // The filled portion of the bar must equal the header usage percentage.
+  check(
+    'segment = tokens/window (105900/1M ~ 10.1%)',
+    Math.abs(contextBarSegmentPercent(105900, total, window) - (105900 / window) * 100) < 1e-9,
+    contextBarSegmentPercent(105900, total, window),
+  )
+  const sum = [105900, 1300, 910, 14, 0, 0].reduce(
+    (s, t) => s + contextBarSegmentPercent(t, total, window),
+    0,
+  )
+  check('segments sum to the usage percent (10.31%)', Math.abs(sum - (total / window) * 100) < 1e-9, sum)
+  check(
+    'no window -> falls back to composition (sums to 100%)',
+    Math.abs(
+      [105900, 1300, 910, 14, 0, 0].reduce(
+        (s, t) => s + contextBarSegmentPercent(t, total, null),
+        0,
+      ) - 100,
+    ) < 1e-9,
+  )
+  check('zero total without window -> 0', contextBarSegmentPercent(50, 0, null) === 0)
+  check('negative row clamped to 0', contextBarSegmentPercent(-5, total, window) === 0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('10) formatTokensK: window label keeps percent-consistent precision:')
+{
+  check('1048576 -> "1.05M"', formatTokensK(1048576) === '1.05M', formatTokensK(1048576))
+  check('1000000 -> "1M"', formatTokensK(1_000_000) === '1M', formatTokensK(1_000_000))
+  check('2000000 -> "2M"', formatTokensK(2_000_000) === '2M', formatTokensK(2_000_000))
+  check('2500000 -> "2.5M"', formatTokensK(2_500_000) === '2.5M', formatTokensK(2_500_000))
+  check('200000 -> "200K"', formatTokensK(200_000) === '200K', formatTokensK(200_000))
+  check('824100 -> "824K"', formatTokensK(824_100) === '824K', formatTokensK(824_100))
+  check('2365100 -> "2.37M"', formatTokensK(2_365_100) === '2.37M', formatTokensK(2_365_100))
+  check('900 -> "900"', formatTokensK(900) === '900', formatTokensK(900))
 }
 
 console.log((globalThis as any).__FAILED ? '\n✗ برخی تستها شکست خوردند' : '\n✓ همه تستها پاس شدند')

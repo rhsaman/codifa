@@ -26,7 +26,7 @@ import agents
 def test_search_rule_makes_broad_exploration_required():
     """_SEARCH_RULE must instruct broad/multi-file search to use explore."""
     rule = agents._SEARCH_RULE
-    assert "subagent_type='explore'" in rule
+    assert "subagent_type='subagent'" in rule
     assert "BROAD" in rule.upper()
     # It frames grep/glob/read as the TARGETED path, not the broad one.
     assert "TARGETED" in rule.upper()

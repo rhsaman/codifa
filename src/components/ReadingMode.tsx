@@ -46,10 +46,11 @@ const ChevronDownIcon = () => (
 )
 
 /**
- * Reading mode — a right-side panel (like Claude Code's docs viewer) for a
- * long agent answer: section titles on the left, the selected section's full
- * content on the right. The chat stays visible behind it — a soft scrim
- * focuses the panel without fully blocking the conversation.
+ * Reading mode — a centered floating panel (like Claude Code's docs viewer)
+ * for a long agent answer: the contents list on the side, the selected
+ * section's full content in a centered reading column like the chat's. The
+ * chat stays visible behind it — a soft scrim focuses the panel without
+ * fully blocking the conversation.
  */
 export function ReadingMode({
   message,

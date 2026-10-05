@@ -1,12 +1,29 @@
 import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
+import { useStore } from './store'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text'
+
+/** Kinds that belong to ONE chat. Everything else (the schedule inbox) is
+ *  global. Chat-scoped ids are `<kind>:<chatId>`, so every chat keeps its own
+ *  tab set and switching chats swaps the whole visible group. */
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text'])
+
+export function viewerTabId(kind: ViewerKind, chatId: string): string {
+  return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
+}
+
+/** Tabs visible while `chatId` is active: global tabs + that chat's own tabs. */
+export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
+  return tabs.filter((t) => !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId)
+}
 
 export interface ViewerTab {
   id: string
   kind: ViewerKind
+  /** Owning chat for chat-scoped kinds (review/trace/plan/browser). */
+  chatId?: string
   title: string
   reviewMessageId?: string | null
   reviewPath?: string
@@ -14,22 +31,48 @@ export interface ViewerTab {
   reviewRev?: string
   traceChatId?: string
   traceTab?: TraceTab
+  /** Background sub-agent job id shown in this trace tab (empty = main chat trace). */
+  traceTaskId?: string
+  /** Short label for a sub-agent trace tab (job description). */
+  traceTitle?: string
+  /** File-viewer tab: path as written (relative to the workspace root or
+   *  absolute), optional line to scroll to, and the workspace root captured
+   *  at open time so the panel survives chat switches. */
+  filePath?: string
+  fileLine?: number
+  fileRoot?: string
+  /** Text-viewer tab: full body of a collapsed chat text (long user message,
+   *  summary, tool output). The body lives in memory only — persist() strips
+   *  it so localStorage quota is never blown by a megabyte paste. */
+  textBody?: string
   createdAt: number
+}
+
+/** Chat a new chat-scoped tab belongs to (empty string when no chat is open). */
+function currentChatId(): string {
+  return useStore.getState().activeChatId
 }
 
 interface ViewerTabsState {
   tabs: ViewerTab[]
   activeId: string | null
   openViewer: (tab: Omit<ViewerTab, 'createdAt'>) => void
-  openReview: (messageId: string, path?: string) => void
-  openGitDiff: () => void
-  openTraces: (chatId?: string, tab?: TraceTab) => void
+  openReview: (messageId: string, path?: string, chatId?: string) => void
+  openGitDiff: (chatId?: string) => void
+  openTraces: (chatId?: string, tab?: TraceTab, taskId?: string, title?: string) => void
   openInbox: () => void
-  /** Open the implementation-plan document of the active chat (Plan card's
-   *  "View full plan"). Follows the active chat like the trace tab. */
-  openPlan: () => void
-  /** Open the in-app virtual browser (shared Playwright session). */
-  openBrowser: () => void
+  /** Open the implementation-plan document of a chat (Plan card's
+   *  "View full plan"). Defaults to the active chat. */
+  openPlan: (chatId?: string) => void
+  /** Open the in-app virtual browser tab of a chat (shared Playwright session). */
+  openBrowser: (chatId?: string) => void
+  /** Open a workspace file in its own viewer tab (one tab per path, global —
+   *  files are not chat-scoped). Reopening the same path focuses the tab and
+   *  updates the target line. */
+  openFile: (path: string, line?: number, root?: string) => void
+  /** Open a collapsed chat text in its own viewer tab (one tab per chat).
+   *  Reopening updates the tab in place. */
+  openText: (title: string, body: string) => void
   closeViewer: (id: string) => void
   setActiveViewer: (id: string) => void
   /** VSCode-style drag reorder: move the dragged tab to the drop position. */
@@ -49,16 +92,25 @@ function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
     if (!raw) return { tabs: [], activeId: null }
     const parsed = JSON.parse(raw) as { tabs?: ViewerTab[]; activeId?: string | null }
     const valid = Array.isArray(parsed.tabs)
-      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser'))
+      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser' || t.kind === 'file' || t.kind === 'text'))
       : []
-    // Single tab per kind: collapse legacy multiples (e.g. review-turn-xxx,
-    // trace-<chatId>) into one tab per kind, keeping the first of each.
-    const seen = new Set<ViewerKind>()
+    // One tab per kind per chat (one per sub-agent for trace tabs).
+    // Legacy flat tabs (pre per-chat ids, no chatId) are dropped — their
+    // owner chat is unknowable.
+    const seen = new Set<string>()
     const tabs: ViewerTab[] = []
     for (const t of valid) {
-      if (seen.has(t.kind)) continue
-      seen.add(t.kind)
-      tabs.push({ ...t, id: t.kind, title: t.kind === 'review' ? 'Git' : t.title })
+      if (CHAT_SCOPED_KINDS.has(t.kind) && !t.chatId) continue
+      const legacyId = viewerTabId(t.kind, t.chatId ?? '')
+      const id =
+        t.kind === 'trace' && typeof (t as ViewerTab).traceTaskId === 'string' && (t as ViewerTab).traceTaskId
+          ? t.id.startsWith('trace:')
+            ? t.id
+            : `trace:${t.chatId}:${(t as ViewerTab).traceTaskId}`
+          : legacyId
+      if (seen.has(id)) continue
+      seen.add(id)
+      tabs.push({ ...t, id, title: t.kind === 'review' ? 'Git' : t.title })
     }
     const activeId = typeof parsed.activeId === 'string' && tabs.some((t) => t.id === parsed.activeId) ? parsed.activeId : (tabs[0]?.id ?? null)
     return { tabs, activeId }
@@ -69,7 +121,13 @@ function loadPersisted(): { tabs: ViewerTab[]; activeId: string | null } {
 
 function persist(tabs: ViewerTab[], activeId: string | null) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs, activeId }))
+    // Text bodies stay in memory only: a pasted log can be megabytes and
+    // would blow the localStorage quota. The tab (title/owner) persists so
+    // the tab bar survives a restart; the body is re-opened from the chat.
+    const slim = tabs.map((t) =>
+      t.kind === 'text' ? { ...t, textBody: undefined } : t,
+    )
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs: slim, activeId }))
   } catch {
     /* storage unavailable */
   }
@@ -110,63 +168,77 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openReview: (messageId, path) =>
+  openReview: (messageId, path, chatId) =>
     set((s) => {
-      // Single diff tab: reopening a diff updates it in place.
-      const id = 'review'
+      // One diff tab per chat: reopening a diff updates it in place.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('review', cid)
       const tab: ViewerTab = {
         id,
         kind: 'review',
+        chatId: cid,
         title: 'Git',
         reviewMessageId: messageId,
         reviewPath: path,
         reviewSource: 'turn',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.kind === 'review')
-        ? s.tabs.map((t) => (t.kind === 'review' ? tab : t))
+      const tabs = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
       const next = { tabs, activeId: id }
       persist(next.tabs, next.activeId)
       return next
     }),
-  openGitDiff: () =>
+  openGitDiff: (chatId) =>
     set((s) => {
-      // Single diff tab: the uncommitted view replaces whatever diff is open.
-      const id = 'review'
+      // One diff tab per chat: the uncommitted view replaces it in place.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('review', cid)
       const tab: ViewerTab = {
         id,
         kind: 'review',
+        chatId: cid,
         title: 'Git',
         reviewMessageId: null,
         reviewSource: 'uncommitted',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.kind === 'review')
-        ? s.tabs.map((t) => (t.kind === 'review' ? tab : t))
+      const tabs = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab]
       const next = { tabs, activeId: id }
       persist(next.tabs, next.activeId)
       return next
     }),
-  openTraces: (chatId, tab) =>
+  openTraces: (chatId, tab, taskId, title) =>
     set((s) => {
-      // Single trace tab: it always follows the active chat (TracePanel reads
-      // the live activeChatId), so reopening only focuses it.
-      const id = 'trace'
+      // One trace tab per chat; each sub-agent gets its own filtered tab.
+      const cid = chatId ?? currentChatId()
+      const tid = (taskId ?? '').trim()
+      const id = tid ? `trace:${cid}:${tid}` : viewerTabId('trace', cid)
+      const short = tid ? tid.slice(0, 8) : ''
+      const label = (title ?? '').trim()
       const entry: ViewerTab = {
         id,
         kind: 'trace',
-        title: 'Trace',
+        chatId: cid,
+        title: tid ? `Trace · ${label ? label.slice(0, 28) : short}` : 'Trace',
         traceChatId: chatId,
         traceTab: tab,
+        traceTaskId: tid || undefined,
+        traceTitle: label || undefined,
         createdAt: Date.now(),
       }
-      const prev = s.tabs.find((t) => t.kind === 'trace')
+      const prev = s.tabs.find((t) => t.id === id)
       const tabs = prev
         ? s.tabs.map((t) =>
-            t.kind === 'trace'
-              ? { ...entry, traceTab: tab ?? t.traceTab ?? prev.traceTab }
+            t.id === id
+              ? {
+                  ...entry,
+                  traceTab: tab ?? t.traceTab ?? prev.traceTab,
+                  traceTitle: label || (t.traceTitle ?? prev.traceTitle),
+                }
               : t,
           )
         : [...s.tabs, entry]
@@ -188,14 +260,15 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openPlan: () =>
+  openPlan: (chatId) =>
     set((s) => {
-      // Single plan tab: it always follows the active chat (PlanPanel reads the
-      // live activeChatId), so reopening only focuses it.
-      const id = 'plan'
+      // One plan tab per chat (PlanPanel reads the live activeChatId).
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('plan', cid)
       const entry: ViewerTab = {
         id,
         kind: 'plan',
+        chatId: cid,
         title: 'Plan',
         createdAt: Date.now(),
       }
@@ -204,18 +277,64 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openBrowser: () =>
+  openBrowser: (chatId) =>
     set((s) => {
-      // Single browser tab: the panel shows the shared in-app Playwright
-      // session, so reopening only focuses it.
-      const id = 'browser'
+      // One browser tab per chat; the panel shows the shared Playwright session.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('browser', cid)
       const entry: ViewerTab = {
         id,
         kind: 'browser',
+        chatId: cid,
         title: 'Browser',
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const next = { tabs, activeId: id }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openFile: (path, line, root) =>
+    set((s) => {
+      const clean = path.trim()
+      if (!clean) return {}
+      // One tab per file, GLOBAL (not chat-scoped): like an editor, opened
+      // files stay across chat switches. Reopening re-targets the line.
+      const id = `file:${clean}`
+      const entry: ViewerTab = {
+        id,
+        kind: 'file',
+        title: clean.split(/[\\/]/).pop() || clean,
+        filePath: clean,
+        fileLine: line,
+        fileRoot: root,
+        createdAt: Date.now(),
+      }
+      const tabs = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line } : t))
+        : [...s.tabs, entry]
+      const next = { tabs, activeId: id }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openText: (title, body) =>
+    set((s) => {
+      if (!body) return {}
+      // One text tab per chat: reopening updates it in place, never stacks
+      // a new tab per click.
+      const cid = currentChatId()
+      const id = viewerTabId('text', cid)
+      const entry: ViewerTab = {
+        id,
+        kind: 'text',
+        chatId: cid,
+        title: title.trim() || 'Text',
+        textBody: body,
+        createdAt: Date.now(),
+      }
+      const tabs = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? entry : t))
+        : [...s.tabs, entry]
       const next = { tabs, activeId: id }
       persist(next.tabs, next.activeId)
       return next

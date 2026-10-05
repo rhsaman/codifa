@@ -170,7 +170,7 @@ async def test_subagent_loop_injects_max_steps_prompt():
                 for m in msgs
             ):
                 self._saw = True
-                return _AIMessage(content="explore summary")
+                return _AIMessage(content="subagent summary")
             n = len([m for m in msgs if getattr(m, "type", "") == "ai"]) + 1
             return _AIMessage(
                 content=f"step {n}",
@@ -180,13 +180,13 @@ async def test_subagent_loop_injects_max_steps_prompt():
     model = _SubModel()
     out = await _llm.langchain_tool_loop(
         model,
-        system="you are explore",
+        system="you are subagent",
         user="find things",
         tools={},
         max_steps=3,
     )
     assert model._saw, "sub-agent loop never injected MAX_STEPS_PROMPT"
-    assert "explore summary" in out, out
+    assert "subagent summary" in out, out
     print("  sub-agent loop injected MAX_STEPS_PROMPT and summarized")
 
 
@@ -195,11 +195,8 @@ async def test_agent_registry_has_per_agent_steps():
     agent.steps)."""
     from agent_registry import AGENTS
 
-    assert AGENTS["general"]["steps"] > 0
     assert AGENTS["subagent"]["steps"] > 0
-    # هر دو sub-agent بودجه‌ی step منطقی دارن (محدودیت step روی grep/glob/read برداشته شد).
-    assert AGENTS["subagent"]["steps"] > 0
-    assert AGENTS["general"]["steps"] > 0
+    # The single sub-agent has a sane step budget (no step limit on grep/glob/read).
     print("  registry per-agent step budgets present")
 
 

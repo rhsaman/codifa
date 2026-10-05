@@ -18,6 +18,8 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
+import { looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
@@ -34,7 +36,7 @@ import {
   ToolSingleRow,
   TraceNarration,
   isEditActivity,
-  isExploreCard,
+  isSubagentCard,
 } from "./ToolCallView";
 import { ReadingMode } from "./ReadingMode";
 import { Mermaid } from "./Mermaid";
@@ -339,9 +341,11 @@ function codeFilePath(children: ReactNode): string {
 // window). hljs.highlight over a big block on every token is the main CPU cost
 // of streaming. Cache by (lang + source) so unchanged blocks pay zero.
 // FIFO-bounded like preparedCache so long sessions can't leak memory.
+// Exported for FileViewerPanel (the file viewer tab) — same cache, same
+// sanitize + span-aware line split as chat code blocks.
 const highlightCache = new Map<string, string[]>();
 const HIGHLIGHT_CACHE_MAX = 150;
-function getHighlightedLines(whole: string, lang: string): string[] {
+export function getHighlightedLines(whole: string, lang: string): string[] {
   const key = `${lang}\n${whole}`;
   const hit = highlightCache.get(key);
   if (hit) return hit;
@@ -369,7 +373,23 @@ function getHighlightedLines(whole: string, lang: string): string[] {
 
 const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const [copied, setCopied] = useState(false);
-  const code = textFromChildren(props.children).replace(/^\n+|\n+$/g, "");
+  // The `code` override may hand back a FileChip for a single-token fence
+  // (bare or with a language) whose whole content is one path-like token:
+  // textFromChildren can't see the chip's internal JSX, so recover the text
+  // from the chip's props instead of rendering an empty block. The chip is
+  // never mounted here — the <pre> below replaces the children entirely.
+  const chipProps = (() => {
+    const kid = Array.isArray(props.children) ? props.children[0] : props.children;
+    const p =
+      kid && typeof kid === "object" && "props" in kid
+        ? (kid as { props: { path?: unknown; display?: unknown } }).props
+        : undefined;
+    return p && typeof p.path === "string" ? p : undefined;
+  })();
+  const code = (
+    textFromChildren(props.children) ||
+    (chipProps ? String(chipProps.display ?? chipProps.path) : "")
+  ).replace(/^\n+|\n+$/g, "");
   const lang = codeLang(props.children);
   const startLine = codeStartLine(props.children);
   const filePath = codeFilePath(props.children);
@@ -428,7 +448,16 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
   return (
     <div className="code-block">
       <div className="code-block-head">
-        {filePath && <span className="code-block-path">{filePath}</span>}
+        {filePath && (
+          <span
+            className="code-block-path code-block-path-open"
+            title={`Open ${filePath}`}
+            onClick={() => openWorkspaceFile(filePath)}
+          >
+            <FileIcon path={filePath} size={18} />
+            {filePath}
+          </span>
+        )}
         <span className="code-block-lang">
           {lang || "code"}
         </span>
@@ -607,6 +636,18 @@ export const mdComponents = {
       const cn = String(node?.properties?.className ?? props.className ?? "");
       const m = /^language-[\w-]+:(.+)/.exec(cn);
       if (m) meta = m[1];
+    }
+    // Inline code that is a bare file path (`src/App.tsx`, `backend/x.py:12`)
+    // renders as a clickable file chip instead of a code span. Fences with a
+    // language/meta never chip (meta is set); a single-token bare fence that
+    // slips into this branch is still safe — CodeBlock recovers the text from
+    // the chip's props, so the block renders with the path verbatim.
+    if (!meta) {
+      const text = textFromChildren(props.children);
+      if (looksLikeFilePath(text)) {
+        const { path, line } = splitPathLine(text);
+        return <FileChip path={path} line={line} display={text} />;
+      }
     }
     return (
       <code {...props} data-meta={meta}>
@@ -1007,8 +1048,8 @@ export function ThinkingIndicator({
 // Only tools that write to the workspace filesystem render as their own
 // visible edit UI (diff + revert) — every other tool (including
 // memory/skill/connector saves) sweeps into the collapsed Claude-app-style
-// trace group. Explore sub-agents are also always-visible (isExploreCard
-// below) so the explorer never hides inside the collapsed group.
+// trace group. Background sub-agents are also always-visible (isSubagentCard
+// below) so the sub-agent never hides inside the collapsed group.
 // ویرایش‌های پشت‌سرهم (edit_file/write_file) در یک گروه ویرایش جدا
 // (ToolEditGroupView) جمع می‌شوند — نه کارت تکی جدا، نه قاطی با گروه
 // ابزارهای فقط‌خواندنی.
@@ -1039,6 +1080,13 @@ export function isCollapsibleText(text: string): boolean {
   );
 }
 
+/** Tab title for a full-text side panel: the first non-empty line, capped. */
+function textTabTitle(text: string, fallback: string): string {
+  const firstLine = text.split("\n").find((l) => l.trim())?.trim() ?? "";
+  if (!firstLine) return fallback;
+  return firstLine.length > 48 ? `${firstLine.slice(0, 48)}…` : firstLine;
+}
+
 function UserMessageBubble({
   message,
   onRetry,
@@ -1050,21 +1098,14 @@ function UserMessageBubble({
 }) {
   const dir = useStore((s) => s.dir);
   const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
   const content = message.content || "";
   const isLong =
     content.length > USER_COLLAPSE_CHARS ||
     content.split("\n").length > USER_COLLAPSE_LINES;
-  // Two-stage expand: the existing 600-char fold for normal long texts, plus
-  // a render cap for megabyte pastes (collapsed paint stays cheap; "Show all"
-  // is an explicit, informed read of the full text).
-  const cap = useCapped(message.id, content, !!message.streaming);
-  const body = !isLong
-    ? content
-    : !expanded
-      ? content.slice(0, USER_COLLAPSE_CHARS)
-      : cap.shown;
-  const clamped = isLong && !expanded;
+  // Folded preview only: the full text opens in the side panel (right), never
+  // expands inline — long texts read like diff/plan tabs.
+  const body = isLong ? content.slice(0, USER_COLLAPSE_CHARS) : content;
+  const clamped = isLong;
 
   const copy = async () => {
     try {
@@ -1085,42 +1126,37 @@ function UserMessageBubble({
         >
           {cachedPrepare(message.id, body, dir) || "(empty)"}
         </div>
-        {isLong && !expanded && (
+        {isLong && (
           <button
             className="msg-expand"
-            onClick={() => setExpanded(true)}
-            aria-expanded={false}
+            onClick={() =>
+              useViewerTabs
+                .getState()
+                .openText(textTabTitle(content, "Message"), content)
+            }
+            title="Open the full text in the side panel"
           >
             Show more
-          </button>
-        )}
-        {isLong && expanded && cap.over && !cap.showAll && (
-          <button
-            className="msg-expand"
-            onClick={() => cap.setShowAll(true)}
-            aria-expanded={false}
-            title={`Full message is ${fmtSize(content.length)}`}
-          >
-            Show all ({fmtSize(cap.cut)} more)
-          </button>
-        )}
-        {isLong && expanded && (!cap.over || cap.showAll) && (
-          <button
-            className="msg-expand"
-            onClick={() => {
-              setExpanded(false);
-              cap.setShowAll(false);
-            }}
-            aria-expanded={true}
-          >
-            Show less
           </button>
         )}
         {message.attachments && message.attachments.length > 0 && (
           <div className="msg-attachments" dir="ltr">
             {message.attachments.map((a) => (
-              <span className="attachment-chip" key={a}>
-                @ {a}
+              <span
+                className="attachment-chip attachment-chip-open"
+                key={a}
+                role="button"
+                tabIndex={0}
+                title={`${a} — open in the side panel`}
+                onClick={() => openWorkspaceFile(a)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openWorkspaceFile(a);
+                  }
+                }}
+              >
+                <FileIcon path={a} size={18} />{a}
               </span>
             ))}
           </div>
@@ -1216,8 +1252,8 @@ function UserMessageBubble({
   );
 }
 
-/** Foldable body text for queued / steer bubbles: long text clamps to the same
- *  max-height as a folded user message, with the same Show more toggle. */
+/** Foldable body text for queued / steer bubbles: long text clamps like a
+ *  folded user message; the button opens the full text in the side panel. */
 export function QueuedCollapsibleText({
   id,
   text,
@@ -1226,13 +1262,11 @@ export function QueuedCollapsibleText({
   text: string;
 }) {
   const dir = useStore((s) => s.dir);
-  const [expanded, setExpanded] = useState(false);
   const isLong = isCollapsibleText(text);
-  const clamped = isLong && !expanded;
   return (
     <>
       <div
-        className={`queued-bubble-text${clamped ? " clamped" : ""}`}
+        className={`queued-bubble-text${isLong ? " clamped" : ""}`}
         dir={detectDir(text)}
       >
         {cachedPrepare(id, text, dir) || "(empty)"}
@@ -1240,10 +1274,14 @@ export function QueuedCollapsibleText({
       {isLong && (
         <button
           className="msg-expand queued-expand"
-          onClick={() => setExpanded((e) => !e)}
-          aria-expanded={expanded}
+          onClick={() =>
+            useViewerTabs
+              .getState()
+              .openText(textTabTitle(text, "Queued text"), text)
+          }
+          title="Open the full text in the side panel"
         >
-          {expanded ? "Show less" : "Show more"}
+          Show more
         </button>
       )}
     </>
@@ -1285,79 +1323,63 @@ function SegSteerBubble({
   );
 }
 
-/** Renders a folded context-summary message: collapsed by default (long dump
- *  of earlier turns), header toggles it open. Shared by the standalone
- *  system-message bubble (a compact between turns) and the inline `compact`
- *  segment (a compact mid-turn, spliced into the still-streaming assistant
- *  message at the point it happened — see renderSegments). */
+/** Renders a folded context-summary message: the preview stays folded in the
+ *  chat and the header opens the full summary in the side panel (like
+ *  diff/plan), never inline. Shared by the standalone system-message bubble
+ *  and the inline `compact` segment. */
 function SummaryBlock({ message }: { message: ChatMessage }) {
   const dir = useStore((s) => s.dir);
-  const [collapsed, setCollapsed] = useState(true);
-  const cap = useCapped(message.id, message.content || "", false);
+  const content = message.content || "";
+  const open = () =>
+    useViewerTabs.getState().openText("Context summary", content);
   return (
-    <div className={`summary-block${collapsed ? " collapsed" : ""}`}>
+    <div className="summary-block collapsed">
       <div
         className="summary-head"
-        onClick={() => setCollapsed((c) => !c)}
+        onClick={open}
         role="button"
         tabIndex={0}
+        title="Open the full summary in the side panel"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            open();
+          }
+        }}
       >
-        <span className={`summary-chevron${collapsed ? "" : " open"}`}>
-          ▶
-        </span>
+        <span className="summary-chevron">▶</span>
         <span className="summary-icon">📎</span>
         <span className="summary-label">Context summary</span>
-        {collapsed && message.content && (
+        {content && (
           <span className="summary-preview" dir="auto">
-            {cachedPrepare(message.id, message.content, dir)}
+            {cachedPrepare(message.id, content, dir)}
           </span>
         )}
         <span className="summary-hint">
-          earlier turns folded into this summary — the agent still
-          receives it
+          earlier turns folded into this summary — click to open it
         </span>
       </div>
-      {!collapsed && (
-        <>
-          <div className="summary-body chat-message markdown-body" dir="auto">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {cachedPrepare(
-                `${message.id}:summary`,
-                cap.shown || "(empty summary)",
-                dir,
-              )}
-            </ReactMarkdown>
-          </div>
-          {cap.over && (
-            <button
-              className="msg-expand"
-              onClick={() => cap.setShowAll((v) => !v)}
-              aria-expanded={cap.showAll}
-            >
-              {cap.showAll
-                ? "Show less"
-                : `Show all (${fmtSize(cap.cut)} more)`}
-            </button>
-          )}
-        </>
-      )}
     </div>
   );
 }
 
 /** A text segment counts as a "caption" (narration the model wrote right
  *  before a tool call, e.g. "بذار ببینم X رو...") rather than real answer
- *  prose. Any text immediately preceding a groupable tool call is narration —
- *  length, line count and headings do NOT disqualify it (the old 260-char /
- *  2-line cap split one logical run into several floating groups whenever a
- *  narration ran long — the "چند تا tool group پشت هم" bug). The ONE
- *  exception: fenced code blocks — those are real content the model is
- *  showing off, never a "let me check X" line, and rendering them as a raw
- *  narration row would lose all formatting. */
+ *  prose. Only SHORT narration qualifies: a long or multi-line text is real
+ *  answer prose (e.g. the plan body or a summary) and must render as a
+ *  paragraph OUTSIDE the tool group — otherwise the reply stays trapped
+ *  inside the group card. Fenced code blocks are also real content, never a
+ *  "let me check X" line, and rendering them as a raw narration row would
+ *  lose all formatting. */
+const CAPTION_MAX_CHARS = 260;
+const CAPTION_MAX_LINES = 2;
+
 function isCaptionCandidate(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
   if (t.includes("```")) return false;
+  if (t.length > CAPTION_MAX_CHARS) return false;
+  if (t.split("\n").length > CAPTION_MAX_LINES) return false;
   return true;
 }
 
@@ -1581,7 +1603,7 @@ export function renderSegments(
       const nextIsGroupable =
         nextActivity &&
         !ALWAYS_VISIBLE_TOOLS.has(nextActivity.tool) &&
-        !isExploreCard(nextActivity);
+        !isSubagentCard(nextActivity);
 
       if (nextIsGroupable && isCaptionCandidate(seg.text)) {
         // A narration BEFORE a groupable tool: it belongs to the NEXT call.
@@ -1606,13 +1628,13 @@ export function renderSegments(
     // می‌شوند و هرگز با ران فقط‌خواندنی (pending) یا گروه ابزارهای دیگر قاطی
     // نمی‌شوند. تک‌ویرایش مثل قبل کارت تکی (ToolCallView) می‌ماند تا Undo و
     // Review تکی هر فایل حفظ شود؛ ۲+ ویرایش در یک ToolEditGroupView جمع می‌شوند.
-    if (isEditActivity(activity) && !isExploreCard(activity)) {
+    if (isEditActivity(activity) && !isSubagentCard(activity)) {
       flush();
       wrapTrace();
       pendingEdit.push({ activity, index: seg.index });
       return;
     }
-    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isExploreCard(activity)) {
+    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isSubagentCard(activity)) {
       flush();
       wrapTrace();
       flushEdits();
@@ -1849,8 +1871,21 @@ export const ChatMessageView = memo(
       {!isUser && message.attachments && message.attachments.length > 0 && (
         <div className="msg-attachments" dir="ltr">
           {message.attachments.map((a) => (
-            <span className="attachment-chip" key={a}>
-              @ {a}
+            <span
+              className="attachment-chip attachment-chip-open"
+              key={a}
+              role="button"
+              tabIndex={0}
+              title={`${a} — open in the side panel`}
+              onClick={() => openWorkspaceFile(a)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  openWorkspaceFile(a);
+                }
+              }}
+            >
+              <FileIcon path={a} size={18} />{a}
             </span>
           ))}
         </div>
@@ -1917,8 +1952,21 @@ export const ChatMessageView = memo(
             {message.attachments && message.attachments.length > 0 && (
               <div className="msg-attachments" dir="ltr">
                 {message.attachments.map((a) => (
-                  <span className="attachment-chip" key={a}>
-                    @ {a}
+                  <span
+                    className="attachment-chip attachment-chip-open"
+                    key={a}
+                    role="button"
+                    tabIndex={0}
+                    title={`${a} — open in the side panel`}
+                    onClick={() => openWorkspaceFile(a)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        openWorkspaceFile(a);
+                      }
+                    }}
+                  >
+                    <FileIcon path={a} size={18} />{a}
                   </span>
                 ))}
               </div>
@@ -1949,13 +1997,17 @@ export const ChatMessageView = memo(
             {cap.over && (
               <button
                 className="msg-expand"
-                onClick={() => cap.setShowAll((v) => !v)}
-                aria-expanded={cap.showAll}
-                title={`Full reply is ${fmtSize((displayContent ?? "").length)}`}
+                onClick={() =>
+                  useViewerTabs
+                    .getState()
+                    .openText(
+                      textTabTitle(displayContent ?? message.content, "Reply"),
+                      displayContent ?? message.content,
+                    )
+                }
+                title={`Full reply is ${fmtSize((displayContent ?? "").length)} — opens in the side panel`}
               >
-                {cap.showAll
-                  ? "Show less"
-                  : `Show all (${fmtSize(cap.cut)} more)`}
+                Show all ({fmtSize(cap.cut)} more)
               </button>
             )}
           </>

@@ -423,3 +423,35 @@ def test_bind_tools_parallel_respects_explicit_disable():
 
     llm.bind_tools_parallel(_M(), [], enabled=False)
     assert seen.get("pc") is False
+
+
+def test_bind_tools_parallel_dedupes_duplicate_tool_names():
+    """The same tool name declared twice must be bound ONCE (first wins).
+
+    Regression for provider HTTP 400: ``tool "mcp__playwright__browser_close"
+    is declared more than once in `tools``` — a steer MCP rebuild can push an
+    already-bound tool into ``lc_tools`` a second time."""
+    seen: dict = {}
+
+    class _M:
+        def bind_tools(self, tools, parallel_tool_calls=False):
+            seen["tools"] = tools
+            return self
+
+    class _Tool:
+        def __init__(self, **attrs):
+            self.__dict__.update(attrs)
+
+    first = _Tool(name="mcp__playwright__browser_close")
+    dupe = _Tool(name="mcp__playwright__browser_close")
+    other = _Tool(name="browser_navigate")
+    nameless = _Tool(description="no name attr fallback")
+
+    llm.bind_tools_parallel(_M(), [first, dupe, other, nameless])
+    bound = seen["tools"]
+    assert [t.name for t in bound if hasattr(t, "name")] == [
+        "mcp__playwright__browser_close",
+        "browser_navigate",
+    ]
+    # nameless tools pass through untouched (no name to dedupe on)
+    assert nameless in bound

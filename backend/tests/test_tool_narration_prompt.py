@@ -1,17 +1,18 @@
-"""تست قانون TOOL NARRATION — روایتِ کاریِ مدل بالای هر فراخوانی ابزار.
+"""Sub-agent narration rule test — the model's working narration above each
+tool call.
 
-- _UNIVERSAL_RULES باید بند TOOL NARRATION را داشته باشد.
-- چون graph.build_turn_context برای همهٔ مودهای اصلی SYSTEM_PROMPTS + _UNIVERSAL_RULES
-  را می‌چسباند، قانون باید در سرهم‌بندیِ نهایی هر مود اصلی دیده شود.
-- ساب‌ایجنت‌ها (explore/general) از agent_system فقط _SEARCH_RULE می‌گیرند و متنشان
-  به UI استریم نمی‌شود؛ پس قانون نباید به پرامپتشان برسد.
+- _UNIVERSAL_RULES must contain the TOOL NARRATION clause.
+- graph.build_turn_context appends SYSTEM_PROMPTS + _UNIVERSAL_RULES for every
+  main mode, so the rule must appear in each main mode's final assembly.
+- Sub-agents get only _SEARCH_RULE via agent_system and their text is never
+  streamed to the UI; the rule must not reach their prompt.
 """
 
 from agent_registry import agent_system
 from agents import _UNIVERSAL_RULES, SYSTEM_PROMPTS
 
 _MAIN_MODES = ("ask", "plan", "coder", "reader")
-_SUBAGENTS = ("explore", "general")
+_SUBAGENTS = ("subagent",)
 
 
 def test_universal_rules_have_narration():
@@ -29,7 +30,7 @@ def test_every_main_mode_gets_narration_rule():
 
 
 def test_subagent_prompts_do_not_get_narration():
-    # متن ساب‌ایجنت به UI استریم نمی‌شود؛ قانون نباید بهشان برسد
+    # Sub-agent text is never streamed to the UI; the rule must not reach it.
     for name in _SUBAGENTS:
         assert "TOOL NARRATION" not in agent_system(name), name
 

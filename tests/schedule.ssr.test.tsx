@@ -37,7 +37,7 @@ const { formatNextRunFa, runStatusFa, cronToPresetValue } = await import(
   "../src/components/SchedulePanel"
 )
 const { unseenRunCount, unseenRunCountForTask, pickInboxTask } = await import("../src/components/ScheduleInbox")
-const { scheduleRunTokenTotal, taskTokenTotals, findNewScheduleRuns } = await import(
+const { scheduleRunTokenTotal, taskTokenTotals, findFinishedScheduleRuns } = await import(
   "../src/lib/schedule-notify"
 )
 
@@ -148,18 +148,27 @@ console.log("۹) taskTokenTotals — مجموع توکن هر تسک روی خو
   check("scheduleRunTokenTotal ران a برابر ۱۵۰", scheduleRunTokenTotal(runs[0]) === 150)
 }
 
-console.log("۱۰) findNewScheduleRuns — فقط ران واقعاً جدید اعلان می‌دهد:")
+console.log("۱۰) findFinishedScheduleRuns — فقط پایان کار اعلان می‌دهد نه شروع ران:")
 {
   const runs = [
     { id: "a", schedule_id: "s", status: "done", started_at: 1 },
-    { id: "b", schedule_id: "s", status: "done", started_at: 2 },
+    { id: "b", schedule_id: "s", status: "running", started_at: 2 },
   ] as any
-  check("اولین پولینگ baseline است (بدون اعلان)", findNewScheduleRuns(new Set(), runs, []).length === 2)
-  check("ران تکراری اعلان نمی‌دهد", findNewScheduleRuns(new Set(["a", "b"]), runs, []).length === 0)
-  check("ران دیده‌شده اعلان نمی‌دهد", findNewScheduleRuns(new Set(["a"]), runs, ["b"]).length === 0)
-  const withNew = [...runs, { id: "c", schedule_id: "s", status: "done", started_at: 3 }] as any
-  const fresh = findNewScheduleRuns(new Set(["a", "b"]), withNew, [])
-  check("فقط ران c جدید است", fresh.length === 1 && fresh[0].id === "c", fresh)
+  check("اولین پولینگ baseline است (بدون اعلان)", findFinishedScheduleRuns(null, runs).length === 0)
+  const prevDone = new Map([["a", "running" as const], ["b", "running" as const]])
+  const finished = findFinishedScheduleRuns(prevDone, runs)
+  check("ران running که done شده اعلان می‌دهد", finished.length === 1 && finished[0].id === "a", finished)
+  const prevDoneErr = new Map([["a", "running" as const]])
+  const finishedErr = findFinishedScheduleRuns(prevDoneErr, [{ id: "a", schedule_id: "s", status: "error", started_at: 1 }] as any)
+  check("ران running که error شده اعلان می‌دهد", finishedErr.length === 1 && finishedErr[0].status === "error", finishedErr)
+  const between = findFinishedScheduleRuns(new Map(), [{ id: "n", schedule_id: "s", status: "done", started_at: 3 }] as any)
+  check("رانی که بین دو پولینگ تمام شده اعلان می‌دهد", between.length === 1 && between[0].id === "n", between)
+  const started = findFinishedScheduleRuns(new Map(), [{ id: "r", schedule_id: "s", status: "running", started_at: 3 }] as any)
+  check("ران تازه شروع‌شده (running) اعلان نمی‌دهد", started.length === 0, started)
+  const noChange = findFinishedScheduleRuns(new Map([["a", "done" as const]]), runs)
+  check("ران قبلاً پایانیافته دوباره اعلان نمی‌دهد", noChange.length === 0, noChange)
+  const stillRunning = findFinishedScheduleRuns(new Map([["b", "running" as const]]), [runs[1]])
+  check("ران هنوز running اعلان نمی‌دهد", stillRunning.length === 0, stillRunning)
 }
 
 if (failed > 0) {

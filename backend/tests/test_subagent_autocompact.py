@@ -1,6 +1,6 @@
 """Unit tests: sub-agent loop auto-compacts its isolated context instead of failing.
 
-Regression guard for the bug where a sub-agent (explore/general) that reads many
+Regression guard for the bug where a sub-agent that reads many
 large files overflows its isolated context window and the whole task fails with
 "context_length_exceeded" / "sub-agent failed". After the fix, ``langchain_tool_loop``
 reclaims the sub-agent's transcript mid-run via ``_auto_compact_subagent`` (mirroring
@@ -27,6 +27,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from conftest import await_task_report
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -160,7 +161,7 @@ async def test_langchain_tool_loop_autocompacts_with_ctx():
     try:
         out = await _llm.langchain_tool_loop(
             model,
-            system="you are explore",
+            system="you are subagent",
             user="read big.txt repeatedly",
             tools={"read": fake_read},
             max_steps=10,
@@ -235,11 +236,14 @@ async def test_task_tool_passes_context_window_to_subagent():
     original = _llm._compact_history
     _llm._compact_history = fake_compact
     try:
-        report = await tools["task"](
+        ack = await tools["task"](
             description="read big.txt",
             prompt="Read big.txt and report what it contains.",
-            subagent_type="general",
+            subagent_type="subagent",
         )
+        # Background dispatch: await the registry job while the patched
+        # fixtures (fake compact / patched read) are still in effect.
+        report = await await_task_report(ack)
     finally:
         _agents._compact_history = original
 

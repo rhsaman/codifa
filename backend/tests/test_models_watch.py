@@ -14,7 +14,6 @@ def _status_with_dirs(tmp_path, monkeypatch, dirs):
         model_download, "embedding_dirs",
         lambda: [{"dir": d, "ready": True} for d in dirs],
     )
-    monkeypatch.setattr(model_download, "laya_dirs", list)
     return model_download.status()
 
 

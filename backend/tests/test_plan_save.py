@@ -93,6 +93,107 @@ async def test_plan_build_saves_with_variant_header(tmp_path, monkeypatch):
         assert saved.get("content", "").strip(), v
 
 
+@pytest.mark.asyncio
+async def test_plan_build_saves_streamed_text_not_just_final_reply(tmp_path, monkeypatch):
+    # The '## Plan' body is written in a step that also carries the update_plan
+    # tool call, so the reply (final message only) lacks it. The saved plan
+    # must come from the FULL streamed turn text — not the closing prose.
+    plan_body = "## Plan\n1. do the thing\nFiles: backend/graph.py"
+    closing = "Plan written and the checklist is ready for review."
+
+    async def fake_turn(state, mode, queue, **kwargs):
+        queue.put_nowait({"kind": "text", "content": "scouting… "})
+        queue.put_nowait({"kind": "text", "content": plan_body})
+        queue.put_nowait({"kind": "text", "content": "\n\n" + closing})
+        return closing  # reply = final message only, no header
+
+    saved = {}
+    monkeypatch.setattr(
+        graph.state_db, "save_plan", lambda *a, **k: saved.update({"content": a[2]})
+    )
+    monkeypatch.setattr(graph, "_run_mode_turn", fake_turn)
+
+    state, _q = _state(str(tmp_path), closing)
+    result = await plan_build(state)
+
+    assert saved.get("content", "").startswith("## Plan"), saved
+    assert "do the thing" in saved["content"]
+    assert result["plan"].startswith("## Plan")
+
+
+@pytest.mark.asyncio
+async def test_plan_revision_saves_streamed_text(tmp_path, monkeypatch):
+    # Same contract on the REVISION path: the gate feedback reruns the planner,
+    # whose reply is again only the closing message — the revised plan streamed
+    # earlier in the turn is what must land on disk.
+    v1 = "## Plan\n1. first step\nFiles: a.py"
+    v2 = "## Plan\n1. first step\n2. second step\nFiles: a.py"
+    closing = "Revised and ready for review."
+
+    async def fake_turn(state, mode, queue, extra_instruction="", **kwargs):
+        body = v2 if extra_instruction else v1
+        queue.put_nowait({"kind": "text", "content": body})
+        queue.put_nowait({"kind": "text", "content": "\n\n" + closing})
+        return closing
+
+    saved = []
+    monkeypatch.setattr(
+        graph.state_db, "save_plan", lambda *a, **k: saved.append(a[2])
+    )
+    monkeypatch.setattr(graph, "_run_mode_turn", fake_turn)
+
+    gates = {}
+    state, q = _state(str(tmp_path), v1)
+    state["ask_gates"] = gates
+    task = asyncio.create_task(plan_build(state))
+
+    async def answer_when_asked(answer):
+        while True:
+            ev = await asyncio.wait_for(q.get(), 2.0)
+            if ev.get("kind") == "ask":
+                gates[ev["id"]].set_result(answer)
+                return
+
+    await answer_when_asked("add a second step")
+    await answer_when_asked(graph.PLAN_APPROVE_TOKEN)
+    result = await asyncio.wait_for(task, 2.0)
+
+    assert len(saved) == 2, saved
+    assert saved[0].startswith("## Plan")
+    assert "second step" in saved[1], saved[1]
+    assert result["plan"].startswith("## Plan")
+    assert result["mode"] == "coder"
+
+
+@pytest.mark.asyncio
+async def test_plan_reply_carrying_header_not_stripped(tmp_path, monkeypatch):
+    # When the model writes '## Plan' in a message WITHOUT a tool call, the
+    # reply carries the plan (+ closing prose). Stripping that suffix from the
+    # streamed turn text would delete the plan and leave only the scouting
+    # narration — which would then be saved AS the plan.
+    narration = "one final search for the setter name..."
+    body = "## Plan\n1. do the thing\nFiles: backend/graph.py"
+    closing = "Plan written and the checklist is ready."
+
+    async def fake_turn(state, mode, queue, **kwargs):
+        queue.put_nowait({"kind": "text", "content": narration})
+        queue.put_nowait({"kind": "text", "content": "\n\n" + body})
+        queue.put_nowait({"kind": "text", "content": "\n\n" + closing})
+        return body + "\n\n" + closing  # reply = plan + closing (no tool call)
+
+    saved = {}
+    monkeypatch.setattr(
+        graph.state_db, "save_plan", lambda *a, **k: saved.update({"content": a[2]})
+    )
+    monkeypatch.setattr(graph, "_run_mode_turn", fake_turn)
+
+    state, _q = _state(str(tmp_path), "")
+    await plan_build(state)
+
+    assert saved.get("content", "").startswith("## Plan"), saved
+    assert "do the thing" in saved["content"], saved
+
+
 def test_save_plan_tool_removed_from_registry():
     # The tool must no longer exist anywhere in the tool registry.
     from tools import make_tool_callbacks
@@ -249,3 +350,52 @@ async def test_plan_nudge_silent_without_checklist(tmp_path):
     )
     out = await tools["write_file"](path="n.txt", content="hello")
     assert "checklist" not in out, out
+
+
+@pytest.mark.asyncio
+async def test_plan_save_uses_loader_workspace_slug(tmp_path, monkeypatch):
+    import state_db
+
+    root = str(tmp_path)
+    reply = "## Plan\n1. do the thing\nFiles: backend/graph.py"
+    captured = {}
+    monkeypatch.setattr(
+        graph.state_db,
+        "save_plan",
+        lambda *a, **k: captured.update({"ws": a[0], "content": a[2]}),
+    )
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(reply))
+
+    state, _q = _state(root, reply)
+    await plan_build(state)
+
+    assert captured.get("ws") == state_db.workspace_slug_for_root(root), captured
+    assert captured.get("content", "").startswith("## Plan")
+
+
+@pytest.mark.asyncio
+async def test_coder_node_emits_plan_card_when_writing_plan(tmp_path, monkeypatch):
+    from graph import coder_node
+
+    plan_body = "## Plan\n1. do the thing\nFiles: backend/graph.py"
+
+    async def fake_turn(state, mode, queue, **kwargs):
+        queue.put_nowait({"kind": "text", "content": plan_body})
+        return "implemented the thing"
+
+    saved = {}
+    monkeypatch.setattr(
+        graph.state_db, "save_plan", lambda *a, **k: saved.update({"content": a[2]})
+    )
+    monkeypatch.setattr(graph, "_run_mode_turn", fake_turn)
+
+    q: asyncio.Queue = asyncio.Queue()
+    state = {"_queue": q, "root": str(tmp_path), "chat_id": "c-coder", "mode": "coder"}
+    result = await coder_node(state)
+
+    assert saved.get("content", "").startswith("## Plan"), saved
+    kinds = []
+    while not q.empty():
+        kinds.append(q.get_nowait().get("kind"))
+    assert "plan_card" in kinds, kinds
+    assert result["coder_result"] == "implemented the thing"

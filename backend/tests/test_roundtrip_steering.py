@@ -1,17 +1,15 @@
-"""Round-trip steering pins: wasteful solo update_plan steps and fully-stubbed
-re-reads/re-greps each burn a full LLM call for zero new content. These
-tests pin the instruction text that steers the model away from both:
+"""Round-trip steering pins: wasteful solo update_plan steps burn a full LLM
+call for nothing. These tests pin the instruction text that steers the
+model away from them:
 
 * update_plan (tool description + checklist continuation rule) prefers
   batching with the next tool calls, while explicitly allowing solo calls
   that mark steps completed (final tick) or create the initial checklist —
   an absolute solo ban taught the model to never call update_plan, leaving
   todos/plan stale.
-* every already-served stub (SKIPPED / DUPLICATE / REUSED) ends with an
-  explicit do-not-re-issue directive so the model proceeds instead of
-  firing another no-op tool step.
+* repeated reads/greps always re-serve their full content — no stub
+  withholds it, so a re-issued call is never a wasted no-op.
 """
-from tool_batching import reset_read_ledger, reset_turn_seen_calls
 
 
 def _cbs(root):
@@ -43,27 +41,22 @@ def test_checklist_continuation_rule_prefers_batching():
     assert "Batch update_plan with your next tool calls" in note, note
 
 
-async def test_skipped_stub_directs_no_reissue(tmp_path):
+async def test_repeat_read_reserves_full_content(tmp_path):
     root = str(tmp_path)
     (tmp_path / "a.py").write_text("alpha\nbeta\n")
     cbs = _cbs(root)
     out1 = await cbs["read"](filePath="a.py")
     assert "alpha" in out1, out1
-    # Next turn, file unchanged -> whole call stubbed.
-    reset_read_ledger()
-    reset_turn_seen_calls()
+    # A repeat serves the full content again — nothing is withheld.
     out2 = await cbs["read"](filePath="a.py")
-    assert out2.startswith("SKIPPED (already in context)"), out2
-    assert "Do NOT re-issue" in out2, out2
+    assert "alpha" in out2 and "beta" in out2, out2
 
 
-async def test_duplicate_stub_directs_no_repeat(tmp_path):
+async def test_repeat_grep_reserves_full_content(tmp_path):
     root = str(tmp_path)
     (tmp_path / "a.py").write_text("alpha marker here\n")
-    reset_turn_seen_calls()
     cbs = _cbs(root)
     out1 = await cbs["grep"]("marker", path="")
     assert "MATCHES for" in out1, out1
     out2 = await cbs["grep"]("marker", path="")
-    assert out2.startswith("DUPLICATE"), out2
-    assert "Do NOT repeat" in out2, out2
+    assert "MATCHES for" in out2 and "marker" in out2, out2

@@ -35,6 +35,28 @@ def _make_cbs():
     return cbs, events
 
 
+async def _await_spawned_job():
+    """Let a background-dispatched task run to completion.
+
+    The task tool returns a spawn acknowledgement immediately; the
+    sub-agent loop runs as an asyncio.Task on the registry job. Yield
+    until no running jobs remain so emitted sub-events are present.
+    """
+    import asyncio as _aio
+
+    import subagent_jobs as _jobs
+
+    for _ in range(200):
+        _running = [j for j in list(_jobs._JOBS.values()) if j.get("status") == "running" and j.get("task") is not None]
+        if not _running:
+            # One extra loop turn for done-callbacks to store the report.
+            await _aio.sleep(0)
+            _still = [j for j in list(_jobs._JOBS.values()) if j.get("status") == "running" and j.get("task") is not None]
+            if not _still:
+                return
+        await _aio.sleep(0.01)
+
+
 async def test_task_card_carries_branch():
     """کارت task باید فیلد branch رو emit کنه (همون _ecall)."""
     from unittest.mock import patch
@@ -49,8 +71,9 @@ async def test_task_card_carries_branch():
         await cbs["task"](
             description="find auth code",
             prompt="search the repo",
-            subagent_type="explore",
+            subagent_type="subagent",
         )
+        await _await_spawned_job()
 
     task_cards = [e for e in events if e.get("tool") == "task"]
     assert task_cards, "کارت task ساخته نشد"
@@ -77,8 +100,9 @@ async def test_sub_events_nest_under_task_card():
         await cbs["task"](
             description="find auth code",
             prompt="search the repo",
-            subagent_type="explore",
+            subagent_type="subagent",
         )
+        await _await_spawned_job()
 
     task_cards = [e for e in events if e.get("tool") == "task"]
     assert task_cards, "کارت task ساخته نشد"
@@ -111,8 +135,9 @@ async def test_sub_events_nest_even_when_card_done():
         await cbs["task"](
             description="find py files",
             prompt="search the repo",
-            subagent_type="explore",
+            subagent_type="subagent",
         )
+        await _await_spawned_job()
 
     task_cards = [e for e in events if e.get("tool") == "task"]
     assert task_cards, "کارت task ساخته نشد"

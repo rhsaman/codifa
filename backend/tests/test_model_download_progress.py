@@ -50,10 +50,10 @@ def test_pause_resume_cancel_cycle():
 
 def test_cancel_clears_error_state():
     _reset()
-    model_download._set_downloading("laya", "org/laya", "", 0)
-    model_download._set_error("laya", "org/laya", "boom")
-    assert model_download.cancel_download("laya") is True
-    assert model_download.download_state("laya") is None
+    model_download._set_downloading("embedding", "org/repo", "", 0)
+    model_download._set_error("embedding", "org/repo", "boom")
+    assert model_download.cancel_download("embedding") is True
+    assert model_download.download_state("embedding") is None
 
 
 def test_cancel_clears_running_state_immediately():

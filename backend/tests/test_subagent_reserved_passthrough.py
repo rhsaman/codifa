@@ -4,7 +4,7 @@ Regression guard for the bug where ``_run_subagent_task`` hard-coded
 ``reserved=20_000`` instead of using the user's auto-compact setting
 (``state["reserved"]``). After the fix, ``make_tool_callbacks`` accepts a
 ``reserved`` parameter and forwards it to ``langchain_tool_loop`` so the
-sub-agent (explore/general) auto-compacts with the same budget the user
+sub-agent auto-compacts with the same budget the user
 configured for the main agent — no quality/speed change, just consistent
 token accounting.
 
@@ -26,6 +26,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from conftest import await_task_report
 from langchain_core.messages import AIMessage
 
 import llm as _llm
@@ -66,11 +67,14 @@ async def _run_with_reserved(reserved):
             main_model=_RecordingModel(),
             reserved=reserved,
         )
-        await cbs["task"](
+        ack = await cbs["task"](
             description="find the config",
             prompt="find the config",
-            subagent_type="explore",
+            subagent_type="subagent",
         )
+        # Background dispatch: await the registry job while the loop patch
+        # is still applied so the capture observes the real loop call.
+        await await_task_report(ack)
     finally:
         _llm.langchain_tool_loop = _orig
     return captured.get("reserved")

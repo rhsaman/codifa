@@ -1,4 +1,4 @@
-"""Tests for input-token savings without quality loss: CODE MAP laya gate,
+"""Tests for input-token savings without quality loss: map fast path,
 cheap-truncation reference exemption, two-tier tool-reuse note, and the
 short MCP reminder (full note only on first sight / server change).
 """
@@ -19,57 +19,7 @@ class _Queue:
         self.items.append(x)
 
 
-def _gate_decision(handled=True, value="no_code_map", confidence=0.9):
-    return types.SimpleNamespace(handled=handled, value=value, confidence=confidence)
-
-
-# --- CODE MAP laya gate -----------------------------------------------------
-
-
-def test_code_map_gate_skips_on_confident_no_map():
-    assert graph._code_map_gate_skips(set(), set(), _gate_decision()) is True
-
-
-def test_code_map_gate_sends_on_any_mention():
-    d = _gate_decision()
-    assert graph._code_map_gate_skips({"a.py"}, set(), d) is False
-    assert graph._code_map_gate_skips(set(), {"my_func"}, d) is False
-
-
-def test_code_map_gate_sends_on_abstain_or_weak_signal():
-    assert graph._code_map_gate_skips(set(), set(), _gate_decision(handled=False)) is False
-    assert graph._code_map_gate_skips(set(), set(), _gate_decision(confidence=0.5)) is False
-    assert graph._code_map_gate_skips(set(), set(), _gate_decision(value="needs_code_map")) is False
-
-
-def test_code_map_gate_sends_on_malformed_decision():
-    assert graph._code_map_gate_skips(set(), set(), None) is False
-    assert graph._code_map_gate_skips(set(), set(), object()) is False
-
-
-# --- skill auto-picks / map fast path -----------------------------------------
-
-
-def _ranked(*pairs):
-    return [{"name": n, "confidence": c} for n, c in pairs]
-
-
-def test_skill_auto_picks_reject_flat_noise():
-    # Greeting-like scores: everything ~0.7x, no distinctive winner.
-    assert graph._skill_auto_picks(_ranked(("impeccable", 0.74), ("caveman", 0.72))) == []
-    assert graph._skill_auto_picks(_ranked(("movie-finder", 0.77), ("translation", 0.75))) == []
-
-
-def test_skill_auto_picks_accept_strong_match():
-    assert (
-        graph._skill_auto_picks(_ranked(("landing-page-design", 0.92), ("other", 0.5)))
-        == ["landing-page-design"]
-    )
-
-
-def test_skill_auto_picks_weak_or_empty_pick_nothing():
-    assert graph._skill_auto_picks(_ranked(("a", 0.6), ("b", 0.4))) == []
-    assert graph._skill_auto_picks([]) == []
+# --- map fast path ----------------------------------------------------------
 
 
 def test_obvious_non_code_turn():

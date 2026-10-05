@@ -1,10 +1,10 @@
-"""Live tests for the `task` tool: general sub-agent, depth limit, unknown type.
+"""Live tests for the `task` tool: sub-agent, depth limit, unknown type.
 
-Consolidates coverage from the former ``test_task_general_agent``,
+Consolidates coverage from the former ``test_task_subagent_tool``,
 ``test_task_depth_limit`` and ``test_task_unknown_agent`` files.
 
 Guards:
-1. task(subagent_type='general') returns <task> XML, runs on MAIN model,
+1. task(subagent_type='subagent') returns <task> XML, runs on MAIN model,
    tool events are tagged sub=True with a branch id.
 2. task(subagent_type='bogus') returns "Unknown agent type" error.
 3. With _TASK_DEPTH_CTX at the limit, task(...) returns the depth error.
@@ -14,7 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-_TMP = tempfile.mkdtemp(prefix="coder-test-task-general-data-")
+_TMP = tempfile.mkdtemp(prefix="coder-test-task-subagent-data-")
 os.environ["CODER_DATA_DIR"] = _TMP
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +22,7 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from conftest import await_task_report
 from langchain_core.messages import AIMessage
 
 from tools import (
@@ -49,7 +50,7 @@ class _FakeModel:
         return AIMessage(content=self._text)
 
 
-class _FakeGeneralModel:
+class _FakeSubagentModel:
     """LangChain-style fake: calls `read` once, then returns the reply."""
 
     model_name = "fake"
@@ -77,14 +78,14 @@ class _FakeGeneralModel:
 # Tests
 # ---------------------------------------------------------------------------
 
-async def test_task_general_subagent():
-    """task(subagent_type='general') returns XML, runs on main model,
+async def test_task_subagent():
+    """task(subagent_type='subagent') returns XML, runs on main model,
     tool events are tagged sub=True with a branch id."""
-    ws = tempfile.mkdtemp(prefix="coder-test-task-general-ws-")
+    ws = tempfile.mkdtemp(prefix="coder-test-task-subagent-ws-")
     Path(os.path.join(ws, "app.py")).write_text("def main():\n    return 42\n")
 
     emitted: list[dict] = []
-    main_model = _FakeGeneralModel(text="GENERAL DONE: app.py has main()")
+    main_model = _FakeSubagentModel(text="SUBAGENT DONE: app.py has main()")
     tools = make_tool_callbacks(
         ws,
         lambda ev: emitted.append(ev),
@@ -92,27 +93,29 @@ async def test_task_general_subagent():
     )
     task = tools["task"]
 
-    report = await task(
+    ack = await task(
         description="check app.py",
         prompt="Read app.py and summarize what it does.",
-        subagent_type="general",
+        subagent_type="subagent",
     )
+    # Background dispatch: the report lands on the registry job, not the ack.
+    report = await await_task_report(ack)
     assert "<task" in report and "<task_result>" in report, f"unexpected report: {report[:300]}"
-    assert "GENERAL DONE" in report, f"general sub-agent output missing: {report[:300]}"
+    assert "SUBAGENT DONE" in report, f"sub-agent output missing: {report[:300]}"
 
     cards = [
         e for e in emitted
         if e.get("kind") == "tool" and e.get("tool") == "task"
-        and (e.get("args") or {}).get("subagent_type") == "general"
+        and (e.get("args") or {}).get("subagent_type") == "subagent"
     ]
-    assert len(cards) == 1, f"expected 1 general task card, got {len(cards)}"
+    assert len(cards) == 1, f"expected 1 subagent task card, got {len(cards)}"
 
     sub_reads = [
         e for e in emitted
         if e.get("kind") == "tool" and e.get("tool") == "read" and e.get("sub")
     ]
-    assert sub_reads, "general sub-agent's read event not tagged sub=True"
-    assert sub_reads[0].get("branch"), "general sub-agent's read event missing branch id"
+    assert sub_reads, "sub-agent's read event not tagged sub=True"
+    assert sub_reads[0].get("branch"), "sub-agent's read event missing branch id"
 
 
 async def test_task_unknown_agent_type():
@@ -151,7 +154,7 @@ async def test_task_depth_limit():
 
     token = _TASK_DEPTH_CTX.set(_SUBAGENT_DEPTH_LIMIT)
     try:
-        out = await task(description="x", prompt="find foo", subagent_type="general")
+        out = await task(description="x", prompt="find foo", subagent_type="subagent")
     finally:
         _TASK_DEPTH_CTX.reset(token)
 

@@ -1,7 +1,7 @@
 """In-memory per-chat trace log (LangSmith-style).
 
 Keeps a bounded queue of trace entries per chat id for live debugging:
-``laya`` decisions, ``llm`` calls (model + tokens + error), ``prompt``
+``llm`` calls (model + tokens + error), ``prompt``
 snapshots (full text + summary) and ``tool`` calls (name + args + result).
 In-memory only, never persisted.
 """
@@ -15,7 +15,7 @@ import uuid
 
 MAX_ENTRIES_PER_CHAT = 200
 
-_VALID_KINDS = ("laya", "llm", "prompt", "tool")
+_VALID_KINDS = ("llm", "prompt", "tool")
 
 _lock = threading.Lock()
 _store: dict[str, list[dict]] = {}
@@ -119,6 +119,7 @@ def append(
     error: str = "",
     prompt: str = "",
     result: str = "",
+    task_id: str = "",
 ) -> dict | None:
     """Append one trace entry for a chat. Returns the entry or None."""
     cid = (chat_id or "").strip() or get_current_chat()
@@ -128,13 +129,18 @@ def append(
     turn = get_current_turn()
     if turn <= 0:
         turn = latest_turn(cid)
+    detail_dict = dict(detail or {})
+    tid = str(task_id or detail_dict.get("task_id") or "").strip()
+    if tid:
+        detail_dict["task_id"] = tid
     entry = {
         "id": uuid.uuid4().hex[:12],
         "at": time.time(),
         "kind": k,
         "turn": int(turn or 0),
+        "task_id": tid,
         "summary": str(summary or "")[:500],
-        "detail": dict(detail or {}),
+        "detail": detail_dict,
         "model": str(model or ""),
         "tokens": dict(tokens or {}),
         "error": str(error or "")[:2000],
@@ -162,9 +168,12 @@ def claim_running_tool(
     execution, then the tool wrapper emits its own ``tool`` event for the
     SAME call. Claiming merges the wrapper fields (event call id, branch,
     sub) into the existing running entry — matched by tool name + turn,
-    most recent unclaimed first — so each call shows exactly once in the
-    panel. Args are deliberately NOT compared: the wrapper normalizes them
-    (e.g. joins include/path lists) while the loop logs the raw model args.
+    oldest unclaimed first — so each call shows exactly once in the
+    panel. Oldest-first matters for parallel same-name calls (two greps in
+    one step): the wrapper emits run in start order, so the first claim must
+    take the first appended entry, not the most recent one. Args are
+    deliberately NOT compared: the wrapper normalizes them (e.g. joins
+    include/path lists) while the loop logs the raw model args.
     The ``sub`` flag keeps sub-agent streams off the main entries and the
     turn check keeps aborted-turn leftovers out of new turns.
     Returns the merged entry, or None when there is no match (caller appends).
@@ -180,7 +189,7 @@ def claim_running_tool(
     extra = dict(extra_detail or {})
     with _lock:
         items = _store.get(cid, [])
-        for entry in reversed(items):
+        for entry in items:
             if entry.get("kind") != "tool":
                 continue
             detail = entry.get("detail") or {}
@@ -247,14 +256,22 @@ def finish_tool(chat_id: str, call_id: object, result: object, error: str = "") 
     return None
 
 
-def list_traces(chat_id: str, kind: str = "") -> list[dict]:
-    """Return a copy of a chat's traces, optionally filtered by kind."""
+def list_traces(chat_id: str, kind: str = "", task_id: str = "") -> list[dict]:
+    """Return a copy of a chat's traces, optionally filtered by kind and task."""
     cid = (chat_id or "").strip()
     k = (kind or "").strip().lower()
+    tid = (task_id or "").strip()
     with _lock:
         items = list(_store.get(cid, []))
     if k and k in _VALID_KINDS:
         items = [e for e in items if e.get("kind") == k]
+    if tid:
+        items = [
+            e
+            for e in items
+            if str(e.get("task_id") or "") == tid
+            or str((e.get("detail") or {}).get("task_id") or "") == tid
+        ]
     return [dict(e) for e in items]
 
 

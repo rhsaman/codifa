@@ -5,7 +5,7 @@
 //        --format=esm --outfile=src/lib/.tmp-retry.mjs && node src/lib/.tmp-retry.mjs
 
 import type { MessageSegment } from "../types"
-import { resetStreamForRetry } from "./retry"
+import { resetStreamForRetry, resolveRestartUser } from "./retry"
 
 export {}
 
@@ -43,15 +43,20 @@ console.log('۲) حالت resume: tool segments حفظ می‌شوند:')
   check('tool حفظ شد', out.segments.some((s) => s.kind === "tool"))
 }
 
-console.log('۳) حالت restart: همه چیز پاک می‌شود:')
+console.log('۳) حالت restart: text و tool پاک می‌شوند، user/compact می‌مانند:')
 {
   const segments: MessageSegment[] = [
     { kind: "text", text: "hello" },
     { kind: "tool", index: 0 },
+    { kind: "user", id: "u1" },
+    { kind: "compact", id: "c1" },
   ]
   const out = resetStreamForRetry("hello", segments, "restart")
   check('content خالی است', out.content === "")
-  check('همه segments پاک شدند', out.segments.length === 0, out.segments)
+  check('text حذف شد', !out.segments.some((s) => s.kind === "text"))
+  check('tool حذف شد', !out.segments.some((s) => s.kind === "tool"))
+  check('user حفظ شد', out.segments.some((s) => s.kind === "user"))
+  check('compact حفظ شد', out.segments.some((s) => s.kind === "compact"))
 }
 
 console.log('۴) حالت resume با segments تعریف‌نشده:')
@@ -77,6 +82,38 @@ console.log('۶) حالت resume: user segments نیز حفظ می‌شوند:')
   const out = resetStreamForRetry("hello", segments)
   check('text حذف شد', !out.segments.some((s) => s.kind === "text"))
   check('user segment حفظ شد', out.segments.some((s) => s.kind === "user"))
+}
+
+console.log('۷) resolveRestartUser روی پیام دستیار، پیام کاربر بالایی را برمی‌گرداند:')
+{
+  const msgs = [
+    { id: 'u1', role: 'user', content: 'hello' },
+    { id: 'a1', role: 'assistant', content: 'hi' },
+  ] as any
+  const out = resolveRestartUser(msgs, 'a1')
+  check('مالک u1 است', out?.id === 'u1', out?.id)
+}
+
+console.log('۸) resolveRestartUser روی پیام کاربر، خودش را برمی‌گرداند:')
+{
+  const msgs = [
+    { id: 'u1', role: 'user', content: 'hello' },
+    { id: 'a1', role: 'assistant', content: 'hi' },
+  ] as any
+  const out = resolveRestartUser(msgs, 'u1')
+  check('خودش است', out?.id === 'u1', out?.id)
+}
+
+console.log('۹) resolveRestartUser با شناسه نامعتبر null است:')
+{
+  const msgs = [{ id: 'u1', role: 'user', content: 'hello' }] as any
+  check('null برمی‌گردد', resolveRestartUser(msgs, 'nope') === null)
+}
+
+console.log('۱۰) resolveRestartUser با محتوای خالی null است:')
+{
+  const msgs = [{ id: 'u1', role: 'user', content: '   ' }] as any
+  check('null برمی‌گردد', resolveRestartUser(msgs, 'u1') === null)
 }
 
 if (failed > 0) {

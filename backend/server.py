@@ -248,17 +248,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     _spawn_tracked(_bg(), "models-dev-preload")
     _stop = await _start_schedule_loop()
-    # Warm up the laya router outside the chat loop to avoid first-build block.
-    try:
-        import laya_decide
-
-        await asyncio.to_thread(laya_decide.warmup_router)
-    except Exception:  # noqa: BLE001, S110 — warmup اختیاری است
-        pass
     # Preload the embedding ONNX model in the background (fire-and-forget):
-    # the first chat turn runs laya rerank before the LLM call, and a cold
-    # load (tokenizer + session, hundreds of MB) blocks the first token for
-    # many seconds. Warming here moves that cost to startup, off the chat path.
+    # a cold load (tokenizer + session, hundreds of MB) blocks the first
+    # token for many seconds. Warming here moves that cost to startup, off
+    # the chat path.
     # Skipped silently when no embedding model is downloaded.
     async def _bg_embed() -> None:
         try:
@@ -278,7 +271,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
     try:
         _stop.set()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 — best-effort shutdown signal
         pass
 
     # Close all cached MCP sessions on exit.
@@ -343,7 +336,7 @@ def _has_recent_running(schedule_id: str, now: float) -> bool:
 
     try:
         runs = state_db.list_schedule_runs(str(schedule_id), limit=5)
-    except Exception:
+    except Exception:  # noqa: BLE001 — unreadable schedule state reads as not-running
         return False
     for r in runs:
         if not isinstance(r, dict) or r.get("status") != "running":
@@ -363,7 +356,7 @@ async def _mark_orphaned_running() -> int:
 
     try:
         runs = state_db.list_schedule_runs("", limit=10_000)
-    except Exception:
+    except Exception:  # noqa: BLE001 — unreadable schedule state means nothing to fix
         return 0
     now = time.time()
     fixed = 0
@@ -384,7 +377,7 @@ async def _mark_orphaned_running() -> int:
                 "finished_at": now,
             })
             fixed += 1
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — per-task repair is best-effort
             pass
     return fixed
 
@@ -460,7 +453,7 @@ async def _run_due_schedules(now: float | None = None) -> int:
                     fresh = state_db.get_schedule(sid) or task
                     fresh["next_run"] = scheduler.compute_next_run(fresh, now)
                     state_db.save_schedule(fresh)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 — reschedule is best-effort
                     pass
             continue
         _SCHEDULE_RUNNING.add(sid)
@@ -471,7 +464,7 @@ async def _run_due_schedules(now: float | None = None) -> int:
                 fresh = state_db.get_schedule(sid) or task
                 fresh["next_run"] = scheduler.compute_next_run(fresh, now)
                 state_db.save_schedule(fresh)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 — reschedule is best-effort
                 pass
             _spawn_tracked(_execute_schedule(sid), f"schedule-{sid}")
             started += 1
@@ -562,7 +555,7 @@ async def _execute_schedule(schedule_id: str, run_id: str | None = None) -> None
                             "id": spid or provider_cfg.get("id") or "",
                         }
                         model = sched_model
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 — model override fallback stays
                 pass
         if run_id:
             # ران running از قبل توسط POST /run ساخته شده؛ started_at آن را نگه دار.
@@ -705,11 +698,11 @@ async def schedules_list() -> dict:
         t = dict(task)
         try:
             t["next_run"] = scheduler.compute_next_run(task, now)
-        except Exception:
+        except Exception:  # noqa: BLE001 — a bad cron must not hide the schedule
             t["next_run"] = None
         try:
             t["cron_label"] = scheduler.describe_cron_fa(str(task.get("cron") or ""))
-        except Exception:
+        except Exception:  # noqa: BLE001 — show the raw cron when it can't be parsed
             t["cron_label"] = str(task.get("cron") or "")
         out.append(t)
     return {"schedules": out}
@@ -753,7 +746,7 @@ async def schedules_upsert(req: ScheduleUpsertRequest) -> dict:
     saved = state_db.save_schedule(task)
     try:
         saved["next_run"] = scheduler.compute_next_run(saved)
-    except Exception:
+    except Exception:  # noqa: BLE001 — a bad cron must not fail the save
         saved["next_run"] = None
     # next_run محاسبه‌شده را روی دیسک هم persist کن — حلقه پس‌زمینه فقط روی
     # next_run ذخیره‌شده تصمیم می‌گیرد (is_due) و بدون این، تسک تازه هیچ‌وقت
@@ -764,7 +757,7 @@ async def schedules_upsert(req: ScheduleUpsertRequest) -> dict:
             # save_schedule خودش next_run گذشته را پاک می‌کند؛ اینجا مقدار
             # آینده است پس نگه داشته می‌شود.
             state_db.save_schedule(persisted)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — persisting next_run is best-effort
             pass
     return {"schedule": saved}
 
@@ -1017,7 +1010,7 @@ class ModelTestRequest(ModelsRequest):
 
 
 class ModelDownloadRequest(BaseModel):
-    """Download a managed on-device model (whisper / embedding / laya)."""
+    """Download a managed on-device model (whisper / embedding)."""
 
     kind: str = ""
     model: str = ""
@@ -1162,23 +1155,23 @@ async def checkpoints_restore(chat_id: str, seq: int, req: CheckpointRestoreRequ
 
 
 # --- traces (LangSmith-style per-chat log) -------------------------------- #
-# حافظه موقت لاگ هر چت برای پنل Trace (لایا / LLM / پرامپت) — فقط حافظه، بدون persist.
+# Temporary per-chat log for the Trace panel (LLM / prompt / tool) - memory only, no persist.
 
 
 @app.get("/chats/{chat_id}/traces")
-async def chat_traces(chat_id: str, kind: str = "") -> dict:
-    """لاگ‌های چت جاری با فیلتر اختیاری نوع (laya / llm / prompt / tool)."""
+async def chat_traces(chat_id: str, kind: str = "", task_id: str = "") -> dict:
+    """Current chat logs with optional kind/task filter (llm / prompt / tool)."""
     import trace_store
 
     cid = (chat_id or "").strip()
     if not cid:
         raise HTTPException(status_code=400, detail="missing chat id")
-    return {"traces": trace_store.list_traces(cid, kind)}
+    return {"traces": trace_store.list_traces(cid, kind, task_id)}
 
 
 @app.delete("/chats/{chat_id}/traces")
 async def chat_traces_clear(chat_id: str) -> dict:
-    """پاک‌کردن لاگ چت جاری."""
+    """Clear the current chat log."""
     import trace_store
 
     cid = (chat_id or "").strip()
@@ -1298,6 +1291,20 @@ async def browser_navigate(req: BrowserNavigateRequest) -> dict:
     import browser_session
 
     return await browser_session.navigate(req.url.strip())
+
+
+class BrowserSearchRequest(BaseModel):
+    """Omnibox query for the virtual browser (Google → Bing → DuckDuckGo)."""
+
+    query: str
+
+
+@app.post("/browser/search")
+async def browser_search(req: BrowserSearchRequest) -> dict:
+    """Search the web: Google first, falling back to Bing then DuckDuckGo."""
+    import browser_session
+
+    return await browser_session.search(req.query)
 
 
 @app.post("/browser/scroll")
@@ -1710,7 +1717,7 @@ async def models_test(req: ModelTestRequest) -> dict:
     return {"ok": True, "reply": (text or "").strip()[:200]}
 
 
-# --- managed on-device models (whisper / embedding / laya) ------------- #
+# --- managed on-device models (whisper / embedding) --------------------- #
 # Download & removal are user-initiated from Settings → Models (never
 # automatic). Downloads run on a background thread; /models/status is polled
 # while one is in flight.
@@ -1721,11 +1728,9 @@ async def models_download(req: ModelDownloadRequest) -> dict:
     import model_download
 
     kind = (req.kind or "").strip() or model_download.KIND_EMBEDDING
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING, model_download.KIND_LAYA):
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
-    if kind == model_download.KIND_LAYA:
-        default_repo = model_download.LAYA_DEFAULT_REPO
-    elif kind == model_download.KIND_WHISPER:
+    if kind == model_download.KIND_WHISPER:
         default_repo = model_download.WHISPER_DEFAULT_REPO
     else:
         default_repo = model_download.EMBEDDING_DEFAULT_REPO
@@ -1755,7 +1760,7 @@ async def models_remove(req: ModelRemoveRequest) -> dict:
     import model_download
 
     kind = (req.kind or "").strip().lower()
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING, model_download.KIND_LAYA):
+    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     removed = model_download.remove(kind, req.model)
     return {"ok": True, "kind": kind, "removed": removed}
@@ -1768,7 +1773,6 @@ def _require_model_kind(kind: str) -> str:
     if kind not in (
         model_download.KIND_WHISPER,
         model_download.KIND_EMBEDDING,
-        model_download.KIND_LAYA,
     ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     return kind
@@ -1806,26 +1810,6 @@ async def models_cancel(req: ModelControlRequest) -> dict:
     # Stop button never looks dead (no 404 when state already cleared).
     model_download.cancel_download(kind)
     return {"ok": True, "kind": kind}
-
-
-@app.get("/models/laya-status")
-async def models_laya_status() -> dict:
-    """تصمیم‌گیر سریع laya: نصب/آماده/ریپو/پروایدر + دلیل دقیق + پروگرس دانلود."""
-    import laya_decide
-    import model_download
-
-    out = laya_decide.status()
-    try:
-        out.update(model_download.laya_weight_status(out.get("repo") or ""))
-    except Exception:  # noqa: BLE001, S110 — وزن اختیاری است
-        pass
-    try:
-        running = model_download.download_state(model_download.KIND_LAYA)
-        if running:
-            out["running"] = running
-    except Exception:  # noqa: BLE001, S110 — پروگرس اختیاری است
-        pass
-    return out
 
 
 @app.get("/system-prompts")
@@ -2590,15 +2574,6 @@ async def chat_compact(req: CompactRequest, request: Request):
         _log("empty summary after success", level=logging.WARNING)
         return {"summary": None, "keep": 0, "error": "empty summary"}
     _log(f"success: keep={keep} summary_len={len(summary)}")
-    # Manual compact folded old turns away: cross-turn reuse still points at
-    # content no longer in history. Clear it so the next repeat re-serves
-    # instead of stubbing "already in context" with nothing to show.
-    try:
-        from tool_batching import reset_cross_turn as _reset_cross
-
-        _reset_cross()
-    except Exception:  # noqa: BLE001, S110 — reuse reset never breaks compact
-        pass
     return {"summary": summary, "keep": int(keep), "usage": compact_usage}
 
 
@@ -2800,7 +2775,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def event_gen():
         # New user turn -> new trace turn so the Trace panel can group
-        # each turn's laya/llm/prompt/tool entries under one header.
+        # each turn's llm/prompt/tool entries under one header.
         try:
             import trace_store as _trace_store
 
@@ -2927,6 +2902,82 @@ async def chat_steer_cancel(req: SteerCancelRequest) -> dict:
     if not req.chat_id or not req.id:
         raise HTTPException(status_code=400, detail="chat_id and id are required")
     await _remove_steer(req.chat_id, req.id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Background sub-agents (per-chat) — right-panel live view + stop/steer from
+# the UI, mirroring the main agent's task_steer/task_stop tools.
+# ---------------------------------------------------------------------------
+
+
+class SubagentSteerRequest(BaseModel):
+    message: str = ""
+
+
+def _subagent_job_view(job: dict) -> dict:
+    """Public JSON shape of one background sub-agent job (no live internals)."""
+    return {
+        "task_id": str(job.get("task_id") or ""),
+        "branch": int(job.get("branch") or 0),
+        "description": str(job.get("description") or ""),
+        "subagent_type": str(job.get("subagent_type") or ""),
+        "status": str(job.get("status") or ""),
+        "created_at": float(job.get("created_at") or 0.0),
+        "steering": bool(job.get("steer_inbox")),
+        "stop_requested": bool(job.get("stop_requested")),
+        "report": str(job.get("report") or "")[:400],
+        "events": [
+            {
+                "text": str(e.get("text") or ""),
+                "tool": str(e.get("tool") or ""),
+                "kind": str(e.get("kind") or "status"),
+            }
+            for e in (job.get("events") or [])[-14:]
+        ],
+    }
+
+
+@app.get("/chats/{chat_id}/subagents")
+async def subagents_list(chat_id: str) -> dict:
+    """All background sub-agent jobs of one chat, newest first."""
+    import subagent_jobs as _sub_jobs
+
+    jobs = [
+        _subagent_job_view(j)
+        for j in _sub_jobs.list_chat_jobs(chat_id)
+    ]
+    jobs.sort(key=lambda j: j["created_at"], reverse=True)
+    return {"jobs": jobs}
+
+
+@app.post("/chats/{chat_id}/subagents/{task_id}/stop")
+async def subagent_stop(chat_id: str, task_id: str) -> dict:
+    """Stop one background sub-agent (same path as the task_stop tool)."""
+    import subagent_jobs as _sub_jobs
+
+    job = _sub_jobs.get_job(task_id)
+    if job is None or str(job.get("chat_id") or "") != str(chat_id):
+        raise HTTPException(status_code=404, detail="no such sub-agent in this chat")
+    if job.get("status") != "running":
+        return {"ok": True, "status": job.get("status")}
+    _sub_jobs.request_stop(task_id)
+    return {"ok": True, "status": "stopping"}
+
+
+@app.post("/chats/{chat_id}/subagents/{task_id}/steer")
+async def subagent_steer(chat_id: str, task_id: str, req: SubagentSteerRequest) -> dict:
+    """Send a follow-up message to one running background sub-agent."""
+    import subagent_jobs as _sub_jobs
+
+    job = _sub_jobs.get_job(task_id)
+    if job is None or str(job.get("chat_id") or "") != str(chat_id):
+        raise HTTPException(status_code=404, detail="no such sub-agent in this chat")
+    if not str(req.message or "").strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    if job.get("status") != "running":
+        raise HTTPException(status_code=409, detail=f"sub-agent is {job.get('status')}")
+    _sub_jobs.enqueue_steer(task_id, req.message)
     return {"ok": True}
 
 

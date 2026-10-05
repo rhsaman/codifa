@@ -421,9 +421,9 @@ async def test_read_dir_xml_format(tmp_path):
 
 @pytest.mark.asyncio
 async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
-    """An unchanged re-read is stubbed (no re-send); the byte cache underneath
-    still serves identical bytes (proven after clearing reuse memory), and an
-    edit invalidates everything so the next read reflects the new content."""
+    """An unchanged re-read re-serves identical bytes (via the byte cache),
+    and an edit invalidates everything so the next read reflects the new
+    content."""
     f = tmp_path / "a.py"
     f.write_text("alpha\nbeta\n")
     root = str(tmp_path)
@@ -439,21 +439,11 @@ async def test_read_tool_caches_and_invalidates_on_edit(tmp_path):
 
     r1 = await read(filePath="a.py")
     assert "1 | alpha" in r1 and "2 | beta" in r1
-    # Second read of the same path/offset/limit: file unchanged -> stubbed,
-    # full text NOT re-sent.
+    # Second read of the same path/offset/limit: file unchanged -> the full
+    # content is served again (summary "cached").
     r2 = await read(filePath="a.py")
-    assert r2.startswith("SKIPPED (already in context)"), r2
-    assert "fetched before" in r2, r2
-    assert "1 | alpha" not in r2, r2
-
-    # The byte cache underneath is intact: with reuse memory cleared, the
-    # same read returns the cached bytes (summary "cached").
-    from tool_batching import reset_cross_turn, reset_read_ledger
-
-    reset_cross_turn()
-    reset_read_ledger()
-    r2b = await read(filePath="a.py")
-    assert r1 == r2b
+    assert r1 == r2
+    assert "1 | alpha" in r2, r2
     assert any(
         e.get("kind") == "tool_result" and e.get("summary") == "cached" for e in captured
     )
@@ -490,20 +480,9 @@ async def test_read_cache_invalidates_across_path_spellings(tmp_path):
 
     r1 = await read(filePath="a.py")
     assert "1 | alpha" in r1
-    # Same path, different spelling -> spelling-normalized reuse stub
-    # (same normalized key), not a re-send.
+    # Same path, different spelling -> the full content is served again.
     r2 = await read(filePath="./a.py")
-    assert r2.startswith("SKIPPED (already in context)"), r2
-    assert "1 | alpha" not in r2, r2
-
-    # With reuse memory cleared the byte cache still matches across
-    # spellings (summary "cached").
-    from tool_batching import reset_cross_turn, reset_read_ledger
-
-    reset_cross_turn()
-    reset_read_ledger()
-    r2b = await read(filePath="./a.py")
-    assert r1 == r2b
+    assert "1 | alpha" in r2, r2
     assert any(
         e.get("kind") == "tool_result" and e.get("summary") == "cached" for e in captured
     )
@@ -635,6 +614,121 @@ async def test_edit_file_batch_accepts_json_string_edits(tmp_path):
     )
     assert "Successfully edited" in out2
     assert (tmp_path / "b.py").read_text() == "ONE\ntwo\n"
+
+
+@pytest.mark.parametrize(
+    "old_string,new_string,expected",
+    [
+        # old copied WITH the read tool's "NNN | " prefixes.
+        ("1 | alpha\n2 | beta", "ALPHA\nBETA", "ALPHA\nBETA\ngamma\n"),
+        # stray trailing whitespace / CRLF in the copied old.
+        ("alpha  \nbeta", "ALPHA\nBETA", "ALPHA\nBETA\ngamma\n"),
+        # grep-style "file:line: " prefix.
+        ("a.py:1: alpha", "ALPHA", "ALPHA\nbeta\ngamma\n"),
+        # grep match marker "> N | " copied from context lines.
+        ("> 1 | alpha\n  2 | beta", "ALPHA\nBETA", "ALPHA\nBETA\ngamma\n"),
+        # grep enclosing-symbol annotation "in Name (L..)" after file:line.
+        (
+            "a.py:1: in foo (L1-3):alpha",
+            "ALPHA",
+            "ALPHA\nbeta\ngamma\n",
+        ),
+        # full read block with wrappers and position marker footer.
+        (
+            (
+                "<path>a.py</path>\n<type>file</type>\n<content>\n"
+                "1 | alpha\n2 | beta\n\n(a.py: lines 1-2 of 3)\n</content>"
+            ),
+            "ALPHA\nBETA",
+            "ALPHA\nBETA\ngamma\n",
+        ),
+        # full read block: wrapper lines, position marker, batch footer.
+        (
+            (
+                "<path>a.py</path>\n<type>file</type>\n<content>\n"
+                "1 | alpha\n2 | beta\n\n(a.py: lines 1-2 of 3)\n</content>\n\n"
+                '(Batch complete — page further windows with ranges=["path:start:count", ...] in one call.)'
+            ),
+            "ALPHA\nBETA",
+            "ALPHA\nBETA\ngamma\n",
+        ),
+    ],
+)
+def test_edit_file_tolerant_old_string(tmp_path, old_string, new_string, expected):
+    """old copied from read/grep output (prefixes, stray whitespace) must
+    still edit instead of failing with 'old_string not found'."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    res = tools.edit_file(str(tmp_path), "a.py", old_string, new_string)
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == expected
+
+
+def test_edit_file_batch_tolerant_second_edit(tmp_path):
+    """Regression: batches died at 'edit 2/N: old_string not found' when a
+    later old_string carried copied read-tool prefixes."""
+    (tmp_path / "b.py").write_text("one\ntwo\nthree\n")
+    res = tools.edit_file_batch(
+        str(tmp_path),
+        "b.py",
+        [
+            {"old_string": "one", "new_string": "ONE"},
+            {"old_string": "2 | two", "new_string": "2 | TWO"},
+        ],
+    )
+    assert res.get("ok"), res
+    assert res["edits_applied"] == 2
+    assert (tmp_path / "b.py").read_text() == "ONE\nTWO\nthree\n"
+
+
+@pytest.mark.parametrize(
+    "old_string,new_string,expected",
+    [
+        # History-rebuilt rows ("path: N | text").
+        ("a.py: 1 | alpha", "ALPHA", "ALPHA\nbeta\ngamma\n"),
+        # Grep symbol annotation with a single line number.
+        ("a.py:1: in foo (L1):alpha", "ALPHA", "ALPHA\nbeta\ngamma\n"),
+        # Duplicate-reference note above a copied window (backend emits
+        # this Persian sentence when a result repeats an earlier one).
+        (
+            (
+                "نتیجه عیناً با پاسخ ابزار call_01abc در همین پیام‌ها یکسان است؛ "
+                "متن کامل همان پاسخ را استفاده کن.\n1 | alpha"
+            ),
+            "ALPHA",
+            "ALPHA\nbeta\ngamma\n",
+        ),
+    ],
+)
+def test_edit_file_tolerant_history_shapes(tmp_path, old_string, new_string, expected):
+    """History/projection row shapes must edit instead of not-found."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    res = tools.edit_file(str(tmp_path), "a.py", old_string, new_string)
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == expected
+
+
+@pytest.mark.parametrize(
+    "old_string,hint",
+    [
+        # Omission marker hides middle lines: error must say so + show content.
+        (
+            "1 | alpha\n[lines 2-2 identical to an earlier read of this file above; omitted]\n3 | gamma",
+            "identical to an earlier read",
+        ),
+        # Collapsed single-line grep head carries no code text.
+        ("a.py:1:[line read above]", "[line read above]"),
+        # Middle-truncated long line.
+        ("alpha…rest", "truncated"),
+    ],
+)
+def test_edit_file_not_found_error_guides_copy(tmp_path, old_string, hint):
+    """Lossy copies must fail with an actionable error, not a bare not-found."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\ngamma\n")
+    res = tools.edit_file(str(tmp_path), "a.py", old_string, "X")
+    assert "error" in res and "old_string not found" in res["error"], res
+    assert hint in res["error"], res
+    assert "copy verbatim" in res["error"], res
+    assert "alpha" in res["error"], res
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,11 @@
-"""Live test: sub-agent tool loop (explore/general) runs read-only tools concurrently.
+"""Live test: sub-agent tool loop runs read-only tools concurrently.
 
 Mirrors opencode's Promise.all: when the model emits several read-only tool
 calls in one step, ``langchain_tool_loop`` executes them via ``asyncio.gather``
 so they overlap in wall-clock time (grep/glob/read/web/vision all run at once).
 Mutating/blocking tools still run sequentially. This is the same behavior the
 main-agent loop in ``graph.py`` already had -- this test guards it for the
-sub-agent path that ``task(subagent_type='explore'|'general')`` uses.
+sub-agent path that ``task(subagent_type='subagent')`` uses.
 """
 import asyncio
 import os
@@ -92,7 +92,7 @@ async def test_subagent_readonly_tools_run_concurrently():
 
 
 async def test_subagent_emits_status_progress_per_step():
-    """Explore must emit a visible status event each step so long runs do not
+    """Sub-agent must emit a visible status event each step so long runs do not
     look frozen on Working between tool results."""
     events: list[dict] = []
     model = _RecordingModel(
@@ -126,13 +126,13 @@ async def test_subagent_single_toolcall_still_sequential_path():
     assert len(peaks) == 1
 
 
-async def test_explore_grep_searches_run_concurrently(monkeypatch):
+async def test_subagent_grep_searches_run_concurrently(monkeypatch):
     """Regression: grep_tool must offload its blocking scan off the event loop.
 
     grep_tool used to call ``search_in_files()`` synchronously inside an async
     function. Because a sync call freezes the event loop until it returns,
     ``asyncio.gather`` (in graph.py and langchain_tool_loop) ran gathered
-    read-only tools ONE AT A TIME -- so Explore's searches (and any parallel
+    read-only tools ONE AT A TIME -- so sub-agent searches (and any parallel
     ``task`` fan-out) never overlapped. Now grep_tool uses
     ``await asyncio.to_thread(search_in_files, ...)``, so two greps emitted in
     one step overlap on worker threads and finish in ~one scan's time.
@@ -174,7 +174,55 @@ async def test_explore_grep_searches_run_concurrently(monkeypatch):
     )
 
 
-async def test_reader_read_runs_concurrent(monkeypatch):
+async def test_two_subagents_run_concurrently_with_different_prompts():
+    """Two `task(subagent_type='subagent')` calls with different prompts run
+    as two simultaneous background jobs: both are `running` at the same time,
+    have unique task_ids, and each delivers its own report."""
+    from conftest import await_task_report
+
+    import subagent_jobs as _jobs
+
+    async def fake_loop(model, **kwargs):
+        await asyncio.sleep(0.05)
+        return f"REPORT for: {kwargs.get('user', '')[:60]}"
+
+    import llm as _llm
+
+    _orig = _llm.langchain_tool_loop
+    _llm.langchain_tool_loop = fake_loop
+    try:
+        ws = tempfile.mkdtemp(prefix="coder-test-two-subagents-ws-")
+        cbs = make_tool_callbacks(
+            ws,
+            lambda ev: None,
+            main_model=_RecordingModel(tool_calls=[], reply="unused"),
+        )
+        ack_a = await cbs["task"](
+            description="first job",
+            prompt="do the FIRST thing",
+            subagent_type="subagent",
+        )
+        ack_b = await cbs["task"](
+            description="second job",
+            prompt="do the SECOND thing",
+            subagent_type="subagent",
+        )
+        tid_a = str(ack_a).split("task_id=", 1)[1].split(",", 1)[0].strip()
+        tid_b = str(ack_b).split("task_id=", 1)[1].split(",", 1)[0].strip()
+        assert tid_a != tid_b, "each spawn must get a unique task_id"
+        # Both jobs overlap: neither finished before the other started.
+        assert _jobs.get_job(tid_a)["status"] == "running"
+        assert _jobs.get_job(tid_b)["status"] == "running"
+        report_a = await await_task_report(ack_a)
+        report_b = await await_task_report(ack_b)
+        assert "FIRST" in report_a, report_a[:200]
+        assert "SECOND" in report_b, report_b[:200]
+        assert "FIRST" not in report_b and "SECOND" not in report_a
+    finally:
+        _llm.langchain_tool_loop = _orig
+
+
+async def test_reader_reads_concurrently(monkeypatch):
     """Regression: the deterministic Explore reader (reader_read) must read the
     targeted files concurrently, not loop one-at-a-time.
 

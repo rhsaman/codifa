@@ -52,7 +52,7 @@ export interface UsageView {
  * "Model usage" panel had, extracted as a pure function so it is testable
  * without mounting any component.
  *
- * - Entries with all-zero token fields are dropped — including laya rows:
+ * - Entries with all-zero token fields are dropped:
  *   a model with zero token consumption is not shown in Model usage.
  * - Cache-only entries (input=0/output=0 but cacheRead/cacheWrite>0) are
  * - providerId + model are stored explicitly on each entry — no key parsing.

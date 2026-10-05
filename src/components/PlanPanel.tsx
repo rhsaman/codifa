@@ -5,6 +5,7 @@ import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { latestPlanDoc } from "../lib/planDoc";
 import { prepareContent } from "../lib/bidi";
+import { mdComponents } from "./ChatMessage";
 
 /** Docked Plan viewer tab (opened by the chat Plan card's "View full plan").
  *  Shows the active chat's latest implementation plan document as markdown.
@@ -63,7 +64,9 @@ export function PlanPanel() {
         <div className="plan-panel-body" dir="ltr">
           <div className="plan-panel-content" dir={dir}>
             <div className="chat-message markdown-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {/* Shared mdComponents: inline file paths become clickable
+                  file chips, fences get the same code-block chrome as chat. */}
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                 {prepareContent(planDoc.body, dir)}
               </ReactMarkdown>
             </div>

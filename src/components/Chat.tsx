@@ -10,7 +10,19 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, providerApiKeys, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { resetStreamForRetry, isKeepTextRetry, planRetry } from "../lib/retry";
+import { resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser } from "../lib/retry";
+import {
+  isSlashCommand,
+  parseSlashInput,
+  prettySlashLabel,
+  loadHistory,
+  recordHistory,
+  loadPins,
+  togglePin,
+  historyRows,
+  historyTitle,
+  historyMeta,
+} from "../lib/slash";
 import {
   applyToolEvent,
   diffStatsFromUnified,
@@ -42,6 +54,7 @@ import {
   buildContextBreakdown,
   isContextPopoverOpen,
   formatBreakdownPercent,
+  contextBarSegmentPercent,
   CONTEXT_BREAKDOWN_COLORS,
 } from "../lib/context";
 import {
@@ -61,6 +74,7 @@ import {
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
+import { playAlarm } from "../lib/alarm";
 
 import type { SkillRow } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
@@ -81,13 +95,16 @@ import {
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
 import { fmtClock } from "../lib/time";
+import { buildResumeNote } from "../lib/resumeNote";
 import {
   isAtBottom,
   distanceFromBottom,
   classifyScrollEvent,
   atBottomScrollPos,
   scrollPosForFlush,
+  messageFingerprint,
   shouldLandOnLatest,
+  scrollMatchesPin,
 } from "../lib/scroll";
 import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget } from "../lib/messageWindow";
 import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
@@ -118,6 +135,7 @@ import {
   isCollapsibleText,
 } from "./ChatMessage";
 import { MessageImages } from "./MessageImages";
+import { FileIcon, openWorkspaceFile } from "./FileIcon";
 import { ModeIcon } from "./ModeIcon";
 import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -460,17 +478,21 @@ export function ChatPanel() {
     // this, switching back to a scrolled-up chat renders only the last
     // MSG_PAGE messages and the restore lands on a wrong viewport.
     const incomingPos = chat?.scrollPos;
-    // Returning to a chat: follow the newest messages when the agent is live
-    // in it or posted a new message while the user was away — restoring the
-    // old anchor there would hide exactly the reply the user came back to read.
+    // Returning to a chat: follow the newest messages when the agent is
+    // active in it (streaming, marked busy, or waiting on the user) or when
+    // its transcript changed while the user was away (new or grown message)
+    // — restoring the old anchor there would hide exactly the reply the user
+    // came back to read.
+    const switchMsgs = chat?.messages ?? [];
+    const agentActive =
+      switchMsgs.some((m) => m.streaming || m.retry?.reconnecting === true) ||
+      (chat ? (busyMap[chat.id] ?? false) : false) ||
+      chat?.pendingAsk != null ||
+      chat?.pendingPermission != null;
     const landLatest = shouldLandOnLatest({
-      streaming:
-        chat?.messages.some((m) => m.streaming || m.retry?.reconnecting === true) ??
-        false,
-      lastMessageId: chat?.messages.length
-        ? chat.messages[chat.messages.length - 1].id
-        : "",
-      seenLastMessageId: lastSeenMsgIdRef.current.get(id),
+      agentActive,
+      fingerprint: messageFingerprint(switchMsgs),
+      seenFingerprint: lastSeenFpRef.current.get(id),
     });
     const restoredPos = landLatest ? atBottomScrollPos() : incomingPos;
     if (incomingPos && !incomingPos.atBottom && chat && !landLatest) {
@@ -575,6 +597,20 @@ export function ChatPanel() {
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
+  // Prompt history popup (ArrowUp): previous prompts + up to 3 pinned
+  // commands. History/pins persist in localStorage (see src/lib/slash).
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyIdx, setHistoryIdx] = useState(0);
+  const [promptHistory, setPromptHistory] = useState<string[]>(() => loadHistory());
+  const [pinnedCmds, setPinnedCmds] = useState<string[]>(() => loadPins());
+  // A typed or inserted slash command paints the composer text with the
+  // accent color (Codex-style). The raw text stays visible in a plain
+  // textarea — no chip/popup card is rendered over the input, so caret,
+  // selection and IME editing keep working. Only known commands highlight;
+  // unknown "/xxx" stays plain text until submit reports it.
+  const slashParsed = parseSlashInput(input);
+  const slashActive =
+    !!slashParsed?.name && COMMANDS.some((c) => c.name === slashParsed.name);
   const [dragOver, setDragOver] = useState(false);
   // "+" action menu (files / screenshot / skills / MCP) — the single entry
   // point that keeps the bottom toolbar minimal.
@@ -625,13 +661,25 @@ export function ChatPanel() {
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
   const setMcpEnabled = useStore((s) => s.setMcpEnabled);
+  const computerUse = useStore((s) => s.computerUse);
+  const setComputerUse = useStore((s) => s.setComputerUse);
   const skillQ = skillQuery.trim().toLowerCase();
-  const filteredMcp = Object.keys(mcpConnectors).filter(
-    (name) => !skillQ || name.toLowerCase().includes(skillQ),
+  // The composer's connector grid = the built-in Computer Use card (same
+  // hard on/off switch as an MCP connector: OFF means the `computer` tool is
+  // never bound) + every user MCP connector, toggleable per turn.
+  const mcpCards: Array<{ name: string; label: string; builtin?: boolean }> = [
+    { name: "computer", label: "Computer Use", builtin: true },
+    ...Object.keys(mcpConnectors).map((name) => ({ name, label: name })),
+  ];
+  const filteredMcpCards = mcpCards.filter(
+    (c) =>
+      !skillQ ||
+      c.label.toLowerCase().includes(skillQ) ||
+      c.name.toLowerCase().includes(skillQ),
   );
-  const skillOptions = filteredMcp.map((name) => ({
-    kind: "mcp" as const,
-    name,
+  const skillOptions = filteredMcpCards.map((c) => ({
+    kind: (c.builtin ? "builtin" : "mcp") as "builtin" | "mcp",
+    name: c.name,
   }));
   const atQuery = skillMentionQuery.trim().toLowerCase();
   const filteredSkills = skillsList.filter(
@@ -649,11 +697,12 @@ export function ChatPanel() {
   // chat scrolled up, don't auto-pin to the bottom on return.
   const initialScrollPosRef = useRef(chat?.scrollPos ?? null);
   const stickToBottom = useRef(!initialScrollPosRef.current || initialScrollPosRef.current.atBottom);
-  // Newest message id per chat as of the last time the user LEFT it (recorded
-  // in the scroll-flush cleanup below). On return, a different id means the
-  // agent posted while the user was away → land on the newest message instead
-  // of the saved anchor (shouldLandOnLatest in the switch effect).
-  const lastSeenMsgIdRef = useRef<Map<string, string>>(new Map());
+  // Transcript fingerprint per chat as of the last time the user LEFT it
+  // (recorded in the scroll-flush cleanup below). On return, a different
+  // fingerprint means the agent posted or updated a message while the user
+  // was away → land on the newest message instead of the saved anchor
+  // (shouldLandOnLatest in the switch effect).
+  const lastSeenFpRef = useRef<Map<string, string>>(new Map());
   // A jump-to-bottom smooth scroll started by the scroll-jump button is still
   // in flight: while set, onChatScroll ignores the animation's intermediate
   // scroll events so they can't unpin the view or pop the button back.
@@ -1063,11 +1112,27 @@ export function ChatPanel() {
    *  the same frame, before the rAF callback, so the window exactly covers
    *  them. Immune to the browser clamping the requested value (which broke the
    *  old value-comparison approach). */
+  /** Last programmatic scrollTop set: the CLAMPED value read back right after
+   *  the set, plus a timestamp. A scroll event arriving at exactly this
+   *  position is the pin's own (possibly late-dispatched) event or content
+   *  growth under a pinned viewport — never a manual scroll-up — so it must
+   *  not unpin auto-scroll. Cleared on the first genuine user scroll. */
+  const pinTopRef = useRef<{ top: number; at: number } | null>(null);
+  /** Frame that lowers the programmatic-scroll flag; cancelled and re-armed
+   *  by every pin so overlapping pins during fast streaming keep the flag up
+   *  until a full frame after the LAST pin. */
+  const pinRafRef = useRef<number | null>(null);
   const setProgrammaticScroll = (el: HTMLDivElement, top: number) => {
     programmaticScrollRef.current = true;
     el.scrollTop = top;
-    requestAnimationFrame(() => {
+    // Record the clamped position (read back: the browser may clamp the
+    // requested value to the scroll range) so a late-dispatched event from
+    // this pin still compares equal (see scrollMatchesPin).
+    pinTopRef.current = { top: el.scrollTop, at: Date.now() };
+    if (pinRafRef.current != null) cancelAnimationFrame(pinRafRef.current);
+    pinRafRef.current = requestAnimationFrame(() => {
       programmaticScrollRef.current = false;
+      pinRafRef.current = null;
     });
   };
 
@@ -1102,7 +1167,12 @@ export function ChatPanel() {
     if (cancelRestore) {
       restoreTargetRef.current = null;
     }
-    if (fromReanchor) return;
+    // Late-dispatched pin event or content growth under a pinned viewport:
+    // scrollTop still sits exactly where the last programmatic pin put it, so
+    // this is not the user scrolling up — ignore it instead of unpinning
+    // auto-scroll mid-stream (the ChatGPT-style follow would otherwise die on
+    // the first fast streaming chunk after every pin).
+    if (fromReanchor || scrollMatchesPin(el.scrollTop, pinTopRef.current)) return;
     // Jump flight in progress: intermediate ticks of the smooth animation are
     // not user scrolls — keep the pin and the hidden button until arrival.
     if (jumpScrollingRef.current) {
@@ -1115,6 +1185,10 @@ export function ChatPanel() {
       }
       return;
     }
+    // A genuine user scroll reached this point (programmatic pins returned
+    // above): the recorded pin is stale, drop it so later events compare
+    // against fresh pins only.
+    pinTopRef.current = null;
     const atBottom = isAtBottom(el);
     if (atBottom) {
       // Record synchronously: at the bottom there is nothing to scan, and the
@@ -1174,10 +1248,17 @@ export function ChatPanel() {
 
   useEffect(() => {
     if (!stickToBottom.current) return;
-    // Keep the saved position pinned too: this scrollTo may fire no scroll
+    const el = scrollRef.current;
+    if (!el) return;
+    // Keep the saved position pinned too: this scroll may fire no scroll
     // event (already at max), and a chat switch flushes the ref as-is.
     recordAtBottom();
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    // Flagged pin: an unflagged scrollTo here fires a scroll event that looks
+    // exactly like a manual scroll-up when the next streaming chunk grows
+    // scrollHeight mid-flight — permanently unpinning auto-scroll mid-stream.
+    // Flagged events are ignored regardless of position (narrow same-frame
+    // window, so a real user scroll-up right after still disables follow).
+    setProgrammaticScroll(el, el.scrollHeight);
   }, [chat?.messages, scrollTick]);
 
   // The jump-to-bottom button is driven by onChatScroll, which only fires on
@@ -1222,7 +1303,10 @@ export function ChatPanel() {
       }
       const atBottom = isAtBottom(el);
       if (stickToBottom.current) {
-        el.scrollTop = el.scrollHeight;
+        // Flagged pin for the same reason as the auto-scroll effect above:
+        // async content growth (images, fonts, highlighting) between an
+        // unflagged set and its scroll event mimics a manual scroll-up.
+        setProgrammaticScroll(el, el.scrollHeight);
         setShowJump(false);
       } else if (atBottom) {
         setShowJump(false);
@@ -1282,8 +1366,10 @@ export function ChatPanel() {
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el || prependAnchorRef.current == null) return;
-    el.scrollTop += el.scrollHeight - prependAnchorRef.current;
+    const prevHeight = prependAnchorRef.current;
     prependAnchorRef.current = null;
+    // Flagged re-anchor, not a raw set: same fake-scroll-up hazard as above.
+    setProgrammaticScroll(el, el.scrollTop + (el.scrollHeight - prevHeight));
   }, [msgLimit]);
 
   // Restore the saved scroll position once the anchor message is rendered.
@@ -1299,7 +1385,10 @@ export function ChatPanel() {
       // حین استریم محتوا رشد می‌کند و reconcile/auto-scroll پین را حفظ می‌کنند.
       restoredRef.current = true;
       recordAtBottom();
-      el.scrollTop = el.scrollHeight;
+      // Flagged pin (not a raw set): a raw set fires an unflagged scroll event
+      // that a streaming chunk rendered just after it turns into a fake
+      // "manual scroll-up", permanently unpinning auto-scroll on return.
+      setProgrammaticScroll(el, el.scrollHeight);
       return;
     }
     let anchor = el.querySelector<HTMLElement>(`[data-msg-id="${pos.id}"]`);
@@ -1349,7 +1438,8 @@ export function ChatPanel() {
       // Nothing left to anchor to → fall back to the newest messages.
       restoredRef.current = true;
       recordAtBottom();
-      el.scrollTop = el.scrollHeight;
+      // Flagged pin, same reason as the atBottom branch above.
+      setProgrammaticScroll(el, el.scrollHeight);
       return;
     }
     restoredRef.current = true;
@@ -1411,17 +1501,15 @@ export function ChatPanel() {
       if (cid && lastScrollPosRef.current) {
         useStore.getState().flushNow();
       }
-      // Record the newest message this chat had as the user left it: on the
-      // next return, a different id means the agent posted while they were
-      // away → land on the newest message instead of the saved anchor
-      // (shouldLandOnLatest). Read fresh from the store — the closure's `chat`
-      // is from the render that last changed chat?.id, so it can be stale.
+      // Record a fingerprint of this chat's transcript as the user leaves it:
+      // on the next return, a different fingerprint means the agent posted or
+      // updated a message while they were away → land on the newest message
+      // instead of the saved anchor (shouldLandOnLatest). Read fresh from the
+      // store — the closure's `chat` is from the render that last changed
+      // chat?.id, so it can be stale.
       if (cid) {
         const cur = useStore.getState().chats.find((c) => c.id === cid);
-        const lastId = cur?.messages.length
-          ? cur.messages[cur.messages.length - 1].id
-          : "";
-        if (lastId) lastSeenMsgIdRef.current.set(cid, lastId);
+        if (cur) lastSeenFpRef.current.set(cid, messageFingerprint(cur.messages));
       }
     };
     // App close: push the position into the store AND force an immediate write,
@@ -1527,6 +1615,15 @@ export function ChatPanel() {
     left: number;
   } | null>(null);
   const ctxRingWrapRef = useRef<HTMLDivElement | null>(null);
+  // Real per-turn part sizes reported by the backend's ctx_parts event
+  // (system prompt tail, skills section, bound MCP schemas) — keyed by chat.
+  type CtxParts = {
+    mode?: string;
+    systemChars?: number;
+    skillsChars?: number;
+    mcpChars?: number;
+  };
+  const [ctxPartsByChat, setCtxPartsByChat] = useState<Record<string, CtxParts>>({});
   const ctxPopoverCloseTimer = useRef<number | null>(null);
   const cancelCtxPopoverClose = () => {
     if (ctxPopoverCloseTimer.current != null) {
@@ -1543,7 +1640,20 @@ export function ChatPanel() {
     );
   };
   const openCtxPopover = () => {
+    // The ring lives inside the "+" menu's ref container now, so its own
+    // pointer-down no longer counts as "outside" — close that menu here.
+    setPlusMenuOpen(false);
     cancelCtxPopoverClose();
+    // The mount-time fetch can race the sidecar (empty result) or the backend
+    // can restart with new prompts — retry whenever this mode's built-in
+    // prompt is still missing so the popover's System prompt row isn't stuck
+    // at zero.
+    if (!builtinPrompts[chat?.mode ?? ""]) {
+      void fetchSystemPrompts().then((p) => {
+        if (Object.keys(p).length > 0)
+          setBuiltinPrompts((prev) => ({ ...prev, ...p }));
+      });
+    }
     const el = ctxRingWrapRef.current;
     if (el && typeof window !== "undefined") {
       const r = el.getBoundingClientRect();
@@ -1568,10 +1678,28 @@ export function ChatPanel() {
   );
   const ctxBreakdown = useMemo(() => {
     if (!ctxPopoverOpen) return null;
-    // Mentioned skills and enabled MCP connectors are part of this turn's
-    // context — derive their footprint from the real configs (no fixed size).
+    // Real per-turn sizes from the backend's ctx_parts event win: they cover
+    // the system prompt TAIL (workspace note / saved plan / …), the full
+    // skills section (catalog + @mentioned + auto-picked) and the bound MCP
+    // tool schemas — none of which the frontend can measure on its own.
+    const real = ctxPartsByChat[chat?.id ?? ""];
+    if (real && chat) {
+      return buildContextBreakdown(chat, systemPrompt, ctxWindow, {
+        systemPromptChars: real.systemChars,
+        skillsChars: real.skillsChars,
+        mcpChars: real.mcpChars,
+      });
+    }
+    // Fallback estimate (before the first turn reports): the AVAILABLE
+    // SKILLS catalog is always sent (- name: desc per line) plus the bodies
+    // of the skills @mentioned in the draft; MCP counts its connector config.
     const mentioned = extractMentionSkills(input, skillsList).skills;
     let skillsChars = 0;
+    for (const s of skillsList) {
+      skillsChars += s.description
+        ? 5 + s.name.length + s.description.length
+        : 3 + s.name.length;
+    }
     for (const name of mentioned) {
       const row = skillsList.find((s) => s.name === name || s.slug === name);
       if (row) skillsChars += row.content.length;
@@ -1588,6 +1716,7 @@ export function ChatPanel() {
     });
   }, [
     ctxPopoverOpen,
+    ctxPartsByChat,
     chat,
     systemPrompt,
     ctxWindow,
@@ -1778,26 +1907,14 @@ export function ChatPanel() {
     // completed), remind the model of the current plan state so it continues
     // ticking the same steps instead of re-planning from scratch. The note is
     // only sent to the model — the stored user message keeps just `text`.
-    let promptWithResume = finalPrompt;
-    for (let i = chat.messages.length - 1; i >= 0; i--) {
-      const plan = chat.messages[i].plan;
-      if (
-        plan &&
-        plan.length > 0 &&
-        (!chat.messages[i].mode || chat.messages[i].mode === chat.mode)
-      ) {
-        if (!plan.every((t) => t.status === "completed")) {
-          const lines = plan
-            .map(
-              (t) =>
-                `- [${t.status === "completed" ? "✓" : t.status === "in_progress" ? "●" : " "}] ${t.content}`,
-            )
-            .join("\n");
-          promptWithResume += `\n\n[SYSTEM: a task was interrupted mid-way in this chat. Its checklist currently is:\n${lines}\nIf this message continues that task, PRESERVE this exact checklist and mark progress via update_plan (same items, update statuses) — do not create a new one. If this message is a new, unrelated task, ignore this note.]`;
-        }
-        break;
-      }
-    }
+    // Plan mode gets NO note (buildResumeNote): its checklist IS the draft
+    // plan, so "PRESERVE, do not create a new one" contradicted the mode's
+    // revise contract — the planner then never emitted a revised plan_card
+    // and the todos never updated.
+    const resumeNote = buildResumeNote(chat.messages, chat.mode);
+    const promptWithResume = resumeNote
+      ? `${finalPrompt}\n\n${resumeNote}`
+      : finalPrompt;
     setSkillOpen(false);
 
     // When draining an undelivered steer, REUSE the user message that is
@@ -2289,6 +2406,13 @@ export function ChatPanel() {
         // Deliberately NOT rendered into the chat (same reason as "skill"
         // above): the active MCP servers are already listed in the prompt's
         // USER-SELECTED SKILLS/TOOLS section, so the note is redundant UI.
+      } else if (event.kind === "ctx_parts") {
+        // Real part sizes for the context popover. Store only this chat's own
+        // main turn — a sub-agent building its context must not overwrite it.
+        const p = event as unknown as CtxParts;
+        if (chat && (!p.mode || p.mode === chat.mode)) {
+          setCtxPartsByChat((prev) => ({ ...prev, [chat.id]: p }));
+        }
       } else if (event.kind === "subagent_models") {
         // Debug-only routing info. Deliberately NOT rendered into the chat —
         // the user asked for subagent model lists to stay out of the message.
@@ -2337,7 +2461,8 @@ export function ChatPanel() {
         // viewer tab on the right so the user watches the shared session live.
         if ((event.tool ?? "").startsWith("browser_")) {
           const browserVt = useViewerTabs.getState();
-          if (!browserVt.tabs.some((t) => t.kind === "browser")) browserVt.openBrowser();
+          if (!browserVt.tabs.some((t) => t.kind === "browser" && t.chatId === chat.id))
+            browserVt.openBrowser(chat.id);
         }
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
@@ -2595,7 +2720,7 @@ export function ChatPanel() {
           // Auto-open the docked Plan viewer tab on create and on every
           // revision so the newest plan replaces the previous one on the right.
           try {
-            useViewerTabs.getState().openPlan();
+            useViewerTabs.getState().openPlan(chat.id);
           } catch {
             // Viewer open must never break the stream.
           }
@@ -2645,6 +2770,7 @@ export function ChatPanel() {
           options,
           style: typeof event.style === "string" ? event.style : undefined,
         });
+        playAlarm("alert");
       } else if (event.kind === "error") {
         // A backend error while the summarizer was supposedly running means the
         // compact can't complete either — never leave the "Compacting context"
@@ -2741,25 +2867,6 @@ export function ChatPanel() {
               ? String((event as { stage?: unknown }).stage).slice(0, 120)
               : "Working";
         useStore.getState().updateMessage(assistantMsg.id, { statusText: label });
-      } else if (event.kind === "laya") {
-        // فعالیت زنده تصمیم سریع laya — جدا از رویداد usage (مصرف دست‌نخورده
-        // می‌ماند)؛ در تاریخچه همان چت مبدأ استریم ثبت می‌شود (نه چت فعال لحظه‌ای)
-        // تا با سوییچ چت، تاریخچه قاطی نشود. لاگ کامل در trace_store بک‌اند است
-        // و از پنل Trace (آیکون اپ‌بار) دیده می‌شود — دیگر پنل راست باز نمی‌شود.
-        const originChatId = chat.id;
-        store.appendLayaRun(originChatId, {
-          route: typeof event.route === "string" ? event.route : "normal",
-          confidence: typeof event.confidence === "number" ? event.confidence : 0,
-          abstained: event.abstained === true,
-          reason: typeof event.reason === "string" ? event.reason : "",
-          handled: event.handled === true,
-          providerId:
-            (event.provider_id as string | undefined) ||
-            (event.provider as string | undefined) ||
-            "local",
-          model: typeof event.model === "string" ? event.model : "",
-          elapsedMs: typeof event.elapsed_ms === "number" ? event.elapsed_ms : 0,
-        });
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -2783,14 +2890,11 @@ export function ChatPanel() {
         );
         // Store the provider + model EXPLICITLY (no key string, no guessing) so
         // the sidebar shows the exact provider/model that ran this chat.
-        // رویداد laya (لوکال صفرتوکنی یا پروایدر خارجی) با پرچم laya ثبت می‌شود
-        // تا ردیف صفرتوکنی لوکال هم در model usage بماند — مثل مدل‌های tools.
         store.accrueChatUsage(chat.id, providerId, model, {
           input: inputTokens,
           output: outputTokens,
           cacheRead: event.cache_read_tokens ?? 0,
           cacheWrite: event.cache_write_tokens ?? 0,
-          ...(event.laya ? { laya: true } : {}),
         });
         // The message badge mirrors the LAST request of this turn (each new
         // request REPLACES the previous while streaming) — it is NOT the
@@ -2869,6 +2973,10 @@ export function ChatPanel() {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });
           }
         }
+        // Turn-finished alarm: the error sound when the turn ended in a backend
+        // failure (an inline `error` event always precedes this `done`
+        // sentinel), the alert sound on a successful completion.
+        playAlarm(curMsg?.error === true ? "error" : "alert");
       }
     };
 
@@ -2915,7 +3023,7 @@ export function ChatPanel() {
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
-          allowComputer: s.computerAllowed,
+          allowComputer: s.computerUse,
           nvimFile:
             isForeground && nvimMentioned ? nvimRel || undefined : undefined,
           nvimDiagnostics: isForeground && nvimMentioned ? nvimDiags : undefined,
@@ -2958,9 +3066,11 @@ export function ChatPanel() {
           },
         });
         preserveToolActivity();
+        playAlarm("error");
       } else if ((err as Error).name !== "AbortError") {
         handleEvent({ kind: "error", content: (err as Error).message });
         preserveToolActivity();
+        playAlarm("error");
       } else {
         // User-initiated Stop: the request was simply cancelled (no
         // retry/resume loop). Folding the completed tool calls into content is
@@ -3251,7 +3361,11 @@ export function ChatPanel() {
   const handleCommand = async (v: string) => {
     const s = useStore.getState();
     const ch = s.chats.find((c) => c.id === s.activeChatId);
-    const word = v.split(/\s+/)[0].toLowerCase();
+    // Record every submitted slash command in the prompt history so the
+    // ArrowUp popup can offer it again (pins are managed from the popup).
+    setPromptHistory((prev) => recordHistory(v, prev));
+    const parsed = parseSlashInput(v);
+    const word = parsed && parsed.name ? `/${parsed.name}` : v.split(/\s+/)[0].toLowerCase();
     switch (word) {
       case "/compact":
         await compactContext();
@@ -3317,9 +3431,12 @@ export function ChatPanel() {
           });
           return;
         }
-        s.addMessage(ch?.id ?? "", {
+        // Store the pretty label (no leading slash) as the visible bubble;
+        // send() reuses this bubble but posts the full prompt to the model.
+        const created = s.addMessage(ch?.id ?? "", {
           role: "user",
-          content: v,
+          content: prettySlashLabel(v),
+          ...(ch?.mode ? { mode: ch.mode } : {}),
         });
         void send(
           target === "skill"
@@ -3328,6 +3445,7 @@ export function ChatPanel() {
           [],
           [],
           true,
+          created.id,
         );
         break;
       }
@@ -3458,25 +3576,17 @@ export function ChatPanel() {
       const s = useStore.getState();
       const ch = s.chats.find((c) => c.id === originId);
       if (!ch) return;
-      const msg = ch.messages.find((m) => m.id === id);
-      if (!msg) return;
-      // Resolve the prompt to re-send: if the retry was triggered on a non-user
-      // message, fall back to the nearest preceding user message so we still
-      // regenerate from the right place.
-      const idx = ch.messages.findIndex((m) => m.id === id);
-      const userMsg =
-        msg.role === "user"
-          ? msg
-          : [...ch.messages.slice(0, idx)]
-            .reverse()
-            .find((m) => m.role === "user");
-      if (!userMsg || !userMsg.content.trim()) return;
-      // ALWAYS truncate-and-restart: remove this message and everything below
-      // it, then re-send the prompt from scratch (send() creates a fresh user
-      // bubble). When `id` is a user message it is removed too; when it is an
-      // assistant message, the user prompt above is kept and only the failed
-      // turn + everything below is dropped.
-      if (!s.truncateTo(id)) return;
+      // Resolve the prompt to re-send via the shared helper (same rule as
+      // resolveRestartUser tests): a user id restarts its own turn, an
+      // assistant id restarts the user turn above it.
+      const userMsg = resolveRestartUser(ch.messages, id);
+      if (!userMsg) return;
+      // ALWAYS truncate-and-restart from the OWNING user message (not `id`):
+      // truncating to an assistant `id` would keep the user prompt above AND
+      // send() would append a second identical user bubble — the duplicate
+      // user message reported. Truncating to userMsg.id removes the turn and
+      // send() recreates exactly one user bubble from scratch.
+      if (!s.truncateTo(userMsg.id)) return;
       const text = userMsg.content;
       // Give the abort's finally block a tick to reset busy/streaming state
       // before re-sending (send() re-sets busy=true itself, but the abort's
@@ -3511,6 +3621,11 @@ export function ChatPanel() {
   const submit = () => {
     const typed = input.trim();
     if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
+    // Record plain prompts too so ArrowUp recalls them (slash commands are
+    // recorded inside handleCommand; this covers normal/steer/queued sends).
+    if (!typed.startsWith("/")) {
+      setPromptHistory((prev) => recordHistory(typed, prev));
+    }
     if (typed.startsWith("/")) {
       // Slash commands act on the typed text only; pasted cards stay pinned to
       // the composer for the next real message.
@@ -3596,6 +3711,15 @@ export function ChatPanel() {
   const queueForLater = () => {
     const typed = input.trim();
     if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
+    // Slash commands run immediately and never enter the chat transcript as
+    // raw "/..." text, even when queued via the queue button.
+    if (typed.startsWith("/")) {
+      setInput("");
+      setCmdOpen(null);
+      setHistoryOpen(false);
+      void handleCommand(typed);
+      return;
+    }
     const v = composePrompt(typed).trim();
     const ss = useStore.getState();
     const chatObj = ss.chats.find((c) => c.id === chatIdRef.current);
@@ -4165,6 +4289,53 @@ export function ChatPanel() {
       startCmd();
       return;
     }
+    // Prompt history popup: ArrowUp on an empty composer opens the history
+    // (pins first, then recents); ArrowUp/Down navigate, Enter inserts the
+    // row into the input, Escape closes. Only when no other popup owns the
+    // chord and the caret is at the very start (no partial text to lose).
+    if (!cmdOpen && !skillMention && !skillOpen && !historyOpen && e.key === "ArrowUp") {
+      const el = textareaRef.current;
+      const atStart = !el || ((el.selectionStart ?? 0) === 0 && (el.selectionEnd ?? 0) === 0);
+      if (input === "" && atStart && (promptHistory.length > 0 || pinnedCmds.length > 0)) {
+        e.preventDefault();
+        e.stopPropagation();
+        setHistoryOpen(true);
+        setHistoryIdx(0);
+        return;
+      }
+    }
+    if (historyOpen) {
+      const rows = historyRows(promptHistory, pinnedCmds);
+      const d = navChord(e);
+      if (d !== 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (rows.length > 0)
+          setHistoryIdx((i) => (i + d + rows.length) % rows.length);
+        return;
+      }
+      if (rows.length > 0 && (e.key === "Enter" || e.key === "Tab")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const picked = rows[historyIdx] ?? rows[0];
+        setHistoryOpen(false);
+        setInput(picked);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (el) {
+            el.focus();
+            el.setSelectionRange(picked.length, picked.length);
+          }
+        });
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setHistoryOpen(false);
+        return;
+      }
+    }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       if (busy || compacting) queueForLater();
@@ -4487,8 +4658,22 @@ export function ChatPanel() {
                   {q.attachments && q.attachments.length > 0 && (
                     <div className="msg-attachments" dir="ltr">
                       {q.attachments.map((a) => (
-                        <span className="attachment-chip" key={a}>
-                          @ {a}
+                        <span
+                          className="attachment-chip attachment-chip-open"
+                          key={a}
+                          role="button"
+                          tabIndex={0}
+                          title={`${a} — open in the side panel`}
+                          onClick={() => openWorkspaceFile(a)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              openWorkspaceFile(a);
+                            }
+                          }}
+                        >
+                          <FileIcon path={a} size={18} />
+                          {a}
                         </span>
                       ))}
                     </div>
@@ -5107,7 +5292,7 @@ export function ChatPanel() {
                           // scope-aware: "Always allow" persists the grant matching
                           // the dialog's scope — computer vs outside-workspace.
                           if (permissionReq.scope === "computer") {
-                            useStore.getState().setComputerAllowed(true);
+                            useStore.getState().setComputerUse(true);
                           } else if (permissionReq.folder) {
                             // Per-folder grant: only the requested folder's
                             // subtree stays approved for the session — NOT the
@@ -5228,26 +5413,142 @@ export function ChatPanel() {
             <div className="drop-overlay">Drop files or images to attach</div>
           )}
           <div className="composer-input-wrap">
+            {historyOpen && (
+              // Codex-style history: entries render as cards split into a
+              // "Pinned" section (max 3) and a "Recent" section. Click / Enter
+              // inserts the row into the composer (no auto-send).
+              <div className="mention-popup history-popup" dir="ltr">
+                <div className="mention-head">
+                  <span className="mention-head-icon">↑</span>
+                  <span>History</span>
+                  <span className="mention-head-count">
+                    {historyRows(promptHistory, pinnedCmds).length}
+                  </span>
+                </div>
+                {(() => {
+                  const rows = historyRows(promptHistory, pinnedCmds);
+                  const pinnedRows = rows.filter((r) => pinnedCmds.includes(r));
+                  const recentRows = rows.filter((r) => !pinnedCmds.includes(r));
+                  const insert = (row: string) => {
+                    setHistoryOpen(false);
+                    setInput(row);
+                    requestAnimationFrame(() => {
+                      const el = textareaRef.current;
+                      if (el) {
+                        el.focus();
+                        el.setSelectionRange(row.length, row.length);
+                      }
+                    });
+                  };
+                  const renderCard = (row: string) => {
+                    const i = rows.indexOf(row);
+                    const pinned = pinnedCmds.includes(row);
+                    const slash = isSlashCommand(row);
+                    // Codex-style card lines shared with unit tests.
+                    const title = historyTitle(row);
+                    const meta = historyMeta(row);
+                    const sub = meta && meta !== title ? meta : null;
+                    return (
+                      <div
+                        key={row}
+                        className={`hist-card${i === historyIdx ? " kbd" : ""}`}
+                        onMouseEnter={() => setHistoryIdx(i)}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          insert(row);
+                        }}
+                      >
+                        <div className="hist-card-head">
+                          <span
+                            className={`hist-card-icon${slash ? " cmd" : ""}`}
+                            aria-hidden="true"
+                          >
+                            {slash ? "✦" : "↩"}
+                          </span>
+                          <span className="hist-card-title">{title}</span>
+                          <button
+                            type="button"
+                            className={`history-pin${pinned ? " on" : ""}`}
+                            title={pinned ? "Unpin" : "Pin (max 3)"}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setPinnedCmds((prev) => togglePin(row, prev));
+                            }}
+                          >
+                            {pinned ? "★" : "☆"}
+                          </button>
+                        </div>
+                        {sub && <div className="hist-card-sub">{sub}</div>}
+                      </div>
+                    );
+                  };
+                  return (
+                    <>
+                      {rows.length === 0 && (
+                        <div className="mention-empty">No history yet</div>
+                      )}
+                      {pinnedRows.length > 0 && (
+                        <div className="hist-section">
+                          <div className="hist-section-label">Pinned</div>
+                          {pinnedRows.map(renderCard)}
+                        </div>
+                      )}
+                      {recentRows.length > 0 && (
+                        <div className="hist-section">
+                          <div className="hist-section-label">Recent</div>
+                          {recentRows.map(renderCard)}
+                        </div>
+                      )}
+                      {rows.length > 0 && (
+                        <div className="hist-hint">
+                          ↑↓ navigate · Enter insert · Esc close
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            )}
             {cmdOpen && (
-              <div className="mention-popup" dir="ltr">
+              <div className="mention-popup history-popup cmd-popup" dir="ltr">
+                <div className="mention-head">
+                  <span className="mention-head-icon">/</span>
+                  <span>Commands</span>
+                  <span className="mention-head-count">
+                    {filteredCmds.length}
+                  </span>
+                </div>
                 {filteredCmds.length === 0 && (
                   <div className="mention-empty">No matching commands</div>
                 )}
                 {filteredCmds.map((c, i) => (
                   <div
                     key={c.name}
-                    className={`mention-item ${i === cmdIndex ? "active" : ""}`}
+                    className={`hist-card cmd-card${i === cmdIndex ? " kbd" : ""}`}
                     onMouseEnter={() => setCmdIndex(i)}
                     onMouseDown={(e) => {
                       e.preventDefault();
                       acceptCmd(c.name);
                     }}
                   >
-                    <span className="mention-icon-badge cmd">/</span>
-                    <span className="mention-rel">/{c.name}</span>
-                    <span className="mention-hint">{c.hint}</span>
+                    <div className="hist-card-head">
+                      <span
+                        className="hist-card-icon cmd"
+                        aria-hidden="true"
+                      >
+                        ✦
+                      </span>
+                      <span className="hist-card-title">/{c.name}</span>
+                    </div>
+                    <div className="hist-card-sub">{c.hint}</div>
                   </div>
                 ))}
+                {filteredCmds.length > 0 && (
+                  <div className="hist-hint">
+                    ↑↓ navigate · Enter insert · Esc close
+                  </div>
+                )}
               </div>
             )}
             {skillMention && (
@@ -5291,7 +5592,7 @@ export function ChatPanel() {
                 <div className="mention-head">
                   <span>MCP tools</span>
                   <span className="mention-head-count">
-                    {filteredMcp.length}
+                    {filteredMcpCards.length}
                   </span>
                 </div>
                 <input
@@ -5321,7 +5622,9 @@ export function ChatPanel() {
                     if (e.key === "Enter") {
                       e.preventDefault();
                       const opt = skillOptions[skillIdx];
-                      if (opt)
+                      if (opt?.kind === "builtin")
+                        setComputerUse(!computerUse);
+                      else if (opt)
                         setMcpEnabled(opt.name, !mcpEnabled.includes(opt.name));
                       return;
                     }
@@ -5339,26 +5642,37 @@ export function ChatPanel() {
                   </div>
                 )}
                 {Object.keys(mcpConnectors).length > 0 &&
-                  filteredMcp.length === 0 && (
+                  filteredMcpCards.length === 0 && (
                     <div className="mention-empty">
                       No connectors match “{skillQuery.trim()}”
                     </div>
                   )}
-                {filteredMcp.length > 0 && (
+                {filteredMcpCards.length > 0 && (
                   <div className="mcp-grid">
-                    {filteredMcp.map((name, i) => {
-                      const on = mcpEnabled.includes(name);
+                    {filteredMcpCards.map((c, i) => {
+                      const on = c.builtin
+                        ? computerUse
+                        : mcpEnabled.includes(c.name);
+                      const toggle = () => {
+                        if (c.builtin) setComputerUse(!on);
+                        else setMcpEnabled(c.name, !on);
+                      };
                       return (
                         <div
-                          key={name}
+                          key={c.name}
                           className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
+                          title={
+                            c.builtin
+                              ? "Desktop control — when off, the agent never gets the computer tool"
+                              : undefined
+                          }
                           onMouseEnter={() => setSkillIdx(i)}
                           onMouseDown={(e) => {
                             e.preventDefault();
-                            setMcpEnabled(name, !on);
+                            toggle();
                           }}
                         >
-                          <span className="mention-rel">{name}</span>
+                          <span className="mention-rel">{c.label}</span>
                           <span className="mcp-switch">
                             <span className="mcp-switch-track">
                               <span className="mcp-switch-knob" />
@@ -5431,22 +5745,7 @@ export function ChatPanel() {
                   const name = idx >= 0 ? a.slice(idx + 1) : a;
                   return (
                     <span className="attachment-chip file-chip" key={a} title={a}>
-                      <svg
-                        className="chip-file-icon"
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                        <path d="M14 2v6h6" />
-                        <path d="M9 13h6" />
-                        <path d="M9 17h6" />
-                      </svg>
+                      <FileIcon path={a} size={18} />
                       <span className="chip-file-name">{name}</span>
                       <button
                         className="chip-x"
@@ -5477,7 +5776,7 @@ export function ChatPanel() {
             )}
             <div className="composer-input-row">
               <textarea
-                className="composer-input"
+                className={`composer-input${slashActive ? " slash-active" : ""}`}
                 rows={1}
                 dir={dir}
                 style={{
@@ -5614,6 +5913,30 @@ export function ChatPanel() {
                       </button>
                     </div>
                   )}
+                  <div
+                    className="ctx-ring-wrap"
+                    ref={ctxRingWrapRef}
+                    onMouseEnter={openCtxPopover}
+                    onMouseLeave={scheduleCtxPopoverClose}
+                  >
+                    <button
+                      type="button"
+                      className={`ctx-ring-btn${contextWarn(contextUsed, usable) ? " warn" : ""}`}
+                      aria-label="Context windows"
+                      aria-haspopup="dialog"
+                      aria-expanded={ctxPopoverOpen}
+                      onClick={() =>
+                        ctxPopoverOpen
+                          ? setCtxPopoverChatId(null)
+                          : openCtxPopover()
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setCtxPopoverChatId(null);
+                      }}
+                    >
+                      <ContextRing pct={ctxPct} />
+                    </button>
+                  </div>
                 </div>
                 <div className="composer-right-actions">
                   <button
@@ -5665,30 +5988,6 @@ export function ChatPanel() {
                       </svg>
                     )}
                   </button>
-                  <div
-                    className="ctx-ring-wrap"
-                    ref={ctxRingWrapRef}
-                    onMouseEnter={openCtxPopover}
-                    onMouseLeave={scheduleCtxPopoverClose}
-                  >
-                    <button
-                      type="button"
-                      className={`ctx-ring-btn${contextWarn(contextUsed, usable) ? " warn" : ""}`}
-                      aria-label="Context windows"
-                      aria-haspopup="dialog"
-                      aria-expanded={ctxPopoverOpen}
-                      onClick={() =>
-                        ctxPopoverOpen
-                          ? setCtxPopoverChatId(null)
-                          : openCtxPopover()
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape") setCtxPopoverChatId(null);
-                      }}
-                    >
-                      <ContextRing pct={ctxPct} />
-                    </button>
-                  </div>
                   {ctxPopoverOpen &&
                     ctxBreakdown &&
                     ctxPopoverPos &&
@@ -5724,12 +6023,11 @@ export function ChatPanel() {
                             <span
                               key={row.key}
                               style={{
-                                width: `${
-                                  ctxBreakdown.total > 0
-                                    ? (row.tokens / ctxBreakdown.total) *
-                                      100
-                                    : 0
-                                }%`,
+                                width: `${contextBarSegmentPercent(
+                                  row.tokens,
+                                  ctxBreakdown.total,
+                                  ctxBreakdown.window,
+                                )}%`,
                                 backgroundColor:
                                   CONTEXT_BREAKDOWN_COLORS[row.key],
                               }}

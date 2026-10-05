@@ -5,10 +5,11 @@ import { useStore } from "../lib/store";
 import { clearOrphanScheduleRuns, clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
 import {
   ensureScheduleNotificationPermission,
-  findNewScheduleRuns,
+  findFinishedScheduleRuns,
   notifyScheduleRun,
   notifyScheduleRunBatch,
 } from "../lib/schedule-notify";
+import { playAlarm } from "../lib/alarm";
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
@@ -734,12 +735,13 @@ export function ScheduleInbox() {
 }
 
 /** دکمه Inbox در تایتل‌بار با بج اجرای دیده‌نشده (نوتیفیکیشن کرون).
- * ران‌های واقعاً جدید (نسبت به پولینگ قبلی و دیده‌نشده‌ها) اعلان سیستم‌عامل هم
- * می‌دهند تا حتی وقتی Inbox باز نیست، کاربر خبردار شود. */
+ * ران‌هایی که به وضعیت پایانی رسیده‌اند (از running به done/error، یا ران‌هایی
+ * که بین دو پولینگ تمام شده‌اند) اعلان سیستم‌عامل و آلارم صوتی می‌دهند تا حتی
+ * وقتی Inbox باز نیست، کاربر خبردار شود؛ رانِ در حال اجرا هرگز اعلان نمی‌دهد. */
 export function ScheduleInboxButton() {
   const seen = useStore((s) => s.scheduleRunsSeen);
   const [runs, setRuns] = useState<ScheduleRun[]>([]);
-  const prevIdsRef = useRef<Set<string> | null>(null);
+  const prevStatusesRef = useRef<Map<string, ScheduleRun["status"]> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -747,14 +749,16 @@ export function ScheduleInboxButton() {
       const out = await listAllScheduleRuns(50);
       if (cancelled || "error" in out) return;
       setRuns(out);
-      // اعلان OS فقط برای ران‌هایی که از پولینگ قبلی جدیدند و هنوز دیده نشده‌اند
-      // (بدون تکرار): اولین پولینگ فقط baseline می‌سازد.
-      const prev = prevIdsRef.current;
-      const seenNow = useStore.getState().scheduleRunsSeen;
-      const schedulesNow = useStore.getState().schedules;
+      // اعلان OS + آلارم فقط برای ران‌هایی که از پولینگ قبلی به وضعیت پایانی
+      // رسیده‌اند (بدون تکرار): اولین پولینگ فقط baseline می‌سازد و رانِ
+      // running هرگز اعلان نمی‌دهد — فقط پایان کار اعلان دارد.
+      const prev = prevStatusesRef.current;
       if (prev !== null) {
-        const fresh = findNewScheduleRuns(prev, out, seenNow);
-        if (fresh.length > 0) {
+        const finished = findFinishedScheduleRuns(prev, out);
+        for (const r of finished) {
+          playAlarm(r.status === "error" ? "error" : "alert");
+        }
+        if (finished.length > 0) {
           const openInbox = () => {
             void import("../lib/viewerTabs").then(({ useViewerTabs }) => {
               useViewerTabs.getState().openInbox();
@@ -762,17 +766,19 @@ export function ScheduleInboxButton() {
             useStore.getState().setScheduleInboxOpen(true);
           };
           if (await ensureScheduleNotificationPermission()) {
-            if (fresh.length === 1) {
-              const r = fresh[0];
-              const name = schedulesNow.find((t) => t.id === r.schedule_id)?.name;
+            if (finished.length === 1) {
+              const r = finished[0];
+              const name = useStore
+                .getState()
+                .schedules.find((t) => t.id === r.schedule_id)?.name;
               notifyScheduleRun(r, name, openInbox);
             } else {
-              notifyScheduleRunBatch(fresh.length, openInbox);
+              notifyScheduleRunBatch(finished.length, openInbox);
             }
           }
         }
       }
-      prevIdsRef.current = new Set(out.map((r) => r.id));
+      prevStatusesRef.current = new Map(out.map((r) => [r.id, r.status]));
     };
     void tick();
     const t = setInterval(() => void tick(), 30000);

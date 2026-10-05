@@ -21,13 +21,14 @@ export default defineConfig(({ mode }) => {
                 entry: 'electron/main.ts',
               },
               preload: {
-                // Shortcut of `build.rolldownOptions.input` (vite 8+)
+                // Shortcut of `build.rollupOptions.input`
                 input: 'electron/preload.ts',
                 vite: {
                   build: {
-                    // vite 8+ uses rolldown; vite < 8 uses rollup. The plugin adapts
-                    // automatically — only `rolldownOptions` is needed for vite 8.
-                    rolldownOptions: {
+                    // This repo builds with vite 5 (rollup). The plugin reads
+                    // `build.rollupOptions` — `rolldownOptions` is ignored here
+                    // and produced a stale preload.cjs missing new IPC APIs.
+                    rollupOptions: {
                       output: {
                         format: 'cjs',
                         entryFileNames: 'preload.cjs',

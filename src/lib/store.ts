@@ -5,7 +5,6 @@ import type {
   Chat,
   ChatDraft,
   ChatMessage,
-  LayaRun,
   McpServerConfig,
   MessageSegment,
   ProviderConfig,
@@ -21,31 +20,6 @@ import type {
   ToolActivity,
   Workspace,
 } from '../types'
-
-/** سقف تاریخچه تصمیم‌های laya هر چت — فقط تازه‌ترین‌ها نگه داشته می‌شوند. */
-export const MAX_LAYA_RUNS_PER_CHAT = 20
-
-/** نرمال‌سازی یک رویداد laya به رکورد نمایشی + سقف آخرین ~۲۰ تا. خالص برای تست. */
-export function appendLayaRun(
-  runs: LayaRun[] | undefined,
-  run: Omit<LayaRun, 'at'> & { at?: number },
-): LayaRun[] {
-  const conf = Number.isFinite(run.confidence)
-    ? Math.max(0, Math.min(1, run.confidence))
-    : 0
-  const next: LayaRun = {
-    route: (run.route || 'normal').trim() || 'normal',
-    confidence: conf,
-    abstained: run.abstained === true,
-    reason: typeof run.reason === 'string' ? run.reason : '',
-    handled: run.handled === true,
-    providerId: typeof run.providerId === 'string' ? run.providerId : '',
-    model: typeof run.model === 'string' ? run.model : '',
-    elapsedMs: Number.isFinite(run.elapsedMs) && (run.elapsedMs ?? 0) >= 0 ? Math.round(run.elapsedMs ?? 0) : 0,
-    at: Number.isFinite(run.at) && (run.at ?? 0) > 0 ? Math.round(run.at as number) : Date.now(),
-  }
-  return [...(runs ?? []), next].slice(-MAX_LAYA_RUNS_PER_CHAT)
-}
 
 /** Max persisted inbox seen ids — newest win, so the badge store stays bounded. */
 export const MAX_SCHEDULE_RUNS_SEEN = 500
@@ -104,11 +78,8 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
-    // تاریخچه laya هر چت حفظ می‌شود (per-chat) با سقف تازه‌ترین‌ها تا با ریلود نپرد.
-    const layaRuns = Array.isArray(c.layaRuns) ? c.layaRuns.slice(-MAX_LAYA_RUNS_PER_CHAT) : undefined
     return {
       ...clean,
-      ...(layaRuns !== undefined ? { layaRuns } : {}),
       messages: capCompactedMessages(c.messages.map((m) => {
         const msg = { ...m } as Record<string, unknown>
         delete msg.retry
@@ -340,8 +311,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -426,7 +397,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -442,7 +413,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, layaModel, layaBaseUrl, layaProviderId, layaProviderModel, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -626,10 +597,12 @@ interface State {
    *  allow" on the per-folder permission dialog). Reset when the root changes,
    *  same lifecycle as outsideAllowed. */
   outsideFolders: string[]
-  /** Session-scoped "allow desktop-app control" (the `computer` tool's mutating
-   *  actions). Set by "Always allow" on the computer permission dialog; reset
-   *  when the workspace root changes, same lifecycle as outsideAllowed. */
-  computerAllowed: boolean
+  /** Persisted "desktop control enabled" hard switch (Settings → Tools →
+   *  Computer use). Like an MCP connector: when OFF the `computer` tool is
+   *  never bound — the agent cannot touch the desktop at all, even if the
+   *  prompt asks for it. When ON, per-action runtime permission prompting
+   *  still applies until "Always allow". */
+  computerUse: boolean
   /** Global "Ctrl+X prefix armed" hint. The prefix is app-wide (managed in
    *  App.tsx), so this lives at the store root, not per-chat. */
   prefixNotice: string | null
@@ -711,13 +684,6 @@ interface State {
   ttsVoice: string
   embeddingModel: string
   embeddingBaseUrl: string
-  /** مدل تصمیم محلی laya (Settings → Models). */
-  layaModel: string
-  layaBaseUrl: string
-  /** منبع تصمیم سریع laya: 'local' یعنی روتر محلی، غیر آن شناسه پروایدر (مثل STT). */
-  layaProviderId: string
-  /** مدل تصمیم سریع روی پروایدر انتخاب‌شده (مثل انتخاب مدل در Tools)؛ خالی = مدل پیش‌فرض همان پروایدر. */
-  layaProviderModel: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
@@ -727,10 +693,6 @@ interface State {
   setTtsVoice: (v: string) => void
   setEmbeddingModel: (m: string) => void
   setEmbeddingBaseUrl: (u: string) => void
-  setLayaModel: (m: string) => void
-  setLayaBaseUrl: (u: string) => void
-  setLayaProviderId: (id: string) => void
-  setLayaProviderModel: (m: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
@@ -836,14 +798,10 @@ interface State {
     chatId: string,
     providerId: string,
     model: string,
-    delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number; laya?: boolean },
+    delta: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
   ) => void
   /** Zero the cumulative per-model usage of a chat (sidebar "reset" button). */
   resetChatUsage: (chatId: string) => void
-  /** ثبت یک تصمیم سریع laya در تاریخچه همان چت (آخرین ~۲۰ تا) برای پنل راست. */
-  appendLayaRun: (chatId: string, run: Omit<LayaRun, 'at'> & { at?: number }) => void
-  /** پاک‌کردن تاریخچه laya یک چت. */
-  clearLayaRuns: (chatId: string) => void
   /** Set/clear a chat's pending `ask_user` request. Stored on the chat (not
    *  local component state) so it survives the ChatPanel remount that happens
    *  on every chat switch (`key={activeChatId}`) — otherwise a background
@@ -887,7 +845,7 @@ interface State {
   /** Add a per-folder outside-workspace grant ("Always allow" on the per-folder
    *  permission dialog). Idempotent; session-scoped like outsideAllowed. */
   addOutsideFolder: (folder: string) => void
-  setComputerAllowed: (allowed: boolean) => void
+  setComputerUse: (v: boolean) => void
   /** Whether any chat currently has a streaming assistant message (persist gate
    *  and multi-chat "busy" indication). */
   anyStreaming: () => boolean
@@ -1029,10 +987,6 @@ export const useStore = create<State>((set, get) => ({
   ttsVoice: 'alloy',
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
-  layaModel: 'convaiinnovations/laya',
-  layaBaseUrl: '',
-  layaProviderId: 'local',
-  layaProviderModel: '',
   recentModels: [],
   subagentModels: {},
   cacheTtlMinutes: 60,
@@ -1075,7 +1029,7 @@ export const useStore = create<State>((set, get) => ({
   isThinking: false,
   outsideAllowed: false,
   outsideFolders: [],
-  computerAllowed: false,
+  computerUse: false,
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
@@ -1359,10 +1313,6 @@ export const useStore = create<State>((set, get) => ({
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
-      layaModel: typeof raw.layaModel === 'string' && raw.layaModel.trim() ? raw.layaModel : 'convaiinnovations/laya',
-      layaBaseUrl: typeof raw.layaBaseUrl === 'string' ? raw.layaBaseUrl : '',
-      layaProviderId: typeof raw.layaProviderId === 'string' && raw.layaProviderId.trim() ? raw.layaProviderId : 'local',
-      layaProviderModel: typeof raw.layaProviderModel === 'string' ? raw.layaProviderModel.trim() : '',
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
         ? { ...(raw.subagentModels as Record<string, string>) }
         : {},
@@ -1381,6 +1331,8 @@ export const useStore = create<State>((set, get) => ({
         || 90,
       // 0 is a valid, deliberate value (auto-fetch disabled) — keep it.
       webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 3, 0, 10),
+      // Hard desktop-control switch: absent/false in old settings files = OFF.
+      computerUse: (raw as { computerUse?: unknown }).computerUse === true,
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
       // are dropped here so they disappear from Settings → Plugins on reload.
       searchPlugins: searchPlugins.length > 0
@@ -1762,7 +1714,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setRoot: (root) => {
-    set({ root, outsideAllowed: false, outsideFolders: [], computerAllowed: false })
+    set({ root, outsideAllowed: false, outsideFolders: [] })
     get().persist()
   },
 
@@ -1841,22 +1793,6 @@ export const useStore = create<State>((set, get) => ({
   },
   setEmbeddingBaseUrl: (u) => {
     set({ embeddingBaseUrl: (u ?? '').trim() })
-    get().persist()
-  },
-  setLayaModel: (m) => {
-    set({ layaModel: (m ?? '').trim() || 'convaiinnovations/laya' })
-    get().persist()
-  },
-  setLayaBaseUrl: (u) => {
-    set({ layaBaseUrl: (u ?? '').trim() })
-    get().persist()
-  },
-  setLayaProviderId: (id) => {
-    set({ layaProviderId: (id ?? '').trim() || 'local' })
-    get().persist()
-  },
-  setLayaProviderModel: (m) => {
-    set({ layaProviderModel: (m ?? '').trim() })
     get().persist()
   },
   setWebSearchAutoFetch: (n) => {
@@ -2628,15 +2564,12 @@ export const useStore = create<State>((set, get) => ({
     // Keep cache-only events (input=0, output=0, but cacheRead/cacheWrite>0):
     // those are real billed tokens and must not be dropped, otherwise the
     // cached portion silently disappears from the totals.
-    // ورودی صفرتوکنی laya (تصمیم لوکال بدون توکن) هم قبول می‌شود تا ردیف
-    // قابل‌مشاهده در model usage بماند — مثل مدل‌های tools.
-    const isLaya = Boolean(delta.laya)
     const hasTokens =
       (delta.input || 0) > 0 ||
       (delta.output || 0) > 0 ||
       (delta.cacheRead || 0) > 0 ||
       (delta.cacheWrite || 0) > 0;
-    if (!hasTokens && !isLaya) return
+    if (!hasTokens) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== chatId) return c
@@ -2653,7 +2586,6 @@ export const useStore = create<State>((set, get) => ({
             cacheRead: (prev.cacheRead ?? 0) + (delta.cacheRead ?? 0),
             cacheWrite: (prev.cacheWrite ?? 0) + (delta.cacheWrite ?? 0),
             lastUsed: Date.now(),
-            ...(isLaya ? { laya: true } : {}),
           }
         } else {
           entries.push({
@@ -2664,7 +2596,6 @@ export const useStore = create<State>((set, get) => ({
             cacheRead: delta.cacheRead ?? 0,
             cacheWrite: delta.cacheWrite ?? 0,
             lastUsed: Date.now(),
-            ...(isLaya ? { laya: true } : {}),
           })
         }
         // Usage fires once per model call INSIDE a run — don't reorder the
@@ -2698,20 +2629,6 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({
       chats: s.chats.map((c) => (c.id === chatId ? { ...c, pendingPermission: req } : c)),
     }))
-  },
-
-  appendLayaRun: (chatId, run) => {
-    set((s) => ({
-      chats: s.chats.map((c) => (c.id === chatId ? { ...c, layaRuns: appendLayaRun(c.layaRuns, run) } : c)),
-    }))
-    persistSoon()
-  },
-
-  clearLayaRuns: (chatId) => {
-    set((s) => ({
-      chats: s.chats.map((c) => (c.id === chatId ? { ...c, layaRuns: [] } : c)),
-    }))
-    get().persist()
   },
 
   setChatCompacting: (id, compacting) => {
@@ -2795,7 +2712,7 @@ export const useStore = create<State>((set, get) => ({
   clearChat: (id) => {
     set((s) => ({
       chats: s.chats.map((c) =>
-        c.id === id ? { ...c, messages: [], usage: undefined, layaRuns: [], updatedAt: Date.now() } : c,
+        c.id === id ? { ...c, messages: [], usage: undefined, updatedAt: Date.now() } : c,
       ),
     }))
     get().persist()
@@ -2803,13 +2720,18 @@ export const useStore = create<State>((set, get) => ({
 
   truncateTo: (messageId) => {
     const s = get()
-    const chat = s.chats.find((c) => c.id === s.activeChatId)
-    if (!chat) return false
-    const idx = chat.messages.findIndex((m) => m.id === messageId)
+    // Find the chat that actually contains the message instead of assuming
+    // the active chat: a retry click resolves its origin chat first, and
+    // truncating the wrong (viewed) chat would leave the original turn in
+    // place while send() appends a second identical user bubble.
+    const target = s.chats.find((c) => c.messages.some((m) => m.id === messageId))
+    if (!target) return false
+    const idx = target.messages.findIndex((m) => m.id === messageId)
     if (idx === -1) return false
+    const targetId = target.id
     set((st) => ({
       chats: st.chats.map((c) =>
-        c.id === s.activeChatId
+        c.id === targetId
           ? { ...c, messages: c.messages.slice(0, idx), updatedAt: Date.now() }
           : c,
       ),
@@ -2971,7 +2893,7 @@ export const useStore = create<State>((set, get) => ({
           : s.outsideFolders,
     })),
 
-  setComputerAllowed: (allowed) => set({ computerAllowed: allowed }),
+  setComputerUse: (v) => set({ computerUse: v }),
 
   anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
 

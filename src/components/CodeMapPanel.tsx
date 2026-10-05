@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
+import { FileIcon } from './FileIcon'
 import type { CodeMap, CodeSymbol } from '../types'
 import './CodeMapPanel.css'
 
@@ -144,7 +145,9 @@ export function CodeMapPanel({ onJumpToFile }: Props) {
           return (
             <details key={file} open className="codemap-file">
               <summary title={file}>
-                <span className="codemap-file-icon" aria-hidden>📄</span>
+                <span className="codemap-file-icon" aria-hidden>
+                  <FileIcon path={file} size={18} />
+                </span>
                 <span className="codemap-file-name">{file}</span>
                 <span className="codemap-file-count">{syms.length}</span>
               </summary>

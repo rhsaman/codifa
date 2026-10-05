@@ -1389,62 +1389,26 @@ textarea {
   color: var(--text-dim);
 }
 
-/* Thin horizontal drag handle — sits ON the panel's edge (VSCode-style):
-   the top handle straddles the top border, the bottom one the bottom
-   border, so the grab area is exactly at the box edge. */
-.sidebar-panel-resize {
-  height: 10px;
-  margin-top: -5px;
-  margin-bottom: -5px;
-  cursor: ns-resize;
-  display: flex;
+/* "View saved plan" button in the Todos head — opens the Plan viewer tab. */
+.sidebar-panel-plan-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  position: relative;
-  z-index: 1;
-  border-bottom: 1px solid transparent;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: 4px;
+  transition:
+    color 0.12s,
+    background 0.12s;
 }
 
-.sidebar-panel-resize::after {
-  content: "";
-  width: 28px;
-  height: 3px;
-  border-radius: 3px;
-  background: var(--border);
-}
-
-.sidebar-panel-resize:hover::after {
-  background: var(--text-dim);
-}
-
-.sidebar-panel-resize:hover {
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-/* Bottom variant (Todos float panel) — drag DOWN to grow from the bottom.
-   Straddles the panel's bottom border; same look as the top handle. */
-.sidebar-panel-resize.bottom {
-  border-bottom: none;
-  border-top: 1px solid transparent;
-}
-
-/* در پنل شناور Todos هر دو دستگیره از جریان خارج می‌شوند و دقیقاً روی
-   لبهٔ کادر می‌نشینند: بالایی روی لبهٔ بالا (روی هدر، نه زیر آن) و
-   پایینی روی لبهٔ پایین (زیر لیست) — مثل ریسایز پنجره در VSCode. */
-.sidebar-panel.todos-float .sidebar-panel-resize {
-  position: absolute;
-  left: 0;
-  right: 0;
-  margin: 0;
-}
-
-.sidebar-panel.todos-float .sidebar-panel-resize:not(.bottom) {
-  top: -5px;
-}
-
-.sidebar-panel.todos-float .sidebar-panel-resize.bottom {
-  top: auto;
-  bottom: -5px;
+.sidebar-panel-plan-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
 }
 
 .sidebar-todos-list {
@@ -1559,33 +1523,276 @@ textarea {
   text-overflow: ellipsis;
 }
 
-/* پنل Todos شناور — دیگر در سایدبار نیست؛ با درگ هدر به هر جای صفحه
-   جابه‌جا می‌شود و موقعیتش در coder:todoPanel ذخیره می‌شود. */
-.sidebar-panel.todos-float {
-  position: fixed;
-  z-index: var(--z-todos-float);
-  width: 300px;
-  max-width: calc(100vw - 32px);
+/* ── بخش ساب‌ایجنت‌های پس‌زمینه در پنل راست ─────────────────────────── */
+.sidebar-subagents-list {
+  list-style: none;
   margin: 0;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%),
-      var(--bg-input));
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
-    0 10px 32px rgba(0, 0, 0, 0.3);
-  margin-bottom: 0;
-  /* دستگیره‌های بالا/پایین نیمهٔ بیرونی‌شان بیرون کادر است — کلیپ نشود. */
-  overflow: visible;
+  padding: 0 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  overflow-y: auto;
+  max-height: 240px;
 }
 
-.sidebar-panel.todos-float .sidebar-panel-head {
-  cursor: grab;
+.sidebar-subagent-item {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  align-items: center;
+  margin: 0 8px;
+  padding: 7px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.45;
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  transition:
+    color 0.16s ease,
+    background 0.16s ease,
+    border-color 0.16s ease,
+    transform 0.16s ease,
+    box-shadow 0.16s ease;
 }
 
-.sidebar-panel.todos-float .sidebar-panel-head:active {
-  cursor: grabbing;
+.sidebar-subagent-item:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border-color: color-mix(in srgb, var(--text) 16%, transparent);
+}
+
+.sidebar-subagent-item.status-running {
+  color: var(--text);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 12%, transparent), color-mix(in srgb, var(--accent) 6%, transparent));
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  box-shadow: 0 1px 8px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.sidebar-subagent-item.status-failed {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--thinking) 35%, transparent);
+}
+
+.sidebar-subagent-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-dim) 55%, transparent);
+}
+
+.sidebar-subagent-item.status-running .sidebar-subagent-dot {
+  background: var(--accent);
+  animation: pulse 1.2s infinite;
+}
+
+.sidebar-subagent-item.status-completed .sidebar-subagent-dot {
+  background: color-mix(in srgb, var(--accent) 75%, transparent);
+}
+
+.sidebar-subagent-item.status-failed .sidebar-subagent-dot,
+.sidebar-subagent-item.status-stopped .sidebar-subagent-dot {
+  background: color-mix(in srgb, var(--thinking) 70%, transparent);
+}
+
+.sidebar-subagent-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: none;
+  background: transparent;
+  padding: 1px 2px;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.sidebar-subagent-main:hover .sidebar-subagent-desc {
+  color: var(--text);
+}
+
+.sidebar-subagent-main:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.sidebar-subagent-open {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
+  font-size: 14px;
+  line-height: 1;
+  padding-inline-end: 2px;
+  transition:
+    color 0.14s,
+    transform 0.14s;
+}
+
+.sidebar-subagent-item:hover .sidebar-subagent-open {
+  color: var(--text);
+  transform: translateX(1px);
+}
+
+.sidebar-subagent-detail {
+  flex: 1 0 100%;
+  min-width: 0;
+  overflow: hidden;
+  border-top: 1px dashed color-mix(in srgb, var(--text-dim) 35%, transparent);
+  padding-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sidebar-subagent-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 170px;
+  overflow-y: auto;
+}
+
+/* هر ردیف مثل کارت ابزار داخل چت: نشان وضعیت + نام ابزار (مونو) +
+   خلاصه کوتاه — همه با ellipsis تا هیچ‌وقت از کارت بیرون نزند. */
+.sub-ev {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.sub-ev-mark {
+  flex: 0 0 auto;
+  width: 10px;
+  text-align: center;
+  font-size: 8px;
+  line-height: 1;
+}
+
+.sub-ev.running .sub-ev-mark {
+  color: var(--accent);
+  animation: pulse 1.2s infinite;
+}
+
+.sub-ev.done .sub-ev-mark {
+  color: var(--accent);
+}
+
+.sub-ev.note .sub-ev-mark {
+  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
+}
+
+.sub-ev-tool {
+  flex: 0 0 auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 9.5px;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.sub-ev-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-ev.done .sub-ev-text {
+  color: color-mix(in srgb, var(--text) 75%, transparent);
+}
+
+.sidebar-subagent-report {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow-y: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.sidebar-subagent-report.empty {
+  font-style: italic;
+}
+
+.sidebar-subagent-desc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: inherit;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.sidebar-subagent-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-subagent-open {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text-dim) 70%, transparent);
+  font-size: 14px;
+  line-height: 1;
+  padding-inline-end: 2px;
+  transition:
+    color 0.14s,
+    transform 0.14s;
+}
+
+.sidebar-subagent-item:hover .sidebar-subagent-open {
+  color: var(--text);
+  transform: translateX(1px);
+}
+
+.sidebar-subagent-stop {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, transparent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0;
+  transition:
+    color 0.14s,
+    border-color 0.14s,
+    background 0.14s;
+}
+
+.sidebar-subagent-stop:hover:not(:disabled) {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--text) 50%, transparent);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.sidebar-subagent-stop:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ---- Titlebar usage chip (total chat tokens; details on hover) ----
@@ -3238,20 +3445,8 @@ textarea {
   transition: transform 0.15s ease;
 }
 
-.summary-chevron.open {
-  transform: rotate(90deg);
-}
-
 .summary-block.collapsed .summary-head {
   border-bottom: none;
-}
-
-.summary-body {
-  padding: 10px 14px 12px;
-  font-size: 12.5px;
-  line-height: 1.6;
-  max-height: 420px;
-  overflow-y: auto;
 }
 
 /* channel-glow: subtle accent ring so the checkpoint reads as "breathed in"
@@ -4779,6 +4974,7 @@ textarea {
 
 .tool-sub-row .tool-sub-args {
   color: var(--text);
+  direction: ltr;
   overflow-wrap: anywhere;
   white-space: normal;
   min-width: 0;
@@ -4885,7 +5081,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  opacity: 0.7;
+  opacity: 0.85;
 }
 
 .copy-btn {
@@ -7400,8 +7596,9 @@ textarea {
 .ctx-ring-wrap {
   position: relative;
   display: inline-flex;
-  margin-inline-start: auto;
-  margin-inline-end: 6px;
+  /* Sits right after the "+" button now (the old `auto` pushed it right). */
+  margin-inline-start: 6px;
+  margin-inline-end: 0;
 }
 
 .ctx-ring-btn {
@@ -8306,6 +8503,126 @@ textarea {
   padding: 4px 2px 2px;
 }
 
+/* A slash command typed/inserted into the composer paints its text with the
+   accent color (Codex-style) — plain text, no chip card over the input. */
+.composer-input.slash-active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- prompt history popup (ArrowUp): Codex-style cards above the input ---- */
+.history-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+
+.hist-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hist-section-label {
+  padding: 2px 8px 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.hist-card {
+  padding: 9px 11px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-alt) 70%, transparent);
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease;
+}
+
+.hist-card:hover,
+.hist-card.kbd {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-alt));
+}
+
+.hist-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hist-card-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* Slash commands get the purple accent glyph, like Codex's command cards. */
+.hist-card-icon.cmd {
+  color: var(--accent);
+}
+
+.hist-card-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hist-card.kbd .hist-card-title,
+.hist-card:hover .hist-card-title {
+  color: var(--accent);
+}
+
+/* Second card row: the full prompt text, muted + ellipsized. */
+.hist-card-sub {
+  margin-top: 4px;
+  padding-left: 21px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hist-hint {
+  padding: 2px 0 0;
+  font-size: 11px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.history-pin {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.history-pin:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.history-pin.on {
+  color: var(--accent);
+}
+
 .mention-item.mcp-toggle {
   flex-direction: column;
   align-items: flex-start;
@@ -8447,22 +8764,13 @@ textarea {
     0 4px 12px -6px rgba(0, 0, 0, 0.3);
 }
 
-/* File chip: a small paper-clip icon so plain file paths read as "file
-   badges" instead of bare text. Queue/image chips already carry their own
-   icon or thumbnail, so they opt out. */
-.attachment-chip:not(.file-chip):not(.queued-chip):not(.image-chip)::before {
-  content: "📎";
-  flex: 0 0 auto;
-  font-size: 10px;
-  opacity: 0.75;
-  filter: saturate(0.6);
-}
+/* File attachment chips render FileIcon next to the path; no pin glyph. */
 
 /* Input file badge: small compact pill — icon + name + X.
    Completely override base attachment-chip: no gradient, no shadow, tiny. */
 .attachment-chip.file-chip {
   position: relative;
-  gap: 3px;
+  gap: 1px;
   padding: 4px 6px 4px 5px;
   border: none;
   background: var(--bg-alt);
@@ -8480,11 +8788,11 @@ textarea {
   background: color-mix(in srgb, var(--bg-panel) 70%, var(--text) 12%);
 }
 
-.chip-file-icon {
+/* Composer file chips render FileIcon (13px tile) next to the name. */
+.attachment-chip.file-chip .file-icon-svg {
   flex: 0 0 auto;
-  width: 11px;
-  height: 11px;
-  color: var(--text-dim);
+  width: 20px;
+  height: 20px;
 }
 
 .chip-file-name {
@@ -9446,6 +9754,7 @@ textarea {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
+  opacity: 0.85;
   overflow-wrap: anywhere;
   min-width: 0;
 }
@@ -10602,14 +10911,17 @@ textarea {
   gap: 4px;
   width: 100%;
   box-sizing: border-box;
-  background: var(--bg-elev, rgba(127, 127, 127, 0.06));
-  border: 1px solid var(--border, rgba(127, 127, 127, 0.14));
-  border-radius: 8px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding-inline-start: 2px;
 }
 
 .file-result {
   display: flex;
-  align-items: baseline;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
   gap: 8px;
   width: 100%;
   font-size: 12px;
@@ -10647,7 +10959,7 @@ textarea {
   flex: 1 1 auto;
   min-width: 0;
   color: var(--text-dim, #8a8a8a);
-  opacity: 0.85;
+  opacity: 0.7;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -12114,6 +12426,15 @@ textarea {
   scrollbar-gutter: stable;
 }
 
+/* Center the plan's content column exactly like the chat does
+   (.chat-messages: max-width + auto margins), so at wide panel widths the
+   plan sits in a centered reading column instead of stretching edge-to-edge
+   and hugging the right/left side. */
+.plan-panel-content {
+  max-width: var(--chat-max-w);
+  margin-inline: auto;
+}
+
 /* Inner content keeps the app direction via its own dir attribute —
    no direction override here so RTL text stays RTL while the outer
    scroll container (and its scrollbar) stays LTR on the right edge. */
@@ -12767,7 +13088,7 @@ textarea {
    it (no fullscreen dark overlay). Section titles on the left, the selected
    section's full content on the right. */
 /* ============================================================
-   Reading Mode — right-side study panel
+   Reading Mode — centered study panel
    ============================================================ */
 .reading-mode {
   position: fixed;
@@ -12806,13 +13127,18 @@ textarea {
 }
 
 /* Floating card — rounded and lifted off the screen edge instead of a
-   full-height slab, so the panel reads as a focused surface. */
+   full-height slab, so the panel reads as a focused surface. Horizontally
+   CENTERED (inset both sides + auto margins): a right-anchored card pushed
+   the text column to the right of the screen, unlike the centered chat
+   column this panel mirrors. */
 .reading-mode-panel {
   position: absolute;
   top: 12px;
+  left: 12px;
   right: 12px;
   bottom: 12px;
   width: var(--reading-w);
+  margin-inline: auto;
   /* Hard safety net: never let the panel overflow the viewport, even if the
      saved width is larger than the current window. */
   max-width: calc(100vw - 24px);
@@ -13290,6 +13616,11 @@ textarea {
 /* Section content — fades in on every section switch. */
 .reading-mode-content-inner {
   padding: 20px 26px 32px;
+  /* Same centered reading column as the chat (see .chat-messages): the
+     section text stays centered at wide panel widths instead of hugging
+     the side. */
+  max-width: var(--chat-max-w);
+  margin-inline: auto;
   animation: reading-content-in 0.22s ease;
 }
 
@@ -15042,7 +15373,7 @@ textarea {
 .review-file-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   width: 100%;
   padding: 6px 12px;
   background: transparent;
@@ -15087,6 +15418,8 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
+  color: var(--text-dim);
+  opacity: 0.85;
 }
 
 .review-file-counts {
@@ -16111,157 +16444,6 @@ mark.diff-hit-active {
   transition: width 0.3s ease;
 }
 
-/* ---- سکشن زنده Laya زیر todos: کارت جذاب با بج مسیر و نوار اطمینان ---- */
-.laya-docked {
-  margin-top: 10px;
-}
-
-.laya-run-list {
-  list-style: none;
-  margin: 8px 0 0;
-  padding: 0 10px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 420px;
-  overflow-y: auto;
-}
-
-.laya-run-card {
-  border: 1px solid var(--hairline);
-  border-radius: 12px;
-  padding: 9px 10px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--bg-panel) 60%, var(--bg) 40%),
-      var(--bg));
-  box-shadow: var(--shadow-card);
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.laya-run-card.laya-local {
-  border-inline-start: 3px solid var(--success);
-}
-
-.laya-run-card.laya-external {
-  border-inline-start: 3px solid var(--accent);
-}
-
-.laya-run-card.laya-fallback {
-  border-inline-start: 3px solid var(--thinking);
-  opacity: 0.92;
-}
-
-.laya-run-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.laya-route-badge {
-  font-size: 11px;
-  font-weight: 800;
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg));
-  color: var(--text);
-  white-space: nowrap;
-}
-
-.laya-route-badge.route-computer {
-  background: color-mix(in srgb, var(--success) 16%, var(--bg));
-  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
-}
-
-.laya-route-badge.route-browser {
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg));
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-}
-
-.laya-tone-badge {
-  font-size: 10.5px;
-  font-weight: 700;
-  padding: 2px 8px;
-  border-radius: 999px;
-  color: var(--text-dim);
-  border: 1px solid var(--hairline);
-  white-space: nowrap;
-}
-
-.laya-tone-badge.tone-local {
-  color: var(--success);
-}
-
-.laya-tone-badge.tone-external {
-  color: var(--accent);
-}
-
-.laya-tone-badge.tone-fallback {
-  color: var(--thinking);
-}
-
-.laya-run-time {
-  margin-inline-start: auto;
-  font-size: 10.5px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.laya-confidence-track {
-  height: 5px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text) 10%, transparent);
-  overflow: hidden;
-}
-
-.laya-confidence-fill {
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #cba6f7));
-  transition: width 0.3s ease;
-}
-
-.laya-run-card.laya-local .laya-confidence-fill {
-  background: linear-gradient(90deg, var(--success), color-mix(in srgb, var(--success) 55%, var(--accent)));
-}
-
-.laya-run-card.laya-fallback .laya-confidence-fill {
-  background: linear-gradient(90deg, var(--thinking), color-mix(in srgb, var(--thinking) 55%, var(--accent)));
-}
-
-.laya-run-meta {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-}
-
-.laya-confidence-num {
-  font-size: 11px;
-  font-weight: 800;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-  flex: 0 0 auto;
-}
-
-.laya-run-reason {
-  font-size: 11px;
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
-.laya-run-empty {
-  padding: 4px 12px 12px;
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-
 /* ---- Trace panel (لاگ چت جاری مثل لنگ‌اسمیت): ردیف‌های تاشو + بلوک پرامپت تمیز ---- */
 .trace-panel-list {
   flex: 1 1 auto;
@@ -16405,10 +16587,6 @@ mark.diff-hit-active {
   opacity: 0.7;
 }
 
-.trace-panel-dot.kind-laya {
-  background: var(--success);
-}
-
 .trace-panel-dot.kind-llm {
   background: var(--accent);
 }
@@ -16492,11 +16670,6 @@ mark.diff-hit-active {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   flex: 0 0 auto;
-}
-
-.trace-kind-badge.kind-laya {
-  color: var(--success);
-  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
 }
 
 .trace-kind-badge.kind-llm {
@@ -16964,48 +17137,6 @@ mark.trace-hit-active {
 
 .model-card-body .field-label {
   margin-top: 2px;
-}
-
-/* کارت Laya: دراپ‌داون مدل‌پیکر (مثل Tools) نباید زیر لبهٔ کارت بریده شود.
- * overflow:hidden کارت برای گوشه‌های گرد لازم است، ولی برای همین کارت
- * visible می‌گذاریم تا لیست پروایدر/مدل کامل دیده شود. */
-.model-card-laya {
-  overflow: visible;
-}
-
-/* سوئیچ دوحالتهٔ Decision provider: فقط لوکال یا خارجی */
-.laya-switch {
-  display: flex;
-  gap: 6px;
-  padding: 4px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg-input);
-}
-
-.laya-switch-btn {
-  flex: 1 1 0;
-  padding: 7px 10px;
-  border-radius: 7px;
-  border: 0;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-  transition:
-    background 0.13s,
-    color 0.13s;
-}
-
-.laya-switch-btn:hover {
-  color: var(--text);
-}
-
-.laya-switch-btn.active {
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg-panel));
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 .model-badge {
@@ -17685,6 +17816,7 @@ mark.trace-hit-active {
 .tab-bar.viewer-tabs {
   gap: 6px;
   padding: 6px 12px;
+  direction: ltr;
   align-items: center;
   background: transparent;
   border-bottom: 1px solid var(--hairline);
@@ -18047,17 +18179,8 @@ mark.trace-hit-active {
   background: color-mix(in srgb, var(--link, #6ea8fe) 12%, transparent);
 }
 
-.browser-subbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
-  font-size: 11px;
-  color: var(--text-dim, #9aa0a6);
-}
-
-.browser-device-select {
+.browser-dims-input {
+  width: 52px;
   height: 24px;
   padding: 0 6px;
   border: 1px solid var(--hairline, rgba(255, 255, 255, 0.14));
@@ -18065,13 +18188,46 @@ mark.trace-hit-active {
   background: color-mix(in srgb, var(--text, #e8e8ea) 6%, transparent);
   color: var(--text, #e8e8ea);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   outline: none;
 }
 
-.browser-device-select option,
-.browser-device-select optgroup {
-  background: #1b1d22;
-  color: #e8e8ea;
+.browser-dims-input:focus {
+  border-color: var(--link, #6ea8fe);
+}
+
+.browser-apply-btn {
+  width: 24px;
+  height: 24px;
+  font-size: 12px;
+}
+
+.browser-sizebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  font-size: 11px;
+  color: var(--text-dim, #9aa0a6);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.browser-fit-btn svg {
+  display: block;
+}
+
+.browser-width-slider {
+  flex: 1 1 auto;
+  min-width: 80px;
+  accent-color: var(--link, #6ea8fe);
+  cursor: pointer;
+}
+
+.browser-width-slider:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .browser-size {
@@ -18125,6 +18281,41 @@ mark.trace-hit-active {
   color: var(--error, #e5484d);
 }
 
+/* ——— Virtual browser: responsive frame fit ———
+   Higher specificity (.browser-panel prefix) so the fit wins regardless of
+   declaration order: the frame letterboxes inside the stage (fits BOTH axes
+   of any panel size), the device row wraps instead of truncating the size
+   label, and the toolbar mouse toggle gets an active accent. */
+.browser-panel .browser-stage-inner {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.browser-panel .browser-stage-img {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.browser-panel .browser-dims-input {
+  min-width: 0;
+}
+
+.browser-panel .browser-size {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.browser-panel .browser-tool-btn--on {
+  background: color-mix(in srgb, var(--link, #6ea8fe) 22%, transparent);
+  border-color: color-mix(in srgb, var(--link, #6ea8fe) 45%, transparent);
+  color: var(--link, #6ea8fe);
+}
+
 /* Chrome-like polish: single omnibox, tidy device row, clean stage. */
 .browser-panel {
   gap: 0;
@@ -18171,4 +18362,537 @@ mark.trace-hit-active {
   margin: auto;
   padding: 24px;
   text-align: center;
+}
+
+/* ── File-type icons & clickable file chips ────────────────────────────────
+   Every file name in the UI (chat inline code, code-block heads, tool rows,
+   viewer tabs, diff list, code map) renders a small tinted squircle tile
+   with the extension monogram for its extension. FileIcon emits pure SVG
+   (no DOM text node), so text-extracting parents (CodeBlock over markdown
+   children) read only the file name back. File paths render dimmer than
+   body text and carry NO underline/highlight — the icon alone marks them
+   as files. The icon always sits on the LEFT of the path: every icon+path
+   row forces dir=ltr, so RTL chat never mirrors the order. */
+.file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  vertical-align: -2px;
+}
+
+.file-icon-svg {
+  display: block;
+  flex: 0 0 auto;
+  border-radius: 30%;
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.35));
+}
+
+/* Clickable file chip: icon on the left + dimmed path, no underline. */
+.file-chip {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  margin: 0;
+  font: inherit;
+  color: var(--text-dim);
+  opacity: 0.85;
+  cursor: pointer;
+  border-radius: 4px;
+  vertical-align: baseline;
+  text-align: start;
+  max-width: 100%;
+}
+
+.file-chip:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  opacity: 1;
+}
+
+.file-chip:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--text) 40%, transparent);
+}
+
+.file-chip-name {
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* Code-block head path becomes a chip: keep the head layout, add affordance. */
+.code-block-path-open {
+  cursor: pointer;
+  opacity: 0.85;
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+}
+
+.code-block-path-open:hover {
+  opacity: 1;
+}
+
+/* Tool rows keep their compact mono look; just align the small badge. */
+.tool-card-head .tool-path {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  opacity: 0.85;
+}
+
+.tool-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+/* Wrote/Edited head: verb stays bright, the file part is dimmed; the icon
+   sits directly before the file name (not before the verb). */
+.tool-card-head .tool-name .tool-verb {
+  color: var(--text);
+}
+
+.tool-card-head .tool-name .tool-file {
+  display: inline-flex;
+  flex-direction: row;
+  direction: ltr;
+  align-items: center;
+  gap: 1px;
+  color: var(--text-dim);
+  opacity: 0.85;
+  min-width: 0;
+}
+
+.tool-card-head .tool-name .tool-file-name {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* Code map summary icon slot already sized; badge fills it. */
+.codemap-file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Review file list: the ext badge slot now shows the colored icon. */
+.review-file-ext {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 2px;
+  background: none;
+}
+
+/* ── File viewer tab (FileViewerPanel) ──────────────────────────────────── */
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg, #101418);
+}
+
+.file-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.file-viewer-dir {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.6;
+}
+
+.file-viewer-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-viewer-line {
+  color: var(--text-dim);
+}
+
+.file-viewer-spacer {
+  margin-left: auto;
+}
+
+.fv-copy {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.fv-copy:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.fv-copy.copied {
+  color: var(--text);
+}
+
+.file-viewer-note {
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.file-viewer-image {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.file-viewer-image img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 6px;
+}
+
+.file-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.file-viewer-pre {
+  margin: 0;
+  padding: 8px 0 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  display: block;
+}
+
+.fv-line {
+  display: block;
+  position: relative;
+  padding: 0 12px 0 52px;
+  white-space: pre;
+}
+
+.fv-line.target {
+  background: color-mix(in srgb, #4ea1ff 20%, transparent);
+}
+
+.fv-gutter {
+  position: absolute;
+  left: 0;
+  width: 40px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-dim);
+  opacity: 0.55;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── Text viewer tab (TextViewerPanel) ──────────────────────────────────── */
+.text-viewer-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.text-viewer-pre {
+  margin: 0;
+  padding: 10px 14px 16px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* External-editor buttons (nvim / VS Code) in the file-viewer head. */
+.fv-ext {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.fv-ext:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* "Open in" split button + dropdown in the file-viewer head. Mirrors the
+   composer plus-menu language: tonal surface, accent hover, blurred pop. */
+.fv-open-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.fv-open-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
+}
+
+.fv-open-btn:hover,
+.fv-open-btn[aria-expanded="true"] {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.fv-open-btn svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.fv-open-chev {
+  font-size: 9px;
+  opacity: 0.7;
+  transition: transform 0.14s ease;
+}
+
+.fv-open-chev.open {
+  transform: rotate(180deg);
+}
+
+.fv-open-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 248px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-pop);
+  z-index: 40;
+  backdrop-filter: blur(24px) saturate(1.2);
+  transform-origin: top right;
+  animation: plus-menu-in 0.14s ease-out;
+}
+
+.fv-open-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.fv-open-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.fv-open-item:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.fv-open-icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.fv-open-icon-nvim {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+
+.fv-open-icon-vscode {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+  color: var(--link);
+}
+
+.fv-open-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.fv-open-label {
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.fv-open-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* "+N more" result rows open the full list in the side panel. */
+.file-result-more-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  opacity: 0.8;
+  cursor: pointer;
+}
+
+.file-result-more-btn:hover {
+  color: var(--text);
+  opacity: 1;
+  text-decoration: underline;
+}
+
+/* Attachment chips in messages open the file in the side panel. */
+.attachment-chip-open {
+  cursor: pointer;
+}
+
+.attachment-chip-open:hover {
+  color: var(--text);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent),
+    0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+/* Long terminal output / tool paths open in the side panel. */
+.trace-terminal-output.clickable {
+  cursor: pointer;
+}
+
+.trace-terminal-output.clickable:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.tool-path.tool-path-open {
+  cursor: pointer;
+}
+
+.tool-path.tool-path-open:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+/* File-viewer syntax colors follow the ACTIVE APP THEME — overrides the
+   global github-dark token palette (higher specificity wins regardless of
+   stylesheet order). */
+.file-viewer-pre.hljs {
+  color: var(--text);
+  background: transparent;
+}
+
+.file-viewer-pre .hljs-comment,
+.file-viewer-pre .hljs-quote {
+  color: var(--text-dim);
+}
+
+.file-viewer-pre .hljs-keyword,
+.file-viewer-pre .hljs-selector-tag,
+.file-viewer-pre .hljs-literal,
+.file-viewer-pre .hljs-doctag,
+.file-viewer-pre .hljs-name,
+.file-viewer-pre .hljs-tag {
+  color: var(--accent);
+}
+
+.file-viewer-pre .hljs-string,
+.file-viewer-pre .hljs-regexp,
+.file-viewer-pre .hljs-addition {
+  color: var(--success);
+}
+
+.file-viewer-pre .hljs-number,
+.file-viewer-pre .hljs-symbol,
+.file-viewer-pre .hljs-bullet,
+.file-viewer-pre .hljs-attr,
+.file-viewer-pre .hljs-variable,
+.file-viewer-pre .hljs-template-variable,
+.file-viewer-pre .hljs-type,
+.file-viewer-pre .hljs-attribute {
+  color: var(--thinking);
+}
+
+.file-viewer-pre .hljs-title,
+.file-viewer-pre .hljs-title.function_,
+.file-viewer-pre .hljs-section,
+.file-viewer-pre .hljs-built_in,
+.file-viewer-pre .hljs-link {
+  color: var(--link);
+}
+
+.file-viewer-pre .hljs-deletion {
+  color: var(--danger);
+}
+
+.file-viewer-pre .hljs-emphasis {
+  font-style: italic;
+}
+
+.file-viewer-pre .hljs-strong {
+  font-weight: 700;
 }

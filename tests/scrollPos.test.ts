@@ -182,22 +182,55 @@ console.log('7) scrollPosForFlush (a pin outranks a stale/absent capture on leav
 
 console.log('8) shouldLandOnLatest (returning to a chat follows live/new messages):')
 {
-  const { shouldLandOnLatest } = await import('../src/lib/scroll.ts')
+  const { shouldLandOnLatest, messageFingerprint } = await import('../src/lib/scroll.ts')
+  const mk = (id: string, content: string) => ({ id, content })
 
-  // Agent still streaming in that chat → follow the live turn:
-  check('streaming → land on the newest message', shouldLandOnLatest({ streaming: true, lastMessageId: 'm5', seenLastMessageId: 'm4' }))
+  // Agent still active in that chat → follow the live turn:
+  check('agent active → land on the newest message', shouldLandOnLatest({ agentActive: true, fingerprint: 'fp1', seenFingerprint: 'fp1' }))
 
   // Agent posted a new message while the user was away:
-  check('new message while away → follow it', shouldLandOnLatest({ streaming: false, lastMessageId: 'm9', seenLastMessageId: 'm4' }))
+  check('new message while away → follow it', shouldLandOnLatest({ agentActive: false, fingerprint: 'fp2', seenFingerprint: 'fp1' }))
 
   // Nothing new happened → restore the saved anchor:
-  check('no new message → keep the saved anchor', shouldLandOnLatest({ streaming: false, lastMessageId: 'm4', seenLastMessageId: 'm4' }) === false)
+  check('no new message → keep the saved anchor', shouldLandOnLatest({ agentActive: false, fingerprint: 'fp1', seenFingerprint: 'fp1' }) === false)
 
   // Never viewed this session → keep the persisted anchor:
-  check('no leave record → keep the persisted anchor', shouldLandOnLatest({ streaming: false, lastMessageId: 'm9', seenLastMessageId: undefined }) === false)
+  check('no leave record → keep the persisted anchor', shouldLandOnLatest({ agentActive: false, fingerprint: 'fp2', seenFingerprint: undefined }) === false)
 
   // Empty chat → nothing to follow:
-  check('empty chat → keep the saved anchor', shouldLandOnLatest({ streaming: false, lastMessageId: '', seenLastMessageId: 'm4' }) === false)
+  check('empty chat → keep the saved anchor', shouldLandOnLatest({ agentActive: false, fingerprint: '', seenFingerprint: 'fp1' }) === false)
+
+  // Fingerprint: same id but grown content (streamed in place) differs:
+  const before = messageFingerprint([mk('m1', 'hello')])
+  const grown = messageFingerprint([mk('m1', 'hello world, much longer now')])
+  check('grown message changes the fingerprint', before !== '' && before !== grown, { before, grown })
+
+  // Fingerprint: identical transcript is stable:
+  check('identical transcript keeps the fingerprint', messageFingerprint([mk('m1', 'hello')]) === before)
+
+  // Fingerprint: empty transcript is empty:
+  check('empty transcript fingerprints empty', messageFingerprint([]) === '')
+}
+
+console.log('9) scrollMatchesPin (pin events must not unpin auto-scroll):')
+{
+  const { scrollMatchesPin } = await import('../src/lib/scroll.ts')
+  const fresh = { top: 1000, at: Date.now() }
+
+  // The pin's own late event / content growth under the pin: same position:
+  check('event at the pinned position is programmatic', scrollMatchesPin(1000, fresh))
+
+  // Sub-pixel rounding still counts:
+  check('sub-pixel drift still matches', scrollMatchesPin(1000.6, fresh))
+
+  // The user scrolled up: position moved:
+  check('moved position is a user scroll', scrollMatchesPin(940, fresh) === false)
+
+  // No pin recorded:
+  check('no pin → user event', scrollMatchesPin(1000, null) === false)
+
+  // Stale pin (older than the freshness window) is a coincidence:
+  check('stale pin does not match', scrollMatchesPin(1000, { top: 1000, at: Date.now() - 60000 }) === false)
 }
 
 if (failed > 0) {

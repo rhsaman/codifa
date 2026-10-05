@@ -550,12 +550,9 @@ def test_loop_nudges_one_at_a_time_greps_different_scopes():
 
 
 class _CoveredReadLoopModel:
-    """The reported regression: the model keeps paging a file it already
-    holds on every step. Each page overlaps the fetched window (>=80%), so
-    each repeat returns a stub AFTER burning the round-trip — the loop must
-    warn on every repeat and hard-stop at the ignore limit. Offsets vary on
-    purpose so the identical-args doom-loop guard cannot mask the coverage
-    guard being tested here."""
+    """The model keeps paging a file it already holds on every step.
+    Every repeat is served in full — no warning, no hard stop; the loop
+    runs to the model's own step budget."""
 
     model_name = "fake-covered-read-loop"
 
@@ -597,10 +594,9 @@ class _CoveredReadLoopModel:
         return _Bound(self)
 
 
-def test_loop_hard_stops_after_ignored_coverage():
-    """Regression lock for the reported repeat: a covered read must warn on
-    every step (no once-per-turn silence) and the loop must hard-stop once
-    the ignore limit is passed instead of burning round-trips forever."""
+def test_loop_serves_repeated_reads_without_stop():
+    """Repeated overlapping reads are all served; no coverage stop order
+    is ever injected and the loop runs to the model's own budget."""
     model = _CoveredReadLoopModel(steps=8)
     reads: list[dict] = []
 
@@ -619,14 +615,10 @@ def test_loop_hard_stops_after_ignored_coverage():
             emit=None,
         )
     )
-    assert model.saw_stop, "the stop order must reach the model"
-    # Stop order goes out on the 3rd ignored step, then ONE further step is
-    # allowed to comply before the hard break — anything more means the
-    # guard never fired (the model would have run to its own 8-step budget).
-    assert len(reads) <= 6, (
-        f"the ignore limit must hard-stop the loop, but it ran {len(reads)} reads"
+    assert not model.saw_stop, "no coverage stop order must reach the model"
+    assert len(reads) == model._max, (
+        f"every repeat must execute, but only {len(reads)} ran"
     )
-    assert len(reads) < model._max
 
 
 class _TwoThenOneGrepModel:

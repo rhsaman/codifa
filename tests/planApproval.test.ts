@@ -157,32 +157,34 @@ console.log("۶-ب) planDisplay — متن پلن بین دو ابزار (update
   )
 }
 
-const { useViewerTabs } = await import("../src/lib/viewerTabs")
+const { useViewerTabs, visibleTabs } = await import("../src/lib/viewerTabs")
+const { useStore } = await import("../src/lib/store")
 
 console.log("۷) تب Plan — openPlan تب plan می‌سازد و فعال می‌کند:")
 {
-  useViewerTabs.getState().closeViewer("plan")
+  for (const t of useViewerTabs.getState().tabs.filter((x) => x.kind === "plan")) useViewerTabs.getState().closeViewer(t.id)
   useViewerTabs.getState().openPlan()
   const s = useViewerTabs.getState()
   const tab = s.tabs.find((t) => t.kind === "plan")
   check("تب plan وجود دارد", !!tab)
-  check("تب plan فعال است", s.activeId === "plan")
+  check("تب plan فعال است", !!tab && s.activeId === tab.id)
   check("عنوان Plan است", tab?.title === "Plan")
+  check("تب به چت فعال منتسب است", tab?.chatId === useStore.getState().activeChatId, tab)
   // reopen فقط فوکوس می‌کند — تب تکراری ساخته نمی‌شود
   useViewerTabs.getState().openPlan()
   check("تب تکراری ساخته نمی‌شود", useViewerTabs.getState().tabs.filter((t) => t.kind === "plan").length === 1)
-  useViewerTabs.getState().closeViewer("plan")
+  if (tab) useViewerTabs.getState().closeViewer(tab.id)
   check("closeViewer حذف می‌کند", !useViewerTabs.getState().tabs.some((t) => t.kind === "plan"))
 }
 
 console.log("۷-ب) تب Browser — openBrowser تب browser را می‌سازد و فعال می‌کند:")
 {
-  useViewerTabs.getState().closeViewer("browser")
+  for (const t of useViewerTabs.getState().tabs.filter((x) => x.kind === "browser")) useViewerTabs.getState().closeViewer(t.id)
   useViewerTabs.getState().openBrowser()
   const s = useViewerTabs.getState()
   const tab = s.tabs.find((t) => t.kind === "browser")
   check("تب browser وجود دارد", !!tab)
-  check("تب browser فعال است", s.activeId === "browser")
+  check("تب browser فعال است", !!tab && s.activeId === tab.id)
   check("عنوان Browser است", tab?.title === "Browser")
   // Reopening only focuses the single tab — no duplicate is created.
   useViewerTabs.getState().openBrowser()
@@ -190,21 +192,36 @@ console.log("۷-ب) تب Browser — openBrowser تب browser را می‌ساز
     "تب تکراری ساخته نمی‌شود",
     useViewerTabs.getState().tabs.filter((t) => t.kind === "browser").length === 1,
   )
-  useViewerTabs.getState().closeViewer("browser")
+  if (tab) useViewerTabs.getState().closeViewer(tab.id)
   check("closeViewer حذف می‌کند", !useViewerTabs.getState().tabs.some((t) => t.kind === "browser"))
 }
 
-console.log("۷-ج) presetForViewport — پریست‌ها دقیقاً مثل لیست دستگاه‌های کروم:")
+console.log("۷-ه) تب‌های browser/git چت‌محورند — هر چت تب‌های خودش را دارد:")
 {
-  const { VIEWPORT_PRESETS, PRESET_GROUP_ORDER, presetForViewport } = await import("../src/lib/browserViewport")
-  check("۴۷ پریست دارد (۴۶ دستگاه کروم + دسکتاپ پیش‌فرض)", VIEWPORT_PRESETS.length === 47, VIEWPORT_PRESETS.length)
-  check("دسکتاپ ۱۲۸۰×۸۰۰", presetForViewport(1280, 800)?.id === "desktop")
-  check("iPhone 12 Pro دقیق کروم ۳۹۰×۸۴۴", presetForViewport(390, 844)?.id === "iphone-12-pro")
-  check("Laptop HiDPI دقیق کروم ۱۴۴۰×۹۰۰", VIEWPORT_PRESETS.some((p) => p.id === "laptop-hidpi" && p.width === 1440 && p.height === 900))
-  check("Nest Hub Max در گروه Smart Displays", VIEWPORT_PRESETS.some((p) => p.id === "nest-hub-max" && p.group === "smart_display" && p.width === 1280 && p.height === 800))
-  check("Moto G4 دقیق کروم ۳۶۰×۶۴۰", VIEWPORT_PRESETS.some((p) => p.id === "moto-g4" && p.width === 360 && p.height === 640))
-  check("ترتیب گروه‌ها مثل کروم است", JSON.stringify(PRESET_GROUP_ORDER) === JSON.stringify(["mobile", "foldable", "tablet_desktop", "smart_display"]))
-  check("سایز دلخواه null برمی‌گرداند", presetForViewport(1024, 700) === null)
+  useViewerTabs.getState().openBrowser("chat-a")
+  useViewerTabs.getState().openGitDiff("chat-a")
+  useViewerTabs.getState().openBrowser("chat-b")
+  const s = useViewerTabs.getState()
+  check("دو تب browser جدا برای دو چت", s.tabs.filter((t) => t.kind === "browser").length === 2, s.tabs.map((t) => t.id))
+  const visA = visibleTabs(s.tabs, "chat-a")
+  const visB = visibleTabs(s.tabs, "chat-b")
+  check("چت a تب browser خودش را می‌بیند", visA.some((t) => t.id === "browser:chat-a"))
+  check("چت b تب browser چت a را نمی‌بیند", !visB.some((t) => t.id === "browser:chat-a"))
+  check("چت a تب browser چت b را نمی‌بیند", !visA.some((t) => t.id === "browser:chat-b"))
+  check("تب git هم چت‌محور است", visA.some((t) => t.id === "review:chat-a") && !visB.some((t) => t.id === "review:chat-a"))
+  // پاک‌سازی تب‌های این تست
+  for (const t of s.tabs.filter((t) => t.kind === "browser" || t.kind === "review")) useViewerTabs.getState().closeViewer(t.id)
+}
+
+console.log("۷-ج) browserViewport — سایز دستی مثل کروم (بدون نام دستگاه):")
+{
+  const { clampViewportSize, WIDTH_SLIDER_MIN, WIDTH_SLIDER_MAX, DEFAULT_VIEWPORT_SIZE, VIEWPORT_LIMITS } = await import("../src/lib/browserViewport")
+  check("پیش‌فرض ۱۲۸۰×۸۰۰", DEFAULT_VIEWPORT_SIZE.width === 1280 && DEFAULT_VIEWPORT_SIZE.height === 800)
+  check("اسلایدر افقی عرض دارد", WIDTH_SLIDER_MIN === 320 && WIDTH_SLIDER_MAX === 1920)
+  check("سایز معتبر دست‌نخورده می‌ماند", JSON.stringify(clampViewportSize(1024, 700)) === JSON.stringify({ width: 1024, height: 700 }))
+  const clamped = clampViewportSize(10, 999999)
+  check("کلمپ پایین/بالا", clamped.width === VIEWPORT_LIMITS.minWidth && clamped.height === VIEWPORT_LIMITS.maxHeight, clamped)
+  check("غیرعددی به پیش‌فرض برمی‌گردد", clampViewportSize(NaN, NaN).width === 1280)
 }
 
 console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپوت پایینی):")
@@ -214,12 +231,41 @@ console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپ
   const { BrowserPanel } = await import("../src/components/BrowserPanel")
   const html = renderToString(React.createElement(BrowserPanel))
   const inputs = html.match(/<input/g) ?? []
-  check("فقط یک اینپوت (omnibox) دارد", inputs.length === 1, inputs)
+  check("omnibox + دو اینپوت عددی عرض/ارتفاع + اسلایدر دارد", inputs.length === 4, inputs.length)
   check("اینپوت پایینی Type حذف شد", !html.includes("Type into the page"))
+  check("اینپوت‌های دستی عرض/ارتفاع هست", html.includes('aria-label="Viewport width"') && html.includes('aria-label="Viewport height"'))
+  check("اسلایدر افقی عرض هست و select دستگاه حذف شد", html.includes('aria-label="Viewport width slider"') && !html.includes("Device preset") && !html.includes("Common widths"))
+  check("about:blank در آدرس‌بار نیست", !html.includes("about:blank"))
+  check("نوار سایز یک‌تکه افقی است", html.includes('aria-label="Viewport size"'))
+  check("آیکون Fit به‌جای تیک است", html.includes('aria-label="Fit width to pane"') && !html.includes('type="checkbox"'))
   check("استیج فوکوس‌پذیر است (کیبورد صفحه)", html.includes('tabindex="0"'))
+  // موس مجازی: مختصات بک‌اند از جعبهٔ img، مکان آیکون از جعبهٔ wrapper —
+  // هر دو از یک تابع خالص pctInBox می‌آیند تا letterbox جا‌به‌جا نشود.
+  const { pctInBox, backendError } = await import("../src/components/BrowserPanel")
+  const imgBox = { left: 20, top: 40, width: 600, height: 400 }
+  check("pctInBox مختصات صفحه را درست می‌گیرد", JSON.stringify(pctInBox(imgBox, 320, 240)) === JSON.stringify({ x: 50, y: 50 }))
+  const wrapperBox = { left: 0, top: 10, width: 800, height: 600 }
+  check("pctInBox نسبت به wrapper فرق می‌کند (letterbox)", pctInBox(wrapperBox, 320, 240).y !== pctInBox(imgBox, 320, 240).y)
+  // خطای کسب‌وکاری sidecar (HTTP 200 + ok:false) قبلاً بی‌صدا بلعیده می‌شد —
+  // اینتر و دکمه‌های history اثر نداشتند چون خطا هرگز دیده نمی‌شد.
+  check("ok:false به پیام خطا تبدیل می‌شود", backendError({ ok: false, error: "launch failed" }) === "launch failed")
+  check("ok:false بدون error پیام پیش‌فرض می‌دهد", backendError({ ok: false }) === "request failed")
+  check("ok:true یا null خطا نیست", backendError({ ok: true }) === null && backendError(null) === null)
+  check("آیکون toggle موس مجازی در تولبار هست", html.includes('aria-label="Virtual mouse"'))
+  check("موس مجازی پیش‌فرض خاموش است", html.includes('aria-pressed="false"'))
+  check("دکمهٔ ✕ کنار Stop حذف شد (بستن از تب)", !html.includes("Close viewer"))
 }
 
-const { useStore } = await import("../src/lib/store")
+console.log("۷-و) isProbablyUrl — سرچ در برابر آدرس (مثل کروم، اول گوگل):")
+{
+  const { isProbablyUrl } = await import("../src/components/BrowserPanel")
+  check("آدرس با scheme آدرس است", isProbablyUrl("https://example.com/x"))
+  check("میزبان نقطه‌دار آدرس است", isProbablyUrl("example.com") && isProbablyUrl("localhost:3000"))
+  check("عبارت فارسی سرچ است", !isProbablyUrl("پایتون چیست"))
+  check("چند کلمه انگلیسی سرچ است", !isProbablyUrl("how to cook rice"))
+  check("کلمهٔ تنها سرچ است", !isProbablyUrl("python"))
+  check("ورودی خالی نه آدرس است نه سرچ", !isProbablyUrl("   "))
+}
 
 console.log("۸) setChatModeQuiet — سوییچ بی‌صدا بدون پیام مارکر:")
 {

@@ -88,6 +88,38 @@ check('کلاس آیتم فایل', fileHtml.includes('file-result'))
 check('آیکون لینک وب (🔗) نمایش داده نشد', !fileHtml.includes('🔗'))
 check('کلاس لینک وب (web-result-link) نمایش داده نشد', !fileHtml.includes('web-result-link'))
 
+console.log('4b) چیپ فایل: آیکن همیشه سمت چپ مسیر است — در RTL و LTR (dir=ltr):')
+{
+  const chipIdx = fileHtml.indexOf('class="file-chip"')
+  check('چیپ فایل رندر شد', chipIdx >= 0, fileHtml.slice(0, 400))
+  check('dir=ltr دارد (آیکن در RTL هم سمت چپ می‌ماند)',
+    fileHtml.indexOf('dir="ltr"') >= 0)
+  // title حاوی نام فایل است و قبل از آیکن می‌آید؛ بعد از file-chip-name بگرد.
+  const nameIdx = fileHtml.indexOf('file-chip-name', chipIdx)
+  check('نام مسیر داخل file-chip-name است', nameIdx > chipIdx,
+    fileHtml.slice(chipIdx, chipIdx + 300))
+  const iconChunk = fileHtml.slice(chipIdx, nameIdx > 0 ? nameIdx : fileHtml.length)
+  check('آیکن svg قبل از نام مسیر رندر شده است',
+    nameIdx > chipIdx && iconChunk.includes('<svg'), iconChunk.slice(0, 200))
+  check('متن مسیر بعد از آیکن می‌آید',
+    nameIdx > 0 && fileHtml.indexOf('src/foo.ts', nameIdx) > nameIdx)
+}
+
+console.log('4c) آیکون فایل: تایل رنگی با مونوگرام پسوند (بدون گرادیان/متن DOM):')
+{
+  const { FileIcon } = await import('../src/components/FileIcon')
+  const tsHtml = renderToString(<FileIcon path="src/App.tsx" size={16} />)
+  check('تایل TS رندر شد', tsHtml.includes('file-icon-svg') && tsHtml.includes('<svg'))
+  check('مونوگرام TS داخل svg است', tsHtml.includes('>TS<') || tsHtml.includes('>TSX<'), tsHtml.slice(0, 300))
+  check('بدون گرادیان defs (بدون تداخل id)', !tsHtml.includes('<linearGradient') && !tsHtml.includes('<defs'))
+  const pyHtml = renderToString(<FileIcon path="backend/agents.py" size={16} />)
+  check('مونوگرام PY داخل svg است', pyHtml.includes('>PY<'), pyHtml.slice(0, 300))
+  const imgHtml = renderToString(<FileIcon path="a/photo.png" size={16} />)
+  check('آیکون تصویری تایل رنگی دارد', imgHtml.includes('#a074c4'))
+  const unknownHtml = renderToString(<FileIcon path="Makefile" size={16} />)
+  check('پسوند ناشناخته: آیکون خنثی بدون تایل رنگی', !unknownHtml.includes('#a074c4') && unknownHtml.includes('<svg'))
+}
+
 console.log('5) FileResultLinks: آیتم glob (فقط path، بدون line/text) درست رندر می‌شود:')
 const globItems = [{ path: 'src/components/Baz.tsx' }] as never
 let globHtml = ''

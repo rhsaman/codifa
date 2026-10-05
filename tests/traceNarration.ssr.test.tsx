@@ -106,10 +106,11 @@ console.log('2) الگوی واقعی داده‌ها: caption، ابزار، ca
   check('کپشن دوم عنوان سرِ گروه است', html.includes('حالا فایل دوم را می‌خوانم'))
 }
 
-console.log('3) باگ «narration بلند»: متن بلند/چندخطی بین ابزارها → هنوز یک گروه واحد:')
+console.log('3) محدودیت کپشن: متن بلند/چندخطی بین ابزارها → prose بیرون از گروه:')
 {
-  // متن بلند (بیش از سقف قدیمی ۲۶۰ کاراکتر) + چندخطی بین دو دستهٔ ابزار —
-  // باید narration بماند و ران را نشکند (قبلاً flush می‌شد و گروه جدا می‌افتاد).
+  // فقط جواب‌های کوتاه داخل گروه ابزار می‌مانند؛ متنِ بلند (بیش از ۲۶۰
+  // کاراکتر) محتوای واقعی است و باید مثل prose معمولی بیرونِ گروه رندر شود —
+  // وگرنه پاسخ ایجنت داخل کارت گروه گیر می‌کند.
   const long = 'این یک متن روایی خیلی طولانی است که مدل قبل از جست‌وجوی بعدی می‌نویسد. '.repeat(6)
   const msg = makeMessage(
     [
@@ -120,10 +121,24 @@ console.log('3) باگ «narration بلند»: متن بلند/چندخطی بی
     ['grep', 'grep'],
   )
   const html = renderToString(<ChatMessageView message={msg} />)
-  check('فقط یک گروه رندر شد', (html.match(/tool-group/g) || []).length === 1)
-  check('به‌عنوان prose رندر نشد', !html.includes('markdown-body'))
-  check('کپشن بلند عنوان سرِ گروه است', html.includes('trace-head-caption'))
-  check('متن کپشن بلند نمایش داده شد', html.includes('این یک متن روایی خیلی طولانی'))
+  check('به‌عنوان prose رندر شد (بیرون گروه)', html.includes('markdown-body'))
+  check('داخل سرِ گروه نرفت', !html.includes('trace-head-caption'))
+  check('ران شکست (دو کارت trace جدا)', (html.match(/tool-trace/g) || []).length === 2)
+  check('متن بلند نمایش داده شد', html.includes('این یک متن روایی خیلی طولانی'))
+
+  // متن کوتاه در مجموع کاراکتر ولی بیش از ۲ خط → باز هم prose (سقف خط).
+  const multiline = 'خط اول\nخط دوم\nخط سوم'
+  const msg2 = makeMessage(
+    [
+      { kind: 'tool', index: 0 },
+      { kind: 'text', text: multiline },
+      { kind: 'tool', index: 1 },
+    ],
+    ['grep', 'grep'],
+  )
+  const html2 = renderToString(<ChatMessageView message={msg2} />)
+  check('متن چندخطی (>۲ خط) هم prose شد', html2.includes('markdown-body'))
+  check('چندخطی داخل گروه نرفت', !html2.includes('trace-head-caption'))
 }
 
 console.log('3ب) متن حاوی بلوک کد (```) → محتوای واقعی، نه narration:')

@@ -45,3 +45,19 @@ export function edgeScroll(
   if (x > bar.width - edge) return Math.round(speed * ((x - (bar.width - edge)) / edge));
   return 0;
 }
+
+/** Tabs eligible for bulk cleanup: open tabs that are not the active tab,
+ *  not currently streaming, and not open in a multi-window pane. Closing a
+ *  tab never deletes the chat (the sidebar keeps it). */
+export function inactiveTabIds(
+  openIds: string[],
+  activeId: string | null | undefined,
+  streaming: Set<string> | string[],
+  visible: Set<string> | string[],
+): string[] {
+  const streamingSet = streaming instanceof Set ? streaming : new Set(streaming);
+  const visibleSet = visible instanceof Set ? visible : new Set(visible);
+  return openIds.filter(
+    (id) => id !== activeId && !streamingSet.has(id) && !visibleSet.has(id),
+  );
+}

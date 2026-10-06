@@ -67,6 +67,9 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   // last manually applied width — like Chrome shrinking the layout viewport
   // when the pane narrows and growing it back up to the set size.
   const [fitToPane, setFitToPane] = useState<boolean>(true);
+  // "..." overflow menu + CDP endpoint for DevTools (from /browser/status).
+  const [menuOpen, setMenuOpen] = useState<boolean>(false);
+  const [cdpUrl, setCdpUrl] = useState<string>("");
   const capWRef = useRef<number>(DEFAULT_VIEWPORT_SIZE.width);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
@@ -144,6 +147,8 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       const st = await sidecarFetch("/browser/status");
       const isActive = st.active === true;
       setActive(isActive);
+      if (typeof st.cdp === "string") setCdpUrl(st.cdp);
+      else if (!isActive) setCdpUrl("");
       if (typeof st.url === "string") {
         // Never surface about:blank in the omnibox — it sticks and the
         // user has to delete it before typing (Chrome shows an empty box).
@@ -498,6 +503,73 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       setActive(false);
       setImage("");
       setError("");
+      setCdpUrl("");
+      setMenuOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Close the "..." menu on outside click or Escape.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent): void => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.(".browser-menu-wrap")) return;
+      setMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
+
+  // Open the current page in the OS default browser (outside the app).
+  async function openInDefaultBrowser(): Promise<void> {
+    setMenuOpen(false);
+    const url = pageUrl || address.trim();
+    if (!url) return;
+    setError("");
+    try {
+      const opener = (window as unknown as { coder?: { openExternal?: (u: string) => Promise<void> } }).coder?.openExternal;
+      if (typeof opener === "function") await opener.call(window.coder, url);
+      else window.open(url, "_blank", "noopener");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Open DevTools for the live session in the OS browser. Resolves the
+  // inspector frontend URL from the session CDP endpoint when reachable;
+  // falls back to the CDP root (target list) or the current page URL.
+  async function openDevTools(): Promise<void> {
+    setMenuOpen(false);
+    if (!active) return;
+    setError("");
+    try {
+      let target = cdpUrl;
+      if (target) {
+        try {
+          const res = await fetch(`${target}/json/list`);
+          const list = (await res.json()) as Array<{ devtoolsFrontendUrl?: string }>;
+          const front = list?.[0]?.devtoolsFrontendUrl;
+          if (typeof front === "string" && front) {
+            target = front.startsWith("http") ? front : `${target}${front}`;
+          }
+        } catch {
+          // CDP list unreachable — open the CDP root target list instead.
+        }
+      }
+      const url = target || pageUrl || address.trim();
+      if (!url) return;
+      const opener = (window as unknown as { coder?: { openExternal?: (u: string) => Promise<void> } }).coder?.openExternal;
+      if (typeof opener === "function") await opener.call(window.coder, url);
+      else window.open(url, "_blank", "noopener");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -544,7 +616,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           onKeyDown={(e) => {
             if (e.key === "Enter") void go();
           }}
-          placeholder="Search or type a URL"
+          placeholder="Enter a URL and press Enter"
           spellCheck={false}
           aria-label="Address"
           onFocus={(e) => e.currentTarget.select()}
@@ -559,6 +631,43 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         >
           ⏹
         </button>
+        <div className="browser-menu-wrap">
+          <button
+            type="button"
+            className="browser-tool-btn"
+            title="More actions"
+            aria-label="More actions"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen((v) => !v)}
+          >
+            ...
+          </button>
+          <div className="browser-menu" role="menu" hidden={!menuOpen}>
+            <button
+              type="button"
+              className="browser-menu-item"
+              role="menuitem"
+              aria-label="Open in default browser"
+              disabled={!active}
+              onClick={() => void openInDefaultBrowser()}
+            >
+              <span className="browser-menu-item-icon" aria-hidden="true">↗</span>
+              Open in default browser
+            </button>
+            <button
+              type="button"
+              className="browser-menu-item"
+              role="menuitem"
+              aria-label="Open DevTools"
+              disabled={!active}
+              onClick={() => void openDevTools()}
+            >
+              <span className="browser-menu-item-icon" aria-hidden="true">🐞</span>
+              Open DevTools
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Width ruler — full-width Chrome DevTools-style graduated bar below

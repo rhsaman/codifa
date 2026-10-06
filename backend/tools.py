@@ -2419,19 +2419,24 @@ def _spans_in(
     return spans
 
 
-def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], bool]:
+def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], str]:
     """Locate ``old`` inside ``content``, tolerating copied tool decorations.
 
-    Returns ``(spans, decorated)``: byte spans in the original ``content``
-    (empty when not found) and whether decorations were stripped from ``old``.
-    When ``decorated`` is True the caller must strip the same decorations from
-    ``new_string`` before splicing, so the file does not grow "2096 | " junk.
+    Returns ``(spans, mode)``: byte spans in the original ``content`` (empty
+    when not found) and the match mode — ``""`` for a plain match,
+    ``"decorated"`` when tool decorations were stripped from ``old`` (the
+    caller must strip the same decorations from ``new_string``), or
+    ``"literal"`` when ``old`` was the DECODED value of a source string
+    literal (the caller must re-encode ``new_string`` via
+    ``_encode_string_literal`` before splicing).
     Tiers: byte-exact, then CRLF/trailing-whitespace tolerant, then with
     read/grep prefixes and wrapper/note lines removed (line-anchored so a
-    stripped fragment can never match mid-line).
+    stripped fragment can never match mid-line), then indent/unicode
+    tolerant, then decoded string-literal, then reflow tolerant (reflow
+    spans overlapping a string literal without covering it are rejected).
     """
     if not old:
-        return [], False
+        return [], ""
     # 1) byte-exact — the common path.
     spans: list[tuple[int, int]] = []
     i = 0
@@ -2442,20 +2447,20 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], bo
         spans.append((j, j + len(old)))
         i = j + len(old)
     if spans:
-        return spans, False
+        return spans, ""
     # 2) same text modulo CRLF / trailing whitespace.
     c_norm, c_origin = _normalize_for_match(content)
     o_norm, _ = _normalize_for_match(old)
     spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=False)
     if spans:
-        return spans, False
+        return spans, ""
     # 3) decorations stripped — only runs when stripping changed something.
     decorated = _undecorate_tool_text(old)
     if decorated != old:
         o_norm, _ = _normalize_for_match(decorated)
         spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=True)
         if spans:
-            return spans, True
+            return spans, "decorated"
     # 4) leading-indent insensitive — the model often retypes a block at
     # column 0 (or with the wrong indent) after copying it from a read
     # excerpt. Stripping leading whitespace on both sides still locates the
@@ -2466,38 +2471,150 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], bo
     o_stripped, _ = _normalize_indent_insensitive(old)
     spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
     if spans:
-        return spans, False
+        return spans, ""
     if decorated != old:
         o_stripped, _ = _normalize_indent_insensitive(decorated)
         spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
         if spans:
-            return spans, True
+            return spans, "decorated"
     # 5) unicode + interior-whitespace tolerant, line-preserving.
     c_canon, c_canon_origin = _normalize_canonical(content)
     o_canon, _ = _normalize_canonical(old)
     spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
     if spans:
-        return spans, False
+        return spans, ""
     if decorated != old:
         o_canon, _ = _normalize_canonical(decorated)
         spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
         if spans:
-            return spans, True
-    # 6) reflow tolerant — same tokens, different line breaks, including a
+            return spans, "decorated"
+    # 6) decoded string-literal — the model copied the VALUE of a source
+    # string literal (quotes dropped, "\\n" already a real newline), which
+    # never byte-matches the quoted source. Match against the decoded
+    # literals in the file instead; the caller re-encodes the replacement.
+    # Runs BEFORE reflow: reflow would otherwise match a value prefix
+    # INSIDE the quoted literal and corrupt its escapes on splice.
+    spans = _match_string_literal(content, old)
+    if spans:
+        return spans, "literal"
+    if decorated != old:
+        spans = _match_string_literal(content, decorated)
+        if spans:
+            return spans, "literal"
+    # 7) reflow tolerant — same tokens, different line breaks, including a
     # multi-line block retyped as a single line (no "\n" left in old).
+    # Spans overlapping a string literal without covering it are rejected:
+    # they are decoded-value prefixes, not code — splicing them would
+    # corrupt the literal's escapes.
     c_flow, c_flow_origin = _normalize_reflow(content)
     o_flow, _ = _normalize_reflow(old)
     if len(o_flow) >= 10:
-        spans = _spans_in(c_flow, c_flow_origin, o_flow, line_anchored=False)
+        spans = _spans_outside_literals(content, c_flow, c_flow_origin, o_flow)
         if spans:
-            return spans, False
+            return spans, ""
     if decorated != old:
         o_flow, _ = _normalize_reflow(decorated)
         if len(o_flow) >= 10:
-            spans = _spans_in(c_flow, c_flow_origin, o_flow, line_anchored=False)
+            spans = _spans_outside_literals(content, c_flow, c_flow_origin, o_flow)
             if spans:
-                return spans, True
-    return [], False
+                return spans, "decorated"
+    return [], ""
+
+
+_STRING_LITERAL_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"'  # double-quoted, single line
+    r"|'(?:[^'\\\n]|\\.)*'"  # single-quoted, single line
+)
+
+
+def _decode_string_literal(token: str) -> str | None:
+    """Decode a quoted source token to its runtime value (None on failure)."""
+    try:
+        value = ast.literal_eval(token)
+    except (ValueError, SyntaxError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _match_string_literal(content: str, old: str) -> list[tuple[int, int]]:
+    """Match ``old`` against the DECODED value of string literals in ``content``.
+
+    The model often copies the runtime value of a source string literal
+    (quotes dropped, ``\\n`` already a real newline) — e.g. a prompt line
+    from ``agents.py``. That text never byte-matches the quoted source, so
+    every other tier fails. Adjacent literals (implicit concatenation) are
+    grouped and compared as one combined value; only a FULL-value match
+    (exact or stripped) is accepted, so a substring never wipes the
+    surrounding text on splice — the caller replaces the whole run with a
+    single re-encoded literal holding the same combined value.
+    """
+    keys = {old}
+    if old.strip() != old:
+        keys.add(old.strip())
+    keys = {k for k in keys if len(k) >= 10}
+    if not keys:
+        return []
+    tokens: list[tuple[int, int, str]] = []
+    for m in _STRING_LITERAL_RE.finditer(content):
+        decoded = _decode_string_literal(m.group(0))
+        if decoded is not None:
+            tokens.append((m.start(), m.end(), decoded))
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(tokens):
+        j = i
+        combined = tokens[i][2]
+        while (
+            j + 1 < len(tokens)
+            and content[tokens[j][1] : tokens[j + 1][0]].strip() == ""
+        ):
+            j += 1
+            combined += tokens[j][2]
+        if any(k == combined or k == combined.strip() for k in keys):
+            spans.append((tokens[i][0], tokens[j][1]))
+        i = j + 1
+    return spans
+
+
+def _encode_string_literal(value: str, quote: str) -> str:
+    """Re-encode a runtime string as source text for the given quote char."""
+    out: list[str] = []
+    for ch in value:
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == quote:
+            out.append("\\" + quote)
+        else:
+            out.append(ch)
+    return quote + "".join(out) + quote
+
+
+def _spans_outside_literals(
+    content: str, norm: str, origin: list[int], needle: str
+) -> list[tuple[int, int]]:
+    """Reflow hits that do not partially overlap a string literal.
+
+    A hit overlapping a quoted literal without covering it fully is a
+    decoded-value prefix, not code — splicing it would corrupt the
+    literal's escapes. Fully-covered literals (a reflowed block that
+    happens to contain a whole string) are kept.
+    """
+    spans = _spans_in(norm, origin, needle, line_anchored=False)
+    if not spans:
+        return []
+    literals = [(m.start(), m.end()) for m in _STRING_LITERAL_RE.finditer(content)]
+    kept: list[tuple[int, int]] = []
+    for s, e in spans:
+        if any(s < le and ls < e and not (s <= ls and le <= e) for ls, le in literals):
+            continue
+        kept.append((s, e))
+    return kept
 
 
 def _edit_copy_hints(old: str) -> list[str]:
@@ -2565,6 +2682,38 @@ def _edit_not_found_error(path: str, old: str, content: str, *, prefix: str = ""
         f"{start + 1} (copy verbatim, without adding line numbers):\n{excerpt}"
     )
     return {"path": path, "error": head + detail + where}
+
+
+def _edit_not_unique_error(
+    path: str, content: str, spans: list[tuple[int, int]], *, prefix: str = ""
+) -> dict:
+    """Actionable old_string-not-unique error listing every occurrence."""
+    file_lines = content.split("\n")
+    if file_lines and file_lines[-1] == "":
+        file_lines = file_lines[:-1]
+    total = len(file_lines)
+    shown = min(len(spans), 5)
+    parts: list[str] = []
+    for num in range(shown):
+        start, end = spans[num]
+        start_line = content.count("\n", 0, start) + 1
+        end_line = content.count("\n", 0, max(start, end - 1)) + 1
+        lo = max(0, start_line - 2)
+        hi = min(total, end_line + 1)
+        window = "\n".join(f"L{i + 1}: {file_lines[i][:120]}" for i in range(lo, hi))
+        parts.append(f"occurrence {num + 1}: lines {start_line}-{end_line}\n{window}")
+    body = "\n---\n".join(parts)[:1500]
+    extra = f" (showing {shown} of {len(spans)})" if len(spans) > shown else ""
+    return {
+        "path": path,
+        "error": (
+            f"{prefix}old_string is not unique ({len(spans)} occurrences){extra} — "
+            "include more surrounding context to make it unique, or pass "
+            "replace_all=true to replace every occurrence. "
+            f"Occurrences in '{path}' (line numbers are metadata — copy clean text "
+            "from read without adding line numbers):\n" + body
+        ),
+    }
 
 
 def _splice_spans(content: str, spans: list[tuple[int, int]], replacement: str) -> str:
@@ -2663,21 +2812,26 @@ def edit_file(
             "error": "file too large to edit safely (use read with offset/limit to inspect it in parts instead)",
         }
 
-    spans, decorated = _match_old_string(content, old_string)
+    spans, mode = _match_old_string(content, old_string)
     if not spans:
         return _edit_not_found_error(path, old_string, content)
     if len(spans) > 1 and not replace_all:
-        return {
-            "path": path,
-            "error": f"old_string is not unique ({len(spans)} occurrences) — include more surrounding "
-            "context to make it unique, or pass replace_all=true to replace every occurrence.",
-        }
+        return _edit_not_unique_error(path, content, spans)
 
     _clean_new = _undecorate_tool_text(new_string)
-    replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
+    replacement = _clean_new if (mode or _clean_new != new_string) else new_string
     apply = spans if replace_all else spans[:1]
-    old_base_text = _undecorate_tool_text(old_string) if decorated else old_string
-    new_content = _splice_reindented(content, apply, old_base_text, replacement)
+    if mode == "literal":
+        # The span covers the whole quoted literal; the replacement must be
+        # re-encoded as source text with the same quote character. Use
+        # new_string VERBATIM here — undecorating would drop lines that
+        # look like tool notes (e.g. "Use grep ...") but are real content.
+        quote = content[apply[0][0]]
+        replacement = _encode_string_literal(new_string, quote)
+        new_content = _splice_spans(content, apply, replacement)
+    else:
+        old_base_text = _undecorate_tool_text(old_string) if mode else old_string
+        new_content = _splice_reindented(content, apply, old_base_text, replacement)
     count = len(apply)
 
     try:
@@ -2776,7 +2930,7 @@ def edit_file_batch(
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string is empty"}
         if old_string == new_string:
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string and new_string are identical"}
-        spans, decorated = _match_old_string(new_content, old_string)
+        spans, mode = _match_old_string(new_content, old_string)
         if not spans:
             if _match_old_string(content, old_string)[0]:
                 return {
@@ -2790,16 +2944,19 @@ def edit_file_batch(
                 prefix=f"edit {idx + 1}/{len(edits)}: ",
             )
         if len(spans) > 1 and not replace_all:
-            return {
-                "path": path,
-                "error": f"edit {idx + 1}/{len(edits)}: old_string is not unique ({len(spans)} occurrences) — include more surrounding "
-                "context to make it unique, or pass replace_all=true to replace every occurrence.",
-            }
+            return _edit_not_unique_error(
+                path, new_content, spans, prefix=f"edit {idx + 1}/{len(edits)}: "
+            )
         _clean_new = _undecorate_tool_text(new_string)
-        replacement = _clean_new if (decorated or _clean_new != new_string) else new_string
+        replacement = _clean_new if (mode or _clean_new != new_string) else new_string
         apply = spans if replace_all else spans[:1]
-        old_base_text = _undecorate_tool_text(old_string) if decorated else old_string
-        new_content = _splice_reindented(new_content, apply, old_base_text, replacement)
+        if mode == "literal":
+            quote = new_content[apply[0][0]]
+            replacement = _encode_string_literal(new_string, quote)
+            new_content = _splice_spans(new_content, apply, replacement)
+        else:
+            old_base_text = _undecorate_tool_text(old_string) if mode else old_string
+            new_content = _splice_reindented(new_content, apply, old_base_text, replacement)
         total_occ += len(apply)
     if new_content == content:
         return {"path": path, "error": "edits leave the file unchanged"}
@@ -5119,9 +5276,9 @@ def make_tool_callbacks(
         includes: list[str] | None = None,
         max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths/include to them — omitting path scans the whole workspace and is REJECTED in that case; order is CODE MAP first, then ONE scoped grep, then symbols read.
 
-Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, delegate to the explore sub-agent (task with subagent_type='subagent') instead of doing it inline."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Batch args sometimes arrive as JSON-encoded strings — coerce first
         # so nothing downstream iterates a string character-by-character.
@@ -5525,7 +5682,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         paths: list[str] | None = None,
         max_results: int = 100,
     ) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your discovery (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, delegate to the explore sub-agent (task with subagent_type='subagent') instead of doing it inline."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths to them — omitting path scans the whole workspace and is REJECTED in that case; order is CODE MAP first, then ONE scoped glob/grep, then symbols read. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your file lookup (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         patterns = _coerce_str_list(patterns)
         paths = _coerce_str_list(paths)
@@ -5896,7 +6053,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         ranges: list[str] | None = None,
         symbols: list[str] | None = None,
     ) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from glob/grep/explore) — not for discovery. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from CODE MAP or scoped glob/grep) — not to search for files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, read ONLY those files via symbols=[...] or ranges=[...] — never scan the whole workspace blindly. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
         BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer).
 
@@ -6227,7 +6384,7 @@ When you need to read several files, read multiple independent files in parallel
     async def task_tool(
         description: str, prompt: str, subagent_type: str = "subagent", task_id: str = ""
     ) -> str:
-        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. For broad/multi-file exploration you MUST use this instead of reading many files yourself; use it also for parallelizable work, research, or multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use it for parallelizable work (independent implementation chunks, verification) and multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same

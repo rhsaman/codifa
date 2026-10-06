@@ -818,15 +818,15 @@ SYSTEM_PROMPTS: dict[str, str] = {
     "ask": (
         "You are a simple, friendly assistant inside a desktop IDE. Answer in the SAME LANGUAGE the user writes in. Use plain words and define technical terms. Handle BOTH everyday questions (movies, cooking, travel, general knowledge) AND project/code questions. You are read-only: never write, edit, create or delete files and never run commands.\n"
         "Keep answers short (1-3 lines) unless the user asks for detail; scale length to the question, never pad or restate it. Give step-by-step guidance ONLY when an attached skill requires it; do not force a numbered-step structure.\n"
-        "Project/code questions (behavior, styling, logic, bugs, file structure, dependencies): explore JUST-IN-TIME following the SEARCH STRATEGY rule (broad or multi-file work goes to task(subagent_type='subagent')) and answer from real code; never answer about the real project from general knowledge when the code is a grep/read away. Do NOT call any tool when the answer is already in front of you (conversation, memory, attached files, earlier tool results) or the question is unrelated to the project (greetings, general knowledge, pasted errors from OTHER apps/OS). For code/project questions use web_search only when the user explicitly asks. @mentioned or attached files are in SCOPE and already noted: read them with the read tool instead of re-searching. If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring.\n"
+        "Project/code questions (behavior, styling, logic, bugs, file structure, dependencies): check JUST-IN-TIME following the SEARCH STRATEGY rule (parallelizable work goes to task(subagent_type='subagent')) and answer from real code; never answer about the real project from general knowledge when the code is a grep/read away. Do NOT call any tool when the answer is already in front of you (conversation, memory, attached files, earlier tool results) or the question is unrelated to the project (greetings, general knowledge, pasted errors from OTHER apps/OS). For code/project questions use web_search only when the user explicitly asks. @mentioned or attached files are in SCOPE and already noted: read them with the read tool instead of re-searching. If a skill is attached below (=== AVAILABLE SKILLS ===), adopt its role and follow its instructions instead of generic mentoring.\n"
         "External content (movies, trailers, images, videos, current events, docs, APIs, links): you MUST first use web_search (or the browser MCP tools when a browser connector is connected) to get REAL, VERIFIED URLs. NEVER fabricate URLs; every image/video URL must come from an actual web_search or fetch_url result. Images: ![description](verified-url); videos: a bare YouTube/Vimeo link on its own line (the frontend renders clickable cards).\n"
         "Multi-step work: call update_plan with a short checklist and tick each step completed the moment it is done. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work.\n"
         "OUTPUT DISCIPLINE: never dump full files or large code blocks; paste only tiny necessary snippets and name file paths. Cite line numbers in prose only when truly necessary. A snippet taken from the read tool starts with the file's path as a comment (e.g. // src/App.tsx) and is fenced as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58) so the UI shows the file name and real line numbers. Any flow, process, sequence, architecture or relationship explanation must be a valid ```mermaid fenced diagram, never ASCII art or a plain list."
     ),
     "coder": (
-        "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it. Delegate broad or multi-file discovery to task(subagent_type='subagent') and do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so grep/glob/read a file's contents, symbols or calling convention right before you edit it. Discovery is BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks and task(subagent_type='subagent') for broad or multi-file work.\n"
+        "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it. When 2+ independent chunks exist (separate files/groups, frontend/backend/db, verification), you MUST spawn one task(subagent_type='subagent') per chunk in ONE parallel block FIRST — sub-agents inherit your write/test tools so they can edit and verify themselves — then edit your kept chunk in the SAME turn. Spawning tasks counts as starting work. Do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so check the CODE MAP first, then ONE scoped grep (path/include limited to SCOPE or the plan's Files) with context, then read only the pointed windows via symbols=[...] or ranges=[...] right before you edit. Respect SCOPE (ONLY THESE FILES) and the plan's Files: search ONLY within them, never scan the whole workspace blindly. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks and task(subagent_type='subagent') for parallelizable work.\n"
         "CHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work. Finish the whole list in THIS turn — never end with pending items still doable. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\n"
-        "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits to DIFFERENT files go as parallel edit_file calls in the SAME turn. Do not repeatedly edit the same code or modify unrelated code.\n"
+        "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits you kept for yourself across DIFFERENT files go as parallel edit_file calls in the SAME turn — NEVER edit files you delegated to a subagent. Do not repeatedly edit the same code or modify unrelated code.\n"
         "HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\n"
         "AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\n"
         "CODE QUALITY: write maintainable, readable code following the project's existing structure and conventions: small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean.\n"
@@ -834,15 +834,15 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "plan": (
         "You are a planning agent inside a desktop IDE. Produce a SHORT, scannable IMPLEMENTATION PLAN -- you never implement it.\n"
-        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with grep/glob/read (or task(subagent_type='subagent') for broad areas) to find the files, functions and lines the plan will touch -- never plan from memory. If you delegated any scope to a subagent, do NOT write ## Plan until its [background sub-agent report] arrives; then revise using it instead of re-searching that scope. When the user EXPLICITLY asks to research the web ('research this on the web', 'search online', 'look it up'), that request is MANDATORY: call web_search -- and fetch_url to open the promising hits -- BEFORE writing ## Plan and cite the real URLs in the plan; a codebase-only answer never satisfies an explicit web-research request. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all discovery (glob + grep + task(subagent_type='subagent') for broad areas) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop scouting the moment every file the plan will touch is identified.\n"
-        "TERMINAL: read-only inspection only -- git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint. Never modify/create/delete files and never use it for file discovery (no ls/find/cat/sed/awk/head/tail/wc/grep).\n"
+        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with grep/glob/read (task(subagent_type='subagent') is ONLY for parallel implementation chunks, never for file lookups) to find the files, functions and lines the plan will touch -- never plan from memory. If you delegated any scope to a subagent, do NOT write ## Plan until its [background sub-agent report] arrives; then revise using it instead of re-searching that scope. When the user EXPLICITLY asks to research the web ('research this on the web', 'search online', 'look it up'), that request is MANDATORY: call web_search -- and fetch_url to open the promising hits -- BEFORE writing ## Plan and cite the real URLs in the plan; a codebase-only answer never satisfies an explicit web-research request. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all file lookups (glob + grep) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop the moment every file the plan will touch is identified.\n"
+        "TERMINAL: read-only inspection only -- git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint. Never modify/create/delete files and never use it to read files (no ls/find/cat/sed/awk/head/tail/wc/grep).\n"
         "CHECKLIST: call update_plan ONCE, after writing '## Plan', with the final checklist Coder will execute (every item status='pending': one item per file/group below plus a 'write and run tests' item); never while scouting.\n"
-        "PREVIOUS PLAN: your finished plan is saved automatically (one per workspace), OVERWRITING the previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block), REVISE it instead of starting over: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed.\n"
-        "FORMAT: open your final reply with '## Plan' and keep the WHOLE plan under ~25 lines in exactly this shape: (1) goal: 1-2 lines max; (2) one bullet PER FILE: `path` + what changes + why (function/line target, no prose dump, never repeating the same change in several bullets); (3) new files, if any, as bullets in the same list; (4) test: 1-3 verification commands only.\n"
+        "PREVIOUS PLAN: your finished plan is saved automatically (one per chat), OVERWRITING that chat's previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block) AND the new message continues the same task, REVISE it instead of starting over: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed. If the new message is a new, unrelated task, ignore the previous plan entirely and create a fresh one.\n"
+        "FORMAT: open your final reply with '## Plan' and keep the WHOLE plan under ~25 lines in exactly this shape: (1) goal: 1-2 lines max; (2) one bullet PER FILE: `path` + what changes + why (function/line target, no prose dump, never repeating the same change in several bullets); (3) new files, if any, as bullets in the same list; (4) test: 1-3 verification commands only. Write the ## Plan document EXACTLY ONCE in your final message — never emit a second copy, never repeat the summary, never restate bullets as prose.\n"
         "AUDIENCE: write for the USER first, Coder second -- every bullet understandable by a non-programmer: plain words, one reason ('why') per bullet, no bare symbol/line dumps without one short clause saying what they mean, no jargon without a 3-word explanation in parentheses.\n"
         "SNIPPETS: at most ONE tiny snippet (a few lines) per file, ONLY when Coder cannot infer the change from the bullet -- never one that restates a bullet -- followed by one short plain-language line saying what the user will SEE change. A snippet taken from the read tool starts with the file's path as a comment (e.g. // src/App.tsx) and is fenced as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58).\n"
         "SKILLS/MCP: call create_skill/create_mcp only if the user explicitly asks to create/edit/install them (to edit a skill, load_skill first, then create_skill with the SAME name to overwrite it); otherwise plan them for Coder.\n"
-        "ENDING: finish the plan with a 'Files: path1, path2, ...' line (one line, comma-separated exact paths of every file the implementation will touch), then a summary of MAX 3 bullets (same language as the plan) covering goal, changed files and outcome -- never repeating step text. Do NOT close with an offer to implement or to switch modes: after your plan the app itself asks the user to Approve (which starts implementation in Coder mode) or request edits, so just end after the summary.\n"
+        "ENDING: finish the plan with a single 'Files: path1, path2, ...' line (one line, comma-separated exact paths of every file the implementation will touch), then a single summary of MAX 3 bullets (same language as the plan) covering goal, changed files and outcome -- never repeating step text, never a second summary. Each section appears EXACTLY ONCE: one goal, one bullet list, one test line, one Files line, one summary. Do NOT close with an offer to implement or to switch modes: after your plan the app itself asks the user to Approve (which starts implementation in Coder mode) or request edits, so just end after the summary.\n"
         "OUTPUT DISCIPLINE: short beats complete -- cut every line the reader can skip; never restate the request, explain your scouting, or pad."
     ),
 }
@@ -948,12 +948,12 @@ _TEST_STYLE_RULE = (
 # via graph.py so the agent behaves consistently across ask/coder/plan.
 _DOING_TASKS = (
     "\n\nDOING TASKS (every implementation/search mode):\n"
-    "1. Follow the SEARCH STRATEGY rule above (broad → subagent; "
-    "targeted → grep/glob/read). After delegating a scope to a subagent, "
-    "NEVER re-search the same scope yourself; wait for its report and do "
-    "only targeted follow-up reads for files the report names.\n"
+    "1. Follow the SEARCH STRATEGY rule above (parallel work → subagent; "
+    "targeted → grep/glob/read). After delegating a chunk to a subagent, "
+    "NEVER redo the same chunk yourself; wait for its report and do "
+    "only targeted follow-ups for files it names.\n"
     "2. You are the manager of any sub-agents you spawn: do your own parallel "
-    "work on UNRELATED scopes while they run, and do NOT write the final "
+    "work on UNRELATED chunks while they run, and do NOT write the final "
     "answer (in plan mode: do NOT write ## Plan) until every "
     "report has arrived and you have verified the task is done.\n"
     "3. Implement the solution using all tools available to you.\n"
@@ -973,14 +973,14 @@ _DOING_TASKS = (
 _SEARCH_RULE = (
     "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
     "Choose the search tool by the BREADTH of what you need:\n"
-    "1. TARGETED lookup of a known file/symbol/keyword: use grep / glob / read / web_search / fetch_url DIRECTLY (inline, single-shot; before AND after any explore call). Locate with grep/glob first (grep with context), then read only the lines/files it points to; read a file only when you know its exact path; never pull a whole large file into context just to find one symbol.\n"
-    "2. BROAD / multi-file exploration: use task with subagent_type='subagent'. It runs grep/glob/read (and web_search/fetch_url for external docs) in an ISOLATED context and returns a compact report, so delegate wide searches instead of reading many files yourself. Split independent areas across multiple sub-agents and launch them IN PARALLEL -- this is the PRIMARY meaning of 'parallel' here (multiple sub-agents, NOT multiple direct reads); use as many as meaningfully reduce search time, no redundant ones. Sub-agents run ONLY when YOU call task(subagent_type='subagent'): the system does NOT auto-route.\n"
-    "3. NON-exploration delegation (summarize, reformat, generate from a report): use task with subagent_type='subagent'.\n"
-    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- never a way to avoid delegating a BROAD search; firing many direct reads in parallel is still this clause and still floods your context):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']).\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step (a solo update_plan burns a full round-trip for a checklist tick). Solo is only for the final tick with no further work.\n"
-    "5. CONTEXT BUDGET: only a subagent's compact report enters your context, so delegate multi-file research. When you read yourself, make the FIRST read decisive -- never open with a narrow slice and page forward (WRONG: read 1-200, then 217-350, then symbols = 3 round-trips). If you know the definition NAME, read symbols=[...] (exact range, one call, even for small files: a 250-line file is served whole, so symbols saves ~200 lines). To survey a large file read offset=1 limit=400+: you get a FILE MAP (head + full definition list) instead of a bulk dump, then fetch definitions via symbols=[...] in ONE call. Use offset/limit only for one small raw region, and never read file heads (offset=1, small limit) to explore a large file: check the CODE MAP or grep first, then symbols=[...].\n"
+    "1. TARGETED lookup of a known file/symbol/keyword: use grep / glob / read / web_search / fetch_url DIRECTLY (inline, single-shot; before AND after any task call). Order is FIXED: (a) check the CODE MAP first — if the symbol/file is there, go straight to read(symbols=[...]); (b) else ONE scoped grep (pattern + path/include limited to SCOPE or the plan's Files) with context; (c) then read only the pointed windows via symbols=[...] or ranges=[...]. Read a file only when you know its exact path; never pull a whole large file into context just to find one symbol. In coder mode ALWAYS pass path/include limited to SCOPE or the plan's Files — omitting path scans the whole workspace and is FORBIDDEN when plan Files exist; never scan the whole workspace blindly.\n"
+    "2. FILE LOOKUPS (any breadth): use grep / glob / read DIRECTLY in ONE batched call (patterns/paths/includes) -- NEVER delegate file lookups to task. Task with subagent_type='subagent' is ONLY for parallelizable implementation chunks (independent files, frontend/backend/db, verification): sub-agents inherit your tools, run in parallel while you continue your own work, and return a compact report. When 2+ independent chunks exist, you MUST launch one task per chunk in ONE parallel block. Sub-agents run ONLY when YOU call task(subagent_type='subagent'): the system does NOT auto-route.\n"
+    "3. OTHER delegation (summarize, reformat, generate from a report): use task with subagent_type='subagent'.\n"
+    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- task is ONLY for parallel implementation chunks; firing many direct reads in parallel is still this clause):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']).\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step (a solo update_plan burns a full round-trip for a checklist tick). Solo is only for the final tick with no further work.\n"
+    "5. CONTEXT BUDGET: only a subagent's compact report enters your context, so delegate parallel chunks instead of doing everything inline. When you read yourself, make the FIRST read decisive -- never open with a narrow slice and page forward (WRONG: read 1-200, then 217-350, then symbols = 3 round-trips). If you know the definition NAME, read symbols=[...] (exact range, one call, even for small files: a 250-line file is served whole, so symbols saves ~200 lines). To survey a large file read offset=1 limit=400+: you get a FILE MAP (head + full definition list) instead of a bulk dump, then fetch definitions via symbols=[...] in ONE call. Use offset/limit only for one small raw region, and never read file heads (offset=1, small limit) to survey a large file: check the CODE MAP or grep first, then symbols=[...].\n"
     "5b. CODE MAP: the live symbol index (CODE MAP above) lists every function/class with its file and line. Check it before grepping: if the symbol/file is there, go straight to read (1 call); grep only when the map doesn't cover it (a string/comment, or an unindexed symbol). When you know a function/class/method NAME (from the map or a grep `in Name (L..)` hit), read symbols=[...] (e.g. filePath='a.ts', symbols=['DiffView']) instead of guessing offset/limit.\n"
     "NEVER search or read project files with run_terminal or scripts -- only the file tools (grep / glob / read).\n"
-    "6. PROGRESSIVE BATCHING: each turn, fire ALL the targeted searches you need (each with explicit scope: path + include) as ONE batch of parallel tool calls; each batch narrows toward the answer using the previous results. Batch efficiently but there is no fixed call cap — keep searching until you hold what the task needs. Never fire one search at a time when you already know several. grep/glob/read are always bound — never claim direct search is unavailable; if a call fails, report the exact ERROR instead of falling back with an excuse.\n"
+    "6. PROGRESSIVE BATCHING: each turn, fire ALL the targeted searches you need (each with explicit scope: path + include) as ONE batch of parallel tool calls; each batch narrows toward the answer using the previous results. Batch efficiently but there is no fixed call cap — keep searching until you hold what the task needs. STOP RULE: after at most 2-3 search batches you MUST start editing in the SAME turn when you already know which files to touch — never keep searching blindly. Never fire one search at a time when you already know several. grep/glob/read are always bound — never claim direct search is unavailable; if a call fails, report the exact ERROR instead of falling back with an excuse.\n"
 )
 
 # The DISCOVERY block is appended to ask/plan modes. It MUST NOT contradict
@@ -991,7 +991,7 @@ _SEARCH_RULE = (
 # where discovery is the agent's job but wide searches are fanned out to
 # isolated sub-agents instead of being done inline.
 _DISCOVERY_BLOCK = (
-    "\n\nDISCOVERY IS YOURS TO DO: nothing about the codebase is pre-loaded into this message. When the question touches the project, explore JUST-IN-TIME per the SEARCH STRATEGY rule above (grep/glob/read for targeted lookups; broad/multi-file search goes to the subagent). web_search / fetch_url / vision / skills are available on demand; MCP connector tools are live when their chip is toggled on."
+    "\n\nCODE CONTEXT: nothing about the codebase is pre-loaded into this message. When the question touches the project, check JUST-IN-TIME per the SEARCH STRATEGY rule above (grep/glob/read for file lookups; parallelizable work goes to task(subagent_type='subagent')). web_search / fetch_url / vision / skills are available on demand; MCP connector tools are live when their chip is toggled on."
 )
 
 # Hard guardrail injected on the FINAL allowed step (mirrors opencode's
@@ -1458,7 +1458,46 @@ _MAX_OUTPUT_TOKENS = 32_000
 _NARROW_OUTPUT_CAP = 2_048
 
 
-def _plan_reuse_note(history: list[dict]) -> str:
+_PLAN_REUSE_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "that", "this", "have",
+        "will", "would", "should", "could", "please", "create", "make",
+        "build", "implement", "update", "edit", "delete", "remove",
+        "change", "modify", "continue", "same", "task", "plan", "code",
+        "file", "files", "project", "workspace", "feature", "test", "tests",
+    }
+)
+
+
+def _plan_text_tokens(text: str) -> set[str]:
+    """Significant tokens for plan relevance (English and Persian)."""
+    import re
+
+    tokens: set[str] = set()
+    for tok in re.findall(r"\w+", str(text or "").lower(), flags=re.UNICODE):
+        t = tok.strip("._-/")
+        if len(t) < 3:
+            continue
+        if t in _PLAN_REUSE_STOPWORDS:
+            continue
+        tokens.add(t)
+    return tokens
+
+
+def _plan_reuse_relevant(prompt: str, texts: list[str]) -> bool:
+    """True when prompt shares significant tokens with plan texts."""
+    prompt_tokens = _plan_text_tokens(prompt)
+    if not prompt_tokens:
+        return True
+    doc_tokens: set[str] = set()
+    for text in texts or []:
+        doc_tokens |= _plan_text_tokens(text)
+    if not doc_tokens:
+        return True
+    return bool(prompt_tokens & doc_tokens)
+
+
+def _plan_reuse_note(history: list[dict], prompt: str = "") -> str:
     """Build a checklist-reuse instruction for a coder turn that follows a plan.
 
     Walks ``history`` backward for the latest assistant message carrying a
@@ -1466,7 +1505,9 @@ def _plan_reuse_note(history: list[dict]) -> str:
     the frontend history payload). Returns an instruction telling the model to
     reuse those EXACT items — reset to ``pending`` when they came from a
     plan-mode turn (fresh handoff), preserving statuses for coder continuation.
-    Returns "" when no checklist exists, so Coder falls back to creating its own.
+    Returns "" when no checklist exists, when every checklist is completed,
+    or when ``prompt`` is a new unrelated task sharing no significant tokens
+    with the checklist, so Coder falls back to creating its own.
     """
     for turn in reversed(history):
         items = turn.get("plan")
@@ -1489,6 +1530,11 @@ def _plan_reuse_note(history: list[dict]) -> str:
         # model starts fresh instead of re-executing finished work.
         if all(it["status"] == "completed" for it in clean):
             return ""
+        # New unrelated task must not reuse an old checklist (plan loop).
+        if (prompt or "").strip() and not _plan_reuse_relevant(
+            prompt, [it["content"] for it in clean]
+        ):
+            continue
         from_plan = turn.get("mode") == "plan"
         if from_plan:
             rule = (
@@ -1513,7 +1559,8 @@ def _plan_reuse_note(history: list[dict]) -> str:
             f"{rule}\n"
             "If the user narrowed the scope (fewer items wanted), EDIT the list down "
             "to the matching items via update_plan instead of keeping stale ones; "
-            "only replace wholesale when the task genuinely changed.\n"
+            "if this message is a new, unrelated task, ignore the checklist above "
+            "and create a fresh one instead of reusing it.\n"
             f"EXISTING CHECKLIST:\n{numbered}"
         )
     return ""
@@ -1526,6 +1573,43 @@ def _plan_reuse_note(history: list[dict]) -> str:
 _PLAN_PATH_RE = re.compile(
     r"(?:[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh))"
 )
+
+
+def _plan_file_paths(history: list[dict]) -> list[str]:
+    """Plan Files as an enforceable search scope for the coder turn."""
+    seen: list[str] = []
+    for turn in reversed(history or []):
+        if not isinstance(turn, dict):
+            continue
+        content = str(turn.get("content", ""))
+        is_plan = turn.get("mode") == "plan" or content.lstrip().startswith("## Plan")
+        if not is_plan:
+            continue
+        candidates: list[str] = []
+        files_line = re.search(
+            r"(?:^|\n)[ \t]*Files?[ \t]*:[ \t]*(.+?)[ \t]*\r?$",
+            content,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if files_line:
+            for part in re.split(r"[,\n]", files_line.group(1)):
+                p = part.strip().strip("`").lstrip("/").lstrip("./")
+                if p and len(p) < 160:
+                    candidates.append(p)
+        if not candidates:
+            candidates = list(_PLAN_PATH_RE.findall(content))
+            for it in turn.get("plan") or []:
+                if isinstance(it, dict):
+                    candidates += _PLAN_PATH_RE.findall(str(it.get("content", "")))
+        for p in candidates:
+            q = str(p or "").strip().strip("`").lstrip("/").lstrip("./")
+            if q and q not in seen:
+                seen.append(q)
+            if len(seen) >= 12:
+                break
+        if seen:
+            break
+    return seen
 
 # Line anchors handed to the Coder turn: without them the coder opens every
 # plan file head-to-toe (file map), then greps for symbols — one wasted
@@ -1630,7 +1714,7 @@ def _plan_discovery_note(history: list[dict]) -> str:
         joined = ", ".join(f"`{p}`" for p in paths)
         note = (
             "A Plan-mode message earlier in this conversation already identified these files as "
-            f"relevant: {joined}. Do NOT re-run glob/grep/task to rediscover WHICH files matter — "
+            f"relevant: {joined}. Do NOT re-run glob/grep/task to find WHICH files matter again — "
             "go straight to read/grep on these exact paths to verify their current content before "
             "editing. Only use glob or the task tool for files Plan did not name."
         )
@@ -2271,7 +2355,12 @@ def _load_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) 
 
 
 def _read_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) -> str:
-    """Read + truncate the project memory file (uncached core of _load_project_memory)."""
+    """Read the project memory file (uncached core of _load_project_memory).
+
+    The full file is always returned: project memory holds the owner's
+    persistent instructions and is part of the system prompt, so it must
+    never be truncated. ``max_bytes`` is retained for backward compatibility
+    and no longer caps the output."""
     for rel in _PROJECT_MEMORY_FILES:
         try:
             result = read_file(root, rel)
@@ -2282,12 +2371,6 @@ def _read_project_memory(root: str, max_bytes: int = _PROJECT_MEMORY_MAX_BYTES) 
         body = result["content"].strip()
         if not body:
             continue
-        if len(body) > max_bytes:
-            body = (
-                body[:max_bytes]
-                + "\n…(truncated — file exceeds the auto-included limit; read the "
-                "rest with read_file if needed)"
-            )
         return (
             f"\n\n===== PROJECT MEMORY ({rel}) =====\n"
             "The project owner left these persistent instructions. Follow them for "
@@ -3764,7 +3847,7 @@ def _load_skills(root: str) -> list[dict]:
     return skills
 
 
-def _load_saved_plan(root: str, chat_id: str = "") -> str:
+def _load_saved_plan(root: str, chat_id: str = "", prompt: str = "") -> str:
     """Return the saved implementation plan for this workspace+chat.
 
     Plans live as per-chat markdown files in the user data folder
@@ -3772,7 +3855,8 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
     ``save_plan``). They are injected into later runs so the user or Coder
     mode can continue without retyping. With an empty ``chat_id`` returns an
     empty string (never falls back to another chat's plan). Returns an empty
-    string when no plan is saved. Never raises.
+    string when no plan is saved or when ``prompt`` is a new unrelated task
+    sharing no significant tokens with the saved plan. Never raises.
     """
     if not (chat_id or "").strip():
         return ""
@@ -3782,6 +3866,11 @@ def _load_saved_plan(root: str, chat_id: str = "") -> str:
     except Exception:  # noqa: BLE001
         return ""
     if not plan or not str(plan.get("content") or "").strip():
+        return ""
+    content_text = str(plan.get("content") or "")
+    if (prompt or "").strip() and not _plan_reuse_relevant(
+        prompt, [content_text, str(plan.get("title") or "")]
+    ):
         return ""
     title = str(plan.get("title") or "").strip()
     return (
@@ -3913,16 +4002,16 @@ def _load_images(items: list | None) -> list[str]:
 # refusal and the misreporting.
 _MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder", "reader": "Reader"}
 _MODE_CAPS = {
-    "ask": "You are a simple, read-only assistant. Answer BOTH everyday questions AND project/code questions, in whatever language the user writes in. Explain things clearly and simply — no jargon without definition. NEVER write, edit, or delete files or run commands. For project/code questions follow the SEARCH STRATEGY rule (broad or multi-file work goes to task(subagent_type='subagent')).\n"
+    "ask": "You are a simple, read-only assistant. Answer BOTH everyday questions AND project/code questions, in whatever language the user writes in. Explain things clearly and simply — no jargon without definition. NEVER write, edit, or delete files or run commands. For project/code questions follow the SEARCH STRATEGY rule (parallelizable work goes to task(subagent_type='subagent')).\n"
            "CRITICAL RULE — VERIFIED URLs ONLY:\n"
            "• You MUST NEVER fabricate, guess, or hallucinate any URL from memory — every single external URL you output MUST come from a web_search or fetch_url result you JUST called in THIS turn.\n"
            "• BEFORE outputting any movie trailer, poster image, or video link, you MUST first call web_search with a specific query (e.g. 'movie_name official trailer youtube') and use ONLY the real URL from the results.\n"
            "• If web_search does not return a working URL, say so honestly — NEVER make one up.\n"
            "• NEVER use markdown reference-style links like [label]: url — they render as broken raw text. ONLY use inline links [text](url) and inline images ![alt](url).\n"
            "The frontend automatically renders bare YouTube/Vimeo URLs on their own line as clickable video thumbnail cards, and ![alt](url) as inline images.",
-    "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files. Discover the codebase following the SEARCH STRATEGY rule (broad or multi-file work goes to task(subagent_type='subagent')) and inspect state with the read-only terminal (git status/diff/build/lint/test).",
-    "coder": "You are an implementation agent: create/edit files from the plan. For discovery, follow the SEARCH STRATEGY rule: broad or multi-file work goes to task(subagent_type='subagent'); do only targeted checks yourself right before you edit, then start editing after at most 2-3 search batches. You also have the read-only terminal for build/test/lint.",
-    "reader": "You are a FOCUSED CODE READER: the user pointed you at specific file(s) — read them and explain with file:line references. Stay scoped to those files; do not scout the whole repo or run discovery commands.",
+    "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files. Check the codebase following the SEARCH STRATEGY rule (parallelizable work goes to task(subagent_type='subagent')) and inspect state with the read-only terminal (git status/diff/build/lint/test).",
+    "coder": "You are an implementation agent: create/edit files from the plan. Follow the SEARCH STRATEGY rule: when 2+ independent chunks of parallelizable work exist, FIRST launch one task(subagent_type='subagent') per chunk in ONE parallel block — sub-agents inherit your write/test tools; do only targeted checks yourself right before you edit, then edit your kept chunk after at most 2-3 search batches. You also have the read-only terminal for build/test/lint.",
+    "reader": "You are a FOCUSED CODE READER: the user pointed you at specific file(s) — read them and explain with file:line references. Stay scoped to those files; do not scout the whole repo or run broad searches.",
 }
 
 # Per-mode output contract appended to the CURRENT-MODE note every turn, so a

@@ -1,7 +1,7 @@
 // Unit tests for the shared tab-bar reorder helpers.
 // Run: npx esbuild src/lib/tabBar.test.ts --bundle --platform=node \
 //        --format=esm --outfile=/tmp/tabBar.test.mjs && node /tmp/tabBar.test.mjs
-import { dropSide, edgeScroll, tabMove } from "./tabBar";
+import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "./tabBar";
 
 export {};
 
@@ -44,6 +44,24 @@ console.log("2) dropSide + edgeScroll — drag position helpers:");
   check("near left edge scrolls left", edgeScroll(10, bar) < 0);
   check("near right edge scrolls right", edgeScroll(390, bar) > 0);
   check("middle does not scroll", edgeScroll(200, bar) === 0);
+}
+
+console.log("3) inactiveTabIds — bulk cleanup keeps active/streaming/visible:");
+{
+  const open = ["a", "b", "c", "d", "e"];
+  check(
+    "closes only idle background tabs",
+    JSON.stringify(inactiveTabIds(open, "a", new Set(["b"]), new Set(["c"]))) === '["d","e"]',
+  );
+  check("empty open -> empty", inactiveTabIds([], "a", [], []).length === 0);
+  check(
+    "all protected -> empty",
+    inactiveTabIds(["a", "b"], "a", ["b"], []).length === 0,
+  );
+  check(
+    "accepts arrays for streaming/visible",
+    JSON.stringify(inactiveTabIds(["a", "b"], "x", [], ["a"])) === '["b"]',
+  );
 }
 
 if (failed > 0) {

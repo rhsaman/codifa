@@ -225,6 +225,62 @@ console.log('10) pickNeighborWindow — vim-style directional move:')
   check('off-axis excluded', pickNeighborWindow({ a: { x: 0, y: 0 }, e: { x: 10, y: 100 } }, 'a', 'right') === null)
 }
 
+console.log('11) viewer multi-window tree — split, focus, close:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const cid = useStore.getState().newChat('ask')
+  vt().openGitDiff(cid)
+  const gitId = viewerTabId('review', cid)
+  vt().openTraces(cid, 'all')
+  const traceId = viewerTabId('trace', cid)
+  vt().ensureViewerTree()
+  check('single leaf mirrors active tab', (() => {
+    const t = vt().viewerTree
+    return !!t && t.kind === 'leaf' && (t as any).chatId === traceId
+  })(), vt().viewerTree)
+  check('focus mirrors active in single mode', vt().focusedViewerId === traceId, vt().focusedViewerId)
+  vt().openViewerInWindow(gitId)
+  const { leafCount: vLeaves, collectChatIds: vIds } = await import('./chatTree')
+  check('second tab splits to two panes', vt().viewerTree ? vLeaves(vt().viewerTree) === 2 : false, vt().viewerTree)
+  check('split holds both tabs', (() => {
+    const ids = vt().viewerTree ? vIds(vt().viewerTree) : []
+    return ids.includes(gitId) && ids.includes(traceId)
+  })())
+  vt().focusViewerWindow(gitId)
+  check('click focuses pane', vt().focusedViewerId === gitId && vt().activeId === gitId, vt().focusedViewerId)
+  vt().closeViewerWindow(traceId)
+  check('close collapses to one pane', vt().viewerTree ? vLeaves(vt().viewerTree) === 1 : false)
+  check('closed tab stays in tab list', vt().tabs.some((t) => t.id === traceId))
+}
+
+console.log('12) split width — drag caps at half viewport:')
+{
+  const { clampSplitWidth } = await import('./viewerTabs')
+  check('drag beyond half clamps to half', clampSplitWidth(900, 1280) === 640, clampSplitWidth(900, 1280))
+  check('small drag kept', clampSplitWidth(400, 1280) === 400, clampSplitWidth(400, 1280))
+  check('min width kept', clampSplitWidth(100, 1280) === 320, clampSplitWidth(100, 1280))
+}
+
+console.log('13) openPlan — one chat-scoped plan tab, auto-opens pane:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+  vt().openPlan(c1)
+  const planId = `plan:${c1}`
+  check('plan tab created with chat id', vt().tabs.some((t) => t.id === planId && t.kind === 'plan' && t.chatId === c1), vt().tabs)
+  check('plan tab is active', vt().activeId === planId, vt().activeId)
+  check('pane auto-opens', vt().paneOpen === true, vt().paneOpen)
+  vt().openPlan(c1)
+  check('reopen does not duplicate', vt().tabs.filter((t) => t.kind === 'plan').length === 1, vt().tabs.length)
+  const c2 = useStore.getState().newChat('ask')
+  vt().openPlan(c2)
+  check('second chat gets own plan tab', vt().tabs.some((t) => t.id === `plan:${c2}`), vt().tabs.map((t) => t.id))
+  const v1 = visibleTabs(vt().tabs, c1)
+  check('plan tab follows its own chat', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${c2}`), v1.map((t) => t.id))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)

@@ -165,7 +165,7 @@ def test_stale_profile_lock_detection_and_clear(tmp_path):
 
 
 def test_launch_reports_every_channel_error(monkeypatch, tmp_path):
-    """A failed sweep keeps every channel error and tries system Chrome
+    """A failed sweep keeps every channel error and tries bundled Chromium
     first (no msedge probe: its not-found noise buries the real cause)."""
 
     class _Chromium:
@@ -188,11 +188,71 @@ def test_launch_reports_every_channel_error(monkeypatch, tmp_path):
             assert "chrome: boom chrome" in msg
             assert "bundled: boom bundled" in msg
             assert "msedge" not in msg
-            assert _Chromium.order[0] == "chrome"
+            assert _Chromium.order[0] == "bundled"
         else:
             raise AssertionError("expected RuntimeError")
 
     asyncio.run(_run())
+
+
+def test_missing_bundled_error_detection():
+    """Only a missing executable triggers the auto-install path."""
+    assert browser_session._is_missing_bundled_error(
+        RuntimeError("Executable doesn't exist at /cache/ms-playwright")
+    )
+    assert browser_session._is_missing_bundled_error(
+        RuntimeError("Please run `playwright install chromium`")
+    )
+    assert not browser_session._is_missing_bundled_error(
+        RuntimeError("ProcessSingleton: profile locked")
+    )
+
+
+def test_launch_missing_bundled_falls_through_to_chrome(monkeypatch, tmp_path):
+    """A missing bundled build kicks a background install and uses system
+    Chrome immediately — the launch never waits on the download."""
+    installs = {"n": 0}
+
+    def _fake_ensure():
+        installs["n"] += 1
+        return False
+
+    monkeypatch.setattr(browser_session, "_ensure_bundled_chromium", _fake_ensure)
+    monkeypatch.setattr(browser_session, "_profile_dir", lambda chat=None: tmp_path)
+    order: list[str] = []
+    sentinel = object()
+
+    class _Chromium:
+        async def launch_persistent_context(self, **kw):
+            order.append(kw.get("channel", "bundled"))
+            if not kw.get("channel"):
+                raise RuntimeError("Executable doesn't exist - run playwright install")
+            return sentinel
+
+    class _PW:
+        chromium = _Chromium()
+
+    assert asyncio.run(browser_session._launch_browser(_PW(), "chat-a")) is sentinel
+    assert installs["n"] == 1
+    assert order == ["bundled", "chrome"]
+
+
+def test_ensure_bundled_chromium_only_once(monkeypatch):
+    """The background install is kicked off at most once per process."""
+    monkeypatch.setattr(browser_session, "_CHROMIUM_INSTALL_ATTEMPTED", False)
+    created = {"n": 0}
+
+    class _Loop:
+        def create_task(self, coro):
+            created["n"] += 1
+            coro.close()
+            return object()
+
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: _Loop())
+    assert browser_session._ensure_bundled_chromium() is False
+    assert created["n"] == 1
+    assert browser_session._ensure_bundled_chromium() is False
+    assert created["n"] == 1
 
 
 def test_lock_reap_only_touches_dead_or_orphaned_owners(tmp_path, monkeypatch):
@@ -454,6 +514,78 @@ def test_search_uses_per_chat_session(monkeypatch):
     browser_session._sessions.clear()
 
 
+def test_search_google_human_path_types_query(monkeypatch):
+    """Google is driven like a human (homepage -> type -> Enter): the direct
+    /search?q= URL is never fetched when the human path succeeds."""
+    import asyncio as _asyncio
+
+    class _HumanPage:
+        def __init__(self):
+            self.url = "about:blank"
+            self.calls: list[str] = []
+            self.typed = ""
+            self._html = "<html><body>results</body></html>"
+
+        def is_closed(self) -> bool:
+            return False
+
+        def locator(self, _sel: str):
+            return self
+
+        async def goto(self, url: str, **_kw):
+            self.calls.append(url)
+            self.url = url
+
+        async def click(self, **_kw):
+            return None
+
+        async def fill(self, _text: str, **_kw):
+            return None
+
+        async def press_sequentially(self, text: str, **_kw):
+            self.typed += text
+
+        async def press(self, key: str, **_kw):
+            if key == "Enter":
+                self.url = "https://www.google.com/search?q=hello+world"
+
+        async def wait_for_load_state(self, *_a, **_kw):
+            return None
+
+        async def content(self) -> str:
+            return self._html
+
+    page = _HumanPage()
+    _install_page(page)
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+    out = asyncio.run(browser_session.search("hello world"))
+    assert out["ok"] is True and out["engine"] == "google"
+    assert page.typed == "hello world"
+    assert page.calls == ["https://www.google.com/"]
+    browser_session._sessions.clear()
+
+
+def test_launch_uses_new_headless_without_window(monkeypatch, tmp_path):
+    """Full-build new headless mode: no OS window, far fewer bot tells."""
+    monkeypatch.setattr(browser_session, "_profile_dir", lambda chat=None: tmp_path)
+    seen: dict = {}
+    sentinel = object()
+
+    class _Chromium:
+        async def launch_persistent_context(self, **kw):
+            seen["headless"] = kw.get("headless")
+            seen["args"] = list(kw.get("args") or [])
+            return sentinel
+
+    class _PW:
+        chromium = _Chromium()
+
+    assert asyncio.run(browser_session._launch_browser(_PW(), "chat-a")) is sentinel
+    assert seen["headless"] is False
+    assert "--headless=new" in seen["args"]
+    assert "--disable-blink-features=AutomationControlled" in seen["args"]
+
+
 def test_history_actions_drive_page_api():
     """back/forward/reload map onto Playwright page methods with
     wait_until='commit'; an unknown action errors without touching the page."""
@@ -471,4 +603,80 @@ def test_history_actions_drive_page_api():
         assert page.history_calls == ["go_back", "go_forward", "reload"]
 
     asyncio.run(_run())
+    browser_session._sessions.clear()
+
+
+def _reset_idle_state():
+    browser_session._sessions.clear()
+    browser_session._open_chats.clear()
+    browser_session._last_used.clear()
+    for handle in list(browser_session._evict_timers.values()):
+        try:
+            handle.cancel()
+        except Exception:
+            pass
+    browser_session._evict_timers.clear()
+
+
+def test_idle_evict_closes_only_closed_chats(monkeypatch):
+    """Closed idle chats are reaped; open chats are exempt from eviction."""
+    import time as _time
+
+    _reset_idle_state()
+    page_open = _FakePage()
+    page_closed = _FakePage()
+    browser_session._get("chat-open").page = page_open
+    browser_session._get("chat-closed").page = page_closed
+    browser_session.set_open_chats(["chat-open"])
+    stale = _time.monotonic() - browser_session._BROWSER_IDLE_EVICT_S - 1
+    browser_session._last_used["chat-open"] = stale
+    browser_session._last_used["chat-closed"] = stale
+    closed: list[str] = []
+
+    async def _fake_close(chat_id=None):
+        key = browser_session._normalize_chat(chat_id)
+        closed.append(key)
+        sess = browser_session._sessions.get(key)
+        if sess is not None:
+            sess.page = None
+            sess.context = None
+            sess.browser = None
+            sess.pw = None
+
+    monkeypatch.setattr(browser_session, "_force_close", _fake_close)
+    try:
+        assert asyncio.run(browser_session._evict_if_idle("chat-open")) is False
+        assert browser_session._get("chat-open").page is page_open
+        assert closed == []
+        assert asyncio.run(browser_session._evict_if_idle("chat-closed")) is True
+        assert closed == ["chat-closed"]
+    finally:
+        _reset_idle_state()
+
+
+def test_recent_use_prevents_idle_evict(monkeypatch):
+    """A recently used closed chat stays alive until the window passes."""
+    import time as _time
+
+    _reset_idle_state()
+    page = _FakePage()
+    browser_session._get("chat-a").page = page
+    browser_session.set_open_chats([])
+    closed: list[str] = []
+
+    async def _fake_close(chat_id=None):
+        closed.append(browser_session._normalize_chat(chat_id))
+
+    monkeypatch.setattr(browser_session, "_force_close", _fake_close)
+    try:
+        browser_session._last_used["chat-a"] = _time.monotonic()
+        assert asyncio.run(browser_session._evict_if_idle("chat-a")) is False
+        assert closed == []
+        browser_session._last_used["chat-a"] = (
+            _time.monotonic() - browser_session._BROWSER_IDLE_EVICT_S - 1
+        )
+        assert asyncio.run(browser_session._evict_if_idle("chat-a")) is True
+        assert closed == ["chat-a"]
+    finally:
+        _reset_idle_state()
     browser_session._sessions.clear()

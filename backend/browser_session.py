@@ -18,10 +18,12 @@ import asyncio
 import base64
 import logging
 import os
+import random
 import re
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -59,6 +61,14 @@ class _ChatSession:
 
 _sessions: dict[str, _ChatSession] = {}
 
+# Idle eviction (Whisper pattern): each chat owns a full Chromium process,
+# so idle CLOSED chats are reaped after a window. OPEN chats are exempt and
+# never auto-closed. Timers are per chat_id, eviction uses _force_close only.
+_BROWSER_IDLE_EVICT_S = 10 * 60
+_open_chats: set[str] = set()
+_last_used: dict[str, float] = {}
+_evict_timers: dict[str, asyncio.TimerHandle] = {}
+
 
 def _normalize_chat(chat_id: str | None) -> str:
     """Session key for a chat (empty/None falls back to the legacy default)."""
@@ -76,15 +86,120 @@ def _get(chat_id: str | None = None) -> _ChatSession:
     return sess
 
 
+def set_open_chats(chat_ids: list[str] | set[str] | tuple | None = None) -> None:
+    """Mark which chats are currently open in the UI (exempt from eviction)."""
+    global _open_chats
+    try:
+        new_open = {_normalize_chat(c) for c in (chat_ids or []) if str(c or "").strip()}
+    except Exception:
+        new_open = set()
+    added = new_open - _open_chats
+    removed = _open_chats - new_open
+    _open_chats = new_open
+    for key in added:
+        _cancel_timer(key)
+    for key in removed:
+        if is_active(key):
+            _last_used[key] = time.monotonic()
+            _schedule_evict(key)
+
+
+def _cancel_timer(key: str) -> None:
+    """Cancel a pending idle timer without touching last-used state."""
+    handle = _evict_timers.pop(key, None)
+    if handle is not None:
+        try:
+            handle.cancel()
+        except Exception:
+            pass
+
+
+def _schedule_evict(key: str) -> None:
+    """(Re)arm the idle timer for one chat on the running loop."""
+    _cancel_timer(key)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        _evict_timers[key] = loop.call_later(
+            _BROWSER_IDLE_EVICT_S, _on_idle_timeout, key
+        )
+    except Exception:
+        pass
+
+
+def _touch(key: str) -> None:
+    """Record activity and re-arm the idle timer for one chat."""
+    _last_used[_normalize_chat(key)] = time.monotonic()
+    _schedule_evict(_normalize_chat(key))
+
+
+def _on_idle_timeout(key: str) -> None:
+    """Loop callback: hand the async eviction check to a task."""
+    _evict_timers.pop(key, None)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        loop.create_task(_evict_if_idle(key))
+    except Exception:
+        pass
+
+
+async def _evict_if_idle(key: str) -> bool:
+    """Close one chat's browser when closed and idle for the whole window."""
+    norm = _normalize_chat(key)
+    if norm in _open_chats:
+        if is_active(norm):
+            _schedule_evict(norm)
+        return False
+    if not is_active(norm):
+        _cancel_timer(norm)
+        return False
+    last = _last_used.get(norm, 0.0)
+    if time.monotonic() - last < _BROWSER_IDLE_EVICT_S:
+        return False
+    sess = _sessions.get(norm)
+    if sess is None:
+        return False
+    async with sess.lock:
+        await _force_close(norm)
+    _cancel_timer(norm)
+    _last_used.pop(norm, None)
+    return True
+
+
 # Stealth init script applied to every page: hides the automation markers
-# that search engines key on (webdriver flag, missing plugins/languages,
-# missing chrome runtime, notification permission fingerprint).
+# that search engines key on (webdriver flag, fake plugin arrays,
+# missing chrome runtime, headless WebGL vendor, notification fingerprint).
+# Every value mimics a real desktop Chrome so content-level bot checks fail
+# closed instead of serving a captcha wall.
 _STEALTH_INIT_SCRIPT = """(() => {
   try {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'plugins', { get: () => {
+      const mk = (name, filename, desc) => ({ name, filename, description: desc, length: 1 });
+      const arr = [mk('Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'),
+                   mk('Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', 'Portable Document Format'),
+                   mk('Native Client', 'internal-nacl-plugin', 'Native Client Executable')];
+      arr.namedItem = (n) => arr.find((p) => p.name === n || p.filename === n) || null;
+      arr.item = (i) => arr[i] || null;
+      return arr;
+    }});
+    Object.defineProperty(navigator, 'mimeTypes', { get: () => {
+      const arr = [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }];
+      arr.namedItem = (n) => arr.find((m) => m.type === n) || null;
+      arr.item = (i) => arr[i] || null;
+      return arr;
+    }});
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    if (!window.chrome) window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    if (!window.chrome || !window.chrome.runtime) {
+      window.chrome = { runtime: {}, csi: () => ({}), loadTimes: () => ({}), app: {} };
+    }
     const perms = window.navigator.permissions;
     if (perms && perms.query) {
       const orig = perms.query.bind(perms);
@@ -94,6 +209,14 @@ _STEALTH_INIT_SCRIPT = """(() => {
           : orig(p)
       );
     }
+    try {
+      const getParam = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function (p) {
+        if (p === 37445) return 'Google Inc. (Intel)';
+        if (p === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return getParam.call(this, p);
+      };
+    } catch (e) {}
   } catch (e) {}
 })();"""
 
@@ -301,16 +424,73 @@ def _clear_stale_profile_lock(profile: Path, force: bool = False) -> None:
     _unlink_singleton_files(profile)
 
 
+_CHROMIUM_INSTALL_ATTEMPTED = False
+_CHROMIUM_INSTALL_TASK: asyncio.Task | None = None
+
+
+def _is_missing_bundled_error(exc: Exception) -> bool:
+    """True when Playwright reports its bundled Chromium is not installed."""
+    msg = str(exc)
+    return "Executable doesn't exist" in msg or "playwright install" in msg.lower()
+
+
+async def _install_bundled_chromium() -> None:
+    """Download bundled Chromium in the background (never blocks a launch)."""
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception:
+        logger.warning("bundled Chromium auto-install failed", exc_info=True)
+        return
+    if proc.returncode != 0:
+        detail = proc.stderr[-500:] if proc.stderr else proc.returncode
+        logger.warning("bundled Chromium auto-install failed: %s", detail)
+        return
+    logger.warning("bundled Chromium auto-install finished")
+
+
+def _ensure_bundled_chromium() -> bool:
+    """Kick off the background Chromium install; never blocks the caller.
+
+    Always returns False so the launch path falls through to the system
+    Chrome fallback immediately — the agent answer must never wait on a
+    ~170MB download. The next launch after the background install finishes
+    picks up the bundled build. Only attempted once per process.
+    """
+    global _CHROMIUM_INSTALL_ATTEMPTED, _CHROMIUM_INSTALL_TASK
+    if _CHROMIUM_INSTALL_ATTEMPTED:
+        return False
+    _CHROMIUM_INSTALL_ATTEMPTED = True
+    logger.warning("bundled Chromium missing - installing in background via playwright")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    _CHROMIUM_INSTALL_TASK = loop.create_task(_install_bundled_chromium())
+    return False
+
+
 async def _launch_browser(pw, chat_key: str | None = None):
     """Launch headless Chromium (persistent profile) with CDP exposed.
 
-    Returns the BrowserContext. The automation markers Google keys on are
-    stripped: no ``--enable-automation`` switch, AutomationControlled blink
-    feature disabled (``navigator.webdriver`` reads as undefined), and the
-    profile persists across runs so existing cookies survive.
-    Prefers the system Chrome first, then Playwright's bundled build, so a
-    machine without ``playwright install`` still works — the panel only
-    needs *a* Chromium-family browser. Edge is intentionally not tried:
+    Runs the full browser build in new headless mode (``headless=False``
+    plus ``--headless=new``): far fewer automation tells than the
+    headless-shell binary, while no window ever opens outside the app.
+    The automation markers Google keys on are stripped: no
+    ``--enable-automation`` switch, AutomationControlled blink feature
+    disabled (``navigator.webdriver`` reads as false), and the profile
+    persists across runs so existing cookies survive.
+    Prefers Playwright's bundled Chromium first, then the system Chrome as
+    a fallback for machines without ``playwright install`` — the panel only
+    needs *a* Chromium-family browser. Bundled-first keeps the virtual
+    browser off the system Chrome binary, so clicking the system Chrome
+    icon while the app runs never hangs behind our headless process.
+    Edge is intentionally not tried:
     most machines lack it and its "not found" error only buries the real
     cause in the logs.
     """
@@ -318,6 +498,10 @@ async def _launch_browser(pw, chat_key: str | None = None):
     port = int(cdp_endpoint(key).rsplit(":", 1)[1])
     args = [
         f"--remote-debugging-port={port}",
+        # New headless mode on a headed launch: the FULL browser build
+        # renders (far fewer automation tells than the headless-shell
+        # binary) while no window ever opens outside the app.
+        "--headless=new",
         "--disable-blink-features=AutomationControlled",
         # Skip first-run flows (welcome pages, choice screens) that look
         # nothing like a real user's settled profile — a bot signal.
@@ -329,11 +513,11 @@ async def _launch_browser(pw, chat_key: str | None = None):
     errors: list[str] = []
     for sweep in range(2):
         blocked = False
-        for kwargs in ({"channel": "chrome"}, {}):
+        for kwargs in ({}, {"channel": "chrome"}):
             try:
                 return await pw.chromium.launch_persistent_context(
                     user_data_dir=str(profile),
-                    headless=True,
+                    headless=False,
                     args=args,
                     ignore_default_args=["--enable-automation"],
                     # Match the stealth init script (languages) at the HTTP
@@ -352,6 +536,11 @@ async def _launch_browser(pw, chat_key: str | None = None):
                     kwargs.get("channel", "bundled"),
                     exc,
                 )
+                if not kwargs.get("channel") and _is_missing_bundled_error(exc):
+                    # Fire-and-forget: install in the background and fall
+                    # through to system Chrome immediately, so the agent
+                    # answer never waits on the download.
+                    _ensure_bundled_chromium()
                 blocked = blocked or "ProcessSingleton" in str(exc)
         if not blocked:
             break
@@ -383,6 +572,7 @@ async def launch(url: str = "about:blank", chat_id: str | None = None) -> dict:
                     await sess.page.goto(target)
                 except Exception as exc:  # noqa: BLE001
                     return {"ok": False, "error": f"navigation failed: {exc}"}
+            _touch(key)
             return status(key)
         try:
             sess.pw = await async_playwright().start()
@@ -394,10 +584,11 @@ async def launch(url: str = "about:blank", chat_id: str | None = None) -> dict:
             # panel then stays "stopped" even though the context launched).
             # It is None for persistent contexts — close tolerates that.
             sess.browser = sess.context.browser
-            sess.page = sess.context.pages[0] if sess.context.pages else await sess.context.new_page()
-            # Stealth markers on every page, including MCP-opened tabs.
+            # Stealth first: the init script must exist before any page or
+            # document loads, otherwise the first page misses it entirely.
             await sess.context.add_init_script(_STEALTH_INIT_SCRIPT)
             await _init_ua_override(sess.context, sess)
+            sess.page = sess.context.pages[0] if sess.context.pages else await sess.context.new_page()
             await sess.page.set_viewport_size(dict(DEFAULT_VIEWPORT))
         except Exception as exc:
             logger.exception("browser launch failed")
@@ -410,6 +601,7 @@ async def launch(url: str = "about:blank", chat_id: str | None = None) -> dict:
                 await sess.page.goto(target)
             except Exception as exc:  # noqa: BLE001
                 return {"ok": False, "error": f"navigation failed: {exc}"}
+    _touch(key)
     return status(key)
 
 
@@ -419,10 +611,27 @@ async def _apply_ua(page, sess: _ChatSession | None = None) -> None:
     if not override:
         return
     try:
+        import re as _re
+
         session = await page.context.new_cdp_session(page)
-        await session.send(
-            "Emulation.setUserAgentOverride", {"userAgent": override}
-        )
+        params: dict = {"userAgent": override}
+        m = _re.search(r"Chrome/(\d+)", override)
+        if m and "Mobile" not in override:
+            ver = m.group(1)
+            params["userAgentMetadata"] = {
+                "brands": [
+                    {"brand": "Chromium", "version": ver},
+                    {"brand": "Google Chrome", "version": ver},
+                    {"brand": "Not-A.Brand", "version": "99"},
+                ],
+                "fullVersion": f"{ver}.0.0.0",
+                "platform": "Windows",
+                "platformVersion": "15.0.0",
+                "architecture": "x86",
+                "model": "",
+                "mobile": False,
+            }
+        await session.send("Emulation.setUserAgentOverride", params)
     except Exception:
         logger.debug("page UA override failed", exc_info=True)
 
@@ -467,6 +676,7 @@ async def screenshot(chat_id: str | None = None) -> dict:
         async with sess.lock:
             raw = await sess.page.screenshot(type="jpeg", quality=60)
         size = sess.page.viewport_size or DEFAULT_VIEWPORT
+        _touch(key)
         return {
             "ok": True,
             "image": "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii"),
@@ -486,6 +696,7 @@ async def click(x: int, y: int, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.mouse.click(float(x), float(y))
+        _touch(key)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -500,6 +711,7 @@ async def type_text(text: str, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.keyboard.type(text)
+        _touch(key)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -514,6 +726,7 @@ async def press_key(key: str, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.keyboard.press(key)
+        _touch(key)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -528,6 +741,7 @@ async def navigate(url: str, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.goto(url)
+        _touch(key)
         return {"ok": True, "url": sess.page.url}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -545,7 +759,20 @@ SEARCH_ENGINES: tuple[tuple[str, str], ...] = (
 
 # URLs that mean "Google refused us" instead of a results page — those fall
 # through to the next engine rather than being shown to the user.
-_GOOGLE_BLOCKED_MARKERS = ("consent.google.com", "/sorry/", "recaptcha")
+_GOOGLE_BLOCKED_MARKERS = ("consent.google.com", "/sorry", "recaptcha", "captcha", "sorry/index")
+
+# Body text that means the same even when the URL looks like results
+# (Google serves these walls with HTTP 200).
+_GOOGLE_BLOCKED_CONTENT = (
+    "recaptcha",
+    "unusual traffic",
+    "our systems have detected",
+    "not a robot",
+    "captcha",
+    "/sorry/",
+    "sorry/index",
+    "consent.google.com",
+)
 
 
 def _is_google_blocked(page_url: str) -> bool:
@@ -553,16 +780,92 @@ def _is_google_blocked(page_url: str) -> bool:
     return any(m in u for m in _GOOGLE_BLOCKED_MARKERS)
 
 
+async def _accept_google_consent(page) -> None:
+    """Click Google's consent accept button when it appears (best-effort).
+
+    Fresh profiles often land on a consent wall before the homepage box
+    is usable; accepting sets the consent cookies in the persistent
+    profile so later searches skip the wall entirely.
+    """
+    try:
+        locator = page.locator(
+            'button:has-text("Accept all"), button:has-text("I agree"), '
+            'button:has-text("\u0642\u0628\u0648\u0644 \u062f\u0627\u0631\u0645"), [aria-label="Accept all"]'
+        )
+    except Exception:
+        return
+    try:
+        btn = locator.first if hasattr(locator, "first") else locator
+        await btn.click(timeout=3_000)
+        await asyncio.sleep(0.6)
+    except Exception:
+        pass
+
+
+async def _try_google_human(page, query: str) -> str | None:
+    """Human-like Google search: homepage -> click box -> type -> Enter.
+
+    Direct GETs to /search?q= are the top automation tell; typing into the
+    homepage box looks like a real user. Returns the settled URL, or None
+    when the human path failed (caller falls back to the direct URL).
+    Pages without locator support (unit fakes) return None immediately.
+    """
+    try:
+        locator = page.locator('textarea[name="q"], input[name="q"]')
+    except Exception:
+        return None
+    try:
+        await page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15_000)
+        await _accept_google_consent(page)
+        await asyncio.sleep(random.uniform(0.5, 1.1))
+        box = locator.first if hasattr(locator, "first") else locator
+        # Glide the virtual mouse to the box in steps: trusted pointer
+        # input with a human-like path before the click.
+        try:
+            target = await box.bounding_box()
+        except Exception:
+            target = None
+        if target is not None:
+            try:
+                await page.mouse.move(
+                    target["x"] + target["width"] / 2,
+                    target["y"] + target["height"] / 2,
+                    steps=random.randint(8, 20),
+                )
+                await asyncio.sleep(random.uniform(0.1, 0.35))
+            except Exception:
+                pass
+        await box.click(timeout=5_000)
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        try:
+            await box.fill("", timeout=3_000)
+        except Exception:
+            pass
+        # Jittered typing in small chunks: a uniform 35ms cadence is
+        # itself a bot tell.
+        for i in range(0, len(query), 3):
+            await box.press_sequentially(query[i : i + 3], delay=random.uniform(25, 90), timeout=15_000)
+            await asyncio.sleep(random.uniform(0.05, 0.25))
+        await asyncio.sleep(random.uniform(0.3, 0.7))
+        await box.press("Enter", timeout=5_000)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
+        return page.url or ""
+    except Exception:
+        return None
+
+
 async def search(query: str, chat_id: str | None = None) -> dict:
     """Search the web: Google first, Bing then DuckDuckGo as fallbacks.
 
-    A goto that throws, returns HTTP >= 400, or (on Google) lands on a
-    consent/CAPTCHA page counts as a failure and the next engine is tried.
-    Content-level walls (recaptcha/unusual-traffic text after a redirect)
-    count too, and a short human-like pause separates engine attempts so
-    rapid-fire gotos do not look scripted. Returns ``{"ok": True,
-    "engine": ..., "url": ...}`` or ``{"ok": False, "error": ...}``
-    (never raises).
+    Google is driven like a human (homepage -> type -> Enter); a direct
+    GET to /search is only the fallback. A goto that throws, returns
+    HTTP >= 400, or lands on a consent/CAPTCHA page counts as a failure
+    and the next engine is tried. Returns ``{"ok": True, "engine": ...,
+    "url": ...}`` or ``{"ok": False, "error": ...}`` (never raises).
     """
     q = (query or "").strip()
     if not q:
@@ -581,7 +884,19 @@ async def search(query: str, chat_id: str | None = None) -> dict:
                 await asyncio.sleep(0.4 + 0.3 * idx)
             url = template.format(encoded)
             try:
-                resp = await sess.page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                if name == "google":
+                    # Human path first: typing into the homepage box looks
+                    # like a real user; a direct GET to /search is the top
+                    # automation tell. None means the human path failed —
+                    # fall through to the direct URL below.
+                    human_url = await _try_google_human(sess.page, q)
+                    if human_url is not None:
+                        url = human_url
+                        resp = None
+                    else:
+                        resp = await sess.page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                else:
+                    resp = await sess.page.goto(url, wait_until="domcontentloaded", timeout=20_000)
                 code = 200 if resp is None else int(getattr(resp, "status", 200))
                 if code >= 400:
                     errors.append(f"{name}: HTTP {code}")
@@ -594,19 +909,30 @@ async def search(query: str, chat_id: str | None = None) -> dict:
                 except Exception:  # noqa: BLE001
                     cur_url = url
                 if name == "google" and _is_google_blocked(cur_url):
-                    errors.append(f"{name}: blocked ({cur_url})")
-                    continue
+                    rescued = False
+                    if "consent" in cur_url:
+                        # Consent wall, not a captcha: accept it (sets the
+                        # cookie in our persistent profile) and re-check.
+                        await _accept_google_consent(sess.page)
+                        await asyncio.sleep(0.8)
+                        try:
+                            cur_url = sess.page.url or ""
+                        except Exception:  # noqa: BLE001
+                            pass
+                        rescued = not _is_google_blocked(cur_url)
+                    if not rescued:
+                        errors.append(f"{name}: blocked ({cur_url})")
+                        continue
                 # Content-level wall: URL looks fine but the body is a
                 # recaptcha/sorry/consent page (Google serves these with 200).
                 try:
                     html = (await sess.page.content())[:8000].lower()
                 except Exception:  # noqa: BLE001
                     html = ""
-                if name == "google" and any(
-                    m in html for m in ("recaptcha", "unusual traffic", "/sorry/", "consent.google.com")
-                ):
+                if name == "google" and any(m in html for m in _GOOGLE_BLOCKED_CONTENT):
                     errors.append(f"{name}: blocked (captcha/consent page)")
                     continue
+                _touch(key)
                 return {"ok": True, "engine": name, "url": sess.page.url}
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{name}: {exc}")
@@ -622,6 +948,7 @@ async def scroll(dx: int, dy: int, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.mouse.wheel(float(dx), float(dy))
+        _touch(key)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -638,6 +965,7 @@ async def set_viewport(width: int, height: int, chat_id: str | None = None) -> d
     try:
         async with sess.lock:
             await sess.page.set_viewport_size({"width": w, "height": h})
+        _touch(key)
         return status(key)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -652,6 +980,7 @@ async def move(x: int, y: int, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await sess.page.mouse.move(float(x), float(y))
+        _touch(key)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -674,6 +1003,7 @@ async def history(action: str, chat_id: str | None = None) -> dict:
     try:
         async with sess.lock:
             await getattr(sess.page, method)(wait_until="commit", timeout=10_000)
+        _touch(key)
         return status(key)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -685,6 +1015,8 @@ async def close(chat_id: str | None = None) -> dict:
     sess = _get(key)
     async with sess.lock:
         await _force_close(key)
+    _cancel_timer(key)
+    _last_used.pop(key, None)
     return {"ok": True}
 
 

@@ -171,11 +171,13 @@ export function ViewerContent() {
   }
 
   if (active.kind === "plan") {
-    // Follows the active chat too: the plan document belongs to the chat that
-    // produced it (PlanPanel reads the live activeChatId from the store).
+    // The plan document belongs to the tab's owner chat — pass it explicitly
+    // so the panel shows that chat's plan even when it was opened from a
+    // background turn while another chat is active.
     return (
       <PlanPanel
         key={active.id}
+        chatId={active.chatId}
       />
     );
   }

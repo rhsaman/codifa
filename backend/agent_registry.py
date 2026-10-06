@@ -16,8 +16,8 @@ unit of work in the background.
 # compact report when done (context isolation: the main agent never sees its
 # internal tool history, spec §9/§11).
 SUBAGENT_DESCRIPTION = (
-    "Background sub-agent for whole units of work: research, multi-file reads, "
-    "code search, verification, multi-step browser (Playwright) and desktop "
+    "Background sub-agent for whole units of work: independent implementation chunks, "
+    "verification, multi-step browser (Playwright) and desktop "
     "(computer) loops, or small delegated tasks. Browser snapshots and desktop "
     "trees bloat the main transcript when run inline — delegate them here so "
     "the main agent only sees the compact report. Delegated tasks run "
@@ -30,9 +30,9 @@ SUBAGENT_SYSTEM = (
     "and is continuing its own task in parallel — work independently with your tools "
     "and finish with a COMPACT report: a 3-5 line summary + a list of `path:line:snippet` "
     "findings (absolute paths) or the concrete result of the task. No prose.\n\n"
-    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries, then fire ALL Glob/Grep discovery in ONE parallel batch, then ALL reads in ONE batch via filePaths=[...] or ranges=[...], then report. If a call fails, report the exact ERROR instead of falling back with an excuse. Chain independent run_terminal checks in ONE call with `;`.\n\n"
+    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries, then fire ALL Glob/Grep lookups in ONE parallel batch, then ALL reads in ONE batch via filePaths=[...] or ranges=[...], then report. If a call fails, report the exact ERROR instead of falling back with an excuse. Chain independent run_terminal checks in ONE call with `;`.\n\n"
     "Procedure (strict order):\n"
-    "1. Finish ALL Glob/Grep discovery FIRST, then read -- never interleave search->read->search->read. Grep with context to locate exact lines, then read only the windows it points to with offset/limit (never a whole large file).\n"
+    "1. Finish ALL Glob/Grep lookups FIRST, then read -- never interleave search->read->search->read. Grep with context to locate exact lines, then read only the windows it points to with offset/limit (never a whole large file).\n"
     "2. If the request names a folder/pattern, scope your search to it -- do not fan out repo-wide unless asked.\n"
     "3. Merge related searches into ONE call: multiple globs/greps -> pattern + patterns=[...] (or '|' inside pattern); scopes via path + paths=[...]; filters via include + includes=[...].\n"
     "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, ...) -- grep first, then read ONLY the needed windows in ONE call via ranges=[...] (same file, several windows included: ranges=['tools.py:640:60','tools.py:2089:80']; symbols=[...] may join that same call). Make the FIRST read decisive: known NAME (CODE MAP or a grep `in Name (L..)` hit) -> symbols=[...]; surveying a large file -> offset=1 limit=400+ for a FILE MAP, then symbols=[...] in ONE call. Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n"

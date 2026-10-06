@@ -8,13 +8,14 @@ import { prepareContent } from "../lib/bidi";
 import { mdComponents } from "./ChatMessage";
 
 /** Docked Plan viewer tab (opened by the chat Plan card's "View full plan").
- *  Shows the active chat's latest implementation plan document as markdown.
- *  Like the trace tab it follows the active chat — no chatId prop.
+ *  Shows the owner chat's latest implementation plan document as markdown.
+ *  The owner chat comes from the viewer tab (falls back to the active chat).
  *  No header row and no close button: the viewer tab strip already labels and
  *  closes this panel, so a second "Plan" title + X would be redundant. Copy
  *  floats at the top-right corner — its previous spot at the header's end. */
-export function PlanPanel() {
-  const activeChatId = useStore((s) => s.activeChatId);
+export function PlanPanel({ chatId }: { chatId?: string } = {}) {
+  const storeActiveChatId = useStore((s) => s.activeChatId);
+  const activeChatId = chatId ?? storeActiveChatId;
   const chats = useStore((s) => s.chats);
   // The panel CHROME stays LTR (same docked layout as Git/Trace); only the
   // plan TEXT follows the app's direction + bidi handling.

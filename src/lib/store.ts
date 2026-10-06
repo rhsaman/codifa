@@ -15,6 +15,8 @@ import type {
   SearchPluginConfig,
   SearchPluginKind,
   Settings,
+  SttFallback,
+  TtsFallback,
   ThinkingLevel,
   TokenUsage,
   ToolActivity,
@@ -41,7 +43,7 @@ import { PROVIDER_META } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry } from './usage'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
-import { appendChat, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, leafCount, loadChatTree, normalizeTree, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats } from './chatTree'
+import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, replaceChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -213,6 +215,37 @@ function coerceBoundedInt(v: unknown, fallback: number, min: number, max: number
   return Math.max(min, Math.min(max, r))
 }
 
+/** Normalize a persisted STT fallback list: keep rows with a provider id, trim model. */
+function normalizeSttFallbacks(raw: unknown): SttFallback[] {
+  if (!Array.isArray(raw)) return []
+  const out: SttFallback[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rec = r as Record<string, unknown>
+    const providerId = typeof rec.providerId === 'string' ? rec.providerId.trim() : ''
+    if (!providerId) continue
+    const model = typeof rec.model === 'string' ? rec.model.trim() : ''
+    out.push({ providerId, model })
+  }
+  return out
+}
+
+/** Normalize a persisted TTS fallback list: keep rows with a provider id, trim model/voice. */
+function normalizeTtsFallbacks(raw: unknown): TtsFallback[] {
+  if (!Array.isArray(raw)) return []
+  const out: TtsFallback[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rec = r as Record<string, unknown>
+    const providerId = typeof rec.providerId === 'string' ? rec.providerId.trim() : ''
+    if (!providerId) continue
+    const model = typeof rec.model === 'string' ? rec.model.trim() : ''
+    const voice = typeof rec.voice === 'string' ? rec.voice.trim() : ''
+    out.push({ providerId, model, voice })
+  }
+  return out
+}
+
 const PERSIST_DEBOUNCE_MS = 100
 function persistSoon(): void {
   clearTimeout(persistTimer)
@@ -358,6 +391,54 @@ function treeDirFromLayout(layout: ChatLayout): ChatSplitDir {
   return layout === 'horizontal' ? 'row' : 'col'
 }
 
+/** Best direction for a newly opened window from the chat area aspect.
+ *  Wide area splits side-by-side (row), tall area stacks (col); falls back
+ *  to the saved layout when the DOM is unavailable (tests/SSR). */
+function smartAppendDir(fallback: ChatLayout): ChatSplitDir {
+  try {
+    if (typeof document !== 'undefined') {
+      const rect = document.querySelector('[data-testid="chat-windows"]')?.getBoundingClientRect()
+      if (rect && rect.width > 0 && rect.height > 0) return bestSplitDir(rect.width, rect.height)
+    }
+    if (typeof window !== 'undefined' && window.innerWidth > 0 && window.innerHeight > 0) {
+      return bestSplitDir(Math.max(1, window.innerWidth - 320), window.innerHeight)
+    }
+  } catch {
+    /* fall through to layout */
+  }
+  return treeDirFromLayout(fallback)
+}
+
+// Last window the user explicitly clicked (header/body). Sidebar/tab select
+// and new chat replace this window; with no prior click they open a new one.
+let clickedWindowId: string | null = null
+
+/** Arm click-to-replace for the next explicit open (sidebar/tab/new chat). */
+export function markWindowClicked(id: string): void {
+  clickedWindowId = id
+}
+
+/** Consume the armed replace target when it is still visible. Always disarms. */
+function takeReplaceTarget(base: ChatTreeNode | null, newId: string): string | null {
+  const target = clickedWindowId
+  clickedWindowId = null
+  if (!target || target === newId) return null
+  if (!base || !containsChat(base, target)) return null
+  return target
+}
+
+/** Place an explicitly opened chat: replace the clicked window when armed,
+// otherwise open a new window beside the focused one along the best axis. */
+function placeChat(base: ChatTreeNode | null, newId: string, activeId: string, layout: ChatLayout): ChatTreeNode | null {
+  if (base && containsChat(base, newId)) {
+    clickedWindowId = null
+    return base
+  }
+  const target = takeReplaceTarget(base, newId)
+  if (target && base) return replaceChat(base, target, newId)
+  return openBeside(base, newId, activeId, smartAppendDir(layout))
+}
+
 /** Persist a split tree plus its legacy mirrors (visible ids, sizes, layout). */
 function persistTreeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
   persistChatTree(tree)
@@ -395,6 +476,26 @@ function persistChatFullscreen(v: boolean): void {
   }
 }
 
+const WINDOW_FULL_KEY = 'coder:windowFullscreen'
+
+function loadWindowFullscreen(): string | null {
+  try {
+    const v = localStorage.getItem(WINDOW_FULL_KEY)
+    return v && v.length > 0 ? v : null
+  } catch {
+    return null
+  }
+}
+
+function persistWindowFullscreen(id: string | null): void {
+  try {
+    if (id) localStorage.setItem(WINDOW_FULL_KEY, id)
+    else localStorage.removeItem(WINDOW_FULL_KEY)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 // Bottom terminal panel visibility (Cmd/Ctrl+J). Session-level UI state like
 // chatFullscreen — localStorage instead of the settings payload so the
 // backend's default-skeleton detection stays untouched.
@@ -411,6 +512,24 @@ function loadTerminalPanel(): boolean {
 function persistTerminalPanel(v: boolean): void {
   try {
     localStorage.setItem(TERMINAL_PANEL_KEY, v ? '1' : '0')
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const TERMINAL_FULL_KEY = 'coder:terminalFullscreen'
+
+function loadTerminalFullscreen(): boolean {
+  try {
+    return localStorage.getItem(TERMINAL_FULL_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistTerminalFullscreen(v: boolean): void {
+  try {
+    localStorage.setItem(TERMINAL_FULL_KEY, v ? '1' : '0')
   } catch {
     /* storage unavailable */
   }
@@ -453,8 +572,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -539,7 +658,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -555,7 +674,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, ttsProviderId, ttsModel, ttsVoice, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -813,6 +932,11 @@ interface State {
   toggleRightPanel: () => void
   setTerminalPanelOpen: (open: boolean) => void
   toggleTerminalPanel: () => void
+  /** Terminal fullscreen (Ctrl+M while the terminal has focus). Persisted in
+   *  localStorage like terminalPanelOpen. */
+  terminalFullscreen: boolean
+  setTerminalFullscreen: (v: boolean) => void
+  toggleTerminalFullscreen: () => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
@@ -837,21 +961,27 @@ interface State {
   sttProviderId: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions. */
   sttModel: string
+  /** Ordered STT fallback targets, tried after the primary STT source fails. */
+  sttFallbacks: SttFallback[]
   /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
   ttsProviderId: string
   /** Remote TTS model id sent to {base_url}/audio/speech. */
   ttsModel: string
   /** Remote TTS voice id sent to {base_url}/audio/speech. */
   ttsVoice: string
+  /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
+  ttsFallbacks: TtsFallback[]
   embeddingModel: string
   embeddingBaseUrl: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
   setSttModel: (m: string) => void
+  setSttFallbacks: (f: SttFallback[]) => void
   setTtsProviderId: (id: string) => void
   setTtsModel: (m: string) => void
   setTtsVoice: (v: string) => void
+  setTtsFallbacks: (f: TtsFallback[]) => void
   setEmbeddingModel: (m: string) => void
   setEmbeddingBaseUrl: (u: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
@@ -892,6 +1022,9 @@ interface State {
   openChat: (id: string) => void
   /** Close a chat tab without deleting the chat data (sidebar keeps it). */
   closeChatTab: (id: string) => void
+  /** Bulk-close tabs that are not active, not streaming and not open in a
+   *  multi-window pane. Chats stay in the sidebar. Returns the closed ids. */
+  closeInactiveChatTabs: () => string[]
   /** Recently closed chat tabs (newest first, capped) for the tab-list
    *  menu's "Recently closed" section. In-memory only. */
   recentlyClosedChatTabs: { id: string; at: number }[]
@@ -913,6 +1046,9 @@ interface State {
   setChatLayout: (layout: ChatLayout) => void
   /** VSCode-like drop: drag chat onto target leaf edge or center. */
   dropChatOnto: (dragChatId: string, targetChatId: string, pos: ChatDropPos) => void
+  /** Root-edge drop: move a chat to the outer edge of the chat area.
+   *  The dragged window's own space counts as empty (removed first). */
+  dropChatOntoRoot: (dragChatId: string, pos: ChatDropPos) => void
   /** Resize a split-tree node by node id. */
   setTreeNodeSize: (nodeId: string, size: number) => void
   /** Resize two sibling split children atomically. */
@@ -922,6 +1058,11 @@ interface State {
   chatFullscreen: boolean
   setChatFullscreen: (v: boolean) => void
   toggleChatFullscreen: () => void
+  /** Fullscreen chat window inside the chat group (other windows hide, viewer
+   *  group stays). Stores the fullscreen chat id, null = off. Persisted. */
+  windowFullscreenId: string | null
+  setWindowFullscreen: (id: string | null) => void
+  toggleWindowFullscreen: (id?: string) => void
   setChatMode: (id: string, mode: AgentMode) => void
   /** Silent mode sync for backend-driven switches (plan approval → coder via
    *  the `mode_changed` event): updates chat.mode WITHOUT the "[Mode switched
@@ -1166,9 +1307,11 @@ export const useStore = create<State>((set, get) => ({
   whisperBaseUrl: '',
   sttProviderId: 'local',
   sttModel: 'whisper-1',
+  sttFallbacks: [],
   ttsProviderId: '',
   ttsModel: 'tts-1',
   ttsVoice: 'alloy',
+  ttsFallbacks: [],
   embeddingModel: 'intfloat/multilingual-e5-base',
   embeddingBaseUrl: '',
   recentModels: [],
@@ -1182,6 +1325,7 @@ export const useStore = create<State>((set, get) => ({
   codeMapPanelOpen: false,
   rightPanelOpen: false,
   terminalPanelOpen: typeof window !== 'undefined' ? loadTerminalPanel() : false,
+  terminalFullscreen: typeof window !== 'undefined' ? loadTerminalFullscreen() : false,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -1198,6 +1342,7 @@ export const useStore = create<State>((set, get) => ({
   chatTree: typeof window !== 'undefined' ? loadChatTree() : null,
   recentlyClosedChatTabs: [],
   chatFullscreen: typeof window !== 'undefined' ? loadChatFullscreen() : false,
+  windowFullscreenId: typeof window !== 'undefined' ? loadWindowFullscreen() : null,
   focusComposer: false,
   unreadChats: [],
   prefixNotice: null,
@@ -1520,11 +1665,13 @@ export const useStore = create<State>((set, get) => ({
       whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
       sttProviderId: typeof raw.sttProviderId === 'string' && raw.sttProviderId.trim() ? raw.sttProviderId : 'local',
       sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
+      sttFallbacks: normalizeSttFallbacks((raw as Record<string, unknown>).sttFallbacks),
       ttsProviderId: typeof raw.ttsProviderId === 'string' ? raw.ttsProviderId.trim() : '',
       // خالی مجاز است (پروایدرهای 9router بدون مدل/ویس): فقط وقتی فیلد اصلاً
       // رشته نیست (settings قدیمی) پیش‌فرض می‌گذاریم، نه وقتی کاربر پاکش کرده.
       ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
+      ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
       subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
@@ -1986,6 +2133,10 @@ export const useStore = create<State>((set, get) => ({
     set({ sttModel: (m ?? '').trim() || 'whisper-1' })
     get().persist()
   },
+  setSttFallbacks: (f) => {
+    set({ sttFallbacks: normalizeSttFallbacks(f) })
+    get().persist()
+  },
   setTtsProviderId: (id) => {
     set({ ttsProviderId: (id ?? '').trim() })
     get().persist()
@@ -2001,6 +2152,10 @@ export const useStore = create<State>((set, get) => ({
   setTtsVoice: (v) => {
     // خالی مجاز است — مثل setTtsModel.
     set({ ttsVoice: (v ?? '').trim() })
+    get().persist()
+  },
+  setTtsFallbacks: (f) => {
+    set({ ttsFallbacks: normalizeTtsFallbacks(f) })
     get().persist()
   },
   setEmbeddingModel: (m) => {
@@ -2093,13 +2248,29 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setTerminalPanelOpen: (terminalPanelOpen) => {
-    set({ terminalPanelOpen })
+    set((s) => ({
+      terminalPanelOpen,
+      terminalFullscreen: terminalPanelOpen ? s.terminalFullscreen : false,
+    }))
     persistTerminalPanel(terminalPanelOpen)
+    if (!terminalPanelOpen) persistTerminalFullscreen(false)
   },
 
   toggleTerminalPanel: () => {
     const next = !get().terminalPanelOpen
     get().setTerminalPanelOpen(next)
+  },
+
+  setTerminalFullscreen: (v) => {
+    // Fullscreen needs an open panel — open it first so Ctrl+M works even
+    // when the panel was closed.
+    if (v && !get().terminalPanelOpen) get().setTerminalPanelOpen(true)
+    persistTerminalFullscreen(v)
+    set({ terminalFullscreen: v })
+  },
+
+  toggleTerminalFullscreen: () => {
+    get().setTerminalFullscreen(!get().terminalFullscreen)
   },
 
   setRecentModels: (recentModels) => {
@@ -2173,17 +2344,17 @@ export const useStore = create<State>((set, get) => ({
     set((st) => {
       const openChatIds = st.openChatIds.includes(activeChatId) ? st.openChatIds : [...st.openChatIds, activeChatId]
       persistOpenState(openChatIds, activeChatId)
-      // New chat replaces single-window view; in multi-window it appends.
+      // New chat replaces single-window view; in multi-window it always
+      // opens a new window (never replaces) placed along the best axis.
       const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
       if (single) {
+        clickedWindowId = null
         persistVisibleChats([activeChatId])
         persistChatTree(null)
         return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      // Full: show the new chat in place of the focused window instead of adding.
-      const full = base && leafCount(base) >= CHAT_WINDOW_MAX && !containsChat(base, activeChatId)
-      const chatTree = full ? (dropOnto(base, activeChatId, st.activeChatId, 'center') ?? base) : appendChat(base, activeChatId, treeDirFromLayout(st.chatLayout))
+      const chatTree = placeChat(base, activeChatId, st.activeChatId, st.chatLayout)
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
@@ -2206,14 +2377,13 @@ export const useStore = create<State>((set, get) => ({
       persistOpenState(openChatIds, activeChatId)
       const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
       if (single) {
+        clickedWindowId = null
         persistVisibleChats([activeChatId])
         persistChatTree(null)
         return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      // Full: show the new chat in place of the focused window instead of adding.
-      const full = base && leafCount(base) >= CHAT_WINDOW_MAX && !containsChat(base, activeChatId)
-      const chatTree = full ? (dropOnto(base, activeChatId, st.activeChatId, 'center') ?? base) : appendChat(base, activeChatId, treeDirFromLayout(st.chatLayout))
+      const chatTree = placeChat(base, activeChatId, st.activeChatId, st.chatLayout)
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
@@ -2448,21 +2618,23 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
-      // Single-window navigation replaces the visible set; multi-window
-      // focus is handled by focusWindow so other windows stay open.
+      // Single-window navigation replaces the visible set; in multi-window
+      // the chat always opens a new window (never replaces an open one).
       const single = leafCount(s.chatTree) <= 1 && s.visibleChatIds.length <= 1
       let chatTree: ChatTreeNode | null = s.chatTree
       let visibleChatIds = s.visibleChatIds
       let chatWindowSizes = s.chatWindowSizes
       let chatLayout = s.chatLayout
       if (single) {
+        clickedWindowId = null
         visibleChatIds = [id]
         chatTree = null
         persistVisibleChats(visibleChatIds)
         persistChatTree(null)
       } else if (!containsChat(chatTree, id)) {
+        // Tab restores into the clicked window, else opens a new pane.
         const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-        chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+        chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
         const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
         visibleChatIds = mirrors.visibleChatIds
         chatWindowSizes = mirrors.chatWindowSizes
@@ -2502,13 +2674,15 @@ export const useStore = create<State>((set, get) => ({
       let chatWindowSizes = s.chatWindowSizes
       let chatLayout = s.chatLayout
       if (single) {
+        clickedWindowId = null
         visibleChatIds = [id]
         chatTree = null
         persistVisibleChats(visibleChatIds)
         persistChatTree(null)
       } else if (!containsChat(chatTree, id)) {
+        // Sidebar/tab select replaces the clicked window, else opens a new one.
         const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-        chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+        chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
         const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
         visibleChatIds = mirrors.visibleChatIds
         chatWindowSizes = mirrors.chatWindowSizes
@@ -2555,6 +2729,48 @@ export const useStore = create<State>((set, get) => ({
     persistSoon()
   },
 
+  closeInactiveChatTabs: () => {
+    let closed: string[] = []
+    set((s) => {
+      const streaming = new Set(
+        s.chats
+          .filter((c) => c.messages.some((m) => m.streaming || m.retry?.reconnecting === true))
+          .map((c) => c.id),
+      )
+      const visible = new Set(s.chatTree ? collectChatIds(s.chatTree) : s.visibleChatIds)
+      const toClose = s.openChatIds.filter(
+        (id) => id !== s.activeChatId && !streaming.has(id) && !visible.has(id),
+      )
+      if (toClose.length === 0) return {}
+      closed = toClose
+      const drop = new Set(toClose)
+      const openChatIds = s.openChatIds.filter((cid) => !drop.has(cid))
+      persistOpenState(openChatIds, s.activeChatId)
+      const validIds = new Set(s.chats.map((c) => c.id))
+      let baseTreeCt = s.chatTree ?? buildFromList(s.visibleChatIds, treeDirFromLayout(s.chatLayout))
+      for (const id of toClose) {
+        if (!baseTreeCt) break
+        baseTreeCt = removeChat(baseTreeCt, id)
+      }
+      const normalizedCt = normalizeTree(baseTreeCt, validIds)
+      const fallbackCt = normalizeVisibleChats(s.visibleChatIds.filter((cid) => !drop.has(cid)), validIds, s.activeChatId)
+      const chatTreeCt = normalizedCt ?? (fallbackCt.length > 0 ? buildFromList(fallbackCt, treeDirFromLayout(s.chatLayout)) : null)
+      const mirrorsCt = persistTreeMirrors(chatTreeCt, s.chatLayout)
+      const visibleChatIds = mirrorsCt.visibleChatIds.length > 0 ? mirrorsCt.visibleChatIds : fallbackCt
+      // Tab-list menu "Recently closed": keep ids while the chat itself
+      // still exists (deleting the chat clears it via the chat store).
+      const now = Date.now()
+      const kept = toClose.filter((id) => s.chats.some((c) => c.id === id))
+      const recentlyClosedChatTabs = [
+        ...kept.map((id, i) => ({ id, at: now - i })),
+        ...s.recentlyClosedChatTabs.filter((r) => !drop.has(r.id)),
+      ].slice(0, 8)
+      return { openChatIds, visibleChatIds, chatTree: chatTreeCt, chatWindowSizes: mirrorsCt.chatWindowSizes, chatLayout: mirrorsCt.chatLayout, recentlyClosedChatTabs }
+    })
+    persistSoon()
+    return closed
+  },
+
   reopenChatTab: (id) => {
     set((s) => ({
       recentlyClosedChatTabs: s.recentlyClosedChatTabs.filter((r) => r.id !== id),
@@ -2585,15 +2801,10 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       if (!s.chats.some((c) => c.id === id)) return {}
       const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [s.activeChatId], s.chatLayout)
-      // Full: keep the tab open but do not add another window or steal focus.
-      if (base && !containsChat(base, id) && leafCount(base) >= CHAT_WINDOW_MAX) {
-        const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
-        persistOpenState(openChatIds, s.activeChatId)
-        return { openChatIds }
-      }
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
-      const chatTree = containsChat(base, id) ? base : appendChat(base, id, treeDirFromLayout(s.chatLayout))
+      clickedWindowId = null
+      const chatTree = containsChat(base, id) ? base : openBeside(base, id, s.activeChatId, smartAppendDir(s.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
       return {
         activeChatId: id,
@@ -2626,12 +2837,15 @@ export const useStore = create<State>((set, get) => ({
         activeChatId = visibleChatIds[Math.min(Math.max(idx, 0), visibleChatIds.length - 1)] ?? ''
       }
       if (activeChatId !== s.activeChatId) persistOpenState(s.openChatIds, activeChatId)
+      const windowFullscreenId = s.windowFullscreenId === id ? null : s.windowFullscreenId
+      if (s.windowFullscreenId === id) persistWindowFullscreen(null)
       return {
         visibleChatIds,
         chatWindowSizes: mirrors.chatWindowSizes,
         chatLayout: mirrors.chatLayout,
         chatTree,
         activeChatId,
+        windowFullscreenId,
         unreadChats: s.unreadChats.filter((cid) => cid !== activeChatId),
       }
     })
@@ -2644,28 +2858,22 @@ export const useStore = create<State>((set, get) => ({
       if (s.activeChatId === id) return {}
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
-      // Focus never reshapes the tree; ensure the focused chat is visible.
+      // Focusing a hidden chat opens a new window beside the previous focus.
       let chatTree: ChatTreeNode | null = s.chatTree
       let visibleChatIds = s.visibleChatIds
       let chatWindowSizes = s.chatWindowSizes
       let chatLayout = s.chatLayout
       if (!containsChat(chatTree, id)) {
         if (leafCount(chatTree) <= 1 && visibleChatIds.length <= 1) {
+          clickedWindowId = null
           visibleChatIds = [id]
           chatTree = null
           persistVisibleChats(visibleChatIds)
           persistChatTree(null)
-        } else if (chatTree && leafCount(chatTree) >= CHAT_WINDOW_MAX) {
-          // Full: show the focused chat in place of the previous focus.
-          const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-          chatTree = dropOnto(base, id, s.activeChatId, 'center') ?? base
-          const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
-          visibleChatIds = mirrors.visibleChatIds
-          chatWindowSizes = mirrors.chatWindowSizes
-          chatLayout = mirrors.chatLayout
         } else {
+          // Focusing a hidden chat replaces the clicked window, else opens new.
           const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-          chatTree = appendChat(base, id, treeDirFromLayout(s.chatLayout))
+          chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
           const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
           visibleChatIds = mirrors.visibleChatIds
           chatWindowSizes = mirrors.chatWindowSizes
@@ -2758,8 +2966,8 @@ export const useStore = create<State>((set, get) => ({
       if (!s.chats.some((c) => c.id === dragChatId)) return {}
       if (!s.chats.some((c) => c.id === targetChatId)) return {}
       const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [targetChatId], s.chatLayout)
-      // Full: a new chat cannot split in; keep the tab open and the target focused.
-      if (base && !containsChat(base, dragChatId) && leafCount(base) >= CHAT_WINDOW_MAX) {
+      // Full: a new chat cannot split in, but center drop replaces the target window.
+      if (base && !containsChat(base, dragChatId) && leafCount(base) >= CHAT_WINDOW_MAX && pos !== 'center') {
         const openChatIds = s.openChatIds.includes(dragChatId) ? s.openChatIds : [...s.openChatIds, dragChatId]
         persistOpenState(openChatIds, s.activeChatId)
         return { openChatIds }
@@ -2769,6 +2977,7 @@ export const useStore = create<State>((set, get) => ({
       const chatTree = dropOnto(base, dragChatId, targetChatId, pos)
       if (!chatTree) return {}
       const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      if (s.windowFullscreenId) persistWindowFullscreen(null)
       return {
         activeChatId: dragChatId,
         openChatIds,
@@ -2776,6 +2985,39 @@ export const useStore = create<State>((set, get) => ({
         chatWindowSizes: mirrors.chatWindowSizes,
         chatLayout: mirrors.chatLayout,
         chatTree,
+        windowFullscreenId: null,
+        unreadChats: s.unreadChats.filter((cid) => cid !== dragChatId),
+      }
+    })
+    persistSoon()
+  },
+
+  dropChatOntoRoot: (dragChatId, pos) => {
+    if (!dragChatId) return
+    if (pos === 'center') return
+    set((s) => {
+      if (!s.chats.some((c) => c.id === dragChatId)) return {}
+      const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [dragChatId], s.chatLayout)
+      if (!base) return {}
+      if (!containsChat(base, dragChatId) && leafCount(base) >= CHAT_WINDOW_MAX) {
+        const openChatIds = s.openChatIds.includes(dragChatId) ? s.openChatIds : [...s.openChatIds, dragChatId]
+        persistOpenState(openChatIds, s.activeChatId)
+        return { openChatIds }
+      }
+      const openChatIds = s.openChatIds.includes(dragChatId) ? s.openChatIds : [...s.openChatIds, dragChatId]
+      persistOpenState(openChatIds, dragChatId)
+      const chatTree = dropOntoRoot(base, dragChatId, pos)
+      if (!chatTree || chatTree === base) return { openChatIds }
+      const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
+      if (s.windowFullscreenId) persistWindowFullscreen(null)
+      return {
+        activeChatId: dragChatId,
+        openChatIds,
+        visibleChatIds: mirrors.visibleChatIds,
+        chatWindowSizes: mirrors.chatWindowSizes,
+        chatLayout: mirrors.chatLayout,
+        chatTree,
+        windowFullscreenId: null,
         unreadChats: s.unreadChats.filter((cid) => cid !== dragChatId),
       }
     })
@@ -2814,6 +3056,29 @@ export const useStore = create<State>((set, get) => ({
       persistChatFullscreen(!s.chatFullscreen)
       return { chatFullscreen: !s.chatFullscreen }
     })
+  },
+
+  setWindowFullscreen: (id) => {
+    persistWindowFullscreen(id)
+    set({ windowFullscreenId: id })
+  },
+
+  toggleWindowFullscreen: (id) => {
+    const st = get()
+    const target = id ?? st.activeChatId
+    if (!target) return
+    const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
+    // Single window already fills the chat area — nothing to expand.
+    if (ids.length < 2 && !st.windowFullscreenId) return
+    const next = toggleFullscreenId(st.windowFullscreenId, target)
+    persistWindowFullscreen(next)
+    if (next && st.activeChatId !== next) {
+      const openChatIds = st.openChatIds.includes(next) ? st.openChatIds : [...st.openChatIds, next]
+      persistOpenState(openChatIds, next)
+      set({ windowFullscreenId: next, activeChatId: next, openChatIds, unreadChats: st.unreadChats.filter((cid) => cid !== next) })
+    } else {
+      set({ windowFullscreenId: next })
+    }
   },
 
   setChatMode: (id, mode) => {

@@ -189,18 +189,20 @@ export function ReadingMode({
     >
       {/* Soft scrim — click anywhere outside the panel to close. */}
       <div className="reading-mode-scrim" aria-hidden="true" onClick={onClose} />
-      {/* Drag handle on the panel's left edge — resize like the sidebar. */}
-      <div
-        className="reading-mode-resize-handle"
-        title="Drag to resize"
-        onMouseDown={startResize}
-      />
       <div
         className="reading-mode-panel"
         role="dialog"
         aria-modal="false"
         aria-label="Reading mode"
       >
+        {/* Drag handle on the panel's left edge — resize like the sidebar.
+            Kept inside the panel so it always straddles the left edge even
+            while --reading-w updates during the drag. */}
+        <div
+          className="reading-mode-resize-handle"
+          title="Drag to resize"
+          onMouseDown={startResize}
+        />
         <div className="reading-mode-head">
           <div className="reading-mode-title">
             <h2>Reading Mode</h2>

@@ -3,6 +3,7 @@ import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { useViewerTabs, viewerTabTitle, visibleTabs, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
+import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
@@ -305,8 +306,7 @@ export function ViewerTabBar() {
               if (e.button === 1) useViewerTabs.getState().closeViewer(t.id);
             }}
             onDragStart={(e) => {
-              e.dataTransfer.setData("text/plain", t.id);
-              e.dataTransfer.effectAllowed = "move";
+              setViewerDragData(e, t.id);
               setDragId(t.id);
             }}
             onDragOver={(e) => {

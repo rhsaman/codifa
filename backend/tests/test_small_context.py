@@ -123,21 +123,15 @@ def test_read_project_memory_short_body_not_truncated():
         assert "truncated" not in out
 
 
-def test_read_project_memory_long_body_truncated():
-    """body بلندتر از max_bytes → trim + marker."""
+def test_read_project_memory_long_body_never_truncated():
+    """Project memory is part of the system prompt: the full file must be
+    returned even when it exceeds max_bytes (no trim, no marker)."""
     with tempfile.TemporaryDirectory() as d:
         body = "x" * 5_000
         _write_agents_md(d, body)
         out = _read_project_memory(d, max_bytes=1_000)
-        # marker اضافه شده
-        assert "truncated" in out
-        # طول خروجی تقریباً max_bytes (با کمی margin برای marker/header)
-        # ما فقط چک می‌کنیم که body اصلی تماماً داخل نیست
-        # (نباید همه‌ی 5000 کاراکتر x پشت سر هم باشد)
-        # marker بعد از max_bytes کاراکتر است، پس x ها ≤ max_bytes + مقداری marker
-        # ساده: بخش x ها از خروجی استخراج و چک می‌کنیم
-        run_of_x = "x" * 2000  # بیشتر از max_bytes
-        assert run_of_x not in out
+        assert "truncated" not in out
+        assert body in out
 
 
 def test_read_project_memory_missing_file_returns_empty():

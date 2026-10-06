@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
-import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
+import { collectChatIds } from "../lib/chatTree";
+import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "../lib/tabBar";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
@@ -152,7 +153,35 @@ export function ChatTabListButton() {
         .filter((e): e is NonNullable<typeof e> => e !== null),
     },
   ];
-  return <TabListButton sections={sections} label="Chat tab list" />;
+  // Reactive cleanup count: tabs that are not active, not streaming and
+  // not open in a multi-window pane. Subscribes to tree/visible/streaming
+  // so the footer label refreshes when a stream starts or stops. Closing a
+  // tab never deletes the chat (the sidebar keeps it), so this only clears
+  // tab clutter.
+  const chatTree = useStore((s) => s.chatTree);
+  const visibleChatIds = useStore((s) => s.visibleChatIds);
+  const streamingKey = useStore((s) =>
+    s.chats
+      .filter((c) => c.messages.some((m) => m.streaming || m.retry?.reconnecting === true))
+      .map((c) => c.id)
+      .sort()
+      .join(","),
+  );
+  const visibleSet = new Set(chatTree ? collectChatIds(chatTree) : visibleChatIds);
+  const streamingSet = new Set(streamingKey ? streamingKey.split(",") : []);
+  const inactive = inactiveTabIds(openChatIds, activeChatId, streamingSet, visibleSet);
+  return (
+    <TabListButton
+      sections={sections}
+      label="Chat tab list"
+      footer={{
+        label: inactive.length > 0 ? `Close ${inactive.length} inactive tab${inactive.length === 1 ? "" : "s"}` : "No inactive tabs",
+        title: "Close tabs that are not active, not streaming and not open in a window (chats stay in the sidebar)",
+        disabled: inactive.length === 0,
+        onPress: () => useStore.getState().closeInactiveChatTabs(),
+      }}
+    />
+  );
 }
 
 /** VSCode-style tab bar for the left editor group (chats only). Tabs can be

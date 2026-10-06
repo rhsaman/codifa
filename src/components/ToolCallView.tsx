@@ -2039,7 +2039,7 @@ export const ToolCallView = memo(function ToolCallView({
         {activity.args && activity.args.path !== undefined && !isWrite && (
           <ToolPathSpan path={String(activity.args.path)} />
         )}
-        {activity.args && activity.args.filePath !== undefined && (
+        {activity.args && activity.args.filePath !== undefined && !isWrite && (
           <ToolPathSpan path={String(activity.args.filePath)} />
         )}
         {activity.args &&

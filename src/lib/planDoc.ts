@@ -35,7 +35,7 @@ export function planDisplay(message: ChatMessage): PlanDisplay {
     const planStart = (text: string): number => {
       const idx = planDoc.body ? text.lastIndexOf(planDoc.body) : -1;
       if (idx >= 0) return idx;
-      const m = text.match(/^#{1,3}\s*plan\b/im);
+      const m = text.match(/^#{1,3}\s*(plan|پلن)\b/im);
       return m && m.index != null ? m.index : -1;
     };
     const kept: MessageSegment[] = [];
@@ -79,7 +79,7 @@ export function planDisplay(message: ChatMessage): PlanDisplay {
     if (bodyIdx >= 0) {
       content = content.slice(0, bodyIdx).trimEnd();
     } else {
-      const m = content.match(/^#{1,3}\s*plan\b[^\n]*$/im);
+      const m = content.match(/^#{1,3}\s*(plan|پلن)\b[^\n]*$/im);
       if (m && m.index != null) {
         content = content.slice(0, m.index).trimEnd();
       }

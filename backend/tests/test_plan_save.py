@@ -400,3 +400,37 @@ async def test_coder_node_emits_plan_card_when_writing_plan(tmp_path, monkeypatc
         kinds.append(q.get_nowait().get("kind"))
     assert "plan_card" in kinds, kinds
     assert result["coder_result"] == "implemented the thing"
+
+
+@pytest.mark.asyncio
+async def test_plan_build_saves_persian_header_once(tmp_path, monkeypatch):
+    root = str(tmp_path)
+    reply = "## پلن\n۱. انجام کار\nFiles: backend/graph.py"
+
+    calls = []
+
+    def fake_save_plan(workspace, title, content, chat_id=""):
+        calls.append((workspace, title, content, chat_id))
+
+    monkeypatch.setattr(graph.state_db, "save_plan", fake_save_plan)
+    monkeypatch.setattr(graph, "_run_mode_turn", lambda state, mode, queue, **kwargs: _await(reply))
+
+    state, _q = _state(root, reply)
+    result = await plan_build(state)
+
+    assert result["plan"] == reply
+    assert len(calls) == 1
+    assert calls[0][2] == reply
+    assert calls[0][1] == "plan"
+
+
+def test_plan_items_from_persian_digits():
+    from graph import _plan_items_from_body
+
+    body = "## پلن\n۱. قدم اول\n۲) قدم دوم\n• قدم سوم\nFiles: a.py"
+    items = _plan_items_from_body(body)
+
+    assert len(items) == 3
+    assert items[0]["content"] == "قدم اول"
+    assert items[1]["content"] == "قدم دوم"
+    assert items[2]["content"] == "قدم سوم"

@@ -1060,6 +1060,20 @@ def filter_tools_for_mode(
     if "computer" in tools and not allow_computer:
         tools = {n: fn for n, fn in tools.items() if n != "computer"}
 
+    # Coder plan scope: plan Files are the enforceable search scope, so grep/
+    # glob/read wrappers reject whole-workspace scans (missing path) and
+    # limit search to these files instead of blind repo-wide sweeps.
+    if mode == "coder":
+        try:
+            _plan_scope = _agents._plan_file_paths(history or [])
+        except Exception:  # noqa: BLE001 — scope must never break filtering
+            _plan_scope = []
+        if _plan_scope:
+            scoped_paths = set(scoped_paths or set()) | {
+                str(p).strip().lstrip("/").lstrip("./")
+                for p in _plan_scope
+                if str(p or "").strip()
+            }
     scoped = bool(scoped_paths)
     if scoped:
         # Scoped requests keep grep/glob/read bound but limited to the scope.
@@ -1243,6 +1257,8 @@ def resolve_subagent_model(
     timeout: float | None = None,
     parent_provider_id: str = "",
     parent_api_keys: Any = None,
+    thinking_level: str = "",
+    model_reasoning: bool = False,
 ) -> Any:
     """Resolve a single sub-agent slot entry to a LangChain model.
 
@@ -1272,6 +1288,8 @@ def resolve_subagent_model(
                 timeout=timeout,
                 cache=True,
                 provider_id=parent_provider_id,
+                thinking_level=thinking_level,
+                model_reasoning=model_reasoning,
             )
             if (default_to_parent and parent_model_name)
             else None
@@ -1291,6 +1309,8 @@ def resolve_subagent_model(
                     timeout=timeout,
                     cache=True,
                     provider_id=parent_provider_id,
+                    thinking_level=thinking_level,
+                    model_reasoning=model_reasoning,
                 )
                 if (default_to_parent and parent_model_name)
                 else None
@@ -1323,6 +1343,8 @@ def resolve_subagent_model(
         timeout=timeout,
         cache=True,
         provider_id=spid,
+        thinking_level=thinking_level,
+        model_reasoning=model_reasoning,
     )
 
 
@@ -1543,14 +1565,11 @@ _SKILL_CATALOG_COMPACT_MAX_SKILLS = 12
 
 
 def _clip_skill_desc(text: str, limit: int) -> str:
-    """Cut ``text`` to ``limit`` chars at a word boundary, ending in ``...``."""
-    if len(text) <= limit:
-        return text
-    cut = text[: max(0, limit - 3)]
-    sp = cut.rfind(" ")
-    if sp >= limit // 2:
-        cut = cut[:sp]
-    return cut.rstrip(" ,;:-—") + "..."
+    """Return ``text`` unchanged.
+
+    Skill descriptions are part of the system prompt and must never be
+    truncated. ``limit`` is retained for backward compatibility."""
+    return text
 
 
 def _fit_skill_catalog_lines(
@@ -1560,56 +1579,19 @@ def _fit_skill_catalog_lines(
     desc_max: int,
     max_skills: int,
 ) -> list[str]:
-    """One ``- name: description`` line per skill, all within ``total_max``.
+    """One ``- name: description`` line per skill, never truncated.
 
-    A skill missing from the catalog can never auto-load, so when the budget
-    is tight the DESCRIPTIONS shrink (down to name-only) instead of whole
-    skills being cut off the end. Only a store too big even for names-only
-    keeps the head and ends with a ``+N more`` note, so the model knows
-    ``load_skill`` still resolves the rest by name or keyword.
+    Every skill keeps a full line: skill entries are part of the system
+    prompt and must never be cut. Budget args are retained for backward
+    compatibility and no longer cap the output.
     """
-    all_rows: list[tuple[str, str]] = []
+    lines: list[str] = []
     for s in skills:
         name = str(s.get("name") or "").strip()
-        if name:
-            all_rows.append((name, str(s.get("description") or "").strip()))
-    rows = all_rows[:max_skills]
-
-    def _note(n: int) -> str:
-        return (
-            f"(+{n} more skills not listed - "
-            "load_skill finds any skill by name or keyword)"
-        )
-
-    def _render(limit: int) -> list[str]:
-        out: list[str] = []
-        for name, desc in rows:
-            ln = f"- {name}"
-            if desc and limit > 0:
-                ln += ": " + _clip_skill_desc(desc, limit)
-            out.append(ln)
-        return out
-
-    def _size(lines: list[str]) -> int:
-        return sum(len(ln) + 1 for ln in lines)
-
-    extra = len(all_rows) - len(rows)
-    room = total_max - len(header) - ((len(_note(extra)) + 1) if extra else 0)
-    limit = desc_max
-    lines = _render(limit)
-    while limit > 0 and _size(lines) > room:
-        limit = limit - 8 if limit - 8 >= 24 else 0
-        lines = _render(limit)
-    if _size(lines) > room:
-        # Even name-only overflows: keep the head, say how many were cut.
-        while lines and (
-            _size(lines) + len(_note(len(all_rows) - len(lines))) + 1
-            > total_max - len(header)
-        ):
-            lines.pop()
-        extra = len(all_rows) - len(lines)
-    if extra:
-        lines.append(_note(extra))
+        if not name:
+            continue
+        desc = str(s.get("description") or "").strip()
+        lines.append(f"- {name}: {desc}" if desc else f"- {name}")
     return lines
 
 
@@ -1739,9 +1721,9 @@ def skills_catalog_block(max_chars: int = 1800) -> str:
     tokens for the common no-skills case. The names+descriptions order is
     the store's.
 
-    ``max_chars`` hard-caps the whole block (catalog-only budget): every
-    skill keeps a line and descriptions shrink to fit, so a big store
-    never eats the delegation context nor hides a skill.
+    Every skill keeps a full line: the catalog is part of the system prompt
+    and must never be truncated. ``max_chars`` is retained for backward
+    compatibility and no longer caps the output.
     """
     try:
         all_skills = _agents._load_skills("")
@@ -1937,6 +1919,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     _provider_lookup = lambda pid: (
         _providers.get(pid) if isinstance(_providers, dict) else None
     )
+    _parent_thinking = str(state.get("thinking_level", "") or "")
+    _parent_reasoning = bool(state.get("model_reasoning", False))
     web_model = resolve_subagent_model(
         state["provider"],
         subagent_models.get("web"),
@@ -1947,6 +1931,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         provider_lookup=_provider_lookup,
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
+        thinking_level=_parent_thinking,
+        model_reasoning=_parent_reasoning,
     )
     compact_model = resolve_subagent_model(
         state["provider"],
@@ -1961,6 +1947,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         timeout=50,
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
+        thinking_level=_parent_thinking,
+        model_reasoning=_parent_reasoning,
     )
     vision_model = resolve_subagent_model(
         state["provider"],
@@ -1977,6 +1965,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         timeout=30,
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
+        thinking_level=_parent_thinking,
+        model_reasoning=_parent_reasoning,
     )
     explore_model = resolve_subagent_model(
         state["provider"],
@@ -1989,6 +1979,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         provider_lookup=_provider_lookup,
         parent_provider_id=state.get("provider_id", ""),
         parent_api_keys=state.get("api_keys"),
+        thinking_level=_parent_thinking,
+        model_reasoning=_parent_reasoning,
     )
     settings = await chat_model_settings(
         mode,
@@ -2142,7 +2134,18 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "\n\n=== SCOPE (ONLY THESE FILES) ===\nThe user explicitly scoped this "
             "request to ONLY these files: "
             + ", ".join("`" + f + "`" for f in sorted(scoped_paths))
-            + ". You MUST work ONLY with these files."
+            + ". You MUST work ONLY with these files. Search ONLY within them: "
+            "grep/glob/read MUST use path/include limited to these files, starting "
+            "from the CODE MAP, then ONE scoped grep with context, then "
+            "symbols=[...] or ranges=[...] — never scan the whole workspace blindly."
+        )
+    if mode == "coder":
+        workspace_note += (
+            "\n\n=== TARGETED SEARCH (CODER) ===\nStart from the CODE MAP, "
+            "then ONE scoped grep (path/include limited to SCOPE or the plan's Files) "
+            "with context, then read only the pointed windows via symbols=[...] or "
+            "ranges=[...]. Whole-workspace grep/glob without path is rejected — always pass path/include. Never scan the whole workspace blindly; after at most "
+            "2-3 search batches start editing in the SAME turn."
         )
 
     base_prompt = (
@@ -2168,7 +2171,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     system_final += (
         "\n\nRULES (strict, always follow, in every mode):\n"
         "1. CLARIFY: when the request is ambiguous, call ask_user FIRST.\n"
-        "2. CONTEXT-FIRST: before any search/discovery tool, check what is ALREADY "
+        "2. CONTEXT-FIRST: before any file tool, check what is ALREADY "
         "in your context (RAG blocks, conversation, files you already read)."
     )
     if system_extra:
@@ -2225,7 +2228,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
 
     if chat_id and mode in ("plan", "coder"):
         try:
-            saved = _agents._load_saved_plan(root, chat_id=chat_id)
+            saved = _agents._load_saved_plan(root, chat_id=chat_id, prompt=prompt)
         except Exception:  # noqa: BLE001
             saved = ""
         if saved:
@@ -2418,7 +2421,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         pass
     _is_status_check = _agents._is_status_check(prompt)
     if mode == "coder" and not _is_status_check:
-        reuse = _agents._plan_reuse_note(history)
+        reuse = _agents._plan_reuse_note(history, prompt)
         if reuse:
             lc_history.insert(0, HumanMessage(content=reuse))
         disc = _agents._plan_discovery_note(history)
@@ -4559,10 +4562,11 @@ async def _run_mode_turn(
                 # Plan mode delivers ## Plan plus an all-pending Coder
                 # checklist: those items are never the planner's work, so a
                 # delivered plan ends the turn instead of re-looping it.
+                _pending_gate_enabled = False  # TEMP-REVERT-CHECK
                 if (
-                    _pending_todos
+                    _pending_gate_enabled
+                    and _pending_todos
                     and _auto_cont < _MAX_AUTO_CONT
-                    and False  # TEMP-REVERT-CHECK
                     and not (
                         (mode or "") == "plan"
                         and _plan_draft_in_turn(
@@ -4765,7 +4769,10 @@ async def _run_mode_turn(
             # Plan-mode scouting budget: force convergence to ## Plan instead
             # of scouting forever. Counts tool steps taken while no ## Plan
             # exists yet this turn; past the budget, nudge every 4th step.
+            # Once a draft exists, stop further scouting so a second copy is
+            # never generated in the first place (no post-hoc dedupe needed).
             _plan_scout_hint = ""
+            _plan_done_hint = ""
             if mode == "plan" and _pending:
                 _plan_written = _plan_draft_in_turn(reply, msgs, _turn_seed_ids)
                 if not _plan_written:
@@ -4780,6 +4787,12 @@ async def _run_mode_turn(
                             "(one bullet per file + test commands); do only "
                             "targeted follow-up reads for files the plan names."
                         )
+                else:
+                    _plan_done_hint = (
+                        "PLAN ALREADY WRITTEN: do NOT write another ## Plan copy "
+                        "and do NOT call more search tools. Finalize the turn now "
+                        "with the single plan you already wrote."
+                    )
             async def _run_readonly(tc, _steps=steps) -> str:
                 return await _execute_tool(
                     tc.get("name") or "", tc.get("args") or {}, tc.get("id") or "", _steps
@@ -4847,6 +4860,8 @@ async def _run_mode_turn(
                     {"kind": "warn", "content": _plan_scout_hint.strip()}
                 )
                 _transient_msgs.append(HumanMessage(content=_plan_scout_hint.strip()))
+            if _plan_done_hint:
+                _transient_msgs.append(HumanMessage(content=_plan_done_hint))
             if _is_plan_only_step(_pending):
                 # Solo update_plan costs a full round-trip. Outside plan mode,
                 # nudge unless the tick marks progress; inside plan mode the
@@ -5456,7 +5471,7 @@ async def coder_node(state: AgentState) -> dict:
     if isinstance(approved_plan, str) and approved_plan.strip():
         import re as _re_approved
 
-        if _re_approved.search(r"#{1,3}\s*plan\b", approved_plan, _re_approved.IGNORECASE):
+        if _re_approved.search(r"#{1,3}\s*(plan|پلن)\b", approved_plan, _re_approved.IGNORECASE):
             extra = (
                 "[APPROVED PLAN — implement now, do not re-plan]\n"
                 "An approved implementation plan already exists for this task "
@@ -5479,7 +5494,7 @@ async def coder_node(state: AgentState) -> dict:
         # Line-anchored header only: a passing "C# plan" / "the plan is ..."
         # mention in a summary must never touch the saved plan.
         if _re_coder_plan.search(
-            r"^#{1,3}\s*plan\b",
+            r"^#{1,3}\s*(plan|پلن)\b",
             turn_text,
             _re_coder_plan.IGNORECASE | _re_coder_plan.MULTILINE,
         ):
@@ -6824,21 +6839,29 @@ def _split_plan_reply(reply: str) -> tuple[str, str]:
     otherwise the whole reply IS the plan and the preamble is empty. The body
     is what gets persisted (the "plan sometimes isn't saved" bug) and shown in
     the Plan card/panel; the preamble stays visible as ordinary chat prose.
+    When the streamed turn holds several plan drafts (an early draft plus the
+    final answer), only the LAST document is taken, so a duplicate is never
+    built in the first place.
     """
     import re
 
     text = (reply or "").strip()
     if not text:
         return "", ""
-    m = re.search(r"^#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
-    if not m:
-        # Streamed chunks concatenate without a newline (e.g. "scouting… " +
-        # "## Plan"), so the header may sit mid-line. Fall back to an
-        # unanchored match so the scouting prose still splits off as preamble.
-        m = re.search(r"#{1,3}\s*plan\b\s*:?", text, re.IGNORECASE)
-    if not m:
+    anchored = list(
+        re.finditer(r"^#{1,3}\s*(plan|پلن)\b\s*:?", text, re.IGNORECASE | re.MULTILINE)
+    )
+    if anchored:
+        m = anchored[-1]
+        return text[: m.start()].strip(), text[m.start() :].strip()
+    # Streamed chunks concatenate without a newline (e.g. "scouting… " +
+    # "## Plan"), so the header may sit mid-line. Fall back to an
+    # unanchored match so the scouting prose still splits off as preamble.
+    loose = list(re.finditer(r"#{1,3}\s*(plan|پلن)\b\s*:?", text, re.IGNORECASE))
+    if not loose:
         return "", text
-    return text[: m.start()].strip(), text[m.start() :]
+    m = loose[-1]
+    return text[: m.start()].strip(), text[m.start() :].strip()
 
 
 def _normalize_plan_reply(reply: str) -> str:
@@ -6862,7 +6885,7 @@ def _qualifying_plan_body(text: str) -> str:
     _preamble, body = _split_plan_reply(text)
     if not body.strip():
         return ""
-    if re.search(r"^#{1,3}\s*plan\b", text, re.IGNORECASE | re.MULTILINE):
+    if re.search(r"^#{1,3}\s*(plan|پلن)\b", text, re.IGNORECASE | re.MULTILINE):
         return body
     if _plan_items_from_body(body):
         return body
@@ -6881,7 +6904,7 @@ def _plan_draft_in_turn(reply: str, msgs: list, seed_ids=None) -> bool:
     """
     import re
 
-    _header = r"^#{1,3}\s*plan\b"
+    _header = r"^#{1,3}\s*(plan|پلن)\b"
     if re.search(_header, reply or "", re.IGNORECASE | re.MULTILINE):
         return True
     for m in msgs or []:
@@ -6914,11 +6937,11 @@ def _plan_items_from_body(plan_body: str) -> list[dict]:
         s = line.strip()
         if not s:
             continue
-        if re.match(r"^#{1,6}\s*plan\b", s, re.IGNORECASE):
+        if re.match(r"^#{1,6}\s*(plan|پلن)\b", s, re.IGNORECASE):
             continue
         if re.match(r"^files?\s*:", s, re.IGNORECASE):
             continue
-        m = re.match(r"^(?:\d+[.)]|[-*])\s+(?:\[[ xX]\]\s+)?(.+)$", s)
+        m = re.match(r"^(?:[0-9۰-۹٠-٩]+[.)]|[-*•])\s+(?:\[[ xX]\]\s+)?(.+)$", s)
         if not m:
             continue
         content = m.group(1).strip().strip("*").strip()
@@ -7082,7 +7105,7 @@ def _without_trailing_reply(turn_text: str, reply: str) -> str:
         # which then gets saved as the whole plan (the "narration saved as the
         # plan" bug). Keep the full text and let _split_plan_reply cut at the
         # header instead; the closing prose stays inside the body.
-        header = re.compile(r"#{1,3}\s*plan\b", re.IGNORECASE)
+        header = re.compile(r"#{1,3}\s*(plan|پلن)\b", re.IGNORECASE)
         if header.search(text) and not header.search(stripped):
             return text
         return stripped

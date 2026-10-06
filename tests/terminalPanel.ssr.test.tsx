@@ -43,6 +43,8 @@ check('has the Terminal title', openHtml.includes('>Terminal<'))
 check('has the new-terminal button', openHtml.includes('New terminal'))
 check('has the hide-panel button', openHtml.includes('Hide terminal panel'))
 check('has a resize handle', openHtml.includes('terminal-resize-handle'))
+check('has the terminal fullscreen button', openHtml.includes('Fullscreen terminal (Ctrl+M)'))
+check('marks fullscreen state', openHtml.includes('data-fullscreen="false"'), openHtml.slice(0, 160))
 
 // Browser/webonly build without the terminal bridge: a friendly fallback
 // note instead of empty screens.

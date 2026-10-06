@@ -111,6 +111,19 @@ export interface ProviderConfig {
   addedModels?: string[]
 }
 
+/** One STT fallback target: 'local' = on-device Whisper, otherwise a settings.providers id. */
+export interface SttFallback {
+  providerId: string
+  model: string
+}
+
+/** One TTS fallback target: a settings.providers id plus model/voice. */
+export interface TtsFallback {
+  providerId: string
+  model: string
+  voice: string
+}
+
 export interface Settings {
   providers: ProviderConfig[]
   activeProviderId: string
@@ -145,12 +158,16 @@ export interface Settings {
   sttProviderId?: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */
   sttModel?: string
+  /** Ordered STT fallback targets, tried after the primary STT source fails. */
+  sttFallbacks?: SttFallback[]
   /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). 'local' پشتیبانی نمی‌شود. */
   ttsProviderId?: string
   /** Remote TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
   ttsModel?: string
   /** Remote TTS voice id sent to {base_url}/audio/speech (e.g. alloy). */
   ttsVoice?: string
+  /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
+  ttsFallbacks?: TtsFallback[]
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string

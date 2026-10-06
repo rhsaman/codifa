@@ -2508,8 +2508,17 @@ textarea {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
-  color: var(--accent);
+  color: var(--ws, var(--accent));
   opacity: 0.9;
+}
+
+.workspace-btn-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ws, var(--accent));
+  box-shadow: 0 0 6px color-mix(in srgb, var(--ws, var(--accent)) 70%, transparent);
 }
 
 .workspace-btn:hover {
@@ -2987,6 +2996,9 @@ textarea {
   min-height: 0;
   min-width: 0;
   height: 100%;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .chat-windows.vertical {
@@ -3015,6 +3027,11 @@ textarea {
   flex: 1 1 auto;
 }
 
+.chat-windows.single .chat-window {
+  flex: 1 1 auto;
+  height: 100%;
+}
+
 .chat-window {
   display: flex;
   flex-direction: column;
@@ -3036,7 +3053,7 @@ textarea {
 /* Cheap focus cue: opacity only (no blur/filter), so unfocused windows
    stay readable but clearly recede. */
 .chat-windows.multi .chat-window.dimmed .chat-window-body {
-  opacity: 0.55;
+  opacity: 0.85;
 }
 
 .chat-windows.multi .chat-window.focused .chat-window-body {
@@ -3077,7 +3094,38 @@ textarea {
   font-weight: 600;
 }
 
-.chat-window-close {
+.chat-window-ws {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 38%;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ws, var(--accent)) 30%, transparent);
+  background: color-mix(in srgb, var(--ws, var(--accent)) 10%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.chat-window-head.focused .chat-window-ws {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--ws, var(--accent)) 45%, transparent);
+  background: color-mix(in srgb, var(--ws, var(--accent)) 14%, transparent);
+}
+
+.chat-window-ws-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-window-close,
+.chat-window-minimize {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -3091,10 +3139,100 @@ textarea {
   cursor: pointer;
 }
 
-.chat-window-close:hover {
+.chat-window-close:hover,
+.chat-window-minimize:hover {
   color: var(--text);
   background: color-mix(in srgb, var(--text) 8%, transparent);
   border-color: var(--border);
+}
+
+.chat-window-fullscreen {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.chat-window-fullscreen:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.chat-window-fullscreen[aria-pressed="true"] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+}
+
+.chat-windows.window-full .chat-window {
+  flex: 1 1 auto;
+}
+
+/* Fullscreen keeps every ChatPanel mounted: hidden windows/subtrees use
+   display:none so toggling fullscreen never remounts panels (no lag). */
+.chat-windows.window-full {
+  position: relative;
+}
+
+.chat-windows .chat-window.window-hidden,
+.chat-windows .chat-split-child.window-hidden {
+  display: none;
+}
+
+/* Root-edge drop preview: whole chat-area strip (dragged window's own space
+   counts as empty, so the remaining tree decides the landing zone). */
+.chat-windows {
+  position: relative;
+}
+
+.chat-root-preview {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  pointer-events: none;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+.chat-root-preview.preview-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 50%;
+}
+
+.chat-root-preview.preview-right {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  right: 0;
+}
+
+.chat-root-preview.preview-top {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 50%;
+}
+
+.chat-root-preview.preview-bottom {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 50%;
 }
 
 .chat-window-body {
@@ -3169,7 +3307,8 @@ textarea {
   gap: 6px;
   min-height: 0;
   min-width: 0;
-  overflow: auto;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .chat-split {
@@ -3250,17 +3389,20 @@ textarea {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-alt);
-  /* Never shrink below the size where chat text and composer stay readable. */
-  min-width: 400px;
-  min-height: 320px;
+  /* Fit all windows on screen: never force horizontal overflow. Inner
+     content scrolls instead of pushing panes off screen. */
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
 }
 
 .chat-split.row > .chat-split-child {
-  min-width: 400px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .chat-split.col > .chat-split-child {
-  min-height: 320px;
+  min-height: 0;
 }
 
 /* Narrow panes: keep trace/edit heads on one readable row instead of
@@ -3298,6 +3440,304 @@ textarea {
 
 .chat-windows.tree .chat-window.drop-active {
   border-color: var(--accent);
+}
+
+/* The pane being moved never shows a landing preview on itself. */
+.chat-windows.tree .chat-window.drag-source.drop-active {
+  border-color: var(--border);
+}
+
+.chat-windows.tree .chat-window.drag-source .chat-drop-preview {
+  display: none;
+}
+
+/* Drag source stays in layout (no display:none): dim only so the preview
+   zone never shifts under the cursor while dragging. */
+.chat-windows.tree .chat-window.drag-source {
+  opacity: 0.55;
+}
+
+.viewer-windows.tree .viewer-window.drag-source.drop-active {
+  border-color: var(--border);
+}
+
+.viewer-windows.tree .viewer-window.drag-source .viewer-drop-preview {
+  display: none;
+}
+
+/* ----- viewer multi-window (right panel splits, VSCode-like) ----- */
+.viewer-windows {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+}
+
+.viewer-content > .viewer-windows {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.viewer-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  gap: 6px;
+}
+
+.viewer-split.col {
+  flex-direction: column;
+}
+
+.viewer-split.row {
+  flex-direction: row;
+}
+
+.viewer-split-child {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
+.viewer-split.col > .viewer-split-child {
+  flex-direction: column;
+}
+
+.viewer-split.row > .viewer-split-child {
+  flex-direction: row;
+}
+
+.viewer-split-resize {
+  flex: 0 0 auto;
+  background: transparent;
+  position: relative;
+  z-index: 5;
+}
+
+.viewer-split-resize.row-bar {
+  height: 7px;
+  margin: -2px 0;
+  padding: 2px 0;
+  cursor: row-resize;
+}
+
+.viewer-split-resize.col-bar {
+  width: 7px;
+  margin: 0 -2px;
+  padding: 0 2px;
+  cursor: col-resize;
+}
+
+.viewer-split-resize::after {
+  content: "";
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.viewer-split-resize.row-bar::after {
+  height: 3px;
+}
+
+.viewer-split-resize.col-bar::after {
+  width: 3px;
+  height: 100%;
+}
+
+.viewer-split-resize:hover::after {
+  background: var(--accent-dim);
+}
+
+.viewer-windows.tree .viewer-window {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-alt);
+  min-width: 280px;
+  min-height: 220px;
+}
+
+.viewer-split.row > .viewer-split-child {
+  min-width: 280px;
+}
+
+.viewer-split.col > .viewer-split-child {
+  min-height: 220px;
+}
+
+.viewer-windows.tree .viewer-window.focused {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
+}
+
+.viewer-windows.tree .viewer-window.drop-active {
+  border-color: var(--link);
+}
+
+/* Cheap focus cue: opacity only (no blur/filter). */
+.viewer-windows.tree .viewer-window.dimmed .viewer-window-body {
+  opacity: 0.85;
+}
+
+.viewer-windows.tree .viewer-window.focused .viewer-window-body {
+  opacity: 1;
+}
+
+.viewer-window-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: default;
+  user-select: none;
+}
+
+.viewer-window-head.focused {
+  color: var(--text);
+}
+
+.viewer-window-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: grab;
+}
+
+.viewer-window-title:active {
+  cursor: grabbing;
+}
+
+.viewer-window-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.viewer-window-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.viewer-window-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.viewer-window-body > * {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Edge highlight: the exact zone the dragged tab will land in. */
+.viewer-drop-preview {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  pointer-events: none;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+.viewer-drop-preview.preview-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 50%;
+}
+
+.viewer-drop-preview.preview-right {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  right: 0;
+}
+
+.viewer-drop-preview.preview-top {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 50%;
+}
+
+.viewer-drop-preview.preview-bottom {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 50%;
+}
+
+.viewer-drop-preview.preview-center {
+  inset: 0;
+}
+
+.viewer-drop-empty-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-panel));
+  border: 1.5px dashed color-mix(in srgb, var(--link) 70%, transparent);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+}
+
+.viewer-drop-empty-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-drop-hint {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
 }
 
 .chat-drop-preview {
@@ -3958,6 +4398,135 @@ textarea {
   color: var(--success);
 }
 
+/* Pencil edit button — sibling of retry/fork/copy in .msg-actions.
+   Inherits the .msg-copy ghost-button base; only the active state differs. */
+.msg-copy.msg-edit.editing {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.msg-copy.msg-edit:disabled {
+  opacity: 0.35;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* Inline edit box replacing the user bubble while editing. */
+.msg.user .msg-bubble.editing,
+.msg.user .msg-bubble:has(.msg-edit-wrap) {
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.msg.user .msg-bubble.editing::after,
+.msg.user .msg-bubble:has(.msg-edit-wrap)::after {
+  display: none;
+}
+
+.msg-edit-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(680px, 100%);
+  margin: 0 auto;
+}
+
+.msg-edit-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 120px;
+  max-height: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--bg-alt);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+  overflow-y: auto;
+  text-align: start;
+  field-sizing: content;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
+    0 0 24px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.msg-edit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 0 28px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.msg-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.msg-edit-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+.msg-edit-save {
+  padding: 6px 18px;
+  border-radius: 999px;
+  border: none;
+  background: var(--text);
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.msg-edit-save:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.msg-edit-save:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.msg-edit-cancel {
+  padding: 6px 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.msg-edit-cancel:hover {
+  color: var(--text);
+}
+
+.msg-edit-cancel:hover {
+  background: var(--bg-input);
+  color: var(--text);
+}
+
 /* خطای پخش صدا زیر دکمه Speak — به‌جای title */
 .msg-tts-error {
   display: inline-flex;
@@ -4012,6 +4581,22 @@ textarea {
 
 .msg-speak.loading {
   opacity: 1;
+}
+
+.msg-speak.paused {
+  opacity: 1;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.tts-spinner {
+  animation: tts-spin 0.9s linear infinite;
+}
+
+@keyframes tts-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ---- context summary (compacted conversation) ---- */
@@ -4237,6 +4822,29 @@ textarea {
   color: var(--accent);
   background: color-mix(in srgb, var(--bg-panel) 90%, transparent);
   border: 1.5px dashed var(--accent);
+  pointer-events: none;
+}
+
+/* ---- full chat panel file drop overlay ---- */
+.chat-panel {
+  position: relative;
+}
+.chat-panel.file-dragover .chat-scroll {
+  opacity: 0.55;
+}
+.chat-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  border: 2px dashed var(--accent);
   pointer-events: none;
 }
 
@@ -10506,6 +11114,62 @@ textarea {
   white-space: nowrap;
 }
 
+/* Single edit rows (Edited/Wrote + filename + diff stats + Review): the name
+   group must shrink with a real ellipsis in narrow panes instead of sliding
+   under the trailing stats. The end cluster never shrinks or wraps. */
+.tool-card-head.write-head .tool-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.tool-card-head.write-head .tool-verb {
+  flex: 0 0 auto;
+}
+
+.tool-card-head.write-head .tool-file {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.tool-card-head.write-head .tool-file-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-card-head.write-head .tool-card-head-end {
+  flex: 0 0 auto;
+}
+
+.tool-card-head.write-head .tool-diff-stats,
+.tool-card-head.write-head .tool-review-btn,
+.tool-card-head.write-head .tool-ms {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* Write heads already show the file in .tool-file: a second full-path chip
+   (ToolPathSpan) or leftover arg chips would crowd narrow panes and slide
+   under the diff stats, so they never render side by side with the name. */
+.tool-card-head.write-head .tool-path,
+.tool-card-head.write-head .tool-args {
+  display: none;
+}
+
+.tool-card-head.write-head .tool-file .file-icon-svg {
+  flex: 0 0 auto;
+}
+
 /* Engine / model / sub-count badge: quiet neutral chip. */
 .tool-card-head .tool-badge {
   font-family: var(--font-mono);
@@ -13943,19 +14607,15 @@ textarea {
   }
 }
 
-/* Floating card — rounded and lifted off the screen edge instead of a
-   full-height slab, so the panel reads as a focused surface. Horizontally
-   CENTERED (inset both sides + auto margins): a right-anchored card pushed
-   the text column to the right of the screen, unlike the centered chat
-   column this panel mirrors. */
+/* Floating card — right-anchored drawer (12px off the screen edge), so the
+   panel always opens from the right side and the text column stays near the
+   right like the review panel. */
 .reading-mode-panel {
   position: absolute;
   top: 12px;
-  left: 12px;
   right: 12px;
   bottom: 12px;
   width: var(--reading-w);
-  margin-inline: auto;
   /* Hard safety net: never let the panel overflow the viewport, even if the
      saved width is larger than the current window. */
   max-width: calc(100vw - 24px);
@@ -14001,15 +14661,16 @@ textarea {
 }
 
 /* Drag handle on the panel's left edge (VSCode-style width resize, like the
-   sidebar). The panel is anchored to the right edge, so the handle sits at
-   right: calc(var(--reading-w) + 9px) — the 12px panel offset minus the 3px
-   overlap — straddling the panel's left edge. */
+   sidebar). Nested inside the panel and straddling its left edge, so it
+   always tracks the edge while --reading-w updates mid-drag. The panel is
+   anchored to the right edge, so dragging left grows it and dragging right
+   shrinks it. */
 .reading-mode-resize-handle {
   position: absolute;
-  top: 12px;
-  bottom: 12px;
-  right: calc(var(--reading-w) + 9px);
-  width: 6px;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 10px;
   cursor: ew-resize;
   z-index: 5;
   pointer-events: auto;
@@ -14019,7 +14680,7 @@ textarea {
   content: "";
   position: absolute;
   top: 0;
-  right: 2px;
+  left: 3px;
   width: 2px;
   height: 100%;
   border-radius: 2px;
@@ -18122,6 +18783,8 @@ mark.trace-hit-active {
   display: flex;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
+  position: relative;
 }
 
 .chat-group {
@@ -18134,6 +18797,11 @@ mark.trace-hit-active {
 
 .chat-group .main {
   flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+  display: flex;
 }
 
 .viewer-group {
@@ -18141,7 +18809,10 @@ mark.trace-hit-active {
   display: flex;
   flex-direction: column;
   min-width: 320px;
-  max-width: calc(100% - 320px);
+  max-width: min(50%, calc(100% - 320px));
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
   min-height: 0;
   border-left: 1px solid color-mix(in srgb, var(--link) 22%, var(--border));
   background: linear-gradient(to bottom,
@@ -18922,6 +19593,31 @@ mark.trace-hit-active {
   text-align: center;
 }
 
+.tab-list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab-list-footer:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.tab-list-footer:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* "+" opener for the side pane (opens the add-tab dropdown). */
 .viewer-add-wrap {
   flex: 0 0 auto;
@@ -19351,6 +20047,62 @@ mark.trace-hit-active {
 .browser-tool-btn:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+/* Overflow "..." menu (like the image): dark popup below the button. */
+.browser-menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.browser-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 230px;
+  padding: 6px;
+  border-radius: 10px;
+  background: #2b2d31;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 30;
+}
+
+.browser-menu[hidden] {
+  display: none;
+}
+
+.browser-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #e8eaed;
+  font-size: 12.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  text-align: left;
+}
+
+.browser-menu-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.browser-menu-item:disabled {
+  color: #9aa0a6;
+  opacity: 0.7;
+  cursor: default;
+}
+
+.browser-menu-item-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
 }
 
 .browser-omnibox {
@@ -20230,6 +20982,21 @@ mark.trace-hit-active {
 }
 
 .terminal-panel[data-open='false'] {
+  display: none;
+}
+
+/* Terminal fullscreen (Ctrl+M while the terminal has focus): overlays the
+   whole app so the shell gets the full viewport. Sessions keep running —
+   this is a CSS toggle, same as open/close. */
+.terminal-panel.terminal-full {
+  position: fixed;
+  inset: 0;
+  z-index: 250;
+  height: 100vh;
+  border-top: none;
+}
+
+.terminal-panel.terminal-full .terminal-resize-handle {
   display: none;
 }
 

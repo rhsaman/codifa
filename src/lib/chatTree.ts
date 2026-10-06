@@ -41,8 +41,9 @@ export function clampSize(n: number): number {
  *  Mirrored in CSS (.chat-windows.tree .chat-window and split children). */
 export const CHAT_WINDOW_MIN_W = 400
 export const CHAT_WINDOW_MIN_H = 320
-/** Maximum open chat windows: beyond this every pane would drop below the
- *  minimum size, so new drops only focus instead of splitting. */
+/** Soft cap for drag-created splits: beyond this every pane would drop below
+ *  the minimum size, so edge drops stop splitting (center drops still swap).
+ *  Explicit opens (new chat, sidebar/tab select) always add a window. */
 export const CHAT_WINDOW_MAX = 4
 
 export function makeLeaf(chatId: string, size = 1, id?: string): ChatTreeLeaf {
@@ -66,6 +67,13 @@ export function dirForPos(pos: ChatDropPos): ChatSplitDir | null {
 
 export function beforePos(pos: ChatDropPos): boolean {
   return pos === 'left' || pos === 'top'
+}
+
+/** Best split direction for a new window from the container aspect ratio.
+ *  Wide areas split side-by-side (row), tall areas stack (col). Pure. */
+export function bestSplitDir(width: number, height: number): ChatSplitDir {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 'row'
+  return width >= height ? 'row' : 'col'
 }
 
 /** All chat ids in tree order (depth-first, left-to-right / top-to-bottom). */
@@ -161,11 +169,13 @@ export function removeChat(
   if (!node) return null
   if (node.kind === 'leaf') return node.chatId === chatId ? null : node
   const children: ChatTreeNode[] = []
+  let changed = false
   for (const c of node.children) {
     const next = removeChat(c, chatId)
     if (next) children.push(next)
+    if (next !== c) changed = true
   }
-  if (children.length === node.children.length) return node
+  if (!changed) return node
   return collapse({ ...node, children })
 }
 
@@ -190,7 +200,7 @@ export function swapChats(
   return changed ? { ...node, children } : node
 }
 
-function replaceChat(
+export function replaceChat(
   node: ChatTreeNode,
   targetChatId: string,
   nextChatId: string,
@@ -207,42 +217,25 @@ function replaceChat(
   return changed ? { ...node, children } : node
 }
 
-/** Drop normalization: keeps order, drops unknown/dupe ids. Pure for tests. */
+/** Drop normalization: keeps order, drops unknown/dupe ids. Pure for tests.
+ *  The seen set is threaded through nested splits so a chat kept anywhere
+ *  earlier (even inside another split) is dropped on later occurrences: one
+ *  chat never renders in two windows. */
 export function normalizeTree(
   node: ChatTreeNode | null,
   validIds: Set<string>,
+  seen: Set<string> = new Set<string>(),
 ): ChatTreeNode | null {
   if (!node) return null
   if (node.kind === 'leaf') {
-    return validIds.has(node.chatId) ? { ...node, size: clampSize(node.size) } : null
+    if (!validIds.has(node.chatId) || seen.has(node.chatId)) return null
+    seen.add(node.chatId)
+    return { ...node, size: clampSize(node.size) }
   }
-  const seen = new Set<string>()
   const children: ChatTreeNode[] = []
   for (const c of node.children) {
-    if (c.kind === 'leaf') {
-      if (!validIds.has(c.chatId) || seen.has(c.chatId)) continue
-      seen.add(c.chatId)
-      children.push({ ...c, size: clampSize(c.size) })
-    } else {
-      const next = normalizeTree(c, validIds)
-      if (!next) continue
-      for (const id of collectChatIds(next)) {
-        if (seen.has(id)) continue
-        seen.add(id)
-      }
-      // A nested split that duplicates an already-kept chat is dropped.
-      const ids = collectChatIds(next)
-      if (ids.length === 0 || ids.some((id) => {
-        // Count occurrences across kept children so far.
-        const all = children.flatMap(collectChatIds)
-        return all.includes(id)
-      })) {
-        // Re-check: keep the split only when it adds a new chat.
-        const fresh = ids.filter((id) => !children.flatMap(collectChatIds).includes(id))
-        if (fresh.length === 0) continue
-      }
-      children.push(next)
-    }
+    const next = normalizeTree(c, validIds, seen)
+    if (next) children.push(next)
   }
   if (children.length === 0) return null
   return collapse({ ...node, children })
@@ -271,12 +264,41 @@ export function appendChat(
 ): ChatTreeNode {
   if (!node) return makeLeaf(chatId)
   if (containsChat(node, chatId)) return node
-  // Full: refuse a new window so panes never shrink below the minimum size.
-  if (leafCount(node) >= CHAT_WINDOW_MAX) return node
+  // Explicit opens always create a window (never replace); drag splits stay
+  // capped by CHAT_WINDOW_MAX inside dropOnto/dropOntoRoot.
   if (node.kind === 'leaf') {
     return makeSplit(dir, [node, makeLeaf(chatId)])
   }
   return { ...node, children: [...node.children, makeLeaf(chatId)] }
+}
+
+/** Open a chat beside the focused window (explicit opens: new chat, sidebar
+ *  or tab select). Never replaces: the focused leaf splits along the best
+ *  axis (wide area -> side-by-side, tall area -> stacked) so the new window
+ *  lands in the best place; same-axis siblings just extend. Pure. */
+export function openBeside(
+  node: ChatTreeNode | null,
+  chatId: string,
+  targetChatId: string,
+  dir: ChatSplitDir,
+): ChatTreeNode {
+  if (!node) return makeLeaf(chatId)
+  if (containsChat(node, chatId)) return node
+  const fresh = makeLeaf(chatId)
+  if (node.kind === 'leaf') return makeSplit(dir, [node, fresh])
+  const target = findLeafByChat(node, targetChatId)
+  if (!target) {
+    if (node.dir === dir) return { ...node, children: [...node.children, fresh] }
+    return makeSplit(dir, [node, fresh])
+  }
+  const parent = findParent(node, target.id)
+  if (parent && parent.dir === dir) {
+    const idx = parent.children.findIndex((c) => c.id === target.id)
+    const children = parent.children.slice()
+    children.splice(idx + 1, 0, fresh)
+    return replaceNode(node, parent.id, { ...parent, children })
+  }
+  return replaceNode(node, target.id, makeSplit(dir, [{ ...target }, fresh]))
 }
 
 /** Core VSCode-like drop: drag chat onto target leaf edge or center. */
@@ -288,8 +310,8 @@ export function dropOnto(
 ): ChatTreeNode | null {
   if (!dragChatId || !targetChatId) return root
   if (dragChatId === targetChatId) return root
-  // Full: a new chat cannot split in, only moves of visible chats are allowed.
-  if (root && !containsChat(root, dragChatId) && leafCount(root) >= CHAT_WINDOW_MAX) return root
+  // Full: a new chat cannot split in, but center drop replaces the target window.
+  if (root && !containsChat(root, dragChatId) && leafCount(root) >= CHAT_WINDOW_MAX && pos !== 'center') return root
   if (pos === 'center') {
     if (!root) return makeLeaf(dragChatId)
     if (containsChat(root, dragChatId)) return swapChats(root, dragChatId, targetChatId)
@@ -338,6 +360,43 @@ export function dropOnto(
   ;(split.children[0] as ChatTreeLeaf).size = 1
   ;(split.children[1] as ChatTreeLeaf).size = 1
   return replaceNode(base, target.id, split)
+}
+
+/** Root-edge drop: move a chat to the outer edge of the chat area.
+ *  The dragged window is removed first, so the remaining tree decides the
+ *  landing zone (e.g. dragging the bottom-right pane to the bottom edge puts
+ *  the rest on top side-by-side and the dragged pane full-width below).
+ *  Pure for tests. */
+export function dropOntoRoot(
+  root: ChatTreeNode | null,
+  dragChatId: string,
+  pos: ChatDropPos,
+): ChatTreeNode | null {
+  if (!dragChatId) return root
+  const dirNeeded = dirForPos(pos)
+  if (!dirNeeded) return root
+  const before = beforePos(pos)
+  if (!root) return makeLeaf(dragChatId)
+  const dragLeaf = findLeafByChat(root, dragChatId)
+  const dragSize = dragLeaf?.size ?? 1
+  if (dragLeaf) {
+    if (leafCount(root) <= 1) return root
+    const base = removeChat(root, dragChatId)
+    if (!base) return makeLeaf(dragChatId, dragSize)
+    const fresh = makeLeaf(dragChatId, dragSize)
+    if (base.kind === 'split' && base.dir === dirNeeded) {
+      const children = before ? [fresh, ...base.children] : [...base.children, fresh]
+      return { ...base, children }
+    }
+    return makeSplit(dirNeeded, before ? [fresh, base] : [base, fresh])
+  }
+  if (leafCount(root) >= CHAT_WINDOW_MAX) return root
+  const fresh = makeLeaf(dragChatId)
+  if (root.kind === 'split' && root.dir === dirNeeded) {
+    const children = before ? [fresh, ...root.children] : [...root.children, fresh]
+    return { ...root, children }
+  }
+  return makeSplit(dirNeeded, before ? [fresh, root] : [root, fresh])
 }
 
 function replaceNode(
@@ -481,4 +540,11 @@ export function pickNeighborWindow(
     }
   }
   return best
+}
+
+/** Toggle a fullscreen window id: same target exits, another target switches.
+ *  Empty target keeps the current state. Pure, for test. */
+export function toggleFullscreenId(current: string | null, target: string): string | null {
+  if (!target) return current
+  return current === target ? null : target
 }

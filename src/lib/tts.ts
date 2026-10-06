@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { speakTextStream, splitTtsSentences, type SpeakProviderOpts } from './api'
+import { planDisplay } from './planDoc'
+import type { ChatMessage } from '../types'
 
-export type TtsStatus = 'idle' | 'loading' | 'speaking'
+export type TtsStatus = 'idle' | 'loading' | 'speaking' | 'paused'
 
 // ── تک‌پخش سراسری ──────────────────────────────────────────────────────────
 // هر پیام چت یک نمونه از useTtsPlayback می‌سازد؛ بدون حالت مشترک، پخش پیام
@@ -107,6 +109,107 @@ export function stopTts(owner?: number) {
   if (owner === undefined || activeOwner === owner) stopTtsGlobal()
 }
 
+// ── پایداری صف پخش ──────────────────────────────────────────────────────────
+// یک جمله کند/خراب نباید کل پاسخ را وسط پخش گیر بیندازد: هر جمله سقف زمانی
+// خودش را دارد با یک تلاش مجدد، و جمله‌ای که باز هم نیامد رد می‌شود تا بقیه
+// پاسخ پخش شود. نگهبان پخش هم Audioی گیرکرده (بدون end/error) را رد می‌کند.
+const SENTENCE_FETCH_TIMEOUT_MS = 45_000
+// Number of full rounds over the provider chain before giving up on a sentence.
+// Delay between rounds (abort-aware). Exported as mutable `let` plus
+// `setTtsRetryConfig` so tests can shrink the delay.
+export let TTS_RETRY_ATTEMPTS = 5
+export let TTS_RETRY_DELAY_MS = 5_000
+
+/** Override retry tuning (mainly for tests to shrink the delay). */
+export function setTtsRetryConfig(cfg: { attempts?: number; delayMs?: number }): void {
+  if (cfg.attempts !== undefined) TTS_RETRY_ATTEMPTS = cfg.attempts
+  if (cfg.delayMs !== undefined) TTS_RETRY_DELAY_MS = cfg.delayMs
+}
+
+/** Normalize a single provider opts or a primary+fallback chain into a chain. */
+function toTtsChain(opts: SpeakProviderOpts | SpeakProviderOpts[]): SpeakProviderOpts[] {
+  return Array.isArray(opts) ? opts : [opts]
+}
+
+/** Abort-aware sleep between retry rounds; throws immediately when aborted. */
+function sleepAbortAware(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Download one sentence, trying each provider in the chain in order per round
+ * and retrying the whole chain across rounds with an abort-aware delay.
+ * Each individual fetch has its own timeout; abort throws immediately.
+ * Throws the last error only when every provider in every round failed.
+ */
+export function fetchSentenceRobust(
+  sentence: string,
+  chain: SpeakProviderOpts | SpeakProviderOpts[],
+  signal: AbortSignal,
+): Promise<Blob> {
+  const providers = toTtsChain(chain)
+  const attemptOnce = (providerOpts: SpeakProviderOpts): Promise<Blob> =>
+    new Promise<Blob>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'))
+        return
+      }
+      const timer = setTimeout(() => {
+        reject(new Error(`TTS sentence timed out after ${SENTENCE_FETCH_TIMEOUT_MS / 1000}s`))
+      }, SENTENCE_FETCH_TIMEOUT_MS)
+      speakTextStream(sentence, providerOpts, undefined, signal).then(
+        (blob) => {
+          clearTimeout(timer)
+          resolve(blob)
+        },
+        (err) => {
+          clearTimeout(timer)
+          reject(err)
+        },
+      )
+    })
+  const run = async (): Promise<Blob> => {
+    let lastErr: unknown = new Error('TTS failed: empty provider chain')
+    const rounds = Math.max(1, TTS_RETRY_ATTEMPTS)
+    for (let round = 0; round < rounds; round++) {
+      for (const providerOpts of providers) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+        try {
+          return await attemptOnce(providerOpts)
+        } catch (err) {
+          if (signal.aborted) throw err
+          lastErr = err
+          // Try the next fallback provider in this round.
+        }
+      }
+      if (round < rounds - 1) {
+        // Wait before the next round; abort throws immediately.
+        await sleepAbortAware(TTS_RETRY_DELAY_MS, signal)
+      }
+    }
+    throw lastErr
+  }
+  return run()
+}
+
+const PLAYBACK_WATCHDOG_MIN_MS = 20_000
+const PLAYBACK_WATCHDOG_PER_BYTE_MS = 0.25
+const PLAYBACK_WATCHDOG_MAX_MS = 180_000
+
 /**
  * پخش متن با مالک مشخص. ویس قبلی (هر پیام/چت) اول قطع می‌شود؛ اگر حین fetch
  * ویس دیگری شروع شود (حتی از همان پیام با کلیک تند پلی/استاپ)، نتیجه کهنه
@@ -118,7 +221,7 @@ export function stopTts(owner?: number) {
  */
 export async function playTts(
   text: string,
-  opts: SpeakProviderOpts,
+  opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
 ): Promise<void> {
   stopTtsGlobal()
@@ -129,36 +232,46 @@ export async function playTts(
   activeOwner = owner
   activeStatus = 'loading'
   notifyTts()
+  // Normalize single opts or primary+fallback chain into a chain.
+  const chain = toTtsChain(opts)
   const sentences = splitTtsSentences(text)
   // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
   const queue = sentences.length > 1 ? sentences : [text]
-  // پیش‌واکشی جمله بعدی حین پخش جمله فعلی تا مکث بین جمله‌ها حذف شود:
-  // دانلود N+1 موازی با پخش N انجام می‌شود، پس پایان N بلافاصله N+1 شروع می‌شود.
-  const fetchSentence = (sentence: string): Promise<Blob> =>
-    speakTextStream(sentence, opts, undefined, controller.signal)
-  let prefetched: Promise<Blob> | null = null
+  // پیش‌واکشی دو جمله جلوتر حین پخش جمله فعلی تا مکث بین جمله‌ها حذف شود:
+  // دانلود N+1 و N+2 موازی با پخش N انجام می‌شود، پس پایان N بلافاصله جمله
+  // بعدی شروع می‌شود و پخش وسط صحبت گیر نمی‌کند.
+  const pending = new Map<number, Promise<Blob>>()
+  const ensureFetch = (idx: number) => {
+    if (idx >= queue.length || pending.has(idx) || controller.signal.aborted) return
+    const job = fetchSentenceRobust(queue[idx], chain, controller.signal)
+    // رد پس‌زمینه تا await بعدی unhandled نماند.
+    job.catch(() => {})
+    pending.set(idx, job)
+  }
+  ensureFetch(0)
+  ensureFetch(1)
+  let playedAny = false
+  let lastErr: unknown = null
   try {
     for (let i = 0; i < queue.length; i++) {
       if (activeSeq !== seq || controller.signal.aborted) return
+      ensureFetch(i + 2)
+      const job = pending.get(i)
+      pending.delete(i)
       let blob: Blob
       try {
-        const pending = prefetched
-        prefetched = null
-        // دانلود جمله بعدی را همین حالا در پس‌زمینه شروع کن تا حین پخش فعلی آماده شود.
-        if (i + 1 < queue.length && !controller.signal.aborted) {
-          prefetched = fetchSentence(queue[i + 1])
-          // رد غیرمنتظره پس‌زمینه نباید unhandled بماند تا await بعدی برسد.
-          prefetched.catch(() => {})
-        }
-        blob = pending ? await pending : await fetchSentence(queue[i])
+        blob = job ? await job : await fetchSentenceRobust(queue[i], chain, controller.signal)
       } catch (err) {
         if (activeSeq !== seq || controller.signal.aborted) return
-        throw err
+        // جمله خراب رد می‌شود — بقیه پاسخ هنوز پخش می‌شود.
+        lastErr = err
+        continue
       }
       if (activeSeq !== seq || controller.signal.aborted) return
       // جمله خالی (پروایدر هیچ بایتی نداد): رد شو تا صف گیر نکند.
       if (blob.size === 0) continue
       await playBlobChunk(blob, seq, controller)
+      playedAny = true
     }
   } catch (err) {
     if (activeAbort === controller) activeAbort = null
@@ -169,8 +282,12 @@ export async function playTts(
     throw err
   }
   if (activeAbort === controller) activeAbort = null
+  const stillMine = activeSeq === seq
   // پایان طبیعی صف: اگر هنوز همین درخواست فعال است، idle شو.
-  if (activeSeq === seq) stopTtsGlobal()
+  if (stillMine) stopTtsGlobal()
+  // هیچ جمله‌ای پخش نشد (همه fetchها خراب): خطای آخر بالا می‌رود تا دکمه
+  // «تلاش مجدد» نمایش داده شود — نه سکوت بی‌دلیل.
+  if (!playedAny && lastErr && stillMine) throw lastErr
 }
 
 /** پخش یک تکه صوتی (یک جمله) و انتظار تا پایان آن. */
@@ -208,14 +325,49 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     // sentence (or the end of the queue) accumulates RAM on long reads.
     // stopTtsGlobal's later revoke is a safe no-op: the shared refs are cleared
     // here whenever they still point at this chunk.
+    let settled = false
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const clearWatchdog = () => {
+      if (watchdog !== null) {
+        clearTimeout(watchdog)
+        watchdog = null
+      }
+    }
     const release = () => {
+      clearWatchdog()
       audio.onended = null
       audio.onerror = null
       if (activeAudio === audio) activeAudio = null
       if (activeUrl === url) activeUrl = null
       URL.revokeObjectURL(url)
     }
+    // نگهبان پخش: Audioی گیرکرده (بدون end/error) صف را برای همیشه نگه
+    // نمی‌دارد — به جمله بعدی رد می‌شود. حین pause تایمر تمدید می‌شود تا
+    // ادامه پخش هیچ صدایی را از دست ندهد.
+    const armWatchdog = () => {
+      clearWatchdog()
+      const budget = Math.min(
+        PLAYBACK_WATCHDOG_MAX_MS,
+        Math.max(PLAYBACK_WATCHDOG_MIN_MS, blob.size * PLAYBACK_WATCHDOG_PER_BYTE_MS),
+      )
+      watchdog = setTimeout(() => {
+        if (settled) return
+        try {
+          if (audio.paused && activeSeq === seq && !controller.signal.aborted) {
+            armWatchdog()
+            return
+          }
+        } catch {
+          // Fall through and skip the stuck chunk.
+        }
+        settled = true
+        release()
+        resolve()
+      }, budget)
+    }
     const onAbort = () => {
+      if (settled) return
+      settled = true
       release()
       try {
         audio.pause()
@@ -226,11 +378,15 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     }
     controller.signal.addEventListener('abort', onAbort, { once: true })
     audio.onended = () => {
+      if (settled) return
+      settled = true
       release()
       controller.signal.removeEventListener('abort', onAbort)
       resolve()
     }
     audio.onerror = () => {
+      if (settled) return
+      settled = true
       release()
       controller.signal.removeEventListener('abort', onAbort)
       // خطای پخش جمله میانی نباید کل صف را بکشد — فقط رد شو.
@@ -238,6 +394,7 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     }
     activeStatus = 'speaking'
     notifyTts()
+    armWatchdog()
     audio.play().then(() => {
       // حین audio.play استاپ زده شده؟ ویسی که تازه شروع شده را بخوابان.
       if (activeSeq !== seq || controller.signal.aborted) {
@@ -248,6 +405,8 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
         }
       }
     }).catch((err: unknown) => {
+      settled = true
+      clearWatchdog()
       controller.signal.removeEventListener('abort', onAbort)
       // درخواست کهنه (حین پخش، ویس دیگری شروع/استاپ شده): خطا را قورت بده —
       // کاربر دیگر منتظر این ویس نیست.
@@ -266,14 +425,73 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
  * می‌شود، نه با state ناهمگام ری‌اکت — پس کلیک تند پلی/استاپ هرگز دو پخش
  * همزمان نمی‌سازد (مشکل خواندن ttsStatus کهنه در toggleSpeak).
  */
-export async function toggleTts(
-  text: string,
-  opts: SpeakProviderOpts,
-  owner: number,
-): Promise<void> {
-  if (activeOwner === owner && activeStatus !== 'idle') {
+/** Pause the active voice in place — resume continues from the same spot. */
+function pauseActive() {
+  if (activeStatus !== 'speaking' || !activeAudio) return
+  try {
+    activeAudio.pause()
+  } catch {
+    // Ignore — the playback watchdog still guards a stuck element.
+  }
+  activeStatus = 'paused'
+  notifyTts()
+}
+
+/**
+ * Pause the active voice (owner-guarded like stopTts).
+ * Pausing during loading (nothing audible yet) cancels instead — there is no
+ * position to resume from.
+ */
+export function pauseTts(owner?: number) {
+  if (owner !== undefined && activeOwner !== owner) return
+  if (activeStatus === 'loading') {
     stopTtsGlobal()
     return
+  }
+  pauseActive()
+}
+
+/** Resume a paused voice from the same position (never restarts). */
+export async function resumeTts(owner?: number): Promise<void> {
+  if (owner !== undefined && activeOwner !== owner) return
+  const audio = activeAudio
+  if (activeStatus !== 'paused' || !audio) return
+  activeStatus = 'speaking'
+  notifyTts()
+  try {
+    await audio.play()
+  } catch {
+    // Resume lost the race (a stop/new playback replaced us): only idle when
+    // this element is still the active one.
+    if (activeAudio === audio) stopTtsGlobal()
+  }
+}
+
+/**
+ * تغییر وضعیت پخش با تصمیم همگام و اتمیک:
+ * speaking → pause درجا، paused → resume از همان‌جا، loading → لغو، وگرنه پخش.
+ * تصمیم با وضعیت ماژول (همگام) گرفته می‌شود، نه با state ناهمگام ری‌اکت — پس
+ * کلیک تند هرگز دو پخش همزمان نمی‌سازد. resume هیچ Audio جدیدی نمی‌سازد، پس
+ * برخلاف استاپ/پخش دوباره، از اول شروع نمی‌شود.
+ */
+export async function toggleTts(
+  text: string,
+  opts: SpeakProviderOpts | SpeakProviderOpts[],
+  owner: number,
+): Promise<void> {
+  if (activeOwner === owner) {
+    if (activeStatus === 'speaking') {
+      pauseActive()
+      return
+    }
+    if (activeStatus === 'paused') {
+      await resumeTts(owner)
+      return
+    }
+    if (activeStatus === 'loading') {
+      stopTtsGlobal()
+      return
+    }
   }
   await playTts(text, opts, owner)
 }
@@ -302,21 +520,87 @@ export function useTtsPlayback() {
   }, [myId])
 
   const play = useCallback(
-    async (text: string, opts: SpeakProviderOpts) => {
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
       await playTts(text, opts, myId)
     },
     [myId],
   )
 
   const toggle = useCallback(
-    async (text: string, opts: SpeakProviderOpts) => {
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
       await toggleTts(text, opts, myId)
     },
     [myId],
   )
 
+  const pause = useCallback(() => {
+    pauseTts(myId)
+  }, [myId])
+
+  const resume = useCallback(async () => {
+    await resumeTts(myId)
+  }, [myId])
+
   // unmount مالک، ویس خودش را قطع می‌کند؛ unmount غیرمالک اثری ندارد.
   useEffect(() => () => stopTts(idRef.current), [])
 
-  return { status, play, stop, toggle }
+  return { status, play, stop, toggle, pause, resume }
+}
+
+/**
+ * Final-answer text for speech synthesis.
+ *
+ * The bubble shows the agent's working trace (tool narrations, status lines)
+ * interleaved with the reply — reading all of `message.content` aloud would
+ * speak the work log too. Only genuine prose counts: text segments that render
+ * as standalone paragraphs. Narration lines attached to tool cards, tool
+ * outputs and the plan body (rendered as the Plan card) are never spoken.
+ */
+export function speakableMessageText(message: ChatMessage): string {
+  const display = planDisplay(message)
+  const segments = display.segments
+  if (segments && segments.length > 0) {
+    const prose: string[] = []
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      if (seg.kind !== 'text') continue
+      if (!seg.text.trim()) continue
+      // Narration for the NEXT tool call renders inside the tool card, not as
+      // prose — it describes work in progress, not the answer.
+      const next = segments[i + 1]
+      if (next && next.kind === 'tool') continue
+      prose.push(seg.text)
+    }
+    return stripMarkdownForTts(prose.join('\n\n'))
+  }
+  return stripMarkdownForTts(display.content ?? '')
+}
+
+/**
+ * Strip markdown syntax for speech synthesis so the voice reads words, not
+ * markup (headers, links, code fences, tables, HTML tags, bare URLs).
+ */
+export function stripMarkdownForTts(text: string): string {
+  let out = text ?? ''
+  // Fenced code blocks: keep the code, drop the fences + language tag.
+  out = out.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, _lang, code: string) => ` ${code} `)
+  // Inline code, images, links → readable words.
+  out = out.replace(/`([^`]*)`/g, '$1')
+  out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+  out = out.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+  // Headings, quotes, list markers, rules, tables, HTML tags.
+  out = out.replace(/^\s{0,3}#{1,6}\s+/gm, '')
+  out = out.replace(/^\s{0,3}>\s?/gm, '')
+  out = out.replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s+/gm, '')
+  out = out.replace(/^\s{0,3}(?:-[-*]|\*[*-]|_[*_])\s*$/gm, '')
+  out = out.replace(/\|/g, ' ')
+  out = out.replace(/<[^>]+>/g, ' ')
+  // Bold/italic/strike markers.
+  out = out.replace(/(\*\*|__)/g, '')
+  out = out.replace(/~~/g, '')
+  // Bare URLs are unreadable aloud — name them instead of spelling them out.
+  out = out.replace(/https?:\/\/\S+/g, 'link')
+  out = out.replace(/[ \t]+/g, ' ')
+  out = out.replace(/\n{3,}/g, '\n\n')
+  return out.trim()
 }

@@ -22,12 +22,21 @@ export interface TabListSection {
  *  list (open tabs with ages + close buttons, then recently closed tabs).
  *  The bars themselves stop scrolling — tabs squeeze instead — so this list
  *  is the way to reach/see every tab when there are many. */
+export interface TabListFooter {
+  label: string;
+  title?: string;
+  disabled?: boolean;
+  onPress: () => void;
+}
+
 export function TabListButton({
   sections,
   label,
+  footer,
 }: {
   sections: TabListSection[];
   label: string;
+  footer?: TabListFooter;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
@@ -190,6 +199,17 @@ export function TabListButton({
               ))}
             </div>
           ))}
+          {footer && (
+            <button
+              type="button"
+              className="tab-list-footer"
+              title={footer.title}
+              disabled={footer.disabled}
+              onClick={() => footer.onPress()}
+            >
+              {footer.label}
+            </button>
+          )}
         </div>
       )}
     </span>

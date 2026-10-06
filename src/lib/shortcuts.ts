@@ -108,7 +108,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   },
   { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Coder)" },
   { keys: "/", label: "Open command palette" },
-  { keys: "Cmd/Ctrl+M", label: "Cycle agent mode (Ask / Plan / Coder)" },
+  { keys: "Cmd/Ctrl+M", label: "Fullscreen the focused chat window — or the terminal while it has focus (press again to restore)" },
   { keys: "Cmd/Ctrl+T", label: "Start a new chat" },
   { keys: "Cmd/Ctrl+P", label: "Quick-open / search overlay (⌘⇧F = content search)" },
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },

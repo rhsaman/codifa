@@ -5,8 +5,6 @@ import { ChatWindows } from './components/ChatWindows'
 /** Tab row visible only in single-window mode. Multi-window hides the row:
  *  each stacked window carries its own header (title + hide button). */
 function ChatTabsRow() {
-  const visibleCount = useStore((s) => s.visibleChatIds.length)
-  if (visibleCount > 1) return null
   return (
     <div className="chat-tabs-row">
       <ChatTabListButton />
@@ -18,7 +16,7 @@ import { Sidebar } from './components/Sidebar'
 import { CodeMapPanel } from './components/CodeMapPanel'
 import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
-import { ViewerContent } from './components/ViewerContent'
+import { ViewerWindows } from './components/ViewerWindows'
 import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs, visibleTabs } from './lib/viewerTabs'
 import { ViewerAddButton, ViewerPaneFullscreenButton, ViewerTabListButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
@@ -27,6 +25,8 @@ import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePlatform } from './lib/shortcuts'
+import { resolveChatClose } from './lib/chatClose'
+import { collectChatIds } from './lib/chatTree'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
@@ -43,19 +43,18 @@ export default function App() {
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
   )
   const activeChatId = useStore((s) => s.activeChatId)
+  const openChatIds = useStore((s) => s.openChatIds)
+  const visibleChatIds = useStore((s) => s.visibleChatIds)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
   const viewerTabs = useViewerTabs((s) => s.tabs)
-  const viewerActiveId = useViewerTabs((s) => s.activeId)
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
   const panelMode = useViewerTabs((s) => s.panelMode)
   const chatFull = useStore((s) => s.chatFullscreen)
   // Viewer tabs are chat-scoped (browser/git/trace/plan): show only this chat's set.
   const visibleViewerTabs = visibleTabs(viewerTabs, activeChatId)
-  const viewerActive =
-    visibleViewerTabs.find((t) => t.id === viewerActiveId) ?? visibleViewerTabs[0] ?? null
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
@@ -168,6 +167,34 @@ export default function App() {
     }
   }, [])
 
+  // Report open chats so idle eviction never closes an open chat's browser.
+  // Closing the Browser panel alone must not trigger eviction: exemption is
+  // driven only by the open chat tabs, not by panel visibility.
+  useEffect(() => {
+    let cancelled = false
+    const ids = Array.from(
+      new Set([...(openChatIds ?? []), ...(visibleChatIds ?? []), activeChatId].filter(Boolean)),
+    )
+    const report = async () => {
+      try {
+        const { ensureSidecar } = await import('./lib/api')
+        const url = await ensureSidecar()
+        if (!url || cancelled) return
+        await fetch(`${url}/browser/open-chats`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_ids: ids }),
+        }).catch(() => {})
+      } catch {
+        /* best-effort only — eviction stays safe when the sidecar is down */
+      }
+    }
+    void report()
+    return () => {
+      cancelled = true
+    }
+  }, [openChatIds, visibleChatIds, activeChatId])
+
   // One-time startup model refresh: for every configured provider, ask the
   // sidecar `/models` endpoint and persist the result (model ids, context
   // windows, per-model pricing, reasoning support) into the store. This is
@@ -260,18 +287,44 @@ export default function App() {
       if (togglePanelFromKey(e)) return
       if (!(e.metaKey || e.ctrlKey)) return
       const k = physicalKey(e)
-      // VSCode-style close tab: Cmd/Ctrl+W closes whatever is in focus —
-      // the active TERMINAL tab while the terminal panel has focus, else the
-      // active viewer tab, else the active chat tab. Skip while typing in the
-      // composer so a stray chord never eats the draft mid-sentence (the
-      // xterm textarea does NOT count as "typing" here — its chord closes the
-      // terminal tab).
+      // VSCode-style close: Cmd/Ctrl+W closes whatever is in focus — the
+      // active TERMINAL tab while the terminal panel has focus, else the
+      // focused CHAT WINDOW in multi-window mode (chat stays in sidebar),
+      // else the active viewer tab, else the active chat tab. Skip while
+      // typing in the composer so a stray chord never eats the draft
+      // mid-sentence (the xterm textarea does NOT count as "typing" here —
+      // its chord closes the terminal tab). Multi-window chat windows are
+      // exempt: their draft survives in the sidebar, so Ctrl+W there always
+      // closes that window.
       if (k === 'w' && !e.shiftKey && !e.altKey) {
         const t = e.target as HTMLElement | null
         const inTerminal = !!(
           t?.closest?.('.terminal-panel') ||
           document.activeElement?.closest?.('.terminal-panel')
         )
+        const inDialog = !!t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')
+        // Multi-window: Ctrl+W on a chat window closes THAT window, even
+        // while typing in its composer (draft survives in the sidebar).
+        // Resolved from the event target so a non-focused window closes
+        // when its own composer has focus.
+        if (!inDialog) {
+          const winEl = t?.closest?.('[data-chat-window]') as HTMLElement | null
+          const winId = winEl?.getAttribute('data-chat-window') || null
+          if (winId) {
+            const st0 = useStore.getState()
+            const treeIds0 = st0.chatTree ? collectChatIds(st0.chatTree) : st0.visibleChatIds
+            if (treeIds0.length > 1 && treeIds0.includes(winId)) {
+              e.preventDefault()
+              e.stopPropagation()
+              if (inTerminal) {
+                window.dispatchEvent(new CustomEvent('coder:close-terminal-tab'))
+                return
+              }
+              st0.closeWindow(winId)
+              return
+            }
+          }
+        }
         const typing =
           !inTerminal &&
           !!t &&
@@ -286,7 +339,10 @@ export default function App() {
           if (vt.activeId) vt.closeViewer(vt.activeId)
           else {
             const st = useStore.getState()
-            if (st.activeChatId) st.closeChatTab(st.activeChatId)
+            const treeIds = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
+            const action = resolveChatClose(st.activeChatId, treeIds, st.activeChatId)
+            if (action?.kind === 'window') st.closeWindow(action.id)
+            else if (action && action.id) st.closeChatTab(action.id)
           }
           return
         }
@@ -324,8 +380,18 @@ export default function App() {
           break
         }
         case 'm': {
+          // Window fullscreen inside the chat area (Tab still cycles agent
+          // modes, so Ctrl/Cmd+M is free for this). Dialogs keep their own
+          // Ctrl chords. While the terminal has focus the same chord
+          // fullscreens the terminal panel instead.
+          const t = e.target as HTMLElement | null
+          if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) break
           e.preventDefault()
-          window.dispatchEvent(new CustomEvent('coder:toggle-mode'))
+          if (t?.closest?.('.terminal-panel')) {
+            useStore.getState().toggleTerminalFullscreen()
+            break
+          }
+          useStore.getState().toggleWindowFullscreen()
           break
         }
         case 't': {
@@ -409,9 +475,7 @@ export default function App() {
                   </button>
                 )}
               </header>
-              {/* Single-window mode shows the tab row; multi-window hides it
-                  (each window carries its own header with title + close) and
-                  the stack below carries one ChatPanel per visible chat. */}
+              {/* Tab row stays visible in every mode; multi-window adds one header per window (title + status + close) and the stack below carries one ChatPanel per visible chat. */}
               <ChatTabsRow />
               <main className="main">
                 {/* Each visible chat mounts its own ChatPanel (independent
@@ -471,8 +535,8 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <div className="viewer-content" key={viewerActive?.id ?? (panelMode ? 'panel' : 'empty')}>
-                    <ViewerContent />
+                  <div className="viewer-content" key={panelMode ? 'panel' : 'windows'}>
+                    <ViewerWindows />
                   </div>
                 </section>
               </>

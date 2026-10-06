@@ -3,16 +3,23 @@
 //        --format=esm --outfile=/tmp/chatTree.test.mjs && node /tmp/chatTree.test.mjs
 import {
   appendChat,
+  bestSplitDir,
   buildFromList,
   collectChatIds,
   containsChat,
   dropOnto,
+  dropOntoRoot,
   leafCount,
+  makeLeaf,
+  makeSplit,
   normalizeTree,
+  openBeside,
   removeChat,
+  replaceChat,
   resizePair,
   setNodeSize,
   sizesByChat,
+  toggleFullscreenId,
 } from "./chatTree";
 
 export {};
@@ -84,6 +91,72 @@ console.log("4) resize + normalize — sizes clamp, unknown ids drop:");
   function a0(): string {
     return "a";
   }
+}
+
+console.log("5) toggleFullscreenId — window fullscreen toggle is idempotent:");
+{
+  check("off + a -> a", toggleFullscreenId(null, "a") === "a");
+  check("a + a -> off", toggleFullscreenId("a", "a") === null);
+  check("a + b -> b", toggleFullscreenId("a", "b") === "b");
+  check("empty target keeps current", toggleFullscreenId("a", "") === "a");
+}
+
+console.log("6) dropOntoRoot — dragged window space counts as empty:");
+{
+  const nested = buildFromList(["a", "b", "c"], "row")!;
+  const moved = dropOntoRoot(nested, "c", "bottom");
+  check("root bottom keeps all chats", JSON.stringify(collectChatIds(moved)) === JSON.stringify(["a", "b", "c"]));
+  check("root bottom puts dragged pane last full-width", moved?.kind === "split" && (moved.children[1] as { chatId?: string }).chatId === "c");
+  const single = buildFromList(["a"], "row")!;
+  check("root drop on single window is a no-op", dropOntoRoot(single, "a", "bottom") === single);
+  // User scenario: row [left, col [topRight, bottomRight]], drag the
+  // bottom-right pane to the bottom edge -> col [row [left, topRight],
+  // dragged] so the dragged pane lands full-width below.
+  const row = buildFromList(["a", "b"], "row")!;
+  const layout = dropOnto(row, "c", "b", "bottom")!;
+  check("nested layout keeps every chat", collectChatIds(layout).join(",") === "a,b,c");
+  const landed = dropOntoRoot(layout, "c", "bottom")!;
+  check("nested root bottom keeps order", collectChatIds(landed).join(",") === "a,b,c");
+  check(
+    "nested root bottom puts dragged pane full-width below",
+    landed.kind === "split" &&
+      landed.dir === "col" &&
+      landed.children.length === 2 &&
+      (landed.children[1] as { chatId?: string }).chatId === "c" &&
+      collectChatIds(landed.children[0]).join(",") === "a,b",
+    landed,
+  );
+}
+
+console.log("7) normalizeTree — nested duplicate chat renders once:");
+{
+  const dup = makeSplit("row", [makeLeaf("a"), makeSplit("col", [makeLeaf("a"), makeLeaf("b")])]) as never as Parameters<typeof normalizeTree>[0];
+  const cleaned = normalizeTree(dup, new Set(["a", "b"]));
+  check("duplicate across splits collapses to one window per chat", JSON.stringify(collectChatIds(cleaned)) === JSON.stringify(["a", "b"]), cleaned);
+}
+
+console.log("8) appendChat never replaces + bestSplitDir follows aspect:");
+{
+  const full = buildFromList(["a", "b", "c", "d"], "row")!;
+  const grown = appendChat(full, "e", "row");
+  check("explicit open adds a fifth window instead of replacing", JSON.stringify(collectChatIds(grown)) === JSON.stringify(["a", "b", "c", "d", "e"]));
+  check("wide container splits side-by-side", bestSplitDir(1600, 900) === "row");
+  check("tall container stacks", bestSplitDir(800, 1200) === "col");
+}
+
+console.log("9) openBeside — new window opens next to focus, never replaces:");
+{
+  const row = buildFromList(["a", "b"], "row")!;
+  const tall = openBeside(row, "c", "b", "col");
+  check("beside split keeps every chat", collectChatIds(tall).join(",") === "a,b,c");
+  const second = tall.kind === "split" ? tall.children[1] : null;
+  check("different axis splits only the focused leaf", second !== null && second.kind === "split" && second.dir === "col" && collectChatIds(second).join(",") === "b,c");
+  const wide = openBeside(row, "c", "a", "row");
+  check("same axis extends without nesting", wide.kind === "split" && wide.dir === "row" && collectChatIds(wide).join(",") === "a,c,b");
+  check("existing chat is a no-op", openBeside(row, "a", "b", "row") === row);
+  const replaced = replaceChat(row, "b", "c");
+  check("replace swaps the clicked window", JSON.stringify(collectChatIds(replaced)) === JSON.stringify(["a", "c"]));
+  check("replace keeps sizes", sizesByChat(replaced).a === 1 && sizesByChat(replaced).c === 1);
 }
 
 if (failed > 0) {

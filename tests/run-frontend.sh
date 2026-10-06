@@ -108,6 +108,9 @@ bidi|tests/bidi.test.ts|-
 fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
 chatTree|src/lib/chatTree.test.ts|
+fileDrag|src/lib/fileDrag.test.ts|
+chatWindowMeta|src/lib/chatWindowMeta.test.ts|
+chatClose|src/lib/chatClose.test.ts|
 viewerTabs|src/lib/viewerTabs.test.ts|--packages=external --external:electron
 fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-

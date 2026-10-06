@@ -35,6 +35,7 @@
 const React = await import('react')
 const { renderToString } = await import('react-dom/server')
 const { TabPendingBadges } = await import('../src/components/ChatTabBar')
+const { windowStatusFor } = await import('../src/lib/chatWindowStatus')
 
 const el = React.createElement
 
@@ -93,6 +94,21 @@ console.log('4) nothing pending renders nothing:')
 {
   const html = renderToString(el(TabPendingBadges, { pendingPermission: null, pendingAsk: null }))
   check('renders empty', html.trim() === '', JSON.stringify(html))
+}
+
+console.log('5) window header status (same language as sidebar and tabs):')
+{
+  const streaming = { messages: [{ streaming: true }], pendingPermission: null, pendingAsk: null }
+  const s1 = windowStatusFor(streaming, 'c1', 'c2', [])
+  check('streaming dot while agent works', s1.streaming === true && s1.unread === false)
+  const done = { messages: [{}], pendingPermission: null, pendingAsk: null }
+  const s2 = windowStatusFor(done, 'c1', 'c2', ['c1'])
+  check('green dot when turn finished elsewhere', s2.streaming === false && s2.unread === true)
+  const s3 = windowStatusFor(done, 'c1', 'c1', ['c1'])
+  check('no unread dot on the focused chat', s3.unread === false)
+  const asking = { messages: [{}], pendingPermission: null, pendingAsk: { question: 'Continue?' } }
+  const s4 = windowStatusFor(asking, 'c1', 'c2', ['c1'])
+  check('ask badge wins over unread dot', s4.pendingAsk?.question === 'Continue?' && s4.unread === false)
 }
 
 if (failed > 0) {

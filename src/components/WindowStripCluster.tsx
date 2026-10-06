@@ -1,4 +1,6 @@
+import type { CSSProperties } from "react";
 import { useStore } from "../lib/store";
+import { workspaceDisplayFor } from "../lib/chatWindowMeta";
 
 /** Window-level controls: sidebar toggle, workspace picker, direction
  *  switch. Rendered at the window's top-left in BOTH sidebar states —
@@ -11,6 +13,9 @@ export function WindowStripCluster() {
   const activeChatRoot = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
   );
+  const workspaces = useStore((s) => s.workspaces);
+  const workspaceColors = useStore((s) => s.workspaceColors);
+  const ws = workspaceDisplayFor(activeChatRoot, workspaces, workspaceColors);
   const dir = useStore((s) => s.dir);
   return (
     <span className="window-strip-cluster">
@@ -28,7 +33,8 @@ export function WindowStripCluster() {
       <button
         className="workspace-btn"
         aria-label="Open workspace folder"
-        title={activeChatRoot || "No workspace open — pick a folder for this chat"}
+        title={ws.root ? `${ws.label} — ${ws.root}` : "No workspace open — pick a folder for this chat"}
+        style={{ "--ws": ws.color } as CSSProperties}
         onClick={() =>
           void window.coder.selectFolder().then((d) => {
             if (!d) return;
@@ -40,7 +46,8 @@ export function WindowStripCluster() {
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
         </svg>
-        <span className="workspace-btn-label">{activeChatRoot ? activeChatRoot.split("/").filter(Boolean).pop() : "Open workspace"}</span>
+        <i className="workspace-btn-dot" aria-hidden="true" />
+        <span className="workspace-btn-label">{ws.root ? ws.label : "Open workspace"}</span>
       </button>
       <button
         className="titlebar-icon-btn dir-text-btn"

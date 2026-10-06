@@ -250,26 +250,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     _spawn_tracked(_bg(), "models-dev-preload")
     _stop = await _start_schedule_loop()
-    # Preload the embedding ONNX model in the background (fire-and-forget):
-    # a cold load (tokenizer + session, hundreds of MB) blocks the first
-    # token for many seconds. Warming here moves that cost to startup, off
-    # the chat path.
-    # Skipped silently when no embedding model is downloaded.
-    async def _bg_embed() -> None:
-        try:
-            import asyncio as _aio
-
-            from embeddings import model_dir
-
-            if not model_dir():
-                return
-            from embeddings import _load as _embed_load
-
-            await _aio.to_thread(_embed_load)
-        except Exception:  # noqa: BLE001, S110 — optional warmup
-            pass
-
-    _spawn_tracked(_bg_embed(), "embedding-warmup")
+    # The embedding ONNX model (~1.1 GB resident) is deliberately NOT preloaded
+    # here: it loads lazily on the first real embed call (embeddings._load) and
+    # is evicted after idle. Preloading pinned that memory on every launch even
+    # when RAG / indexing was never used.
     yield
     try:
         _stop.set()
@@ -1121,6 +1105,12 @@ async def app_save(req: StateRequest) -> dict:
                 _tools_del.clear_chat_state(str(cid))
             except Exception:  # noqa: BLE001, S110 — cleanup never breaks save
                 pass
+            try:
+                import browser_session as _bs_del
+
+                await _bs_del.close(str(cid))
+            except Exception:  # noqa: BLE001, S110 — cleanup never breaks save
+                pass
     if req.deleted_workspaces:
         state_db.remove_workspace_vectors(req.deleted_workspaces)
         try:
@@ -1373,6 +1363,22 @@ async def browser_close(req: BrowserCloseRequest | None = None) -> dict:
     import browser_session
 
     return await browser_session.close(req.chat_id if req else "")
+
+
+class BrowserOpenChatsRequest(BaseModel):
+    chat_ids: list[str] = []
+
+
+@app.post("/browser/open-chats")
+async def browser_open_chats(req: BrowserOpenChatsRequest | None = None) -> dict:
+    """Mark which chats are open in the UI (exempt from idle eviction)."""
+    import browser_session
+
+    try:
+        browser_session.set_open_chats(req.chat_ids if req else [])
+    except Exception:  # noqa: BLE001, S110 — tracking never breaks the caller
+        pass
+    return {"ok": True}
 
 
 # --- git ------------------------------------------------------------------- #

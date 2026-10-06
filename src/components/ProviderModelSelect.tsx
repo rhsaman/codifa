@@ -26,7 +26,7 @@ function modelLabel(p: ProviderConfig, m: string): string {
  *  fetchAndPersist. Opening this popup only reads the persisted list, so it
  *  never fires a network request. The last 10 used models appear in a
  *  "Recent" section on top. */
-export function ProviderModelSelect() {
+export function ProviderModelSelect(props?: { chatId?: string }) {
   const providers = useStore((s) => s.settings.providers);
   const activeId = useStore((s) => s.settings.activeProviderId);
   const recents = useStore((s) => s.recentModels);
@@ -37,7 +37,14 @@ export function ProviderModelSelect() {
   const removeRecentModel = useStore((s) => s.removeRecentModel);
   const togglePinRecentModel = useStore((s) => s.togglePinRecentModel);
   const pinnedCount = useStore((s) => s.recentModels.filter((r) => r.pinned).length);
-  const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
+  // Per-window: when mounted inside a multi-window ChatPanel, show THAT
+  // window's chat model, not the globally focused chat. Single-window
+  // callers omit chatId and follow the focused chat as before.
+  const chat = useStore((s) => {
+    const id = props?.chatId ?? s.activeChatId;
+    for (const c of s.chats) if (c.id === id) return c;
+    return null;
+  });
   const setChatProvider = useStore((s) => s.setChatProvider);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");

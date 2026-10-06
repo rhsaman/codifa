@@ -972,12 +972,32 @@ _EFFORT_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_OFF = {"none", "minimal"}
 
 
+def _rejected_effort(low: str) -> str | None:
+    """Extract the rejected effort value from a lowercased 400 error text.
+
+    Handles single quotes, double quotes, and bare ``thinking_effort=xhigh``
+    shapes (e.g. Kimi's ``thinking_effort="xhigh"``). Only returns values on
+    the effort ladder so a quoted param name like 'reasoning_effort' is never
+    mistaken for the rejected value.
+    """
+    for pat in (
+        r"(?:reasoning_effort|thinking_effort)\s*=\s*[\"']?(\w+)[\"']?",
+        r"does not support\s*[\"']?(\w+)[\"']?",
+    ):
+        m = re.search(pat, low)
+        if m and m.group(1) in _EFFORT_LADDER:
+            return m.group(1)
+    return None
+
+
 def _parse_allowed_efforts(exc: Exception) -> set[str] | None:
     """Parse the allowed reasoning-effort values from a 400's error text.
 
     Handles both shapes seen in the wild:
       * English: "does not support 'max' ... Supported values are: 'none',
         'low', 'medium', 'high', and 'xhigh'."
+      * Kimi: 'Unsupported Kimi K3 thinking_effort="xhigh"; supported values
+        are low, high, and max' (double quotes, ``thinking_effort=`` form).
       * Chinese (agentrouter): 「请使用 low、high 或 max」
 
     The REJECTED value (e.g. 'max' in "does not support 'max'") is excluded so
@@ -991,21 +1011,33 @@ def _parse_allowed_efforts(exc: Exception) -> set[str] | None:
         r"supported values(?:\s+are)?:?\s*(.+?)(?:\.|$)", low, re.IGNORECASE
     )
     if m:
-        words = re.findall(r"[a-z]+", m.group(1))
-        # The rejected value appears as "does not support 'max'" — grab THAT,
-        # not the param name quoted in "Unsupported value: 'reasoning_effort'".
-        rejected = re.search(r"does not support\s*'(\w+)'", low) or re.search(
-            r"unsupported value\s*:\s*'(\w+)'", low
-        )
-        bad = rejected.group(1) if rejected else None
+        segment = m.group(1)
+        # Cut the JSON tail some gateways append after the message string
+        # (e.g. Kimi: "...max', 'type': ..., 'param': None, ..." — the None
+        # would otherwise parse as allowed 'none').
+        for _marker in (
+            "'type'",
+            '"type"',
+            "'param'",
+            '"param"',
+            "'code'",
+            '"code"',
+            "trace_id",
+        ):
+            _idx = segment.find(_marker)
+            if _idx >= 0:
+                segment = segment[:_idx]
+                break
+        words = re.findall(r"[a-z]+", segment)
+        # The rejected value appears as "does not support 'max'" or
+        # ``thinking_effort="xhigh"`` — grab THAT, not the param name quoted
+        # in "Unsupported value: 'reasoning_effort'".
+        bad = _rejected_effort(low)
         allowed = {w for w in words if w in _EFFORT_LADDER and w != bad}
         return allowed or None
     # Chinese "please use low, high or max" — list the bare ladder words.
     # Exclude the REJECTED value like the English branch to avoid max->max loop.
-    rejected_zh = re.search(r"does not support\s*'(\w+)'", low) or re.search(
-        r"unsupported value\s*:\s*'(\w+)'", low
-    )
-    bad_zh = rejected_zh.group(1) if rejected_zh else None
+    bad_zh = _rejected_effort(low)
     allowed = {w for w in _EFFORT_LADDER if w in low and w != bad_zh}
     if allowed:
         return allowed
@@ -1065,10 +1097,20 @@ def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
     if not current:
         mk = getattr(model, "model_kwargs", None) or {}
         current = mk.get("reasoning_effort")
+    # Explicit top-rung equivalence: providers disagree on the strongest level
+    # ('xhigh' vs 'max'). Any route rejecting one but listing the other maps
+    # directly, regardless of ladder distance.
+    _explicit: str | None = None
+    if current == "xhigh" and "xhigh" not in allowed and "max" in allowed:
+        _explicit = "max"
+    elif current == "max" and "max" not in allowed and "xhigh" in allowed:
+        _explicit = "xhigh"
     # Map the current level to the nearest allowed rung: the closest value by
     # ladder distance, preferring the stronger one on ties (a user who picked
     # medium wants real reasoning, not the floor).
-    if current in allowed:
+    if _explicit is not None:
+        target = _explicit
+    elif current in allowed:
         # "high" is the strongest level the user can pick — when the route
         # allows something even stronger (xhigh or max), upgrade so the user
         # can actually use it. Lower picks (low/medium) keep the user's choice.
@@ -1274,6 +1316,35 @@ async def llm_generate(
                 raise
             model = _clone_model_with_key(model, rest[0])
             res = await model.ainvoke(msgs)
+        elif _is_reasoning_effort_error(exc):
+            # Always-thinking route rejected our effort (e.g. Kimi rejects
+            # xhigh but accepts max). Remap and retry up to 3 times; providers
+            # disagree on the top rung so one hop may lead to another.
+            _re_exc = exc
+            _re_model = model
+            _done = False
+            for _ in range(3):
+                _remapped = _remap_reasoning_effort(_re_model, _re_exc)
+                _old = getattr(_re_model, "reasoning_effort", None) or (
+                    getattr(_re_model, "model_kwargs", None) or {}
+                ).get("reasoning_effort")
+                _new = getattr(_remapped, "reasoning_effort", None) or (
+                    getattr(_remapped, "model_kwargs", None) or {}
+                ).get("reasoning_effort")
+                if _new == _old:
+                    break
+                _re_model = _remapped
+                try:
+                    res = await _re_model.ainvoke(msgs)
+                    model = _re_model
+                    _done = True
+                    break
+                except Exception as exc2:
+                    if not _is_reasoning_effort_error(exc2):
+                        raise
+                    _re_exc = exc2
+            if not _done:
+                raise _re_exc
         else:
             try:
                 import trace_store
@@ -2340,6 +2411,7 @@ async def langchain_tool_loop(
     _streak = _BatchStreakTracker()
     _revisit = _RevisitStreakTracker()
     _no_pc = False  # flips on a parallel_tool_calls 400 (strip and retry once)
+    _no_re = 0  # counts reasoning-effort remaps (up to 3, xhigh<->max chain)
     # Reminders / steering are TRANSIENT: sent with the very next request only,
     # never stored in msgs. Stored copies were re-sent on every later step (one
     # more per step while a streak lasted), growing the context for no benefit.
@@ -2395,15 +2467,32 @@ async def langchain_tool_loop(
         normalize_tool_transcript(msgs, _logger)
         _req = [*project_tool_results(_stable_tool_order(msgs)), *_transient]
         _llm_t0 = time.monotonic()
-        try:
-            ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
-        except Exception as _pc_exc:
-            # Some gateways/models reject `parallel_tool_calls` with a 400 —
-            # retry this step once without it (same fallback as graph.py).
-            if _no_pc or not _is_parallel_calls_error(_pc_exc):
-                raise
-            _no_pc = True
-            ai = await bind_tools_parallel(model, lc_tools, False).ainvoke(_req)
+        while True:
+            try:
+                ai = await bind_tools_parallel(model, lc_tools, not _no_pc).ainvoke(_req)
+                break
+            except Exception as _pc_exc:
+                # Always-thinking route rejected our effort (e.g. Kimi rejects
+                # xhigh but accepts max): remap and retry the same step.
+                if _no_re < 3 and _is_reasoning_effort_error(_pc_exc):
+                    _remapped = _remap_reasoning_effort(model, _pc_exc)
+                    _old = getattr(model, "reasoning_effort", None) or (
+                        getattr(model, "model_kwargs", None) or {}
+                    ).get("reasoning_effort")
+                    _new = getattr(_remapped, "reasoning_effort", None) or (
+                        getattr(_remapped, "model_kwargs", None) or {}
+                    ).get("reasoning_effort")
+                    if _new != _old:
+                        _no_re += 1
+                        model = _remapped
+                        continue
+                    raise
+                # Some gateways/models reject `parallel_tool_calls` with a 400 —
+                # retry this step once without it (same fallback as graph.py).
+                if _no_pc or not _is_parallel_calls_error(_pc_exc):
+                    raise
+                _no_pc = True
+                continue
         _llm_wait_s = time.monotonic() - _llm_t0
         try:
             _logger.info(

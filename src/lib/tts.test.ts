@@ -36,6 +36,7 @@ class MockAudio {
   }
   async play() {
     this.played = true
+    this.paused = false
     setTimeout(() => {
       if (!this.paused && this.onended) this.onended()
     }, 30)
@@ -78,21 +79,56 @@ const sleepAbort = (ms: number, signal?: AbortSignal) =>
 // سیگنال لغو احترام می‌گذارد. سیگنال‌ها نگه داشته می‌شوند تا abort شدنشان بررسی شود.
 let ttsCall = 0
 let firstTtsSlow = false
-// NOTE: playTts prefetches sentence N+1 BEFORE awaiting sentence N's own
-// fetch, so the first /tts call of a queue is the NEXT sentence's download.
-// This flag delays call 1 = sentence 2's prefetch, keeping the queue open
-// while sentence 1 plays and ends.
+// NOTE: playTts prefetches sentence 0 and 1 up front in queue order, so
+// /tts call 1 = sentence 1, call 2 = sentence 2. This flag delays call 2 =
+// sentence 2's download, keeping the queue open while sentence 1 plays and ends.
 let sentenceTwoSlow = false
+// شماره فراخوانی‌های /tts که باید fail شوند — برای تست رد شدن جمله خراب.
+const failTtsCalls = new Set<number>()
+let failAllTts = false
+// فالبک/retry: fail بر اساس body ارسالی (provider/base_url) یا N خطای اول.
+// body ارسالی api.ts شامل provider (= opts.kind) و base_url (= opts.baseUrl) است.
+const failBaseUrls = new Set<string>()
+const failProviders = new Set<string>()
+let ttsFailRemaining = 0
+// Fail any /tts request whose body text includes this substring (sentence-targeted,
+// immune to call numbering and retry rounds).
+let failTextIncludes = ''
+const seenBaseUrls: string[] = []
 const seenSignals: AbortSignal[] = []
-;(globalThis as any).fetch = async (url: string, init?: { signal?: AbortSignal }) => {
+;(globalThis as any).fetch = async (url: string, init?: { signal?: AbortSignal; body?: unknown }) => {
   if (url.endsWith('/health')) return new Response('', { status: 200 })
   if (url.endsWith('/tts')) {
     ttsCall++
     const myCall = ttsCall
+    // تفکیک opts از روی body ارسالی شامل provider و base_url (api.ts)
+    let bodyBaseUrl = ''
+    let bodyProvider = ''
+    let bodyText = ''
+    try {
+      const raw = (init as any)?.body
+      if (typeof raw === 'string' && raw) {
+        const parsed = JSON.parse(raw)
+        bodyBaseUrl = String(parsed?.base_url ?? '')
+        bodyProvider = String(parsed?.provider ?? '')
+        bodyText = String(parsed?.text ?? '')
+      }
+    } catch {
+      // body غیر JSON: نادیده بگیر
+    }
+    if (failTextIncludes && bodyText.includes(failTextIncludes)) throw new Error('synthesis failed (500)')
+    if (bodyBaseUrl) seenBaseUrls.push(bodyBaseUrl)
+    if (bodyBaseUrl && failBaseUrls.has(bodyBaseUrl)) throw new Error('synthesis failed (500)')
+    if (bodyProvider && failProviders.has(bodyProvider)) throw new Error('synthesis failed (500)')
+    if (ttsFailRemaining > 0) {
+      ttsFailRemaining--
+      throw new Error('synthesis failed (500)')
+    }
+    if (failAllTts || failTtsCalls.has(myCall)) throw new Error('synthesis failed (500)')
     const signal = init?.signal
     if (signal) seenSignals.push(signal)
     if (firstTtsSlow && myCall === 1) await sleepAbort(60, signal)
-    if (sentenceTwoSlow && myCall === 1) await sleepAbort(120, signal)
+    if (sentenceTwoSlow && myCall === 2) await sleepAbort(120, signal)
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     return {
       ok: true,
@@ -103,7 +139,11 @@ const seenSignals: AbortSignal[] = []
   return new Response('', { status: 200 })
 }
 
-const { playTts, stopTts, toggleTts, getTtsSnapshot, friendlyTtsError } = await import('./tts')
+const ttsMod = await import('./tts')
+const { playTts, stopTts, toggleTts, pauseTts, resumeTts, getTtsSnapshot, friendlyTtsError, stripMarkdownForTts, speakableMessageText } = ttsMod
+// setter تاخیر retry (با فرض پیاده‌سازی setTtsRetryConfig در tts.ts توسط ساب‌ایجنت tts؛
+// اگر هنوز اضافه نشده باشد undefined است و تست‌های ۲۰/۲۱ آن را گزارش می‌کنند).
+const setTtsRetryConfig = (ttsMod as unknown as { setTtsRetryConfig?: (cfg: Record<string, unknown>) => void }).setTtsRetryConfig
 const { splitTtsSentences } = await import('./api')
 
 const opts = { kind: 'openai', baseUrl: 'http://127.0.0.1:8899' }
@@ -287,6 +327,233 @@ console.log('۱۱) پایان هر جمله بلافاصله ObjectURL آن را
   await p
   check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
   stopTts()
+}
+
+console.log('۱۲) pause حین پخش، صدا را نگه می‌دارد و resume از همان‌جا ادامه می‌دهد:')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  const p = playTts('First sentence here. Second sentence here. Third sentence here.', opts, 90)
+  await sleep(10)
+  check('حین پخش: speaking', getTtsSnapshot().status === 'speaking')
+  const first = MockAudio.instances[0]
+  pauseTts(90)
+  check('بعد از pause: paused', getTtsSnapshot().status === 'paused')
+  check('ویس pause شد', first?.paused === true)
+  await resumeTts(90)
+  check('بعد از resume: speaking', getTtsSnapshot().status === 'speaking')
+  await p
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle')
+  stopTts()
+}
+
+console.log('۱۳) toggle حین پخش pause می‌کند و toggle دوباره resume می‌کند (بدون پخش از اول):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  const p1 = toggleTts('First here. Second here. Third here.', opts, 91)
+  await sleep(10)
+  await toggleTts('ignored', opts, 91)
+  check('toggle حین پخش → paused', getTtsSnapshot().status === 'paused')
+  const countAtPause = MockAudio.instances.length
+  await toggleTts('ignored', opts, 91)
+  check('toggle دوباره → speaking', getTtsSnapshot().status === 'speaking')
+  check('resume ویس جدید نساخت (از اول پخش نشد)', MockAudio.instances.length === countAtPause, MockAudio.instances.length)
+  await p1
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle')
+  stopTts()
+}
+
+console.log('۱۴) جمله ناموفق رد می‌شود و بقیه پاسخ پخش می‌شود (گیر نکردن وسط پخش):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  // Sentence 2 always fails (matched by body text, immune to call numbering and
+  // retry rounds) so it is skipped after all rounds; sentence 1 still plays.
+  // Small retry delay keeps the test fast (default is 5s between rounds).
+  setTtsRetryConfig?.({ delayMs: 10 } as any)
+  failTextIncludes = 'Second sentence here'
+  await playTts('First sentence here. Second sentence here.', opts, 92)
+  failTextIncludes = ''
+  setTtsRetryConfig?.({ delayMs: 5000 } as any)
+  check('با وجود خطای یک جمله، صف resolve شد و جمله سالم پخش شد', MockAudio.instances.length === 1, MockAudio.instances.length)
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle')
+  stopTts()
+}
+
+console.log('۱۵) وقتی هیچ جمله‌ای موفق نیست، خطا بالا می‌آید (سکوت بی‌دلیل نه):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  // Shrink retry delay: both sentences fail all rounds, default 5s gaps are slow.
+  setTtsRetryConfig?.({ delayMs: 10 } as any)
+  failAllTts = true
+  let threw = false
+  try {
+    await playTts('First here. Second here.', opts, 93)
+  } catch {
+    threw = true
+  }
+  failAllTts = false
+  setTtsRetryConfig?.({ delayMs: 5000 } as any)
+  check('خطا throw شد', threw)
+  check('هیچ Audio ساخته نشد', MockAudio.instances.length === 0, MockAudio.instances.length)
+  check('وضعیت idle است', getTtsSnapshot().status === 'idle')
+  stopTts()
+}
+
+console.log('۱۶) markdown برای گفتار تمیز می‌شود:')
+{
+  const md = stripMarkdownForTts('## Title\n\nSee [docs](https://x.test/page) and `code`.\n\n```ts\nconst a = 1\n```\n\n- item one\n> quote here\n\nVisit https://x.test/raw now')
+  check('هدر/لینک/کدفنس/نقل‌قول خوانا شد', md.includes('Title') && md.includes('docs') && md.includes('const a = 1') && md.includes('item one') && md.includes('quote here'), md)
+  check('نشانه‌گذاری و URL خام خوانده نمی‌شود', !md.includes('https://') && !md.includes('```') && !md.includes('##'), md)
+}
+
+console.log('۱۷) فقط prose نهایی خوانده می‌شود (narration ابزارها نه):')
+{
+  type Msg = Parameters<typeof speakableMessageText>[0]
+  const msg = {
+    id: 'm1',
+    role: 'assistant',
+    content: 'x',
+    createdAt: 0,
+    segments: [
+      { kind: 'text', text: 'Let me check the file.' },
+      { kind: 'tool', index: 0 },
+      { kind: 'text', text: 'Done, here is the result.' },
+    ],
+  } as unknown as Msg
+  const spoken = speakableMessageText(msg)
+  check('فقط prose نهایی', spoken === 'Done, here is the result.', spoken)
+  stopTts()
+}
+
+console.log('۱۸) بدنه پلن (کارت Plan) خوانده نمی‌شود:')
+{
+  type Msg = Parameters<typeof speakableMessageText>[0]
+  const msg = {
+    id: 'm2',
+    role: 'assistant',
+    content: 'Intro here.\n## Plan\nbody here',
+    createdAt: 0,
+    planDoc: { title: 'P', body: '## Plan\nbody here', preamble: 'Intro here.' },
+  } as unknown as Msg
+  const spoken = speakableMessageText(msg)
+  check('فقط preamble خوانده می‌شود', spoken.includes('Intro here.') && !spoken.includes('body here'), spoken)
+  stopTts()
+}
+
+console.log('۱۹) فالبک TTS: provider اول fail، دومی موفق (آرایه opts):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  seenBaseUrls.length = 0
+  failTtsCalls.clear()
+  failAllTts = false
+  failBaseUrls.clear()
+  failProviders.clear()
+  ttsFailRemaining = 0
+  const badOpts = { kind: 'bad-provider', baseUrl: 'http://bad-provider:8899' }
+  const goodOpts = { kind: 'openai', baseUrl: 'http://good-provider:8899' }
+  // تفکیک opts از روی base_url متفاوت؛ موک fetch بادی را parse می‌کند.
+  failBaseUrls.add('http://bad-provider:8899')
+  const before = MockAudio.instances.length
+  const startCalls = ttsCall
+  let threw = false
+  try {
+    await (playTts as any)('متن فالبک', [badOpts, goodOpts], 100)
+  } catch (err) {
+    threw = true
+    console.error('   fallback threw:', err)
+  }
+  failBaseUrls.clear()
+  const usedCalls = ttsCall - startCalls
+  check('فالبک throw نکرد', !threw)
+  check('حداقل ۲ فراخوانی (bad + good)', usedCalls >= 2, usedCalls)
+  check('provider سالم واقعاً صدا زده شد', seenBaseUrls.includes('http://good-provider:8899'), seenBaseUrls)
+  check('یک Audio ساخته شد', MockAudio.instances.length === before + 1, MockAudio.instances.length)
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+  stopTts()
+}
+
+console.log('۲۰) retry خودکار: ۲ fail بعد success (delay کوچک):')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  seenBaseUrls.length = 0
+  failTtsCalls.clear()
+  failAllTts = false
+  failBaseUrls.clear()
+  failProviders.clear()
+  if (typeof setTtsRetryConfig !== 'function') {
+    check('setTtsRetryConfig وجود دارد (tts.ts باید setter بدهد)', false, typeof setTtsRetryConfig)
+    stopTts()
+  } else {
+    // delay کوچک با setTimeout واقعی — بدون sleep چندثانیه‌ای.
+    try {
+      setTtsRetryConfig({ delayMs: 10, baseDelayMs: 10, retryDelayMs: 10, delay: 10, maxAttempts: 5 } as any)
+    } catch (err) {
+      console.error('   setTtsRetryConfig threw:', err)
+    }
+    ttsFailRemaining = 2
+    const startCalls = ttsCall
+    let threw = false
+    try {
+      await playTts('متن retry', opts, 101)
+    } catch (err) {
+      threw = true
+      console.error('   retry threw:', err)
+    }
+    const usedCalls = ttsCall - startCalls
+    ttsFailRemaining = 0
+    // برگرداندن delay به مقدار اصلی (پیش‌فرض سالم).
+    try {
+      setTtsRetryConfig({ delayMs: 5000, maxAttempts: 5 } as any)
+    } catch {}
+    check('playTts موفق شد (throw نکرد)', !threw)
+    check('تعداد فراخوانی‌ها ۳ است (۲ fail + ۱ success)', usedCalls === 3, usedCalls)
+    check('یک Audio ساخته شد', MockAudio.instances.length === 1, MockAudio.instances.length)
+    check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+    stopTts()
+  }
+}
+
+console.log('۲۱) همه ۵ تلاش fail → throw:')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  seenBaseUrls.length = 0
+  failTtsCalls.clear()
+  failAllTts = false
+  failBaseUrls.clear()
+  failProviders.clear()
+  if (typeof setTtsRetryConfig !== 'function') {
+    check('setTtsRetryConfig وجود دارد (tts.ts باید setter بدهد)', false, typeof setTtsRetryConfig)
+    stopTts()
+  } else {
+    try {
+      setTtsRetryConfig({ delayMs: 10, baseDelayMs: 10, retryDelayMs: 10, delay: 10, maxAttempts: 5 } as any)
+    } catch {}
+    // بیشتر از ۵ fail تا هر ۵ تلاش قطعاً fail شود.
+    ttsFailRemaining = 10
+    const startCalls = ttsCall
+    let threw = false
+    try {
+      await playTts('متن همیشه خراب', opts, 102)
+    } catch {
+      threw = true
+    }
+    const usedCalls = ttsCall - startCalls
+    ttsFailRemaining = 0
+    try {
+      setTtsRetryConfig({ delayMs: 5000, maxAttempts: 5 } as any)
+    } catch {}
+    check('playTts throw کرد', threw)
+    check('۵ بار تلاش شد', usedCalls === 5, usedCalls)
+    check('هیچ Audio ساخته نشد', MockAudio.instances.length === 0, MockAudio.instances.length)
+    check('وضعیت idle است', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+    stopTts()
+  }
 }
 
 if (failed > 0) {

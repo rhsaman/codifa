@@ -789,6 +789,48 @@ def test_edit_file_reflow_single_line(tmp_path):
     assert (tmp_path / "a.py").read_text() == "ALPHA BETA\ngamma\n"
 
 
+@pytest.mark.parametrize(
+    "source,old_string,new_string,expected",
+    [
+        # Single literal: old is the full decoded value (quotes dropped).
+        (
+            'PROMPT = "Follow the search strategy rule above for every task.\\n"\n',
+            "Follow the search strategy rule above for every task.\n",
+            "Follow the updated search strategy rule for every task.\n",
+            'PROMPT = "Follow the updated search strategy rule for every task.\\n"\n',
+        ),
+        # Implicitly-concatenated run: old is the full combined decoded value.
+        (
+            'P = (\n    "Follow the search strategy rule above.\\n"\n    "Use grep for a targeted look.\\n"\n)\n',
+            "Follow the search strategy rule above.\nUse grep for a targeted look.\n",
+            "Follow the updated search strategy rule.\nUse grep for a targeted look.\n",
+            'P = (\n    "Follow the updated search strategy rule.\\nUse grep for a targeted look.\\n"\n)\n',
+        ),
+    ],
+)
+def test_edit_file_decoded_string_literal(tmp_path, source, old_string, new_string, expected):
+    """old_string as the decoded VALUE of a source string literal must match.
+
+    Regression for the recurring failure where the model copies a prompt line's
+    runtime value (quotes dropped, real newlines) from a quoted source string in
+    the file — the byte text differs, so every other tier fails.
+    """
+    (tmp_path / "a.py").write_text(source)
+    res = tools.edit_file(str(tmp_path), "a.py", old_string, new_string)
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == expected
+
+
+def test_edit_file_not_unique_lists_occurrences(tmp_path):
+    """Ambiguous old_string must fail with every occurrence location."""
+    (tmp_path / "a.py").write_text("alpha\nbeta\nalpha\nbeta\nalpha\n")
+    res = tools.edit_file(str(tmp_path), "a.py", "alpha", "ALPHA")
+    assert "error" in res and "not unique (3 occurrences)" in res["error"], res
+    assert "occurrence 1" in res["error"], res
+    assert "occurrence 3" in res["error"], res
+    assert "replace_all=true" in res["error"], res
+
+
 @pytest.mark.asyncio
 async def test_read_batch_partial_failure_footer(tmp_path):
     """رگرسیون «خواندن دسته‌ای خطا داد»: یک فایل خطادار در batch نباید کل

@@ -799,45 +799,17 @@ def save_plan(workspace: str, title: str, content: str, chat_id: str = "") -> No
         )
 
 
-def _most_recent_chat_dir(ws_dir: str) -> str | None:
-    best: tuple[float, str] | None = None
-    try:
-        entries = os.listdir(ws_dir)
-    except OSError:
-        return None
-    for entry in entries:
-        d = os.path.join(ws_dir, entry)
-        if not os.path.isdir(d):
-            continue
-        meta = _read_json(os.path.join(d, "plan.meta.json"))
-        ts = 0.0
-        if isinstance(meta, dict):
-            try:
-                ts = float(meta.get("updated_at") or 0)
-            except (TypeError, ValueError):
-                ts = 0.0
-        if ts <= 0:
-            try:
-                ts = os.path.getmtime(os.path.join(d, "plan.md"))
-            except OSError:
-                ts = 0.0
-        if best is None or ts > best[0]:
-            best = (ts, d)
-    return best[1] if best else None
-
-
 def get_plan(workspace: str, chat_id: str = "") -> dict | None:
     """Return ``{"workspace", "chat_id", "title", "content"}``.
 
-    With an explicit ``chat_id`` reads that chat's plan; with an empty one
-    (legacy callers) returns the most recently updated plan in the workspace.
+    Reads that chat's plan only; with an empty ``chat_id`` returns None
+    (never falls back to another chat's plan).
     """
     with _LOCK:
+        if not (chat_id or "").strip():
+            return None
         ws_dir = os.path.join(plans_dir(), _safe_file(workspace or "workspace", "workspace"))
-        if chat_id:
-            d = os.path.join(ws_dir, _safe_file(chat_id, "default"))
-        else:
-            d = _most_recent_chat_dir(ws_dir) or ""
+        d = os.path.join(ws_dir, _safe_file(chat_id, "default"))
         if not d or not os.path.isfile(os.path.join(d, "plan.md")):
             return None
         meta = _read_json(os.path.join(d, "plan.meta.json")) or {}

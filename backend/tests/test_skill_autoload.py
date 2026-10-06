@@ -58,7 +58,9 @@ def test_skills_catalog_block_content_and_empty(monkeypatch):
     assert skills_catalog_block() == ""
 
 
-def test_skills_catalog_block_truncates_huge_store(monkeypatch):
+def test_skills_catalog_block_never_truncates_huge_store(monkeypatch):
+    """The skills catalog is part of the system prompt: every skill keeps a
+    full line even for a huge store (no truncation, no '+N more' note)."""
     import graph as G
 
     many = [
@@ -66,7 +68,10 @@ def test_skills_catalog_block_truncates_huge_store(monkeypatch):
         for i in range(40)
     ]
     monkeypatch.setattr(G._agents, "_load_skills", lambda _r: many)
-    assert len(skills_catalog_block()) <= 1800
+    block = skills_catalog_block()
+    for i in range(40):
+        assert f"skill-{i}" in block
+    assert "more skills not listed" not in block
 
 
 class _MsgRecordingModel:
@@ -208,8 +213,8 @@ def test_compact_catalog_always_present(monkeypatch):
     assert len(out) <= 900
 
 
-def test_catalog_caps_hold_for_huge_store(monkeypatch):
-    """Full and compact catalogs both respect their total budgets."""
+def test_catalog_lists_every_skill_for_huge_store(monkeypatch):
+    """Full and compact catalogs list every skill with its full description."""
     import graph as G
 
     many = [
@@ -217,9 +222,14 @@ def test_catalog_caps_hold_for_huge_store(monkeypatch):
         for i in range(40)
     ]
     monkeypatch.setattr(G._agents, "_load_skills", lambda _r: many)
-    assert len(G._build_skills_section([], "/x", catalog=True)) <= 2200
-    assert len(G._build_skills_section([], "/x", catalog=True, compact=True)) <= 900
-    assert len(skills_catalog_block()) <= 1800
+    for out in (
+        G._build_skills_section([], "/x", catalog=True),
+        G._build_skills_section([], "/x", catalog=True, compact=True),
+        skills_catalog_block(),
+    ):
+        for i in range(40):
+            assert f"skill-{i}" in out
+        assert "d" * 180 in out
 
 
 def test_load_skill_staged_match_keyword_and_fuzzy():

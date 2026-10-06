@@ -13,6 +13,7 @@ Two bugs were fixed:
 """
 
 import os
+import pathlib
 import sys
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
@@ -20,15 +21,17 @@ for _p in (_THIS, os.path.dirname(_THIS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import agent_registry
 import agents
 
 
-def test_search_rule_makes_broad_exploration_required():
-    """_SEARCH_RULE must instruct broad/multi-file search to use explore."""
+def test_search_rule_reserves_task_for_parallel_work():
+    """_SEARCH_RULE must keep file lookups on grep/glob/read and reserve task for parallel chunks."""
     rule = agents._SEARCH_RULE
     assert "subagent_type='subagent'" in rule
-    assert "BROAD" in rule.upper()
-    # It frames grep/glob/read as the TARGETED path, not the broad one.
+    assert "NEVER delegate file lookups to task" in rule
+    assert "parallelizable implementation chunks" in rule
+    # grep/glob/read stay the file-lookup path, never delegated.
     assert "TARGETED" in rule.upper()
 
 
@@ -97,6 +100,29 @@ def test_coder_prompt_mentions_task_tool():
     assert "task(subagent_type='subagent')" in agents._MODE_CAPS["coder"]
 
 
+def test_coder_prompt_mentions_parallel_implementation():
+    """Coder must delegate parallelizable implementation, not just discovery."""
+    coder = agents.SYSTEM_PROMPTS["coder"]
+    assert "parallelizable" in coder
+    assert "inherit your write/test tools" in coder
+    assert "parallelizable" in agents._MODE_CAPS["coder"]
+
+
+def test_search_rule_forces_parallel_task_spawn():
+    """_SEARCH_RULE must order one task per chunk, not just allow it."""
+    rule = agents._SEARCH_RULE
+    assert "you MUST launch one task per chunk" in rule
+    assert "FILE LOOKUPS (any breadth)" in rule
+
+
+def test_coder_prompt_forces_parallel_task_spawn():
+    """Coder prompt must order parallel task spawn first, not just allow it."""
+    coder = agents.SYSTEM_PROMPTS["coder"]
+    assert "you MUST spawn one task" in coder
+    assert "NEVER edit files you delegated" in coder
+    assert "parallelizable" in agents._MODE_CAPS["coder"]
+
+
 def test_ask_and_plan_prompts_mention_task_tool():
     """Ask/plan prompts must name the task tool so those modes also spawn sub-agents."""
     for mode in ("ask", "plan"):
@@ -106,6 +132,78 @@ def test_ask_and_plan_prompts_mention_task_tool():
         assert "task(subagent_type='subagent')" in agents._MODE_CAPS[mode], (
             f"{mode} caps do not mention the task tool"
         )
+
+
+def test_no_discover_word_in_prompts():
+    """Prompts must not contain the word discovery (token saving)."""
+    for mode, prompt in agents.SYSTEM_PROMPTS.items():
+        assert "discover" not in prompt.lower(), (
+            f"{mode} prompt still contains discover"
+        )
+    for mode, caps in agents._MODE_CAPS.items():
+        assert "discover" not in caps.lower(), (
+            f"{mode} caps still contain discover"
+        )
+    assert "discover" not in agents._DISCOVERY_BLOCK.lower()
+    assert "discover" not in agent_registry.SUBAGENT_SYSTEM.lower()
+    assert "discover" not in agent_registry.SUBAGENT_DESCRIPTION.lower()
+    tools_text = pathlib.Path(__file__).resolve().parent.parent.joinpath("tools.py").read_text(encoding="utf-8")
+    for marker in ("Do your file lookup", "not to search for files"):
+        assert marker in tools_text
+
+
+def test_search_rule_requires_targeted_order():
+    """_SEARCH_RULE must enforce CODE MAP first, scoped grep, symbol read, stop rule."""
+    rule = agents._SEARCH_RULE
+    assert "CODE MAP" in rule
+    assert "SCOPE" in rule
+    assert "symbols=[...]" in rule
+    assert "2-3 search batches" in rule
+    assert "plan's Files" in rule or "plan Files" in rule
+
+
+def test_coder_prompt_requires_targeted_search():
+    """Coder prompt must require CODE MAP first and SCOPE-limited search."""
+    coder = agents.SYSTEM_PROMPTS["coder"]
+    assert "CODE MAP" in coder
+    assert "SCOPE" in coder
+    assert "symbols=[...]" in coder
+    assert "2-3 search batches" in coder
+    assert "whole workspace blindly" in coder
+
+
+def test_graph_pins_scope_for_coder():
+    """graph.py must pin SCOPE and targeted search for the coder turn."""
+    import pathlib
+
+    text = pathlib.Path(__file__).resolve().parent.parent.joinpath("graph.py").read_text(encoding="utf-8")
+    assert "TARGETED SEARCH (CODER)" in text
+    assert "Search ONLY within them" in text
+    assert "CODE MAP" in text
+    assert "2-3 search batches" in text
+
+
+def test_plan_file_paths_extracts_files_line():
+    """Plan Files line must become an enforceable search scope."""
+    history = [
+        {
+            "role": "assistant",
+            "mode": "plan",
+            "content": "## Plan\n- change foo\nFiles: backend/a.py, backend/b.py",
+            "plan": [{"content": "change foo", "status": "pending"}],
+        }
+    ]
+    assert agents._plan_file_paths(history) == ["backend/a.py", "backend/b.py"]
+
+
+def test_tool_docstrings_require_scope():
+    """grep/glob/read docstrings must require SCOPE-limited, CODE MAP-first search."""
+    import pathlib
+
+    text = pathlib.Path(__file__).resolve().parent.parent.joinpath("tools.py").read_text(encoding="utf-8")
+    assert text.count("SCOPE (ONLY THESE FILES)") >= 3
+    assert "CODE MAP first" in text
+    assert "never scan the whole workspace blindly" in text.lower()
 
 
 

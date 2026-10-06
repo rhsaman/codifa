@@ -10,9 +10,11 @@ export interface ParsedSlash {
 
 const HISTORY_KEY = 'coder:promptHistory'
 const PINS_KEY = 'coder:pinnedCommands'
+const COMMAND_USAGE_KEY = 'coder:commandUsage'
 
 export const MAX_HISTORY = 10
 export const MAX_PINS = 3
+export const MAX_COMMAND_USAGE = 20
 
 function storage(): Storage | null {
   try {
@@ -151,6 +153,67 @@ export function togglePin(text: string, prev?: string[]): string[] {
     /* ignore */
   }
   return next
+}
+
+/** Load persisted slash-command usage (bare command names, newest first). */
+export function loadCommandUsage(): string[] {
+  const s = storage()
+  if (!s) return []
+  try {
+    const raw = s.getItem(COMMAND_USAGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return arr
+      .filter((x) => typeof x === 'string')
+      .map((x) => (x as string).trim().toLowerCase().replace(/^\//, ''))
+      .filter((x) => x.length > 0)
+      .slice(0, MAX_COMMAND_USAGE)
+  } catch {
+    return []
+  }
+}
+
+/** Record a slash-command use at the front (dedupe, cap length). Accepts raw
+ *  input ("/compact ..."). Non-slash or bare "/" input leaves the list
+ *  unchanged. Returns the new list. */
+export function recordCommandUsage(input: string, prev?: string[]): string[] {
+  const base = prev ?? loadCommandUsage()
+  if (!isSlashCommand(input)) return base
+  const name = parseSlashInput(input)?.name?.trim().toLowerCase() ?? ''
+  if (!name) return base
+  const next = [name, ...base.filter((x) => x !== name)].slice(0, MAX_COMMAND_USAGE)
+  const s = storage()
+  try {
+    s?.setItem(COMMAND_USAGE_KEY, JSON.stringify(next))
+  } catch {
+    /* ignore */
+  }
+  // Notify every mounted chat panel so its command popup re-sorts immediately.
+  try {
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('coder:command-usage'))
+    }
+  } catch {
+    /* ignore */
+  }
+  return next
+}
+
+/** Sort command rows by recent usage: used commands first (newest use first),
+ *  never-used commands keep their original relative order. Matching stays the
+ *  caller's job — this only reorders. */
+export function sortCommandsByUsage<T extends { name: string }>(commands: T[], usage: string[]): T[] {
+  if (usage.length === 0) return [...commands]
+  const rank = new Map<string, number>()
+  usage.forEach((n, i) => {
+    const key = n.trim().toLowerCase()
+    if (key && !rank.has(key)) rank.set(key, i)
+  })
+  return [...commands]
+    .map((c, idx) => ({ c, idx, r: rank.has(c.name.toLowerCase()) ? (rank.get(c.name.toLowerCase()) as number) : Number.POSITIVE_INFINITY }))
+    .sort((a, b) => (a.r !== b.r ? a.r - b.r : a.idx - b.idx))
+    .map((x) => x.c)
 }
 
 /** Ordered popup rows: pins first (in pin order), then history minus pinned. */

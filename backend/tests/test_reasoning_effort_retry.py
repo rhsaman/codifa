@@ -5,7 +5,11 @@ gateways like agentrouter) and ``_remap_reasoning_effort`` (mapping the user's
 level onto the nearest value the route accepts, parsed from the error text).
 """
 
-from llm import _is_reasoning_effort_error, _remap_reasoning_effort
+from llm import (
+    _is_reasoning_effort_error,
+    _parse_allowed_efforts,
+    _remap_reasoning_effort,
+)
 
 
 class _Fake400(Exception):
@@ -205,3 +209,24 @@ def test_bad_request_prefix_variant_is_parsed():
     model = _FakeModel(effort="max")
     out = _remap_reasoning_effort(model, exc)
     assert out.reasoning_effort == "xhigh"
+
+
+# --- Kimi K3 double-quote thinking_effort= shape ---
+
+KIMI_400 = (
+    "Error code: 400 - {'error': {'message': 'Unsupported Kimi K3 "
+    'thinking_effort="xhigh"; supported values are low, high, and max\', '
+    "'type': 'invalid_request_error', 'param': None, 'code': 400}}"
+)
+
+
+def test_detects_kimi_double_quote_400():
+    assert _is_reasoning_effort_error(_Fake400(KIMI_400))
+
+
+def test_kimi_xhigh_remaps_to_max():
+    # The JSON tail contains 'None' (param) — it must not parse as allowed 'none'.
+    assert _parse_allowed_efforts(_Fake400(KIMI_400)) == {"low", "high", "max"}
+    model = _FakeModel(effort="xhigh")
+    out = _remap_reasoning_effort(model, _Fake400(KIMI_400))
+    assert out.reasoning_effort == "max"

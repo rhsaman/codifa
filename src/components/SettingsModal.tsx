@@ -556,12 +556,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
   const setSttModel = useStore((s) => s.setSttModel)
+  const sttFallbacks = useStore((s) => s.sttFallbacks)
+  const setSttFallbacks = useStore((s) => s.setSttFallbacks)
   const ttsProviderId = useStore((s) => s.ttsProviderId)
   const ttsModel = useStore((s) => s.ttsModel)
   const ttsVoice = useStore((s) => s.ttsVoice)
   const setTtsProviderId = useStore((s) => s.setTtsProviderId)
   const setTtsModel = useStore((s) => s.setTtsModel)
   const setTtsVoice = useStore((s) => s.setTtsVoice)
+  const ttsFallbacks = useStore((s) => s.ttsFallbacks)
+  const setTtsFallbacks = useStore((s) => s.setTtsFallbacks)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
@@ -2302,6 +2306,63 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
                     </>
                   )}
+                  <label className="field-label">STT fallbacks</label>
+                  <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
+                  {sttFallbacks.map((fb, i) => (
+                    <div key={i}>
+                      <select value={fb.providerId} onChange={(e) => {
+                        const next = [...sttFallbacks]
+                        next[i] = { ...next[i], providerId: e.target.value }
+                        setSttFallbacks(next)
+                      }} dir="ltr">
+                        <option value="local">Local Whisper — Offline</option>
+                        {providers.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                          </option>
+                        ))}
+                      </select>
+                      {fb.providerId !== 'local' && (
+                        <input value={fb.model} onChange={(e) => {
+                          const next = [...sttFallbacks]
+                          next[i] = { ...next[i], model: e.target.value }
+                          setSttFallbacks(next)
+                        }} dir="ltr" placeholder="whisper-1" />
+                      )}
+                      <button type="button" className="btn secondary" onClick={() => setSttFallbacks(sttFallbacks.filter((_, j) => j !== i))}>Remove</button>
+                    </div>
+                  ))}
+                  <button type="button" className="btn secondary" onClick={() => setSttFallbacks([...sttFallbacks, { providerId: 'local', model: '' }])}>Add STT fallback</button>
+                  <label className="field-label">TTS fallbacks</label>
+                  <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
+                  {ttsFallbacks.map((fb, i) => (
+                    <div key={i}>
+                      <select value={fb.providerId} onChange={(e) => {
+                        const next = [...ttsFallbacks]
+                        next[i] = { ...next[i], providerId: e.target.value }
+                        setTtsFallbacks(next)
+                      }} dir="ltr">
+                        <option value="">Not selected</option>
+                        {providers.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                          </option>
+                        ))}
+                      </select>
+                      <input value={fb.model} onChange={(e) => {
+                        const next = [...ttsFallbacks]
+                        next[i] = { ...next[i], model: e.target.value }
+                        setTtsFallbacks(next)
+                      }} dir="ltr" placeholder="tts-1" />
+                      <input value={fb.voice} onChange={(e) => {
+                        const next = [...ttsFallbacks]
+                        next[i] = { ...next[i], voice: e.target.value }
+                        setTtsFallbacks(next)
+                      }} dir="ltr" placeholder="alloy" />
+                      <button type="button" className="btn secondary" onClick={() => setTtsFallbacks(ttsFallbacks.filter((_, j) => j !== i))}>Remove</button>
+                    </div>
+                  ))}
+                  <button type="button" className="btn secondary" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>Add TTS fallback</button>
                 </div>
               </div>
             </div>

@@ -160,6 +160,9 @@ export function ReviewPanel(props?: {
   initialRev?: string
   docked?: boolean
   onClose?: () => void
+  /** Owner chat for split panes: the git root follows this chat instead of
+   *  the globally focused chat, so two panes never mirror each other. */
+  chatId?: string
 }) {
   const docked = props?.docked ?? false
   const store = useReviewPanel();
@@ -277,9 +280,11 @@ export function ReviewPanel(props?: {
     [messageId, activities],
   );
 
-  // ریشه‌ی پروژه برای کوئری‌های گیت — از چت فعال.
+  // ریشه‌ی پروژه برای کوئری‌های گیت — در حالت اسپلیت از چت مالک برگه،
+  // وگرنه از چت فعال.
+  const ownerChatId = props?.chatId
   const root = useStore(
-    (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
+    (s) => s.chats.find((c) => c.id === (ownerChatId ?? s.activeChatId))?.root ?? s.root,
   );
   const [gitFiles, setGitFiles] = useState<GitFile[]>([]);
   const [gitLoading, setGitLoading] = useState(false);

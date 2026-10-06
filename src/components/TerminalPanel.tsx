@@ -75,6 +75,7 @@ function xtermTheme(): ITheme {
 
 export function TerminalPanel() {
   const open = useStore((s) => s.terminalPanelOpen)
+  const fullscreen = useStore((s) => s.terminalFullscreen)
   const theme = useStore((s) => s.theme)
   const [tabs, setTabs] = useState<TerminalTab[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -284,7 +285,27 @@ export function TerminalPanel() {
     return () => window.removeEventListener('coder:close-terminal-tab', onCloseTab)
   }, [closeSession])
 
+  // Fullscreen toggle changes geometry while sessions keep running — refit
+  // the active screen so the pty adopts the new size.
+  useEffect(() => {
+    if (!open || !fullscreen) return
+    scheduleFit()
+    const t = window.setTimeout(() => fitActive(activeId), 50)
+    return () => window.clearTimeout(t)
+  }, [fullscreen, open, activeId, scheduleFit, fitActive])
+
+  // Escape exits terminal fullscreen (focus stays in the terminal).
+  useEffect(() => {
+    if (!open || !fullscreen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') useStore.getState().setTerminalFullscreen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, fullscreen])
+
   const startResize = (e: React.MouseEvent) => {
+    if (useStore.getState().terminalFullscreen) return
     e.preventDefault()
     dragRef.current = { startY: e.clientY, startH: height }
     const onMove = (ev: MouseEvent) => {
@@ -339,7 +360,7 @@ export function TerminalPanel() {
         if (ev.type !== 'keydown' || ev.altKey || ev.shiftKey) return true
         const apple = isApplePlatform()
         const reserved = apple ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey
-        if (reserved && (ev.key === 'j' || ev.code === 'KeyJ' || ev.key === 'w' || ev.code === 'KeyW')) return false
+        if (reserved && (ev.key === 'j' || ev.code === 'KeyJ' || ev.key === 'w' || ev.code === 'KeyW' || ev.key === 'm' || ev.code === 'KeyM')) return false
         return true
       })
       entries.current.set(tab.id, { term, fit, el })
@@ -354,7 +375,14 @@ export function TerminalPanel() {
   const toggleLabel = isApplePlatform() ? '⌘J' : 'Ctrl+J'
 
   return (
-    <section className="terminal-panel" data-open={open} dir="ltr" style={{ height }} aria-label="Terminal">
+    <section
+      className={'terminal-panel' + (fullscreen ? ' terminal-full' : '')}
+      data-open={open}
+      data-fullscreen={fullscreen}
+      dir="ltr"
+      style={fullscreen ? undefined : { height }}
+      aria-label="Terminal"
+    >
       <div className="terminal-resize-handle" title="Drag to resize" onMouseDown={startResize} />
       <header className="terminal-tabbar">
         <span className="terminal-title">Terminal</span>
@@ -398,6 +426,23 @@ export function TerminalPanel() {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
               <path d="M12 5v14M5 12h14" />
             </svg>
+          </button>
+          <button
+            className="terminal-action-btn"
+            aria-label={fullscreen ? 'Exit terminal fullscreen (Ctrl+M)' : 'Fullscreen terminal (Ctrl+M)'}
+            title={fullscreen ? 'Exit terminal fullscreen (Ctrl+M)' : 'Fullscreen terminal (Ctrl+M)'}
+            aria-pressed={fullscreen}
+            onClick={() => useStore.getState().toggleTerminalFullscreen()}
+          >
+            {fullscreen ? (
+              <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M4.5 1.5v3.5h-3M4.5 1.5 1.6 4.4M7.5 10.5V7h3M7.5 10.5l2.9-2.9" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M7 1.5h3.5V5M10.5 1.5 7 5M5 10.5H1.5V7M1.5 10.5 5 7" />
+              </svg>
+            )}
           </button>
           <button
             className="terminal-action-btn"

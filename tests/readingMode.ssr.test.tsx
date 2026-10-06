@@ -48,6 +48,12 @@ check('تیتر بخش دوم در فهرست', html.includes('بخش ب'))
 check('متن بخش فعال رندر شده', html.includes('متن الف'))
 check('دکمه سوال حذف شده', !html.includes('Ask about this section'))
 check('کلاس مودال', html.includes('reading-mode'))
+check(
+  'دستگیره درگ داخل پنل است (لبه چپ پنل راست‌چسبیده را دنبال می‌کند)',
+  html.indexOf('reading-mode-scrim') < html.indexOf('reading-mode-panel') &&
+    html.indexOf('reading-mode-panel') < html.indexOf('reading-mode-resize-handle'),
+  html.slice(0, 600),
+)
 
 console.log('3) پیام بدون بخش → null (بدون خطا):')
 try {

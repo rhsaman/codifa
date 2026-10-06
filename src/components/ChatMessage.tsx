@@ -23,7 +23,8 @@ import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
-import { friendlyTtsError, useTtsPlayback } from "../lib/tts";
+import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
+import type { SpeakProviderOpts } from "../lib/api";
 import { useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
@@ -1107,14 +1108,31 @@ function textTabTitle(text: string, fallback: string): string {
 function UserMessageBubble({
   message,
   onRetry,
+  onEdit,
+  editingDisabled,
   className,
 }: {
   message: ChatMessage;
   onRetry?: (id: string) => void;
+  onEdit?: (messageId: string, newText: string) => void;
+  editingDisabled?: boolean;
   className?: string;
 }) {
   const dir = useStore((s) => s.dir);
   const [copied, setCopied] = useState(false);
+  // Inline edit mode: the bubble text swaps for a textarea with Save/Cancel.
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Auto-grow the textarea to fit the draft (up to max-height) so long
+  // messages keep the full bubble size instead of a small scroll box.
+  useEffect(() => {
+    if (!isEditing) return;
+    const el = editInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+  }, [isEditing, draft]);
   const content = message.content || "";
   const isLong =
     content.length > USER_COLLAPSE_CHARS ||
@@ -1134,16 +1152,71 @@ function UserMessageBubble({
     }
   };
 
+  // Enter edit mode with a fresh draft; Save calls onEdit only when the
+  // trimmed text is non-empty and actually changed.
+  const startEdit = () => {
+    if (editingDisabled) return;
+    setDraft(content);
+    setIsEditing(true);
+  };
+  const cancelEdit = () => setIsEditing(false);
+  const saveEdit = () => {
+    const next = draft.trim();
+    if (!next || next === content) {
+      setIsEditing(false);
+      return;
+    }
+    onEdit?.(message.id, next);
+    setIsEditing(false);
+  };
+
   return (
     <>
-      <div className={`msg-bubble${className ? ` ${className}` : ""}`}>
+      <div className={`msg-bubble${className ? ` ${className}` : ""}${isEditing ? " editing" : ""}`}>
+        {isEditing ? (
+          <div className="msg-edit-wrap">
+            <textarea
+              ref={editInputRef}
+              className="msg-edit-input"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") cancelEdit();
+                else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
+              }}
+              dir="auto"
+              rows={4}
+              autoFocus
+            />
+            <div className="msg-edit-actions">
+              <span
+                className="msg-edit-hint"
+                title="Escape cancels, Cmd/Ctrl+Enter saves"
+                aria-hidden="true"
+              >
+                i
+              </span>
+              <button className="msg-edit-cancel" onClick={cancelEdit}>
+                Cancel
+              </button>
+              <button
+                className="msg-edit-save"
+                onClick={saveEdit}
+                disabled={!draft.trim() || draft.trim() === content}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        ) : (
         <div
           className={`chat-message user-text${clamped ? " clamped" : ""}`}
           dir={dir}
         >
           {cachedPrepare(message.id, body, dir) || "(empty)"}
         </div>
-        {isLong && (
+        )}
+        {!isEditing && isLong && (
           <button
             className="msg-expand"
             onClick={() =>
@@ -1182,7 +1255,7 @@ function UserMessageBubble({
           <MessageImages images={message.images} />
         )}
       </div>
-      {message.content && (
+      {message.content && !isEditing && (
         <div className="msg-actions">
           {onRetry && (
             <button
@@ -1202,6 +1275,29 @@ function UserMessageBubble({
               >
                 <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
                 <path d="M3 3v5h5" />
+              </svg>
+            </button>
+          )}
+          {onEdit && !isEditing && (
+            <button
+              className="msg-copy msg-edit"
+              onClick={startEdit}
+              disabled={editingDisabled}
+              title="Edit message"
+              aria-label="Edit message"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                <path d="m15 5 4 4" />
               </svg>
             </button>
           )}
@@ -1308,9 +1404,13 @@ export function QueuedCollapsibleText({
 function SegSteerBubble({
   message,
   onRetry,
+  onEdit,
+  editingDisabled,
 }: {
   message: ChatMessage;
   onRetry?: (id: string) => void;
+  onEdit?: (messageId: string, newText: string) => void;
+  editingDisabled?: boolean;
 }) {
   // Render the EXACT same structure as a standalone user message (role header
   // + bubble + actions) so an interleaved steer is pixel-identical to the
@@ -1335,7 +1435,7 @@ function SegSteerBubble({
         </span>
         You
       </div>
-      <UserMessageBubble message={message} onRetry={onRetry} />
+      <UserMessageBubble message={message} onRetry={onRetry} onEdit={onEdit} editingDisabled={editingDisabled} />
     </div>
   );
 }
@@ -1406,6 +1506,8 @@ function isCaptionCandidate(text: string): boolean {
 export function renderSegments(
   message: ChatMessage,
   onRetry?: (id: string) => void,
+  onEdit?: (messageId: string, newText: string) => void,
+  editingDisabled?: boolean,
 ): ReactNode[] {
   const nodes: ReactNode[] = [];
   let pending: { activity: ToolActivity; index: number }[] = [];
@@ -1576,7 +1678,7 @@ export function renderSegments(
         .find((m) => m.id === seg.id);
       if (steerMsg) {
         nodes.push(
-          <SegSteerBubble key={i} message={steerMsg} onRetry={onRetry} />,
+          <SegSteerBubble key={i} message={steerMsg} onRetry={onRetry} onEdit={onEdit} editingDisabled={editingDisabled} />,
         );
       }
       return;
@@ -1690,9 +1792,13 @@ export const ChatMessageView = memo(
   function ChatMessageView({
     message,
     onRetry,
+    onEdit,
+    editingDisabled,
   }: {
     message: ChatMessage;
     onRetry?: (id: string) => void;
+    onEdit?: (messageId: string, newText: string) => void;
+    editingDisabled?: boolean;
   }) {
   const isUser = message.role === "user";
   const dir = useStore((s) => s.dir);
@@ -1719,24 +1825,46 @@ export const ChatMessageView = memo(
     }
   };
 
-  // تصمیم پلی/استاپ داخل toggle همگام و اتمیک است (نه با ttsStatus ناهمگام) —
-  // کلیک تند هرگز دو پخش همزمان نمی‌سازد. لغو دستی (AbortError) خطا نیست.
+  // تصمیم پلی/پاز داخل toggle همگام و اتمیک است (نه با ttsStatus ناهمگام) —
+  // کلیک تند هرگز دو پخش همزمان نمی‌سازد. حین پخش → pause درجا، حین pause →
+  // resume از همان‌جا (نه از اول)، حین لودینگ → لغو. لغو دستی خطا نیست.
   const toggleSpeak = async () => {
     setTtsError(null);
     const st = useStore.getState();
-    const provider = st.settings.providers.find((p) => p.id === st.ttsProviderId);
-    if (!provider) {
+    const providers = st.settings.providers ?? [];
+    // Build the provider chain: primary first, then ordered fallbacks.
+    const toSpeakOpts = (
+      provider: (typeof providers)[number],
+      model: string | undefined,
+      voice: string | undefined,
+    ): SpeakProviderOpts => ({
+      kind: provider.kind,
+      baseUrl: provider.baseUrl ?? "",
+      apiKeys: [...(provider.apiKeys ?? (provider.apiKey ? [provider.apiKey] : []))],
+      model,
+      voice,
+    });
+    const chain: SpeakProviderOpts[] = [];
+    const primary = providers.find((p) => p.id === st.ttsProviderId);
+    if (primary) chain.push(toSpeakOpts(primary, st.ttsModel, st.ttsVoice));
+    for (const fb of st.ttsFallbacks ?? []) {
+      const p = providers.find((x) => x.id === fb.providerId);
+      if (!p) continue;
+      chain.push(toSpeakOpts(p, fb.model, fb.voice));
+    }
+    if (chain.length === 0) {
       setTtsError("برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید");
       return;
     }
+    // Only the final answer is spoken — the working trace (tool narrations,
+    // status lines) shown mid-run is never read aloud.
+    const speakable = stripBidiMarks(fixZwsp(speakableMessageText(message)));
+    if (!speakable.trim()) {
+      setTtsError("متن قابل خواندنی برای پخش نیست");
+      return;
+    }
     try {
-      await ttsToggle(stripBidiMarks(fixZwsp(message.content)), {
-        kind: provider.kind,
-        baseUrl: provider.baseUrl ?? "",
-        apiKeys: [...(provider.apiKeys ?? (provider.apiKey ? [provider.apiKey] : []))],
-        model: st.ttsModel,
-        voice: st.ttsVoice,
-      });
+      await ttsToggle(speakable, chain);
     } catch (err) {
       const friendly = friendlyTtsError(err);
       if (!friendly) return;
@@ -1925,6 +2053,8 @@ export const ChatMessageView = memo(
             {renderSegments(
               { ...message, segments: displaySegments },
               onRetry,
+              onEdit,
+              editingDisabled,
             )}
           </div>
         ) : isUser && message.steerPending ? (
@@ -1998,7 +2128,7 @@ export const ChatMessageView = memo(
              a Latin word/digit (e.g. "API key رو بده") flipped to LTR and the
              72ch box hugged the LEFT side even in RTL mode. A fixed dir keeps
              the rendered bubble identical to what the user typed. */
-          <UserMessageBubble message={message} onRetry={onRetry} />
+          <UserMessageBubble message={message} onRetry={onRetry} onEdit={onEdit} editingDisabled={editingDisabled} />
         ) : (
           <>
             <div className="msg-bubble">
@@ -2110,23 +2240,63 @@ export const ChatMessageView = memo(
               </button>
               {!isUser && !message.streaming && (
                 <button
-                  className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""}`}
+                  className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""} ${ttsStatus === "paused" ? "paused" : ""}`}
                   onClick={toggleSpeak}
-                  title={ttsError ?? "خواندن با صدا"}
-                  aria-label={ttsStatus === "speaking" ? "Stop" : "Speak"}
+                  title={
+                    ttsError ??
+                    (ttsStatus === "speaking"
+                      ? "توقف موقت"
+                      : ttsStatus === "paused"
+                        ? "ادامه پخش"
+                        : ttsStatus === "loading"
+                          ? "لغو"
+                          : "خواندن با صدا")
+                  }
+                  aria-label={
+                    ttsStatus === "speaking"
+                      ? "Pause"
+                      : ttsStatus === "paused"
+                        ? "Resume"
+                        : ttsStatus === "loading"
+                          ? "Cancel"
+                          : "Speak"
+                  }
                 >
-                  {ttsStatus === "speaking" ? (
+                  {ttsStatus === "loading" ? (
+                    <svg
+                      className="tts-spinner"
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+                    </svg>
+                  ) : ttsStatus === "speaking" ? (
                     <svg
                       width="16"
                       height="16"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
-                      strokeWidth="2"
+                      strokeWidth="3"
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     >
-                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                      <path d="M9 5v14M15 5v14" />
+                    </svg>
+                  ) : ttsStatus === "paused" ? (
+                    <svg
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="currentColor"
+                    >
+                      <path d="M8 5v14l11-7z" />
                     </svg>
                   ) : (
                     <svg
@@ -2263,6 +2433,8 @@ export const ChatMessageView = memo(
   // identical record. Only a real content/state change re-parses markdown.
   (prev, next) => {
     if (prev.onRetry !== next.onRetry) return false;
+    if (prev.onEdit !== next.onEdit) return false;
+    if (prev.editingDisabled !== next.editingDisabled) return false;
     const a = prev.message;
     const b = next.message;
     if (a === b) return true;

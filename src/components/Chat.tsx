@@ -23,6 +23,9 @@ import {
   historyRows,
   historyTitle,
   historyMeta,
+  loadCommandUsage,
+  recordCommandUsage,
+  sortCommandsByUsage,
 } from "../lib/slash";
 import {
   applyToolEvent,
@@ -77,7 +80,7 @@ import {
 } from "../lib/api";
 import { playAlarm } from "../lib/alarm";
 
-import type { SkillRow } from "../lib/api";
+import type { SkillRow, TranscribeProviderOpts } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
 import {
@@ -123,6 +126,7 @@ import {
   formatShortcut,
   navChord,
 } from "../lib/shortcuts";
+import { shouldHandleForChat } from "../lib/chatWindowMeta";
 import type {
   AgentMode,
   ChatMessage,
@@ -150,6 +154,7 @@ import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
+import { isFileDrag } from "../lib/fileDrag";
 import { useViewerTabs } from "../lib/viewerTabs";
 
 // Sentinels the plan-approval card sends as the ask answer — must match
@@ -282,8 +287,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // explicit chatId. Single-window callers omit it and follow the focused
   // (active) chat. Each instance owns its scroll/draft/msgLimit state, so
   // two visible windows keep independent viewports and composers.
-  const storeActiveChatId = useStore((s) => s.activeChatId);
-  const activeChatId = props?.chatId ?? storeActiveChatId;
+  // Focus subscription without re-render storms: explicit multi-window panels
+  // select a constant id plus an isActive boolean, so a focus hop only
+  // re-renders the two affected panels instead of every mounted transcript.
+  // Single-window callers omit chatId and follow the focused chat as before.
+  const activeChatId = useStore((s) => (props?.chatId ? props.chatId : s.activeChatId));
+  const isActive = useStore((s) => (props?.chatId ? s.activeChatId === props.chatId : true));
   const dimmed = props?.dimmed ?? false;
   const chat = useStore((s) => {
     const id = props?.chatId ?? s.activeChatId;
@@ -382,7 +391,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const dir = useStore((s) => s.dir);
   const workspaces = useStore((s) => s.workspaces);
   const settings = useStore((s) => s.settings);
-  const modes = useStore((s) => allModes(s.settings));
+  const modes = useMemo(() => allModes(settings), [settings]);
   const nvimFile = useStore((s) => s.nvimFile);
   const nvimDiags = useStore((s) => s.nvimDiagnostics);
   const nvimDiagCounts = useMemo(() => {
@@ -613,6 +622,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [historyIdx, setHistoryIdx] = useState(0);
   const [promptHistory, setPromptHistory] = useState<string[]>(() => loadHistory());
   const [pinnedCmds, setPinnedCmds] = useState<string[]>(() => loadPins());
+  // Recently used slash commands (bare names, newest first) — drives the
+  // command popup order so the last used command stays on top.
+  const [commandUsage, setCommandUsage] = useState<string[]>(() => loadCommandUsage());
   // Codex-style slash highlight: only the leading "/name" token gets the
   // accent color, args and plain text keep the normal color. A backdrop div
   // mirrors the textarea text (same font/padding/wrap) and paints the token
@@ -633,6 +645,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   }, []);
   const [dragOver, setDragOver] = useState(false);
+  const dragDepth = useRef(0);
   // "+" action menu (files / screenshot / skills / MCP) — the single entry
   // point that keeps the bottom toolbar minimal.
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
@@ -664,6 +677,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [transcribing, setTranscribing] = useState(false);
   const sttProviderId = useStore((s) => s.sttProviderId);
   const sttModel = useStore((s) => s.sttModel);
+  const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
   // Mirror of `recording` so the global keydown handler (which lives in a
@@ -866,8 +880,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const skillNotice = chat?.skillNotice ?? null;
   const stalled = chat?.stalled ?? false;
   /** The Ctrl+X prefix is app-wide (managed in App.tsx), so its hint lives at
-   *  the store root — it survives chat switches too. */
-  const prefixNotice = useStore((s) => s.prefixNotice ?? null);
+   *  the store root — it survives chat switches too. Rendered only in the
+   *  focused panel so one Ctrl+X does not banner every visible window. */
+  const rawPrefixNotice = useStore((s) => s.prefixNotice ?? null);
+  const prefixNotice = rawPrefixNotice && isActive ? rawPrefixNotice : null;
   const thinkingLevel = chat?.thinkingLevel ?? "medium";
   const setThinkingLevel = (lv: ThinkingLevel) => {
     if (chat) useStore.getState().setChatThinkingLevel(chat.id, lv);
@@ -905,8 +921,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // normal (non-thinking) state too.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      if (!recordingRef.current) return;
+      // Per-chat isolation: every mounted ChatPanel listens on document, so
+      // without this guard a Space pressed in ANY chat would stop ALL
+      // recording chats (and swallow the space keystroke).
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       if (
-        recordingRef.current &&
         e.key === " " &&
         !e.shiftKey &&
         !e.metaKey &&
@@ -971,6 +991,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   useEffect(() => {
     const onCmd = (e: Event) => {
+      // Prefix slash commands target the focused chat only — otherwise one
+      // Ctrl+X chord would run the same command in every visible window.
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       const cmd = (e as CustomEvent<string>).detail;
       if (typeof cmd === "string") void handleCommandRef.current(cmd);
     };
@@ -992,6 +1015,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       window.removeEventListener("coder:cmd", onCmd);
       window.removeEventListener("coder:prefix", onPrefix);
     };
+  }, []);
+
+  // Cross-window command-usage sync: another ChatPanel recording a slash
+  // command broadcasts `coder:command-usage`, so this panel's popup order
+  // (filteredCmds via sortCommandsByUsage) stays recent-first everywhere.
+  useEffect(() => {
+    const onUsage = () => setCommandUsage(loadCommandUsage());
+    window.addEventListener("coder:command-usage", onUsage);
+    return () => window.removeEventListener("coder:command-usage", onUsage);
   }, []);
 
   // Close the skills/MCP popup when clicking outside of it.
@@ -1648,15 +1680,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   useEffect(() => {
     const onToggleMode = () => {
+      // Only the focused chat cycles mode — otherwise one Tab/⌘M chord
+      // would flip every visible window.
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       cycleMode(1);
     };
     const onAttachFile = (e: Event) => {
+      // File picker attaches to the focused chat only — without this guard
+      // Ctrl+P in one window appends the file to ALL visible composers.
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       const rel = (e as CustomEvent<{ rel: string }>).detail?.rel;
       if (!rel || !wroot) return;
       setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
       requestAnimationFrame(() => textareaRef.current?.focus());
     };
     const onToggleVoice = () => {
+      // Voice dictation toggles only in the focused chat — otherwise Space
+      // during transcription inserts into every visible composer.
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       toggleRecordingRef.current();
     };
     window.addEventListener("coder:toggle-mode", onToggleMode);
@@ -1676,10 +1717,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const filteredCmds = useMemo(() => {
     if (!cmdOpen) return [];
     const q = cmdQuery.toLowerCase();
-    return COMMANDS.filter(
+    const matched = COMMANDS.filter(
       (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
-    ).slice(0, 10);
-  }, [cmdOpen, cmdQuery]);
+    );
+    // Recently used commands first (newest use on top); never-used keep
+    // their original relative order.
+    return sortCommandsByUsage(matched, commandUsage).slice(0, 10);
+  }, [cmdOpen, cmdQuery, commandUsage]);
 
   const ctxWindow = modelContextWindow(provider, activeModel);
 
@@ -2808,8 +2852,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           });
           // Auto-open the docked Plan viewer tab on create and on every
           // revision so the newest plan replaces the previous one on the right.
+          // Focus the chat that produced the plan: viewer tabs are chat-scoped,
+          // so without focusing the plan tab stays invisible (and the panel
+          // looks empty) while another chat is active.
           try {
             useViewerTabs.getState().openPlan(chat.id);
+            const st = useStore.getState();
+            if (st.activeChatId !== chat.id) st.focusWindow(chat.id);
           } catch {
             // Viewer open must never break the stream.
           }
@@ -3455,6 +3504,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setPromptHistory((prev) => recordHistory(v, prev));
     const parsed = parseSlashInput(v);
     const word = parsed && parsed.name ? `/${parsed.name}` : v.split(/\s+/)[0].toLowerCase();
+    // Track usage only for known commands so typos never pollute the popup order.
+    // Compute from localStorage (the source of truth) instead of inside a
+    // state updater, so the write + cross-window broadcast run exactly once.
+    if (COMMANDS.some((c) => `/${c.name}` === word)) {
+      setCommandUsage(recordCommandUsage(v));
+    }
     switch (word) {
       case "/compact":
         await compactContext();
@@ -3728,6 +3783,45 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [],
   );
 
+  // Edit-and-resubmit: replace a user message's text and regenerate from there.
+  // Cancels any active stream, truncates history up to the edited user message,
+  // then resends the new text with the same attachments (restart=true clears
+  // the backend checkpoint so the turn runs fresh, like regenerate).
+  const handleEditMessage = useCallback(
+    (id: string, newText: string) => {
+      const text = newText.trim();
+      if (!text) return;
+      const originId = chatIdRef.current;
+      const active = useStore.getState().chatAborts[originId];
+      if (active && !active.signal.aborted) {
+        active.abort();
+      }
+      const s = useStore.getState();
+      const ch = s.chats.find((c) => c.id === originId);
+      if (!ch) return;
+      const userMsg = resolveRestartUser(ch.messages, id);
+      if (!userMsg) return;
+      if (!s.truncateTo(userMsg.id)) return;
+      const targetId = ch.id;
+      const atts = userMsg.attachments ?? [];
+      const imgs = userMsg.images ?? [];
+      setTimeout(
+        () => send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
+        0,
+      );
+    },
+    [send],
+  );
+
+  // Stable identity for memoized children, same pattern as onRetry above.
+  const handleEditMessageRef = useRef(handleEditMessage);
+  handleEditMessageRef.current = handleEditMessage;
+
+  const onEdit = useMemo(
+    () => (id: string, newText: string) => handleEditMessageRef.current(id, newText),
+    [],
+  );
+
   const submit = () => {
     const typed = input.trim();
     if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
@@ -3889,16 +3983,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
   };
 
-  const onDragOver = (e: React.DragEvent) => {
+  const hasFileDrag = (e: React.DragEvent) => isFileDrag(e.dataTransfer.types);
+  const onPanelDragEnter = (e: React.DragEvent) => {
+    if (!hasFileDrag(e)) return;
     e.preventDefault();
-    if (e.dataTransfer.types?.includes("Files")) setDragOver(true);
+    dragDepth.current += 1;
+    setDragOver(true);
   };
-  const onDragLeave = (e: React.DragEvent) => {
+  const onPanelDragOver = (e: React.DragEvent) => {
+    if (!hasFileDrag(e)) return;
     e.preventDefault();
-    setDragOver(false);
+    e.dataTransfer.dropEffect = "copy";
+    setDragOver(true);
   };
-  const onDrop = (e: React.DragEvent) => {
+  const onPanelDragLeave = (e: React.DragEvent) => {
+    if (!hasFileDrag(e)) return;
     e.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragOver(false);
+  };
+  const onPanelDrop = (e: React.DragEvent) => {
+    if (!hasFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth.current = 0;
     setDragOver(false);
     const dropped = Array.from(e.dataTransfer.files ?? []);
     for (const f of dropped) {
@@ -4000,23 +4108,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setImages((imgs) => imgs.filter((i) => i.path !== path));
   };
 
-  // Resolve STT provider config + language for the current input.
-  const resolveStt = () => {
+  // Build the STT chain: primary first, then ordered fallbacks.
+  // 'local' means on-device Whisper (undefined opts).
+  const resolveSttChain = (): {
+    lang: string | undefined;
+    chains: (TranscribeProviderOpts | undefined)[];
+  } => {
     const lang =
       dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
-    const sttCfg =
-      sttProviderId === "local"
-        ? undefined
-        : settings.providers.find((p) => p.id === sttProviderId);
-    const opts = sttCfg
-      ? {
-          kind: sttCfg.kind,
-          baseUrl: sttCfg.baseUrl ?? "",
-          apiKeys: [...(sttCfg.apiKeys ?? (sttCfg.apiKey ? [sttCfg.apiKey] : []))],
-          model: sttModel,
-        }
-      : undefined;
-    return { lang, opts };
+    const toTranscribeOpts = (
+      cfg: (typeof settings.providers)[number],
+      model: string | undefined,
+    ): TranscribeProviderOpts => ({
+      kind: cfg.kind,
+      baseUrl: cfg.baseUrl ?? "",
+      apiKeys: [...(cfg.apiKeys ?? (cfg.apiKey ? [cfg.apiKey] : []))],
+      model,
+    });
+    const chains: (TranscribeProviderOpts | undefined)[] = [];
+    if (sttProviderId === "local") {
+      chains.push(undefined);
+    } else {
+      const sttCfg = settings.providers.find((p) => p.id === sttProviderId);
+      chains.push(sttCfg ? toTranscribeOpts(sttCfg, sttModel) : undefined);
+    }
+    for (const fb of sttFallbacks ?? []) {
+      if (fb.providerId === "local") {
+        chains.push(undefined);
+        continue;
+      }
+      const cfg = settings.providers.find((p) => p.id === fb.providerId);
+      if (!cfg) continue;
+      chains.push(toTranscribeOpts(cfg, fb.model));
+    }
+    return { lang, chains };
   };
 
   const startRecording = async () => {
@@ -4055,13 +4180,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         setTranscribing(true);
         try {
-          const { lang, opts } = resolveStt();
+          const { lang, chains } = resolveSttChain();
           console.debug("[voice] transcribing", {
             mime: blob.type,
             bytes: blob.size,
             lang,
           });
-          const text = await transcribeAudio(blob, setTranscribing, lang, opts);
+          // Try each STT target in order; first success wins.
+          let text = "";
+          let lastError: unknown = null;
+          for (const opts of chains) {
+            try {
+              text = await transcribeAudio(blob, setTranscribing, lang, opts);
+              lastError = null;
+              break;
+            } catch (e) {
+              lastError = e;
+            }
+          }
+          if (lastError) throw lastError;
           const finalText = (text ?? "").trim();
           if (finalText) {
             setInput((prev) => (prev ? prev.trimEnd() + " " + finalText : finalText));
@@ -4119,6 +4256,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const pos = at ?? el.selectionStart;
     const prevChar = pos > 0 ? input[pos - 1] : "";
     if (prevChar && !/\s/.test(prevChar)) return;
+    // Fresh usage on every open so the order is always recent-first.
+    setCommandUsage(loadCommandUsage());
     setCmdOpen({ at: pos });
     setSkillMention(null);
     setCmdQuery("");
@@ -4598,13 +4737,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const isFocused = !dimmed;
   return (
     <div
-      className={"chat-panel" + (dimmed ? " chat-window-dimmed" : "")}
+      className={"chat-panel" + (dimmed ? " chat-window-dimmed" : "") + (dragOver ? " file-dragover" : "")}
       data-chat-id={chat?.id ?? activeChatId}
       data-focused={isFocused ? "true" : "false"}
       onPointerDown={() => {
         const id = chat?.id ?? (props?.chatId ?? null);
         if (id && useStore.getState().activeChatId !== id) useStore.getState().focusWindow(id);
       }}
+      onDragEnter={onPanelDragEnter}
+      onDragOver={onPanelDragOver}
+      onDragLeave={onPanelDragLeave}
+      onDrop={onPanelDrop}
     >
       {titlebarEl && toolbar ? (isFocused ? createPortal(toolbar, titlebarEl) : toolbar) : toolbar}
       {titlebarRightEl && isFocused && createPortal(balanceChip, titlebarRightEl)}
@@ -4688,7 +4831,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {windowed
                   .map((m: ChatMessage) => (
                     <Fragment key={m.id}>
-                      <ChatMessageView message={m} onRetry={onRetry} />
+                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} />
                       {/* Newer messages render tool cards inline via `segments`; only
                         older persisted messages without segments keep the stacked
                         timeline below the bubble. */}
@@ -4801,17 +4944,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   {q.images && q.images.length > 0 && (
                     <MessageImages images={q.images} />
                   )}
-                  {((q.skills && q.skills.length > 0) ||
-                    (q.mcpServers && Object.keys(q.mcpServers).length > 0)) && (
+                  {q.skills && q.skills.length > 0 && (
                     <div className="msg-attachments" dir="ltr">
                       {(q.skills ?? []).map((sk) => (
                         <span className="attachment-chip" key={`skill-${sk}`}>
                           @{sk}
-                        </span>
-                      ))}
-                      {Object.keys(q.mcpServers ?? {}).map((n) => (
-                        <span className="attachment-chip" key={`mcp-${n}`}>
-                          MCP {n}
                         </span>
                       ))}
                     </div>
@@ -5000,13 +5137,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         </div>
         </div>
 
-      <div
-        ref={composerRef}
-        className={`composer${dragOver ? " dragover" : ""}`}
-        onDragOver={onDragOver}
-        onDragLeave={onDragLeave}
-        onDrop={onDrop}
-      >
+      <div ref={composerRef} className="composer">
         {showJump && (
           <button
             type="button"
@@ -6448,10 +6579,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </span>
                 )}
             </span>
-            <ProviderModelSelect />
+            <ProviderModelSelect chatId={chat?.id ?? activeChatId} />
           </span>
         </div>
       </div>
+      {dragOver && (
+        <div className="chat-drop-overlay" aria-hidden="true">
+          <span>Drop to attach to input</span>
+        </div>
+      )}
     </div>
   );
 }

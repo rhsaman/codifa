@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
 import { useStore } from './store'
+import type { ChatDropPos, ChatTreeNode } from './chatTree'
+import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, loadChatTree as loadPersistedViewerTreeRaw, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
 export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text'
 
@@ -114,6 +116,20 @@ interface ViewerTabsState {
   reopenClosedViewerTab: (id: string) => void
   /** VSCode-style drag reorder: move the dragged tab to the drop position. */
   moveViewerTab: (fromId: string, toId: string, after?: boolean) => void
+  /** Multi-window split tree for the right panel (VSCode-like). Each leaf
+   *  holds one viewer tab id (stored in the leaf `chatId` field). Single leaf
+   *  = classic single-pane behavior; multiple leaves = split panes with
+   *  independent content, drag-split, resize and click-focus. */
+  viewerTree: ChatTreeNode | null
+  /** Focused viewer window (leaf tab id). Mirrors activeId in single mode. */
+  focusedViewerId: string | null
+  ensureViewerTree: () => void
+  openViewerInWindow: (id: string) => void
+  dropViewerOnto: (dragId: string, targetId: string, pos: ChatDropPos) => void
+  closeViewerWindow: (id: string) => void
+  focusViewerWindow: (id: string) => void
+  resizeViewerPair: (parentId: string, firstId: string, secondId: string, firstSize: number, secondSize: number) => void
+  setViewerTreeNodeSize: (nodeId: string, size: number) => void
   /** Fullscreen toggle for the side-by-side viewer group (hides the chat
    *  group). Per-tab header buttons flip this; persisted across restarts. */
   fullscreen: boolean
@@ -277,9 +293,46 @@ function persistPanelMode(v: boolean) {
   }
 }
 
+const VIEWER_TREE_KEY = 'coder:viewerTree'
+const VIEWER_WINDOW_MAX = 4
+
+function loadViewerTree(): ChatTreeNode | null {
+  try {
+    const raw = localStorage.getItem(VIEWER_TREE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as ChatTreeNode | null
+    if (!parsed || typeof parsed !== 'object') return null
+    if (parsed.kind !== 'leaf' && parsed.kind !== 'split') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function persistViewerTree(tree: ChatTreeNode | null): void {
+  try {
+    if (!tree) localStorage.removeItem(VIEWER_TREE_KEY)
+    else localStorage.setItem(VIEWER_TREE_KEY, JSON.stringify(tree))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const initialViewerTree = (() => {
+  if (typeof window === 'undefined') return null
+  const valid = new Set(initial.tabs.map((t) => t.id))
+  const norm = normalizeViewerTreeRaw(loadViewerTree(), valid)
+  if (norm) return norm
+  if (initial.tabs.length === 0) return null
+  const id = initial.activeId && valid.has(initial.activeId) ? initial.activeId : initial.tabs[0]?.id
+  return id ? buildViewerTree([id], 'row') : null
+})()
+
 export const useViewerTabs = create<ViewerTabsState>((set) => ({
   tabs: initial.tabs,
   activeId: initial.activeId,
+  viewerTree: initialViewerTree,
+  focusedViewerId: initial.activeId,
   lastActiveByChat: {},
   closedTabs: initial.closed,
   fullscreen: typeof window !== 'undefined' ? loadFullscreen() : false,
@@ -322,6 +375,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   openReview: (messageId, path, chatId) =>
     set((s) => {
       // One diff tab per chat: reopening a diff updates it in place.
+      // User-gesture open: show the pane. Automatic (stream-driven) opens
+      // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const cid = chatId ?? currentChatId()
       const id = viewerTabId('review', cid)
       const tab: ViewerTab = {
@@ -331,7 +386,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         title: 'Git',
         reviewMessageId: messageId,
         reviewPath: path,
-        reviewSource: 'turn',
+        reviewSource: 'turn', 
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id)
@@ -345,6 +400,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   openGitDiff: (chatId) =>
     set((s) => {
       // One diff tab per chat: the uncommitted view replaces it in place.
+      // User-gesture open: show the pane. Automatic (stream-driven) opens
+      // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const cid = chatId ?? currentChatId()
       const id = viewerTabId('review', cid)
       const tab: ViewerTab = {
@@ -367,6 +424,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   openTraces: (chatId, tab, taskId, title) =>
     set((s) => {
       // One trace tab per chat; each sub-agent gets its own filtered tab.
+      // User-gesture open: show the pane. Automatic (stream-driven) opens
+      // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const cid = chatId ?? currentChatId()
       const tid = (taskId ?? '').trim()
       const id = tid ? `trace:${cid}:${tid}` : viewerTabId('trace', cid)
@@ -410,6 +469,8 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      // User-gesture open: show the pane. Automatic (stream-driven) opens
+      // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
       persist(next.tabs, next.activeId)
       // Pre-open the inbox flag BEFORE the docked pane mounts: its content
@@ -521,7 +582,25 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       if (removed.chatId && lastActiveByChat[removed.chatId] === id) {
         delete lastActiveByChat[removed.chatId]
       }
-      return { tabs, activeId, closedTabs, lastActiveByChat }
+      // Prune the split tree so closed tabs never linger as empty panes.
+      let viewerTree = s.viewerTree
+      let focusedViewerId = s.focusedViewerId
+      if (viewerTree && viewerTreeContains(viewerTree, id)) {
+        const valid = new Set(tabs.map((t) => t.id))
+        viewerTree = normalizeViewerTreeRaw(removeViewerLeaf(viewerTree, id), valid)
+        if (!viewerTree && tabs.length > 0) {
+          const fallback = activeId && valid.has(activeId) ? activeId : tabs[0]?.id
+          viewerTree = fallback ? buildViewerTree([fallback], 'row') : null
+        }
+        persistViewerTree(viewerTree)
+        const ids = viewerTree ? collectViewerTabIds(viewerTree) : []
+        if (focusedViewerId === id || (focusedViewerId && !ids.includes(focusedViewerId))) {
+          focusedViewerId = activeId ?? ids[0] ?? null
+        }
+      } else if (focusedViewerId === id) {
+        focusedViewerId = activeId
+      }
+      return { tabs, activeId, closedTabs, lastActiveByChat, viewerTree, focusedViewerId }
     }),
   setActiveViewer: (id) =>
     set((s) => {
@@ -531,7 +610,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const lastActiveByChat = tab.chatId
         ? { ...s.lastActiveByChat, [tab.chatId]: id }
         : s.lastActiveByChat
-      return { activeId: id, panelMode: false, lastActiveByChat }
+      // Single-pane focus follows the active tab; split focus stays until clicked.
+      const focusedViewerId = s.viewerTree && viewerLeafCount(s.viewerTree) > 1 ? s.focusedViewerId : id
+      return { activeId: id, panelMode: false, lastActiveByChat, focusedViewerId }
     }),
   reopenClosedViewerTab: (id) =>
     set((s) => {
@@ -572,6 +653,103 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ? { ...s.lastActiveByChat, [moved.chatId]: fromId }
         : s.lastActiveByChat
       return { tabs, activeId: fromId, lastActiveByChat }
+    }),
+  ensureViewerTree: () =>
+    set((s) => {
+      const valid = new Set(s.tabs.map((t) => t.id))
+      let tree = s.viewerTree ? normalizeViewerTreeRaw(s.viewerTree, valid) : null
+      if (!tree) {
+        if (s.tabs.length === 0) {
+          if (s.viewerTree !== null || s.focusedViewerId !== null) {
+            persistViewerTree(null)
+            return { viewerTree: null, focusedViewerId: null }
+          }
+          return {}
+        }
+        const id = s.activeId && valid.has(s.activeId) ? s.activeId : s.tabs[0].id
+        tree = buildViewerTree([id], 'row')
+      }
+      persistViewerTree(tree)
+      const ids = collectViewerTabIds(tree)
+      const focusedViewerId = s.focusedViewerId && ids.includes(s.focusedViewerId)
+        ? s.focusedViewerId
+        : (s.activeId && ids.includes(s.activeId) ? s.activeId : (ids[0] ?? null))
+      if (tree === s.viewerTree && focusedViewerId === s.focusedViewerId) return {}
+      return { viewerTree: tree, focusedViewerId }
+    }),
+  openViewerInWindow: (id) =>
+    set((s) => {
+      if (!s.tabs.some((t) => t.id === id)) return {}
+      let tree = s.viewerTree ?? (s.activeId ? buildViewerTree([s.activeId], 'row') : null)
+      if (!tree) tree = buildViewerTree([id], 'row')
+      else if (!viewerTreeContains(tree, id)) {
+        if (viewerLeafCount(tree) >= VIEWER_WINDOW_MAX) {
+          persist(s.tabs, id, s.closedTabs)
+          return { activeId: id, focusedViewerId: id }
+        }
+        tree = appendViewerLeaf(tree, id, 'row')
+      }
+      persistViewerTree(tree)
+      persist(s.tabs, id, s.closedTabs)
+      return { viewerTree: tree, activeId: id, focusedViewerId: id, paneOpen: true, panelMode: false }
+    }),
+  dropViewerOnto: (dragId, targetId, pos) =>
+    set((s) => {
+      if (!dragId || !targetId || dragId === targetId) return {}
+      if (!s.tabs.some((t) => t.id === dragId) || !s.tabs.some((t) => t.id === targetId)) return {}
+      const base = s.viewerTree ?? buildViewerTree([targetId], 'row')
+      if (!base) return {}
+      if (!viewerTreeContains(base, dragId) && viewerLeafCount(base) >= VIEWER_WINDOW_MAX) {
+        persist(s.tabs, s.activeId, s.closedTabs)
+        return { activeId: targetId, focusedViewerId: targetId }
+      }
+      const tree = dropViewerOnto(base, dragId, targetId, pos)
+      if (!tree) return {}
+      persistViewerTree(tree)
+      persist(s.tabs, dragId, s.closedTabs)
+      return { viewerTree: tree, activeId: dragId, focusedViewerId: dragId, paneOpen: true, panelMode: false }
+    }),
+  closeViewerWindow: (id) =>
+    set((s) => {
+      if (!s.viewerTree || !viewerTreeContains(s.viewerTree, id)) return {}
+      const ids = collectViewerTabIds(s.viewerTree)
+      if (ids.length <= 1) return {}
+      const idx = ids.indexOf(id)
+      const valid = new Set(s.tabs.map((t) => t.id))
+      const tree = normalizeViewerTreeRaw(removeViewerLeaf(s.viewerTree, id), valid)
+        ?? buildViewerTree(ids.filter((x) => x !== id), 'row')
+      persistViewerTree(tree)
+      const nextIds = collectViewerTabIds(tree)
+      const fallback = nextIds[Math.min(Math.max(idx, 0), nextIds.length - 1)] ?? nextIds[0] ?? s.activeId
+      persist(s.tabs, fallback, s.closedTabs)
+      return { viewerTree: tree, activeId: fallback, focusedViewerId: fallback }
+    }),
+  focusViewerWindow: (id) =>
+    set((s) => {
+      if (!s.tabs.some((t) => t.id === id)) return {}
+      if (s.focusedViewerId === id && s.activeId === id) return {}
+      const tab = s.tabs.find((t) => t.id === id)
+      persist(s.tabs, id, s.closedTabs)
+      const lastActiveByChat = tab?.chatId
+        ? { ...s.lastActiveByChat, [tab.chatId]: id }
+        : s.lastActiveByChat
+      return { activeId: id, focusedViewerId: id, panelMode: false, lastActiveByChat }
+    }),
+  resizeViewerPair: (parentId, firstId, secondId, firstSize, secondSize) =>
+    set((s) => {
+      if (!s.viewerTree) return {}
+      const tree = resizeViewerPairRaw(s.viewerTree, parentId, firstId, secondId, firstSize, secondSize)
+      if (!tree || tree === s.viewerTree) return {}
+      persistViewerTree(tree)
+      return { viewerTree: tree }
+    }),
+  setViewerTreeNodeSize: (nodeId, size) =>
+    set((s) => {
+      if (!s.viewerTree) return {}
+      const tree = setViewerNodeSizeRaw(s.viewerTree, nodeId, size)
+      if (!tree || tree === s.viewerTree) return {}
+      persistViewerTree(tree)
+      return { viewerTree: tree }
     }),
 }))
 
@@ -615,7 +793,7 @@ export function loadSplitWidth(fallbackRatio = 0.5): number {
   })()
   const fallback = Math.round(vw * fallbackRatio)
   const n = Number.isFinite(saved) ? saved : fallback
-  return Math.max(320, Math.min(vw - 320, n))
+  return clampSplitWidth(n, vw)
 }
 
 export function persistSplitWidth(w: number) {
@@ -628,5 +806,7 @@ export function persistSplitWidth(w: number) {
 
 export function clampSplitWidth(w: number, vw?: number): number {
   const width = typeof vw === 'number' && Number.isFinite(vw) ? vw : typeof window !== 'undefined' ? window.innerWidth : 1024
-  return Math.max(320, Math.min(width - 320, w))
+  // Drag caps at half the viewport so chats keep at least half; fullscreen bypasses this via CSS.
+  const max = Math.min(width / 2, width - 320)
+  return Math.max(320, Math.min(max, w))
 }

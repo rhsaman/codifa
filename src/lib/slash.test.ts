@@ -12,6 +12,9 @@ import {
   historyRows,
   historyTitle,
   historyMeta,
+  recordCommandUsage,
+  loadCommandUsage,
+  sortCommandsByUsage,
   MAX_HISTORY,
   MAX_PINS,
 } from "./slash"
@@ -111,6 +114,59 @@ console.log("8) slashTokenRange (composer token highlight):")
   )
   check("plain text is null", slashTokenRange("hello") === null)
   check("bare slash is null", slashTokenRange("/") === null)
+}
+
+console.log("9) recordCommandUsage + sortCommandsByUsage (recent-first popup):")
+{
+  let u: string[] = []
+  u = recordCommandUsage("/compact", u)
+  u = recordCommandUsage("/undo", u)
+  u = recordCommandUsage("/compact extra args", u)
+  check("last used moves to front", u[0] === "compact" && u[1] === "undo", u)
+  check("args stripped to bare name", !u.some((x) => x.includes(" ")), u)
+  const before = [...u]
+  u = recordCommandUsage("plain text", u)
+  check("non-slash ignored", JSON.stringify(u) === JSON.stringify(before), u)
+  u = recordCommandUsage("/", u)
+  check("bare slash ignored", JSON.stringify(u) === JSON.stringify(before), u)
+  const cmds = [{ name: "help" }, { name: "compact" }, { name: "undo" }, { name: "clear" }]
+  const sorted = sortCommandsByUsage(cmds, ["undo", "compact"])
+  check(
+    "used first newest-first",
+    sorted[0].name === "undo" && sorted[1].name === "compact",
+    sorted.map((c) => c.name),
+  )
+  check(
+    "unused keep original order",
+    sorted[2].name === "help" && sorted[3].name === "clear",
+    sorted.map((c) => c.name),
+  )
+  check("empty usage keeps order", JSON.stringify(sortCommandsByUsage(cmds, [])) === JSON.stringify(cmds))
+}
+
+console.log("10) command usage persists across popup opens (storage round-trip):")
+{
+  const store: Record<string, string> = {}
+  const stub = {
+    getItem: (k: string) => (k in store ? store[k] : null),
+    setItem: (k: string, v: string) => { store[k] = String(v) },
+    removeItem: (k: string) => { delete store[k] },
+  }
+  const g = globalThis as Record<string, unknown>
+  const prevStorage = g.localStorage
+  g.localStorage = stub
+  try {
+    recordCommandUsage("/compact")
+    recordCommandUsage("/undo")
+    const loaded = loadCommandUsage()
+    check("storage keeps newest first", loaded[0] === "undo" && loaded[1] === "compact", loaded)
+    const cmds = [{ name: "help" }, { name: "compact" }, { name: "undo" }]
+    const sorted = sortCommandsByUsage(cmds, loaded)
+    check("reopened popup sorts recent first", sorted[0].name === "undo" && sorted[1].name === "compact", sorted.map((c) => c.name))
+  } finally {
+    if (prevStorage === undefined) delete g.localStorage
+    else g.localStorage = prevStorage
+  }
 }
 
 if (failed > 0) {

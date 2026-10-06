@@ -129,6 +129,27 @@ def test_provider_slash_model_strips_prefix():
     assert _name(result) == "gemma-4-E2B-it-Q4_K_M.gguf"
 
 
+def test_subagent_inherits_parent_thinking_level():
+    # The parent thinking level flows into sub-agent models: high stays high,
+    # and changing the parent to medium moves sub-agents to medium too.
+    for level in ("high", "medium"):
+        resolved = resolve_subagent_model(
+            "openrouter", "", BASE, KEY, ENV, "main-model",
+            thinking_level=level,
+        )
+        assert resolved is not None
+        assert getattr(resolved, "reasoning_effort", None) == level
+
+
+def test_subagent_empty_thinking_level_sends_no_effort():
+    resolved = resolve_subagent_model(
+        "openrouter", "", BASE, KEY, ENV, "main-model",
+        thinking_level="",
+    )
+    assert resolved is not None
+    assert getattr(resolved, "reasoning_effort", None) is None
+
+
 def test_cross_provider_routing():
     # A "providerId/model" entry whose head matches a SAVED provider row must
     # be routed to that provider's OWN base URL / key -- not dumped onto the

@@ -73,6 +73,58 @@ def test_terminal_state_completed_for_status_check_and_full_plan():
     )
 
 
+def test_empty_chat_id_never_loads_other_chat_plan():
+    import agents as agents_mod
+
+    assert agents_mod._load_saved_plan("/tmp", chat_id="") == ""
+    assert agents_mod._load_saved_plan("/tmp", chat_id="   ") == ""
+
+
+def test_get_plan_without_chat_id_returns_none(tmp_path, monkeypatch):
+    import state_db
+
+    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path))
+    state_db.save_plan("ws1", "plan", "## Plan\nstep", chat_id="chat-1")
+    assert state_db.get_plan("ws1", chat_id="") is None
+    got = state_db.get_plan("ws1", chat_id="chat-1")
+    assert got is not None and "step" in got["content"]
+    assert state_db.get_plan("ws1", chat_id="chat-other") is None
+
+
+def test_plan_reuse_skips_unrelated_task():
+    import agents as agents_mod
+
+    history = [
+        {
+            "role": "assistant",
+            "mode": "plan",
+            "content": "## Plan\n1. multi-window chat grid",
+            "plan": [{"content": "multi-window chat grid layout", "status": "pending"}],
+        }
+    ]
+    assert agents_mod._plan_reuse_note(history, "multi-window chat grid") != ""
+    assert agents_mod._plan_reuse_note(history, "fix login crash on submit") == ""
+
+
+def test_saved_plan_skips_unrelated_task(tmp_path, monkeypatch):
+    import agents as agents_mod
+    import state_db
+
+    monkeypatch.setattr(state_db, "plans_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(state_db, "workspace_slug_for_root", lambda root: "ws1")
+    state_db.save_plan("ws1", "plan", "## Plan\nmulti-window chat grid", chat_id="chat-1")
+    assert agents_mod._load_saved_plan("ws1", chat_id="chat-1", prompt="multi-window chat") != ""
+    assert agents_mod._load_saved_plan("ws1", chat_id="chat-1", prompt="fix login crash") == ""
+
+
+def test_split_plan_reply_keeps_last_plan_document():
+    from graph import _split_plan_reply
+
+    _, body = _split_plan_reply("## Plan\n1. stale step\n## Plan\n1. fresh step")
+    assert "fresh step" in body
+    assert "stale step" not in body
+
+
 def test_prune_keeps_previous_turn_evidence(monkeypatch):
     import agents as agents_mod
 

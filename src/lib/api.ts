@@ -1203,6 +1203,7 @@ export interface SkillRow {
   description: string
   path: string
   content: string
+  files?: string[]
 }
 
 export interface SkillSyncResult {
@@ -1231,6 +1232,20 @@ export async function listSkills(): Promise<SkillRow[]> {
   } catch (err) {
     console.error('[skills] listSkills: fetch failed', err)
     return []
+  }
+}
+
+/** Fetch one extra (Codex-style) file of a skill. Null when missing. */
+export async function getSkillFile(name: string, file: string): Promise<string | null> {
+  const url = await ensureSidecar()
+  if (!url) return null
+  try {
+    const res = await fetch(`${url}/skills/file?name=${encodeURIComponent(name)}&file=${encodeURIComponent(file)}`)
+    if (!res.ok) return null
+    const data = (await res.json()) as { content?: string }
+    return typeof data.content === 'string' ? data.content : null
+  } catch {
+    return null
   }
 }
 
@@ -1278,6 +1293,8 @@ export async function syncSkill(params: {
   content?: string
   description?: string
   delete?: boolean
+  files?: Record<string, string>
+  deletedFiles?: string[]
 }): Promise<SkillSyncResult> {
   const url = await ensureSidecar()
   if (!url) return { ok: false, note: "Python agent not ready" }
@@ -1291,6 +1308,14 @@ export async function syncSkill(params: {
         content: params.content ?? "",
         description: params.description ?? "",
         delete: params.delete ?? false,
+        // Multi-file (Codex-style) skills: extra file contents to upsert.
+        // Omitted when undefined so single-file skills are unaffected.
+        // Send both spellings for backend compatibility.
+        ...(params.files !== undefined ? { extra_files: params.files, files: params.files } : {}),
+        // Deleted extra files. Send both spellings for backend compatibility.
+        ...(params.deletedFiles !== undefined && params.deletedFiles.length > 0
+          ? { deleted_files: params.deletedFiles, deletedFiles: params.deletedFiles }
+          : {}),
       }),
     })
     if (!res.ok) {
@@ -1632,6 +1657,33 @@ export async function gitCheckout(
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
     if (!res.ok) return { error: (body.detail as string) || `checkout failed (${res.status})` }
     return body as unknown as { current: string }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+export interface GitPushResult {
+  pushed: boolean
+  branch?: string
+  remote?: string
+  output?: string
+}
+
+/** Push the current branch to its upstream (defaults to origin). */
+export async function gitPush(
+  root: string,
+): Promise<GitPushResult | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "Python agent not ready" }
+  try {
+    const res = await fetch(`${url}/git/push`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root }),
+    })
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok) return { error: (body.detail as string) || `push failed (${res.status})` }
+    return body as unknown as GitPushResult
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }

@@ -494,6 +494,44 @@ def _docx_edit(
     return f"edited {path}: " + ", ".join(parts)
 
 
+def _coerce_bold(value: Any) -> bool | None:
+    """Coerce an LLM-provided bold flag to bool/None.
+
+    The model sometimes sends 'true'/'True' strings instead of JSON booleans;
+    without this python-docx raises TypeError and the style call fails.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("", "none", "null"):
+            return None
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+    raise DocError(f"invalid bold {value!r} — use true or false")
+
+
+def _coerce_size(value: Any) -> float:
+    """Coerce an LLM-provided size to float (accepts numeric strings)."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return 0
+        try:
+            return float(v)
+        except ValueError:
+            raise DocError(f"invalid size {value!r} — use a number like 12") from None
+    raise DocError(f"invalid size {value!r} — use a number like 12")
+
+
 def _apply_run_font(run: Any, font: str, size: float, bold: bool | None, color: str) -> None:
     """Apply font family / size / bold / color to one docx run.
 
@@ -501,6 +539,9 @@ def _apply_run_font(run: Any, font: str, size: float, bold: bool | None, color: 
     slots — Word renders Persian/Arabic text from the cs slot, so without it a
     "change the font" request silently does nothing on RTL text.
     """
+    bold = _coerce_bold(bold)
+    size = _coerce_size(size)
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Pt, RGBColor
 
@@ -512,8 +553,27 @@ def _apply_run_font(run: Any, font: str, size: float, bold: bool | None, color: 
         r_fonts.set(qn("w:eastAsia"), font)
     if size:
         run.font.size = Pt(size)
+        # Word renders RTL text from w:szCs while the HTML preview reads
+        # w:sz, so mirror the size into both slots.
+        r_pr = run._element.get_or_add_rPr()
+        sz_cs = r_pr.find(qn("w:szCs"))
+        if sz_cs is None:
+            sz_cs = OxmlElement("w:szCs")
+            r_pr.append(sz_cs)
+        sz_cs.set(qn("w:val"), str(round(float(size) * 2)))
     if bold is not None:
         run.font.bold = bold
+        # Same split for bold: preview reads w:b, Word RTL reads w:bCs.
+        r_pr = run._element.get_or_add_rPr()
+        b_cs = r_pr.find(qn("w:bCs"))
+        if b_cs is None:
+            b_cs = OxmlElement("w:bCs")
+            r_pr.append(b_cs)
+        if bold:
+            if b_cs.get(qn("w:val")) is not None:
+                del b_cs.attrib[qn("w:val")]
+        else:
+            b_cs.set(qn("w:val"), "false")
     if color:
         run.font.color.rgb = RGBColor.from_string(color)
 
@@ -528,6 +588,8 @@ def _docx_style(
 ) -> str:
     from docx import Document
 
+    bold = _coerce_bold(bold)
+    size = _coerce_size(size)
     _check_size(path)
     if not font and not size and bold is None and not color:
         raise DocError(
@@ -935,6 +997,8 @@ def _xlsx_style(
     import openpyxl
     from openpyxl.styles import Font
 
+    bold = _coerce_bold(bold)
+    size = _coerce_size(size)
     _check_size(path)
     if not font and not size and bold is None and not color:
         raise DocError(
@@ -1382,6 +1446,8 @@ def style_document(
     rng: str = "",
 ) -> str:
     """Apply font / size / bold / color to an existing document."""
+    bold = _coerce_bold(bold)
+    size = _coerce_size(size)
     ext = _ext(path)
     if ext == ".docx":
         return _docx_style(

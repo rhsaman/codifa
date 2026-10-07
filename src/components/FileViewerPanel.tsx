@@ -5,7 +5,7 @@ import { readDocumentText } from "../lib/api";
 import { commentFileSelection } from "../lib/fileComments";
 import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
-import { IMAGE_EXTS, extOf, fileBasename } from "../lib/fileTypes";
+import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
 import { FileChip, FileIcon } from "./FileIcon";
 import { getHighlightedLines } from "./ChatMessage";
 
@@ -16,7 +16,7 @@ const FILE_RENDER_CAP = 400_000;
 /** "Open in" destinations. All of them first try a running Neovim instance;
  *  the terminal entries then launch nvim inside that terminal (Warp's URI
  *  scheme cannot run a command, so it opens a tab at the file's folder). */
-type OpenTargetId = "nvim" | "vscode" | "cmux" | "ghostty" | "warp";
+type OpenTargetId = "nvim" | "vscode" | "cmux" | "ghostty" | "warp" | "default";
 
 const OPEN_TARGETS: Array<{
   id: OpenTargetId;
@@ -120,7 +120,18 @@ function markQueryHtml(html: string, query: string): string {
  *  with spacer divs keeping the scroll height. No sheet title is rendered
  *  (the tab already shows the file name). First row renders as a sticky
  *  Excel-like header. Scrollbar stays on the right via dir=ltr. */
-function VirtualSheetTable({ rows, query, activeRow }: { name: string; rows: string[]; query?: string; activeRow?: number }) {
+function colToLetters(n: number): string {
+  let s = "";
+  let v = n;
+  while (v > 0) {
+    const m = (v - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    v = Math.floor((v - 1) / 26);
+  }
+  return s;
+}
+
+function VirtualSheetTable({ name, rows, query, activeRow }: { name: string; rows: string[]; query?: string; activeRow?: number }) {
   // App-scrollbar grid (like Word): no inner scroll container — the outer
   // .file-viewer-doc provides the single app scrollbar. Full render up to a
   // cap keeps small/medium sheets cheap; huge sheets show the first window.
@@ -151,7 +162,7 @@ function VirtualSheetTable({ rows, query, activeRow }: { name: string; rows: str
     }
   }, [activeRow, shown]);
   return (
-    <div className="fv-sheet-wrap" dir="ltr" style={{ direction: "ltr", textAlign: "left", width: "100%" }}>
+    <div className="fv-sheet-wrap" data-sheet={name} dir="ltr" style={{ direction: "ltr", textAlign: "left", width: "100%" }}>
       <div ref={gridRef}>
         <table border={1} cellPadding={6} cellSpacing={0} style={{ borderCollapse: "collapse", whiteSpace: "pre", width: "max-content", minWidth: "100%", direction: "ltr", margin: 0, background: "#ffffff", color: "#111111", fontSize: 13, lineHeight: "20px" }}>
           <tbody dangerouslySetInnerHTML={{ __html: visibleHtml }} />
@@ -194,7 +205,7 @@ function parseCommentRange(loc: string): [number, number] | null {
 
 /** Docked viewer tab for one workspace file: line-numbered, syntax
  *  highlighted, with an optional target line highlighted and scrolled into
- *  view (opened via file chips / code-map jumps). Images render inline,
+ *  view (opened via file chips / LSP jumps). Images render inline,
  *  binary files show a notice. Relative paths are read against the
  *  workspace root captured at open time (survives chat switches). */
 export function FileViewerPanel({
@@ -221,6 +232,33 @@ export function FileViewerPanel({
     : `${(root || "").replace(/\/+$/, "")}/${filePath}`;
   const ext = extOf(filePath);
   const isImage = IMAGE_EXTS.has(ext);
+  // Office documents (Word/Excel/PDF) open in the system default app
+  // (Word/Excel/PDF viewer) — code editors are hidden for these types.
+  const defaultApp = defaultAppForExt(ext);
+  const isOfficeDoc = defaultApp !== null;
+  const defaultAppLabel = defaultApp?.label ?? "Default app";
+  const defaultTargetIcon = defaultApp?.icon ?? "DOC";
+  const visibleTargets:
+    | typeof OPEN_TARGETS
+    | Array<{
+        id: OpenTargetId;
+        icon: string;
+        iconClass: string;
+        label: string;
+        hint: string;
+        title: string;
+      }> = isOfficeDoc
+    ? [
+        {
+          id: "default",
+          icon: defaultTargetIcon,
+          iconClass: "fv-open-icon-default",
+          label: `Open in ${defaultAppLabel}`,
+          hint: "System default app",
+          title: `Open in ${defaultAppLabel}`,
+        },
+      ]
+    : OPEN_TARGETS;
   // Live editing: every write_document tool_result / write_file+edit_file
   // diff bumps this counter for the touched path, so an open viewer
   // re-fetches and shows the agent's edits as they happen.
@@ -315,13 +353,34 @@ export function FileViewerPanel({
         const rows = Array.from(aRow.parentElement.children);
         const i = rows.indexOf(aRow) + 1;
         const fRow = fEl?.closest?.("tr");
+        // Column letters from the selected cells (Excel A1 style): the agent
+        // needs both row and column to jump straight to the cell range.
+        const cellOf = (el: Element | null) => el?.closest?.("td, th") ?? null;
+        const colOf = (cell: Element | null): number => {
+          if (!cell?.parentElement) return NaN;
+          return Array.from(cell.parentElement.children).indexOf(cell) + 1;
+        };
+        const aCol = colOf(cellOf(aEl));
+        const fCol = colOf(cellOf(fEl));
+        const fmtRowsCols = (r1: number, r2: number | null, c1: number, c2: number | null): string => {
+          const rowsPart = r2 != null && r2 !== r1 ? `rows ${Math.min(r1, r2)}-${Math.max(r1, r2)}` : `row ${r1}`;
+          const cKnown = (v: number) => Number.isFinite(v) && v > 0;
+          if (!cKnown(c1) && (c2 == null || !cKnown(c2))) return rowsPart;
+          const lo = cKnown(c1) && c2 != null && cKnown(c2) ? Math.min(c1, c2) : (cKnown(c1) ? c1 : (c2 as number));
+          const hi = cKnown(c1) && c2 != null && cKnown(c2) ? Math.max(c1, c2) : lo;
+          const colsPart = hi !== lo ? `cols ${colToLetters(lo)}-${colToLetters(hi)}` : `col ${colToLetters(lo)}`;
+          return `${rowsPart}, ${colsPart}`;
+        };
         if (fRow && fRow !== aRow && fRow.parentElement === aRow.parentElement) {
           const j = rows.indexOf(fRow) + 1;
-          const lo = Math.min(i, j);
-          const hi = Math.max(i, j);
-          return lo === hi ? `row ${lo}` : `rows ${lo}-${hi}`;
+          return fmtRowsCols(i, j, aCol, fCol);
         }
-        if (i > 0) return `row ${i}`;
+        if (i > 0) {
+          // Multi-cell selection inside one row (e.g. B3:D3) still carries cols.
+          const sameRowMultiCol = fRow === aRow && Number.isFinite(aCol) && Number.isFinite(fCol) && aCol !== fCol;
+          if (sameRowMultiCol) return fmtRowsCols(i, i, aCol, fCol);
+          return fmtRowsCols(i, null, aCol, NaN);
+        }
       }
     } catch {
       /* no line info */
@@ -415,17 +474,49 @@ export function FileViewerPanel({
       document.removeEventListener("keyup", onKey);
     };
   }, [commentOpen, selection, commentText]);
-  const sendComment = () => {
+  const sendComment = (queued?: boolean) => {
     const base = commentQuote || selection;
     if (!base || !ownerChatId) return;
     const note = commentText.trim();
-    // Path with :line locator (path:42 / path:42-45): formatFileComment
-    // builds the header and the direct-edit directive, so the agent opens
-    // this exact path/line without a workspace search.
-    const locMatch = commentLoc.match(/(\d+)(?:\s*-\s*(\d+))?/);
-    const locSuffix = locMatch ? (locMatch[2] ? `:${locMatch[1]}-${locMatch[2]}` : `:${locMatch[1]}`) : "";
+    // Path with locator (path:42 / path:42-45 for code, path:Sheet1!B3:D5
+    // for Excel grids): formatFileComment builds the header and the
+    // direct-edit directive, so the agent opens this exact spot without a
+    // workspace search. The locator kind matches the file nature — lines
+    // for code/text, sheet + cell range for spreadsheets.
+    let locSuffix = "";
+    const rowsMatch = commentLoc.match(/rows?\s+(\d+)(?:\s*-\s*(\d+))?/i);
+    const colsMatch = commentLoc.match(/cols?\s+([A-Z]+)(?:\s*-\s*([A-Z]+))?/i);
+    if (rowsMatch) {
+      const r1 = parseInt(rowsMatch[1], 10);
+      const r2 = rowsMatch[2] ? parseInt(rowsMatch[2], 10) : r1;
+      const loR = Math.min(r1, r2);
+      const hiR = Math.max(r1, r2);
+      const c1 = colsMatch?.[1]?.toUpperCase();
+      const c2 = (colsMatch?.[2] ?? c1)?.toUpperCase();
+      if (c1) {
+        // Sheet name from the frozen range's table (falls back to the sheet
+        // filter input): the agent needs it to pick the right worksheet.
+        let sheetName = "";
+        try {
+          const sc = savedRangeRef.current?.startContainer ?? null;
+          const scEl = sc instanceof Element ? sc : (sc as Node | null)?.parentElement ?? null;
+          sheetName = scEl?.closest?.("[data-sheet]")?.getAttribute("data-sheet") ?? "";
+        } catch {
+          sheetName = "";
+        }
+        if (!sheetName) sheetName = sheet.trim();
+        const a1 = hiR !== loR || c2 !== c1 ? `${c1}${loR}:${c2}${hiR}` : `${c1}${loR}`;
+        const safeSheet = sheetName.includes(" ") || sheetName.includes("'") ? `'${sheetName.replace(/'/g, "''")}'` : sheetName;
+        locSuffix = sheetName ? `:${safeSheet}!${a1}` : `:${a1}`;
+      } else {
+        locSuffix = hiR !== loR ? `:rows ${loR}-${hiR}` : `:row ${loR}`;
+      }
+    } else {
+      const locMatch = commentLoc.match(/(\d+)(?:\s*-\s*(\d+))?/);
+      locSuffix = locMatch ? (locMatch[2] ? `:${locMatch[1]}-${locMatch[2]}` : `:${locMatch[1]}`) : "";
+    }
     const body = note ? `${base}\n\nNote: ${note}` : base;
-    commentFileSelection(ownerChatId, `${filePath}${locSuffix}`, body);
+    commentFileSelection(ownerChatId, `${filePath}${locSuffix}`, body, { queue: queued });
     // sent (no confirmation chrome: the box simply closes)
     if (typeof window !== "undefined") window.getSelection()?.removeAllRanges();
     savedRangeRef.current = null;
@@ -799,8 +890,8 @@ export function FileViewerPanel({
             </svg>
           </button>
           {openMenu && (
-            <div className="fv-open-menu" role="menu" dir={appDir}>
-              {OPEN_TARGETS.map((t) => (
+            <div className="fv-open-menu" role="menu" dir="ltr" style={{ direction: "ltr" }}>
+              {visibleTargets.map((t) => (
                 <button
                   key={t.id}
                   type="button"
@@ -941,9 +1032,12 @@ export function FileViewerPanel({
                   if (e.key === "Escape") {
                     e.preventDefault();
                     cancelComment();
+                  } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    sendComment(true);
                   } else if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    sendComment();
+                    sendComment(false);
                   }
                 }}
                 placeholder="Write a comment… Enter to send, Esc to cancel"

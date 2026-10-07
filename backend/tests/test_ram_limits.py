@@ -6,7 +6,6 @@ import os
 import sqlite3
 
 import embeddings as emb_mod
-import symbol_index as sym_mod
 import tools as tools_mod
 
 
@@ -76,36 +75,11 @@ def test_web_store_is_shared(monkeypatch, tmp_path):
         tools_mod.close_web_store()
 
 
-def test_symbol_cache_bounded_and_scoped(tmp_path, monkeypatch):
-    """Per-root clear drops only that project; range cache stays bounded."""
-    sym_mod._FILE_CACHE.clear()
-    sym_mod._CACHE.clear()
-    sym_mod._SYMBOL_RANGE_CACHE.clear()
-    try:
-        sym_mod._FILE_CACHE["/proj-a/f.py"] = (1, 1, [], [])
-        sym_mod._CACHE["/proj-a/f.py"] = (0.0, [], (0, 0, 0))
-        sym_mod._SYMBOL_RANGE_CACHE["/proj-a/f.py"] = (0.0, {}, {})
-        sym_mod._FILE_CACHE["/proj-b/g.py"] = (1, 1, [], [])
-        sym_mod.clear_symbol_cache("/proj-a")
-        assert "/proj-a/f.py" not in sym_mod._FILE_CACHE
-        assert "/proj-a/f.py" not in sym_mod._SYMBOL_RANGE_CACHE
-        assert "/proj-b/g.py" in sym_mod._FILE_CACHE
-        # Bound: range cache evicts oldest-first once over the cap.
-        monkeypatch.setattr(sym_mod, "_SYMBOL_RANGE_CACHE_MAX_FILES", 3)
-        sym_mod._SYMBOL_RANGE_CACHE.clear()
-        paths = []
-        for i in range(5):
-            p = tmp_path / f"f{i}.py"
-            p.write_text(f"def fn{i}():\n    pass\n", encoding="utf-8")
-            paths.append(str(p))
-        for p in paths:
-            sym_mod.get_symbol_ranges(p)
-        assert len(sym_mod._SYMBOL_RANGE_CACHE) <= 3
-        # get_symbol_ranges on a missing file returns {} without growing cache.
-        before = len(sym_mod._SYMBOL_RANGE_CACHE)
-        assert sym_mod.get_symbol_ranges(os.path.join("/definitely", "missing.py")) == {}
-        assert len(sym_mod._SYMBOL_RANGE_CACHE) == before
-    finally:
-        sym_mod._FILE_CACHE.clear()
-        sym_mod._CACHE.clear()
-        sym_mod._SYMBOL_RANGE_CACHE.clear()
+def test_lsp_registry_covers_common_languages():
+    """LSP registry must cover common languages with PATH-resolved binaries."""
+    from lsp_manager import LANGUAGE_SERVERS, SUFFIX_TO_LANGUAGE
+
+    assert "python" in LANGUAGE_SERVERS
+    assert "typescript" in LANGUAGE_SERVERS
+    assert SUFFIX_TO_LANGUAGE.get(".py") == "python"
+    assert SUFFIX_TO_LANGUAGE.get(".tsx") == "typescript"

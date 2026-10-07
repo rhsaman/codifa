@@ -903,7 +903,7 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "OUTPUT DISCIPLINE: never dump full files or large code blocks; paste only tiny necessary snippets and name file paths. Cite line numbers in prose only when truly necessary. A snippet taken from the read tool starts with the file's path as a comment (e.g. // src/App.tsx) and is fenced as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58) so the UI shows the file name and real line numbers. Any flow, process, sequence, architecture or relationship explanation must be a valid ```mermaid fenced diagram, never ASCII art or a plain list."
     ),
     "coder": (
-        "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it. When 2+ independent chunks exist (separate files/groups, frontend/backend/db, verification), you MUST spawn one task(subagent_type='subagent') per chunk in ONE parallel block FIRST — sub-agents inherit your write tools so they can edit (they NEVER run tests — you run all tests after merging reports; order each sub-agent to use targeted search only with CODE MAP first, no blind scans, batched in ONE call each (patterns/paths/includes, filePaths, ranges+symbols)) — then edit your kept chunk in the SAME turn. Spawning tasks counts as starting work. Do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so check the CODE MAP first, then ONE scoped grep (path/include limited to SCOPE or the plan's Files) with context, then read only the pointed windows via symbols=[...] or ranges=[...] right before you edit. Respect SCOPE (ONLY THESE FILES) and the plan's Files: search ONLY within them, never scan the whole workspace blindly. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks and task(subagent_type='subagent') for parallelizable work.\n"
+        "You are Coder, an implementation agent inside a desktop IDE. You receive the plan and implement it. When 2+ independent chunks exist (separate files/groups, frontend/backend/db, verification), you MUST spawn one task(subagent_type='subagent') per chunk in ONE parallel block FIRST — sub-agents inherit your write tools so they can edit (they NEVER run tests — you run all tests after merging reports; order each sub-agent to use targeted search only with LSP first, no blind scans, batched in ONE call each (patterns/paths/includes, filePaths, ranges+symbols)) — then edit your kept chunk in the SAME turn. Spawning tasks counts as starting work. Do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so try LSP first, else ONE scoped grep (path/include limited to SCOPE or the plan's Files) with context, then read only the pointed windows via symbols=[...] or ranges=[...] right before you edit. Respect SCOPE (ONLY THESE FILES) and the plan's Files: search ONLY within them, never scan the whole workspace blindly. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks and task(subagent_type='subagent') for parallelizable work.\n"
         "CHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work. Finish the whole list in THIS turn — never end with pending items still doable. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\n"
         "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits you kept for yourself across DIFFERENT files go as parallel edit_file calls in the SAME turn — NEVER edit files you delegated to a subagent. Do not repeatedly edit the same code or modify unrelated code.\n"
         "HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\n"
@@ -913,7 +913,7 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "plan": (
         "You are a planning agent inside a desktop IDE. Produce a SHORT, scannable IMPLEMENTATION PLAN -- you never implement it.\n"
-        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with grep/glob/read (task(subagent_type='subagent') is ONLY for parallel implementation chunks, never for file lookups) to find the files, functions and lines the plan will touch -- never plan from memory. If you delegated any scope to a subagent, do NOT write ## Plan until its [background sub-agent report] arrives; then revise using it instead of re-searching that scope. When the user EXPLICITLY asks to research the web ('research this on the web', 'search online', 'look it up'), that request is MANDATORY: call web_search -- and fetch_url to open the promising hits -- BEFORE writing ## Plan and cite the real URLs in the plan; a codebase-only answer never satisfies an explicit web-research request. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all file lookups (glob + grep) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop the moment every file the plan will touch is identified.\n"
+        "MANDATORY RESEARCH: before writing ## Plan, search the real codebase with LSP/grep/glob/read (LSP first for precise jumps, then scoped grep; task(subagent_type='subagent') is ONLY for parallel implementation chunks, never for file lookups) to find the files, functions and lines the plan will touch -- never plan from memory. If you delegated any scope to a subagent, do NOT write ## Plan until its [background sub-agent report] arrives; then revise using it instead of re-searching that scope. When the user EXPLICITLY asks to research the web ('research this on the web', 'search online', 'look it up'), that request is MANDATORY: call web_search -- and fetch_url to open the promising hits -- BEFORE writing ## Plan and cite the real URLs in the plan; a codebase-only answer never satisfies an explicit web-research request. When the task needs external docs/APIs/versions, call web_search/fetch_url first and cite real results. When the request is ambiguous or you hit a genuine fork with no clearly-correct default, call ask_user with 2-5 short options and WAIT -- never pick silently. Do all file lookups (glob + grep) up front in ONE batched parallel turn, then read only the specific files you need: enough context in a SINGLE call (read with offset/limit), never rereading a location. Stop the moment every file the plan will touch is identified.\n"
         "TERMINAL: read-only inspection only -- git status, plain git diff (working-tree/staged), pwd, node/python --version, and build/test/lint. Never modify/create/delete files and never use it to read files (no ls/find/cat/sed/awk/head/tail/wc/grep).\n"
         "CHECKLIST: call update_plan ONCE, after writing '## Plan', with the final checklist Coder will execute (every item status='pending': one item per file/group below plus a 'write and run tests' item); never while scouting.\n"
         "PREVIOUS PLAN: your finished plan is saved automatically (one per chat), OVERWRITING that chat's previous one. If the conversation already contains a previous ## Plan (in history or a SAVED PLAN block) AND the new message continues the same task, REVISE it instead of starting over: keep the bullets that are still correct, update/add/remove only what the user's new message affects, and open with 1-2 lines saying what changed. If the new message is a new, unrelated task, ignore the previous plan entirely and create a fresh one.\n"
@@ -1055,12 +1055,12 @@ _DOING_TASKS = (
 _SEARCH_RULE = (
     "\n\n=== IMPORTANT RULE: SEARCH STRATEGY (every mode) ===\n"
     "Choose the search tool by the BREADTH of what you need:\n"
-    "1. TARGETED lookup of a known file/symbol/keyword: use grep / glob / read / web_search / fetch_url DIRECTLY (inline, single-shot; before AND after any task call). Order is FIXED: (a) check the CODE MAP first — if the symbol/file is there, go straight to read(symbols=[...]); (b) else ONE scoped grep (pattern + path/include limited to SCOPE or the plan's Files) with context; (c) then read only the pointed windows via symbols=[...] or ranges=[...]. Read a file only when you know its exact path; never pull a whole large file into context just to find one symbol. In coder mode ALWAYS pass path/include limited to SCOPE or the plan's Files — omitting path scans the whole workspace and is FORBIDDEN when plan Files exist; never scan the whole workspace blindly.\n"
-    "2. FILE LOOKUPS (any breadth): use grep / glob / read DIRECTLY in ONE batched call (patterns/paths/includes) -- NEVER delegate file lookups to task. Task with subagent_type='subagent' is ONLY for parallelizable implementation chunks (independent files, frontend/backend/db): sub-agents inherit your write tools but NEVER run tests (the main agent runs all tests after merging reports) and NEVER blind-scan (CODE MAP first, then ONE scoped grep, then symbols/ranges read only, batched like you: patterns/paths/includes in ONE grep, filePaths in ONE read, ranges+symbols in ONE read), run in parallel while you continue your own work, and return a compact report. When 2+ independent chunks exist, you MUST launch one task per chunk in ONE parallel block. Naming a file in a task() prompt auto-authorizes it for that sub-agent — no manual attach needed. Sub-agents run ONLY when YOU call task(subagent_type='subagent'): the system does NOT auto-route.\n"
+    "1. TARGETED lookup of a known file/symbol/keyword: use LSP or glob / grep / read / web_search / fetch_url DIRECTLY (filename pattern -> glob first, never grep for filenames; symbol NAME -> LSP/read symbols, never grep for the name) (inline, single-shot; before AND after any task call). Order is FIXED: (a) try LSP first (lsp_definition/references/hover/symbols) for a precise jump — if you know a symbol NAME but not its file, use read(symbols=[...]) without filePath (project-wide lookup), never grep for the name; when the server is missing/installing, WAIT for the install (retry the same lsp_* call) and do NOT fall back to grep/file search without LSP; (b) else ONE scoped grep (pattern + path/include limited to SCOPE or the plan's Files) with context — small hit lists already carry the full definition body (deterministic grep+read), so do NOT re-read those; NEVER repeat the same grep pattern/path/include in the same turn — batch all patterns via patterns=[...], all scopes via paths=[...], all filters via includes=[...] in ONE call and reuse the cached result; (c) then read only the pointed windows via symbols=[...] or ranges=[...] when the body is not already shown — NEVER re-read the same file window twice. Read a file only when you know its exact path; never pull a whole large file into context just to find one symbol. In coder mode ALWAYS pass path/include limited to SCOPE or the plan's Files — omitting path scans the whole workspace and is FORBIDDEN when plan Files exist; never scan the whole workspace blindly. FORBIDDEN blind-search: (i) grep pattern with >3 `|` alternatives; (ii) multilingual OR mixing languages in one pattern (e.g. 'کامیت|commit|آندو|undo|push|پوش|composer|Composer' — pick ONE language, ONE concept, max 3 alternatives); (iii) workspace-wide grep without path/paths AND include/includes — every grep MUST set both scope (path/paths limited to SCOPE or plan Files, e.g. path='backend') AND file filter (include/includes, e.g. include='*.py'), including all src/backend searches; (iv) grep for a filename — filename discovery (e.g. *Composer* *DiffBar*) MUST glob first (pattern='*Composer*', patterns=['*DiffBar*']) before any content grep; (v) read workspace root (filePath='.', '', '/' or empty) — root listing is NEVER allowed, use glob with a filename pattern or scoped grep instead. Keep LSP-first order: LSP -> (glob-first if filename) -> ONE scoped+filtered grep -> symbols/ranges read.\n"
+    "2. FILE LOOKUPS (any breadth): use grep / glob / read DIRECTLY in ONE batched call (patterns/paths/includes) -- NEVER delegate file lookups to task. When the task names exact files (Files: ... / ONLY these), SKIP all discovery (no LSP, no grep, no glob) -- go straight to ONE read via filePaths/ranges+symbols in the SAME turn. Task with subagent_type='subagent' is ONLY for parallelizable implementation chunks (independent files, frontend/backend/db): sub-agents inherit your write tools but NEVER run tests (the main agent runs all tests after merging reports) and NEVER blind-scan (LSP first, else ONE scoped grep, then symbols/ranges read only, batched like you: patterns/paths/includes in ONE grep, filePaths in ONE read, ranges+symbols in ONE read), run in parallel while you continue your own work, and return a compact report. When 2+ independent chunks exist, you MUST launch one task per chunk in ONE parallel block. Naming a file in a task() prompt auto-authorizes it for that sub-agent — no manual attach needed. Sub-agents run ONLY when YOU call task(subagent_type='subagent'): the system does NOT auto-route.\n"
     "3. OTHER delegation (summarize, reformat, generate from a report): use task with subagent_type='subagent'.\n"
-    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- task is ONLY for parallel implementation chunks; firing many direct reads in parallel is still this clause):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']).\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step (a solo update_plan burns a full round-trip for a checklist tick). Solo is only for the final tick with no further work.\n"
-    "5. CONTEXT BUDGET: only a subagent's compact report enters your context, so delegate parallel chunks instead of doing everything inline. When you read yourself, make the FIRST read decisive -- never open with a narrow slice and page forward (WRONG: read 1-200, then 217-350, then symbols = 3 round-trips). If you know the definition NAME, read symbols=[...] (exact range, one call, even for small files: a 250-line file is served whole, so symbols saves ~200 lines). To survey a large file read offset=1 limit=400+: you get a FILE MAP (head + full definition list) instead of a bulk dump, then fetch definitions via symbols=[...] in ONE call. Use offset/limit only for one small raw region, and never read file heads (offset=1, small limit) to survey a large file: check the CODE MAP or grep first, then symbols=[...].\n"
-    "5b. CODE MAP: the live symbol index (CODE MAP above) lists every function/class with its file and line. Check it before grepping: if the symbol/file is there, go straight to read (1 call); grep only when the map doesn't cover it (a string/comment, or an unindexed symbol). When you know a function/class/method NAME (from the map or a grep `in Name (L..)` hit), read symbols=[...] (e.g. filePath='a.ts', symbols=['DiffView']) instead of guessing offset/limit.\n"
+    "4. BATCHING DIRECT TOOLS (TARGETED lookups ONLY -- task is ONLY for parallel implementation chunks; firing many direct reads in parallel is still this clause):\n- Fire every search you already know you need in the SAME turn (parallel tool calls).\n- Several files to read: ONE read call via the filePaths list (filePath='a.ts', filePaths=['b.ts','c.ts']). One read per file is a HARD violation. Firing separate Read File calls for different files/ranges already known upfront in the same turn is the same violation — batch them in ONE read via filePaths/ranges. NEVER re-read the same file window twice in the same turn — reuse the cached result.\n- Several grep terms: ONE call via `patterns` (pattern='foo', patterns=['bar','baz']); several scopes via `paths` (path='src', paths=['backend','tools']); several file filters via `includes` (include='*.ts', includes=['*.py']). Several glob patterns: ONE call via `patterns` (pattern='**/*.ts', patterns=['**/*.test.ts']); filename lookup -> glob first, content lookup -> grep, never grep for filenames.\n- Different windows: ONE read via `ranges` (ranges=['a.ts:100:80','b.ts:1:60']). The same file with different windows is ALSO one read via ranges (ranges=['tools.py:640:60','tools.py:2089:80']), never two reads. symbols=[...] combines with ranges=[...] in that SAME call; never a ranges call plus a separate symbols call on one file.\n- Never put several files under one shared offset/limit (short files run past EOF): give each its own window via ranges.\n- Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n- Chain independent shell commands in ONE run_terminal call with `;` or `&&`, never one call per command.\n- NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step (a solo update_plan burns a full round-trip for a checklist tick). Solo is only for the final tick with no further work.\n"
+    "5. CONTEXT BUDGET: only a subagent's compact report enters your context, so delegate parallel chunks instead of doing everything inline. When you read yourself, make the FIRST read decisive -- never open with a narrow slice and page forward (WRONG: read 1-200, then 217-350, then symbols = 3 round-trips). If you know the definition NAME, read symbols=[...] (exact range, one call, even for small files: a 250-line file is served whole, so symbols saves ~200 lines). To survey a large file read offset=1 limit=400+: you get a FILE MAP (head + full definition list) instead of a bulk dump, then fetch definitions via symbols=[...] in ONE call. Use offset/limit only for one small raw region, and never read file heads (offset=1, small limit) to survey a large file: check LSP or grep first, then symbols=[...].\n"
+    "5b. LSP: use lsp_definition/references/hover/symbols for a precise single-hop jump to the definition. When no LSP server covers the file, fall back to ONE scoped grep with context, then read the pointed windows. When you know a function/class/method NAME (from an LSP hit or a grep `in Name (L..)` hit), read symbols=[...] (e.g. filePath='a.ts', symbols=['DiffView']) instead of guessing offset/limit.\n"
     "NEVER search or read project files with run_terminal or scripts -- only the file tools (grep / glob / read).\n"
     "6. PROGRESSIVE BATCHING: each turn, fire ALL the targeted searches you need (each with explicit scope: path + include) as ONE batch of parallel tool calls; each batch narrows toward the answer using the previous results. Batch efficiently but there is no fixed call cap — keep searching until you hold what the task needs. STOP RULE: after at most 2-3 search batches you MUST start editing in the SAME turn when you already know which files to touch — never keep searching blindly. Never fire one search at a time when you already know several. grep/glob/read are always bound — never claim direct search is unavailable; if a call fails, report the exact ERROR instead of falling back with an excuse.\n"
 )
@@ -2088,14 +2088,13 @@ _MAX_PRESERVE_RECENT_TOKENS = 15_000
 
 # --- Small-context optimisation (local models with tight windows) -----------
 # When the configured model context window is below the threshold below we
-# switch to a token-frugal prompt assembly: smaller CODE MAP, half-size RAG,
+# switch to a token-frugal prompt assembly: half-size RAG,
 # skill index without descriptions, tighter project-memory cap, and tighter
 # tool-output trim. Models with ctx ≥ threshold keep the full prompt unchanged.
 # Threshold 32k catches qwen2.5-coder:7b (32k), llama3.1:8b (8k/16k),
 # gemma2:9b (8k), phi-3/4 (4k-16k). Larger models (Claude/GPT-4 / 200k ctx)
 # are unaffected. context_window=0 means "unknown" → safe default (no opt).
 _SMALL_CTX_THRESHOLD = 32_000
-_SMALL_CTX_CODE_MAP_TOKENS = 256  # was 512 (ask) / 1024 (coder/plan)
 _SMALL_CTX_RAG_MAX_CHARS = 1_500  # half of _DEFAULT_MAX_CHARS=3_600
 _SMALL_CTX_TOOL_OUTPUT_MAX = 1_200  # tighter than _TOOL_OUTPUT_MAX_CHARS=2_000
 _SMALL_CTX_PROJECT_MEMORY_MAX = 4_000  # tighter than _PROJECT_MEMORY_MAX_BYTES=12_000
@@ -3002,6 +3001,27 @@ def _is_test_task(prompt: str, picked_skills: Sequence[dict] | None = None) -> b
             if "test" in slug or "تست" in slug:
                 return True
     return False
+
+
+# Live user-like testing intent (generic across projects and stacks).
+# Matches explicit live-test requests in English and Persian so the graph can
+# inject the LIVE TEST RULE instead of the unit-test verification rule.
+_LIVE_TEST_RE = re.compile(
+    r"(?:live[\s_\-]*test|test[\s_\-]*live|live[\s_\-]*run|run[\s_\-]*live|"
+    r"as[\s_\-]+a[\s_\-]+user|like[\s_\-]+a[\s_\-]+user|real[\s_\-]+browser|"
+    r"\be2e\b|end[\s_\-]+to[\s_\-]+end|"
+    r"تست[\s_]*لایو|لایو[\s_]*تست|تست[\s_]*زنده|اجرای[\s_]*زنده|"
+    r"مثل[\s_]*کاربر|همچون[\s_]*کاربر|بالا[\s_]*بیار)",
+    re.IGNORECASE,
+)
+
+
+def _is_live_test_task(prompt: str) -> bool:
+    """True when the user asks for live user-like testing, not code tests."""
+    p = (prompt or "").strip()
+    if not p:
+        return False
+    return bool(_LIVE_TEST_RE.search(p))
 
 
 # Implementation-task detection: a coder task that CHANGES code (feature, fix,
@@ -4109,33 +4129,73 @@ _MAX_VISION_DIM = 1536  # longest side sent to a vision model
 _MAX_VISION_BYTES = 3 * 1024 * 1024  # decoded bytes; above this we shrink
 
 
-def _maybe_downscale_image(data_url: str) -> str:
+def _sanitize_image_data_url(data_url: str) -> str | None:
+    """Validate a base64 data URL and return a clean version, or None if corrupt.
+
+    Drops truncated payloads (persisted snapshots cut with an ellipsis),
+    whitespace/newlines, and non-base64 chars; repairs missing padding.
+    Never raises. Callers must drop None instead of forwarding it: sending a
+    corrupt data URL makes the provider reject the whole request with
+    "400 invalid base64 in data URI".
+    """
+    if not isinstance(data_url, str):
+        return None
+    text = data_url.strip()
+    if not text.startswith("data:") or "," not in text:
+        return None
+    if "\u2026" in text:
+        return None
+    head, _, payload = text.partition(",")
+    payload = "".join(payload.split())
+    if not payload:
+        return None
+    if ";base64" not in head.lower():
+        # Not a base64 URL (e.g. inline SVG): vision needs base64, so an
+        # image URL without the marker is dropped; anything else passes
+        # through untouched.
+        return None if head.startswith("data:image/") else text
+    if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in payload):
+        return None
+    if len(payload) % 4 == 1:
+        return None
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        base64.b64decode(payload, validate=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return f"{head},{payload}"
+
+
+def _maybe_downscale_image(data_url: str) -> str | None:
     """Shrink oversized raster image data URIs so vision providers accept them.
 
     No-op when Pillow is unavailable or the image is already within limits.
-    Guarded so a missing Pillow never breaks image loading — the original URI
-    is returned untouched on any failure.
+    Never raises and never emits a corrupt URL: invalid base64 returns None
+    (callers drop it instead of sending it to the provider).
     """
-    if not data_url.startswith("data:image/"):
-        return data_url
+    cleaned = _sanitize_image_data_url(data_url)
+    if cleaned is None:
+        return None
+    if not cleaned.startswith("data:image/"):
+        return cleaned
     try:
         from io import BytesIO
 
         from PIL import Image
     except Exception:  # noqa: BLE001
-        return data_url
+        return cleaned
     try:
-        _, b64 = data_url.split(",", 1)
+        _, b64 = cleaned.split(",", 1)
         raw = base64.b64decode(b64)
     except Exception:  # noqa: BLE001
-        return data_url
+        return None
     if len(raw) <= _MAX_VISION_BYTES:
         try:
             with Image.open(BytesIO(raw)) as img:
                 if max(img.size) <= _MAX_VISION_DIM:
-                    return data_url
+                    return cleaned
         except Exception:  # noqa: BLE001
-            return data_url
+            return cleaned
     try:
         with Image.open(BytesIO(raw)) as img:
             src = img.copy()
@@ -4159,7 +4219,7 @@ def _maybe_downscale_image(data_url: str) -> str:
         mime = "image/png" if fmt == "PNG" else "image/jpeg"
         return f"data:{mime};base64,{new_b64}"
     except Exception:  # noqa: BLE001
-        return data_url
+        return cleaned
 
 
 def _load_images(items: list | None) -> list[str]:
@@ -4181,7 +4241,12 @@ def _load_images(items: list | None) -> list[str]:
         else:
             path = str(raw).strip()
         if data_url and str(data_url).startswith("data:"):
-            uris.append(_maybe_downscale_image(str(data_url)))
+            cleaned = _sanitize_image_data_url(str(data_url))
+            if cleaned is None:
+                continue
+            scaled = _maybe_downscale_image(cleaned)
+            if scaled:
+                uris.append(scaled)
             continue
         p = (path or "").strip()
         if not p:
@@ -4197,11 +4262,11 @@ def _load_images(items: list | None) -> list[str]:
             continue
         if len(data) > _MAX_IMAGE_BYTES:
             continue
-        uris.append(
-            _maybe_downscale_image(
-                f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
-            )
+        scaled = _maybe_downscale_image(
+            f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
         )
+        if scaled:
+            uris.append(scaled)
     return uris
 
 
@@ -4221,7 +4286,7 @@ _MODE_CAPS = {
            "• NEVER use markdown reference-style links like [label]: url — they render as broken raw text. ONLY use inline links [text](url) and inline images ![alt](url).\n"
            "The frontend automatically renders bare YouTube/Vimeo URLs on their own line as clickable video thumbnail cards, and ![alt](url) as inline images.",
     "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files. Check the codebase following the SEARCH STRATEGY rule (parallelizable work goes to task(subagent_type='subagent')) and inspect state with the read-only terminal (git status/diff/build/lint/test, plus detached live launch of the project's own start command via bg:).",
-    "coder": "You are an implementation agent: create/edit files from the plan. Follow the SEARCH STRATEGY rule: when 2+ independent chunks of parallelizable work exist, FIRST launch one task(subagent_type='subagent') per chunk in ONE parallel block — sub-agents inherit your write tools but NEVER run tests (you run all tests after merging reports); order each sub-agent to use targeted search only (CODE MAP first, no blind scans, batched: ONE grep via patterns/paths/includes, ONE read via filePaths/ranges+symbols); do only targeted checks yourself right before you edit, then edit your kept chunk after at most 2-3 search batches. You also have the read-only terminal for build/test/lint and detached live launch (the project's own start command from its manifest via bg:, logs in OS temp dir, background marker exempt). If a dependency must be installed to run or test, ask permission with request_permission and explain why before installing.",
+    "coder": "You are an implementation agent: create/edit files from the plan. Follow the SEARCH STRATEGY rule: when 2+ independent chunks of parallelizable work exist, FIRST launch one task(subagent_type='subagent') per chunk in ONE parallel block — sub-agents inherit your write tools but NEVER run tests (you run all tests after merging reports); order each sub-agent to use targeted search only (LSP first in coder mode, no blind scans, batched: ONE grep via patterns/paths/includes, ONE read via filePaths/ranges+symbols); do only targeted checks yourself right before you edit, then edit your kept chunk after at most 2-3 search batches. You also have the read-only terminal for build/test/lint and detached live launch (the project's own start command from its manifest via bg:, logs in OS temp dir, background marker exempt). If a dependency must be installed to run or test, ask permission with request_permission and explain why before installing.",
     "reader": "You are a FOCUSED CODE READER: the user pointed you at specific file(s) — read them and explain with file:line references. Stay scoped to those files; do not scout the whole repo or run broad searches.",
 }
 
@@ -4387,6 +4452,7 @@ async def run_agent(
     vector_db_path: str = "",
     vector_config: dict | None = None,
     retrieval_config: dict | None = None,
+    lsp_config: dict | None = None,
     subagent_models: dict | None = None,
     chat_id: str = "",
     reserved: int | None = None,
@@ -4444,6 +4510,7 @@ async def run_agent(
         "vector_db_path": vector_db_path,
         "vector_config": vector_config,
         "retrieval_config": retrieval_config,
+        "lsp_config": dict(lsp_config or {}),
         "subagent_models": dict(subagent_models or {}),
         "chat_id": chat_id,
         "reserved": reserved,

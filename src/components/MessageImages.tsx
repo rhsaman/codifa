@@ -26,11 +26,13 @@ export function MessageImages({
   const [selected, setSelected] = useState<number | null>(null);
 
   if (!images || images.length === 0) return null;
+  const usable = (u?: string) => !!u && !u.includes('\u2026');
   const expanded = activeKey === fsKey && selected !== null;
   const current = selected !== null ? images[selected] : null;
 
   const open = (idx: number) => {
-    if (!images[idx]?.dataUrl) return;
+    const du = images[idx]?.dataUrl;
+    if (!du || du.includes('\u2026')) return;
     setSelected(idx);
     openFs(fsKey);
   };
@@ -44,14 +46,14 @@ export function MessageImages({
       <div className="msg-images" dir="ltr">
         {images.map((img, idx) => (
           <div
-            className={`msg-image${img.dataUrl ? " zoomable" : ""}`}
+            className={`msg-image${usable(img.dataUrl) ? " zoomable" : ""}`}
             key={img.path}
-            title={img.dataUrl ? `${img.name} — click to expand` : img.name}
-            role={img.dataUrl ? "button" : undefined}
-            tabIndex={img.dataUrl ? 0 : undefined}
-            aria-label={img.dataUrl ? `Expand image ${img.name}` : undefined}
-            style={img.dataUrl ? { cursor: "zoom-in" } : undefined}
-            onClick={img.dataUrl ? () => open(idx) : undefined}
+            title={usable(img.dataUrl) ? `${img.name} — click to expand` : img.name}
+            role={usable(img.dataUrl) ? "button" : undefined}
+            tabIndex={usable(img.dataUrl) ? 0 : undefined}
+            aria-label={usable(img.dataUrl) ? `Expand image ${img.name}` : undefined}
+            style={usable(img.dataUrl) ? { cursor: "zoom-in" } : undefined}
+            onClick={usable(img.dataUrl) ? () => open(idx) : undefined}
             onKeyDown={
               img.dataUrl
                 ? (e) => {
@@ -63,7 +65,7 @@ export function MessageImages({
                 : undefined
             }
           >
-            {img.dataUrl ? (
+            {usable(img.dataUrl) ? (
               <img
                 src={img.dataUrl}
                 alt={img.name}
@@ -76,7 +78,7 @@ export function MessageImages({
           </div>
         ))}
       </div>
-      {current?.dataUrl && (
+      {current && usable(current.dataUrl) && (
         <FullscreenModal
           open={expanded}
           onClose={close}

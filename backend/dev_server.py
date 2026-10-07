@@ -110,11 +110,34 @@ def start(
             # Stale entry: drop it before respawning.
             _REGISTRY.pop(name, None)
         if log_file:
-            # Caller paths are reduced to their basename inside the OS temp
-            # dir: logs never land in codifa logs or the workspace.
-            log_path = os.path.join(
-                tempfile.gettempdir(), os.path.basename(str(log_file))
-            )
+            # Caller paths stay inside the OS temp dir: paths already under
+            # temp (including subdirs like codifa-terminal) are kept as-is so
+            # the caller and the registry agree on one path; anything else is
+            # reduced to its basename. Logs never land in codifa logs or the
+            # workspace.
+            _candidate = str(log_file)
+            try:
+                _real_candidate = os.path.realpath(_candidate)
+                _real_tmp = os.path.realpath(tempfile.gettempdir())
+                if _real_candidate == _real_tmp or _real_candidate.startswith(
+                    _real_tmp + os.sep
+                ):
+                    log_path = _real_candidate
+                else:
+                    log_path = os.path.join(
+                        tempfile.gettempdir(), os.path.basename(_candidate)
+                    )
+            except Exception:  # noqa: BLE001 — best-effort path check
+                log_path = os.path.join(
+                    tempfile.gettempdir(), os.path.basename(_candidate)
+                )
+            try:
+                os.makedirs(
+                    os.path.dirname(log_path) or tempfile.gettempdir(),
+                    exist_ok=True,
+                )
+            except OSError:
+                pass
         else:
             log_path = _log_path(name, workdir)
         handle = open(log_path, "ab")  # noqa: SIM115 — owned by entry, closed on stop

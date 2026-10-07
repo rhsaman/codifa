@@ -456,8 +456,7 @@ textarea {
 }
 
 /* Hover-only scrollbars for the sidebar chat list, the side panel and every
-   right-docked viewer pane (file/text viewer, plan, git diff, trace, browser,
-   code map, the viewer tab strip, nested trace JSON): the bars stay invisible
+   right-docked viewer pane (file/text viewer, plan, git diff, trace, browser, the viewer tab strip, nested trace JSON): the bars stay invisible
    until the pointer is over the surface (keyboard and touch scrolling still
    work while hidden). */
 .sidebar-list,
@@ -4407,9 +4406,21 @@ textarea {
 }
 
 .msg-copy.msg-edit:disabled {
-  opacity: 0.35;
+  opacity: 0;
   cursor: default;
   pointer-events: none;
+}
+
+.msg:hover .msg-copy.msg-edit:disabled {
+  opacity: 0.35;
+}
+
+.queued-bubble:hover .msg-copy {
+  opacity: 1;
+}
+
+.queued-bubble:hover .msg-copy.msg-edit:disabled {
+  opacity: 0.35;
 }
 
 /* Inline edit box replacing the user bubble while editing. */
@@ -4488,26 +4499,6 @@ textarea {
   opacity: 0.8;
 }
 
-.msg-edit-save {
-  padding: 6px 18px;
-  border-radius: 999px;
-  border: none;
-  background: var(--text);
-  color: var(--on-accent);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.msg-edit-save:hover:not(:disabled) {
-  filter: brightness(1.06);
-}
-
-.msg-edit-save:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-
 .msg-edit-cancel {
   padding: 6px 4px;
   border: none;
@@ -4519,11 +4510,6 @@ textarea {
 }
 
 .msg-edit-cancel:hover {
-  color: var(--text);
-}
-
-.msg-edit-cancel:hover {
-  background: var(--bg-input);
   color: var(--text);
 }
 
@@ -10395,87 +10381,114 @@ textarea {
 .queued-bubbles {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin: 14px 0 4px;
+  gap: 12px;
+  margin: 16px 0 6px;
 }
 
 .queued-bubble {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  border-radius: 14px;
-  padding: 12px 14px 12px 16px;
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--link) 10%, var(--bg-panel)),
-      color-mix(in srgb, var(--link) 4%, var(--bg-panel)));
-  border: 1px solid color-mix(in srgb, var(--link) 26%, var(--border));
+  gap: 10px;
+  border-radius: 16px;
+  padding: 12px 14px;
+  padding-inline-start: 18px;
+  background: color-mix(in srgb, var(--link) 7%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--link) 20%, var(--border));
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--link) 16%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.12),
-    0 6px 16px -8px color-mix(in srgb, var(--link) 40%, transparent);
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 1px 2px rgba(0, 0, 0, 0.18);
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.queued-bubble:hover {
+  border-color: color-mix(in srgb, var(--link) 34%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 4px 16px -8px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+.queued-bubble:focus-within {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border));
 }
 
 /* soft accent bar on the leading edge */
 .queued-bubble::before {
   content: "";
   position: absolute;
-  left: 0;
-  top: 10px;
-  bottom: 10px;
+  inset-inline-start: 6px;
+  top: 12px;
+  bottom: 12px;
   width: 3px;
   border-radius: 3px;
   background: linear-gradient(to bottom,
       var(--link),
-      color-mix(in srgb, var(--link) 35%, transparent));
+      color-mix(in srgb, var(--link) 30%, transparent));
+  pointer-events: none;
 }
 
 .queued-bubble.steer {
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--success) 10%, var(--bg-panel)),
-      color-mix(in srgb, var(--success) 4%, var(--bg-panel)));
-  border-color: color-mix(in srgb, var(--success) 26%, var(--border));
+  background: color-mix(in srgb, var(--success) 7%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--success) 20%, var(--border));
+}
+
+.queued-bubble.steer:hover {
+  border-color: color-mix(in srgb, var(--success) 34%, var(--border));
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--success) 16%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.12),
-    0 6px 16px -8px color-mix(in srgb, var(--success) 40%, transparent);
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 4px 16px -8px color-mix(in srgb, var(--success) 35%, transparent);
+}
+
+.queued-bubble.steer:focus-within {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
 }
 
 .queued-bubble.steer::before {
   background: linear-gradient(to bottom,
       var(--success),
-      color-mix(in srgb, var(--success) 35%, transparent));
+      color-mix(in srgb, var(--success) 30%, transparent));
 }
 
 .queued-bubble-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  min-height: 24px;
 }
 
 .queued-bubble-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 7px;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
   flex: 0 0 auto;
-  background: color-mix(in srgb, var(--link) 14%, transparent);
+  background: color-mix(in srgb, var(--link) 13%, transparent);
   color: var(--link);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--link) 22%, transparent);
 }
 
 .queued-bubble.steer .queued-bubble-icon {
-  background: color-mix(in srgb, var(--success) 14%, transparent);
+  background: color-mix(in srgb, var(--success) 13%, transparent);
   color: var(--success);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 22%, transparent);
 }
 
 .queued-bubble-label {
   flex: 1;
-  font-size: 11.5px;
+  min-width: 0;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.2px;
+  letter-spacing: 0.15px;
+  line-height: 1.4;
   color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* animated "pending" dot */
@@ -10515,38 +10528,108 @@ textarea {
 
 .queued-bubble-x {
   flex: 0 0 auto;
-  width: 26px;
-  height: 26px;
-  font-size: 19px;
+  width: 24px;
+  height: 24px;
+  font-size: 16px;
   font-weight: 500;
   line-height: 1;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--text-dim) 9%, transparent);
+  background: transparent;
+  border: none;
   color: var(--text-dim);
+  opacity: 0.75;
+  cursor: pointer;
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .queued-bubble-x:hover {
-  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  opacity: 1;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
   color: var(--danger);
 }
 
 .queued-bubble-text {
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.65;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  padding-left: 30px;
-}
-
-.chat-messages[data-dir="rtl"] .queued-bubble::before {
-  left: auto;
-  right: 0;
+  color: var(--text);
+  padding-inline-start: 34px;
 }
 
 .chat-messages[data-dir="rtl"] .queued-bubble-text {
-  padding-left: 0;
-  padding-right: 30px;
   text-align: right;
+}
+
+/* action row inside queue/steer aligns with the text column */
+.queued-bubble .msg-actions {
+  padding: 0;
+  padding-inline-start: 34px;
+}
+
+.queued-bubble:focus-within .msg-copy {
+  opacity: 1;
+}
+
+.queued-bubble:has(.msg-edit-wrap) {
+  gap: 10px;
+}
+
+.queued-bubble .msg-edit-wrap {
+  width: 100%;
+  margin: 0;
+}
+
+.queued-bubble .msg-edit-input {
+  min-height: 84px;
+}
+
+/* Narrow sidebar / small viewport: keep comment/queue bubbles inside the
+   transcript instead of overflowing from the inline-start side (right in
+   RTL). Long file paths and LTR attachment rows inside an RTL bubble
+   otherwise push past the container because flex items default to
+   min-width:auto and never shrink. */
+.queued-bubbles {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.queued-bubble {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.queued-bubble-text {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.queued-bubble .msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.queued-bubble .msg-attachments .attachment-chip {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-messages {
+  min-width: 0;
+  overflow-x: clip;
+}
+
+.msg {
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* ---- retry banner ---- */
@@ -17031,13 +17114,15 @@ textarea {
 .composer-diff-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
-  max-width: 680px;
+  gap: 6px;
+  width: fit-content;
+  max-width: min(420px, 100%);
   min-width: 0;
-  margin: 0 auto 8px;
-  padding: 3px 8px 3px 6px;
-  font-size: 12px;
+  margin: 0 auto 4px;
+  padding: 1px 6px 1px 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  min-height: 0;
   font-family: var(--font-mono);
   color: var(--text-dim);
   background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
@@ -17078,7 +17163,7 @@ textarea {
 .composer-diff-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .composer-diff-main {
@@ -17086,7 +17171,7 @@ textarea {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   background: transparent;
   border: none;
   padding: 0;
@@ -17100,15 +17185,22 @@ textarea {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  padding: 0 2px;
 }
 
 .composer-diff-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 7px;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
-  padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: transparent;
@@ -17117,35 +17209,97 @@ textarea {
   transition:
     color 0.15s ease,
     border-color 0.15s ease,
-    background 0.15s ease;
+    background 0.15s ease,
+    transform 0.1s ease;
+}
+
+.composer-diff-btn[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.composer-diff-btn svg {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
 }
 
 .composer-diff-btn:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.composer-diff-btn:active:not(:disabled) {
+  transform: scale(0.96);
 }
 
 .composer-diff-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
+  opacity: 0.55;
+  cursor: wait;
 }
 
 .composer-diff-btn.commit:hover:not(:disabled) {
   color: var(--success);
   border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
 }
 
 .composer-diff-btn.undo:hover:not(:disabled) {
   color: #f85149;
   border-color: #f85149;
+  background: color-mix(in srgb, #f85149 10%, transparent);
+}
+
+.composer-diff-btn.push:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.composer-diff-btn.is-loading {
+  cursor: wait;
+  opacity: 0.75;
+}
+
+.composer-diff-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: composer-diff-spin 0.7s linear infinite;
+}
+
+@keyframes composer-diff-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .composer-diff-branch-wrap {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  max-width: 180px;
+  min-width: 0;
+  max-width: 200px;
+  overflow: hidden;
   padding: 1px 6px 1px 4px;
   border-radius: 999px;
   border: 1px solid transparent;
@@ -17177,10 +17331,10 @@ textarea {
 .composer-diff-branch {
   appearance: none;
   -webkit-appearance: none;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   width: auto;
   min-width: 0;
-  max-width: 140px;
+  max-width: 160px;
   border: none;
   outline: none;
   background: transparent;
@@ -19386,6 +19540,7 @@ mark.trace-hit-active {
   flex: 0 0 auto;
   display: flex;
   align-items: stretch;
+  gap: 2px;
   min-width: 0;
   border-bottom: 1px solid var(--hairline);
   -webkit-app-region: drag;
@@ -19413,6 +19568,7 @@ mark.trace-hit-active {
   align-items: center;
   gap: 2px;
   padding: 0 8px;
+  margin-left: auto;
   -webkit-app-region: no-drag;
 }
 
@@ -19426,7 +19582,7 @@ mark.trace-hit-active {
 }
 
 .viewer-pane-head .tab-list-wrap {
-  padding: 0 4px 0 8px;
+  padding: 0 0 0 8px;
   align-self: center;
 }
 
@@ -19618,12 +19774,32 @@ mark.trace-hit-active {
   cursor: default;
 }
 
-/* "+" opener for the side pane (opens the add-tab dropdown). */
+/* "+" opener for the side pane (opens the add-tab dropdown). It sits directly
+   beside the tab-list chevron with minimal gap, even when no tabs are open. */
 .viewer-add-wrap {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  padding: 0 4px 0 2px;
+  padding: 0;
+  margin-inline-start: 2px;
+}
+
+/* Empty viewer tabs: collapse the tab strip so the "+" opener stays tight
+   against the tab-list chevron. The flexible spacer stays visible so the
+   right-side panel icons stay pinned to the right corner (chevron + "+" on
+   the left, panel icons on the right). */
+.tab-bar.viewer-tabs:empty {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 0;
+  border-bottom: none;
+}
+
+/* Keep the flexible spacer when tabs are empty so right-side icons stay
+   pinned to the right corner (chevron + "+" left, panel icons right). */
+.viewer-pane-head:has(.tab-bar.viewer-tabs:empty) .viewer-pane-spacer {
+  display: block;
+  flex: 1 1 auto;
 }
 
 .viewer-add-menu {
@@ -19698,6 +19874,47 @@ mark.trace-hit-active {
 .viewer-chooser-item:hover svg {
   color: var(--accent);
   opacity: 1;
+}
+
+/* Default panel for the empty side pane: inline viewer-tab list (Schedules,
+   Todos) rendered as the pane body when no tabs are open. Same card language
+   as the "Open tab" chooser so the dark theme stays consistent. Rendered by
+   the side-pane container when the tab list is empty; falls back to the
+   chooser cards when the list has no entries. */
+.viewer-default-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px 16px;
+}
+.viewer-default-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(420px, 100%);
+  margin-inline: auto;
+}
+.viewer-default-panel-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: start;
+  width: 100%;
+}
+.viewer-default-panel-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 /* Panel mode body: the todos / sub-agents / schedules sections stacked in
@@ -20441,7 +20658,7 @@ mark.trace-hit-active {
 
 /* ── File-type icons & clickable file chips ────────────────────────────────
    Every file name in the UI (chat inline code, code-block heads, tool rows,
-   viewer tabs, diff list, code map) renders a small tinted squircle tile
+   viewer tabs, diff list) renders a small tinted squircle tile
    with the extension monogram for its extension. FileIcon emits pure SVG
    (no DOM text node), so text-extracting parents (CodeBlock over markdown
    children) read only the file name back. File paths render dimmer than
@@ -20561,7 +20778,7 @@ mark.trace-hit-active {
   min-width: 0;
 }
 
-/* Code map summary icon slot already sized; badge fills it. */
+/* Symbol summary icon slot already sized; badge fills it. */
 .codemap-file-icon {
   display: inline-flex;
   align-items: center;
@@ -20829,20 +21046,28 @@ tr[data-search-current] .fv-mark,
 }
 
 /* Comment editor popup anchored at the highlight: fixed + top z-index so it
-   never stays behind chat windows. */
+   never stays behind chat windows. JS must clamp the inline left/top so the
+   popup never overflows the viewport: left = min(x, innerWidth - popupWidth - 8),
+   top = min(y, innerHeight - popupHeight - 8). The max-width below is only a
+   second guard so the box itself never exceeds the viewport. */
 .fv-comment-pop {
   position: fixed;
   z-index: 9999;
-  width: min(320px, calc(100% - 32px));
+  width: min(320px, calc(100vw - 16px));
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 96%, transparent);
+  background: var(--bg-panel, var(--bg));
+  opacity: 1;
+  isolation: isolate;
   box-shadow: var(--shadow-pop);
-  backdrop-filter: blur(20px) saturate(1.2);
 }
 
 .fv-comment-pop-title {
@@ -20903,16 +21128,34 @@ tr[data-search-current] .fv-mark,
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
-/* Floating highlight comment: small themed box at the highlight position. */
+/* Floating highlight comment: */
 .fv-comment-float {
-  width: 320px;
-  max-width: min(320px, calc(100vw - 32px));
+  position: fixed;
+  z-index: 9999;
+  width: min(320px, calc(100vw - 16px));
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   padding: 8px;
   border-radius: 14px;
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--bg-panel, var(--bg));
   background: color-mix(in srgb, var(--bg-panel, var(--bg)) 97%, transparent);
+  opacity: 1;
+  isolation: isolate;
   box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
   backdrop-filter: blur(20px) saturate(1.2);
+}
+/* Narrow viewport fallback: dock the comment popup to the inline-end edge
+   so it can never overflow the app from the right. Wide screens keep the
+   JS-anchored position; only small screens force docking. */
+@media (max-width: 760px) {
+  .fv-comment-pop,
+  .fv-comment-float {
+    left: auto !important;
+    right: 8px !important;
+  }
 }
 
 .fv-comment-float:focus-within {
@@ -20934,6 +21177,20 @@ tr[data-search-current] .fv-mark,
 
 .fv-comment-float .fv-comment-input::placeholder {
   opacity: 0.55;
+}
+
+/* Preserved highlight for the commented range. Opening the popup focuses the
+   textarea, which collapses window.getSelection() and drops the native
+   highlight. JS must save the Range (or selected text + quote) BEFORE focusing
+   the textarea, keep the quote element rendered from the saved text so send
+   still works, and re-apply the saved range on close/cancel. Apply this class
+   to the commented range while the popup is open to keep it visibly marked. */
+.fv-comment-highlight-persist {
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* Excel-like grid wrapper: single app scrollbar from .file-viewer-doc. */
@@ -21240,6 +21497,8 @@ tr[data-search-current] .fv-mark,
   display: flex;
   flex-direction: column;
   gap: 2px;
+  direction: ltr;
+  unicode-bidi: isolate;
   background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -21312,6 +21571,11 @@ tr[data-search-current] .fv-mark,
 .fv-open-icon-warp {
   background: color-mix(in srgb, #fab387 16%, transparent);
   color: #fab387;
+}
+
+.fv-open-icon-default {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+  color: var(--link);
 }
 
 .fv-open-text {

@@ -102,3 +102,16 @@ def test_rank_files_by_prompt_orders_by_token():
     files = ["lib/util.py", "src/auth/login.py", "readme.md"]
     ranked = graph._rank_files_by_prompt(files, "auth login")
     assert ranked[0] == "src/auth/login.py"
+
+
+def test_load_images_drops_truncated_data_url():
+    # A persisted snapshot cut with an ellipsis must never reach the provider.
+    trunc = "data:image/png;base64," + "A" * 100 + "\u2026"
+    assert _load_images([{"path": "x.png", "dataUrl": trunc}]) == []
+    assert _maybe_downscale_image(trunc) is None
+
+
+def test_load_images_drops_invalid_base64():
+    bad = "data:image/png;base64,!!!not-base64!!!"
+    assert _load_images([{"path": "x.png", "dataUrl": bad}]) == []
+    assert _maybe_downscale_image(bad) is None

@@ -18,14 +18,14 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
-import { extractInlinePathParts, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { dedupDocPaths, extractInlinePathParts, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
 import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
 import type { SpeakProviderOpts } from "../lib/api";
-import { useStore } from "../lib/store";
+import { lspStatusLabel, useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
 import { handleLinkClick } from "../lib/link";
@@ -1181,6 +1181,27 @@ function textTabTitle(text: string, fallback: string): string {
   return firstLine.length > 48 ? `${firstLine.slice(0, 48)}…` : firstLine;
 }
 
+/** Refined pen-nib edit icon (pen-line style): slimmer nib plus a baseline
+ *  reads as "edit text" and stays crisp at 16px next to retry/copy icons. */
+function EditIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 20h9" />
+      <path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z" />
+    </svg>
+  );
+}
+
 function UserMessageBubble({
   message,
   onRetry,
@@ -1228,7 +1249,7 @@ function UserMessageBubble({
     }
   };
 
-  // Enter edit mode with a fresh draft; Save calls onEdit only when the
+  // Enter edit mode with a fresh draft; Enter sends via onEdit only when the
   // trimmed text is non-empty and actually changed.
   const startEdit = () => {
     if (editingDisabled) return;
@@ -1258,7 +1279,10 @@ function UserMessageBubble({
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Escape") cancelEdit();
-                else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
+                else if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  saveEdit();
+                }
               }}
               dir="auto"
               rows={4}
@@ -1267,20 +1291,13 @@ function UserMessageBubble({
             <div className="msg-edit-actions">
               <span
                 className="msg-edit-hint"
-                title="Escape cancels, Cmd/Ctrl+Enter saves"
+                title="Escape cancels, Enter sends"
                 aria-hidden="true"
               >
                 i
               </span>
               <button className="msg-edit-cancel" onClick={cancelEdit}>
                 Cancel
-              </button>
-              <button
-                className="msg-edit-save"
-                onClick={saveEdit}
-                disabled={!draft.trim() || draft.trim() === content}
-              >
-                Save
               </button>
             </div>
           </div>
@@ -1362,19 +1379,7 @@ function UserMessageBubble({
               title="Edit message"
               aria-label="Edit message"
             >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                <path d="m15 5 4 4" />
-              </svg>
+              <EditIcon />
             </button>
           )}
           <button
@@ -1494,7 +1499,7 @@ export function QueuedCollapsibleText({
     el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
   }, [isEditing, draft]);
 
-  // Enter edit mode with a fresh draft; Save calls onEdit only when the
+  // Enter edit mode with a fresh draft; Enter sends via onEdit only when the
   // trimmed text is non-empty and actually changed.
   const startEdit = () => {
     if (editingDisabled) return;
@@ -1521,33 +1526,29 @@ export function QueuedCollapsibleText({
             className="msg-edit-input"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") cancelEdit();
-              else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
-            }}
-            dir="auto"
-            rows={4}
-            autoFocus
-          />
-          <div className="msg-edit-actions">
-            <span
-              className="msg-edit-hint"
-              title="Escape cancels, Cmd/Ctrl+Enter saves"
-              aria-hidden="true"
-            >
-              i
-            </span>
-            <button className="msg-edit-cancel" onClick={cancelEdit}>
-              Cancel
-            </button>
-            <button
-              className="msg-edit-save"
-              onClick={saveEdit}
-              disabled={!draft.trim() || draft.trim() === text}
-            >
-              Save
-            </button>
-          </div>
+                          onKeyDown={(e) => {
+                if (e.key === "Escape") cancelEdit();
+                else if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  saveEdit();
+                }
+              }}
+              dir="auto"
+              rows={4}
+              autoFocus
+            />
+            <div className="msg-edit-actions">
+              <span
+                className="msg-edit-hint"
+                title="Escape cancels, Enter sends"
+                aria-hidden="true"
+              >
+                i
+              </span>
+              <button className="msg-edit-cancel" onClick={cancelEdit}>
+                Cancel
+              </button>
+            </div>
         </div>
       ) : (
         <>
@@ -1581,19 +1582,7 @@ export function QueuedCollapsibleText({
             title="Edit message"
             aria-label="Edit message"
           >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-              <path d="m15 5 4 4" />
-            </svg>
+            <EditIcon />
           </button>
         </div>
       )}
@@ -1700,9 +1689,9 @@ function isCaptionCandidate(text: string): boolean {
   return true;
 }
 
-/** برای تست واحد export شده (الگوی filterCodeMap در CodeMapPanel): بازرسی
- *  مستقیم کلیدهای عناصر — پایداری هویت کارت trace حین استریم — بدون
- *  نیاز به render. */
+/** Unit-tested helper (trace card identity pattern): direct key inspection —
+ *  keeps trace card identity stable during streaming — without
+ *  needing a render. */
 export function renderSegments(
   message: ChatMessage,
   onRetry?: (id: string) => void,
@@ -2103,10 +2092,10 @@ export const ChatMessageView = memo(
   const displaySegments = display.segments;
   // Non-code documents created or edited this turn (write_document plus doc
   // edits via edit_file/write_file). Rendered as clickable chips below.
-  const docPaths = useMemo(
-    () => docPathsFromActivities(message.toolActivity),
-    [message.toolActivity],
-  );
+  const docPaths = useMemo(() => {
+    const docs = docPathsFromActivities(message.toolActivity);
+    return dedupDocPaths(docs, message.attachments ?? []);
+  }, [message.toolActivity, message.attachments]);
   // Render cap for the plain (non-segmented) assistant reply. Segmented
   // replies render caption slices around tool cards (small by construction);
   // the full text stays in history/copy regardless.
@@ -2573,7 +2562,11 @@ export const ChatMessageView = memo(
               <ThinkingIndicator startedAt={message.thinkingStartedAt} />
             ) : (
               <ThinkingIndicator
-                label={message.statusText ? `Working · ${message.statusText}` : "Working"}
+                label={(() => {
+                  const lsp = lspStatusLabel(message.lspStatus);
+                  if (lsp) return lsp;
+                  return message.statusText ? `Working · ${message.statusText}` : "Working";
+                })()}
                 startedAt={message.workingStartedAt}
               />
             ))}
@@ -2676,6 +2669,7 @@ export const ChatMessageView = memo(
       a.steerPending === b.steerPending &&
       a.steerInterleaved === b.steerInterleaved &&
       (a as { statusText?: string }).statusText === (b as { statusText?: string }).statusText &&
+      (a as { lspStatus?: unknown }).lspStatus === (b as { lspStatus?: unknown }).lspStatus &&
       a.interrupted === b.interrupted
     );
   },

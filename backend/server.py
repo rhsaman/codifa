@@ -925,6 +925,9 @@ class ChatRequest(BaseModel):
     # Retrieval knobs (auto_index, auto_recall, top_k, include_* toggles).
     # None = backend defaults.
     retrieval_config: dict | None = None
+    # LSP servers config (opencode-style lsp section): per-language
+    # {disabled, command, extensions, env, initialization} plus custom servers.
+    lsp_config: dict = {}
     # Per-subagent model overrides: {"search": "model-id", "web": "...", "vision": "...", "compact": "..."}.
     # Missing / empty dict = use the parent model for every subagent.
     subagent_models: dict = {}
@@ -1114,11 +1117,11 @@ async def app_save(req: StateRequest) -> dict:
     if req.deleted_workspaces:
         state_db.remove_workspace_vectors(req.deleted_workspaces)
         try:
-            from symbol_index import clear_symbol_cache
+            from lsp_manager import shutdown as _lsp_shutdown
 
             for _root in req.deleted_workspaces or []:
                 try:
-                    clear_symbol_cache(str(_root))
+                    _lsp_shutdown(str(_root))
                 except Exception:  # noqa: BLE001, S110 — best-effort
                     pass
         except Exception:  # noqa: BLE001, S110 — best-effort
@@ -1474,6 +1477,13 @@ class GitCheckoutRequest(BaseModel):
     create: bool = False
 
 
+class GitPushRequest(BaseModel):
+    root: str
+    remote: str = "origin"
+    branch: str = ""
+    set_upstream: bool = False
+
+
 class GitAutoCommitRequest(BaseModel):
     root: str
     provider: str = "custom"
@@ -1569,6 +1579,18 @@ async def git_checkout(req: GitCheckoutRequest) -> dict:
     if not req.root or not os.path.isdir(req.root):
         raise HTTPException(status_code=400, detail="invalid project root")
     out = git_tools.git_checkout(req.root, req.branch, req.create)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
+@app.post("/git/push")
+async def git_push(req: GitPushRequest) -> dict:
+    import git_tools
+
+    if not req.root or not os.path.isdir(req.root):
+        raise HTTPException(status_code=400, detail="invalid project root")
+    out = git_tools.git_push(req.root, req.remote, req.branch, req.set_upstream)
     if "error" in out:
         raise HTTPException(status_code=400, detail=out["error"])
     return out
@@ -1952,6 +1974,10 @@ class SkillSyncRequest(BaseModel):
     description: str = ""
     fa_keywords: list[str] = []
     delete: bool = False
+    extra_files: dict | None = None
+    files: dict | None = None
+    deleted_files: list[str] | None = None
+    deletedFiles: list[str] | None = None
 
 
 @app.get("/skills")
@@ -1963,6 +1989,21 @@ async def skills_list() -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"could not read skills: {exc}") from exc
     return {"skills": skills}
+
+
+@app.get("/skills/file")
+async def skills_file(name: str = "", file: str = "") -> dict:
+    import state_db
+
+    if not (name or "").strip() or not (file or "").strip():
+        raise HTTPException(status_code=400, detail="missing skill name or file")
+    try:
+        content = state_db.read_skill_extra_file(name.strip(), file.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"could not read skill file: {exc}") from exc
+    if content is None:
+        raise HTTPException(status_code=404, detail="skill file not found")
+    return {"name": name.strip(), "file": file.strip(), "content": content}
 
 
 @app.post("/skills/sync")
@@ -1990,7 +2031,16 @@ async def skills_sync(req: SkillSyncRequest) -> dict:
             "---\n\n"
             f"# {name}\n"
         )
-    result = persist_skill(content, fallback_name=name, previous_name=req.previous_name, fa_keywords=req.fa_keywords or None)
+    extras = req.extra_files if req.extra_files is not None else req.files
+    deleted = req.deleted_files if req.deleted_files is not None else req.deletedFiles
+    result = persist_skill(
+        content,
+        fallback_name=name,
+        previous_name=req.previous_name,
+        fa_keywords=req.fa_keywords or None,
+        extra_files=extras or None,
+        deleted_files=deleted or None,
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("note", "save failed"))
     return result
@@ -2957,6 +3007,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             vector_db_path=req.vector_db_path,
             vector_config=req.vector_config,
             retrieval_config=req.retrieval_config,
+            lsp_config=req.lsp_config,
             subagent_models=req.subagent_models,
             chat_id=req.chat_id,
             providers=req.providers,
@@ -3238,31 +3289,20 @@ def _open_store(root: str, vector_db_path: str):
     return store
 
 
-@app.get("/code-map")
-async def get_code_map(
+@app.get("/lsp/status")
+async def lsp_status(
     root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
 ) -> dict:
-    """نقشه‌ی زنده‌ی نمادهای پروژه را برای پنل CodeMapPanel برمی‌گرداند.
-
-    خروجی به شکل ``{rel_path: [{name, line, kind}, ...]}`` است؛ هر فایل فقط
-    نمادهای قابل استخراج (تابع، کلاس، متد، struct، enum، ...) را شامل می‌شود.
-    """
-    from symbol_index import build_symbol_map
-
-    if not root or not os.path.isdir(root):
-        raise HTTPException(status_code=404, detail=f"workspace not found: {root}")
+    """Return lazy LSP manager status (opencode-style, started on demand)."""
     try:
-        sym_map = await asyncio.to_thread(build_symbol_map, root)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("code-map build failed for %s: %s", root, exc)
-        raise HTTPException(status_code=500, detail=f"code-map build failed: {exc}") from exc
-    # تبدیل tuple به dict (frontend-friendly) — kind همان مقدار "function"/"class"/...
-    return {
-        rel: [{"name": n, "line": l, "kind": k} for (n, l, k) in syms]
-        for rel, syms in sym_map.items()
-    }
+        from lsp_manager import get_status as _lsp_status
+    except Exception:  # noqa: BLE001 - LSP optional, status degrades gracefully
+        return {"available": False, "servers": {}}
+    try:
+        return await asyncio.to_thread(_lsp_status, root)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("lsp status failed for %s: %s", root, exc)
+        return {"available": False, "error": str(exc)}
 
 
 @app.get("/index/status")

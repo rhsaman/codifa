@@ -20,6 +20,7 @@ import type {
   ThinkingLevel,
   TokenUsage,
   ToolActivity,
+  LspStatus,
   Workspace,
 } from '../types'
 
@@ -72,6 +73,44 @@ export function capCompactedMessages(messages: ChatMessage[]): ChatMessage[] {
   return out
 }
 
+// Persian label for live LSP install/update progress. Shown in the
+// thinking/working row with a loading state so a pause reads as waiting.
+// Returns null when nothing should render (no status or terminal phase).
+// Pure for test.
+export function lspStatusLabel(status: LspStatus | null | undefined): string | null {
+  if (!status) return null
+  if (status.phase === 'done' || status.phase === 'error') return null
+  const lang = (status.language ?? '').trim()
+  const suffix = lang ? ` ${lang}` : ''
+  if (status.phase === 'updating') return `در حال آپدیت LSP${suffix}...`
+  return `در حال نصب LSP${suffix}...`
+}
+
+// Normalize a backend status/tool event into LspStatus. Accepts the
+// {kind:"status",stage:"lsp"} shape and lsp_* tool activity with an
+// installing/updating summary. Returns null when the event is not LSP
+// progress. Pure for test.
+export function lspStatusFromEvent(ev: {
+  stage?: string
+  tool?: string
+  status?: string
+  summary?: string
+  content?: string
+  language?: string
+}): LspStatus | null {
+  const stage = (ev.stage ?? '').trim().toLowerCase()
+  const tool = (ev.tool ?? '').trim().toLowerCase()
+  const isLsp = stage === 'lsp' || tool === 'lsp' || tool.startsWith('lsp_')
+  if (!isLsp) return null
+  const text = `${ev.summary ?? ''} ${ev.content ?? ''} ${ev.status ?? ''}`.toLowerCase()
+  const updating = text.includes('updat') || text.includes('آپدیت') || text.includes('به‌روزرسانی') || text.includes('بروز')
+  const done = text.includes('done') || text.includes('complete') || ev.status === 'done'
+  const failed = text.includes('fail') || text.includes('error') || ev.status === 'error'
+  if (failed) return { phase: 'error', language: ev.language }
+  if (done) return { phase: 'done', language: ev.language }
+  return { phase: updating ? 'updating' : 'installing', language: ev.language }
+}
+
 // Strip transient, in-memory-only fields from messages AND chats before
 // persisting so they never reappear after a restart (e.g. the rate-limit retry
 // banner, or a stale ask/permission popup whose agent is long gone).
@@ -94,6 +133,7 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
         if (msg.streaming) msg.interrupted = true
         delete msg.streaming
         delete msg.thinking
+        delete msg.lspStatus
         // Keep toolActivity (trimmed) so tool cards survive a restart — it was
         // previously stripped as transient, which is why tool calls vanished
         // after any reload, not just after a power cut.
@@ -147,6 +187,33 @@ function trimPersistImageValue(v: unknown): unknown {
     }
   }
   return v
+}
+
+/** Validate a base64 image data URL, returning a clean version or null.
+ *  Drops truncated payloads (persisted snapshots cut with '…'), whitespace,
+ *  and non-base64 chars; repairs missing padding. Never throws. */
+export function sanitizeImageDataUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const s = value.trim()
+  if (!s.startsWith('data:')) return null
+  if (s.includes('\u2026')) return null
+  const comma = s.indexOf(',')
+  if (comma < 0) return null
+  const head = s.slice(0, comma)
+  let payload = s.slice(comma + 1).replace(/\s+/g, '')
+  if (!payload) return null
+  if (!/;base64/i.test(head)) {
+    return head.startsWith('data:image/') ? null : s
+  }
+  if (/[^A-Za-z0-9+/=]/.test(payload)) return null
+  if (payload.length % 4 === 1) return null
+  payload += '='.repeat((4 - (payload.length % 4)) % 4)
+  try {
+    atob(payload)
+  } catch {
+    return null
+  }
+  return `${head},${payload}`
 }
 
 function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
@@ -565,7 +632,7 @@ function persistTerminalFullscreen(v: boolean): void {
 }
 
 // Lightweight debounced write for panel visibility toggles (sidebar / right
-// panel / code-map). A toggle must feel instant: it only flips a boolean in
+// panel). A toggle must feel instant: it only flips a boolean in
 // memory and schedules a settings-only write in the background — never the
 // heavy full snapshot (sanitizeChats over every message + AES encryption +
 // chats IPC) on the keydown path. Chats are untouched by a toggle, so there
@@ -601,8 +668,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -687,7 +754,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -703,7 +770,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, codeMapPanelOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -856,8 +923,7 @@ interface State {
   dir: 'rtl' | 'ltr'
   recentModels: RecentModel[]
   sidebarOpen: boolean
-  codeMapPanelOpen: boolean
-  /** پنل راست داک‌شده (تودوها + بخش‌های آینده) — مثل sidebarOpen persisted می‌شود. */
+  /** Docked right panel (todos + future sections) — persisted like sidebarOpen. */
   rightPanelOpen: boolean
   /** Bottom terminal panel (Cmd/Ctrl+J). Persisted in localStorage like
    *  chatFullscreen, NOT in the settings payload. Sessions survive hiding. */
@@ -955,8 +1021,6 @@ interface State {
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
   toggleSidebar: () => void
-  setCodeMapPanelOpen: (open: boolean) => void
-  toggleCodeMapPanel: () => void
   setRightPanelOpen: (open: boolean) => void
   toggleRightPanel: () => void
   setTerminalPanelOpen: (open: boolean) => void
@@ -1357,7 +1421,6 @@ export const useStore = create<State>((set, get) => ({
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
-  codeMapPanelOpen: false,
   rightPanelOpen: false,
   terminalPanelOpen: typeof window !== 'undefined' ? loadTerminalPanel() : false,
   terminalFullscreen: typeof window !== 'undefined' ? loadTerminalFullscreen() : false,
@@ -1737,7 +1800,6 @@ export const useStore = create<State>((set, get) => ({
       searchConsole: migratedSc,
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
-      codeMapPanelOpen: raw.codeMapPanelOpen === true,
       rightPanelOpen: raw.rightPanelOpen === true,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
@@ -2260,16 +2322,6 @@ export const useStore = create<State>((set, get) => ({
   toggleSidebar: () => {
     const next = !get().sidebarOpen
     get().setSidebarOpen(next)
-  },
-
-  setCodeMapPanelOpen: (codeMapPanelOpen) => {
-    set({ codeMapPanelOpen })
-    persistPanelsSoon()
-  },
-
-  toggleCodeMapPanel: () => {
-    const next = !get().codeMapPanelOpen
-    get().setCodeMapPanelOpen(next)
   },
 
   setRightPanelOpen: (rightPanelOpen) => {

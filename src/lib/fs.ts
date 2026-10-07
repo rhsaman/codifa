@@ -58,7 +58,7 @@ export const api = {
     window.coder.onMigrateProgress(cb),
   openFileExternal: async (
     absPath: string,
-    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp',
+    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp' | 'default',
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
       const fn = (window as unknown as { coder?: { openFileExternal?: unknown } }).coder?.openFileExternal

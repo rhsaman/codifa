@@ -60,3 +60,17 @@ async def test_repeat_grep_reserves_full_content(tmp_path):
     assert "MATCHES for" in out1, out1
     out2 = await cbs["grep"]("marker", path="")
     assert "MATCHES for" in out2 and "marker" in out2, out2
+
+
+async def test_update_plan_result_reminds_batching_until_final(tmp_path):
+    # Non-final ticks must carry the batch reminder (no extra round-trip);
+    # the final tick has no next work, so it stays clean.
+    cbs = _cbs(str(tmp_path))
+    mid = await cbs["update_plan"](
+        [{"content": "do the thing", "status": "in_progress"}]
+    )
+    assert "batch" in mid.lower(), mid
+    final = await cbs["update_plan"](
+        [{"content": "do the thing", "status": "completed"}]
+    )
+    assert "batch" not in final.lower(), final

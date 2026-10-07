@@ -576,6 +576,106 @@ def _find_skill_dir(name_or_slug: str) -> str | None:
     return None
 
 
+def _sanitize_skill_extra_filename(filename: str) -> str | None:
+    """Validate an extra skill file name. Returns the safe basename or None."""
+    raw = str(filename or "").strip().strip("/\\")
+    if not raw or raw.casefold() == "skill.md":
+        return None
+    if "/" in raw or "\\" in raw or raw in (".", ".."):
+        return None
+    base = os.path.basename(raw)
+    if not base or base.startswith(".") or base != raw:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", base):
+        return None
+    return base
+
+
+def list_skill_files(name_or_slug: str) -> list[str]:
+    """List extra file names inside a skill folder (excludes skill.md)."""
+    d = _find_skill_dir(name_or_slug)
+    if not d or not os.path.isdir(d):
+        return []
+    out: list[str] = []
+    try:
+        for entry in sorted(os.listdir(d)):
+            if entry.casefold() == "skill.md":
+                continue
+            p = os.path.join(d, entry)
+            if not os.path.isfile(p):
+                continue
+            if _sanitize_skill_extra_filename(entry) is None:
+                continue
+            out.append(entry)
+    except OSError:
+        return []
+    return out
+
+
+def write_skill_extra_files(slug: str, files: dict | None) -> list[str]:
+    """Write extra files into skills/<slug>/ alongside skill.md."""
+    if not files or not isinstance(files, dict):
+        return []
+    slug = str(slug or "").strip()
+    if not slug:
+        return []
+    written: list[str] = []
+    with _LOCK:
+        d = _skill_dir(slug)
+        os.makedirs(d, exist_ok=True)
+        for filename, content in files.items():
+            safe = _sanitize_skill_extra_filename(str(filename or ""))
+            if not safe:
+                continue
+            _atomic_write(os.path.join(d, safe), str(content or ""))
+            written.append(safe)
+    if written:
+        invalidate_skills_cache()
+    return sorted(written)
+
+
+def read_skill_extra_file(name_or_slug: str, filename: str) -> str | None:
+    """Read one extra skill file. Returns None when missing or invalid."""
+    safe = _sanitize_skill_extra_filename(filename)
+    if not safe:
+        return None
+    d = _find_skill_dir(name_or_slug)
+    if not d:
+        return None
+    p = os.path.join(d, safe)
+    if os.path.dirname(os.path.abspath(p)) != os.path.abspath(d):
+        return None
+    try:
+        if not os.path.isfile(p):
+            return None
+        with open(p, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def delete_skill_extra_file(name_or_slug: str, filename: str) -> bool:
+    """Delete one extra skill file (never skill.md). True when removed."""
+    safe = _sanitize_skill_extra_filename(filename)
+    if not safe:
+        return False
+    with _LOCK:
+        d = _find_skill_dir(name_or_slug)
+        if not d:
+            return False
+        p = os.path.join(d, safe)
+        if os.path.dirname(os.path.abspath(p)) != os.path.abspath(d):
+            return False
+        try:
+            if not os.path.isfile(p):
+                return False
+            os.remove(p)
+        except OSError:
+            return False
+        invalidate_skills_cache()
+        return True
+
+
 def save_skill(
     name: str,
     slug: str,
@@ -588,6 +688,7 @@ def save_skill(
     The frontmatter carries ``name``/``slug``/``description``/``fa_keywords``. The rest of
     the file is the skill body. An empty ``slug`` falls back to the slugified
     name and then to a stable hash, so distinct names never share a folder.
+    Only skill.md is rewritten here; extra files in the skill folder are kept.
     """
     with _LOCK:
         _migrate_legacy_db()
@@ -643,7 +744,7 @@ def invalidate_skills_cache() -> None:
 
 
 def list_skills() -> list[dict]:
-    """Return all skills as ``{name, slug, description, path, content, fa_keywords}``.
+    """Return all skills as ``{name, slug, description, path, content, fa_keywords, files}``.
 
     Cached until the skills folder fingerprint changes; internal writers
     (save_skill/delete_skill) invalidate the cache so changes appear at once."""
@@ -677,6 +778,19 @@ def _list_skills_uncached() -> list[dict]:
                 end = body.find("\n---", 3)
                 if end != -1:
                     body = body[end + 4:].lstrip("\n")
+            extras: list[str] = []
+            try:
+                for entry in sorted(os.listdir(d)):
+                    if entry.casefold() == "skill.md":
+                        continue
+                    ep = os.path.join(d, entry)
+                    if not os.path.isfile(ep):
+                        continue
+                    if _sanitize_skill_extra_filename(entry) is None:
+                        continue
+                    extras.append(entry)
+            except OSError:
+                extras = []
             out.append(
                 {
                     "name": name or entry,
@@ -685,6 +799,7 @@ def _list_skills_uncached() -> list[dict]:
                     "path": f"file://{md}",
                     "content": body,
                     "fa_keywords": fa_keywords,
+                    "files": extras,
                 }
             )
     return out

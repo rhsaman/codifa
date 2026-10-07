@@ -18,7 +18,6 @@ import pytest
 import graph
 from agents import (
     _PROJECT_MEMORY_MAX_BYTES,
-    _SMALL_CTX_CODE_MAP_TOKENS,
     _SMALL_CTX_PROJECT_MEMORY_MAX,
     _SMALL_CTX_RAG_MAX_CHARS,
     _SMALL_CTX_THRESHOLD,
@@ -147,7 +146,6 @@ def test_read_project_memory_missing_file_returns_empty():
 def test_small_ctx_constants_are_reasonable():
     """ثابت‌ها باید مقدار معقول داشته باشند (نه صفر، نه بیشتر از نسخهٔ عادی)."""
     assert 0 < _SMALL_CTX_THRESHOLD <= 200_000
-    assert 0 < _SMALL_CTX_CODE_MAP_TOKENS <= 1024
     assert _SMALL_CTX_RAG_MAX_CHARS < 3_600
     assert _SMALL_CTX_TOOL_OUTPUT_MAX < 2_000
     assert _SMALL_CTX_PROJECT_MEMORY_MAX < _PROJECT_MEMORY_MAX_BYTES

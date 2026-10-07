@@ -190,6 +190,29 @@ def test_docx_style_whole_document(tmp_path):
     assert all(
         r._element.rPr.rFonts.get(qn("w:cs")) == "Vazirmatn" for r in runs
     )
+    # Size/bold must mirror into the complex-script slots too — Word reads
+    # w:szCs/w:bCs for RTL text while the HTML preview reads w:sz/w:b.
+    assert all(
+        r._element.rPr.find(qn("w:szCs")) is not None
+        and r._element.rPr.find(qn("w:szCs")).get(qn("w:val")) == "28"
+        for r in runs
+    )
+    assert all(r._element.rPr.find(qn("w:bCs")) is not None for r in runs)
+
+
+def test_docx_style_string_bold_coerced(tmp_path):
+    from docx import Document
+
+    p = str(tmp_path / "b.docx")
+    create_document(p, "hello")
+    # The model sometimes sends 'true'/'True' strings instead of JSON booleans.
+    out = style_document(p, size=8, bold="true")  # type: ignore[arg-type]
+    assert "styled" in out
+    doc = Document(p)
+    runs = [r for para in doc.paragraphs for r in para.runs if r.text.strip()]
+    assert runs and all(r.font.bold for r in runs)
+    out2 = style_document(p, bold="True")  # type: ignore[arg-type]
+    assert "styled" in out2
 
 
 def test_docx_style_with_find_filter(tmp_path):

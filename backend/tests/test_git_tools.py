@@ -184,3 +184,105 @@ def test_checkout_create_and_switch(repo):
     assert "feature/x" in st["branches"]
     out = git_tools.git_checkout(repo, "--bad")
     assert "error" in out
+
+
+def _add_bare_remote(repo, tmp_path, name="origin"):
+    """Create a local bare repo and register it as a remote. No network."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", name, str(bare)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    return str(bare)
+
+
+def test_push_to_local_bare_repo(repo, tmp_path):
+    bare = _add_bare_remote(repo, tmp_path)
+    out = git_tools.git_push(repo)
+    assert out.get("pushed") is True, out
+    assert out["remote"] == "origin"
+    assert out["branch"]
+    # Remote now holds the same HEAD as the local repo.
+    local = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    remote = subprocess.run(
+        ["git", "--git-dir", bare, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert local and local == remote
+
+
+def test_push_explicit_branch_with_upstream(repo, tmp_path):
+    _add_bare_remote(repo, tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/push-me"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    with open(os.path.join(repo, "p.txt"), "w") as f:
+        f.write("push me\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "push me"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    out = git_tools.git_push(
+        repo, remote="origin", branch="feature/push-me", set_upstream=True
+    )
+    assert out.get("pushed") is True, out
+    assert out["branch"] == "feature/push-me"
+
+
+def test_push_rejects_bad_remote_and_branch(repo):
+    out = git_tools.git_push(repo, remote="https://evil.example/r.git")
+    assert "error" in out
+    out = git_tools.git_push(repo, remote="--upload-pack=evil")
+    assert "error" in out
+    out = git_tools.git_push(repo, remote="origin; rm -rf /")
+    assert "error" in out
+    out = git_tools.git_push(repo, branch="--bad")
+    assert "error" in out
+    out = git_tools.git_push(repo, branch="evil; rm")
+    assert "error" in out
+
+
+def test_push_not_a_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
+    out = git_tools.git_push(str(tmp_path))
+    assert "error" in out
+
+
+def test_push_uses_list_argv_without_shell(repo, tmp_path, monkeypatch):
+    _add_bare_remote(repo, tmp_path)
+    calls = []
+    real_run = subprocess.run
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(git_tools.subprocess, "run", fake_run)
+    out = git_tools.git_push(repo)
+    assert out.get("pushed") is True, out
+    assert calls
+    for argv, kwargs in calls:
+        assert isinstance(argv, list)
+        assert argv[0] == "git"
+        assert kwargs.get("shell") in (None, False)

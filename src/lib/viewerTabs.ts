@@ -52,6 +52,13 @@ export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
   })
 }
 
+/** True when the viewer tab-list has anything to show inline (visible open
+ *  tabs or recently closed tabs). Pure, for the empty-state fallback. */
+export function hasViewerTabListEntries(tabs: ViewerTab[], closedTabs: ClosedViewerTab[], chatId: string): boolean {
+  if (closedTabs.length > 0) return true
+  return visibleTabs(tabs, chatId).length > 0
+}
+
 export interface ViewerTab {
   id: string
   kind: ViewerKind

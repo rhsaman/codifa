@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
-import { cancelModelDownload, downloadModel, getModelsStatus, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
+import { cancelModelDownload, downloadModel, getModelsStatus, getSkillFile, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
@@ -793,9 +793,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
-  const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string }>>([])
+  const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string; files: string[] }>>([])
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
   const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
+  // Extra (Codex-style) files per skill key: filename -> content to upsert.
+  const [skillExtraFiles, setSkillExtraFiles] = useState<Record<string, Record<string, string>>>({})
+  // Extra files marked for deletion per skill key.
+  const [skillDeletedFiles, setSkillDeletedFiles] = useState<Record<string, string[]>>({})
+  // Currently viewed/edited extra file per skill key ('' = main skill.md).
+  const [skillActiveFile, setSkillActiveFile] = useState<Record<string, string>>({})
+  // Extra file currently being fetched per skill key (shows a loading hint).
+  const [skillFileLoading, setSkillFileLoading] = useState<Record<string, string>>({})
+  // New-file name input per skill key.
+  const [skillNewFileName, setSkillNewFileName] = useState<Record<string, string>>({})
   const [skillsMsg, setSkillsMsg] = useState('')
   const [skillFilter, setSkillFilter] = useState('')
   const [mcpFilter, setMcpFilter] = useState('')
@@ -804,7 +814,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const reloadSkills = useCallback(async (preferName?: string) => {
     const rows = await listSkills()
-    const found = rows.map((r) => ({ name: r.name, path: r.path, raw: r.content }))
+    const found = rows.map((r) => ({ name: r.name, path: r.path, raw: r.content, files: r.files ?? [] }))
     setSkills(found)
     setSkillDrafts((prev) => {
       const names = new Set(found.map((f) => f.name))
@@ -840,6 +850,28 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setSkillsMsg('')
   }
 
+  const getSkillServerFiles = (key: string): string[] => {
+    if (key === NEW_SKILL_KEY) return []
+    return skills.find((x) => x.name === key)?.files ?? []
+  }
+
+  const getSkillVisibleFiles = (key: string): string[] => {
+    const server = getSkillServerFiles(key)
+    const deleted = new Set(skillDeletedFiles[key] ?? [])
+    const local = Object.keys(skillExtraFiles[key] ?? {})
+    const merged = [...server.filter((f) => !deleted.has(f))]
+    for (const f of local) if (!merged.includes(f)) merged.push(f)
+    return merged.sort()
+  }
+
+  const sanitizeSkillFileName = (raw: string): string => {
+    const v = raw.trim()
+    if (!v || v === 'SKILL.md' || v === 'skill.md') return ''
+    if (v.includes('/') || v.includes('\\') || v.includes('..') || v.startsWith('.')) return ''
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v)) return ''
+    return v
+  }
+
   const saveSkill = async (name: string) => {
     const content = skillDrafts[name] ?? ''
     if (!content.trim()) {
@@ -848,29 +880,134 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
     const newName = resolveSkillName(content, name)
     const normalized = withSkillName(content, newName)
+    const extra = skillExtraFiles[name] ?? {}
+    const extraNames = Object.keys(extra)
+    const deleted = (skillDeletedFiles[name] ?? []).filter((f) => !extraNames.includes(f))
     const res = await syncSkill({
       name: newName,
       previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
       content: normalized,
+      ...(extraNames.length > 0 ? { files: extra } : {}),
+      ...(deleted.length > 0 ? { deletedFiles: deleted } : {}),
     })
     setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
     if (res.ok) {
       const savedName = res.name || newName
+      const renamed = name === NEW_SKILL_KEY || name !== savedName
       setSkillDrafts((prev) => {
         const next = { ...prev }
-        if (name !== NEW_SKILL_KEY && name !== savedName) delete next[name]
+        if (renamed) delete next[name]
         next[savedName] = normalized
         return next
       })
       setExpandedSkills((prev) => {
         const next = new Set(prev)
-        if (name === NEW_SKILL_KEY || name !== savedName) next.delete(name)
+        if (renamed) next.delete(name)
         next.add(savedName)
         return next
       })
+      // Move extra-file state to the saved name so renames keep edits.
+      if (renamed) {
+        setSkillExtraFiles((prev) => {
+          if (prev[name] === undefined) return prev
+          const next = { ...prev }
+          delete next[name]
+          next[savedName] = prev[name]
+          return next
+        })
+        setSkillDeletedFiles((prev) => {
+          if (prev[name] === undefined) return prev
+          const next = { ...prev }
+          delete next[name]
+          next[savedName] = prev[name]
+          return next
+        })
+        setSkillActiveFile((prev) => {
+          if (prev[name] === undefined) return prev
+          const next = { ...prev }
+          delete next[name]
+          next[savedName] = prev[name]
+          return next
+        })
+        setSkillNewFileName((prev) => {
+          if (prev[name] === undefined) return prev
+          const next = { ...prev }
+          delete next[name]
+          return next
+        })
+      } else {
+        // Saved in place: clear deletion markers that were applied.
+        setSkillDeletedFiles((prev) => {
+          if (prev[name] === undefined) return prev
+          const next = { ...prev }
+          delete next[name]
+          return next
+        })
+      }
       void reloadSkills(savedName)
       invalidateSkillsList()
     }
+  }
+
+  const selectSkillFile = (key: string, fileName: string) => {
+    const cur = skillActiveFile[key] ?? ''
+    const next = cur === fileName ? '' : fileName
+    setSkillActiveFile((prev) => ({ ...prev, [key]: next }))
+    if (!next) return
+    // Server files have no local content yet — fetch once so the editor shows real text.
+    const local = skillExtraFiles[key]?.[next]
+    if (local !== undefined) return
+    if (key === NEW_SKILL_KEY) return
+    if (!getSkillServerFiles(key).includes(next)) return
+    setSkillFileLoading((prev) => ({ ...prev, [key]: next }))
+    void getSkillFile(key, next).then((content) => {
+      setSkillFileLoading((prev) => (prev[key] === next ? { ...prev, [key]: '' } : prev))
+      if (content === null) {
+        setSkillsMsg(`Could not load ${next}.`)
+        setSkillActiveFile((prev) => (prev[key] === next ? { ...prev, [key]: '' } : prev))
+        return
+      }
+      setSkillExtraFiles((prev) => {
+        if (prev[key]?.[next] !== undefined) return prev
+        return { ...prev, [key]: { ...(prev[key] ?? {}), [next]: content } }
+      })
+    })
+  }
+
+  const addSkillFile = (key: string) => {
+    const fileName = sanitizeSkillFileName(skillNewFileName[key] ?? '')
+    if (!fileName) {
+      setSkillsMsg('Invalid file name. Use letters, numbers, dot, dash or underscore (e.g. notes.md).')
+      return
+    }
+    if (getSkillVisibleFiles(key).includes(fileName)) {
+      setSkillActiveFile((prev) => ({ ...prev, [key]: fileName }))
+      setSkillsMsg('')
+      return
+    }
+    setSkillExtraFiles((prev) => ({ ...prev, [key]: { ...(prev[key] ?? {}), [fileName]: '' } }))
+    setSkillDeletedFiles((prev) => ({ ...prev, [key]: (prev[key] ?? []).filter((f) => f !== fileName) }))
+    setSkillActiveFile((prev) => ({ ...prev, [key]: fileName }))
+    setSkillNewFileName((prev) => ({ ...prev, [key]: '' }))
+    setSkillsMsg('')
+  }
+
+  const removeSkillFile = (key: string, fileName: string) => {
+    setSkillExtraFiles((prev) => {
+      const cur = prev[key] ?? {}
+      if (cur[fileName] === undefined) return prev
+      const nextFiles = { ...cur }
+      delete nextFiles[fileName]
+      return { ...prev, [key]: nextFiles }
+    })
+    if (getSkillServerFiles(key).includes(fileName)) {
+      setSkillDeletedFiles((prev) => {
+        const cur = prev[key] ?? []
+        if (cur.includes(fileName)) return prev
+        return { ...prev, [key]: [...cur, fileName] }
+      })
+    }
+    setSkillActiveFile((prev) => (prev[key] === fileName ? { ...prev, [key]: '' } : prev))
   }
 
   const deleteSkill = async (name: string) => {
@@ -884,6 +1021,31 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         return next
       })
       setSkillDrafts((prev) => {
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
+      // Drop cached extra-file state for the deleted skill.
+      setSkillExtraFiles((prev) => {
+        if (prev[name] === undefined) return prev
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
+      setSkillDeletedFiles((prev) => {
+        if (prev[name] === undefined) return prev
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
+      setSkillActiveFile((prev) => {
+        if (prev[name] === undefined) return prev
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
+      setSkillNewFileName((prev) => {
+        if (prev[name] === undefined) return prev
         const next = { ...prev }
         delete next[name]
         return next
@@ -1895,7 +2057,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <span className="skill-chevron open">▶</span>
                       <span className="skill-card-name">New skill</span>
                     </div>
-                    <div className="skill-card-body">
+                    <div className="skill-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12, overflow: 'visible' }}>
                       <textarea
                         className="system-prompt skill-raw"
                         value={skillDrafts[NEW_SKILL_KEY] ?? ''}
@@ -1905,6 +2067,25 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         rows={12}
                         dir="ltr"
                         spellCheck={false}
+                      />
+                      <SkillFilesEditor
+                        serverFiles={[]}
+                        extraFiles={skillExtraFiles[NEW_SKILL_KEY] ?? {}}
+                        deletedFiles={skillDeletedFiles[NEW_SKILL_KEY] ?? []}
+                        activeFile={skillActiveFile[NEW_SKILL_KEY] ?? ''}
+                        newFileName={skillNewFileName[NEW_SKILL_KEY] ?? ''}
+                        onSelect={(f) => selectSkillFile(NEW_SKILL_KEY, f)}
+                        onContentChange={(f, v) =>
+                          setSkillExtraFiles((prev) => ({
+                            ...prev,
+                            [NEW_SKILL_KEY]: { ...(prev[NEW_SKILL_KEY] ?? {}), [f]: v },
+                          }))
+                        }
+                        onNewFileNameChange={(v) =>
+                          setSkillNewFileName((prev) => ({ ...prev, [NEW_SKILL_KEY]: v }))
+                        }
+                        onAdd={() => addSkillFile(NEW_SKILL_KEY)}
+                        onRemove={(f) => removeSkillFile(NEW_SKILL_KEY, f)}
                       />
                       <div className="prompt-actions">
                         <span className="hint">{skillsMsg}</span>
@@ -1939,7 +2120,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                           {desc && <span className="skill-card-desc">{desc}</span>}
                         </div>
                         {isOpen && (
-                          <div className="skill-card-body">
+                          <div className="skill-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12, overflow: 'visible' }}>
                             <textarea
                               className="system-prompt skill-raw"
                               value={skillDrafts[s.name] ?? s.raw}
@@ -1949,6 +2130,25 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                               rows={12}
                               dir="ltr"
                               spellCheck={false}
+                            />
+                            <SkillFilesEditor
+                              serverFiles={s.files ?? []}
+                              extraFiles={skillExtraFiles[s.name] ?? {}}
+                              deletedFiles={skillDeletedFiles[s.name] ?? []}
+                              activeFile={skillActiveFile[s.name] ?? ''}
+                              newFileName={skillNewFileName[s.name] ?? ''}
+                              onSelect={(f) => selectSkillFile(s.name, f)}
+                              onContentChange={(f, v) =>
+                                setSkillExtraFiles((prev) => ({
+                                  ...prev,
+                                  [s.name]: { ...(prev[s.name] ?? {}), [f]: v },
+                                }))
+                              }
+                              onNewFileNameChange={(v) =>
+                                setSkillNewFileName((prev) => ({ ...prev, [s.name]: v }))
+                              }
+                              onAdd={() => addSkillFile(s.name)}
+                              onRemove={(f) => removeSkillFile(s.name, f)}
                             />
                             <div className="prompt-actions">
                               <span className="hint">{skillsMsg}</span>
@@ -2657,6 +2857,101 @@ function ModelStatusCard({
           </button>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ---- Skill extra files (Codex-style) --------------------------------------- //
+
+/** Editor for a skill's supporting files (everything besides SKILL.md). */
+function SkillFilesEditor({
+  serverFiles,
+  extraFiles,
+  deletedFiles,
+  activeFile,
+  newFileName,
+  onSelect,
+  onContentChange,
+  onNewFileNameChange,
+  onAdd,
+  onRemove,
+}: {
+  serverFiles: string[]
+  extraFiles: Record<string, string>
+  deletedFiles: string[]
+  activeFile: string
+  newFileName: string
+  onSelect: (file: string) => void
+  onContentChange: (file: string, content: string) => void
+  onNewFileNameChange: (value: string) => void
+  onAdd: () => void
+  onRemove: (file: string) => void
+}) {
+  const deleted = new Set(deletedFiles)
+  const visible = [...serverFiles.filter((f) => !deleted.has(f))]
+  for (const f of Object.keys(extraFiles)) if (!visible.includes(f)) visible.push(f)
+  visible.sort()
+  const activeContent = activeFile ? extraFiles[activeFile] : null
+  const loading = activeFile !== '' && activeContent === undefined && !deleted.has(activeFile)
+  return (
+    <div className="skill-files" style={{ marginTop: 12, padding: 12, borderRadius: 10, border: '1px solid rgba(255,255,255,0.08)', background: 'rgba(255,255,255,0.02)', clear: 'both' }}>
+      <div className="field-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+        <label>Extra files</label>
+      </div>
+      {visible.length === 0 ? (
+        <div className="hint">Single-file skill (only skill.md). Add a supporting file below, e.g. notes.md.</div>
+      ) : (
+        <div className="skill-file-list" style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+          {visible.map((f) => (
+            <div key={f} className={`skill-file-row ${f === activeFile ? 'active' : ''}`} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button
+                className="btn tiny"
+                onClick={() => onSelect(f)}
+                title="View/edit file content"
+                style={f === activeFile ? { borderColor: 'var(--accent)' } : undefined}
+              >
+                {f}
+              </button>
+              <button className="btn tiny danger" onClick={() => onRemove(f)} title="Remove file">
+                Delete
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {activeFile && activeContent !== null && !deleted.has(activeFile) && (
+        <div className="skill-file-editor" style={{ marginTop: 8 }}>
+          <label className="field-label">{activeFile}</label>
+          {loading ? (
+            <div className="hint">Loading {activeFile}…</div>
+          ) : (
+            <textarea
+              className="system-prompt skill-raw"
+              value={activeContent ?? ''}
+              onChange={(e) => onContentChange(activeFile, e.target.value)}
+              rows={8}
+              dir="ltr"
+              spellCheck={false}
+              placeholder="File content..."
+              style={{ width: '100%' }}
+            />
+          )}
+        </div>
+      )}
+      <div className="skill-file-add" style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+        <input
+          value={newFileName}
+          onChange={(e) => onNewFileNameChange(e.target.value)}
+          placeholder="e.g. notes.md"
+          dir="ltr"
+          spellCheck={false}
+          style={{ flex: 1 }}
+          onKeyDown={(e) => { if (e.key === 'Enter') onAdd() }}
+        />
+        <button className="btn tiny" onClick={onAdd} disabled={!newFileName.trim()}>
+          + Add file
+        </button>
+      </div>
     </div>
   )
 }

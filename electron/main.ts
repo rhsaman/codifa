@@ -770,6 +770,24 @@ function registerIpc(): void {
     })
     if (!abs || !path.isAbsolute(abs)) return { ok: false, error: 'Not an absolute path.' }
     try {
+      if (which === 'default') {
+        // Office documents and PDFs open in the OS-associated app
+        // (Word for doc/docx, Excel for xls/xlsx/xlsm, default viewer for pdf).
+        if (process.platform === 'darwin') {
+          const lower = abs.toLowerCase()
+          if (lower.endsWith('.doc') || lower.endsWith('.docx')) {
+            if (await runCli('open', ['-a', 'Microsoft Word', abs], 8000)) return { ok: true }
+          } else if (
+            lower.endsWith('.xls') ||
+            lower.endsWith('.xlsx') ||
+            lower.endsWith('.xlsm')
+          ) {
+            if (await runCli('open', ['-a', 'Microsoft Excel', abs], 8000)) return { ok: true }
+          }
+        }
+        const err = await shell.openPath(abs)
+        return err ? fail(err) : { ok: true }
+      }
       if (which === 'vscode') {
         // 1) `code` CLI on PATH.
         if (await spawnDetached('code', [abs])) return { ok: true }

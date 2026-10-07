@@ -141,9 +141,7 @@ export interface Settings {
   compact?: boolean
   recentModels?: RecentModel[]
   sidebarOpen?: boolean
-  /** پنل code map سمت راست (Ctrl+O) باز باشد یا نه — مثل sidebarOpen persisted می‌شود. */
-  codeMapPanelOpen?: boolean
-  /** پنل راست داک‌شده (تودوها + بخش‌های آینده) — مثل sidebarOpen persisted می‌شود. */
+  /** Docked right panel (todos + future sections) — persisted like sidebarOpen. */
   rightPanelOpen?: boolean
   /** Directory for the per-workspace RAG vector store (memory + web chunks).
    *  Empty string = default ({dataPath}/vector-db). */
@@ -406,6 +404,9 @@ export interface ChatMessage {
    *  model). Cleared on first real text/tool/thinking content. Never persisted
    *  as model history. */
   statusText?: string
+  /** Live LSP install/update progress shown in the thinking/working row with a
+   *  loading state so a pause reads as waiting, not stuck. Cleared on turn end. */
+  lspStatus?: LspStatus
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
@@ -540,8 +541,21 @@ export interface TraceEntry {
   result?: string
 }
 
+export type LspProgressPhase = 'installing' | 'updating' | 'done' | 'error'
+
+/** Live LSP install/update progress for one assistant message. Kept on the
+ *  message so the thinking/working row can explain a pause (server install
+ *  blocks tool results). Transient: never sent as model history. */
+export interface LspStatus {
+  phase: LspProgressPhase
+  language?: string
+  message?: string
+}
+
 export interface SidecarEvent {
   kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive'
+  /** Status stage (e.g. 'lsp' for language-server install/update progress). */
+  stage?: string
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -648,18 +662,6 @@ export interface SidecarEvent {
    *  (which slowed the UI); the frontend uses it to glow the composer. */
   active?: boolean
 }
-
-/** یک نماد استخراج‌شده از فایل (تابع، کلاس، متد، struct، enum، ...) — خروجی
- *  مستقیم endpoint بک‌اند `GET /code-map`. */
-export interface CodeSymbol {
-  name: string
-  line: number
-  /** "function" | "class" | "method" | "struct" | "enum" | "interface" | ... */
-  kind: string
-}
-
-/** نقشه‌ی کامل یک پروژه: مسیر نسبی فایل → لیست نمادهایش. */
-export type CodeMap = Record<string, CodeSymbol[]>
 
 /** یک تسک زمان‌بندی‌شده (مثل Codex): پرامپت + تکرار کرون + اجرای پس‌زمینه. */
 export interface ScheduledTask {

@@ -153,9 +153,9 @@ def test_no_discover_word_in_prompts():
 
 
 def test_search_rule_requires_targeted_order():
-    """_SEARCH_RULE must enforce CODE MAP first, scoped grep, symbol read, stop rule."""
+    """_SEARCH_RULE must enforce LSP-first (coder) / scoped grep, symbol read, stop rule."""
     rule = agents._SEARCH_RULE
-    assert "CODE MAP" in rule
+    assert "LSP" in rule
     assert "SCOPE" in rule
     assert "symbols=[...]" in rule
     assert "2-3 search batches" in rule
@@ -163,9 +163,9 @@ def test_search_rule_requires_targeted_order():
 
 
 def test_coder_prompt_requires_targeted_search():
-    """Coder prompt must require CODE MAP first and SCOPE-limited search."""
+    """Coder prompt must require LSP first and SCOPE-limited search."""
     coder = agents.SYSTEM_PROMPTS["coder"]
-    assert "CODE MAP" in coder
+    assert "LSP" in coder
     assert "SCOPE" in coder
     assert "symbols=[...]" in coder
     assert "2-3 search batches" in coder
@@ -179,7 +179,7 @@ def test_graph_pins_scope_for_coder():
     text = pathlib.Path(__file__).resolve().parent.parent.joinpath("graph.py").read_text(encoding="utf-8")
     assert "TARGETED SEARCH (CODER)" in text
     assert "Search ONLY within them" in text
-    assert "CODE MAP" in text
+    assert "LSP" in text
     assert "2-3 search batches" in text
 
 
@@ -197,12 +197,12 @@ def test_plan_file_paths_extracts_files_line():
 
 
 def test_tool_docstrings_require_scope():
-    """grep/glob/read docstrings must require SCOPE-limited, CODE MAP-first search."""
+    """grep/glob/read docstrings must require SCOPE-limited, LSP-first search."""
     import pathlib
 
     text = pathlib.Path(__file__).resolve().parent.parent.joinpath("tools.py").read_text(encoding="utf-8")
     assert text.count("SCOPE (ONLY THESE FILES)") >= 3
-    assert "CODE MAP first" in text
+    assert "LSP first" in text
     assert "never scan the whole workspace blindly" in text.lower()
 
 

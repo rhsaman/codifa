@@ -1,5 +1,5 @@
 """Sub-agent test: the sub-agent has no search_memory tool and its prompt
-references the CODE MAP while banning search_memory."""
+bans search_memory."""
 
 import os
 import sys
@@ -15,10 +15,9 @@ def test_subagent_has_no_search_memory():
     assert "search_memory" not in tools
 
 
-def test_subagent_system_mentions_code_map_and_no_search_memory():
-    """The sub-agent prompt must reference the CODE MAP and ban search_memory."""
+def test_subagent_system_bans_search_memory():
+    """The sub-agent prompt must ban search_memory."""
     sys_prompt = AGENTS["subagent"]["system"]
-    assert "CODE MAP" in sys_prompt
     assert "Do NOT call search_memory" in sys_prompt
     assert "filePaths=[...]" in sys_prompt  # batch read
 

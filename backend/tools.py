@@ -86,6 +86,7 @@ SNIPPET_LINE_WIDTH = 240  # per-line cap in grep snippets to keep results compac
 _GREP_PER_FILE_CAP = 8  # max hits shown per file when a dump truncates across many files
 _DEF_BODY_MAX_LINES = 60  # per-definition body lines expanded inline in grep hits
 _DEF_BODY_MAX_COUNT = 6  # max definition bodies expanded inline per grep call
+_LSP_REF_CAP = 40  # max reference locations returned per call (grouped by file)
 
 # Formatted results include output limits in their keys. In-flight sharing
 # covers only raw scans, scoped to a workspace, event loop and edit generation.
@@ -996,8 +997,14 @@ def _terminal_bg_start(command: str, root: str, log_file: str | None = None) -> 
             )
             if isinstance(handle, dict):
                 pid = int(handle.get("pid") or 0)
+                # dev_server reduces log_file to its basename inside the OS
+                # temp dir, so adopt the actual path it created.
+                log_path = str(handle.get("log_path") or log_path)
             else:
                 pid = int(getattr(handle, "pid", 0) or 0)
+                _handle_log = getattr(handle, "log_path", None)
+                if _handle_log:
+                    log_path = str(_handle_log)
             with _TERMINAL_BG_LOCK:
                 _TERMINAL_BG_JOBS[job_id] = {
                     "pid": pid,
@@ -1158,8 +1165,55 @@ def terminal_logs(job_id: str, tail_chars: int = MAX_TERMINAL_OUTPUT) -> dict:
     try:
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-    except OSError as exc:
-        return {"job_id": jid, "error": str(exc)}
+    except OSError:
+        # The dev_server registry historically stripped custom log dirs to
+        # the temp-dir basename, so jobs started before the path-unification
+        # fix point at a file that was actually created next door. Try the
+        # registry entry and the basename fallback before giving up, and adopt
+        # whichever path actually exists so later reads succeed.
+        _resolved = ""
+        _candidates: list[str] = []
+        try:
+            import dev_server as _dev_server_logs  # type: ignore
+
+            for _entry in _dev_server_logs.status():
+                if _entry.get("name") == f"terminal-{jid}":
+                    _reg_path = str(_entry.get("log_path") or "")
+                    if _reg_path and _reg_path not in _candidates:
+                        _candidates.append(_reg_path)
+                    break
+        except Exception:  # noqa: BLE001, S110 — registry is best-effort
+            pass
+        _basename_fallback = os.path.join(
+            tempfile.gettempdir(), os.path.basename(log_path)
+        )
+        if _basename_fallback and _basename_fallback not in _candidates:
+            _candidates.append(_basename_fallback)
+        for _cand in _candidates:
+            if not _cand or _cand == log_path:
+                continue
+            try:
+                with open(_cand, encoding="utf-8", errors="replace") as _fh:
+                    content = _fh.read()
+                _resolved = _cand
+                break
+            except OSError:
+                continue
+        if not _resolved:
+            return {
+                "job_id": jid,
+                "error": (
+                    f"No such log file: {log_path}. The server may still be "
+                    "starting — retry shortly. Read the log path directly "
+                    "with the read tool; do not run terminal_logs as a shell binary."
+                ),
+                "log_file": log_path,
+            }
+        log_path = _resolved
+        with _TERMINAL_BG_LOCK:
+            _job = _TERMINAL_BG_JOBS.get(jid)
+            if _job is not None:
+                _job["log_file"] = log_path
     if len(content) > tail_chars:
         content = content[-tail_chars:]
     # Refresh liveness: the reaper thread marks exit, but a directly-killed
@@ -1314,7 +1368,8 @@ def resolve_safe(
     Paths OUTSIDE the root are allowed only when they lie under one of the
     per-folder grants in ``permit["folders"]`` (the user approved that exact
     folder via request_permission) — or when ``permit["outside"]`` is set
-    (full outside-workspace permission).
+    (full outside-workspace permission). The OS temp dir is always allowed
+    without permission (background terminal logs live there by design).
     """
     root_real = os.path.realpath(os.path.abspath(root))
     if not os.path.isdir(root_real):
@@ -1334,6 +1389,14 @@ def resolve_safe(
             coder = os.path.realpath(user_coder_dir())
             if target == coder or target.startswith(coder + os.sep):
                 return target
+        # OS temp dir is always accessible without permission: background
+        # terminal logs and other transient files live there by design.
+        try:
+            tmp_real = os.path.realpath(tempfile.gettempdir())
+            if target == tmp_real or target.startswith(tmp_real + os.sep):
+                return target
+        except Exception:  # noqa: BLE001, S110 — temp check never breaks resolution
+            pass
         if permit is not None and _path_in_folders(
             target, _permit_folders(permit)
         ):
@@ -2068,13 +2131,18 @@ def persist_skill(
     fallback_name: str = "",
     previous_name: str = "",
     fa_keywords: list[str] | str | None = None,
+    extra_files: dict | None = None,
+    deleted_files: list[str] | None = None,
 ) -> dict:
     """Persist a skill as ``skills/<slug>/skill.md`` in the user data folder.
 
     ``raw`` is the full skill markdown (frontmatter + body); the name and
     description are parsed from the frontmatter. The name must be English
-    (ASCII) — it becomes the storage folder slug. Returns
-    ``{"ok", "name", "slug", "path", "note"}`` on success.
+    (ASCII) — it becomes the storage folder slug. Optional ``extra_files``
+    maps filename -> content and is written alongside skill.md; rewriting
+    skill.md never deletes existing extra files except those listed in
+    ``deleted_files``. Returns
+    ``{"ok", "name", "slug", "path", "note", "files"}`` on success.
     """
     name, description, body = _parse_skill_markdown(raw)
     if fa_keywords is None:
@@ -2099,12 +2167,25 @@ def persist_skill(
         return {"ok": False, "note": f"could not save skill: {exc}"}
     if previous_name and previous_name != name:
         _state_db.delete_skill(previous_name)
+    files: list[str] = []
+    try:
+        for _gone in deleted_files or []:
+            try:
+                _state_db.delete_skill_extra_file(slug, str(_gone or ""))
+            except Exception:  # noqa: BLE001, S112
+                continue
+        if extra_files:
+            _state_db.write_skill_extra_files(slug, extra_files)
+        files = _state_db.list_skill_files(name) or _state_db.list_skill_files(slug)
+    except Exception:  # noqa: BLE001
+        files = []
     return {
         "ok": True,
         "name": name,
         "slug": slug,
         "path": os.path.join(_state_db.skills_dir(), slug, "skill.md"),
         "note": f"skill '{name}' saved",
+        "files": files,
     }
 
 
@@ -2136,6 +2217,8 @@ def sync_builtin_skills() -> list[str]:
     Note: built-ins are superseded by shipped updates even if a user edited the
     stored copy — personal edits should live in user-created skills, not
     built-ins. Deletions are re-seeded on next startup (built-ins always ship).
+    Rewriting skill.md never deletes extra files in the skill folder, so
+    user-added sidecar files survive re-syncs.
     """
     folder = _builtin_skills_dir()
     if not os.path.isdir(folder):
@@ -2284,15 +2367,18 @@ def create_skill(
     description: str,
     content: str,
     fa_keywords: list[str] | str | None = None,
+    extra_files: dict | None = None,
 ) -> dict:
     """Create or edit (overwrite) a user skill (global, shared across workspaces).
 
     ``name`` is the display name — it must be English (ASCII) because the
     storage folder slug is derived from it. ``description`` is indexed for
     the system prompt, and ``content`` is the full markdown body. The skill
-    is stored as ``skills/<slug>/skill.md`` in the user data folder. Calling
-    with an existing skill's SAME ``name`` overwrites it (edit flow). The
-    ``root`` argument is kept for API compatibility and is not used.
+    is stored as ``skills/<slug>/skill.md`` in the user data folder with
+    optional ``extra_files`` (filename -> content) alongside it. Calling
+    with an existing skill's SAME ``name`` overwrites skill.md but keeps
+    existing extra files. The ``root`` argument is kept for API compatibility
+    and is not used.
     """
     body = content.strip()
     if not body:
@@ -2309,7 +2395,7 @@ def create_skill(
         + "---\n\n"
         f"# {name}\n\n{body}\n"
     )
-    result = persist_skill(markdown, fallback_name=name, fa_keywords=fa_list or None)
+    result = persist_skill(markdown, fallback_name=name, fa_keywords=fa_list or None, extra_files=extra_files)
     if not result.get("ok"):
         return {"error": result.get("note", "save failed")}
     return {
@@ -2317,6 +2403,7 @@ def create_skill(
         "name": result["name"],
         "ok": True,
         "note": result["note"],
+        "files": result.get("files", []),
     }
 
 
@@ -2329,9 +2416,17 @@ def _format_skill_body(row: dict) -> str:
         if end != -1:
             body = body[end + 4 :].lstrip("\n").strip()
     desc = str(row.get("description") or "").strip()
+    files = [str(f or "").strip() for f in (row.get("files") or []) if str(f or "").strip()]
+    if not files:
+        try:
+            files = _state_db.list_skill_files(str(row.get("name") or "")) or _state_db.list_skill_files(str(row.get("slug") or ""))
+        except Exception:  # noqa: BLE001
+            files = []
     out = f"# {row.get('name')}\n"
     if desc:
         out += f"\n{desc}\n"
+    if files:
+        out += f"\nExtra files: {', '.join(files)} — load a specific file with load_skill(file=<name>) only when needed.\n"
     out += f"\n{body}\n"
     return out
 
@@ -3427,11 +3522,36 @@ def _verify_typescript(root: str) -> str | None:
     return f"{count} TypeScript error(s):\n{preview}{more}"
 
 
+def _verify_lsp_diagnostics(root: str, target: str) -> str | None:
+    """Best-effort LSP diagnostics for one file, or None when unavailable."""
+    try:
+        from lsp_manager import get_manager as _get_lsp_mgr_verify
+
+        mgr = _get_lsp_mgr_verify(root)
+        if not mgr.is_server_running(target):
+            return None
+        diags = mgr.diagnostics(target)
+    except Exception:  # noqa: BLE001 - diagnostics never break verify
+        return None
+    if not diags:
+        return None
+    lines = []
+    for d in diags[:8]:
+        line = f"{d.get('path')}:{d.get('line')} [{d.get('severity')}] {d.get('message')}"
+        if d.get("source"):
+            line += f" ({d.get('source')})"
+        lines.append(line)
+    more = f"\n\u2026({len(diags) - 8} more)" if len(diags) > 8 else ""
+    return f"{len(diags)} LSP diagnostic(s):\n" + "\n".join(lines) + more
+
+
 def verify_edit(root: str, path: str, permit: dict | None = None) -> str | None:
     """Best-effort post-write verification for Coder mode's write_file/edit_file.
 
     Dispatches by extension: .py gets an instant AST syntax check; .json gets an
     instant json.loads check; .ts/.tsx get a debounced project-wide typecheck.
+    LSP diagnostics are then appended deterministically (no extra tool call)
+    so the model never needs a separate lsp_diagnostics call after an edit.
     Every other extension (and any error resolving the path) returns ``None`` so
     the caller adds nothing to the tool result — this must never turn a
     successful write into a reported failure.
@@ -3441,13 +3561,23 @@ def verify_edit(root: str, path: str, permit: dict | None = None) -> str | None:
         target = resolve_safe(root, path, permit=permit)
     except PathEscapeError:
         return None
+    base: str | None = None
     if ext == ".py":
-        return _verify_python_syntax(target)
-    if ext == ".json":
-        return _verify_json_syntax(target)
-    if ext in (".ts", ".tsx"):
-        return _verify_typescript(root)
-    return None
+        base = _verify_python_syntax(target)
+        if base is not None and base != "OK":
+            return base
+    elif ext == ".json":
+        base = _verify_json_syntax(target)
+        if base is not None and base != "OK":
+            return base
+    elif ext in (".ts", ".tsx"):
+        base = _verify_typescript(root)
+    lsp_note = _verify_lsp_diagnostics(root, target)
+    if lsp_note:
+        if base and base != "OK":
+            return base + "\n" + lsp_note
+        return lsp_note
+    return base
 
 
 def _format_verify_suffix(note: str | None) -> str:
@@ -3805,16 +3935,49 @@ async def _coalesced_search(
     )
 
 
+def _expand_brace_pattern(pattern: str) -> list[str]:
+    """Expand a single `{a,b,c}` brace group into separate glob patterns.
+
+    stdlib ``glob`` does not handle braces, so ``**/*.{tsx,ts,css}`` is split
+    into ``**/*.tsx``, ``**/*.ts``, ``**/*.css`` before matching. Only the
+    first brace group is split per recursion level; remaining/nested groups
+    expand recursively. Returns ``[pattern]`` unchanged when no brace
+    alternation is present.
+    """
+    m = re.search(r"\{([^{}]*)\}", pattern)
+    if not m:
+        return [pattern]
+    prefix = pattern[: m.start()]
+    suffix = pattern[m.end() :]
+    alts = [a.strip() for a in m.group(1).split(",")]
+    if len(alts) <= 1:
+        return [pattern]
+    out: list[str] = []
+    for alt in alts:
+        for rest in _expand_brace_pattern(prefix + alt + suffix):
+            if rest not in out:
+                out.append(rest)
+    return out or [pattern]
+
+
+def _has_brace_alternation(pattern: str) -> bool:
+    return bool(re.search(r"\{[^{}]*,[^{}]*\}", pattern))
+
+
 def _glob_python(root: str, pattern: str, target: str, path: str) -> dict:
     """Python fallback for :func:`glob_files` when ripgrep is unavailable.
 
     Uses the stdlib ``glob`` with ``recursive=True`` so ``**`` works, then clips
     results to our usual limits (skips hidden dirs, honours ``_SKIP_DIRS``).
     """
-    try:
-        matches = _pyglob.glob(os.path.join(target, pattern), recursive=True)
-    except (ValueError, re.error, OSError):
-        return {"pattern": pattern, "matches": [], "error": f"invalid glob: {pattern}"}
+    expanded = _expand_brace_pattern(pattern)
+    all_matches: list[str] = []
+    for sub in expanded:
+        try:
+            all_matches.extend(_pyglob.glob(os.path.join(target, sub), recursive=True))
+        except (ValueError, re.error, OSError):
+            return {"pattern": pattern, "matches": [], "error": f"invalid glob: {pattern}"}
+    matches = all_matches
 
     # glob may return directories too; keep files.
     files: list[str] = []
@@ -3891,9 +4054,10 @@ def glob_files(root: str, pattern: str, path: str = "", permit: dict | None = No
     """Find files by glob pattern under ``path`` (relative to root).
 
     Matches opencode's ``glob`` tool: ``pattern`` is a glob like ``**/*.js`` or
-    ``src/**/*.ts``. Uses ripgrep when available (respecting ``.gitignore``,
-    skipping hidden/binary files) with a stdlib ``glob`` fallback. Returns a
-    list of relative paths (``matches``), sorted.
+    ``src/**/*.ts``. Brace alternations like ``**/*.{tsx,ts,css}`` are expanded
+    into separate patterns before matching. Uses ripgrep when available
+    (respecting ``.gitignore``, skipping hidden/binary files) with a stdlib
+    ``glob`` fallback. Returns a list of relative paths (``matches``), sorted.
     """
     pattern = (pattern or "").strip()
     target = resolve_safe(root, path, allow_coder=True, permit=permit)
@@ -3901,6 +4065,27 @@ def glob_files(root: str, pattern: str, path: str = "", permit: dict | None = No
         return {"pattern": pattern, "matches": [], "error": "not a directory"}
     if not pattern:
         return {"pattern": pattern, "matches": []}
+    expanded = _expand_brace_pattern(pattern)
+    if len(expanded) > 1:
+        seen: set[str] = set()
+        merged: list[str] = []
+        truncated = False
+        for sub in expanded:
+            result = _rg_glob(root, sub, target, path)
+            if result is None:
+                result = _glob_python(root, sub, target, path)
+            if result.get("error") and not result.get("matches"):
+                continue
+            truncated = truncated or bool(result.get("truncated"))
+            for m in result.get("matches", []):
+                if m not in seen:
+                    seen.add(m)
+                    merged.append(m)
+        return {
+            "pattern": pattern,
+            "matches": _clip_glob_results(merged),
+            "truncated": truncated,
+        }
     result = _rg_glob(root, pattern, target, path)
     if result is not None:
         return result
@@ -4539,11 +4724,7 @@ def make_tool_callbacks(
     # make_tool_callbacks به‌ازای هر turn دوباره صدا زده می‌شود، پس این state
     # خودکار per-turn است و نیازی به reset دستی ندارد.
     _ckpt_open: dict = {}
-    # تاریخچهٔ چت از حافظه (از graph.py پاس داده می‌شه) — برای استخراج
-    # mentioned_fnames/idents جهت رتبه‌بندی CODE MAP در explore. از خوندن
-    # دیسک (get_state) اجتناب می‌کنیم تا event loop بلاک نشه و کل چت‌ها اسکن
-    # نشن.
-    _history_for_map: list[dict] = list(history or [])
+    # Chat history snapshot from memory (passed from graph.py).
     """Build the agent tools bound to ``root`` with an emit callback.
 
     ``emit`` receives a dict like ``{"kind": "tool"|"tool_result", "tool": name,
@@ -4951,6 +5132,143 @@ def make_tool_callbacks(
         """
         return {"kind": "tool_result", "tool": tool, "summary": msg, "status": "error"}
 
+    def _lsp_announce_start(target: str) -> str:
+        """Emit a status event when the LSP server binary is missing.
+
+        Installs can take minutes (package managers); the status event is sent
+        synchronously BEFORE the blocking install so the UI shows *why* the
+        tool call is waiting instead of a stuck spinner. The install itself
+        runs in a worker thread via asyncio.to_thread, so the event loop stays
+        responsive and this event flushes first. Returns the language being
+        installed ("" when nothing needs installing). Best-effort: never
+        breaks the tool.
+        """
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_prog
+
+            lang = _get_lsp_mgr_prog(root).pending_install_language(target)
+            if lang:
+                emit(
+                    {
+                        "kind": "status",
+                        "stage": "lsp",
+                        "content": f"installing language server for {lang}...",
+                    }
+                )
+                return lang
+        except Exception:  # noqa: BLE001, S110 - progress never breaks tools
+            pass
+        return ""
+
+    def _lsp_announce_done(lang: str, ok: bool) -> None:
+        """Emit the closing status event for an announced LSP install."""
+        if not lang:
+            return
+        try:
+            emit(
+                {
+                    "kind": "status",
+                    "stage": "lsp",
+                    "content": (
+                        f"language server for {lang} ready"
+                        if ok
+                        else f"language server install failed for {lang}"
+                    ),
+                }
+            )
+        except Exception:  # noqa: BLE001, S110 - progress never breaks tools
+            pass
+
+    def _lsp_resolve_position(target: str, line: int, character: int, symbol: str) -> tuple[int, int]:
+        """Resolve the LSP column from the symbol text on the same line.
+
+        Column guesses are the top failure mode: when `symbol` is given, read
+        that line and use the symbol offset instead of the raw `character`.
+        Falls back to `character` when the line or symbol cannot be read.
+        """
+        want = str(symbol or "").strip()
+        try:
+            ln = max(1, int(line or 1))
+        except (TypeError, ValueError):
+            return int(line or 1), int(character or 0)
+        if not want:
+            return ln, int(character or 0)
+        try:
+            text = ""
+            with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                for i, raw in enumerate(fh, start=1):
+                    if i == ln:
+                        text = raw.rstrip("\n")
+                        break
+        except OSError:
+            return ln, int(character or 0)
+        if not text:
+            return ln, int(character or 0)
+        idx = text.find(want)
+        if idx < 0:
+            idx = text.lower().find(want.lower())
+        if idx >= 0:
+            return ln, idx
+        return ln, int(character or 0)
+
+    def _lsp_error_text(tool: str, filePath: str, line: int, character: int, exc: Exception) -> str:
+        """Precise LSP failure message so the model never falls back to blind grep.
+
+        Empty, timeout, missing binary, and dead server are distinct: timeout
+        is a retry (never "no results"), the install hint appears only when
+        the binary is truly missing, and every branch names the exact next
+        action instead of a generic workspace grep.
+        """
+        try:
+            from lsp_manager import classify_lsp_error as _classify
+
+            kind = _classify(exc)
+        except Exception:  # noqa: BLE001 - classification never fails
+            kind = "error"
+        base = f"{filePath}:{line}:{character}"
+        if kind == "timeout":
+            return (
+                f"ERROR {tool} {base}: request timed out ({exc}). "
+                f"The server is running but slow - retry this same call once; "
+                f"do NOT report no results and do NOT fall back to a blind workspace grep."
+            )
+        if kind == "dead":
+            return (
+                f"ERROR {tool} {base}: language server died ({exc}). "
+                f"Retry this same call once (the server restarts on demand); "
+                f"if it persists, use lsp_symbols for the file, not a blind grep."
+            )
+        if kind == "missing":
+            return (
+                f"ERROR {tool} {base}: {exc}. "
+                f"This is the only case where the install hint applies; "
+                f"global installs need one-time confirmation "
+                f"(pre-approve with CODIFA_LSP_INSTALL_CONSENT=1). "
+                f"Do NOT blind-grep the workspace for the definition."
+            )
+        _exc_text = str(exc or "").lower()
+        if "starting" in _exc_text or "retry shortly" in _exc_text:
+            return (
+                f"ERROR {tool} {base}: language server is starting in background ({exc}). "
+                f"Retry the same {tool} call shortly; do NOT fall back to a blind workspace grep."
+            )
+        if "32601" in _exc_text or "unhandled method" in _exc_text or "method not found" in _exc_text:
+            return (
+                f"ERROR {tool} {base}: pull diagnostics not supported by this server ({exc}). "
+                f"Do NOT retry the pull - the pushed batch (possibly empty = clean) is authoritative; "
+                f"use lsp_symbols for exact names, never a blind workspace grep."
+            )
+        if kind == "unavailable":
+            return (
+                f"ERROR {tool} {base}: {exc}. "
+                f"No server covers this language - use grep scoped to the file, "
+                f"not a workspace-wide scan."
+            )
+        return (
+            f"ERROR {tool} {base}: {exc}. "
+            f"Retry once; if it persists use lsp_symbols for exact names."
+        )
+
     async def write_file_tool(path: str, content: str) -> str:
         """Replace the ENTIRE file at ``path`` with ``content`` (existing content is overwritten). Prefer edit_file to modify an existing file; only use this for brand-new files or an explicit full rewrite — you must supply the complete new content yourself since there is no whole-file read tool."""
         emit({"kind": "tool", "tool": "write_file", "args": {"path": path}})
@@ -5019,6 +5337,12 @@ def make_tool_callbacks(
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
         _invalidate_read_cache_for(path, root)
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_sync
+            _sync_path = path if os.path.isabs(path) else os.path.join(root, path)
+            _get_lsp_mgr_sync(root).notify_change(_sync_path)
+        except Exception:  # noqa: BLE001, S110 - lsp sync never breaks edit
+            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         return (
             f"Successfully wrote {len(content)} characters to {path}."
@@ -5158,6 +5482,11 @@ def make_tool_callbacks(
             }
         )
         _ret = f"Plan updated: {len(normalized)} steps, {done} completed."
+        if done < len(normalized):
+            _ret += (
+                " Batch rule: NEVER send update_plan alone when there IS next "
+                "work -- always batch it with your next tool calls in the SAME step."
+            )
         if _repeat_without_progress:
             _ret += (
                 f" Note: you re-sent the SAME checklist without advancing any status, "
@@ -5175,6 +5504,7 @@ def make_tool_callbacks(
         source_url: str = "",
         source_query: str = "",
         fa_keywords: str = "",
+        extra_files: dict | None = None,
     ) -> str:
         """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` specific one-line when-to-use — MUST be specific English (REQUIRED, never omit or leave generic); `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given. `fa_keywords`: ALWAYS REQUIRED (never optional) — provide 3-8 specific comma-separated phrases (Persian and English) that a user would naturally say when they need this skill — skills are auto-matched to the user's request by name, description and these keywords, so a specific one-line English `description` plus good `fa_keywords` decide whether the skill fires on its own. Keep them specific: a generic word like 'code' or 'file' would fire on every request."""
         emit(
@@ -5340,7 +5670,7 @@ def make_tool_callbacks(
                 str(k or "").strip() for k in (fa_keywords or []) if str(k or "").strip()
             ]
         try:
-            result = create_skill(root, name, description, body, _fa_list or None)
+            result = create_skill(root, name, description, body, _fa_list or None, extra_files=extra_files)
         except PathEscapeError as exc:
             msg = f"invalid path: {exc}"
             emit(_error_result("create_skill", msg))
@@ -5364,8 +5694,8 @@ def make_tool_callbacks(
             "Tell the user the skill was created."
         )
 
-    async def load_skill_tool(name: str) -> str:
-        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this when the task matches a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill — including short or non-English requests: judge by the task's meaning, not its wording. Load EVERY skill the task needs (one call each) and follow their instructions; when nothing matches, load none. Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
+    async def load_skill_tool(name: str, file: str = "") -> str:
+        """Load the full body of a skill from the app's skill store by its display name (case-insensitive). Call this ONLY when the task clearly needs a skill listed in the AVAILABLE SKILLS catalog in your prompt, or when the user asks to follow/apply a skill — including short or non-English requests: judge by the task's meaning, not its wording. A single shared word is NOT enough (e.g. LSP / Language Server does NOT match learning a programming language); when in doubt, load none. Load EVERY skill the task needs (one call each) and follow their instructions; when nothing matches, load none. Pass `file` with one of the skill's listed extra file names to load that file instead of skill.md (use the "Extra files" list in the prompt; load a specific file only when needed). Returns the skill's complete instructions; follow them for this task. If the name matches nothing, returns an error listing the available skill names."""
         emit({"kind": "tool", "tool": "load_skill", "args": {"name": name}})
         wanted = (name or "").strip().casefold()
         skills: list[dict] = []
@@ -5403,6 +5733,24 @@ def make_tool_callbacks(
         desc = (match.get("description") or "").strip()
         body = (match.get("content") or "").strip()
         fa = [str(k or "").strip() for k in (match.get("fa_keywords") or []) if str(k or "").strip()]
+        wanted_file = (file or "").strip()
+        if wanted_file:
+            try:
+                extra = _state_db.read_skill_extra_file(match.get("name") or name, wanted_file)
+            except Exception:  # noqa: BLE001
+                extra = None
+            if extra is None:
+                try:
+                    available_files = _state_db.list_skill_files(match.get("name") or name)
+                except Exception:  # noqa: BLE001
+                    available_files = []
+                summary = f"file {wanted_file!r} not found in skill {match['name']!r}"
+                emit({"kind": "tool_result", "tool": "load_skill", "summary": summary, "status": "error"})
+                listing = ", ".join(available_files) or "(none)"
+                return f"ERROR: file {wanted_file!r} not found in skill {match['name']!r}. Extra files: {listing}"
+            summary = f"loaded skill {match['name']!r} file {wanted_file!r}"
+            emit({"kind": "tool_result", "tool": "load_skill", "summary": summary})
+            return f"===== SKILL: {match['name']} / {wanted_file} =====\n\n{extra.strip()}\n===== END SKILL: {match['name']} / {wanted_file} ====="
         summary = f"loaded skill {match['name']!r}"
         emit(
             {
@@ -5416,6 +5764,12 @@ def make_tool_callbacks(
             out += f"Description: {desc}\n"
         if fa:
             out += f"Persian match keywords (resend as fa_keywords when editing): {', '.join(fa)}\n"
+        try:
+            _extra = _state_db.list_skill_files(match.get("name") or name) or _state_db.list_skill_files(match.get("slug") or "")
+        except Exception:  # noqa: BLE001
+            _extra = []
+        if _extra:
+            out += f"Extra files: {', '.join(_extra)} — call load_skill with file=<name> for a specific file only when needed.\n"
         out += f"\n{body}\n===== END SKILL: {match['name']} ====="
         return out
 
@@ -5558,6 +5912,12 @@ def make_tool_callbacks(
         # Invalidate any cached read_tool result for this path so a re-read
         # reflects the new content instead of returning stale cached bytes.
         _invalidate_read_cache_for(path, root)
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_sync
+            _sync_path = path if os.path.isabs(path) else os.path.join(root, path)
+            _get_lsp_mgr_sync(root).notify_change(_sync_path)
+        except Exception:  # noqa: BLE001, S110 - lsp sync never breaks edit
+            pass
         verify_note = await asyncio.to_thread(verify_edit, root, path, permit)
         _n_edits = int(result.get("edits_applied", 0) or 0)
         _head = (
@@ -5633,9 +5993,9 @@ def make_tool_callbacks(
         includes: list[str] | None = None,
         max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths/include to them — omitting path scans the whole workspace and is REJECTED in that case; order is CODE MAP first, then ONE scoped grep, then symbols read.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths/include to them — omitting path scans the whole workspace and is REJECTED in that case; order is LSP first, else ONE scoped grep, then symbols read. If you know a filename fragment or extension, use glob first, never grep for filenames. Filename-fragment search must use glob first, never grep for filenames; forbid broad OR patterns with >3 alternatives mixing languages (e.g. `foo|bar|baz|qux` across .py/.ts/.css) — split into targeted greps instead. If you know a function/class/method NAME, do NOT grep — use lsp_symbols or read(symbols=[...]) instead.
 
-Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context — only read when you need more than ±3 lines or need to edit the file. A match ON a definition line (def/class/...) inlines the full body (up to 60 lines) instead of the snippet — do NOT follow up with `read` for those; the body is already above. Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to narrow the search. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
+Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context. When the hit list is small (6 or fewer shown) the full enclosing definition body (up to 60 lines, via LSP) is inlined instead of the snippet — do NOT follow up with `read` for those; the body is already above. Only read when you need more than the shown body or need to edit the file. If you know a function/class/method NAME, do NOT grep for it — use lsp_symbols(filePath) or read(filePath, symbols=[...]) instead (or read(symbols=[...]) without filePath for a project-wide lookup). Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to read the shown files instead of re-grepping. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         # Batch args sometimes arrive as JSON-encoded strings — coerce first
         # so nothing downstream iterates a string character-by-character.
@@ -5644,6 +6004,79 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         includes = _coerce_str_list(includes)
         # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
         combined = "|".join(_dedup_patterns(pattern, patterns))
+        # Symbol-first fast path: plain identifier -> workspace/symbol first
+        # so a simple name lookup merges grep+LSP into one call.
+        _sym_generation = _search_generations.get(root, 0)
+        try:
+            _single = _dedup_patterns(pattern, patterns)
+            _is_simple_name = (
+                len(_single) == 1
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{1,64}", _single[0] or "") is not None
+            )
+        except Exception:  # noqa: BLE001 - pattern check never fails
+            _single = []
+            _is_simple_name = False
+        if _is_simple_name:
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_symfirst
+
+                _sym_mgr = _get_lsp_mgr_symfirst(root)
+                _sym_hits = await asyncio.to_thread(_sym_mgr.find_symbols, _single)
+                _sym_list = _sym_hits.get(_single[0], []) if isinstance(_sym_hits, dict) else []
+                if _sym_list and len(_sym_list) <= _DEF_BODY_MAX_COUNT:
+                    _sym_lines: list[str] = []
+                    _sym_total = 0
+                    for _sp, _sl, _sk, _rn in _sym_list[:_DEF_BODY_MAX_COUNT]:
+                        try:
+                            _s_abs = os.path.join(root, str(_sp))
+                            _s_syms = await asyncio.to_thread(_sym_mgr.document_symbols_if_running, _s_abs)
+                        except Exception:  # noqa: BLE001, S112 - one bad file never breaks grep
+                            continue
+                        if not _s_syms:
+                            continue
+                        _best = None
+                        for _nm, (_ss, _se, _kk) in _s_syms.items():
+                            try:
+                                _ssi, _sei = int(_ss), int(_se)
+                            except (TypeError, ValueError):
+                                continue
+                            if _ssi <= int(_sl or 0) <= _sei and (
+                                _best is None or (_sei - _ssi) < (_best[2] - _best[1])
+                            ):
+                                _best = (_nm, _ssi, _sei)
+                        if _best is None:
+                            continue
+                        _bn, _bs, _be = _best
+                        try:
+                            _ex = await asyncio.to_thread(
+                                _read_lines_excerpt, _s_abs, _bs,
+                                min(_be - _bs + 1, _DEF_BODY_MAX_LINES),
+                            )
+                        except Exception:  # noqa: BLE001, S112 - read never breaks grep
+                            continue
+                        if _ex.get("error") or not _ex.get("lines"):
+                            continue
+                        _body = "\n".join(f"{_r['line']} | {_r['text']}" for _r in _ex["lines"])
+                        if _sym_total + len(_body) + 2 > tool_out_chars:
+                            break
+                        _sym_total += len(_body) + 2
+                        _sym_lines.append(f"{_sp}:{_sl} in {_bn} ({_sk})\n{_body}")
+                    if _sym_lines:
+                        _sym_raw = f"SYMBOL MATCHES for {_single[0]!r}\n" + "\n\n".join(_sym_lines)
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "grep",
+                                "summary": f"{len(_sym_lines)} symbol match(es)",
+                                "model": _main_name,
+                            }
+                        )
+                        _sym_cache_key = ("grep-sym", _single[0], root, str(tool_out_chars))
+                        if _search_generations.get(root, 0) == _sym_generation:
+                            _parent_search_cache[_sym_cache_key] = _sym_raw
+                        return _sym_raw
+            except Exception:  # noqa: BLE001, S110 - symbol-first is best-effort
+                pass
         # چند scope در همان فراخوانی: path + paths=[...] → یک grep برای همه.
         # Near-duplicate scopes ("backend/" vs "backend") merge into one so
         # they share a single scan and cache entry — same results, less cost.
@@ -5652,7 +6085,18 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             _np = _normalize_search_scope(_p)
             if _np not in _normed_paths:
                 _normed_paths.append(_np)
-        all_paths = _normed_paths
+        # Drop nested scopes ("backend" + "backend/tools.py"): the broader
+        # scan already covers the narrower one, so keep one scan per file.
+        _deduped_paths: list[str] = []
+        for _np in sorted(_normed_paths, key=len):
+            _covered = False
+            for _kept in _deduped_paths:
+                if _np == _kept or _np.startswith(_kept.rstrip("/") + "/"):
+                    _covered = True
+                    break
+            if not _covered:
+                _deduped_paths.append(_np)
+        all_paths = _deduped_paths
         scope = "|".join(all_paths) if len(all_paths) > 1 else (all_paths[0] if all_paths else "")
         # چند فیلتر فایل در همان فراخوانی: include + includes=[...].
         all_includes = _dedup_patterns(include, includes)
@@ -5741,10 +6185,14 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         lines: list[str] = []
         total = 0
         _adaptive = 3 if min(len(matches), max_results) <= 5 else 1
-        try:
-            from symbol_index import enclosing_symbol as _enclosing_symbol
-        except ImportError:
-            _enclosing_symbol = None  # type: ignore[assignment]
+        # Enclosing-symbol labels now come from the LSP hover tool on demand.
+        # Grep stays a plain text search with no symbol-index import.
+        _enclosing_symbol = None  # type: ignore[assignment]
+        # Pre-initialized so the footers below never hit UnboundLocalError
+        # when the annotation branch above is skipped.
+        _expanded = 0
+        _omitted_n = 0
+        _omitted: list[tuple[str, str]] = []
         # Phase 1: pick shown matches and render bodies (budget check on the
         # unsuffixed text; the ~30-char annotation cannot flip it).
         # Diversity cap: when the dump truncates across many files, one noisy
@@ -5801,6 +6249,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # are mtime-cached (~ms) — either way never block the tool loop.
         # Kept after the `file:line:` prefix so existing `path:line:`
         # consumers keep matching.
+        # Expansion counters: initialized before the annotation branch so
+        # the deterministic LSP expansion and the footer below can use
+        # them even when annotations are disabled.
+        _expanded = 0
+        _omitted_n = 0
+        _omitted: list[tuple[str, str]] = []
         if _enclosing_symbol is not None and _shown_ms:
             def _annotate_one(mm: dict) -> tuple[str, str | None]:
                 try:
@@ -5832,9 +6286,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             # Phase 3: stitch suffixes + definition bodies. Bodies replace the
             # ±3-line snippet (they contain it) while the output budget lasts;
             # leftovers keep the snippet + its `in Name (L..)` line pointer.
-            _expanded = 0
-            _omitted_n = 0
-            _omitted: list[tuple[str, str]] = []
+            # (Expansion counters initialized before the annotation branch.)
             for _i, (_mm, (_suffix, _dbody)) in enumerate(zip(_shown_ms, _annotated)):
                 if _suffix:
                     _old = lines[_i]
@@ -5860,13 +6312,82 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     lines[_i] = lines[_i] + "\n" + _dbody
                 total += len(_dbody) + 2 - len(_old_body)
                 _expanded += 1
+        # Deterministic grep+read: small targeted hit lists carry the full
+        # enclosing definition body (via LSP, no extra model call), so no
+        # follow-up read is needed. Broad searches keep snippets only.
+        if _shown_ms and len(_shown_ms) <= _DEF_BODY_MAX_COUNT:
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_grep
+                _lsp_grep = _get_lsp_mgr_grep(root)
+            except Exception:  # noqa: BLE001 - expansion is best-effort
+                _lsp_grep = None
+            if _lsp_grep is not None:
+                _g_sym_cache: dict[str, dict] = {}
+                for _gi, _gm in enumerate(_shown_ms):
+                    if _expanded >= _DEF_BODY_MAX_COUNT:
+                        break
+                    try:
+                        _g_abs = os.path.join(root, str(_gm.get("file")))
+                        if _g_abs in _g_sym_cache:
+                            _g_syms = _g_sym_cache[_g_abs]
+                        else:
+                            # Background expansion never starts or installs a server:
+                            # reuse an already-running one, else skip the file.
+                            _g_syms = await asyncio.to_thread(_lsp_grep.document_symbols_if_running, _g_abs)
+                            _g_sym_cache[_g_abs] = _g_syms
+                    except Exception:  # noqa: BLE001, S112 - one bad file never breaks grep
+                        continue
+                    if not _g_syms:
+                        continue
+                    try:
+                        _g_ln = int(_gm.get("line") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    _g_best = None
+                    for _g_nm, (_g_s, _g_e, _g_k) in _g_syms.items():
+                        try:
+                            _g_si, _g_ei = int(_g_s), int(_g_e)
+                        except (TypeError, ValueError):
+                            continue
+                        if _g_si <= _g_ln <= _g_ei and (
+                            _g_best is None or (_g_ei - _g_si) < (_g_best[2] - _g_best[1])
+                        ):
+                            _g_best = (_g_nm, _g_si, _g_ei)
+                    if _g_best is None:
+                        continue
+                    _g_nm, _g_si, _g_ei = _g_best
+                    try:
+                        _g_ex = await asyncio.to_thread(
+                            _read_lines_excerpt, _g_abs, _g_si,
+                            min(_g_ei - _g_si + 1, _DEF_BODY_MAX_LINES),
+                        )
+                    except Exception:  # noqa: BLE001, S112 - read never breaks grep
+                        continue
+                    if _g_ex.get("error") or not _g_ex.get("lines"):
+                        continue
+                    _g_body = "\n".join(f"{_r['line']} | {_r['text']}" for _r in _g_ex["lines"])
+                    if total + len(_g_body) + 2 > tool_out_chars:
+                        _omitted_n += 1
+                        _omitted.append((str(_gm.get("file")), _g_nm))
+                        continue
+                    _g_old = _bodies[_gi]
+                    if _g_old and lines[_gi].endswith(_g_old):
+                        lines[_gi] = lines[_gi][: -len(_g_old)] + _g_body
+                    else:
+                        lines[_gi] = lines[_gi] + "\n" + _g_body
+                    if f" in {_g_nm} (L" not in lines[_gi]:
+                        _g_head, _g_sep, _g_rest = lines[_gi].partition(":")
+                        _g_ln2, _g_sep2, _g_body2 = _g_rest.partition(":")
+                        lines[_gi] = f"{_g_head}:{_g_ln2}: in {_g_nm} (L{_g_si}-{_g_ei}){_g_sep2}{_g_body2}"
+                    total += len(_g_body) + 2 - len(_g_old)
+                    _expanded += 1
         _shown = len(lines)
         _hidden = len(matches) - _shown
         if _hidden > 0:
             note = (
                 f"\nFound {len(matches)} matches.\n"
                 f"Showing the first {_shown} relevant matches ({_hidden} more not shown).\n"
-                "Use a narrower pattern/path or read specific files."
+                "Read the specific files above with read(symbols=[...]/ranges=[...]) in ONE call — do NOT re-grep the same pattern."
             )
         else:
             note = ""
@@ -6063,7 +6584,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         paths: list[str] | None = None,
         max_results: int = 100,
     ) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths to them — omitting path scans the whole workspace and is REJECTED in that case; order is CODE MAP first, then ONE scoped glob/grep, then symbols read. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your file lookup (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths to them — omitting path scans the whole workspace and is REJECTED in that case; order is LSP first in coder mode, else ONE scoped glob/grep, then symbols read. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your file lookup (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; filename-fragment search must use glob first, never grep for filenames; forbid broad OR patterns with >3 alternatives mixing languages — split into targeted globs via patterns=[...] instead; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         patterns = _coerce_str_list(patterns)
         paths = _coerce_str_list(paths)
@@ -6077,7 +6598,18 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             _np = _normalize_search_scope(_p)
             if _np not in _normed_paths:
                 _normed_paths.append(_np)
-        all_paths = _normed_paths
+        # Drop nested scopes ("backend" + "backend/tools.py"): the broader
+        # scan already covers the narrower one, so keep one scan per file.
+        _deduped_paths: list[str] = []
+        for _np in sorted(_normed_paths, key=len):
+            _covered = False
+            for _kept in _deduped_paths:
+                if _np == _kept or _np.startswith(_kept.rstrip("/") + "/"):
+                    _covered = True
+                    break
+            if not _covered:
+                _deduped_paths.append(_np)
+        all_paths = _deduped_paths
         scope = "|".join(all_paths) if len(all_paths) > 1 else (all_paths[0] if all_paths else "")
         generation = _search_generations.get(root, 0)
         cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
@@ -6148,7 +6680,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "model": _main_name,
                 }
             )
-            return f"No files match {disp!r} under {scope or '/'}."
+            _brace_hint = (
+                " Brace patterns like **/*.{tsx,ts,css} are expanded into separate patterns;"
+                " prefer patterns=['**/*.tsx', '**/*.ts', '**/*.css'] batching instead."
+                if any(_has_brace_alternation(p) for p in all_patterns)
+                else ""
+            )
+            return f"No files match {disp!r} under {scope or '/'}.{_brace_hint}"
         lines = list(matches[:max_results])
         note = (
             f"\n({len(matches)} matches found, showing the first {max_results})"
@@ -6178,15 +6716,35 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     def _did_you_mean(target: str, filePath: str) -> str:
         """Suggest close matches when a read path doesn't exist, so the model
         self-corrects a hallucinated filename (e.g. a guessed test name)
-        instead of failing blind. Best-effort: never raises, empty on no match."""
+        instead of failing blind. Best-effort: never raises, empty on no match.
+        Same-directory only: lists the missing file's parent dir once, never
+        scans the workspace."""
         try:
             parent = os.path.dirname(target)
             if not parent or not os.path.isdir(parent):
                 return ""
+            # Same-dir bound: only suggest inside the project root. No
+            # recursive or workspace-wide scan, no LSP, no symbol index.
+            try:
+                _proot = os.path.realpath(os.path.abspath(root))
+                _ppar = os.path.realpath(parent)
+                if _ppar != _proot and not _ppar.startswith(_proot + os.sep):
+                    return ""
+            except Exception:  # noqa: BLE001, S110 — bound check never breaks read
+                pass
             want = os.path.basename(target)
+            if not want or len(want) > 128:
+                return ""
             try:
                 names = os.listdir(parent)
             except OSError:
+                return ""
+            if len(names) > 500:
+                # Large dirs (e.g. node_modules): cap the scan to keep
+                # first-read fast.
+                names = names[:500]
+            names = [n for n in names if len(n) <= 128][:500]
+            if not names:
                 return ""
             close = difflib.get_close_matches(want, names, n=3, cutoff=0.6)
             if not close:
@@ -6207,52 +6765,20 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """File map instead of a blind head dump (see _HEAD_MAP_* above).
 
-        Envelope matches normal read blocks.
+        Fast path: no LSP/symbol work here. Plain reads must never wait on
+        the language server, so the map serves head lines directly with
+        paging guidance. Envelope matches normal read blocks.
         """
-        try:
-            from symbol_index import get_symbol_ranges as _get_sym_ranges
-
-            _syms = await asyncio.to_thread(_get_sym_ranges, target)
-        except Exception:  # noqa: BLE001 — map never breaks a read
-            _syms = {}
-        _items: list[tuple[str, int, int, str]] = []
-        if isinstance(_syms, dict):
-            for _name, _span in _syms.items():
-                try:
-                    _s, _e, _k = int(_span[0]), int(_span[1]), str(_span[2])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                _items.append((str(_name), _s, _e, _k))
-        _items.sort(key=lambda t: (t[1], t[2]))
-        if _items:
-            _rows = head_lines[:_HEAD_MAP_ROWS]
-            _shown = _items[:_HEAD_MAP_MAX_SYMBOLS]
-            _sym_list = "\n".join(
-                f"- {_k} {_n} (L{_s}-{_e})" for _n, _s, _e, _k in _shown
-            )
-            if len(_items) > len(_shown):
-                _sym_list += f"\n- (+{len(_items) - len(_shown)} more definitions)"
-            _example = (
-                f"read(filePath={filePath!r}, symbols=['{_shown[0][0]}'])"
-            )
-            _body = (
-                "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
-                + "\n" + _sym_list
-                + f"\n\n(file map: {filePath} has {total} lines — full head "
-                f"not shown. Read any definition with {_example} — one call, "
-                f"exact range. For other lines use "
-                f"ranges=['{filePath}:start:count'] in one call.)"
-            )
-            _summary = f"file map · {total} lines · {len(_items)} symbols"
-        else:
-            _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
-            _body = (
-                "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
-                + f"\n\n(file map: {filePath} has {total} lines, no indexable "
-                f"symbols. Use grep to locate what you need, then read exact "
-                f"ranges.)"
-            )
-            _summary = f"file map · {total} lines"
+        # No LSP import, no document_symbols call, no thread hop: serve the
+        # already-fetched head lines directly to keep cold first-read fast.
+        _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
+        _body = (
+            "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+            + f"\n\n(file map: {filePath} has {total} lines, no indexable "
+            f"symbols. Use grep to locate what you need, then read exact "
+            f"ranges.)"
+        )
+        _summary = f"file map · {total} lines"
         _last = int(_rows[-1]["line"])
         if not quiet:
             emit(
@@ -6285,6 +6811,15 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         emits ONE aggregate card instead, so a fast-failing missing file can
         no longer hijack the whole batch card to red "file not found" while
         the other files succeeded."""
+        if str(filePath or "").strip() in (".", "", "/"):
+            msg = (
+                "reading the workspace root is not allowed — use glob with a "
+                "filename pattern (e.g. pattern='*Composer*') or grep scoped "
+                "with path+include, never list the root"
+            )
+            if not quiet:
+                emit(_error_result("read", msg))
+            return f"ERROR reading {filePath or '.'}: {msg}"
         try:
             target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
         except PathEscapeError as exc:
@@ -6313,6 +6848,19 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     }
                 )
             return cached
+        try:
+            _root_real = os.path.realpath(os.path.abspath(root))
+        except Exception:  # noqa: BLE001 - root check never breaks read
+            _root_real = ""
+        if target == _root_real or str(filePath or "").strip() in (".", "", "/"):
+            msg = (
+                "reading the workspace root is not allowed — use glob with a "
+                "filename pattern (e.g. pattern='*Composer*') or grep scoped "
+                "with path+include, never list the root"
+            )
+            if not quiet:
+                emit(_error_result("read", msg))
+            return f"ERROR reading {filePath or '.'}: {msg}"
         if os.path.isdir(target):
             raw = await _read_dir_tool(target, filePath, offset, limit, _main_name, quiet=quiet)
             _parent_search_cache[cache_key] = raw
@@ -6335,21 +6883,9 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # instead of mid-function. The byte cap still bounds total output.
         want = limit + _SNAP_LOOKAHEAD if limit < 1000 else limit
 
-        async def single_excerpt() -> dict:
-            return await asyncio.to_thread(_read_lines_excerpt, target, offset, want)
-
-        async def batch_excerpts(windows: list[tuple[int, int]]) -> list[dict]:
-            widened = [
-                (o, (l + _SNAP_LOOKAHEAD) if l < 1000 else l) for o, l in windows
-            ]
-            if len(widened) == 1:
-                return [await asyncio.to_thread(_read_lines_excerpt, target, *widened[0])]
-            return await asyncio.to_thread(_read_lines_excerpts, target, widened)
-
-        excerpt = await coalesce_io(
-            ("read", root, target, id(permit), _search_generations.get(root, 0)),
-            (offset, want), single_excerpt, batch_excerpts,
-        )
+        # Cold-miss fast path: serve file bytes directly with one streaming
+        # read. No coalesce delay, no workspace scan, no LSP/symbol work.
+        excerpt = await asyncio.to_thread(_read_lines_excerpt, target, offset, want)
         if excerpt.get("error"):
             msg = excerpt["error"]
             if not quiet:
@@ -6365,21 +6901,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 emit(_error_result("read", msg))
             return f"ERROR reading {filePath}: {msg}"
         if allow_head_map and offset == 1 and limit >= _HEAD_MAP_MIN_LIMIT:
-            # One small probe fetch: big files serve a map (saving the bulk
-            # fetch entirely); small files fall through to the normal path
-            # below at the cost of one extra 60-line read.
-            _head = await asyncio.to_thread(
-                _read_lines_excerpt, target, 1, _HEAD_MAP_ROWS_NO_SYMBOLS
-            )
-            _htotal = int(_head.get("total") or 0)
-            if (
-                _htotal > _HEAD_MAP_MIN_LINES
-                and not _head.get("error")
-                and _head.get("lines")
-            ):
+            # Cheap probe: reuse the excerpt already fetched above. Big files
+            # serve a map; small files fall through. No second I/O, no LSP.
+            _htotal = int(excerpt.get("total") or 0)
+            if _htotal > _HEAD_MAP_MIN_LINES and excerpt.get("lines"):
                 return await _serve_head_map(
-                    filePath, target, _head["lines"], _htotal,
-                    _main_name, quiet, cache_key,
+                    filePath, target, excerpt["lines"][:_HEAD_MAP_ROWS_NO_SYMBOLS],
+                    _htotal, _main_name, quiet, cache_key,
                 )
             # Small after all: fall through to the normal path below.
         # Small files come back whole from the offset: one read instead of
@@ -6440,11 +6968,11 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         ranges: list[str] | None = None,
         symbols: list[str] | None = None,
     ) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from CODE MAP or scoped glob/grep) — not to search for files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, read ONLY those files via symbols=[...] or ranges=[...] — never scan the whole workspace blindly. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from LSP or scoped glob/grep) — not to search for files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, read ONLY those files via symbols=[...] or ranges=[...] — never scan the whole workspace blindly. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
         BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer).
 
-SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from the CODE MAP. OMIT `filePath` and each name is looked up across the whole project: one definition is read directly (no grep needed); a name defined in several files returns the candidate list — then pass filePath. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
+SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from LSP. OMIT `filePath` and each name is looked up across the whole project: one definition is read directly (no grep needed); a name defined in several files returns the candidate list — then pass filePath. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
 WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. A head read (offset 1, limit 400+) of a file over 400 lines returns a FILE MAP (first 40 lines + definition list) instead of a bulk dump — read definitions via symbols=[...] in one call, never re-read the head for content. Make the FIRST read of a file decisive — never open with a narrow slice and page forward one window per step (read 1-200, then 217-350, …). When you need more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
 
@@ -6453,10 +6981,10 @@ When you need to read several files, read multiple independent files in parallel
         filePaths = _coerce_str_list(filePaths)
         ranges = _coerce_str_list(ranges)
         symbols = _coerce_str_list(symbols)
-        # بازه‌های per-path ("path:offset:limit") → پنجره‌ی اختصاصی هر فایل.
-        # offset/limit سراسری همچنان برای مسیرهای بدون بازه‌ی اختصاصی اعمال می‌شود.
-        # jobs فهرست است (نه dict روی path) تا ranges تکراری هم‌فایل
-        # (مثل ["tools.py:640:60","tools.py:2089:80"]) هر دو اجرا شوند.
+        # Per-path windows ("path:offset:limit") map to each file's own window.
+        # The global offset/limit still applies to paths without a dedicated window.
+        # jobs is a list (not a dict keyed by path) so repeated same-file ranges
+        # (e.g. ["tools.py:640:60","tools.py:2089:80"]) both run.
         jobs: list[tuple[str, int, int]] = []
         for spec in ranges or []:
             parts = str(spec).split(":")
@@ -6467,7 +6995,7 @@ When you need to read several files, read multiple independent files in parallel
                 continue
             jobs.append((p, int(o), int(l)))
         # `symbols=[...]` resolves to concrete windows on filePath via the
-        # symbol index (CODE MAP) — one call instead of guessing line numbers.
+        # LSP manager — one call instead of guessing line numbers.
         _symbol_missing: list[str] = []
         _symbol_ambiguous: list[str] = []
         if symbols and not str(filePath or "").strip() and not filePaths:
@@ -6476,14 +7004,26 @@ When you need to read several files, read multiple independent files in parallel
             # call instead of grep + read); several definitions are listed so
             # the model can re-ask with filePath — nothing is guessed.
             try:
-                from symbol_index import find_symbol_files as _find_syms
-                from symbol_index import resolve_symbol_ranges as _resolve_syms_g
+                from lsp_manager import get_manager as _get_lsp_manager_for_symbols
             except ImportError:
-                return "ERROR reading symbols=: symbols= is unavailable (symbol index missing)"
+                return "ERROR reading symbols=: symbols= is unavailable (LSP manager missing)"
+            _lsp_mgr_g = _get_lsp_manager_for_symbols(root)
             _want = [str(s) for s in symbols]
-            _found = await asyncio.to_thread(_find_syms, root, _want)
+            _found = await asyncio.to_thread(_lsp_mgr_g.find_symbols, _want)
             for _nm in _want:
                 _hits = _found.get(_nm) or []
+                if not _hits:
+                    _symbol_missing.append(_nm)
+                    continue
+                # workspace/symbol is fuzzy: an exact name match wins, so a
+                # unique name is never reported as ambiguous.
+                _exact = [h for h in _hits if len(h) > 3 and h[3] == _nm]
+                if _exact:
+                    _hits = _exact
+                else:
+                    _lower_nm = _nm.lower()
+                    _ci = [h for h in _hits if len(h) > 3 and str(h[3]).lower() == _lower_nm]
+                    _hits = _ci if _ci else []
                 if not _hits:
                     _symbol_missing.append(_nm)
                     continue
@@ -6499,7 +7039,9 @@ When you need to read several files, read multiple independent files in parallel
                 except PathEscapeError:
                     _symbol_missing.append(_nm)
                     continue
-                _w_hit, _ = _resolve_syms_g(_abs_hit, [_real])
+                _w_hit, _ = await asyncio.to_thread(
+                    _lsp_mgr_g.symbol_ranges, _abs_hit, [_real]
+                )
                 if not _w_hit:
                     _symbol_missing.append(_nm)
                     continue
@@ -6521,21 +7063,25 @@ When you need to read several files, read multiple independent files in parallel
             if os.path.isdir(_sym_target):
                 return f"ERROR reading {filePath}: symbols= needs a file, not a directory"
             try:
-                from symbol_index import resolve_symbol_ranges as _resolve_syms
+                from lsp_manager import get_manager as _get_lsp_manager_for_ranges
             except ImportError:
-                return f"ERROR reading {filePath}: symbols= is unavailable (symbol index missing)"
-            _wins, _symbol_missing = _resolve_syms(_sym_target, [str(s) for s in symbols])
+                return f"ERROR reading {filePath}: symbols= is unavailable (LSP manager missing)"
+            _wins, _symbol_missing = await asyncio.to_thread(
+                _get_lsp_manager_for_ranges(root).symbol_ranges,
+                _sym_target,
+                [str(s) for s in symbols],
+            )
             if not _wins:
                 return (
                     f"ERROR reading {filePath}: no such symbol(s): "
-                    f"{', '.join(_symbol_missing)}. Check the CODE MAP for exact names."
+                    f"{', '.join(_symbol_missing)}. Use lsp_symbols or grep for exact names."
                 )
             jobs.extend((filePath, _o, _l) for _o, _l in _wins)
         base_paths = ([filePath] if str(filePath or "").strip() else []) + [
             p for p in (filePaths or []) if p and p != filePath
         ]
-        # مسیرهای فقط داخل ranges هم به batch اضافه می‌شوند (بدون تکرار
-        # برای لاگ) — اجرای واقعی از tasks می‌آید تا تکراری‌ها حفظ شوند.
+        # Paths that only appear inside ranges join the batch (deduplicated
+        # for logging) — actual execution comes from tasks to keep duplicates.
         for p, _, _ in jobs:
             if p not in base_paths:
                 base_paths.append(p)
@@ -6581,7 +7127,7 @@ When you need to read several files, read multiple independent files in parallel
         # Read every target concurrently — same asyncio.gather pattern used for
         # parallel read-only tool calls elsewhere in the graph, just applied
         # WITHIN one tool call instead of across several parallel tool calls.
-        # tasks تکراری‌های هم‌فایل را حفظ می‌کند (هر ranges یک job جدا).
+        # tasks keeps same-file duplicates (each ranges entry is its own job).
         # Per-file events are suppressed (quiet=True): the batch emits ONE
         # aggregate card below, so a fast-failing missing file can no longer
         # win the race and paint the whole batch red while siblings succeed.
@@ -6627,10 +7173,9 @@ When you need to read several files, read multiple independent files in parallel
                     f"showing from line 1 instead)\n\n{_rr}"
                 )
             results = _results
-        # فوتر خلاصه: اگر بعضی فایل‌ها خطا داده‌اند ولی بقیه موفق بوده‌اند،
-        # مدل نباید فکر کند کل batch شکست خورده (رفع «خواندن دسته‌ای خطا
-        # داد» — مدل به read های جدا برمی‌گشت). خطاها جدا و موفق‌ها عادی
-        # برمی‌گردند + یک خط خلاصه در انتها.
+        # Summary footer: when some files error but the rest succeed, the model
+        # must not treat the whole batch as failed. Errors and successes return
+        # separately plus one summary line at the end.
         _errs = [
             (p, r)
             for (p, _, _), r in zip(tasks, results)
@@ -6679,7 +7224,7 @@ When you need to read several files, read multiple independent files in parallel
                 _out += (
                     "\n\n(symbols not found: "
                     + ", ".join(_symbol_missing)
-                    + ". Check the CODE MAP for exact names.)"
+                    + ". Use lsp_symbols or grep for exact names.)"
                 )
             if _symbol_ambiguous:
                 _out += (
@@ -7155,9 +7700,7 @@ When you need to read several files, read multiple independent files in parallel
         _ctx = int(context_window) if context_window and context_window > 0 else 0
         _attempts = 0
         _last_exc: Exception | None = None
-        # تاریخچه از حافظه (از graph.py پاس داده شد) — نه از دیسک. فقط برای
-        # استخراج mentioned_fnames/idents جهت رتبه‌بندی CODE MAP کافیه.
-        _hist_for_map: list[dict] = _history_for_map
+        # No history snapshot needed here.
         # Route mid-run steers (task_steer) to THIS job: llm.py drains
         # RUNNING_TASK_CTX between steps so a follow-up lands while the
         # sub-agent is still working, not only after its whole run.
@@ -7182,83 +7725,21 @@ When you need to read several files, read multiple independent files in parallel
         while _attempts < _SUBAGENT_MAX_ATTEMPTS:
             _attempts += 1
             try:
-                # Inject the live CODE MAP into the explore agent's system
-                # prompt so it knows the symbol layout up front and can go
-                # straight to read() instead of blind grep/glob sweeps.
+                # No code-map injection: explore uses on-demand LSP and symbols.
                 _sys = agent_system(subagent_type) or (
                     "You are a sub-agent. Work through the task independently with "
                     "your tools, then reply with a concise final result. Do not ask the "
                     "user questions; do not call the task tool."
                 )
                 _sys += (
-                    "\n\nSEARCH DISCIPLINE: targeted search only — CODE MAP first, "
+                    "\n\nSEARCH DISCIPLINE: targeted search only — LSP first in coder mode, "
                     "then ONE scoped grep, then symbols/ranges read only; NEVER "
                     "blind-scan. BATCH like the main agent: ONE grep via "
                     "patterns/paths/includes, ONE read via filePaths, ONE read via "
                     "ranges+symbols. NEVER run tests — report files changed and "
                     "let the main agent run all tests after merging reports."
                 )
-                if resolve_agent(subagent_type) == "subagent":
-                    try:
-                        from symbol_index import (
-                            _looks_like_code_ident,
-                            format_symbol_map,
-                        )
-
-                        # استخراج فایل‌های ذکرشده از تاریخچه (مثل graph.py)
-                        _mentioned_fnames: set[str] = set()
-                        _mentioned_idents: set[str] = set()
-                        for _turn in _hist_for_map:
-                            for _ta in (_turn.get("toolActivity") or []):
-                                _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get("filePath")
-                                if _p:
-                                    _mentioned_fnames.add(os.path.relpath(_p, root))
-                            _content = _turn.get("content") or ""
-                            if isinstance(_content, str):
-                                for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
-                                    if _looks_like_code_ident(_m):
-                                        _mentioned_idents.add(_m)
-
-                        _map_rank_info: dict = {}
-                        _codemap_t0 = time.monotonic()
-                        _code_map = (
-                            await asyncio.to_thread(
-                                format_symbol_map,
-                                root,
-                                max_map_tokens=1024,
-                                mentioned_fnames=_mentioned_fnames,
-                                mentioned_idents=_mentioned_idents,
-                                query=prompt,
-                                rank_info=_map_rank_info,
-                            )
-                            if root
-                            else ""
-                        )
-                        try:
-                            _codemap_dt = time.monotonic() - _codemap_t0
-                            if _codemap_dt > 5.0:
-                                logger.warning(
-                                    "[explore-timing] codemap slow codemap=%.1fs root=%s",
-                                    _codemap_dt,
-                                    str(root or "")[:80],
-                                )
-                        except Exception:  # noqa: BLE001, S110 — timing never breaks explore
-                            pass
-                    except Exception:  # noqa: BLE001
-                        _code_map = ""
-                    if _code_map:
-                        _code_map_block = (
-                            "\n\n===== CODE MAP (live symbol index) =====\n"
-                            + _code_map
-                            + "\n===== END CODE MAP =====\n"
-                            "Use this map to locate symbols/files before reading. "
-                            "Go straight to read() with the file:line from the map."
-                        )
-                        # نقشه رو به user turn اضافه می‌کنیم (نه system prompt) —
-                        # چون محتوایش هر بار بر اساس mentioned_fnames/idents عوض
-                        # می‌شه؛ اگه بره تو system، prefix cache هیچ‌وقت hit
-                        # نمی‌خورد. این دقیقاً همون الگوی main agent تو graph.py هست.
-                        prompt = prompt + _code_map_block
+                # No code-map injection: explore uses on-demand LSP tools.
                 try:
                     _tee_emit(
                         {
@@ -9317,6 +9798,404 @@ When you need to read several files, read multiple independent files in parallel
         )
         return summary
 
+    async def lsp_definition_tool(filePath: str, line: int = 1, character: int = 0, symbol: str = "") -> str:
+        """Jump to the definition of the symbol at a position (LSP).
+
+        Uses the lazily-started language server for the file type — no
+        workspace scan. `line` is 1-based, `character` is 0-based. Pass
+        `symbol` (identifier text on that line) to resolve the column from
+        the line text instead of guessing `character`.
+        Returns `path:line:character` locations (small hit lists inline the definition body so no follow-up read is needed). Empty means the server
+        answered with no locations (genuine miss); timeout/dead/missing are
+        ERRORs with a precise next action, never a silent empty."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        emit(
+            {
+                "kind": "tool",
+                "tool": "lsp_definition",
+                "args": {"filePath": filePath, "line": line, "character": character, "symbol": symbol},
+                "model": _main_name,
+            }
+        )
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("lsp_definition", msg))
+            return f"ERROR: {msg}"
+        _lsp_lang = _lsp_announce_start(target)
+        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_def
+
+            hits = await asyncio.to_thread(
+                _get_lsp_mgr_def(root).definition,
+                target,
+                _line_no,
+                _char_no,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _lsp_announce_done(_lsp_lang, False)
+            _msg = _lsp_error_text("lsp_definition", filePath, _line_no, _char_no, exc)
+            emit(_error_result("lsp_definition", _msg))
+            return _msg
+        _lsp_announce_done(_lsp_lang, True)
+        if not hits:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "lsp_definition",
+                    "summary": "no definition found",
+                    "model": _main_name,
+                }
+            )
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_hint
+
+                _mgr = _get_lsp_mgr_hint(root)
+                _state = _mgr.server_state(target)
+                _lang = _mgr.language_for(target) or ""
+                _hint = _mgr.install_hint(_lang) if _state == "missing" and _lang else ""
+            except Exception:  # noqa: BLE001 - hint is best-effort
+                _hint = ""
+            if _hint:
+                return (
+                    f"No definition found for {filePath}:{_line_no}:{_char_no} "
+                    f"(server answered empty). Install hint (binary truly missing): {_hint}."
+                )
+            return (
+                f"No definition found for {filePath}:{_line_no}:{_char_no} "
+                f"(server answered empty - no definition here; try lsp_symbols for exact names, not a workspace-wide grep.)"
+            )
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "lsp_definition",
+                "summary": f"{len(hits)} location(s)",
+                "model": _main_name,
+            }
+        )
+        _loc_lines = [
+            f"{h.get('path')}:{h.get('line')}:{h.get('character', 0)}" for h in hits
+        ]
+        # Inline bodies for few hits so the follow-up read is skipped.
+        if len(hits) <= 3:
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_defbody
+
+                _db_mgr = _get_lsp_mgr_defbody(root)
+                _db_out: list[str] = []
+                for _h in hits[:3]:
+                    try:
+                        _h_abs = os.path.join(root, str(_h.get("path") or ""))
+                        _h_ln = int(_h.get("line") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        _h_syms = await asyncio.to_thread(_db_mgr.document_symbols_if_running, _h_abs)
+                    except Exception:  # noqa: BLE001 - one bad file never breaks definition
+                        _h_syms = {}
+                    _h_best = None
+                    for _hn, (_hs, _he, _hk) in (_h_syms or {}).items():
+                        try:
+                            _hsi, _hei = int(_hs), int(_he)
+                        except (TypeError, ValueError):
+                            continue
+                        if _hsi <= _h_ln <= _hei and (
+                            _h_best is None or (_hei - _hsi) < (_h_best[2] - _h_best[1])
+                        ):
+                            _h_best = (_hn, _hsi, _hei)
+                    if _h_best is None:
+                        continue
+                    _hbn, _hbs, _hbe = _h_best
+                    try:
+                        _h_ex = await asyncio.to_thread(
+                            _read_lines_excerpt, _h_abs, _hbs,
+                            min(_hbe - _hbs + 1, _DEF_BODY_MAX_LINES),
+                        )
+                    except Exception:  # noqa: BLE001, S112 - read never breaks definition
+                        continue
+                    if _h_ex.get("error") or not _h_ex.get("lines"):
+                        continue
+                    _h_body = "\n".join(f"{_r['line']} | {_r['text']}" for _r in _h_ex["lines"])
+                    _db_out.append(
+                        f"{_h.get('path')}:{_h.get('line')}:{_h.get('character', 0)} in {_hbn}\n{_h_body}"
+                    )
+                if _db_out:
+                    return "\n\n".join(_db_out)
+            except Exception:  # noqa: BLE001, S110 - inline bodies are best-effort
+                pass
+        return "\n".join(_loc_lines)
+
+    async def lsp_references_tool(filePath: str, line: int = 1, character: int = 0, symbol: str = "") -> str:
+        """Find references (including the declaration) for a position (LSP).
+
+        Uses the lazily-started language server for the file type — no
+        workspace scan. `line` is 1-based, `character` is 0-based. Pass
+        `symbol` (identifier text on that line) to resolve the column from
+        the line text instead of guessing `character`.
+        Timeout is an ERROR with retry (never "No references found"); empty
+        means the server answered with no locations. At most 40 locations
+        are returned, grouped by file with a "+N more" footer."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        emit(
+            {
+                "kind": "tool",
+                "tool": "lsp_references",
+                "args": {"filePath": filePath, "line": line, "character": character, "symbol": symbol},
+                "model": _main_name,
+            }
+        )
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("lsp_references", msg))
+            return f"ERROR: {msg}"
+        _lsp_lang = _lsp_announce_start(target)
+        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_ref
+
+            hits = await asyncio.to_thread(
+                _get_lsp_mgr_ref(root).references,
+                target,
+                _line_no,
+                _char_no,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _lsp_announce_done(_lsp_lang, False)
+            _msg = _lsp_error_text("lsp_references", filePath, _line_no, _char_no, exc)
+            emit(_error_result("lsp_references", _msg))
+            return _msg
+        _lsp_announce_done(_lsp_lang, True)
+        if not hits:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "lsp_references",
+                    "summary": "no references found",
+                    "model": _main_name,
+                }
+            )
+            return f"No references found for {filePath}:{_line_no}:{_char_no} (server answered empty)."
+        _by_file: dict[str, list[dict]] = {}
+        for _h in hits:
+            _by_file.setdefault(str(_h.get("path") or ""), []).append(_h)
+        _shown_hits = hits[:_LSP_REF_CAP]
+        _hidden_n = len(hits) - len(_shown_hits)
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "lsp_references",
+                "summary": f"{len(hits)} location(s) in {len(_by_file)} file(s)",
+                "model": _main_name,
+            }
+        )
+        _out = "\n".join(
+            f"{h.get('path')}:{h.get('line')}:{h.get('character', 0)}" for h in _shown_hits
+        )
+        if _hidden_n > 0:
+            _groups = ", ".join(f"{p} ({len(v)})" for p, v in sorted(_by_file.items())[:8])
+            _out += (
+                f"\n(+{_hidden_n} more across {len(_by_file)} files: {_groups} — "
+                f"narrow with symbol= or read specific files.)"
+            )
+        return _out
+
+    async def lsp_hover_tool(filePath: str, line: int = 1, character: int = 0, symbol: str = "") -> str:
+        """Hover text (signature/docs) for a position (LSP).
+
+        Uses the lazily-started language server for the file type — no
+        workspace scan. `line` is 1-based, `character` is 0-based. Pass
+        `symbol` (identifier text on that line) to resolve the column from
+        the line text instead of guessing `character`."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        emit(
+            {
+                "kind": "tool",
+                "tool": "lsp_hover",
+                "args": {"filePath": filePath, "line": line, "character": character, "symbol": symbol},
+                "model": _main_name,
+            }
+        )
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("lsp_hover", msg))
+            return f"ERROR: {msg}"
+        _lsp_lang = _lsp_announce_start(target)
+        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_hover
+
+            text = await asyncio.to_thread(
+                _get_lsp_mgr_hover(root).hover,
+                target,
+                _line_no,
+                _char_no,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _lsp_announce_done(_lsp_lang, False)
+            _msg = _lsp_error_text("lsp_hover", filePath, _line_no, _char_no, exc)
+            emit(_error_result("lsp_hover", _msg))
+            return _msg
+        _lsp_announce_done(_lsp_lang, True)
+        if not text:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "lsp_hover",
+                    "summary": "no hover info",
+                    "model": _main_name,
+                }
+            )
+            return f"No hover info for {filePath}:{_line_no}:{_char_no} (server answered empty)."
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "lsp_hover",
+                "summary": f"{len(text)} chars",
+                "model": _main_name,
+            }
+        )
+        return text
+
+    async def lsp_symbols_tool(filePath: str) -> str:
+        """List definitions in one file via LSP document symbols.
+
+        Uses the lazily-started language server for the file type — no
+        workspace scan. Returns `- kind name (Lstart-end)` lines. When the
+        server binary is missing it is installed automatically on first
+        use — WAIT for the install (retry this same call) instead of
+        searching files without LSP."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        emit(
+            {
+                "kind": "tool",
+                "tool": "lsp_symbols",
+                "args": {"filePath": filePath},
+                "model": _main_name,
+            }
+        )
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("lsp_symbols", msg))
+            return f"ERROR: {msg}"
+        _lsp_lang = _lsp_announce_start(target)
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_sym
+
+            syms = await asyncio.to_thread(
+                _get_lsp_mgr_sym(root).document_symbols, target
+            )
+        except Exception as exc:  # noqa: BLE001
+            _lsp_announce_done(_lsp_lang, False)
+            _msg = _lsp_error_text("lsp_symbols", filePath, 1, 0, exc)
+            emit(_error_result("lsp_symbols", _msg))
+            return _msg
+        _lsp_announce_done(_lsp_lang, True)
+        if not syms:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "lsp_symbols",
+                    "summary": "no symbols",
+                    "model": _main_name,
+                }
+            )
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_hint_sym
+
+                _mgr_sym = _get_lsp_mgr_hint_sym(root)
+                _state_sym = _mgr_sym.server_state(target)
+                _lang_sym = _mgr_sym.language_for(target) or ""
+                _hint_sym = _mgr_sym.install_hint(_lang_sym) if _state_sym == "missing" and _lang_sym else ""
+            except Exception:  # noqa: BLE001 - hint is best-effort
+                _hint_sym = ""
+            if _hint_sym:
+                return (
+                    f"No symbols reported for {filePath} "
+                    f"(server answered empty). Install hint (binary truly missing): {_hint_sym}."
+                )
+            return (
+                f"No symbols reported for {filePath} "
+                f"(server answered empty - try grep scoped to the file for exact names.)"
+            )
+        rows = sorted(syms.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "lsp_symbols",
+                "summary": f"{len(rows)} symbol(s)",
+                "model": _main_name,
+            }
+        )
+        return "\n".join(f"- {kind} {name} (L{start}-{end})" for name, (start, end, kind) in rows)
+
+    async def lsp_diagnostics_tool(filePath: str) -> str:
+        """Diagnostics for one file via LSP (pull, else last pushed batch).
+
+        Uses the lazily-started language server for the file type — no
+        workspace scan. Returns `path:line [severity] message` lines.
+        NOTE: after write_file/edit_file this is already inlined
+        deterministically in that tool's reply — do NOT call it again
+        just to re-check the file you edited."""
+        _main_name = str(getattr(main_model, "model_name", "") or "")
+        emit(
+            {
+                "kind": "tool",
+                "tool": "lsp_diagnostics",
+                "args": {"filePath": filePath},
+                "model": _main_name,
+            }
+        )
+        try:
+            target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit(_error_result("lsp_diagnostics", msg))
+            return f"ERROR: {msg}"
+        _lsp_lang = _lsp_announce_start(target)
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_diag
+
+            diags = await asyncio.to_thread(
+                _get_lsp_mgr_diag(root).diagnostics, target
+            )
+        except Exception as exc:  # noqa: BLE001
+            _lsp_announce_done(_lsp_lang, False)
+            _msg = _lsp_error_text("lsp_diagnostics", filePath, 1, 0, exc)
+            emit(_error_result("lsp_diagnostics", _msg))
+            return _msg
+        _lsp_announce_done(_lsp_lang, True)
+        if not diags:
+            emit(
+                {
+                    "kind": "tool_result",
+                    "tool": "lsp_diagnostics",
+                    "summary": "no diagnostics",
+                    "model": _main_name,
+                }
+            )
+            return f"No diagnostics for {filePath}."
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "lsp_diagnostics",
+                "summary": f"{len(diags)} diagnostic(s)",
+                "model": _main_name,
+            }
+        )
+        return "\n".join(
+            f"{d.get('path')}:{d.get('line')} [{d.get('severity')}] {d.get('message')}"
+            + (f" ({d.get('source')})" if d.get("source") else "")
+            for d in diags
+        )
+
     _tools = {
         "request_permission": request_permission_tool,
         "confirm_action": confirm_action_tool,
@@ -9345,6 +10224,11 @@ When you need to read several files, read multiple independent files in parallel
         "git_diff": git_diff_tool,
         "git_commit": git_commit_tool,
         "git_log": git_log_tool,
+        "lsp_definition": lsp_definition_tool,
+        "lsp_references": lsp_references_tool,
+        "lsp_hover": lsp_hover_tool,
+        "lsp_symbols": lsp_symbols_tool,
+        "lsp_diagnostics": lsp_diagnostics_tool,
     }
     # The `vision` tool is only meaningful when a dedicated vision model is
     # configured AND this turn actually carries images — otherwise the main

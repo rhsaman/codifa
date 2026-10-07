@@ -8,9 +8,9 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, getChatProvider, providerApiKeys, useStore } from "../lib/store";
+import { getActiveProvider, getChatProvider, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser } from "../lib/retry";
+import { AutoRetryScheduler, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
   isSlashCommand,
   parseSlashInput,
@@ -74,6 +74,7 @@ import {
   triggerCompact,
   gitAutoCommit,
   gitDiscard,
+  gitPush,
   type CompactResult,
   type CompactUsage,
   type StreamParams,
@@ -243,6 +244,26 @@ const IMAGE_EXTS = new Set([
   "heic",
   "heif",
 ]);
+
+/** Drop corrupt image data URLs before send (truncated snapshots, bad base64).
+ *  Keeps path-only entries and the text; warns for each dropped image. */
+function cleanImagesForSend<T extends { path: string; name?: string; dataUrl?: string }>(imgs: T[]): T[] {
+  const out: T[] = [];
+  for (const img of imgs ?? []) {
+    if (!img) continue;
+    if (!img.dataUrl) {
+      out.push(img);
+      continue;
+    }
+    const clean = sanitizeImageDataUrl(img.dataUrl);
+    if (clean) {
+      out.push(clean === img.dataUrl ? img : { ...img, dataUrl: clean });
+    } else {
+      console.warn("[chat] dropping corrupt image data URL (not sent):", img.path);
+    }
+  }
+  return out;
+}
 
 function relFromRoot(root: string, p: string): string | null {
   const norm = (s: string) => s.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -613,6 +634,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  between the user's message and the incoming content. */
   const retryingMsg = chat?.messages.find((m) => m.retry) ?? null;
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
+  // Separate git-action states so commit/undo/push spinners never lock the
+  // composer (the shared `busy` flag disables sending).
+  const [isCommitting, setIsCommitting] = useState(false);
+  const [isUndoing, setIsUndoing] = useState(false);
+  const [isPushing, setIsPushing] = useState(false);
 
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
@@ -826,6 +852,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  another chat's banner after the user stopped THIS chat. */
   const stoppedMapRef = useRef<Map<string, boolean>>(new Map());
   const stoppedRef = useRef(false);
+  // Per-chat auto-retry schedulers (epoch-guarded): every automatic resend
+  // (watchdog stall retry, post-turn drain) is armed through these, so an
+  // explicit Stop bumps the epoch and a timer firing afterwards is dropped
+  // instead of restarting the turn and bringing the retry banner back.
+  const autoRetryMapRef = useRef<Map<string, AutoRetryScheduler>>(new Map());
+  const autoRetryFor = (chatId: string): AutoRetryScheduler => {
+    let sched = autoRetryMapRef.current.get(chatId);
+    if (!sched) {
+      sched = new AutoRetryScheduler();
+      autoRetryMapRef.current.set(chatId, sched);
+    }
+    return sched;
+  };
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Hidden mirror + row/action widths used to count visual lines at the
   // compact input width (layout-independent, so no compact/expanded flip
@@ -1813,6 +1852,640 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setCtxPopoverChatId(activeChatId);
   };
   useEffect(() => cancelCtxPopoverClose, []);
+  // Keep file-viewer comment popups on screen and keep the commented text
+  // visibly marked while the popup is open. The viewer anchors the popup at
+  // the highlight position, which can sit close to the right/bottom edge, and
+  // focusing the textarea collapses window.getSelection(). Clamp the inline
+  // left/top after mount and wrap the last non-collapsed range in a persist
+  // span so the highlight survives the focus steal; unwrap on close.
+  useEffect(() => {
+    let lastGoodRange: Range | null = null;
+    let lastGoodText = "";
+    let lastGoodRoot: Element | null = null;
+    let lastGoodDoc: Document | null = null;
+    let persistEls: HTMLElement[] = [];
+    const POPUP_SEL = ".fv-comment-pop, .fv-comment-float, .fv-comment-box, .fv-comment-input";
+    function isInsidePopup(node: Node | null) {
+      if (!node) return false;
+      const el = node instanceof Element ? node : node.parentElement;
+      return !!el?.closest?.(POPUP_SEL);
+    }
+    function popupOpen() {
+      return !!document.querySelector(".fv-comment-pop, .fv-comment-float, .fv-comment-box");
+    }
+    function isEditableTarget(t: Element | null) {
+      // Text entry inside the popup must receive focus normally.
+      return !!t?.closest?.("textarea, input, [contenteditable=\"true\"], [contenteditable=\"\"]");
+    }
+    function onPopupMouseDown(e: MouseEvent) {
+      // Keep the document selection alive while the popup is open. Pressing
+      // on popup chrome (quote, margins) must not steal focus and collapse
+      // the native highlight; typing areas are excluded so focus still works.
+      const t = e.target as Element | null;
+      const box = t?.closest?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box");
+      if (!box) return;
+      if (isEditableTarget(t)) {
+        // Focus is about to move into the textarea: paint the persist
+        // highlight synchronously before getSelection() collapses.
+        persistHighlight();
+        return;
+      }
+      e.preventDefault();
+    }
+    function onDocMouseUp() {
+      // Save the live Range before the viewer mounts and focuses the popup.
+      onSelectionChange();
+      scanIframeSelections();
+      ensureIframeListeners();
+      if (popupOpen()) persistHighlight();
+    }
+    function onPopupFocusIn(e: FocusEvent) {
+      // Textarea autofocus collapses the native selection; the saved clone
+      // from selectionchange/mouseup is the source of truth, so re-apply
+      // the visible highlight immediately instead of waiting for observer.
+      const t = e.target as Element | null;
+      if (!t?.closest?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box")) return;
+      persistHighlight();
+    }
+    const wiredFrames = new WeakSet<HTMLIFrameElement>();
+    function ensureIframeListeners() {
+      // Iframe selections never fire the main document selectionchange, so
+      // watch each same-origin viewer frame directly and mirror its range.
+      try {
+        const frames = Array.from(document.querySelectorAll("iframe"));
+        for (const frame of frames) {
+          if (wiredFrames.has(frame)) continue;
+          let fdoc: Document | null = null;
+          try {
+            fdoc = frame.contentDocument ?? null;
+          } catch {
+            continue;
+          }
+          if (!fdoc) continue;
+          try {
+            const onFrameSel = () => scanIframeSelections();
+            fdoc.addEventListener("selectionchange", onFrameSel);
+            fdoc.addEventListener("mouseup", onFrameSel);
+            wiredFrames.add(frame);
+          } catch {
+            continue;
+          }
+        }
+      } catch {
+        // Ignore iframe access failures (cross-origin).
+      }
+    }
+    // Active document holding the selection: main doc or same-origin viewer iframe.
+    // All range/walker ops must use this doc, otherwise iframe ranges look detached.
+    function activeDoc(): Document {
+      return lastGoodDoc ?? document;
+    }
+    function docHas(doc: Document | null, node: Node | null): boolean {
+      if (!doc || !node) return false;
+      try {
+        return doc.contains(node);
+      } catch {
+        return false;
+      }
+    }
+    // Inline style fallback so the persist mark stays visible even inside a
+    // viewer iframe that does not inherit global.css.
+    function stylePersistSpan(span: HTMLElement) {
+      span.style.background = "rgba(137, 180, 250, 0.38)";
+      span.style.borderRadius = "2px";
+      span.style.outline = "1px solid rgba(137, 180, 250, 0.55)";
+      try {
+        (span.style as CSSStyleDeclaration & { boxDecorationBreak?: string }).boxDecorationBreak = "clone";
+      } catch {
+        // Ignore styling failures.
+      }
+    }
+    function saveRange(range: Range, text: string, doc: Document | null) {
+      try {
+        lastGoodRange = range.cloneRange();
+        lastGoodText = text;
+        lastGoodDoc = doc;
+        const container = range.commonAncestorContainer;
+        const el = container instanceof Element ? container : container.parentElement;
+        lastGoodRoot =
+          el?.closest?.(".file-viewer-doc, .fv-sheet-wrap, .fv-grid-doc, [data-file-viewer]") ??
+          el ??
+          null;
+      } catch {
+        lastGoodRange = null;
+        lastGoodText = "";
+        lastGoodRoot = null;
+        lastGoodDoc = null;
+      }
+    }
+    function scanIframeSelections(): boolean {
+      // Docx viewer may render inside a same-origin iframe: the main
+      // document selection stays empty while the real selection lives
+      // inside the iframe. Capture it so the highlight survives.
+      let found = false;
+      try {
+        const frames = Array.from(document.querySelectorAll("iframe"));
+        for (const frame of frames) {
+          let fdoc: Document | null = null;
+          try {
+            fdoc = frame.contentDocument ?? null;
+          } catch {
+            continue;
+          }
+          if (!fdoc) continue;
+          let fsel: Selection | null = null;
+          try {
+            fsel = fdoc.getSelection ? fdoc.getSelection() : null;
+          } catch {
+            continue;
+          }
+          if (!fsel || fsel.rangeCount === 0 || fsel.isCollapsed) continue;
+          let frange: Range | null = null;
+          try {
+            frange = fsel.getRangeAt(0);
+          } catch {
+            continue;
+          }
+          if (!frange || isInsidePopup(frange.commonAncestorContainer)) continue;
+          saveRange(frange, fsel.toString(), fdoc);
+          found = true;
+        }
+      } catch {
+        // Ignore iframe access failures (cross-origin).
+      }
+      return found;
+    }
+    function onSelectionChange() {
+      const active = document.activeElement as HTMLElement | null;
+      if (active?.closest?.(POPUP_SEL)) return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        scanIframeSelections();
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      if (isInsidePopup(range.commonAncestorContainer)) return;
+      saveRange(range, sel.toString(), document);
+    }
+    // Wrap a substring inside a single text node with the persist class.
+    function wrapSubstring(node: Text, substr: string): boolean {
+      const val = node.nodeValue || "";
+      const idx = val.indexOf(substr);
+      if (idx < 0) return false;
+      if (substr.length === 0) return false;
+      try {
+        const owner = node.ownerDocument ?? activeDoc();
+        const r = owner.createRange();
+        r.setStart(node, idx);
+        r.setEnd(node, idx + substr.length);
+        if (r.collapsed) return false;
+        const span = owner.createElement("span");
+        span.className = "fv-comment-highlight-persist";
+        stylePersistSpan(span);
+        r.surroundContents(span);
+        persistEls.push(span);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    // Find a text node inside root containing the key (forward or backward).
+    function findKeyNode(root: Element | Document, key: string, fromEnd: boolean): Text | null {
+      if (!key || key.trim().length < 3) return null;
+      try {
+        const rootDoc = root instanceof Document ? root : (root.ownerDocument ?? activeDoc());
+        const walker = rootDoc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        const nodes: Text[] = [];
+        let n = walker.nextNode() as Text | null;
+        while (n) {
+          const parentEl = n.parentElement;
+          if (n.nodeValue && n.nodeValue.trim() !== "" && !parentEl?.closest?.(POPUP_SEL)) {
+            nodes.push(n);
+          }
+          n = walker.nextNode() as Text | null;
+        }
+        const ordered = fromEnd ? [...nodes].reverse() : nodes;
+        for (const node of ordered) {
+          if (!docHas(rootDoc, node)) continue;
+          if (node.parentElement?.closest?.(".fv-comment-highlight-persist")) continue;
+          if ((node.nodeValue || "").includes(key)) return node;
+        }
+      } catch {
+        // Ignore lookup failures.
+      }
+      return null;
+    }
+    // Rebuild an attached range from saved text when the original range
+    // detached (viewer re-render). Uses start/end anchors so fragmented
+    // docx runs (one word per span) still resolve to the selected block.
+    function reconstructRange(root: Element, text: string): Range | null {
+      const norm = text.replace(/\s+/g, " ").trim();
+      if (norm.length < 4) return null;
+      const words = norm.split(" ").filter((w) => w.length >= 3);
+      const startKeys = [norm.slice(0, 12), words[0] || ""].filter((k) => k.trim().length >= 3);
+      const endKeys = [norm.slice(-12), words[words.length - 1] || ""].filter((k) => k.trim().length >= 3);
+              const rdoc = root.ownerDocument ?? activeDoc();
+        for (const sk of startKeys) {
+        const startNode = findKeyNode(root, sk, false);
+        if (!startNode) continue;
+        for (const ek of endKeys) {
+          const endNode = findKeyNode(root, ek, true);
+          if (!endNode) continue;
+          try {
+            const r = rdoc.createRange();
+            const sVal = startNode.nodeValue || "";
+            const eVal = endNode.nodeValue || "";
+            const sIdx = Math.max(0, sVal.indexOf(sk));
+            const eIdx = eVal.lastIndexOf(ek);
+            r.setStart(startNode, sIdx);
+            r.setEnd(endNode, eIdx < 0 ? eVal.length : eIdx + ek.length);
+            if (!r.collapsed) return r;
+          } catch {
+            continue;
+          }
+        }
+        // Start found but end not: single-node selection.
+        try {
+          const r = rdoc.createRange();
+          const sVal = startNode.nodeValue || "";
+          const sIdx = Math.max(0, sVal.indexOf(sk));
+          r.setStart(startNode, sIdx);
+          r.setEnd(startNode, Math.min(sVal.length, sIdx + norm.length));
+          if (!r.collapsed) return r;
+        } catch {
+          continue;
+        }
+      }
+      return null;
+    }
+    // Text fallback when React re-rendered the viewer and detached the saved
+    // Range: find distinctive slices of the saved text in the live DOM.
+    function wrapByText(text: string): boolean {
+      const norm = text.replace(/\s+/g, " ").trim();
+      if (norm.length < 4) return false;
+      let slices: string[] = [];
+      if (norm.length <= 30) slices = [norm];
+      else {
+        slices = [
+          norm.slice(0, 20),
+          norm.slice(Math.floor(norm.length / 2) - 10, Math.floor(norm.length / 2) + 10),
+          norm.slice(-20),
+        ].filter((s) => s.trim().length >= 6);
+      }
+      let wrapped = false;
+      let count = 0;
+      try {
+        const adoc = activeDoc();
+        const walker = adoc.createTreeWalker(adoc.body ?? document.body, NodeFilter.SHOW_TEXT);
+        const nodes: Text[] = [];
+        let n = walker.nextNode() as Text | null;
+        while (n) {
+          const parentEl = n.parentElement;
+          if (n.nodeValue && n.nodeValue.trim() !== "" && !parentEl?.closest?.(POPUP_SEL)) {
+            nodes.push(n);
+          }
+          n = walker.nextNode() as Text | null;
+        }
+        for (const slice of slices) {
+          for (const node of nodes) {
+            if (count >= 20) break;
+            const v = node.nodeValue || "";
+            if (!v.includes(slice)) continue;
+            // Skip nodes already wrapped.
+            if (node.parentElement?.closest?.(".fv-comment-highlight-persist")) continue;
+            if (!adoc.contains(node) && !document.contains(node)) continue;
+            if (wrapSubstring(node, slice)) {
+              wrapped = true;
+              count++;
+              break;
+            }
+          }
+          if (count >= 20) break;
+        }
+      } catch {
+        // Ignore lookup failures; quote still flows into the popup.
+      }
+      return wrapped;
+    }
+    // Fragmentation-proof fallback: docx viewers often render one word per
+    // span, so no single text node contains a multi-word slice. Walk the
+    // viewer root in order and find the contiguous word sequence matching
+    // the saved selection, then wrap those whole word nodes.
+    function wrapByWordSequence(root: Element, text: string): boolean {
+      const norm = text.replace(/\s+/g, " ").trim();
+      if (norm.length < 2) return false;
+      const selWords = norm.split(" ").filter((w) => w.length > 0);
+      // Single words repeat everywhere; a first-occurrence highlight would
+      // mark the wrong place, so only handle multi-word sequences here.
+      if (selWords.length < 2) return false;
+      try {
+        const wdoc = root.ownerDocument ?? activeDoc();
+        const walker = wdoc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        const nodes: Text[] = [];
+        let n = walker.nextNode() as Text | null;
+        while (n) {
+          const parentEl = n.parentElement;
+          if (
+            n.nodeValue &&
+            n.nodeValue.trim() !== "" &&
+            !parentEl?.closest?.(POPUP_SEL) &&
+            !parentEl?.closest?.(".fv-comment-highlight-persist") &&
+            wdoc.contains(n)
+          ) {
+            nodes.push(n);
+          }
+          n = walker.nextNode() as Text | null;
+        }
+        const flat: { w: string; ni: number }[] = [];
+        nodes.forEach((node, ni) => {
+          const ws = (node.nodeValue || "").replace(/\s+/g, " ").trim().split(" ").filter((w) => w.length > 0);
+          for (const w of ws) flat.push({ w, ni });
+        });
+        if (flat.length === 0) return false;
+        let best = -1;
+        outer: for (let i = 0; i + selWords.length <= flat.length; i++) {
+          for (let j = 0; j < selWords.length; j++) {
+            const fw = flat[i + j];
+            const sw = selWords[j];
+            if (!fw || fw.w !== sw) continue outer;
+          }
+          best = i;
+          break;
+        }
+        if (best < 0) return false;
+        const first = flat[best];
+        const last = flat[best + selWords.length - 1];
+        if (!first || !last) return false;
+        const startNi = first.ni;
+        const endNi = last.ni;
+        if (endNi - startNi + 1 > 200) return false;
+        let wrapped = false;
+        // Wrap back-to-front so earlier node references stay valid.
+        for (let ni = endNi; ni >= startNi; ni--) {
+          try {
+            const node = nodes[ni];
+            if (!node || !wdoc.contains(node)) continue;
+            if (node.parentElement?.closest?.(".fv-comment-highlight-persist")) continue;
+            const r = wdoc.createRange();
+            r.selectNodeContents(node);
+            if (r.collapsed) continue;
+            const span = wdoc.createElement("span");
+            span.className = "fv-comment-highlight-persist";
+            stylePersistSpan(span);
+            r.surroundContents(span);
+            persistEls.push(span);
+            wrapped = true;
+          } catch {
+            continue;
+          }
+        }
+        return wrapped;
+      } catch {
+        return false;
+      }
+    }
+    function unwrapPersist(restoreSelection: boolean) {
+      for (const el of persistEls) {
+        const parent = el.parentNode;
+        if (!parent) continue;
+        while (el.firstChild) parent.insertBefore(el.firstChild, el);
+        parent.removeChild(el);
+        parent.normalize?.();
+      }
+      persistEls = [];
+      if (restoreSelection && lastGoodRange) {
+        try {
+          const sel = lastGoodDoc?.getSelection?.() ?? window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(lastGoodRange);
+        } catch {
+          // Stale range after DOM moves; highlight already unwrapped.
+        }
+      }
+    }
+    function persistHighlight() {
+      // Drop spans wiped by React re-renders so highlight can be re-applied
+      // while the popup stays open.
+      if (persistEls.length > 0) {
+        persistEls = persistEls.filter((el) => document.contains(el) || docHas(activeDoc(), el));
+        if (persistEls.length > 0) return;
+      }
+      // Refresh from the live selection when it is still valid: the popup
+      // focuses its textarea on mount, which collapses getSelection() before
+      // the observer fires, so the saved clone from selectionchange is the
+      // source of truth once focus is stolen.
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+          const live = sel.getRangeAt(0);
+          if (!isInsidePopup(live.commonAncestorContainer)) {
+            saveRange(live, sel.toString(), document);
+          }
+        } else {
+          scanIframeSelections();
+        }
+      } catch {
+        // Keep the previously saved range.
+      }
+      // If the saved range detached (viewer re-rendered), rebuild it from
+      // saved text using start/end anchors so fragmented docx runs still
+      // resolve, then fall through to range wrapping below.
+      if (!lastGoodRange || !docHas(activeDoc(), lastGoodRange.commonAncestorContainer)) {
+        const adoc = activeDoc();
+        const rootEl =
+          lastGoodRoot && docHas(adoc, lastGoodRoot)
+            ? lastGoodRoot
+            : (adoc.body ?? document.body);
+        let rebuilt = false;
+        if (lastGoodText && rootEl instanceof Element) {
+          try {
+            const r = reconstructRange(rootEl, lastGoodText);
+            if (r && !r.collapsed) {
+              lastGoodRange = r;
+              rebuilt = true;
+            }
+          } catch {
+            // Keep text fallback below.
+          }
+        }
+        if (!rebuilt) {
+          const adoc2 = activeDoc();
+          const viewerRoot =
+            (lastGoodRoot && docHas(adoc2, lastGoodRoot) ? lastGoodRoot : null) ??
+            adoc2.querySelector(".file-viewer-doc, .fv-sheet-wrap, .fv-grid-doc, [data-file-viewer]") ??
+            document.querySelector(".file-viewer-doc, .fv-sheet-wrap, .fv-grid-doc, [data-file-viewer]") ??
+            adoc2.body ??
+            document.body;
+          // Word-sequence first: it matches fragmented single-word runs
+          // precisely; anchor/text-slice search follows as backup.
+          if (lastGoodText && viewerRoot instanceof Element && wrapByWordSequence(viewerRoot, lastGoodText)) return;
+          if (lastGoodText && wrapByText(lastGoodText)) return;
+          if (!lastGoodRange) return;
+          try {
+            if (!docHas(activeDoc(), lastGoodRange.commonAncestorContainer)) return;
+          } catch {
+            return;
+          }
+        }
+      }
+      const range = lastGoodRange;
+      if (!range) return;
+      // Prefer the saved viewer root: the narrow commonAncestor is often a
+      // single word span in fragmented docx runs, which would hide the rest
+      // of the selection from the candidate scan below.
+      let root: Element | null = null;
+      if (lastGoodRoot && document.contains(lastGoodRoot)) {
+        root = lastGoodRoot;
+      } else {
+        const ancestor = range.commonAncestorContainer;
+        root = ancestor instanceof Element ? ancestor : ancestor.parentElement;
+      }
+      if (!root || (!document.contains(root) && !docHas(activeDoc(), root))) return;
+      let candidates: Text[] = [];
+      try {
+        const cdoc = root.ownerDocument ?? activeDoc();
+        const walker = cdoc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode() as Text | null;
+        while (node) {
+          try {
+            if (
+              node.nodeValue &&
+              node.nodeValue.trim() !== "" &&
+              range.intersectsNode(node)
+            ) {
+              const parentEl = node.parentElement;
+              if (
+                !parentEl?.closest?.(
+                  ".fv-comment-pop, .fv-comment-float, .fv-comment-input",
+                )
+              ) {
+                candidates.push(node);
+              }
+            }
+          } catch {
+            // Skip nodes that cannot be tested.
+          }
+          node = walker.nextNode() as Text | null;
+        }
+      } catch {
+        candidates = [];
+      }
+      // Single text node fast path: surroundContents works when the range
+      // sits inside one node.
+      if (candidates.length === 0) {
+        if (lastGoodText && root instanceof Element && wrapByWordSequence(root, lastGoodText)) return;
+        try {
+          const span = (range.startContainer.ownerDocument ?? activeDoc()).createElement("span");
+          span.className = "fv-comment-highlight-persist";
+          stylePersistSpan(span);
+          range.surroundContents(span);
+          persistEls.push(span);
+        } catch {
+          // Partially-selected non-text nodes cannot be surrounded; the saved
+          // text still flows into the popup quote instead of throwing.
+        }
+        return;
+      }
+      for (const textNode of candidates) {
+        try {
+          const sub = (textNode.ownerDocument ?? activeDoc()).createRange();
+          sub.selectNodeContents(textNode);
+          if (
+            textNode === range.startContainer &&
+            textNode === range.endContainer
+          ) {
+            sub.setStart(textNode, range.startOffset);
+            sub.setEnd(textNode, range.endOffset);
+          } else if (textNode === range.startContainer) {
+            sub.setStart(textNode, range.startOffset);
+            sub.setEnd(textNode, textNode.length);
+          } else if (textNode === range.endContainer) {
+            sub.setStart(textNode, 0);
+            sub.setEnd(textNode, range.endOffset);
+          } else if (
+            range.compareBoundaryPoints(Range.END_TO_START, sub) <= 0 ||
+            range.compareBoundaryPoints(Range.START_TO_END, sub) >= 0
+          ) {
+            continue;
+          }
+          if (sub.collapsed) continue;
+          const span = (textNode.ownerDocument ?? activeDoc()).createElement("span");
+          span.className = "fv-comment-highlight-persist";
+          stylePersistSpan(span);
+          sub.surroundContents(span);
+          persistEls.push(span);
+        } catch {
+          continue;
+        }
+      }
+    }
+    function clampCommentPopup(popup: HTMLElement) {
+      // Measure after layout so offsetWidth/offsetHeight are valid.
+      requestAnimationFrame(() => {
+        const rect = popup.getBoundingClientRect();
+        const rawLeft = popup.style.left ? Number.parseFloat(popup.style.left) : rect.left;
+        const rawTop = popup.style.top ? Number.parseFloat(popup.style.top) : rect.top;
+        const x = Number.isFinite(rawLeft) ? rawLeft : rect.left;
+        const y = Number.isFinite(rawTop) ? rawTop : rect.top;
+        const clampedLeft = Math.max(8, Math.min(x, window.innerWidth - popup.offsetWidth - 8));
+        const clampedTop = Math.max(8, Math.min(y, window.innerHeight - popup.offsetHeight - 8));
+        popup.style.left = `${clampedLeft}px`;
+        popup.style.top = `${clampedTop}px`;
+      });
+      persistHighlight();
+    }
+    function scan(root: ParentNode) {
+      const popups = root.querySelectorAll?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box");
+      popups?.forEach((el) => clampCommentPopup(el as HTMLElement));
+    }
+    function scanRemoved(node: Node) {
+      if (!(node instanceof HTMLElement)) return false;
+      if (node.matches?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box")) return true;
+      return !!node.querySelector?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box");
+    }
+    scan(document.body);
+    const observer = new MutationObserver((mutations) => {
+      let sawAdd = false;
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (!(node instanceof HTMLElement)) return;
+          if (node.matches?.(".fv-comment-pop, .fv-comment-float, .fv-comment-box")) {
+            sawAdd = true;
+            clampCommentPopup(node);
+          } else scan(node);
+        });
+        let popupClosed = false;
+        mutation.removedNodes.forEach((node) => {
+          if (scanRemoved(node)) popupClosed = true;
+        });
+        if (popupClosed) unwrapPersist(true);
+      }
+      // Viewer re-render wiped our spans while popup stays open: re-apply.
+      if (!sawAdd && popupOpen()) {
+        const live = persistEls.filter((el) => document.contains(el) || docHas(activeDoc(), el));
+        if (live.length === 0) persistHighlight();
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    function onResize() {
+      scan(document.body);
+    }
+    document.addEventListener("selectionchange", onSelectionChange);
+    document.addEventListener("mousedown", onPopupMouseDown, true);
+    document.addEventListener("mouseup", onDocMouseUp);
+    document.addEventListener("focusin", onPopupFocusIn);
+    window.addEventListener("resize", onResize);
+    ensureIframeListeners();
+    return () => {
+      observer.disconnect();
+      document.removeEventListener("selectionchange", onSelectionChange);
+      document.removeEventListener("mousedown", onPopupMouseDown, true);
+      document.removeEventListener("mouseup", onDocMouseUp);
+      document.removeEventListener("focusin", onPopupFocusIn);
+      window.removeEventListener("resize", onResize);
+      unwrapPersist(false);
+    };
+  }, []);
   const ctxPopoverOpen = isContextPopoverOpen(
     ctxPopoverChatId,
     activeChatId,
@@ -1946,7 +2619,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const chatId = forChatId ?? chatIdRef.current;
     const chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
+    const sendImgs = cleanImagesForSend(imgs);
     stoppedMapRef.current.set(chatId, false);
+    // Fresh turn: invalidate any retry armed by the previous turn and allow
+    // auto-retry again (an explicit Stop bumps the epoch via stop() below).
+    autoRetryFor(chatId).beginTurn();
     // Per-turn local state (was shared refs — now locals so concurrent chats
     // don't race). stop() coordinates via stoppedMapRef + chatAborts store.
     let mcpChanged = false;
@@ -2072,7 +2749,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         role: "user",
         content: text,
         attachments: atts,
-        images: imgs,
+        images: sendImgs,
         mcpServers: effectiveMcpServers,
         skills: effectiveSkills,
         // Capture the CURRENT chat mode on the user bubble so the transcript
@@ -2184,8 +2861,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // "forgets" an attached image on the very next turn.
         ...(m.images?.length
           ? {
-              images: m.images.map((i) =>
-                i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
+              images: m.images.flatMap(
+                (i): Array<string | { path: string; dataUrl: string }> => {
+                  if (!i.dataUrl) return [i.path];
+                  const clean = sanitizeImageDataUrl(i.dataUrl);
+                  return clean ? [{ path: i.path, dataUrl: clean }] : [];
+                },
               ),
             }
           : {}),
@@ -2257,6 +2938,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         ...(cur?.retry?.fallback === true ? {} : { retry: null }),
         thinkingActive: false,
         statusText: undefined,
+        lspStatus: undefined,
       });
     };
     const queueTextChunk = (chunk: string) => {
@@ -2325,6 +3007,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const WATCHDOG_BASE_BACKOFF_MS = 30_000;
     const STALL_CHECK_INTERVAL_MS = 10_000;
     const stallTimer = setInterval(() => {
+      // An explicit Stop cancels all auto-retry: never re-arm the retry banner
+      // or schedule a resend after the user stopped this chat. Without this, a
+      // tick queued before the abort fires afterwards and the banner comes back.
+      if (autoRetryFor(chat.id).isStopped) return;
       // While the agent is waiting for the user to answer a permission /
       // confirm / ask request, it is legitimately paused — never treat that
       // as a stall and never force-abort, no matter how long the user takes.
@@ -2406,20 +3092,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // another chat; without forChatId the retry would land in the wrong chat.
           if (!abort.signal.aborted) abort.abort();
           const originId = chat.id;
-          setTimeout(
-            () =>
-              send(
-                lastUser.content,
-                lastUser.attachments ?? [],
-                lastUser.images ?? [],
-                false,
-                lastUser.id,
-                assistantMsg.id,
-                false,
-                undefined,
-                originId,
-              ),
-            0,
+          // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
+          autoRetryFor(originId).schedule(0, () =>
+            send(
+              lastUser.content,
+              lastUser.attachments ?? [],
+              lastUser.images ?? [],
+              false,
+              lastUser.id,
+              assistantMsg.id,
+              false,
+              undefined,
+              originId,
+            ),
           );
         }
         return;
@@ -2867,10 +3552,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               chat.id,
               "Context compacted — older messages are summarized below (after the conversation).",
             );
-          // پیام‌های صف‌شده حین کامپکت فقط بعد از اتمام کامپکت تحویل داده می‌شوند
-          setTimeout(() => {
+          // Queued messages during compact are delivered only after compact ends.
+          // Epoch-guarded so an explicit Stop drops the drain.
+          autoRetryFor(chat.id).schedule(0, () => {
             if (!sendPendingSteerNext(chat.id)) sendQueuedNext(chat.id);
-          }, 0);
+          });
         }
       } else if (event.kind === "compact_failed") {
         // Auto-compact failed — the backend did NOT drop any messages. Surface
@@ -2886,10 +3572,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             event.reason ||
             "Automatic compaction failed — nothing was deleted.",
           );
-        // حتی در شکست کامپکت هم صف تخلیه شود تا پیام کاربر گم نشود
-        setTimeout(() => {
+        // Drain the queue even on compact failure so no user message is lost.
+        // Epoch-guarded so an explicit Stop drops the drain.
+        autoRetryFor(chat.id).schedule(0, () => {
           if (!sendPendingSteerNext(chat.id)) sendQueuedNext(chat.id);
-        }, 0);
+        });
       } else if (event.kind === "plan") {
         // Backend emits the authoritative merged checklist (preserves completed,
         // handles steer edits/removals). Replace — never merge stale extras back.
@@ -2980,6 +3667,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         });
         playAlarm("alert");
       } else if (event.kind === "error") {
+        // A late backend error arriving after an explicit Stop must not re-arm
+        // the retry banner — the user already cancelled this turn.
+        if (shouldIgnoreLateRetryEvent(stoppedMapRef.current.get(chat.id) === true)) return;
         // A backend error while the summarizer was supposedly running means the
         // compact can't complete either — never leave the "Compacting context"
         // banner stuck next to the error. Clear it defensively (the backend's
@@ -3063,8 +3753,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
       } else if (event.kind === "status") {
         // Staged progress before first token (preparing context, contacting
-        // model, retrying). Shown in the Working pill so a slow turn does not
-        // look frozen. Cleared on first real text/tool/thinking content.
+        // model, retrying, LSP install/update). Shown in the Working pill so
+        // a slow turn does not look frozen. Cleared on first real
+        // text/tool/thinking content or turn done.
         lastEventAtMs = Date.now();
         lastContentAtMs = Date.now();
         ensureLiveBubble();
@@ -3074,7 +3765,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             : typeof (event as { stage?: unknown }).stage === "string"
               ? String((event as { stage?: unknown }).stage).slice(0, 120)
               : "Working";
-        useStore.getState().updateMessage(assistantMsg.id, { statusText: label });
+        const lsp = lspStatusFromEvent(event as { stage?: string; tool?: string; status?: string; summary?: string; content?: string; language?: string });
+        if (lsp) {
+          if (lsp.phase === "done" || lsp.phase === "error") {
+            useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined, lspStatus: undefined });
+          } else {
+            useStore.getState().updateMessage(assistantMsg.id, { statusText: label, lspStatus: lsp });
+          }
+        } else {
+          useStore.getState().updateMessage(assistantMsg.id, { statusText: label });
+        }
       } else if (event.kind === "usage") {
         // `unbilled` events report a REJECTED (window-overflow) request — the
         // provider never charged those tokens, so they must not count toward
@@ -3138,7 +3838,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // content is complete before the turn closes.
         flushPendingText();
         resolveStuckCards();
-        useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined });
+        useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined, lspStatus: undefined });
         // Backend reports steers it discarded without injecting
         // (dropped_steer_ids). Keep them pending/visible so the auto-drain
         // below re-sends them as the next turn instead of losing them.
@@ -3216,7 +3916,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               ? a
               : `${rootDir}/${a.replace(/^\/+/, "")}`,
           ),
-          images: imgs.map((i) =>
+          images: sendImgs.map((i) =>
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
           ),
           systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
@@ -3371,11 +4071,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           (m) => m.role === "user" && m.steerPending,
         );
         if (pendingSteer) {
-          setTimeout(() => sendPendingSteerNext(chat.id), 0);
+          // Epoch-guarded: an explicit Stop drops this drain instead of
+          // restarting the turn the user just cancelled.
+          autoRetryFor(chat.id).schedule(0, () => sendPendingSteerNext(chat.id));
         } else {
           const remaining = cNow.queued?.filter((q) => !q.sent);
           if (remaining && remaining.length > 0) {
-            setTimeout(() => sendQueuedNext(chat.id), 0);
+            autoRetryFor(chat.id).schedule(0, () => sendQueuedNext(chat.id));
           }
         }
       }
@@ -3535,10 +4237,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       useStore
         .getState()
         .setChatCompactError(ch.id, result?.error || errMsg || "empty summary");
-      // حتی در شکست کامپکت دستی هم صف تخلیه شود تا پیام کاربر گم نشود
-      setTimeout(() => {
+      // Drain the queue even on manual compact failure so no user message is lost.
+      // Epoch-guarded so an explicit Stop drops the drain.
+      autoRetryFor(ch.id).schedule(0, () => {
         if (!sendPendingSteerNext(ch.id)) sendQueuedNext(ch.id);
-      }, 0);
+      });
       return;
     }
     // The backend already returns opencode's "[Compacted earlier context]"
@@ -3568,10 +4271,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         ch.id,
         "Context compacted — older messages are summarized below (after the conversation).",
       );
-    // پیام‌های صف‌شده حین کامپکت دستی فقط بعد از اتمام کامپکت تحویل داده می‌شوند
-    setTimeout(() => {
+    // Queued messages during manual compact are delivered only after compact ends.
+    // Epoch-guarded so an explicit Stop drops the drain.
+    autoRetryFor(ch.id).schedule(0, () => {
       if (!sendPendingSteerNext(ch.id)) sendQueuedNext(ch.id);
-    }, 0);
+    });
     // Stay where the user is (normally the bottom, where the live conversation
     // continues). The messages-change effect below keeps the view pinned to
     // the bottom; do NOT yank the view up to the summary — that reads as the
@@ -3765,20 +4469,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const plan = planRetry(ch.messages, userMsg.id, 'banner');
       const continueId = plan?.target.continueAssistantId ?? failed.id;
       const targetId = ch.id;
-      setTimeout(
-        () =>
-          send(
-            userMsg.content,
-            userMsg.attachments ?? [],
-            userMsg.images ?? [],
-            false,
-            userMsg.id,
-            continueId,
-            false,
-            undefined,
-            targetId,
-          ),
-        0,
+      // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
+      autoRetryFor(targetId).schedule(0, () =>
+        send(
+          userMsg.content,
+          userMsg.attachments ?? [],
+          userMsg.images ?? [],
+          false,
+          userMsg.id,
+          continueId,
+          false,
+          undefined,
+          targetId,
+        ),
       );
       return;
     }
@@ -3793,9 +4496,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const targetId = ch.id;
       const atts = userMsg.attachments ?? [];
       const imgs = userMsg.images ?? [];
-      setTimeout(
-        () => send(text, atts, imgs, false, undefined, undefined, false, undefined, targetId),
-        0,
+      // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
+      autoRetryFor(targetId).schedule(0, () =>
+        send(text, atts, imgs, false, undefined, undefined, false, undefined, targetId),
       );
     }
   }, [send]);
@@ -3843,9 +4546,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const targetId = ch.id;
         const atts = userMsg.attachments ?? [];
         const imgs = userMsg.images ?? [];
-        setTimeout(
-          () => send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
-          0,
+        // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
+        autoRetryFor(targetId).schedule(0, () =>
+          send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
         );
       }
     },
@@ -3887,9 +4590,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const targetId = ch.id;
       const atts = userMsg.attachments ?? [];
       const imgs = userMsg.images ?? [];
-      setTimeout(
-        () => send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
-        0,
+      // Epoch-guarded: dropped when Stop bumps the epoch before it fires.
+      autoRetryFor(targetId).schedule(0, () =>
+        send(text, atts, imgs, false, undefined, undefined, false, { restart: true }, targetId),
       );
     },
     [send],
@@ -4008,7 +4711,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       setPastedBlocks([]);
       setCmdOpen(null);
       forceScrollToBottom();
-      void steerChat(chatObj.id, userMsg.id, v, atts, imgs, {
+      void steerChat(chatObj.id, userMsg.id, v, atts, cleanImagesForSend(imgs), {
         mcpServers: selectedMcpServers,
         skills: selectedSkills,
       });
@@ -4758,6 +5461,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // controller here was the cross-chat kill (Stop in B ended A's stream).
     const originId = chatIdRef.current;
     stoppedMapRef.current.set(originId, true);
+    // Single cancellation path: drop pending auto-retry timers and bump the
+    // epoch so any armed retry firing afterwards is ignored — it never
+    // restarts the turn or brings the retry banner back.
+    autoRetryFor(originId).stop();
     useStore.getState().setChatPendingAsk(originId, null);
     useStore.getState().setChatPendingPermission(originId, null);
     // Clear any retry banner immediately. The banner's visibility
@@ -4977,7 +5684,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {windowed
                   .map((m: ChatMessage) => (
                     <Fragment key={m.id}>
-                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} editingDisabled={busy} />
+                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} />
                       {/* Newer messages render tool cards inline via `segments`; only
                         older persisted messages without segments keep the stacked
                         timeline below the bubble. */}
@@ -5718,10 +6425,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           root={wroot}
           disabled={busy}
           onCommit={() => {
-            if (!wroot || busy || !chat) return;
+            if (!wroot || busy || !chat || isCommitting) return;
             const chatId = chat.id;
             void (async () => {
-              setBusyFor(chatId, true);
+              setIsCommitting(true);
               try {
                 // Commit messages run on the "compact" tool model
                 // (Settings → Tools → Compact model): a one-line message needs
@@ -5790,19 +6497,48 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   );
                 }
               } finally {
-                setBusyFor(chatId, false);
+                setIsCommitting(false);
               }
             })();
           }}
+          isCommitting={isCommitting}
+          isUndoing={isUndoing}
+          isPushing={isPushing}
           onUndo={() => {
-            if (!wroot || busy) return;
+            if (!wroot || busy || isUndoing) return;
             if (
               !window.confirm(
                 "Discard all uncommitted changes? This cannot be undone.",
               )
             )
               return;
-            void gitDiscard(wroot);
+            const chatId = chat?.id;
+            void (async () => {
+              setIsUndoing(true);
+              try {
+                const res = await gitDiscard(wroot);
+                if ("error" in res && chatId) {
+                  useStore.getState().setChatCmdError(chatId, res.error);
+                }
+              } finally {
+                setIsUndoing(false);
+              }
+            })();
+          }}
+          onPush={() => {
+            if (!wroot || busy || isPushing) return;
+            const chatId = chat?.id;
+            void (async () => {
+              setIsPushing(true);
+              try {
+                const res = await gitPush(wroot);
+                if ("error" in res && chatId) {
+                  useStore.getState().setChatCmdError(chatId, res.error);
+                }
+              } finally {
+                setIsPushing(false);
+              }
+            })();
           }}
         />
         <div className="composer-inner">

@@ -4,6 +4,8 @@
 import {
   FILE_BADGES,
   IMAGE_EXTS,
+  dedupDocPaths,
+  defaultAppForExt,
   extOf,
   extractInlinePathParts,
   fileBasename,
@@ -174,3 +176,37 @@ if (failed > 0) {
   process.exit(1);
 }
 console.log("fileTypes: all checks passed");
+
+console.log("7) dedupDocPaths — attachments hide duplicate doc chips:");
+{
+  check(
+    "same basename filtered",
+    dedupDocPaths(["a/contract.docx"], ["/data/contract.docx"]).length === 0,
+  );
+  check(
+    "case-insensitive",
+    dedupDocPaths(["a/Report.PDF"], ["b/report.pdf"]).length === 0,
+  );
+  check(
+    "unattached docs kept",
+    dedupDocPaths(["a/one.docx", "b/two.xlsx"], ["c/one.docx"]).join() === "b/two.xlsx",
+  );
+  check(
+    "same file twice with different forms kept once",
+    dedupDocPaths(["contract.docx", "/Users/saman/Downloads/workspace/contract.docx"], []).join() ===
+      "contract.docx",
+  );
+  check(
+    "persian basename duplicate kept once",
+    dedupDocPaths(["قرارداد_تهاتر.docx", "/Users/saman/Downloads/workspace/قرارداد_تهاتر.docx"], []).length === 1,
+  );
+}
+
+console.log("8) defaultAppForExt — office docs open in system app:");
+{
+  check("docx maps to Word", defaultAppForExt("docx")?.label === "Word");
+  check("xlsx maps to Excel", defaultAppForExt("xlsx")?.label === "Excel");
+  check("csv maps to Excel", defaultAppForExt("csv")?.label === "Excel");
+  check("pdf maps to viewer", defaultAppForExt("pdf")?.label === "Default PDF app");
+  check("code files keep editors", defaultAppForExt("ts") === null);
+}

@@ -404,19 +404,36 @@ async def test_read_file_cut_footer(tmp_path):
 
 @pytest.mark.asyncio
 async def test_read_dir_xml_format(tmp_path):
-    (tmp_path / "a.py").write_text("a\n")
-    (tmp_path / "b.py").write_text("b\n")
-    (tmp_path / "sub").mkdir()
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.py").write_text("a\n")
+    (pkg / "b.py").write_text("b\n")
+    (pkg / "sub").mkdir()
     root = str(tmp_path)
     read, _ = _make_read(root)
-    out = await read(filePath=".")
-    assert "<path>." in out
+    out = await read(filePath="pkg")
+    assert "<path>pkg" in out
     assert "<type>directory</type>" in out
     assert "<entries>" in out
     assert "a.py" in out
     assert "b.py" in out
     assert "sub/" in out
     assert "(3 entries)" in out
+
+
+@pytest.mark.asyncio
+async def test_read_root_blocked(tmp_path):
+    (tmp_path / "a.py").write_text("a\n")
+    root = str(tmp_path)
+    read, _ = _make_read(root)
+    for blocked in (".", "/"):
+        out = await read(filePath=blocked)
+        assert "ERROR reading" in out
+        assert "workspace root is not allowed" in out
+    # Empty path means "no file specified" - also an error, never a root listing.
+    out = await read(filePath="")
+    assert "ERROR reading" in out
+    assert "<type>directory</type>" not in out
 
 
 @pytest.mark.asyncio
@@ -496,11 +513,13 @@ async def test_read_cache_invalidates_across_path_spellings(tmp_path):
 
 @pytest.mark.asyncio
 async def test_read_dir_paginated_footer(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
     for i in range(5):
-        (tmp_path / f"f{i}.py").write_text("x\n")
+        (pkg / f"f{i}.py").write_text("x\n")
     root = str(tmp_path)
     read, _ = _make_read(root)
-    out = await read(filePath=".", offset=1, limit=2)
+    out = await read(filePath="pkg", offset=1, limit=2)
     assert "Showing 2 of 5 entries" in out
     assert "Use 'offset' parameter to read beyond entry 2" in out
 

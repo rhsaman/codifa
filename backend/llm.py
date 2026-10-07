@@ -25,7 +25,9 @@ graph or the tools.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -66,7 +68,7 @@ from tool_message_projection import (
 # Alias kept for existing call sites; logic lives in tool_message_projection.
 _stable_tool_order = stable_tool_order
 
-# _strip_think_tags و _is_repeating از _common import می‌شوند (single source of truth).
+# _strip_think_tags and _is_repeating are imported from _common (single source of truth).
 
 # _THINKING_LEVELS از _common import می‌شود (single source of truth).
 
@@ -1257,18 +1259,26 @@ from agents import (
 )
 
 # Mirrors graph.py's `_SEQUENTIAL_TOOLS` (duplicated, not imported, to avoid a
-# circular import -- graph.py imports FROM this module). Mutating / blocking
-# tool calls run one at a time; everything else may run concurrently. See the
-# comment on graph.py's `_SEQUENTIAL_TOOLS` for the full rationale.
+# circular import -- graph.py imports FROM this module). Only mutating /
+# blocking calls run one at a time; everything else (grep/glob/read /
+# lsp_symbols/web_search/fetch_url/vision -- all read-only) runs concurrently
+# via asyncio.gather with sync callables offloaded to worker threads, so two
+# concurrent sub-agent loops never serialize on a shared lock or event loop.
+# Each loop owns isolated trackers/transcript state; LSP is configured once
+# per turn outside tool calls, never with a blocking start inside a call.
+# Reads never take a global write lock (per-file locks only, held solely by
+# mutating tools). See graph.py `_SEQUENTIAL_TOOLS` for the full rationale.
 _SEQUENTIAL_TOOLS = {
     "write_file",
     "edit_file",
+    "write_document",
     "run_terminal",
     "confirm_action",
     "memory",
     "create_skill",
     "create_mcp",
     "ask_user",
+    "computer",
 }
 
 
@@ -2341,7 +2351,13 @@ async def langchain_tool_loop(
     ]
 
     async def _exec(tc):
-        """Execute a single tool call; never raises (errors become a result string)."""
+        """Execute a single tool call; never raises (errors become a result string).
+
+        Read-only calls must not block the event loop: sync callables run in
+        a worker thread so two concurrent sub-agent loops progress in
+        parallel. This function never takes a shared lock; only the caller
+        sequences _SEQUENTIAL_TOOLS one at a time.
+        """
         name = tc.get("name") or ""
         args = tc.get("args") or {}
         fn = tools.get(name)
@@ -2360,8 +2376,13 @@ async def langchain_tool_loop(
                 # "descriptor '__call__' for 'type' objects..."; the Runnable
                 # API is the correct invocation path.
                 r = fn.ainvoke(args or {})
-            else:
+            elif inspect.iscoroutinefunction(fn):
                 r = fn(**(args or {}))
+            else:
+                # Sync callable (blocking disk I/O): offload to a worker
+                # thread so a sibling sub-agent sharing this event loop is
+                # never stalled behind this call.
+                r = await asyncio.to_thread(fn, **(args or {}))
             if inspect.isawaitable(r):
                 r = await r
             return r
@@ -2462,8 +2483,8 @@ async def langchain_tool_loop(
         # the provider never sees a tool_calls block without matching
         # ToolMessages (which causes a 400 "missing results for
         # tool_call_id(s)" validation error).
-        # نگهبان نهایی ترنسکریپت (یکتاسازی شناسه‌ها + حذف بی‌جواب‌ها + یک
-        # خروجی به‌ازای هر شناسه) — همان گلوگاهِ مسیر اصلی.
+        # Final transcript guard (dedupe ids + drop unanswered + one output
+        # per id) -- same bottleneck as the main path.
         normalize_tool_transcript(msgs, _logger)
         _req = [*project_tool_results(_stable_tool_order(msgs)), *_transient]
         _llm_t0 = time.monotonic()
@@ -2582,9 +2603,9 @@ async def langchain_tool_loop(
                         _unit = max(20, _unit // 2)
                     content = content[: _unit * 3] + " … [repetition loop truncated]"
             return str(content) if isinstance(content, str) else str(content or "")
-        # idهای تکراری داخل همین پیام یک ToolMessage مشترک می‌خواهند و provider
-        # با «Duplicate function_call_output» پاسخ را رد می‌کند — قبل از ثبت
-        # پیام یکتاشان کن تا هر فراخوانی جواب خودش را بگیرد.
+        # Duplicate ids within one message need one shared ToolMessage, and the
+        # provider rejects them with "Duplicate function_call_output" -- dedupe
+        # before recording so each call gets its own answer.
         _reserved_tc_ids = {
             str(m.tool_call_id)
             for m in msgs
@@ -2818,9 +2839,9 @@ async def _auto_compact_subagent(
         if role == "assistant":
             rebuilt.append(AIMessage(content=content))
         elif role == "tool":
-            # NOTE: چند ToolMessage خلاصه‌شده با یک tool_call_id ثابت
-            # خطای 400 «Duplicate function_call_output» می‌سازد؛ شناسه‌ها
-            # را شمارشی یکتا نگه می‌داریم تا گارد pre-flight پاکشان نکند.
+            # NOTE: several compacted ToolMessages sharing one fixed tool_call_id
+            # produce a 400 "Duplicate function_call_output" error; keep ids
+            # unique with a counter so the pre-flight guard does not drop them.
             _cid = f"__compacted__{_cid_n}" if _cid_n else "__compacted__"
             _cid_n += 1
             rebuilt.append(ToolMessage(content=content, tool_call_id=_cid))

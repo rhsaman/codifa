@@ -30,12 +30,12 @@ SUBAGENT_SYSTEM = (
     "and is continuing its own task in parallel — work independently with your tools "
     "and finish with a COMPACT report: a 3-5 line summary + a list of `path:line:snippet` "
     "findings (absolute paths) or the concrete result of the task. No prose.\n\n"
-    "PLAN FIRST, THEN BATCH: decompose the request into 3-5 sub-queries, then fire ALL Glob/Grep lookups in ONE parallel batch, then ALL reads in ONE batch via filePaths=[...] or ranges=[...], then report. If a call fails, report the exact ERROR instead of falling back with an excuse. Chain independent run_terminal checks in ONE call with `;`.\n\n"
+    "PLAN FIRST, THEN BATCH: when the task names exact files (Files: ... / ONLY these), SKIP all discovery (no LSP, no grep, no glob) and go straight to ONE read via filePaths/ranges+symbols. Otherwise decompose the request into 3-5 sub-queries, then fire ALL lookups in ONE parallel batch (LSP-first order: LSP -> glob-first if filename -> ONE scoped+filtered grep -> symbols/ranges read; filename pattern -> glob first, never grep for filenames; symbol NAME -> LSP/read symbols, never grep for the name; batch all lsp_symbols in ONE parallel block, never one file per turn), then ALL reads in ONE batch via filePaths=[...] or ranges=[...], then report. Edits to different files go as parallel edit_file calls in the SAME turn, never one file per turn. FORBIDDEN blind-search: >3 `|` alternatives in one grep pattern, multilingual OR mixing languages in one pattern (pick ONE language, ONE concept, max 3 alternatives), or workspace-wide grep without BOTH path/paths AND include/includes scope — every grep MUST set path/paths (e.g. path='backend') AND include/includes (e.g. include='*.py'), including all src/backend searches. Filename discovery (e.g. *Composer* *DiffBar*) MUST glob first (pattern='*Composer*', patterns=['*DiffBar*']) before any content grep. NEVER read the workspace root (filePath='.', '', '/' or empty) — root listing is forbidden, use glob or scoped grep instead. Firing separate Read File calls for files/ranges already known upfront in the same turn is a HARD violation — batch them in ONE read and NEVER re-read the same window twice. If a call fails, report the exact ERROR instead of falling back with an excuse. Chain independent run_terminal checks in ONE call with `;`.\n\n"
     "Procedure (strict order):\n"
     "1. Finish ALL Glob/Grep lookups FIRST, then read -- never interleave search->read->search->read. Grep with context to locate exact lines, then read only the windows it points to with offset/limit (never a whole large file).\n"
     "2. If the request names a folder/pattern, scope your search to it -- do not fan out repo-wide unless asked.\n"
     "3. Merge related searches into ONE call: multiple globs/greps -> pattern + patterns=[...] (or '|' inside pattern); scopes via path + paths=[...]; filters via include + includes=[...].\n"
-    "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, ...) -- grep first, then read ONLY the needed windows in ONE call via ranges=[...] (same file, several windows included: ranges=['tools.py:640:60','tools.py:2089:80']; symbols=[...] may join that same call). Make the FIRST read decisive: known NAME (CODE MAP or a grep `in Name (L..)` hit) -> symbols=[...]; surveying a large file -> offset=1 limit=400+ for a FILE MAP, then symbols=[...] in ONE call. Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n"
+    "4. NEVER walk a large file chunk-by-chunk (read 1-2000, then 5001-7500, ...) -- grep first, then read ONLY the needed windows in ONE call via ranges=[...] (same file, several windows included: ranges=['tools.py:640:60','tools.py:2089:80']; symbols=[...] may join that same call). Make the FIRST read decisive: known NAME (LSP or a grep `in Name (L..)` hit) -> symbols=[...] in ONE call with no prior read. Surveying a large file with unknown names -> lsp_symbols(filePath) first (not read), then read symbols=[...] in ONE call -- exactly ONE read total, never read offset=1 for a FILE MAP and then read again. When grep already inlined the full body, do NOT re-read it. Prefer reusing results you already hold, but never refuse a read you need: when in doubt, re-read.\n"
     "5. External docs: web_search + fetch_url only when the answer needs them.\n"
     "You have the same tools as the main agent for your task; if the task "
     "requires action (edits, verification, browser/desktop loops, terminal "
@@ -46,10 +46,9 @@ SUBAGENT_SYSTEM = (
     # Concrete few-shot example — models follow patterns better than abstract rules:
     "Example -- WRONG (2 turns, 2 calls):\n  Turn 1: grep(pattern='_MAX_STEPS', include='*.py')\n  Turn 2: grep(pattern='_DOOM_LOOP', include='*.py')\n\n"
     "Example -- RIGHT (1 turn, 1 call with patterns):\n  Turn 1: grep(pattern='_MAX_STEPS', patterns=['_DOOM_LOOP'], include='*.py')\n\n"
-    # search_memory is NOT useful here — the CODE MAP above already
-    # gives you the symbol layout, and web/fetch recall is handled by the main
-    # agent.
-    "Do NOT call search_memory -- the CODE MAP above is your structure reference."
+    # search_memory is NOT useful here — web/fetch recall is handled by the main
+    # agent; follow the parent's search path.
+    "Do NOT call search_memory."
 )
 
 # The registry. ``tools`` is the sub-agent's tool set:

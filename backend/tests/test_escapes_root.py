@@ -85,6 +85,26 @@ def test_permit_folder_allows_terminal_outside(tmp_path) -> None:
     assert "request_permission" in blocked["error"]
 
 
+def test_temp_dir_always_readable_without_permit(tmp_path) -> None:
+    """OS temp dir is always readable without permission (terminal logs live there)."""
+    import tempfile
+
+    from tools import read_file
+
+    log = os.path.join(tempfile.gettempdir(), "codifa-terminal", "probe-test.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(log, "w", encoding="utf-8") as fh:
+        fh.write("probe-ok")
+    try:
+        out = read_file(str(tmp_path), log)
+    finally:
+        try:
+            os.remove(log)
+        except OSError:
+            pass
+    assert "probe-ok" in out.get("content", ""), f"temp log must be readable: {out}"
+
+
 def test_permit_folder_allows_file_tools(tmp_path) -> None:
     """مجوز per-folder در ابزارهای فایل: read/write/edit زیر پوشه‌ی مجاز
     کار می‌کند؛ مسیر بیرونیِ دیگر همچنان PathEscapeError می‌دهد."""

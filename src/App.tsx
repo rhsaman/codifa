@@ -13,7 +13,6 @@ function ChatTabsRow() {
   )
 }
 import { Sidebar } from './components/Sidebar'
-import { CodeMapPanel } from './components/CodeMapPanel'
 import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
@@ -32,7 +31,6 @@ import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
 import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
-import { openWorkspaceFile } from './components/FileIcon'
 import { WindowStripCluster } from './components/WindowStripCluster'
 import { TerminalPanel } from './components/TerminalPanel'
 
@@ -47,7 +45,6 @@ export default function App() {
   const visibleChatIds = useStore((s) => s.visibleChatIds)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
-  const codeMapPanelOpen = useStore((s) => s.codeMapPanelOpen)
   const viewerTabs = useViewerTabs((s) => s.tabs)
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
@@ -108,7 +105,7 @@ export default function App() {
   }, [])
 
   // `coder:open-file` is the app-wide "open this workspace file" event (fired
-  // by file chips, the code map, and any future external-editor hook). Opening
+  // by file chips and any future external-editor hook). Opening
   // happens here once so every dispatcher shares the same right-panel path.
   useEffect(() => {
     const onOpenFile = (e: Event) => {
@@ -363,11 +360,6 @@ export default function App() {
           window.dispatchEvent(new CustomEvent('coder:search'))
           break
         }
-        case 'o': {
-          e.preventDefault()
-          useStore.getState().toggleCodeMapPanel()
-          break
-        }
         case 'j': {
           // Bottom terminal panel — Cmd+J on Apple platforms, Ctrl+J elsewhere
           // (the user-facing spec, unlike the app's usual Cmd/Ctrl duality).
@@ -542,16 +534,6 @@ export default function App() {
               </>
             )}
           </div>
-          {codeMapPanelOpen && (
-            <CodeMapPanel
-              onJumpToFile={(path, line) => {
-                // Opens the file in its own viewer tab (FileViewerPanel) and
-                // also dispatches the `coder:open-file` CustomEvent so any
-                // future listener (e.g. an external editor hook) still works.
-                openWorkspaceFile(path, line)
-              }}
-            />
-          )}
         </ErrorBoundary>
       </div>
 

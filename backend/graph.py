@@ -147,19 +147,23 @@ from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 # memory/skills/connectors) or block on a real human (ask_user) -- they run
 # SEQUENTIALLY, each waiting for the previous to finish, so two writes can
 # never race and a blocking question never overlaps another call. Everything
-# else (grep/glob/read/web_search/fetch_url/vision/search_memory/task -- all
+# else (grep/glob/read/lsp_symbols/web_search/fetch_url/vision/task -- all
 # read-only) runs CONCURRENTLY via asyncio.gather when the model requests
 # several in the same step, matching opencode's own behavior (regular tool
-# calls run via Promise.all; only Task calls are serialized there, which is a
-# known opencode bug -- github.com/anomalyco/opencode/issues/14195). This does
-# NOT increase token cost: the provider still gets exactly the same set of
-# ToolMessages either way -- only wall-clock latency changes.
+# calls run via Promise.all). Reads never take a global write lock (per-file
+# locks only, held solely by mutating tools) and never block on LSP startup
+# inside the call, so two concurrent sub-agent loops progress in parallel:
+# each loop owns isolated transcript/tracker state and shares no transcript
+# lock or LSP-start lock. This does NOT increase token cost: the provider
+# still gets exactly the same set of ToolMessages either way -- only
+# wall-clock latency changes.
 _SEQUENTIAL_TOOLS = {
     "write_file",
     "edit_file",
     "write_document",
     "run_terminal",
     "confirm_action",
+    "memory",
     "create_skill",
     "create_mcp",
     "ask_user",
@@ -230,16 +234,16 @@ async def _save_turn_checkpoint(
         logger.warning("failed to persist resume checkpoint: %s", exc)
 
 
-# نتیجهٔ placeholder برای tool_callهایی که قبل از قطع‌شدنِ turn اجرا نشدند.
-# بدون این پوشش، provider ترنسکریپت را با خطای «tool_calls must be followed
-# by tool messages» رد می‌کند و resume از کار می‌افتد.
+# Placeholder result for tool_calls that never ran before the turn was cut off.
+# Without this cover, the provider rejects the transcript with
+# "tool_calls must be followed by tool messages" and resume breaks.
 _INTERRUPTED_TOOL_PLACEHOLDER = (
     "[interrupted before running — re-issue if still needed]"
 )
 
 
 def _unanswered_tool_calls(msgs: list, calls: list) -> list:
-    """فراخوانی‌های ``calls`` که هنوز ToolMessage متناظری در ``msgs`` ندارند."""
+    """Return ``calls`` that still lack a matching ToolMessage in ``msgs``."""
     answered = {m.tool_call_id for m in msgs if isinstance(m, ToolMessage)}
     return [tc for tc in calls if tc.get("id") and tc.get("id") not in answered]
 
@@ -281,11 +285,12 @@ async def _save_turn_checkpoint_valid(
     mode: str = "",
     plan: list | None = None,
 ) -> None:
-    """ذخیرهٔ چک‌پوینتی که ترنسکریپتش «همیشه» برای provider معتبر است.
+    """Save a checkpoint whose transcript is ALWAYS valid for the provider.
 
-    هر tool_call از step جاری که هنوز نتیجه‌ای ندارد با یک ToolMessageی
-    placeholder پوشانده می‌شود، تا resume هرگز با خطای «tool_calls must be
-    followed by tool messages» رد نشود و turn از همان‌جا ادامه یابد.
+    Every tool_call of the current step that still lacks a result is covered
+    with a placeholder ToolMessage, so resume is never rejected with
+    "tool_calls must be followed by tool messages" and the turn continues
+    from the same point.
 
     Writes are throttled (every N steps or on significant growth) so the
     per-step sqlite latency does not grow with the transcript; pass
@@ -313,12 +318,12 @@ async def _save_turn_checkpoint_valid(
 
 
 def _sanitize_trailing_tool_calls(msgs: list) -> list:
-    """پاک‌سازی دفاعی چک‌پوینت‌های (احتمالاً خرابِ) موجود روی دیسک.
+    """Defensive cleanup for (possibly corrupt) checkpoints already on disk.
 
-    اگر آخرین AIMessage دارای tool_calls هنوز جواب‌های کاملش را ندارد،
-    برای فراخوانی‌های بی‌جواب placeholder append می‌کنیم. اگر بعد از آن
-    HumanMessageی در کار باشد (مثلاً steer)، دست نمی‌زنیم — pre-flight
-    ``strip_orphaned_tool_calls`` آن مورد را پوشش می‌دهد.
+    When the last AIMessage carries tool_calls that still lack their full
+    answers, append placeholders for the unanswered calls. When a
+    HumanMessage follows (e.g. a steer), leave it alone -- the pre-flight
+    ``strip_orphaned_tool_calls`` covers that case.
     """
     for m in reversed(msgs):
         if isinstance(m, HumanMessage):
@@ -336,11 +341,12 @@ def _sanitize_trailing_tool_calls(msgs: list) -> list:
 
 
 def _append_resume_request(messages: list, request: str) -> list:
-    """افزودن پیام تازهٔ کاربر به ترنسکریپتِ resume (بدون duplicate).
+    """Append a fresh user message to the resume transcript (no duplicates).
 
-    موقع resume، ``messages`` کلاً با چک‌پوینت جایگزین می‌شود؛ بدون این
-    helper متن جدید کاربر («ادامه بده» یا هر دستور تازه) هرگز به مدل
-    نمی‌رسید. Retryِ همان متن قبلی duplicate نمی‌شود چون هم‌نامِ موجود است.
+    On resume, ``messages`` is fully replaced by the checkpoint; without this
+    helper the user's new text ("continue" or any fresh instruction) would
+    never reach the model. Retrying the same previous text is not duplicated
+    because it matches an existing message.
     """
     req = (request or "").strip()
     if not req:
@@ -710,6 +716,7 @@ class AgentState(TypedDict, total=False):
     vector_db_path: str
     vector_config: dict
     retrieval_config: dict
+    lsp_config: dict
     subagent_models: dict
     providers: dict
     reserved: int | None
@@ -1067,6 +1074,10 @@ def filter_tools_for_mode(
     # runtime permission prompting still applies until "Always allow".
     if "computer" in tools and not allow_computer:
         tools = {n: fn for n, fn in tools.items() if n != "computer"}
+    # LSP tools are available in every mode with repo access
+    # (coder/plan/ask/reader): precise jump helps answering and planning
+    # too, not just editing. Write/terminal tools stay coder-only (handled
+    # above), so LSP remains read-only outside coder mode.
 
     # Coder plan scope: plan Files are the enforceable search scope, so grep/
     # glob/read wrappers reject whole-workspace scans (missing path) and
@@ -1398,6 +1409,19 @@ async def _vision_analyze(
         "verbatim (file paths, code, errors), then describe layout/UI."
     )
     model_name = getattr(model, "model_name", "") or "unknown"
+    # Filter corrupt data URLs ONCE before any provider call (not per-attempt):
+    # a truncated image would otherwise be resent on every retry, burning all
+    # attempts on a request the provider can never accept (400 invalid base64).
+    try:
+        image_uris = [
+            u for u in
+            (_agents._sanitize_image_data_url(x) for x in (image_uris or []))
+            if u
+        ]
+    except Exception:  # noqa: BLE001
+        image_uris = list(image_uris or [])
+    if not image_uris:
+        return None
     # Retry ONLY transient provider failures (429 / 5xx / timeout / network
     # blip) so a single flaky vision request doesn't silently make the image
     # invisible. Permanent errors (e.g. 400 image-rejected) are NOT retried —
@@ -1609,10 +1633,132 @@ def _fit_skill_catalog_lines(
     return lines
 
 
+def _skill_extra_files_map() -> dict:
+    """Map skill name/slug (casefolded) to its extra file list, best-effort."""
+    try:
+        rows = state_db.list_skills()
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict = {}
+    for r in rows or []:
+        files = [str(f or "").strip() for f in (r.get("files") or []) if str(f or "").strip()]
+        for key in (str(r.get("name") or ""), str(r.get("slug") or "")):
+            if key.strip():
+                out[key.strip().casefold()] = files
+    return out
+
+
+def _skill_generic_norm(text: str) -> str:
+    """Normalize text for data-driven skill matching (no hardcoded map)."""
+    return (
+        str(text or "")
+        .lower()
+        .replace("\u200c", " ")
+        .replace("ي", "ی")
+        .replace("ك", "ک")
+    )
+
+
+def _skill_generic_stems(text: str) -> set[str]:
+    """Lower-cased word stems (first 6 chars) from skill/request data only."""
+    out: set[str] = set()
+    try:
+        stop = set(getattr(_agents, "_SKILL_AUTO_STOP", frozenset()))
+    except Exception:  # noqa: BLE001
+        stop = frozenset()
+    for tok in re.findall(r"\w+", _skill_generic_norm(text)):
+        if len(tok) < 3 or tok.isdigit() or tok in stop:
+            continue
+        out.add(tok[:6])
+    return out
+
+
+def _skill_generic_phrase_in(norm_text: str, phrase: str) -> bool:
+    """True when ``phrase`` occurs in ``norm_text`` (both normalized)."""
+    key = _skill_generic_norm(phrase).strip()
+    return len(key) >= 2 and re.search(r"(?<!\w)" + re.escape(key), norm_text) is not None
+
+
+def _skill_generic_score(skill: dict, p_stems: set[str], norm: str) -> int:
+    """Score a skill from its own data only (name/slug/description/fa_keywords)."""
+    name_stems = _skill_generic_stems(f"{skill.get('name', '')} {skill.get('slug', '')}")
+    hits = len(p_stems & name_stems)
+    score = 2 * hits
+    if hits and len(name_stems) == 1:
+        score += 2
+    desc_stems = _skill_generic_stems(skill.get("description", "")) - name_stems
+    score += min(len(p_stems & desc_stems), 2)
+    for kw in skill.get("fa_keywords") or []:
+        kw_n = _skill_generic_norm(kw).strip()
+        if not kw_n:
+            continue
+        if _skill_generic_phrase_in(norm, kw):
+            score += 4
+            break
+        if _skill_generic_phrase_in(kw_n, norm.strip()[:120]):
+            score += 4
+            break
+        kw_words = {w for w in re.findall(r"\w+", kw_n) if len(w) >= 2}
+        p_words = {w for w in re.findall(r"\w+", norm) if len(w) >= 2}
+        if not kw_words or not p_words:
+            continue
+        inter = kw_words & p_words
+        if len(kw_words) == 1 and inter:
+            score += 4
+            break
+        if len(inter) >= 2:
+            score += 4
+            break
+    return score
+
+
+def _skill_generic_pick(prompt: str, skills: list[dict], exclude=()) -> list[dict]:
+    """Data-driven fallback when the deterministic auto-pick returns nothing.
+
+    Scores ONLY from each skill's own data (name/slug/description/fa_keywords)
+    with no hardcoded concept map, so any task — including vague or Persian-only
+    requests — resolves via the skill data itself. Persian-only prompts with no
+    Latin stems still match via ``fa_keywords`` substring. Thresholds mirror the
+    deterministic picker so a single generic word never qualifies.
+    """
+    try:
+        max_n = int(getattr(_agents, "_SKILL_AUTO_MAX", 2))
+    except Exception:  # noqa: BLE001
+        max_n = 2
+    try:
+        min_score = int(getattr(_agents, "_SKILL_AUTO_MIN_SCORE", 4))
+    except Exception:  # noqa: BLE001
+        min_score = 4
+    if max_n <= 0 or not skills:
+        return []
+    norm = _skill_generic_norm(prompt)[:1200]
+    if len(norm.strip()) < 3:
+        return []
+    try:
+        if getattr(_agents, "_SKILL_META_RE", None) is not None and _agents._SKILL_META_RE.search(norm):
+            return []
+    except Exception:  # noqa: BLE001
+        pass
+    p_stems = _skill_generic_stems(norm)
+    skip = {str(n).casefold() for n in exclude}
+    scored: list[tuple[int, int, dict]] = []
+    for i, s in enumerate(skills or []):
+        if str(s.get("name") or "").casefold() in skip:
+            continue
+        sc = _skill_generic_score(s, p_stems, norm)
+        if sc >= min_score:
+            scored.append((-sc, i, s))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [s for _, _, s in scored[:max_n]]
+
+
 def _format_skill_body(s: dict) -> str:
     """One inlined skill (shared by @mentioned and auto-matched skills)."""
+    files = [str(f or "").strip() for f in (s.get("files") or []) if str(f or "").strip()]
+    extra = f"\nExtra files: {', '.join(files)} — call load_skill with file=<name> only when needed." if files else ""
     return (
         f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
+        f"{extra}"
         f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
     )
 
@@ -1654,6 +1800,18 @@ def _build_skills_section(
     if not catalog and not manual_names:
         return ""
     all_skills = _agents._load_skills(root)
+    if all_skills:
+        try:
+            _files_map = _skill_extra_files_map()
+        except Exception:  # noqa: BLE001
+            _files_map = {}
+        if _files_map:
+            for _s in all_skills:
+                if not _s.get("files"):
+                    _hit = _files_map.get(str(_s.get("name") or "").strip().casefold())
+                    if _hit is None:
+                        _hit = _files_map.get(str(_s.get("slug") or "").strip().casefold(), [])
+                    _s["files"] = list(_hit or [])
     out = ""
     if catalog and all_skills:
         if compact:
@@ -1663,9 +1821,11 @@ def _build_skills_section(
             _header = (
                 "\n\n=== AVAILABLE SKILLS ===\n"
                 "Skills are reusable instruction bundles. When the task "
-                "matches a description below, call the load_skill tool "
+                "clearly needs a skill below, call the load_skill tool "
                 "with that skill's name FIRST and follow its instructions; "
-                "when nothing matches, load none.\n"
+                "a single shared word is NOT a match (e.g. LSP / Language "
+                "Server does NOT match learning a programming language); "
+                "when nothing clearly matches, load none.\n"
             )
         else:
             _max_skills = _SKILL_CATALOG_MAX_SKILLS
@@ -1674,10 +1834,13 @@ def _build_skills_section(
             _header = (
                 "\n\n=== AVAILABLE SKILLS ===\n"
                 "Skills are reusable instruction bundles. When the user's task "
-                "matches one of the descriptions below, call the load_skill tool "
-                "with that skill's name FIRST and follow its instructions. When "
+                "clearly needs one of the skills below, call the load_skill tool "
+                "with that skill's name FIRST and follow its instructions. A "
+                "single shared word is NOT a match (e.g. LSP / Language Server "
+                "does NOT match learning a programming language). When "
                 "the user explicitly @mentions a skill, its full body is already "
-                "inlined below — do NOT load it again.\n"
+                "inlined below — do NOT load it again. When nothing clearly "
+                "matches, load none.\n"
             )
         lines = _fit_skill_catalog_lines(
             all_skills, _header, _total_max, _line_max, _max_skills
@@ -1689,6 +1852,11 @@ def _build_skills_section(
             if prompt
             else []
         )
+        if not auto and prompt:
+            try:
+                auto = _skill_generic_pick(prompt, all_skills, manual_names)
+            except Exception:  # noqa: BLE001 — fallback never breaks the turn
+                auto = []
         if auto:
             cap = _agents._SKILL_AUTO_MAX_BODY_CHARS
             inline = [s for s in auto if len(s["content"]) <= cap]
@@ -1699,7 +1867,10 @@ def _build_skills_section(
                 parts.append(
                     "These skills match the user's request and are ALREADY "
                     "LOADED below — follow their instructions for this task "
-                    "and do NOT call load_skill for them.\n"
+                    "and do NOT call load_skill for them. When a skill lists "
+                    "Extra files, the main body is enough unless the task needs "
+                    "a listed file — then call load_skill with file=<name> for "
+                    "that specific file only (saves tokens).\n"
                     + "\n\n".join(_format_skill_body(s) for s in inline)
                 )
             if heavy:
@@ -1792,38 +1963,6 @@ def skills_catalog_block(max_chars: int = 1800) -> str:
     return header + "\n".join(lines) + "\n"
 
 
-def _dedup_code_map(
-    code_map_block: str,
-    map_hash: str,
-    chat_id: str,
-    lc_history: list,
-) -> str:
-    """اگه نقشهٔ CODE MAP نسبت به turn قبلی تغییر نکرده، به‌جای ارسال کامل فقط
-    یه marker کوتاه می‌فرسته — مگر اینکه نقشهٔ کاملِ قبلی دیگه تو recent tail
-    (lc_history) نباشه (مثلاً به‌خاطر historyLimit یا auto-compact حذف/خلاصه
-    شده باشه) که اون‌وقت نقشهٔ کامل رو دوباره می‌فرستیم تا مدل با marker
-    بی‌محتوا گمراه نشه. کش هش per-chat هست (chat_id کلید dict)."""
-    try:
-        _cache = getattr(build_turn_context, "_code_map_hash_cache", None)
-        if not isinstance(_cache, dict):
-            _cache = {}
-        _prev = _cache.get(chat_id)
-        _full_still_in_history = any(
-            isinstance(m, HumanMessage) and "CODE MAP" in str(getattr(m, "content", ""))
-            for m in lc_history
-        )
-        if _prev == map_hash and _full_still_in_history:
-            return (
-                "\n\n===== CODE MAP (live symbol index — unchanged since last turn) =====\n"
-                "[see previous turn's CODE MAP — no files changed]"
-            )
-        _cache[chat_id] = map_hash
-        build_turn_context._code_map_hash_cache = _cache
-    except Exception:  # noqa: BLE001, S110
-        pass
-    return code_map_block
-
-
 def _slice_history_by_turns(history: list, n: int) -> list:
     """برش history به «n رفت‌وبرگشت اخیر» بر اساس مرز پیام user.
 
@@ -1898,6 +2037,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     mode = state["mode"]
     prompt = (state.get("request") or "").strip()
     chat_id = state.get("chat_id", "")
+    try:
+        from lsp_manager import configure_lsp as _configure_lsp
+        _configure_lsp(state.get("lsp_config") or {})
+    except Exception:  # noqa: BLE001 - lsp config never breaks the turn
+        pass
     cap = state.get("cap") or {}
     allow_create = bool(state.get("allow_create"))
     allow_outside = bool(state.get("allow_outside"))
@@ -1949,7 +2093,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             ctx = 0
     ctx = max(0, ctx)
     # Small-context mode: when the model's window is below the threshold we
-    # switch to a token-frugal prompt assembly (smaller CODE MAP, no skill
+    # switch to a token-frugal prompt assembly (half-size RAG, no skill
     # descriptions, tighter project-memory cap, tighter tool-output trim).
     # Models with ctx >= threshold (or unknown ctx=0) keep the full prompt.
     small_ctx = _agents.is_small_context(ctx)
@@ -2193,15 +2337,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "request to ONLY these files: "
             + ", ".join("`" + f + "`" for f in sorted(scoped_paths))
             + ". You MUST work ONLY with these files. Search ONLY within them: "
-            "grep/glob/read MUST use path/include limited to these files, starting "
-            "from the CODE MAP, then ONE scoped grep with context, then "
+            "grep/glob/read MUST use path/include limited to these files: ONE scoped grep with context, then "
             "symbols=[...] or ranges=[...] — never scan the whole workspace blindly."
         )
     if mode == "coder":
         workspace_note += (
-            "\n\n=== TARGETED SEARCH (CODER) ===\nStart from the CODE MAP, "
+            "\n\n=== TARGETED SEARCH (CODER) ===\nStart from LSP (lsp_definition/references/hover/symbols) for a precise jump, "
             "then ONE scoped grep (path/include limited to SCOPE or the plan's Files) "
-            "with context, then read only the pointed windows via symbols=[...] or "
+            "with context if needed, then read only the pointed windows via symbols=[...] or "
             "ranges=[...]. Whole-workspace grep/glob without path is rejected — always pass path/include. Never scan the whole workspace blindly; after at most "
             "2-3 search batches start editing in the SAME turn."
         )
@@ -2294,88 +2437,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if saved:
             system_final += saved
 
-    # نقشه‌ی نماد لحظه‌ای (CODE MAP) — مدل مستقیماً می‌ره سراغ read،
-    # بدون نیاز به grep/glob کورکورانه. جایگزین ایندکس کد در RAG.
-    # فقط برای مودهای کد تزریق می‌شه (ask/reader/chat نماد نمی‌خوان) و
-    # به user turn اضافه می‌شه (نه سیستم‌پرامپت) تا کشِ پیشوند نشکنه.
-    code_map_block = ""
-    # Fast path: obvious chit-chat skips the map.
-    _map_fast_skip = _obvious_non_code_turn(prompt, state.get("history") or [])
-    if mode in ("coder", "plan", "ask") and not _map_fast_skip:
-        _tctx_status("codemap", "Building code map")
-        try:
-            from symbol_index import _looks_like_code_ident, format_symbol_map
-
-            # استخراج فایل‌های ذکرشده از تاریخچه (مثل aider.get_repo_map که از
-            # پیام فعلی می‌گیره — ما از کل تاریخچه می‌گیریم چون context کامل‌تره).
-            # این باعث می‌شه نقشه بر اساس سوال/چت رتبه‌بندی بشه (PageRank با
-            # personalization) بدون اینکه فایلی کلاً حذف بشه.
-            _mentioned_fnames: set[str] = set()
-            _mentioned_idents: set[str] = set()
-            _hist_chars_for_map = 0
-            _hist_for_map = state.get("history") or []
-            for _turn in _hist_for_map:
-                for _ta in _turn.get("toolActivity") or []:
-                    _p = _ta.get("args", {}).get("path") or _ta.get("args", {}).get(
-                        "filePath"
-                    )
-                    if _p:
-                        _mentioned_fnames.add(os.path.relpath(_p, root))
-                _content = _turn.get("content") or ""
-                if isinstance(_content, str):
-                    _hist_chars_for_map += len(_content)
-                    for _m in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", _content):
-                        if _looks_like_code_ident(_m):
-                            _mentioned_idents.add(_m)
-
-            # ask توکن‌حساس‌تره → بودجه کمتر.
-            if small_ctx:
-                max_map_tokens = _agents._SMALL_CTX_CODE_MAP_TOKENS  # 256
-            elif _hist_chars_for_map > 400_000:
-                # Huge history already shows the model the files it touched; a
-                # tighter map avoids re-sending kilobytes it has just seen.
-                # Ranking still puts mentioned/chat files first, so the logic
-                # is unchanged — only the low-rank tail is trimmed.
-                max_map_tokens = 512
-            else:
-                max_map_tokens = 512 if mode == "ask" else 1024
-            # نقشه کامل فرستاده می‌شه (بدون فیلتر بر اساس سوال) — فیلتر کردن
-            # نقشه باعث می‌شد ایجنت فایل موردنظرش رو توی نقشه نبینه و مجبور بشه
-            # با grep/read دنبالش بگرده → tool call بیشتر. پس نقشه رو کامل
-            # می‌فرستیم و فقط به کش هش (پایین) تکیه می‌کنیم تا توکن تورن‌های
-            # تکراری کم بشه.
-            _map_rank_info: dict = {}
-            code_map_block = (
-                await _bounded_to_thread(
-                    "codemap",
-                    str(chat_id or ""),
-                    _env_timeout("CODIFA_CODEMAP_TIMEOUT", 120.0),
-                    format_symbol_map,
-                    root,
-                    max_map_tokens=max_map_tokens,
-                    mentioned_fnames=_mentioned_fnames,
-                    mentioned_idents=_mentioned_idents,
-                    query=prompt,
-                    rank_info=_map_rank_info,
-                )
-                if root
-                else ""
-            )
-        except Exception:  # noqa: BLE001
-            code_map_block = ""
-    _tctx_mark("codemap")
-
-    # کش هش نقشه: اگه نقشه نسبت به تورن قبلی عوض نشده، کل نقشه رو نمی‌فرستیم
-    # بلکه یه marker کوتاه می‌فرستیم (توکن کمتر، چون محتوای یکسانه). این با
-    # prefix-cache هم تداخل نداره چون نقشه توی user turn هست نه سیستم‌پرامپت.
-    _map_hash = ""
-    if code_map_block:
-        try:
-            _map_hash = hashlib.md5(
-                code_map_block.encode("utf-8", "ignore")
-            ).hexdigest()[:12]
-        except Exception:  # noqa: BLE001, S110
-            pass
+    # No code-map injection: coder uses on-demand LSP tools (opencode-style lazy manager).
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -2416,14 +2478,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             )
             lc_history = history_to_langchain_messages(_recent, current_mode=mode)
             lc_history.insert(0, HumanMessage(content=_summary))
-            # بخش خلاصه‌شده ممکنه شامل turnی با نقشهٔ کامل بوده باشه → محتوای نقشه
-            # از context افتاده. کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل
-            # بفرسته نه marker بی‌محتوای «see previous turn».
-            _code_map_hash_cache = getattr(
-                build_turn_context, "_code_map_hash_cache", None
-            )
-            if isinstance(_code_map_hash_cache, dict) and chat_id in _code_map_hash_cache:
-                _code_map_hash_cache.pop(chat_id, None)
     else:
         lc_history = history_to_langchain_messages(history, current_mode=mode)
     # Small-context: tighter cap on tool outputs in the history transcript.
@@ -2439,13 +2493,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         _c[:_tool_cap]
                         + "\n[truncated for small-context model — re-read with offset/limit if needed]"
                     )
-    # CODE MAP dedup: فقط وقتی marker "unchanged" بفرست که نقشهٔ کامل هنوز
-    # تو recent tail (lc_history) هست — وگرنه (اگه historyLimit یا auto-compact
-    # turn حاوی نقشه رو حذف/خلاصه کرده باشه) نقشهٔ کامل رو دوباره می‌فرستیم تا
-    # مدل با یه marker بی‌محتوا ("see previous turn") که به هیچی اشاره نمی‌کنه
-    # گمراه نشه. کش هش per-chat هست (chat_id کلید dict) نه یه scalar global.
-    if code_map_block and mode in ("coder", "plan", "ask") and _map_hash:
-        code_map_block = _dedup_code_map(code_map_block, _map_hash, chat_id, lc_history)
     with contextlib.suppress(Exception):
         _hist_chars = sum(len(str(getattr(m, "content", ""))) for m in lc_history)
         _tool_items_chars = 0
@@ -2490,13 +2537,57 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         disc = _agents._plan_discovery_note(history)
         if disc:
             lc_history.append(HumanMessage(content=disc))
+        # Live user-like testing takes precedence over code-test verification:
+        # when the user asks for a live test, the agent must launch the app
+        # and behave like a user instead of writing test files. Generic across
+        # projects and stacks: the start command and port always come from the
+        # project's own manifest, never assumed. The predicate lives in agents.py.
+        _is_live_test = False
+        try:
+            _is_live_test = bool(_agents._is_live_test_task(prompt))
+        except Exception:  # noqa: BLE001 — detection never breaks the turn
+            _is_live_test = False
+        if _is_live_test and not _is_status_check:
+            lc_history.insert(
+                0,
+                HumanMessage(
+                    content=(
+                        "LIVE TEST RULE: this is a live user-like test, not a code-test task. "
+                        "Do NOT write test files (no pytest/vitest/jest specs for this request). "
+                        "Do NOT loop on Read File / Search Files to guess the bug — browser "
+                        "evidence comes first, code reads are a last resort (at most 2-3 targeted "
+                        "reads, never batched Search Files loops). "
+                        "Launch the project's own start/dev command from its manifest "
+                        "(package.json scripts, pyproject, Cargo.toml, go.mod, etc. — never assume "
+                        "the command, cwd, or port; run from the directory that actually holds "
+                        "the manifest/server file) detached with `bg:` via run_terminal "
+                        "(a foreground server timeout is expected, not a failure). "
+                        "Read its output with run_terminal `terminal_logs <job_id>` (an internal "
+                        "run_terminal command, not a shell binary) or the read tool on the "
+                        "returned log path until ready; a missing log file means still "
+                        "starting, retry shortly. The OS temp dir (log files) is always readable "
+                        "without permission — never ask for permission to read it. Then drive "
+                        "the REAL running app like a user at the sidecar's actual launched port "
+                        "(never the playwright MCP port; never assume /health — probe only routes "
+                        "declared in the server code) via browser navigate/click/type or computer "
+                        "actions, DOM assertions, screenshots, and report a verdict per behavior "
+                        "with evidence. After EVERY navigate, collect browser_console_messages "
+                        "(errors), browser_snapshot, and DOM state via browser_evaluate before any "
+                        "code read. A blank/white page with an empty #root plus a missing "
+                        "window.coder means the app shell needs its bridge: use the harness route "
+                        "(/tests/ui/harness.html?scenario=...) which stubs window.coder, instead of "
+                        "reading source files in a loop. "
+                        "Stop the dev server with `terminal_stop <job_id>` when finished."
+                    )
+                ),
+            )
         # Enforce the test-verification rule at runtime for any code-changing
         # coder task (feature/bugfix/refactor), not only when the prompt
         # literally says "test". This closes the gap the user reported: coder
         # must write/update and run tests before finishing, even on ordinary
         # code work — but only for changes that alter behavior/logic, not pure
         # cosmetic/refactor/doc edits. The pure-logic predicates live in agents.py.
-        if _agents._is_code_task(prompt) and not _is_status_check:
+        elif _agents._is_code_task(prompt) and not _is_status_check:
             stack = detect_frontend_stack(root)
             fw_note = ""
             if stack:
@@ -2637,8 +2728,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "Accessibility access (the tool's check_access action has the per-OS "
             "instructions) and stop."
         )
-    if code_map_block:
-        user_parts.append(code_map_block)
+    # LSP tools are available in all modes with repo access
+    # (coder/plan/ask/reader): precise jump helps answering and planning
+    # too, not just editing.
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
     # vision model, but FALL BACK to the main model (mirroring the `vision`
     # tool's own fallback) so an attached image is ALWAYS analyzed
@@ -2755,7 +2847,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         _tctx_total = _tctx_marks.get("done", 0.0)
         _tctx_parts = []
         _tctx_prev = 0.0
-        for _k in ("mcp", "codemap", "done"):
+        for _k in ("mcp", "done"):
             _v = float(_tctx_marks.get(_k, 0.0))
             _tctx_parts.append(f"{_k}={_v - _tctx_prev:.1f}s")
             _tctx_prev = _v
@@ -3692,13 +3784,6 @@ async def _maybe_auto_compact(
     # kept receiving the un-compacted `msgs` — so the context never actually
     # shrank and the turn still overflowed. Mirrors llm._auto_compact_subagent.
     _apply_compaction_in_place(msgs, new_history)
-    # compaction واقعی انجام شد → نقشهٔ کامل ممکنه از context افتاده باشه.
-    # کش هش رو پاک می‌کنیم تا turn بعدی نقشهٔ کامل بفرسته نه marker بی‌محتوا.
-    _code_map_hash_cache = getattr(build_turn_context, "_code_map_hash_cache", None)
-    if isinstance(_code_map_hash_cache, dict):
-        _cid = state.get("chat_id", "")
-        if _cid in _code_map_hash_cache:
-            _code_map_hash_cache.pop(_cid, None)
     return 1
 
 
@@ -3868,10 +3953,16 @@ async def _run_mode_turn(
         try:
             if isinstance(fn, StructuredTool):
                 res = await fn.ainvoke(args or {})
-            else:
+            elif inspect.iscoroutinefunction(fn):
                 res = fn(**(args or {}))
                 if inspect.isawaitable(res):
                     res = await res
+            else:
+                # Sync callable (blocking disk I/O): offload to a worker
+                # thread so a sibling sub-agent sharing this event loop is
+                # never stalled behind this call. Never takes a shared lock;
+                # only the caller sequences _SEQUENTIAL_TOOLS one at a time.
+                res = await asyncio.to_thread(fn, **(args or {}))
             try:
                 import trace_store as _ts2
 
@@ -4868,10 +4959,10 @@ async def _run_mode_turn(
             # carries its own tool_call_id, so the model matches results by id
             # regardless of position.
             _tcs = ai.tool_calls
-            # روی reconnect/interrupt، هیستوری ممکن است شامل ToolMessageهای
-            # بازسازی‌شده از toolActivity باشد. اگر نتیجهٔ یک tool_call قبلاً
-            # در transcript هست، آن را دوباره اجرا نکن — مستقیماً reuse کن
-            # (صرفه‌جویی در context و جلوگیری از اجرای تکراریِ کارهای انجام‌شده).
+            # On reconnect/interrupt, history may carry ToolMessages rebuilt
+            # from toolActivity. When a tool_call result already exists in the
+            # transcript, reuse it instead of re-running (saves context and
+            # avoids re-executing completed work).
             # Collect tool_call_ids that already have a ToolMessage in msgs so
             # we can detect when a reuse-by-signature skipped call is missing
             # its result.
@@ -5696,13 +5787,13 @@ async def coder_node(state: AgentState) -> dict:
 
 
 def _shared_permit(state: dict, allow_outside: bool) -> dict:
-    """پرچم‌ها و پوشه‌های مجاز مشترک بین rebuildهای ابزار در طول یک turn.
+    """Flags and allowed folders shared across tool rebuilds within one turn.
 
-    گره‌ی coder در LangGraph در هر step دوباره اجرا می‌شود و
-    ``make_tool_callbacks`` با dict تازه ساخته می‌شود؛ بدون این dict
-    مشترک، گرانت «Always allow» یا تأیید درون-turn در step بعدی می‌پرود
-    و دیالوگ پرمیشن برای هر فراخوانی دوباره ظاهر می‌شود. dict تازه فقط
-    اولین بار (یا وقتی state هنوز مقدار ندارد) ساخته می‌شود.
+    The coder node in LangGraph re-runs every step and ``make_tool_callbacks``
+    is rebuilt with a fresh dict; without this shared dict, an "Always allow"
+    grant or an in-turn approval would be lost on the next step and the
+    permission dialog would reappear for every call. A fresh dict is created
+    only the first time (or when the state has no value yet).
     """
     permit = state.get("_permit")
     if not isinstance(permit, dict):
@@ -5714,8 +5805,9 @@ def _shared_permit(state: dict, allow_outside: bool) -> dict:
         permit["outside"] = True
     if state.get("allow_computer"):
         permit["computer"] = True
-    # پوشه‌های pre-approved از UI (دکمه «همیشه اجازه» روی دیالوگ per-folder)
-    # هم کف‌اند: هر rebuild دوباره به permit["folders"] تزریق می‌شوند.
+    # Pre-approved folders from the UI (the "always allow" button on the
+    # per-folder dialog) are also a floor: every rebuild re-injects them into
+    # permit["folders"].
     for folder in state.get("allow_outside_folders") or []:
         if isinstance(folder, str) and folder and folder not in permit.setdefault("folders", []):
             permit["folders"].append(folder)
@@ -6257,7 +6349,13 @@ async def _run_repo_tool(tools: dict, name: str, **kwargs) -> str:
     if fn is None:
         return f"ERROR: unknown tool {name!r}"
     try:
-        res = fn(**kwargs)
+        if inspect.iscoroutinefunction(fn):
+            res = fn(**kwargs)
+        else:
+            # Sync tool (blocking disk I/O): run in a worker thread so
+            # asyncio.gather callers overlap instead of serializing on the
+            # event loop. No shared lock is taken here.
+            res = await asyncio.to_thread(fn, **kwargs)
         if inspect.isawaitable(res):
             res = await res
         return res

@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
-import { useViewerTabs, viewerTabTitle, visibleTabs, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
+import { useViewerTabs, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
+import { fmtAgo } from "../lib/time";
 
 function ReviewIcon() {
   return (
@@ -168,31 +169,32 @@ function CloseIcon() {
   );
 }
 
-/** Chevron at the pane header's start: the searchable full tab list (open
- *  tabs with ages + close buttons, then recently closed tabs). The bar
- *  itself never scrolls — tabs squeeze — so this is how every tab stays
- *  reachable when there are many. */
-export function ViewerTabListButton() {
-  const tabs = useViewerTabs((s) => s.tabs);
-  const activeId = useViewerTabs((s) => s.activeId);
-  const closed = useViewerTabs((s) => s.closedTabs);
-  const activeChatId = useStore((s) => s.activeChatId);
-  const iconFor = (t: ViewerTab) =>
-    t.kind === "file" ? (
-      <FileIcon path={t.filePath ?? t.title} size={20} />
-    ) : (
-      (() => {
-        const Icon = KIND_ICON[t.kind];
-        return <Icon />;
-      })()
-    );
-  const sections: TabListSection[] = [
+/** Icon for one viewer tab (file tabs use their per-path icon). Shared by
+ *  the header dropdown and the inline empty-state list. */
+export function viewerTabIcon(t: ViewerTab): React.ReactNode {
+  if (t.kind === "file") {
+    return <FileIcon path={t.filePath ?? t.title} size={20} />;
+  }
+  const Icon = KIND_ICON[t.kind];
+  return <Icon />;
+}
+
+/** Build the viewer tab-list sections (visible open tabs, then recently
+ *  closed tabs). Single source of truth for the header dropdown and the
+ *  inline empty-state list. */
+export function buildViewerTabListSections(
+  tabs: ViewerTab[],
+  closed: ClosedViewerTab[],
+  activeId: string | null,
+  activeChatId: string,
+): TabListSection[] {
+  return [
     {
       label: "Open tabs",
       entries: visibleTabs(tabs, activeChatId).map((t) => ({
         key: t.id,
         title: viewerTabTitle(t),
-        icon: iconFor(t),
+        icon: viewerTabIcon(t),
         age: t.createdAt,
         active: t.id === activeId,
         onOpen: () => useViewerTabs.getState().setActiveViewer(t.id),
@@ -204,12 +206,66 @@ export function ViewerTabListButton() {
       entries: closed.map((c) => ({
         key: `closed-${c.tab.id}`,
         title: viewerTabTitle(c.tab),
-        icon: iconFor(c.tab),
+        icon: viewerTabIcon(c.tab),
         age: c.closedAt,
         onOpen: () => useViewerTabs.getState().reopenClosedViewerTab(c.tab.id),
       })),
     },
   ];
+}
+
+/** Inline rendering of `sections[].entries[]` for the side pane body: the
+ *  same open/recent tab entries as the header dropdown, without the popup.
+ *  Empty sections are skipped; null when the whole list is empty. */
+export function ViewerTabListInline({ sections }: { sections: TabListSection[] }) {
+  const visible = sections.filter((s) => s.entries.length > 0);
+  if (visible.length === 0) return null;
+  return (
+    <div className="viewer-tablist-inline">
+      {visible.map((s) => (
+        <div key={s.label} className="tab-list-section">
+          <div className="tab-list-section-label">{s.label}</div>
+          {s.entries.map((e) => (
+            <div key={e.key} className={`tab-list-item${e.active ? " active" : ""}`}>
+              <button type="button" className="tab-list-open" onClick={e.onOpen}>
+                {e.icon && <span className="tab-list-icon">{e.icon}</span>}
+                <span className="tab-list-title">{e.title}</span>
+              </button>
+              {e.age !== undefined && <span className="tab-list-age">{fmtAgo(e.age)}</span>}
+              {e.onClose && (
+                <button
+                  type="button"
+                  className="tab-list-close"
+                  title="Close tab"
+                  aria-label={`Close ${e.title}`}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    e.onClose?.();
+                  }}
+                >
+                  <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                    <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+                  </svg>
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Chevron at the pane header's start: the searchable full tab list (open
+ *  tabs with ages + close buttons, then recently closed tabs). The bar
+ *  itself never scrolls — tabs squeeze — so this is how every tab stays
+ *  reachable when there are many. */
+export function ViewerTabListButton() {
+  const tabs = useViewerTabs((s) => s.tabs);
+  const activeId = useViewerTabs((s) => s.activeId);
+  const closed = useViewerTabs((s) => s.closedTabs);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const sections = buildViewerTabListSections(tabs, closed, activeId, activeChatId);
   return <TabListButton sections={sections} label="Tab list" />;
 }
 

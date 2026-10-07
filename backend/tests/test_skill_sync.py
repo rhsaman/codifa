@@ -262,3 +262,115 @@ def test_sync_reseeds_when_description_changes(skill_env):
     assert "Test Skill" in seeded
     skill = next(s for s in state_db.list_skills() if s["name"] == "Test Skill")
     assert skill["description"] == "a NEW description"
+
+
+# ---------------------------------------------------------------------------
+# اسکیل چندفایلی (Codex-style): فایل‌های اضافه کنار skill.md
+# ---------------------------------------------------------------------------
+
+
+def test_persist_skill_with_extra_files(skill_env):
+    """ساخت با فایل اضافه: فایل کنار skill.md ذخیره و در list دیده می‌شود."""
+    result = tools.persist_skill(
+        "---\nname: Multi File\n---\n\n# Multi File\n\nbody\n",
+        extra_files={"notes.md": "HELLO-NOTES"},
+    )
+    assert result.get("ok"), result
+    assert "notes.md" in (result.get("files") or [])
+    skill = next(s for s in state_db.list_skills() if s["name"] == "Multi File")
+    assert "notes.md" in (skill.get("files") or [])
+
+
+def test_load_skill_specific_extra_file(skill_env):
+    """لود یک فایل خاص با load_skill(name, file) باید محتوای همان فایل را بدهد."""
+    import asyncio
+
+    tools.persist_skill(
+        "---\nname: Multi File\n---\n\n# Multi File\n\nbody\n",
+        extra_files={"notes.md": "HELLO-NOTES"},
+    )
+    state_db.invalidate_skills_cache()
+    cbs = tools.make_tool_callbacks(root="/tmp", emit=lambda e: None)
+    out = asyncio.run(cbs["load_skill"]("Multi File", "notes.md"))
+    assert "HELLO-NOTES" in out
+
+
+def test_rewrite_body_keeps_extra_files(skill_env):
+    """بازنویسی بدنه اصلی نباید فایل‌های اضافه را پاک کند."""
+    tools.persist_skill(
+        "---\nname: Multi File\n---\n\n# Multi File\n\nbody one\n",
+        extra_files={"notes.md": "HELLO-NOTES"},
+    )
+    result = tools.persist_skill(
+        "---\nname: Multi File\n---\n\n# Multi File\n\nbody two\n",
+    )
+    assert result.get("ok"), result
+    assert "notes.md" in (result.get("files") or [])
+    assert state_db.read_skill_extra_file("Multi File", "notes.md") == "HELLO-NOTES"
+
+
+def test_skills_file_endpoint_returns_extra_file(skill_env):
+    """GET /skills/file should return the stored extra file content."""
+    import asyncio
+
+    from server import skills_file
+
+    tools.persist_skill(
+        "---\nname: Multi File\n---\n\n# Multi File\n\nbody\n",
+        extra_files={"notes.md": "HELLO-NOTES"},
+    )
+    out = asyncio.run(skills_file(name="Multi File", file="notes.md"))
+    assert out["content"] == "HELLO-NOTES"
+
+
+def test_generic_pick_matches_persian_sentence():
+    """Generic fallback resolves Persian sentences via fa_keywords (no hardcode)."""
+    import graph
+
+    skills = [
+        {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه", "ترجمه کن"]},
+        {"name": "summarization", "slug": "summarization", "description": "summarize text", "content": "x", "fa_keywords": ["خلاصه", "خلاصه کن"]},
+    ]
+    picks = graph._skill_generic_pick("لطفا این متن را ترجمه کن", skills)
+    assert [s["name"] for s in picks] == ["translation"]
+
+
+def test_generic_pick_has_no_hardcoded_map():
+    """Generic matcher must not carry a hardcoded concept dict."""
+    import graph
+
+    assert not hasattr(graph, "_SKILL_FA_CONCEPTS")
+    assert not hasattr(graph, "_FA_CONCEPTS")
+
+
+def test_generic_pick_vague_english_without_overlap_is_empty():
+    """Vague requests without data overlap must not hallucinate a skill."""
+    import graph
+
+    skills = [
+        {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه"]},
+    ]
+    assert graph._skill_generic_pick("change this icon in header", skills) == []
+
+
+def test_resolve_skill_match_persian_keywords():
+    """tools._resolve_skill_match resolves Persian keywords via skill data."""
+    skills = [
+        {"name": "translation", "slug": "translation", "description": "translate text", "fa_keywords": ["ترجمه", "ترجمه کن"]},
+        {"name": "summarization", "slug": "summarization", "description": "summarize text", "fa_keywords": ["خلاصه"]},
+    ]
+    assert (tools._resolve_skill_match(skills, "ترجمه کن") or {}).get("name") == "translation"
+    assert (tools._resolve_skill_match(skills, "خلاصه کن") or {}).get("name") == "summarization"
+
+
+def test_lsp_fix_does_not_match_learn_from_docs():
+    """LSP / Language Server must not resolve to the language-learning skill."""
+    import graph
+
+    skills = [
+        {"name": "Learn from Docs", "slug": "learn-from-docs", "description": "When the user wants to learn a programming language directly from its official documentation", "content": "x", "fa_keywords": ["learn programming language"]},
+        {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه"]},
+    ]
+    assert tools._resolve_skill_match(skills, "language server") is None
+    assert tools._resolve_skill_match(skills, "fix LSP") is None
+    assert graph._skill_generic_pick("fix LSP language server", skills) == []

@@ -158,3 +158,64 @@ export function resetStreamForRetry(
 export function isKeepTextRetry(reconnecting: boolean | undefined, fallback: boolean | undefined): boolean {
   return reconnecting === true || fallback === true
 }
+
+/**
+ * Epoch-guarded scheduler for automatic retries (watchdog stall resends,
+ * banner resends, post-turn drains).
+ *
+ * A scheduled retry captures the scheduler's epoch when armed and only fires
+ * while the epoch is unchanged: an explicit Stop (or a fresh turn) bumps the
+ * epoch first, so a timer callback that fires after Stop is dropped instead
+ * of restarting the turn and bringing the retry banner back.
+ *
+ * Timer functions are injectable so unit tests can use fake timers.
+ */
+export class AutoRetryScheduler {
+  private epoch = 0
+  private stopped = false
+  private timer: unknown = null
+  constructor(
+    private setTimer: (cb: () => void, ms: number) => unknown = (cb, ms) => setTimeout(cb, ms),
+    private clearTimerFn: (id: unknown) => void = (id) => clearTimeout(id as number),
+  ) {}
+  /** True after an explicit Stop, until the next turn begins. */
+  get isStopped(): boolean {
+    return this.stopped
+  }
+  /** Arm `cb` after `delayMs`; dropped when Stop/a new turn bumps the epoch. */
+  schedule(delayMs: number, cb: () => void): void {
+    this.clearPending()
+    const epoch = this.epoch
+    this.timer = this.setTimer(() => {
+      this.timer = null
+      if (epoch !== this.epoch) return
+      cb()
+    }, delayMs)
+  }
+  /** A new turn started: invalidate stale schedules, allow retries again. */
+  beginTurn(): void {
+    this.stopped = false
+    this.epoch += 1
+    this.clearPending()
+  }
+  /** Explicit Stop: drop pending retries and invalidate armed callbacks. */
+  stop(): void {
+    this.stopped = true
+    this.epoch += 1
+    this.clearPending()
+  }
+  private clearPending(): void {
+    if (this.timer !== null) {
+      this.clearTimerFn(this.timer)
+      this.timer = null
+    }
+  }
+}
+
+/**
+ * Whether a late `error`/`retry` stream event arriving after an explicit Stop
+ * must be ignored instead of re-arming the retry banner.
+ */
+export function shouldIgnoreLateRetryEvent(stopped: boolean): boolean {
+  return stopped
+}

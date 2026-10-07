@@ -163,6 +163,62 @@ def git_checkout(root: str, branch: str, create: bool = False) -> dict:
     return {"current": name}
 
 
+def _valid_remote(name: str) -> bool:
+    """Conservative remote-name check (single argv, never a flag or URL)."""
+    import re
+
+    if not name or name.startswith(("-", ".")):
+        return False
+    if ".." in name or "~" in name or "^" in name or ":" in name:
+        return False
+    if any(c in name for c in (" ", "?", "*", "[", "\\", "'", '"', ";", "&", "|")):
+        return False
+    if any(c in name for c in ("/", "$", "`", "(", ")", "<", ">")):
+        return False
+    return re.match(r"^[A-Za-z0-9._\-]+$", name) is not None
+
+
+def git_push(
+    root: str, remote: str = "origin", branch: str = "", set_upstream: bool = False
+) -> dict:
+    """Push the current branch (or ``branch``) to ``remote``.
+
+    List-argv subprocess only (via ``_run_git``) — no shell. ``remote``
+    must be a plain remote name (default ``"origin"``); URLs are rejected.
+    An empty ``branch`` pushes the current branch (``HEAD`` when detached).
+    """
+    if not _is_repo(root):
+        return {"error": "not a git repository"}
+    remote = (remote or "origin").strip() or "origin"
+    if not _valid_remote(remote):
+        return {"error": f"invalid remote name: {remote!r}"}
+    name = (branch or "").strip()
+    if not name:
+        cur = _run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        cur_name = cur.get("out", "").strip() if cur.get("ok") else ""
+        if not cur_name or cur_name == "HEAD":
+            name = "HEAD"
+        else:
+            name = cur_name
+    if name != "HEAD" and not _valid_branch(name):
+        return {"error": f"invalid branch name: {branch!r}"}
+    args = ["push", remote, name]
+    if set_upstream and name != "HEAD":
+        args = ["push", "-u", remote, name]
+    res = _run_git(root, args)
+    if not res.get("ok"):
+        return {"error": res.get("error") or res.get("err") or "git push failed"}
+    out = (res.get("out") or "").strip()
+    err = (res.get("err") or "").strip()
+    summary = err or out
+    return {
+        "pushed": True,
+        "remote": remote,
+        "branch": name,
+        "summary": summary,
+    }
+
+
 def git_log(root: str, limit: int = 20) -> dict:
     """Recent commits: hash, author date, subject — newest first."""
     if not _is_repo(root):

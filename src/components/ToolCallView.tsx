@@ -923,7 +923,7 @@ export function DiffView({
     setBox(null);
     setNote("");
   };
-  const sendBox = () => {
+  const sendBox = (queued?: boolean) => {
     if (!box || !chatId) {
       closeBox();
       return;
@@ -931,7 +931,11 @@ export function DiffView({
     const filePath = path ?? "diff";
     const trimmed = note.trim();
     const quote = trimmed ? `${box.base}\n\nNote: ${trimmed}` : box.base;
-    commentFileSelection(chatId, filePath, quote);
+    // Extract line range from the frozen diff quote ([path line N] /
+    // [path lines A-B]) so the agent message carries File/Lines directly.
+    const lineMatch = box.base.match(/\[.* lines? (\d+(?:-\d+)?)\]/);
+    const target = lineMatch ? `${filePath}:${lineMatch[1]}` : filePath;
+    commentFileSelection(chatId, target, quote, { queue: queued });
     try {
       window.getSelection()?.removeAllRanges();
     } catch {
@@ -1170,9 +1174,12 @@ export function DiffView({
                       /* ignore */
                     }
                     closeBox();
+                  } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    sendBox(true);
                   } else if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    sendBox();
+                    sendBox(false);
                   }
                 }}
                 rows={2}

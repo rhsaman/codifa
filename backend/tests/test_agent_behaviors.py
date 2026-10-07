@@ -368,3 +368,17 @@ def test_plan_prompt_mandates_web_research_on_explicit_request():
         "web research must happen before the plan is written"
     )
     assert "web_search" in plan, "plan prompt must name the web_search tool"
+
+
+async def test_live_test_injects_live_rule_not_unit_tests(run_events, mock_server):
+    """A live user-like test must inject LIVE TEST RULE and suppress the unit-test rule."""
+    _base, mock = mock_server
+    mock.script = [text_reply("done")]
+    await run_events("تست لایو انجام بده و مثل کاربر چک کن", mode="coder")
+    all_messages = [m for body in mock.captured for m in body.get("messages", [])]
+    joined = json.dumps(all_messages, ensure_ascii=False)
+    assert "LIVE TEST RULE" in joined
+    assert "Do NOT write test files" in joined
+    assert "browser evidence comes first" in joined
+    assert "OS temp dir (log files) is always readable" in joined
+    assert "TEST VERIFICATION RULE: this is code-changing work" not in joined

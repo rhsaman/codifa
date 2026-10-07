@@ -77,7 +77,7 @@ const api = {
   openExternalChrome: (url: string): Promise<void> => ipcRenderer.invoke('open:external-chrome', url),
   openFileExternal: (
     absPath: string,
-    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp',
+    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp' | 'default',
   ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('open:file-external', absPath, editor),
   openWorkspaceFolder: (dir: string): Promise<{ ok: boolean; error?: string }> =>

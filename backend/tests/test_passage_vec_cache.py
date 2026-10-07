@@ -1,6 +1,6 @@
 """Passage-vector cache + length-sorted batching: identical outputs, less CPU.
 
-The codemap rerank re-embeds the same file descriptions on every turn while
+The rerank re-embeds the same file descriptions on every turn while
 only the query changes. These pins guarantee the speedup never changes
 ranking quality:
 

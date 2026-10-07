@@ -171,7 +171,8 @@ console.log("5) edit styles present in global.css:");
   check("disabled edit button style", css.includes(".msg-copy.msg-edit:disabled"));
   check("inline edit box (.msg-edit-wrap)", css.includes(".msg-edit-wrap"));
   check("edit textarea (.msg-edit-input)", css.includes(".msg-edit-input"));
-  check("save/cancel buttons (.msg-edit-save/.msg-edit-cancel)", css.includes(".msg-edit-save") && css.includes(".msg-edit-cancel"));
+  check("cancel-only button (.msg-edit-cancel)", css.includes(".msg-edit-cancel"));
+  check("no save button style (.msg-edit-save removed)", !css.includes(".msg-edit-save"));
 }
 
 console.log("6) queue edit -> text updated in place, order kept, history untouched:");

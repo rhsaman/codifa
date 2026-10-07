@@ -5,7 +5,7 @@
 //        --format=esm --outfile=src/lib/.tmp-retry.mjs && node src/lib/.tmp-retry.mjs
 
 import type { MessageSegment } from "../types"
-import { resetStreamForRetry, resolveRestartUser } from "./retry"
+import { AutoRetryScheduler, resetStreamForRetry, resolveRestartUser, shouldIgnoreLateRetryEvent } from "./retry"
 
 export {}
 
@@ -114,6 +114,65 @@ console.log('۱۰) resolveRestartUser با محتوای خالی null است:')
 {
   const msgs = [{ id: 'u1', role: 'user', content: '   ' }] as any
   check('null برمی‌گردد', resolveRestartUser(msgs, 'u1') === null)
+}
+
+console.log('11) AutoRetryScheduler: stop prevents a scheduled retry from firing:');
+{
+  // Fake timers: deterministic, no real sleeps.
+  const pending = new Map<number, () => void>()
+  let nextId = 1
+  const fakeSet = (cb: () => void, _ms: number): number => {
+    const id = nextId++
+    pending.set(id, cb)
+    return id
+  }
+  const fakeClear = (id: unknown): void => {
+    pending.delete(id as number)
+  }
+  const runAll = () => {
+    const cbs = [...pending.values()]
+    pending.clear()
+    for (const cb of cbs) cb()
+  }
+  const sched = new AutoRetryScheduler(fakeSet, fakeClear)
+  let fired = 0
+  sched.schedule(5000, () => { fired++ })
+  sched.stop()
+  runAll()
+  check('scheduled retry did not fire after stop', fired === 0)
+  check('stale error after stop must be ignored', shouldIgnoreLateRetryEvent(sched.isStopped) === true)
+}
+
+console.log('12) AutoRetryScheduler: normal retry still fires without stop, and re-arms on the next turn:');
+{
+  const pending = new Map<number, () => void>()
+  let nextId = 1
+  const fakeSet = (cb: () => void, _ms: number): number => {
+    const id = nextId++
+    pending.set(id, cb)
+    return id
+  }
+  const fakeClear = (id: unknown): void => {
+    pending.delete(id as number)
+  }
+  const runAll = () => {
+    const cbs = [...pending.values()]
+    pending.clear()
+    for (const cb of cbs) cb()
+  }
+  const sched = new AutoRetryScheduler(fakeSet, fakeClear)
+  let fired = 0
+  sched.schedule(5000, () => { fired++ })
+  runAll()
+  check('scheduled retry fired without stop', fired === 1)
+  check('error without stop is not ignored', shouldIgnoreLateRetryEvent(sched.isStopped) === false)
+  // A fresh turn re-arms the scheduler after a stop.
+  sched.stop()
+  sched.beginTurn()
+  let fired2 = 0
+  sched.schedule(0, () => { fired2++ })
+  runAll()
+  check('retry works again on the next turn', fired2 === 1)
 }
 
 if (failed > 0) {

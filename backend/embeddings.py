@@ -107,7 +107,7 @@ def _evict_if_idle() -> None:
     gc.collect()
 
 # Passage vector cache: exact description text -> L2-normalized vector.
-# The codemap rerank re-embeds the same file descriptions on every turn while
+# The rerank step re-embeds the same file descriptions on every turn while
 # only the query changes. Caching per-text vectors turns repeat turns into a
 # single query embed + cosine, with bit-identical results (same model, same
 # prefix, same text). Bounded LRU so vector-store callers with many distinct

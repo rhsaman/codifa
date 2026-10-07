@@ -1,5 +1,5 @@
 // Pure file-type helpers shared by every surface that shows a file name
-// (chat chips, tool rows, viewer tabs, diff list, code map). No store or
+// (chat chips, tool rows, viewer tabs, diff list). No store or
 // React imports here so plain-node tests can load this module directly.
 
 /** Marks stripped before inspecting user/model text (bidi isolation marks,
@@ -333,4 +333,35 @@ export function extractInlinePathParts(raw: string): InlinePathPart[] {
 /** Basename of a path for tab/chip labels ("a/b/c.py" → "c.py"). */
 export function fileBasename(path: string): string {
   return path.replace(INVISIBLE, "").trim().split(/[\\/]/).pop() || path;
+}
+
+/** Remove duplicate document paths (basename, case-insensitive) so
+ *  non-code files are not rendered twice in chat. Covers both sources of
+ *  duplication: docs already shown as attachment chips, and the same file
+ *  collected twice with different path forms (relative vs absolute). */
+export function dedupDocPaths(docs: string[], attachments: string[]): string[] {
+  const attached = new Set(
+    attachments.map((a) => fileBasename(a).toLowerCase()),
+  );
+  const seenBase = new Set<string>();
+  const out: string[] = [];
+  for (const p of docs) {
+    const base = fileBasename(p).toLowerCase();
+    if (attached.has(base)) continue;
+    if (seenBase.has(base)) continue;
+    seenBase.add(base);
+    out.push(p);
+  }
+  return out;
+}
+
+/** System-default app for an office document extension (Word/Excel/PDF).
+ *  Returns null for code files that should keep the editor picker. */
+export function defaultAppForExt(ext: string): { label: string; icon: string } | null {
+  const e = ext.toLowerCase();
+  if (e === "pdf") return { label: "Default PDF app", icon: "PDF" };
+  if (e === "doc" || e === "docx") return { label: "Word", icon: "W" };
+  if (e === "xls" || e === "xlsx" || e === "xlsm" || e === "csv")
+    return { label: "Excel", icon: "X" };
+  return null;
 }

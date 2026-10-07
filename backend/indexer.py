@@ -159,16 +159,15 @@ def _chunk_text(text: str, size: int = INDEX_CHUNK_CHARS,
 
 
 # Languages whose content is NOT embedded — only symbol/location pointers
-# are stored (the "code map" design): the file is the source of truth, the
+# are stored: the file is the source of truth, the
 # index records what-is-where, and content_hash invalidates stale pointers
 # when the code changes.
 #
-# توجه: auto-index کد خاموش شده (نگاه کن به پایین `AUTO_INDEX_CODE`). کد
-# پروژه از طریق CODE MAP (نقشه نماد لحظه‌ای در symbol_index.py) به مدل داده
-# می‌شه، نه از طریق ایندکس RAG. این باعث می‌شه context سبک‌تر بمونه و مدل
-# مستقیماً بره سراغ read.
+# Note: auto-index of code is disabled (see `AUTO_INDEX_CODE` below). Code
+# reaches the model on demand via LSP tools, not via the RAG index. This
+# keeps context light and lets the model jump straight to read.
 
-# آیا ایندکس خودکار کد فعال باشه؟ (خاموش — کد از طریق CODE MAP تزریق می‌شه)
+# Whether automatic code indexing is enabled (off — code is served via LSP on demand)
 AUTO_INDEX_CODE = False
 _CODE_LANGUAGES = {
     "python", "javascript", "typescript", "jsx", "tsx", "vue", "svelte",
@@ -294,7 +293,7 @@ def index_file(store: VectorStore, root: str, info: dict) -> int:
         "content_hash": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24],
     }
     if language in _CODE_LANGUAGES:
-        # Code map: store symbol/location POINTERS, not the code body. The file
+        # Store symbol/location POINTERS, not the code body. The file
         # is the source of truth; content_hash invalidates stale pointers when
         # the code changes. Each chunk is a compact "what is where" line.
         syms = _extract_symbols(text, language)
@@ -334,9 +333,8 @@ def index_workspace(
     dict ``{"total": int, "indexed": int, "pruned": int, "skipped": int,
     "unchanged": int}``. Never raises.
 
-    وقتی ``AUTO_INDEX_CODE`` خاموش باشه (پیش‌فرض فعلی)، فقط اسناد قدیمی
-    KIND_FILE رو پاک‌سازی می‌کنه و ایندکس جدیدی نمی‌سازه — چون کد از طریق
-    CODE MAP تزریق می‌شه.
+    When ``AUTO_INDEX_CODE`` is off (current default), only old KIND_FILE
+    docs are pruned and no new index is built — code is served via LSP on demand.
     """
     stats = {"total": 0, "indexed": 0, "pruned": 0, "skipped": 0, "unchanged": 0}
     if not AUTO_INDEX_CODE:

@@ -105,3 +105,66 @@ def test_log_path_ignores_cwd(tmp_path):
     path = dev_server._log_path("web", str(tmp_path))
     assert path.startswith(tempfile.gettempdir())
     assert str(tmp_path) not in path
+
+
+def test_temp_subdir_log_file_kept_as_is(tmp_path):
+    """Log paths already under the OS temp dir keep their subdir.
+
+    Regression for the terminal_logs ENOENT: _terminal_bg_start stores
+    <tmp>/codifa-terminal/terminal-<job>.log but the registry stripped it
+    to <tmp>/terminal-<job>.log, so terminal_logs opened a missing file.
+    """
+    wanted = os.path.join(tempfile.gettempdir(), "codifa-terminal", "terminal-abc123.log")
+    info = dev_server.start(
+        "subdir", ["vite"], port=5174, cwd=str(tmp_path), log_file=wanted
+    )
+    assert os.path.realpath(info["log_path"]) == os.path.realpath(wanted)
+    assert os.path.isfile(info["log_path"])
+    assert dev_server.stop("subdir", grace_s=0) is True
+
+
+def test_outside_temp_log_file_reduced_to_basename(tmp_path):
+    """Paths outside temp never escape: only the basename is kept."""
+    info = dev_server.start(
+        "outside", ["vite"], port=5174, cwd=str(tmp_path),
+        log_file="/elsewhere/nested/custom.log",
+    )
+    assert info["log_path"].startswith(tempfile.gettempdir())
+    assert os.path.basename(info["log_path"]) == "custom.log"
+    assert dev_server.stop("outside", grace_s=0) is True
+
+
+def test_terminal_logs_falls_back_to_basename():
+    """terminal_logs recovers when the job points at a pre-fix subdir path."""
+    import tools as _tools
+
+    jid = "fallback7x"
+    missing = os.path.join(
+        tempfile.gettempdir(), "codifa-terminal", f"terminal-{jid}.log"
+    )
+    fallback = os.path.join(tempfile.gettempdir(), f"terminal-{jid}.log")
+    # Isolation: another test creates terminal-abc123.log; use a unique job
+    # id and make sure the stale subdir path really does not exist.
+    try:
+        os.remove(missing)
+    except OSError:
+        pass
+    with open(fallback, "w", encoding="utf-8") as fh:
+        fh.write("hello-live")
+    _tools._TERMINAL_BG_JOBS[jid] = {
+        "pid": 0,
+        "command": "echo hi",
+        "log_file": missing,
+        "status": "exited",
+        "returncode": 0,
+    }
+    try:
+        out = _tools.terminal_logs(jid)
+        assert out.get("output") == "hello-live"
+        assert out.get("log_file") == fallback
+    finally:
+        _tools._TERMINAL_BG_JOBS.pop(jid, None)
+        try:
+            os.remove(fallback)
+        except OSError:
+            pass

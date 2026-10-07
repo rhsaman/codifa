@@ -13,6 +13,7 @@ from agents import (
     _fts_keywords,
     _is_code_task,
     _is_impl_task,
+    _is_live_test_task,
     _is_test_task,
     _subagent_target,
 )
@@ -246,6 +247,15 @@ def test_is_test_task_still_detects_test_prompts():
     assert _is_test_task("تست بنویس")
     assert _is_test_task("add unit tests for the parser")
     assert not _is_test_task("fix the login bug")
+
+
+def test_is_live_test_task_detects_user_like_requests():
+    assert _is_live_test_task("تست لایو انجام بده")
+    assert _is_live_test_task("اپ را بالا بیار و مثل کاربر تست کن")
+    assert _is_live_test_task("run a live test like a user")
+    assert _is_live_test_task("launch the app and do an e2e check")
+    assert not _is_live_test_task("write unit tests for the parser")
+    assert not _is_live_test_task("fix the login bug")
 
 
 # ---------------------------------------------------------------------------

@@ -10,12 +10,20 @@ export function ComposerDiffBar({
   root,
   onCommit,
   onUndo,
+  onPush,
   disabled,
+  isCommitting,
+  isUndoing,
+  isPushing,
 }: {
   root: string | null;
   onCommit?: () => void;
   onUndo?: () => void;
+  onPush?: () => void;
   disabled?: boolean;
+  isCommitting?: boolean;
+  isUndoing?: boolean;
+  isPushing?: boolean;
 }) {
   const openGitDiff = useViewerTabs((s) => s.openGitDiff);
   const [files, setFiles] = useState(0);
@@ -55,7 +63,7 @@ export function ComposerDiffBar({
         setAdds(totals.adds);
         setDels(totals.dels);
       } catch {
-        /* خطای گیت نوار را مخفی نگه می‌دارد — غیرحیاتی */
+        /* Git errors keep the bar hidden — non-critical. */
       }
     };
     void load();
@@ -153,7 +161,7 @@ export function ComposerDiffBar({
             className="composer-diff-branch"
             value={branches.includes(current) ? current : ""}
             disabled={disabled || switching}
-            title="Current branch — click to switch"
+            title={current ? `Branch: ${current} — click to switch` : "Current branch — click to switch"}
             onClick={(e) => e.stopPropagation()}
             onChange={(e) => {
               e.stopPropagation();
@@ -185,34 +193,176 @@ export function ComposerDiffBar({
         </span>
       </button>
       )}
-      {files > 0 && (onCommit || onUndo) && (
+      {files > 0 && (onCommit || onUndo || onPush) && (
         <span className="composer-diff-actions">
-          {onCommit && (
-            <button
-              type="button"
-              className="composer-diff-btn commit"
-              disabled={disabled}
-              title="Generate commit message and commit"
-              onClick={(e) => {
-                e.stopPropagation();
-                onCommit();
-              }}
-            >
-              Commit
-            </button>
-          )}
           {onUndo && (
             <button
               type="button"
               className="composer-diff-btn undo"
-              disabled={disabled}
-              title="Discard uncommitted changes"
+              disabled={disabled || isUndoing}
+              data-tip="Undo"
+              aria-label={isUndoing ? "Undoing" : "Undo"}
               onClick={(e) => {
                 e.stopPropagation();
                 onUndo();
               }}
             >
-              Undo
+              {isUndoing ? (
+                <svg
+                  className="composer-diff-spinner"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <g>
+                    <animateTransform
+                      attributeName="transform"
+                      type="rotate"
+                      from="0 12 12"
+                      to="360 12 12"
+                      dur="0.8s"
+                      repeatCount="indefinite"
+                    />
+                    <path
+                      d="M21 12a9 9 0 1 1-6.2-8.56"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                  </g>
+                </svg>
+              ) : (
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M3 7v6h6" />
+                  <path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
+                </svg>
+              )}
+            </button>
+          )}
+          {onCommit && (
+            <button
+              type="button"
+              className="composer-diff-btn commit"
+              disabled={disabled || isCommitting}
+              data-tip="Commit"
+              aria-label={isCommitting ? "Committing" : "Commit"}
+              onClick={(e) => {
+                e.stopPropagation();
+                onCommit();
+              }}
+            >
+              {isCommitting ? (
+                <svg
+                  className="composer-diff-spinner"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <g>
+                    <animateTransform
+                      attributeName="transform"
+                      type="rotate"
+                      from="0 12 12"
+                      to="360 12 12"
+                      dur="0.8s"
+                      repeatCount="indefinite"
+                    />
+                    <path
+                      d="M21 12a9 9 0 1 1-6.2-8.56"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                  </g>
+                </svg>
+              ) : (
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="12" r="3" />
+                  <line x1="3" y1="12" x2="9" y2="12" />
+                  <line x1="15" y1="12" x2="21" y2="12" />
+                </svg>
+              )}
+            </button>
+          )}
+          {onPush && (
+            <button
+              type="button"
+              className="composer-diff-btn push"
+              disabled={disabled || isPushing}
+              data-tip="Push"
+              aria-label={isPushing ? "Pushing" : "Push"}
+              onClick={(e) => {
+                e.stopPropagation();
+                onPush();
+              }}
+            >
+              {isPushing ? (
+                <svg
+                  className="composer-diff-spinner"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <g>
+                    <animateTransform
+                      attributeName="transform"
+                      type="rotate"
+                      from="0 12 12"
+                      to="360 12 12"
+                      dur="0.8s"
+                      repeatCount="indefinite"
+                    />
+                    <path
+                      d="M21 12a9 9 0 1 1-6.2-8.56"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                  </g>
+                </svg>
+              ) : (
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 16V4" />
+                  <path d="m6 10 6-6 6 6" />
+                  <path d="M4 20h16" />
+                </svg>
+              )}
             </button>
           )}
         </span>

@@ -511,6 +511,9 @@ export interface StreamParams {
      *  the UI; folded into the assistant message's content server-side so the
      *  model sees what was already done without re-executing the tools. */
     preservedToolSummary?: string
+    /** Images carried by this historical user message (path or inline dataUrl)
+     *  so the backend re-analyzes them and the model keeps seeing them. */
+    images?: Array<string | { path: string; dataUrl?: string }>
   }>
   attachments?: string[]
   /** Each image is a path string OR an object {path, dataUrl}; the backend
@@ -912,6 +915,42 @@ export async function cancelSteer(chatId: string, id: string): Promise<void> {
     })
   } catch {
     /* best effort */
+  }
+}
+
+/** Read a document for the file viewer. format: "text" (default) | "html"
+ *  (styled Word/Excel view) | "pages" (PDF pages as JPEG data URLs).
+ *  `sheet` selects one Excel sheet, `pages` selects PDF pages like "1-3,7".
+ *  Results are mtime-cached backend-side, so repeated calls are cheap. */
+export async function readDocumentText(
+  root: string,
+  absPath: string,
+  format: "text" | "html" | "pages" = "text",
+  opts?: { sheet?: string; pages?: string },
+): Promise<{ content?: string; html?: string; pages?: string[]; error?: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: 'agent backend is not running' }
+  try {
+    const res = await fetch(`${url}/doc/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        root,
+        path: absPath,
+        format,
+        sheet: opts?.sheet ?? '',
+        pages: opts?.pages ?? '',
+      }),
+    })
+    if (!res.ok) return { error: `document read failed (${res.status})` }
+    return (await res.json()) as {
+      content?: string
+      html?: string
+      pages?: string[]
+      error?: string
+    }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
   }
 }
 

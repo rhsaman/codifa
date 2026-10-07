@@ -309,7 +309,23 @@ async def test_real_docker_mcp_connects(monkeypatch):
             n.startswith("mcp__docker__") or not n.startswith("mcp__") for n in names
         )
     finally:
-        await cleanup()
+        # The gateway spawns watchers/monitors that may outlive the session;
+        # bound cleanup so a hanging gateway never stalls the suite teardown.
+        try:
+            await asyncio.wait_for(cleanup(), timeout=15)
+        except Exception:  # noqa: BLE001, S110 — cleanup is best-effort in tests
+            pass
+        # Cancel gateway watchers left behind: pytest-asyncio teardown hangs
+        # cancelling tasks that ignore cancellation, so drop them here first.
+        # Fire-and-forget only: awaiting them re-raises CancelledError (a
+        # BaseException, not caught by `except Exception`) and fails the test.
+        try:
+            me = asyncio.current_task()
+            for t in asyncio.all_tasks():
+                if t is not me and not t.done():
+                    t.cancel()
+        except BaseException:  # noqa: BLE001, S110 — best-effort in tests
+            pass
 
 
 @pytest.mark.asyncio

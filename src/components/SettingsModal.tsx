@@ -898,9 +898,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setSkillDrafts((prev) => ({
       ...prev,
       [NEW_SKILL_KEY]:
-        '---\nname: new-skill\n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
+        '---\nname: new-skill\ndescription: One-line English summary of when to use this skill\nfa_keywords: \n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
     }))
-    setSkillsMsg('Editing a new skill — fill in the details, then press Save skill.')
+    setSkillsMsg('Editing a new skill — fill in the details, then press Save skill. Add a one-line English `description:` and fill `fa_keywords:` (comma-separated phrases you would say, e.g. ترجمه کن, translate this) so it is matched automatically.')
     // The "New skill" editor renders at the TOP of the list; if the user had
     // scrolled down, scroll the list back to the top so it's immediately visible.
     requestAnimationFrame(() => skillListRef.current?.scrollTo({ top: 0, behavior: 'smooth' }))

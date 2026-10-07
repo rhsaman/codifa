@@ -34,6 +34,7 @@ from langchain_core.tools import BaseTool
 logger = logging.getLogger(__name__)
 
 import checkpoints as _checkpoints
+import doc_tools as _doc_tools
 import git_tools as _git
 import providers as _providers
 import state_db as _state_db
@@ -61,6 +62,15 @@ TERMINAL_TIMEOUT_MAX = 300
 _LONG_RUNNING_CMD_RE = re.compile(
     r"\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck)\S*"
     r"|pytest|vitest|jest|tsc|cargo\s+(?:test|build)|go\s+(?:test|build)|mvn|gradle)\b"
+)
+# Sub-agents NEVER run tests: the main agent runs all tests after merging
+# reports. Matches test runners only (build/lint/typecheck stay allowed
+# so a sub-agent can still verify syntax without running the suite).
+_SUBAGENT_NO_TEST_RE = re.compile(
+    r"\b(?:pytest|vitest|jest|ava|xo|playwright test|cypress run"
+    r"|flutter test|dart test|go test|cargo test|mvn test|gradle test"
+    r"|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test)\b",
+    re.IGNORECASE,
 )
 MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
@@ -96,6 +106,12 @@ _PLAN_BY_CHAT: dict[str, list[dict]] = {}
 _PLAN_MUTATING_SINCE_UPDATE: dict[str, int] = {}
 # Last successful terminal run per chat for duplicate suppression.
 _TERMINAL_LAST_RUN: dict[str, dict] = {}
+
+# Background terminal jobs: job_id -> {pid, command, log_file, started_at,
+# status, returncode}. Module-global so stop/logs work across turns.
+_TERMINAL_BG_JOBS: dict[str, dict] = {}
+_TERMINAL_BG_LOCK = threading.Lock()
+_TERMINAL_BG_LOG_DIRNAME = "codifa-terminal"
 
 
 def clear_chat_state(chat_id: str) -> None:
@@ -164,6 +180,23 @@ def _invalidate_read_cache_for(path: str, root: str) -> None:
     ]
     for k in stale:
         del _parent_search_cache[k]
+
+
+def _normalize_search_scope(path: str) -> str:
+    """Normalize a grep/glob scope so near-duplicate ranges share one scan.
+
+    Strips whitespace, a leading "./", and trailing slashes: "backend/",
+    "./backend" and "backend" are the same directory. Empty (or "/") stays
+    the whole-workspace scope. Case is preserved (paths are case-sensitive).
+    """
+    p = str(path or "").strip()
+    while p.startswith("./"):
+        p = p[2:].strip()
+    if p == "/":
+        return ""
+    if len(p) > 1:
+        p = p.rstrip("/")
+    return p
 
 # Sub-agent model calls (web distiller)
 # share the parent turn's retry policy so a free-tier rate limit or connection
@@ -912,27 +945,303 @@ def _writes_outside_root(command: str) -> str | None:
     return None
 
 
-def run_terminal(
-    root: str, command: str, timeout: int = TERMINAL_TIMEOUT, permit: dict | None = None
-) -> dict:
-    """Run a shell command in the workspace root and capture its output."""
-    reason = _blocked_terminal(command)
-    if reason:
-        return {"command": command, "error": reason}
-    if not (permit or {}).get("outside"):
-        reason = _escapes_root(command, root, permit)
-        if reason is None:
-            reason = _writes_outside_root(command)
-        if reason:
+def _terminal_bg_log_dir() -> str:
+    """Directory for background terminal log files (OS temp dir only)."""
+    base = tempfile.gettempdir()
+    path = os.path.join(str(base), _TERMINAL_BG_LOG_DIRNAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        path = os.path.join(tempfile.gettempdir(), _TERMINAL_BG_LOG_DIRNAME)
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+# Background routing is generic on purpose: every detached launch goes
+# through the dev_server registry first (fallback: plain Popen). No
+# per-stack command list is kept here, so any project type works.
+
+
+
+
+
+def _terminal_bg_start(command: str, root: str, log_file: str | None = None) -> dict:
+    """Spawn ``command`` detached; stream output to a log file; return at once."""
+    job_id = uuid.uuid4().hex[:8]
+    if log_file:
+        # Logs always stay in the OS temp dir, never in codifa logs or the
+        # workspace: keep only the basename of a caller-supplied path.
+        log_path = os.path.join(
+            _terminal_bg_log_dir(),
+            os.path.basename(str(log_file)) or f"terminal-{job_id}.log",
+        )
+        try:
+            os.makedirs(_terminal_bg_log_dir(), exist_ok=True)
+        except OSError:
+            pass
+    else:
+        log_path = os.path.join(_terminal_bg_log_dir(), f"terminal-{job_id}.log")
+    # Generic registry path: when a dev_server registry is available, let it
+    # own the detached process lifecycle for any background command. The
+    # dangerous-command blacklist above still applies; only the spawn path
+    # differs.
+    try:
+        import dev_server as _dev_server  # type: ignore
+    except ImportError:
+        _dev_server = None  # type: ignore
+    if _dev_server is not None:
+        try:
+            handle = _dev_server.start(  # type: ignore
+                f"terminal-{job_id}", command, port=0, cwd=root, log_file=log_path
+            )
+            if isinstance(handle, dict):
+                pid = int(handle.get("pid") or 0)
+            else:
+                pid = int(getattr(handle, "pid", 0) or 0)
+            with _TERMINAL_BG_LOCK:
+                _TERMINAL_BG_JOBS[job_id] = {
+                    "pid": pid,
+                    "command": command,
+                    "log_file": log_path,
+                    "started_at": time.time(),
+                    "status": "running",
+                    "returncode": None,
+                    "via": "dev_server",
+                }
             return {
                 "command": command,
+                "background": True,
+                "job_id": job_id,
+                "pid": pid,
+                "log_file": log_path,
+                "message": (
+                    f"started in background via dev_server (job {job_id}, pid {pid}). "
+                    f"Logs: {log_path}. Use run_terminal with "
+                    f"`terminal_logs {job_id}` to read output and "
+                    f"`terminal_stop {job_id}` to stop it."
+                ),
+            }
+        except Exception:  # noqa: BLE001, S110 — fall through to plain Popen
+            pass
+    term_env = {k: v for k, v in os.environ.items() if k != "CODER_DATA_DIR"}
+    with open(log_path, "a", encoding="utf-8", errors="replace") as _head:
+        try:
+            _head.write(f"$ {command}\n")
+            _head.flush()
+        except OSError:
+            pass
+    log_fh = open(log_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115 — owned by job, closed on stop/reap
+    try:
+        log_fh.write(f"$ {command}\n")
+        log_fh.flush()
+    except OSError:
+        pass
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=root,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+            env={**term_env, "PYTHONUNBUFFERED": "1"},
+        )
+    except OSError as exc:
+        try:
+            log_fh.close()
+        except OSError:
+            pass
+        return {"command": command, "error": str(exc)}
+    with _TERMINAL_BG_LOCK:
+        _TERMINAL_BG_JOBS[job_id] = {
+            "pid": proc.pid,
+            "command": command,
+            "log_file": log_path,
+            "started_at": time.time(),
+            "status": "running",
+            "returncode": None,
+            "via": "popen",
+        }
+
+    def _reap(pid: int, jid: str, fh) -> None:
+        try:
+            proc.wait()
+            code = proc.returncode
+        except Exception:  # noqa: BLE001 — reap is best-effort
+            code = None
+        try:
+            fh.close()
+        except OSError:
+            pass
+        with _TERMINAL_BG_LOCK:
+            job = _TERMINAL_BG_JOBS.get(jid)
+            if job is not None and job.get("status") == "running":
+                job["status"] = f"exited ({code})"
+                job["returncode"] = code
+
+    threading.Thread(target=_reap, args=(proc.pid, job_id, log_fh), daemon=True).start()
+    return {
+        "command": command,
+        "background": True,
+        "job_id": job_id,
+        "pid": proc.pid,
+        "log_file": log_path,
+        "message": (
+            f"started in background (job {job_id}, pid {proc.pid}). "
+            f"Logs: {log_path}. Use run_terminal with "
+            f"`terminal_logs {job_id}` to read output and "
+            f"`terminal_stop {job_id}` to stop it."
+        ),
+    }
+
+
+def terminal_stop(job_id: str) -> dict:
+    """Stop a background terminal job started via ``_terminal_bg_start``."""
+    jid = (job_id or "").strip()
+    with _TERMINAL_BG_LOCK:
+        job = _TERMINAL_BG_JOBS.get(jid)
+    if job is None:
+        return {"job_id": jid, "error": f"no such background job: {jid!r}"}
+    if job.get("status") != "running":
+        return {"job_id": jid, "status": job.get("status"), "message": "already finished"}
+    pid = int(job.get("pid") or 0)
+    try:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        time.sleep(1.0)
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            alive = False
+        if alive:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        return {"job_id": jid, "error": str(exc)}
+    with _TERMINAL_BG_LOCK:
+        job["status"] = "stopped"
+        via = str(job.get("via") or "")
+        log_file = job.get("log_file")
+    # Registry cleanup: drop the dev_server entry so no stale handle lingers.
+    if via == "dev_server":
+        try:
+            import dev_server as _dev_server_stop  # type: ignore
+
+            _dev_server_stop.stop(f"terminal-{jid}", grace_s=2.0)  # type: ignore
+        except Exception:  # noqa: BLE001, S110 — cleanup is best-effort
+            pass
+    return {"job_id": jid, "status": "stopped", "log_file": log_file}
+
+
+def terminal_logs(job_id: str, tail_chars: int = MAX_TERMINAL_OUTPUT) -> dict:
+    """Read the log file of a background terminal job."""
+    jid = (job_id or "").strip()
+    with _TERMINAL_BG_LOCK:
+        job = _TERMINAL_BG_JOBS.get(jid)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is None:
+        return {"job_id": jid, "error": f"no such background job: {jid!r}"}
+    log_path = str(snapshot.get("log_file") or "")
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError as exc:
+        return {"job_id": jid, "error": str(exc)}
+    if len(content) > tail_chars:
+        content = content[-tail_chars:]
+    # Refresh liveness: the reaper thread marks exit, but a directly-killed
+    # pid may still read as running until reaped.
+    pid = int(snapshot.get("pid") or 0)
+    status = str(snapshot.get("status") or "running")
+    if status == "running" and pid:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            status = "exited"
+        except (PermissionError, OSError):
+            pass
+    return {
+        "job_id": jid,
+        "status": status,
+        "log_file": log_path,
+        "output": content,
+    }
+
+
+def run_terminal(
+    root: str, command: str, timeout: int = TERMINAL_TIMEOUT, permit: dict | None = None,
+    background: bool = False, log_file: str | None = None,
+) -> dict:
+    """Run a shell command in the workspace root and capture its output.
+
+    Background mode (for long-lived servers): pass ``background=True`` (with
+    optional ``log_file``) or prefix the command with ``bg:``. The process is
+    spawned detached via ``start_new_session`` with output streaming to a log
+    file and this call returns immediately with a ``job_id`` plus a
+    stop/logs hint. Control commands ``terminal_stop <job_id>`` and
+    ``terminal_logs <job_id>`` manage those jobs.
+    """
+    raw = (command or "")
+    stripped = raw.strip()
+    # Control-plane commands for background jobs. Intercepted before the
+    # dangerous-command blacklist so `terminal_stop`/`terminal_logs` (which
+    # are not shell commands) never hit shell validation.
+    low = stripped.lower()
+    if low.startswith("terminal_stop"):
+        parts = stripped.split(None, 1)
+        if len(parts) == 2 and parts[1].strip():
+            return {"command": stripped, **terminal_stop(parts[1].strip())}
+        return {"command": stripped, "error": "usage: terminal_stop <job_id>"}
+    if low.startswith("terminal_logs"):
+        parts = stripped.split(None, 2)
+        if len(parts) >= 2 and parts[1].strip():
+            tail = MAX_TERMINAL_OUTPUT
+            if len(parts) == 3:
+                try:
+                    tail = max(500, min(MAX_TERMINAL_OUTPUT * 2, int(parts[2])))
+                except (TypeError, ValueError):
+                    tail = MAX_TERMINAL_OUTPUT
+            return {"command": stripped, **terminal_logs(parts[1].strip(), tail)}
+        return {"command": stripped, "error": "usage: terminal_logs <job_id> [tail_chars]"}
+    real_command = stripped
+    want_bg = bool(background) or bool(log_file)
+    if stripped.lower().startswith("bg:"):
+        want_bg = True
+        real_command = stripped[3:].strip()
+    if not real_command:
+        return {"command": command, "error": "empty command"}
+    reason = _blocked_terminal(real_command)
+    if reason:
+        return {"command": real_command, "error": reason}
+    if not (permit or {}).get("outside"):
+        reason = _escapes_root(real_command, root, permit)
+        if reason is None:
+            reason = _writes_outside_root(real_command)
+        if reason:
+            return {
+                "command": real_command,
                 "error": f"{reason}. Ask the user for permission (request_permission) before accessing anything outside the workspace.",
             }
+    if want_bg:
+        return _terminal_bg_start(real_command, root, log_file)
     try:
-        code, output = _exec_terminal(command, root, min(timeout, TERMINAL_TIMEOUT_MAX))
+        code, output = _exec_terminal(real_command, root, min(timeout, TERMINAL_TIMEOUT_MAX))
     except OSError as exc:
-        return {"command": command, "error": str(exc)}
-    return {"command": command, "exit_code": code, "output": output}
+        return {"command": real_command, "error": str(exc)}
+    return {"command": real_command, "exit_code": code, "output": output}
 
 
 class PathEscapeError(ValueError):
@@ -1146,14 +1455,44 @@ def read_file(root: str, path: str, permit: dict | None = None) -> dict:
     """Read the text content of ``path`` (relative to root).
 
     Paths under the user data folder are readable without permission.
+    PDF / Word / Excel documents are auto-extracted as text (via the document
+    reader) instead of failing as "binary", so the model never needs to pick
+    the right tool first.
     """
     target = resolve_safe(root, path, allow_coder=True, permit=permit)
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
     if os.path.isdir(target):
         return {"path": path, "error": "path is a directory"}
+    ext = os.path.splitext(target)[1].lower()
+    if ext in (".pdf", ".docx", ".xlsx", ".xlsm", ".xls", ".doc", ".csv"):
+        # Document formats BEFORE the text check: .docx/.xlsx/.xls are zip
+        # or binary containers that _is_text_path would happily "read" as
+        # mojibake. .csv goes through doc_tools for the shared char cap.
+        try:
+            content = _doc_tools.read_document(target)
+            if len(content) > _doc_tools.MAX_DOC_READ_CHARS + 256:
+                content = content[: _doc_tools.MAX_DOC_READ_CHARS] + (
+                    f"\n[truncated at {_doc_tools.MAX_DOC_READ_CHARS} chars]"
+                )
+            return {
+                "path": path,
+                "content": content,
+                "truncated": False,
+                "note": "text auto-extracted from the document",
+            }
+        except _doc_tools.DocError as exc:
+            return {"path": path, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — degrade to an error string
+            return {"path": path, "error": f"document extraction failed: {exc}"}
     if not _is_text_path(target):
-        return {"path": path, "error": "binary file (read skipped)"}
+        return {
+            "path": path,
+            "error": (
+                "binary file (read skipped) — for PDF / Word / Excel / CSV use the "
+                "read_document tool instead"
+            ),
+        }
     try:
         content, truncated = _read_text(target)
     except OSError as exc:
@@ -3630,29 +3969,34 @@ def web_search(query: str, max_results: int = 5) -> dict:
 MAX_FETCH_BYTES = 1_000_000
 FETCH_TIMEOUT = 30
 # Cap applied to a fetched page before it is handed to the model. Matches
-# codex's web_fetch (100k chars); opencode returns even more (5MB) and lets the
-# model's context window decide. It is not the context budget (that comes from
-# the model's reported window via `tool_out_chars`) — it only bounds a single
-# page so one fetch can never flood the window.
+# codex's web_fetch (100k chars) so one call returns the full page like codex;
+# callers that need more page the rest via `offset`. It is not the context
+# budget (that comes from the model's reported window via `tool_out_chars`)
+# — it only bounds a single page so one fetch can never flood the window.
 FETCH_EXCERPT_CHARS = 100_000
 
 
-def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
+def fetch_url(
+    url: str, max_chars: int = FETCH_EXCERPT_CHARS, offset: int = 0
+) -> dict:
     """Fetch a web page and return its extracted text.
 
     Returns ``{"url", "title", "content"}`` on success or ``{"url", "error"}``
     with a friendly reason otherwise. HTML is converted to Markdown (like
     opencode's webfetch) so headings/links/code/tables survive; binary /
     non-text responses are rejected; content is capped at ``max_chars`` so a
-    single page can never flood the context window. The response is streamed
-    and reads at most ``MAX_FETCH_BYTES``, so oversized pages are truncated
-    rather than rejected wholesale. On a Cloudflare 403 the request is retried
-    once with an honest User-Agent. Never raises.
+    single page can never flood the context window. Pass ``offset`` to page
+    past an earlier excerpt (the truncation marker reports the next offset).
+    The response is streamed and reads at most ``MAX_FETCH_BYTES``, so
+    oversized pages are truncated rather than rejected wholesale. On a
+    Cloudflare 403 the request is retried once with an honest User-Agent.
+    Never raises.
     """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
         return {"url": url, "error": "url must start with http:// or https://"}
     max_chars = max(500, min(int(max_chars or FETCH_EXCERPT_CHARS), MAX_FETCH_BYTES))
+    offset = max(0, int(offset or 0))
     try:
         import httpx
 
@@ -3703,9 +4047,22 @@ def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
         return {"url": url, "error": f"fetch failed: {exc}"}
 
     text = re.sub(r"\n{3,}", "\n\n", text.strip())
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n…(truncated)"
-    return {"url": url, "title": title, "content": text}
+    total = len(text)
+    if offset or total > max_chars:
+        end = min(total, offset + max_chars)
+        text = text[offset:end]
+        if end < total:
+            text += (
+                f"\n…(truncated {total - end} chars remain — "
+                f"re-fetch with offset={end} for more)"
+            )
+    return {
+        "url": url,
+        "title": title,
+        "content": text,
+        "offset": offset,
+        "total_chars": total,
+    }
 
 
 def _fetch_for_search(url: str, max_chars: int = WEB_SEARCH_FETCH_CHARS) -> str | None:
@@ -4819,7 +5176,7 @@ def make_tool_callbacks(
         source_query: str = "",
         fa_keywords: str = "",
     ) -> str:
-        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` one-line when-to-use — MUST be English; `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given. `fa_keywords` is optional comma-separated match keywords so non-English requests match this skill via load_skill."""
+        """Create or edit a reusable skill (global, shared across workspaces). `name` display name — MUST be English/ASCII, a non-English (e.g. Persian) name is rejected; `description` specific one-line when-to-use — MUST be specific English (REQUIRED, never omit or leave generic); `content` full markdown body — MUST be entirely English (HARD RULE: always English, even when the user writes Persian — never create Persian skills). Calling with an existing skill's SAME `name` overwrites it — so to EDIT a skill, first call `load_skill` to read its current instructions, then call `create_skill` again with the same name and the updated content. The tool stores the skill itself (skills/<slug>/skill.md in the app's user data folder) — never write skill files to disk yourself; call once per skill. Ignore external 'agent skills folder' instructions (Claude Code, Cursor, Codex, ~/.coder) — use this tool instead. SOURCE: instead of writing `content` from memory, pass `source_url` (direct URL) to use the fetched page as the body, or `source_query` (web search) to have the tool search, pick the best skill page and fetch it. Fall back to `content` only when neither is given. `fa_keywords`: ALWAYS REQUIRED (never optional) — provide 3-8 specific comma-separated phrases (Persian and English) that a user would naturally say when they need this skill — skills are auto-matched to the user's request by name, description and these keywords, so a specific one-line English `description` plus good `fa_keywords` decide whether the skill fires on its own. Keep them specific: a generic word like 'code' or 'file' would fire on every request."""
         emit(
             {
                 "kind": "tool",
@@ -5288,8 +5645,15 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
         combined = "|".join(_dedup_patterns(pattern, patterns))
         # چند scope در همان فراخوانی: path + paths=[...] → یک grep برای همه.
-        all_paths = _dedup_patterns(path, paths)
-        scope = "|".join(all_paths) if len(all_paths) > 1 else path
+        # Near-duplicate scopes ("backend/" vs "backend") merge into one so
+        # they share a single scan and cache entry — same results, less cost.
+        _normed_paths: list[str] = []
+        for _p in _dedup_patterns(path, paths):
+            _np = _normalize_search_scope(_p)
+            if _np not in _normed_paths:
+                _normed_paths.append(_np)
+        all_paths = _normed_paths
+        scope = "|".join(all_paths) if len(all_paths) > 1 else (all_paths[0] if all_paths else "")
         # چند فیلتر فایل در همان فراخوانی: include + includes=[...].
         all_includes = _dedup_patterns(include, includes)
         inc_disp = "|".join(all_includes) if len(all_includes) > 1 else include
@@ -5561,10 +5925,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
-        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default."""
+        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default. LONG-LIVED SERVERS (any stack): prefix the project's own start command (found in its manifest, never assumed) with `bg:` (e.g. `bg: <project launch command>`) — it starts detached and returns immediately with a job_id; logs go to the OS temp dir; read output with `terminal_logs <job_id>` and stop it with `terminal_stop <job_id>`. If a dependency must be installed first, ask permission with request_permission and explain why before installing."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
+        _stripped_cmd = (command or "").strip()
+        _low_cmd = _stripped_cmd.lower()
+        _is_bg_ctrl = _low_cmd.startswith(("bg:", "terminal_stop", "terminal_logs"))
         # Parent search cache for terminal search commands
-        if _is_terminal_search(command):
+        if not _is_bg_ctrl and _is_terminal_search(command):
             cache_key = ("terminal", command, "", "")
             cached = _parent_search_cache.get(cache_key)
             if cached is not None:
@@ -5586,13 +5953,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 )
                 return cached
 
-        _is_search_cmd = _is_terminal_search(command)
+        _is_search_cmd = _is_terminal_search(command) and not _is_bg_ctrl
         # Duplicate suppression: a short follow-up like "done?" makes the
         # model re-issue the exact same verification command. When the last
         # successful run for this chat used the identical command, return the
         # cached success instead of spending another terminal execution.
         _cmd_key = str(command or "").strip()
-        if _cmd_key and _chat_id:
+        if not _is_bg_ctrl and _cmd_key and _chat_id:
             _last_run = _TERMINAL_LAST_RUN.get(_chat_id)
             if _last_run and _last_run.get("command") == _cmd_key:
                 _cached_out = str(_last_run.get("output") or "")
@@ -5617,24 +5984,38 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     + "\n[duplicate-suppressed: identical command already succeeded "
                     "— reported from cached result, not re-executed]"
                 )
+        _emit_args: dict = {"command": command}
         emit(
             {
                 "kind": "tool",
                 "tool": "run_terminal",
-                "args": {"command": command},
+                "args": _emit_args,
                 "model": _main_name if _is_search_cmd else "",
             }
         )
         # Test / build / typecheck runs routinely exceed the 120s default;
         # they were killed (exit -1) and re-run identically, burning a full
         # round trip each time. Give them the maximum window up front.
-        if timeout == TERMINAL_TIMEOUT and _LONG_RUNNING_CMD_RE.search(command):
+        if timeout == TERMINAL_TIMEOUT and not _is_bg_ctrl and _LONG_RUNNING_CMD_RE.search(command):
             timeout = TERMINAL_TIMEOUT_MAX
         result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]
             emit(_error_result("run_terminal", msg))
             return f"ERROR running {command!r}: {msg}"
+        if result.get("background"):
+            _job_id = str(result.get("job_id") or "")
+            _summary = f"background job {_job_id} · pid {result.get('pid')}"
+            _msg = str(result.get("message") or "")
+            emit({"kind": "tool_result", "tool": "run_terminal", "summary": _summary, "results": [{"content": f"$ {command}\n{_msg}"}]})
+            return f"$ {command}\n{_msg}" + _format_plan_nudge_suffix(_plan_nudge_due())
+        if "exit_code" not in result:
+            _status = str(result.get("status") or result.get("message") or result)
+            _detail = str(result.get("log_file") or "")
+            _logged_out = str(result.get("output") or "").strip()
+            _text = f"$ {command}\n{_status}" + (f"\nLog: {_detail}" if _detail else "") + (f"\n{_logged_out}" if _logged_out else "")
+            emit({"kind": "tool_result", "tool": "run_terminal", "summary": _status[:200], "results": [{"content": _text[:8000]}]})
+            return _text
         output = result["output"].strip()
         # Truncate from the MIDDLE, not the tail: test runners (pytest, jest,
         # vitest, npm test...) print their pass/fail summary and failure
@@ -5690,8 +6071,14 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         # نمایش تک‌الگویی برای سازگاری پیام‌ها؛ برای batch همه‌ی الگوها با |.
         disp = all_patterns[0] if len(all_patterns) == 1 else "|".join(all_patterns)
         # چند scope در همان فراخوانی: path + paths=[...] → یک glob برای همه.
-        all_paths = _dedup_patterns(path, paths)
-        scope = "|".join(all_paths) if len(all_paths) > 1 else path
+        # Near-duplicate scopes share one scan/cache entry (same as grep_tool).
+        _normed_paths: list[str] = []
+        for _p in _dedup_patterns(path, paths):
+            _np = _normalize_search_scope(_p)
+            if _np not in _normed_paths:
+                _normed_paths.append(_np)
+        all_paths = _normed_paths
+        scope = "|".join(all_paths) if len(all_paths) > 1 else (all_paths[0] if all_paths else "")
         generation = _search_generations.get(root, 0)
         cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
         cached = _parent_search_cache.get(cache_key)
@@ -6384,7 +6771,7 @@ When you need to read several files, read multiple independent files in parallel
     async def task_tool(
         description: str, prompt: str, subagent_type: str = "subagent", task_id: str = ""
     ) -> str:
-        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use it for parallelizable work (independent implementation chunks, verification) and multi-step delegated tasks; launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use it for parallelizable work (independent implementation chunks) and multi-step delegated tasks (sub-agents NEVER run tests — the main agent runs all tests); launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same
@@ -6688,12 +7075,14 @@ When you need to read several files, read multiple independent files in parallel
                 for name, fn in _tool_source.items()
                 if name not in ("task", "update_plan", "vision")
             }
-        # Keep the background sub-agent from searching via the shell: code
-        # search/inspection must go through grep/glob/read (slow + token-heavy
-        # via run_terminal). Mutating commands stay allowed here because the
-        # sub-agent already inherits exactly the parent's mode-filtered toolset
-        # (plan/ask parents have no write tools to inherit), so coder parents
-        # can delegate verifiable work (tests, terminal checks) fully.
+        # Keep the background sub-agent from searching via the shell and from
+        # running tests: code search/inspection must go through grep/glob/read
+        # (slow + token-heavy via run_terminal), and all tests are run by the
+        # main agent after merging reports (single test authority avoids
+        # duplicate runs and conflicting results). The sub-agent inherits
+        # exactly the parent's mode-filtered toolset (plan/ask parents have no
+        # write tools to inherit), so coder parents can delegate implementation
+        # chunks fully — edits yes, tests no.
         if resolve_agent(subagent_type) == "subagent" and "run_terminal" in _sub_tools:
             _orig_terminal = _tool_source.get("run_terminal")
 
@@ -6703,6 +7092,8 @@ When you need to read several files, read multiple independent files in parallel
                 # The sub-agent must search via grep/glob/read, not by
                 # shelling out through run_terminal (slow + token-heavy).
                 # git working-tree inspection stays allowed (read-only).
+                # Tests are forbidden here: the main agent runs all tests
+                # after merging sub-agent reports.
                 _first = (
                     command.strip().split()[0].lower()
                     if command.strip().split()
@@ -6712,11 +7103,44 @@ When you need to read several files, read multiple independent files in parallel
                     return (
                         "ERROR: code search/inspection via run_terminal is not "
                         "allowed in the sub-agent — use grep/glob/read for "
-                        "targeted lookups, or fan out parallel sub-agent calls."
+                        "targeted lookups batched in ONE call "
+                        "(patterns/paths/includes, filePaths, ranges+symbols)."
+                    )
+                if _SUBAGENT_NO_TEST_RE.search(command or ""):
+                    return (
+                        "ERROR: test runs are not allowed in the "
+                        "sub-agent — report files changed and let the main "
+                        "agent run all tests after merging reports."
                     )
                 return await _orig_terminal(command=command, timeout=timeout)
 
             _sub_tools["run_terminal"] = _readonly_terminal
+        # Delegation grants scope: file paths named in the task itself are
+        # auto-authorized for this sub-agent, so the user never attaches them.
+        _scope_ctx = None
+        _scope_token = None
+        try:
+            from agents import _TASK_EXTRA_SCOPE_CTX as _scope_ctx_mod
+
+            _scope_ctx = _scope_ctx_mod
+            _scope_combined = f"{description or ''}\n{prompt or ''}"
+            _scope_found: list[str] = []
+            for _scope_m in re.findall(
+                r"[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh)",
+                _scope_combined,
+            ):
+                _scope_q = str(_scope_m or "").strip().strip("`").lstrip("/")
+                while _scope_q.startswith("./"):
+                    _scope_q = _scope_q[2:]
+                _scope_q = _scope_q.lstrip("/")
+                if _scope_q and len(_scope_q) < 160 and _scope_q not in _scope_found:
+                    _scope_found.append(_scope_q)
+                if len(_scope_found) >= 20:
+                    break
+            if _scope_found:
+                _scope_token = _scope_ctx.set(frozenset(_scope_found))
+        except Exception:  # noqa: BLE001 — extra scope never breaks spawn
+            _scope_token = None
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(branch)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
@@ -6765,6 +7189,14 @@ When you need to read several files, read multiple independent files in parallel
                     "You are a sub-agent. Work through the task independently with "
                     "your tools, then reply with a concise final result. Do not ask the "
                     "user questions; do not call the task tool."
+                )
+                _sys += (
+                    "\n\nSEARCH DISCIPLINE: targeted search only — CODE MAP first, "
+                    "then ONE scoped grep, then symbols/ranges read only; NEVER "
+                    "blind-scan. BATCH like the main agent: ONE grep via "
+                    "patterns/paths/includes, ONE read via filePaths, ONE read via "
+                    "ranges+symbols. NEVER run tests — report files changed and "
+                    "let the main agent run all tests after merging reports."
                 )
                 if resolve_agent(subagent_type) == "subagent":
                     try:
@@ -6921,6 +7353,11 @@ When you need to read several files, read multiple independent files in parallel
             # available — the note only suggests a cheaper retry, it never
             # claims direct search is unavailable.
             _tee_emit(_error_result("task", f"sub-agent failed: {_last_exc}"))
+            try:
+                if _scope_token is not None and _scope_ctx is not None:
+                    _scope_ctx.reset(_scope_token)
+            except Exception:  # noqa: BLE001, S110 — bookkeeping only
+                pass
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
@@ -6930,6 +7367,11 @@ When you need to read several files, read multiple independent files in parallel
             except Exception:  # noqa: BLE001, S110 — bookkeeping only
                 pass
             return _note
+        try:
+            if _scope_token is not None and _scope_ctx is not None:
+                _scope_ctx.reset(_scope_token)
+        except Exception:  # noqa: BLE001, S110 — bookkeeping only
+            pass
         _SUB_AGENT_CTX.reset(_token)
         _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
         _TASK_DEPTH_CTX.reset(_depth_token)
@@ -7330,14 +7772,18 @@ When you need to read several files, read multiple independent files in parallel
         cache.set(ck, raw_results, _web_cache_ttl())
         return raw_results
 
-    async def fetch_url_tool(url: str, full: bool = False) -> str:
-        """Fetch a web page / raw file and return its extracted text (Markdown). Returns the FULL page content — no summarization, exactly like opencode's `webfetch` and codex's `web_fetch`. Pages are capped at 100k chars (codex's cap) so one fetch can never flood the context window; pass `full=True` to lift the cap for copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs). Every call re-sends the whole conversation, so it costs real tokens. If you need several URLs, fire all `fetch_url` calls in the SAME turn (parallel tool calls). Before `fetch_url`, run `web_search` to find the right URL; then fetch only the URLs you actually need — not every result."""
+    async def fetch_url_tool(url: str, full: bool = False, offset: int = 0) -> str:
+        """Fetch a web page / raw file and return its extracted text (Markdown). Returns the FULL page content — no summarization, exactly like codex's `webfetch` (capped at 100k chars so one fetch can never flood the context window); pass `full=True` to lift the cap for copying source files (SKILL.md/docs/raw.githubusercontent/jsdelivr/gist URLs), or `offset=N` to page past an earlier excerpt (the truncation marker reports the next offset). Every call re-sends the whole conversation, so it costs real tokens. If you need several URLs, fire all `fetch_url` calls in the SAME turn (parallel tool calls). Before `fetch_url`, run `web_search` to find the right URL; then fetch only the URLs you actually need — not every result."""
         effective_full = bool(full)
+        try:
+            _fetch_offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            _fetch_offset = 0
         emit(
             {
                 "kind": "tool",
                 "tool": "fetch_url",
-                "args": {"url": url, "full": effective_full},
+                "args": {"url": url, "full": effective_full, "offset": _fetch_offset},
             }
         )
         # fetch_url is for WEB pages / raw URLs only. The model sometimes hands
@@ -7420,7 +7866,7 @@ When you need to read several files, read multiple independent files in parallel
         if _ws_for_lookup is None and _rag_web_enabled():
             _ws_for_lookup = _get_web_store(root)
         rag_hit = await _rag_web_lookup(url, _ws_for_lookup, root)
-        if rag_hit:
+        if rag_hit and not _fetch_offset:
             emit(
                 {
                     "kind": "tool_result",
@@ -7431,9 +7877,10 @@ When you need to read several files, read multiple independent files in parallel
             return f"FETCHED {url} (from saved RAG)\n{rag_hit}"
         cache = _get_result_cache()
         cache_key = f"fetch:{url}"
-        # Return cached page if fresh (TTL: 24h).
+        # Return cached page if fresh (TTL: 24h). Offset pages always
+        # re-fetch so pagination slices the full text, not the cached excerpt.
         cached = cache.get(cache_key)
-        if cached:
+        if cached and not _fetch_offset:
             body = ""
             title = ""
             try:
@@ -7453,17 +7900,17 @@ When you need to read several files, read multiple independent files in parallel
                 return f"FETCHED {url} (cached)\nTitle: {title or 'unknown'}\n\n{body}"
         # full=True (or auto-detected source file) lifts the cap so one call is
         # enough for copying source files (SKILL.md / docs).
-        result = await asyncio.to_thread(
-            fetch_url, url, MAX_FETCH_BYTES if effective_full else FETCH_EXCERPT_CHARS
-        )
+        _page_size = MAX_FETCH_BYTES if effective_full else FETCH_EXCERPT_CHARS
+        result = await asyncio.to_thread(fetch_url, url, _page_size, _fetch_offset)
         if "error" in result:
             msg = result["error"]
             emit(_error_result("fetch_url", msg))
             return f"ERROR fetching {url}: {msg}"
         body = result.get("content", "")
         title = result.get("title", "")
-        # Cache the fetch result (TTL از تنظیمات — پیش‌فرض ۷ روز)
-        if body:
+        # Cache the first page only (TTL from settings — default 7 days);
+        # offset pages are slices, never the cache source.
+        if body and not _fetch_offset:
             try:
                 cache.set(
                     cache_key,
@@ -7502,11 +7949,16 @@ When you need to read several files, read multiple independent files in parallel
             {
                 "kind": "tool_result",
                 "tool": "fetch_url",
-                "summary": f"{len(body)} chars",
+                "summary": (
+                    f"{len(body)} chars (offset={_fetch_offset})"
+                    if _fetch_offset
+                    else f"{len(body)} chars"
+                ),
                 "results": [{"title": title or url, "url": url, "snippet": body[:4000]}],
             }
         )
-        return f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "") + body
+        _page_head = f"PAGE {url} (offset={_fetch_offset})\n" if _fetch_offset else f"PAGE {url}\n"
+        return _page_head + (f"TITLE: {title}\n" if title else "") + body
 
     async def request_permission_tool(
         action: str, path: str = "", reason: str = ""
@@ -8744,6 +9196,127 @@ When you need to read several files, read multiple independent files in parallel
 
     _agents_load_skills_for_tool = _load_skills_for_tool
 
+    async def read_document_tool(path: str, sheet: str = "", pages: str = "") -> str:
+        """Read a document's text. Handles PDF (per-page extraction — pass `pages` like "1-3,5" for big files), Word .docx (paragraphs and tables as markdown), Excel .xlsx/.xlsm (sheets as TSV — pass `sheet` to pick one), CSV, and any text file (txt, md, json, code). Returns the extracted text; large results are capped, so narrow with `pages`/`sheet` and read again. Scanned/image-only PDF pages contain no extractable text."""
+        emit({"kind": "tool", "tool": "read_document", "args": {"path": path}})
+        try:
+            target = resolve_safe(root, path, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            emit(_error_result("read_document", f"invalid path: {exc}"))
+            return f"ERROR reading {path}: invalid path: {exc}"
+        try:
+            out = await asyncio.to_thread(
+                _doc_tools.read_document, target, sheet=sheet, pages=pages
+            )
+        except _doc_tools.DocError as exc:
+            emit(_error_result("read_document", str(exc)))
+            return f"ERROR reading {path}: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            emit(_error_result("read_document", f"{type(exc).__name__}: {exc}"))
+            return f"ERROR reading {path}: {type(exc).__name__}: {exc}"
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "read_document",
+                "summary": f"{len(out)} chars",
+            }
+        )
+        return out
+
+    async def write_document_tool(
+        action: str,
+        path: str,
+        content: str = "",
+        dest: str = "",
+        sheet: str = "",
+        cell: str = "",
+        value: str = "",
+        find: str = "",
+        replace: str = "",
+        font: str = "",
+        size: float = 0,
+        bold: bool | None = None,
+        color: str = "",
+        rng: str = "",
+        pages: str = "",
+        source: str = "",
+    ) -> str:
+        """Create, edit or style a document file (PDF / Word / Excel / text). Actions:
+        **create** — write `content` into `path`; the extension decides the format: .pdf (markdown-lite text → PDF, Persian/Arabic supported), .docx (markdown-lite: '# ' headings, '- ' bullets, '**bold**'), .xlsx (JSON rows like [["col",...],[...]] or a TSV/CSV table; `sheet` names the sheet), txt/md/csv/json/code (plain text). Creates parent folders and OVERWRITES an existing file.
+        **edit** — .docx: replace every `find` with `replace` (fails loudly when `find` is not found), or append `content` (markdown-lite) when `find` is empty. .xlsx: set `cell` (e.g. "B3") to `value` on `sheet` (default first sheet), or append `content` rows (JSON/TSV/CSV) to `sheet`. .pdf: extract `pages` ("1-3,5") into `dest`, append pages of `source` into `path`, or delete `pages` from `path`.
+        **style** — change formatting: .docx applies `font` (family name), `size` (pt), `bold` (true/false) and/or `color` (hex "FF0000") to the WHOLE document, or only to paragraphs containing `find`. .xlsx applies them to `cell`, a range `rng` (e.g. "A1:C10"), or the whole `sheet`. PDF styling is not supported (recreate it instead).
+        Editing uploaded files (absolute paths under the app data root) is allowed. For plain text files prefer write_file/edit_file. Returns a one-line summary; errors mean NOTHING was changed."""
+        emit(
+            {
+                "kind": "tool",
+                "tool": "write_document",
+                "args": {"action": action, "path": path},
+            }
+        )
+        if action not in ("create", "edit", "style"):
+            msg = "action must be 'create', 'edit' or 'style'"
+            emit(_error_result("write_document", msg))
+            return f"ERROR: {msg}"
+        # allow_coder: editing UPLOADED documents in the app data root is a
+        # first-class flow ("change the font of my Word file"); other paths
+        # outside the workspace still need the permit policy.
+        try:
+            target = resolve_safe(root, path, allow_coder=True, permit=permit)
+        except PathEscapeError as exc:
+            emit(_error_result("write_document", f"invalid path: {exc}"))
+            return f"ERROR writing {path}: invalid path: {exc}"
+        kwargs: dict = {"path": target}
+        if action == "create":
+            fn = _doc_tools.create_document
+            kwargs.update(content=content, sheet=sheet)
+        elif action == "style":
+            fn = _doc_tools.style_document
+            kwargs.update(
+                font=font,
+                size=size,
+                bold=bold,
+                color=color,
+                find=find,
+                sheet=sheet,
+                cell=cell,
+                rng=rng,
+            )
+        else:
+            fn = _doc_tools.edit_document
+            kwargs.update(
+                content=content,
+                dest=dest,
+                sheet=sheet,
+                cell=cell,
+                value=value,
+                find=find,
+                replace=replace,
+                pages=pages,
+                source=(
+                    resolve_safe(root, source, allow_coder=True, permit=permit)
+                    if source
+                    else ""
+                ),
+            )
+        try:
+            summary = await asyncio.to_thread(fn, **kwargs)
+        except _doc_tools.DocError as exc:
+            emit(_error_result("write_document", str(exc)))
+            return f"ERROR: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            emit(_error_result("write_document", f"{type(exc).__name__}: {exc}"))
+            return f"ERROR: {type(exc).__name__}: {exc}"
+        emit(
+            {
+                "kind": "tool_result",
+                "tool": "write_document",
+                "summary": summary,
+                # The viewer live-refreshes on this path (store.bumpDocRev).
+                "path": path,
+            }
+        )
+        return summary
+
     _tools = {
         "request_permission": request_permission_tool,
         "confirm_action": confirm_action_tool,
@@ -8757,6 +9330,8 @@ When you need to read several files, read multiple independent files in parallel
         "grep": grep_tool,
         "glob": glob_tool,
         "read": read_tool,
+        "read_document": read_document_tool,
+        "write_document": write_document_tool,
         "task": task_tool,
         "task_steer": task_steer_tool,
         "task_stop": task_stop_tool,

@@ -1,6 +1,7 @@
 ---
 name: data-analysis
 description: Analyze data rigorously: understand the question, inspect quality, compute, visualize, and report findings honestly.
+fa_keywords: تحلیل داده, تحلیل آماری, data analysis
 ---
 
 # data-analysis

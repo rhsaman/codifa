@@ -128,6 +128,8 @@ export function ViewerContent() {
     );
   }
 
+  // Only the active tab mounts: hidden file tabs cost no RAM/CPU, and each
+  // file tab carries its owning chat so live edits + comments stay in it.
   if (active.kind === "file") {
     return (
       <FileViewerPanel
@@ -135,6 +137,7 @@ export function ViewerContent() {
         filePath={active.filePath ?? ""}
         fileLine={active.fileLine}
         fileRoot={active.fileRoot}
+        chatId={active.chatId ?? activeChatId}
       />
     );
   }

@@ -18,7 +18,7 @@ import {
   stripBidiMarks,
 } from "../lib/bidi";
 import { copyToClipboard } from "../lib/clipboard";
-import { extractInlinePathParts, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { extractInlinePathParts, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
@@ -45,6 +45,72 @@ import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { planDisplay } from "../lib/planDoc";
+
+/** Basename for attachment chips: message bubbles must show "report.pdf",
+ *  never the full absolute path (imported uploads live in the app data root
+ *  and rendering it verbatim is noise). The full path stays in the tooltip. */
+function attachmentBasename(a: string): string {
+  const idx = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
+  return idx >= 0 ? a.slice(idx + 1) : a;
+}
+
+/** Collect distinct non-code document paths (pdf/word/excel/csv) from tool
+ *  activities for created or edited files. Covers write_document
+ *  (create/edit/style) plus edit_file/write_file when they touch a doc
+ *  extension. Only path strings are collected, no file bodies, so rendering
+ *  stays cheap. */
+function docPathsFromActivities(list?: ToolActivity[]): string[] {
+  if (!list || list.length === 0) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const a of list) {
+    const tool = a.tool ?? "";
+    const isDocTool =
+      tool === "write_document" || tool === "edit_file" || tool === "write_file";
+    if (isDocTool) {
+      const raw = (a.args?.path ?? a.args?.filePath) as unknown;
+      const candidates = [
+        typeof raw === "string" ? raw : "",
+        typeof a.summary === "string" ? a.summary : "",
+      ];
+      for (const c of candidates) {
+        if (!c) continue;
+        const token =
+          c.trim().split(/\s+/).find((t) => isDocPath(t)) ?? "";
+        const target = token || (isDocPath(c) ? c.trim() : "");
+        if (!target) continue;
+        const { path } = splitPathLine(target);
+        const clean = path.trim();
+        if (!clean || seen.has(clean)) continue;
+        seen.add(clean);
+        out.push(clean);
+      }
+    }
+    if (a.children && a.children.length > 0) {
+      for (const p of docPathsFromActivities(a.children)) {
+        if (!seen.has(p)) {
+          seen.add(p);
+          out.push(p);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Clickable row of non-code document files produced in this turn. Each chip
+ *  opens the file in the viewer panel via openWorkspaceFile (path/line/root
+ *  only, no body preload). */
+function DocFileChips({ paths }: { paths: string[] }) {
+  if (paths.length === 0) return null;
+  return (
+    <div className="msg-attachments" dir="ltr">
+      {paths.map((p) => (
+        <FileChip key={p} path={p} display={attachmentBasename(p)} />
+      ))}
+    </div>
+  );
+}
 
 // Cache prepareContent per message id so re-renders with UNCHANGED content
 // (dir toggles, parent re-renders that don't recreate the message, memo
@@ -688,6 +754,16 @@ export const mdComponents = {
         />
       );
     }
+    // Non-code document links (pdf/word/excel/csv) render as clickable file
+    // chips that open in the viewer panel, same as attachment chips.
+    if (href && !/^[a-z][a-z0-9+.-]*:/i.test(href) && isDocPath(href)) {
+      const { path, line } = splitPathLine(href);
+      const label =
+        typeof props.children === "string" && props.children
+          ? props.children
+          : href;
+      return <FileChip path={path} line={line} display={String(label)} />;
+    }
     return (
       <a
         {...props}
@@ -1246,7 +1322,7 @@ function UserMessageBubble({
                   }
                 }}
               >
-                <FileIcon path={a} size={20} />{a}
+                <FileIcon path={a} size={20} />{attachmentBasename(a)}
               </span>
             ))}
           </div>
@@ -1365,37 +1441,161 @@ function UserMessageBubble({
   );
 }
 
+/** Order-preserving in-place text swap for a not-yet-sent queue item.
+ *  Returns the updated list, or null when the edit is rejected (empty text
+ *  or unknown id). Pure helper so the queue edit path is unit-testable
+ *  without rendering. */
+export function editQueuedText<T extends { id: string; text: string }>(
+  items: T[],
+  id: string,
+  newText: string,
+): T[] | null {
+  const text = newText.trim();
+  if (!text) return null;
+  let found = false;
+  const next = items.map((q) => {
+    if (q.id !== id) return q;
+    found = true;
+    return { ...q, text };
+  });
+  return found ? next : null;
+}
+
 /** Foldable body text for queued / steer bubbles: long text clamps like a
- *  folded user message; the button opens the full text in the side panel. */
+ *  folded user message; the button opens the full text in the side panel.
+ *  When onEdit is set, a pencil button swaps the text for the same inline
+ *  textarea + Save/Cancel used by user bubbles (same CSS classes). Queue
+ *  items edit in place (no resubmit); steer bubbles resubmit through the
+ *  shared onEdit path in Chat.tsx. */
 export function QueuedCollapsibleText({
   id,
   text,
+  onEdit,
+  editingDisabled,
 }: {
   id: string;
   text: string;
+  onEdit?: (messageId: string, newText: string) => void;
+  editingDisabled?: boolean;
 }) {
   const dir = useStore((s) => s.dir);
   const isLong = isCollapsibleText(text);
+  // Inline edit mode: same UX as UserMessageBubble — the text swaps for a
+  // textarea with Save/Cancel.
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Auto-grow the textarea to fit the draft (up to max-height).
+  useEffect(() => {
+    if (!isEditing) return;
+    const el = editInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+  }, [isEditing, draft]);
+
+  // Enter edit mode with a fresh draft; Save calls onEdit only when the
+  // trimmed text is non-empty and actually changed.
+  const startEdit = () => {
+    if (editingDisabled) return;
+    setDraft(text);
+    setIsEditing(true);
+  };
+  const cancelEdit = () => setIsEditing(false);
+  const saveEdit = () => {
+    const next = draft.trim();
+    if (!next || next === text) {
+      setIsEditing(false);
+      return;
+    }
+    onEdit?.(id, next);
+    setIsEditing(false);
+  };
+
   return (
     <>
-      <div
-        className={`queued-bubble-text${isLong ? " clamped" : ""}`}
-        dir={detectDir(text)}
-      >
-        {cachedPrepare(id, text, dir) || "(empty)"}
-      </div>
-      {isLong && (
-        <button
-          className="msg-expand queued-expand"
-          onClick={() =>
-            useViewerTabs
-              .getState()
-              .openText(textTabTitle(text, "Queued text"), text)
-          }
-          title="Open the full text in the side panel"
-        >
-          Show more
-        </button>
+      {isEditing ? (
+        <div className="msg-edit-wrap">
+          <textarea
+            ref={editInputRef}
+            className="msg-edit-input"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") cancelEdit();
+              else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
+            }}
+            dir="auto"
+            rows={4}
+            autoFocus
+          />
+          <div className="msg-edit-actions">
+            <span
+              className="msg-edit-hint"
+              title="Escape cancels, Cmd/Ctrl+Enter saves"
+              aria-hidden="true"
+            >
+              i
+            </span>
+            <button className="msg-edit-cancel" onClick={cancelEdit}>
+              Cancel
+            </button>
+            <button
+              className="msg-edit-save"
+              onClick={saveEdit}
+              disabled={!draft.trim() || draft.trim() === text}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div
+            className={`queued-bubble-text${isLong ? " clamped" : ""}`}
+            dir={detectDir(text)}
+          >
+            {cachedPrepare(id, text, dir) || "(empty)"}
+          </div>
+          {isLong && (
+            <button
+              className="msg-expand queued-expand"
+              onClick={() =>
+                useViewerTabs
+                  .getState()
+                  .openText(textTabTitle(text, "Queued text"), text)
+              }
+              title="Open the full text in the side panel"
+            >
+              Show more
+            </button>
+          )}
+        </>
+      )}
+      {onEdit && !isEditing && (
+        <div className="msg-actions">
+          <button
+            className="msg-copy msg-edit"
+            onClick={startEdit}
+            disabled={editingDisabled}
+            title="Edit message"
+            aria-label="Edit message"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+              <path d="m15 5 4 4" />
+            </svg>
+          </button>
+        </div>
       )}
     </>
   );
@@ -1444,7 +1644,7 @@ function SegSteerBubble({
  *  chat and the header opens the full summary in the side panel (like
  *  diff/plan), never inline. Shared by the standalone system-message bubble
  *  and the inline `compact` segment. */
-function SummaryBlock({ message }: { message: ChatMessage }) {
+const SummaryBlock = memo(function SummaryBlock({ message }: { message: ChatMessage }) {
   const dir = useStore((s) => s.dir);
   const content = message.content || "";
   const open = () =>
@@ -1478,7 +1678,7 @@ function SummaryBlock({ message }: { message: ChatMessage }) {
       </div>
     </div>
   );
-}
+});
 
 /** A text segment counts as a "caption" (narration the model wrote right
  *  before a tool call, e.g. "بذار ببینم X رو...") rather than real answer
@@ -1901,6 +2101,12 @@ export const ChatMessageView = memo(
   const display = planDisplay(message);
   const displayContent = display.content;
   const displaySegments = display.segments;
+  // Non-code documents created or edited this turn (write_document plus doc
+  // edits via edit_file/write_file). Rendered as clickable chips below.
+  const docPaths = useMemo(
+    () => docPathsFromActivities(message.toolActivity),
+    [message.toolActivity],
+  );
   // Render cap for the plain (non-segmented) assistant reply. Segmented
   // replies render caption slices around tool cards (small by construction);
   // the full text stays in history/copy regardless.
@@ -2030,7 +2236,7 @@ export const ChatMessageView = memo(
                 }
               }}
             >
-              <FileIcon path={a} size={20} />{a}
+              <FileIcon path={a} size={20} />{attachmentBasename(a)}
             </span>
           ))}
         </div>
@@ -2095,7 +2301,12 @@ export const ChatMessageView = memo(
                 ×
               </button>
             </div>
-            <QueuedCollapsibleText id={message.id} text={message.content} />
+            <QueuedCollapsibleText
+              id={message.id}
+              text={message.content}
+              onEdit={onEdit}
+              editingDisabled={editingDisabled}
+            />
             {message.attachments && message.attachments.length > 0 && (
               <div className="msg-attachments" dir="ltr">
                 {message.attachments.map((a) => (
@@ -2113,7 +2324,7 @@ export const ChatMessageView = memo(
                       }
                     }}
                   >
-                    <FileIcon path={a} size={20} />{a}
+                    <FileIcon path={a} size={20} />{attachmentBasename(a)}
                   </span>
                 ))}
               </div>
@@ -2159,6 +2370,8 @@ export const ChatMessageView = memo(
             )}
           </>
         ))}
+
+      {!isUser && docPaths.length > 0 && <DocFileChips paths={docPaths} />}
 
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
@@ -2453,6 +2666,7 @@ export const ChatMessageView = memo(
       a.toolActivity === b.toolActivity &&
       a.segments === b.segments &&
       a.plan === b.plan &&
+      a.planDoc === b.planDoc &&
       a.attachments === b.attachments &&
       a.images === b.images &&
       a.usage === b.usage &&

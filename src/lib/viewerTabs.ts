@@ -7,12 +7,18 @@ import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, colle
 
 export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text'
 
-/** Kinds that belong to ONE chat. Everything else (the schedule inbox) is
- *  global. Chat-scoped ids are `<kind>:<chatId>`, so every chat keeps its own
- *  tab set and switching chats swaps the whole visible group. */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text'])
+/** Kinds that belong to ONE chat. File tabs are chat-scoped too
+ *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
+ *  live edits only refresh the owning chat. Inbox stays global. */
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file'])
 
-export function viewerTabId(kind: ViewerKind, chatId: string): string {
+export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): string {
+  if (kind === 'file') {
+    const clean = (path ?? '').trim()
+    // Chat-scoped file id `file:<chatId>:<path>` (one tab per file per chat).
+    // Without a path keep the `file:<chatId>` prefix so existing callers keep working.
+    return clean ? `file:${chatId}:${clean}` : `file:${chatId}`
+  }
   return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
 }
 
@@ -36,15 +42,20 @@ export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskI
   return VIEWER_KIND_LABEL[t.kind] ?? t.title
 }
 
-/** Tabs visible while `chatId` is active: global tabs + that chat's own tabs. */
+/** Tabs visible while `chatId` is active: global tabs + that chat's own tabs.
+ *  Legacy global file tabs (no chatId, pre chat-scoping) stay visible in
+ *  every chat so old sessions don't lose them. */
 export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
-  return tabs.filter((t) => !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId)
+  return tabs.filter((t) => {
+    if (t.kind === 'file' && !t.chatId) return true
+    return !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId
+  })
 }
 
 export interface ViewerTab {
   id: string
   kind: ViewerKind
-  /** Owning chat for chat-scoped kinds (review/trace/plan/browser). */
+  /** Owning chat for chat-scoped kinds (review/trace/plan/browser/text/file). */
   chatId?: string
   title: string
   reviewMessageId?: string | null
@@ -93,10 +104,11 @@ interface ViewerTabsState {
   openPlan: (chatId?: string) => void
   /** Open the in-app virtual browser tab of a chat (shared Playwright session). */
   openBrowser: (chatId?: string) => void
-  /** Open a workspace file in its own viewer tab (one tab per path, global —
-   *  files are not chat-scoped). Reopening the same path focuses the tab and
-   *  updates the target line. */
-  openFile: (path: string, line?: number, root?: string) => void
+  /** Open a workspace file in its own viewer tab, scoped to ONE chat
+   *  (id `file:<chatId>:<path>`, one tab per file per chat). Reopening the
+   *  same path in the same chat focuses the tab and updates the target line.
+   *  `chatId` defaults to the active chat; empty means a legacy global tab. */
+  openFile: (path: string, line?: number, root?: string, chatId?: string) => void
   /** Open a collapsed chat text in its own viewer tab (one tab per chat).
    *  Reopening updates the tab in place. `format` sets the default render
    *  mode: "md" renders the body as markdown (default), "text" keeps it
@@ -160,8 +172,58 @@ export interface ClosedViewerTab {
 
 const CLOSED_CAP = 8
 
+/** Cap open tabs so hidden file tabs never fill RAM/localStorage. */
+const TOTAL_TAB_CAP = 30
+
+/** Cap file tabs separately so a file-open spree never squeezes out
+ *  review/trace/plan/browser tabs. Oldest file tabs drop first. */
+const FILE_TAB_CAP = 20
+
+function capTabs(tabs: ViewerTab[]): ViewerTab[] {
+  let next = tabs
+  // File-tab cap first: a file-open spree never squeezes out
+  // review/trace/plan/browser tabs. Oldest file tabs drop first.
+  const files = next.filter((t) => t.kind === 'file').sort((a, b) => a.createdAt - b.createdAt)
+  if (files.length > FILE_TAB_CAP) {
+    const dropFiles = new Set(files.slice(0, files.length - FILE_TAB_CAP).map((t) => t.id))
+    next = next.filter((t) => !dropFiles.has(t.id))
+  }
+  if (next.length <= TOTAL_TAB_CAP) return next
+  // Total cap: drop oldest file tabs first, then oldest of the rest.
+  const filesByAge = next.filter((t) => t.kind === 'file').sort((a, b) => a.createdAt - b.createdAt)
+  const drop = new Set<string>()
+  let over = next.length - TOTAL_TAB_CAP
+  for (const f of filesByAge) {
+    if (over <= 0) break
+    drop.add(f.id)
+    over--
+  }
+  next = next.filter((t) => !drop.has(t.id))
+  if (next.length > TOTAL_TAB_CAP) {
+    const sorted = [...next].sort((a, b) => a.createdAt - b.createdAt)
+    const extra = new Set(sorted.slice(0, next.length - TOTAL_TAB_CAP).map((t) => t.id))
+    next = next.filter((t) => !extra.has(t.id))
+  }
+  return next
+}
+
 function slimTab(t: ViewerTab): ViewerTab {
-  return t.kind === 'text' ? { ...t, textBody: undefined } : t
+  if (t.kind === 'text') return { ...t, textBody: undefined }
+  // File tabs persist only id/path/chatId (plus title/line/root for restore).
+  // The file body is never stored so localStorage and RAM stay low.
+  if (t.kind === 'file') {
+    return {
+      id: t.id,
+      kind: t.kind,
+      ...(t.chatId ? { chatId: t.chatId } : {}),
+      title: t.title,
+      filePath: t.filePath,
+      fileLine: t.fileLine,
+      fileRoot: t.fileRoot,
+      createdAt: t.createdAt,
+    } as ViewerTab
+  }
+  return t
 }
 
 function loadPersisted(): {
@@ -181,30 +243,38 @@ function loadPersisted(): {
       ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser' || t.kind === 'file' || t.kind === 'text'))
       : []
     // One tab per kind per chat (one per sub-agent for trace tabs).
-    // Legacy flat tabs (pre per-chat ids, no chatId) are dropped — their
-    // owner chat is unknowable.
+    // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
+    // are kept so old sessions don't lose them; every other chat-scoped kind
+    // without an owner is dropped — its owner chat is unknowable.
     const seen = new Set<string>()
     const tabs: ViewerTab[] = []
     for (const t of valid) {
-      if (CHAT_SCOPED_KINDS.has(t.kind) && !t.chatId) continue
+      if (CHAT_SCOPED_KINDS.has(t.kind) && !t.chatId && t.kind !== 'file') continue
+      // File tabs keep their full id (`file:<path>` legacy, `file:<chatId>:<path>`
+      // scoped): recomputing via viewerTabId would collapse every file of one
+      // chat into a single `file:<chatId>` id.
       const legacyId = viewerTabId(t.kind, t.chatId ?? '')
       const id =
-        t.kind === 'trace' && typeof (t as ViewerTab).traceTaskId === 'string' && (t as ViewerTab).traceTaskId
-          ? t.id.startsWith('trace:')
-            ? t.id
-            : `trace:${t.chatId}:${(t as ViewerTab).traceTaskId}`
-          : legacyId
+        t.kind === 'file'
+          ? t.id
+          : t.kind === 'trace' && typeof (t as ViewerTab).traceTaskId === 'string' && (t as ViewerTab).traceTaskId
+            ? t.id.startsWith('trace:')
+              ? t.id
+              : `trace:${t.chatId}:${(t as ViewerTab).traceTaskId}`
+            : legacyId
       if (seen.has(id)) continue
       seen.add(id)
       tabs.push({ ...t, id, title: t.kind === 'review' ? 'Git' : t.title })
     }
-    const activeId = typeof parsed.activeId === 'string' && tabs.some((t) => t.id === parsed.activeId) ? parsed.activeId : (tabs[0]?.id ?? null)
+    // Enforce the tab cap on load so a bloated store never fills RAM/localStorage.
+    const capped = capTabs(tabs)
+    const activeId = typeof parsed.activeId === 'string' && capped.some((t) => t.id === parsed.activeId) ? parsed.activeId : (capped[0]?.id ?? null)
     const closed = Array.isArray(parsed.closed)
       ? parsed.closed
           .filter((c) => c && typeof c.closedAt === 'number' && c.tab && typeof c.tab.id === 'string' && (c.tab.kind === 'review' || c.tab.kind === 'trace' || c.tab.kind === 'inbox' || c.tab.kind === 'plan' || c.tab.kind === 'browser' || c.tab.kind === 'file' || c.tab.kind === 'text'))
           .slice(0, CLOSED_CAP)
       : []
-    return { tabs, activeId, closed }
+    return { tabs: capped, activeId, closed }
   } catch {
     return { tabs: [], activeId: null, closed: [] }
   }
@@ -362,9 +432,11 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     set((s) => {
       const normalized = tab.kind === 'review' ? { ...tab, title: 'Git' } : tab
       const exists = s.tabs.some((t) => t.id === normalized.id)
-      const tabs = exists
+      // File bodies are never stored on the tab (only path/line/root), so
+      // capping here bounds RAM/localStorage without losing content.
+      const tabs = capTabs(exists
         ? s.tabs.map((t) => (t.id === normalized.id ? { ...t, ...normalized } : t))
-        : [...s.tabs, { ...normalized, createdAt: Date.now() }]
+        : [...s.tabs, { ...normalized, createdAt: Date.now() }])
       const lastActiveByChat = normalized.chatId
         ? { ...s.lastActiveByChat, [normalized.chatId]: normalized.id }
         : s.lastActiveByChat
@@ -389,9 +461,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         reviewSource: 'turn', 
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id)
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
-        : [...s.tabs, tab]
+        : [...s.tabs, tab])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -413,9 +485,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         reviewSource: 'uncommitted',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id)
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? tab : t))
-        : [...s.tabs, tab]
+        : [...s.tabs, tab])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -443,7 +515,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const prev = s.tabs.find((t) => t.id === id)
-      const tabs = prev
+      const tabs = capTabs(prev
         ? s.tabs.map((t) =>
             t.id === id
               ? {
@@ -453,7 +525,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
                 }
               : t,
           )
-        : [...s.tabs, entry]
+        : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -468,7 +540,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         title: 'Inbox',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       // User-gesture open: show the pane. Automatic (stream-driven) opens
       // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
@@ -492,7 +564,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         title: 'Plan',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -510,32 +582,37 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         title: 'Browser',
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry]
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
-  openFile: (path, line, root) =>
+  openFile: (path, line, root, chatId) =>
     set((s) => {
       const clean = path.trim()
       if (!clean) return {}
-      // One tab per file, GLOBAL (not chat-scoped): like an editor, opened
-      // files stay across chat switches. Reopening re-targets the line.
-      const id = `file:${clean}`
+      // Chat-scoped file tab: each chat keeps its own open files, so live
+      // edits refresh only the owning chat and switching chats swaps the
+      // visible files. Only path/line/root persist — never the file body.
+      const cid = (chatId ?? currentChatId()).trim()
+      const id = cid ? viewerTabId('file', cid, clean) : `file:${clean}`
       const entry: ViewerTab = {
         id,
         kind: 'file',
+        ...(cid ? { chatId: cid } : {}),
         title: clean.split(/[\\/]/).pop() || clean,
         filePath: clean,
         fileLine: line,
         fileRoot: root,
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id)
-        ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line } : t))
+      const raw = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line, fileRoot: root ?? t.fileRoot } : t))
         : [...s.tabs, entry]
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const tabs = capTabs(raw)
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -555,9 +632,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         textFormat: format,
         createdAt: Date.now(),
       }
-      const tabs = s.tabs.some((t) => t.id === id)
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? entry : t))
-        : [...s.tabs, entry]
+        : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -620,7 +697,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       if (!entry) return {}
       const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
       const exists = s.tabs.some((t) => t.id === id)
-      const tabs = exists ? s.tabs : [...s.tabs, entry.tab]
+      const tabs = capTabs(exists ? s.tabs : [...s.tabs, entry.tab])
       const lastActiveByChat = entry.tab.chatId
         ? { ...s.lastActiveByChat, [entry.tab.chatId]: id }
         : s.lastActiveByChat

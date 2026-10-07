@@ -231,10 +231,14 @@ const WindowHeader = memo(function WindowHeader({
             draggable={false}
             onDragStart={(e) => e.preventDefault()}
             onMouseDown={(e) => {
+              e.preventDefault();
               e.stopPropagation();
             }}
             onClick={(e) => {
+              e.preventDefault();
               e.stopPropagation();
+              // Sync + light: clear preview first, close immediately.
+              // Persist is debounced inside the store (no await here).
               onDragState(null);
               useStore.getState().closeWindow(chatId);
             }}
@@ -308,9 +312,10 @@ const LeafView = memo(function LeafView({
   drag: DragState;
   fullscreenId: string | null;
 }) {
-  // Preview only while a drag is active: a stale drop without dragId must
-  // never paint an empty page inside an unrelated pane.
-  const dropPos = drag.dragId && drag.drop?.id === chatId ? drag.drop.pos : null;
+  // Preview whenever this leaf is the drop target, including external
+  // tab/sidebar drags (dragId stays null for those — the id is only
+  // readable on drop). Stale previews are cleared on dragend/drop.
+  const dropPos = drag.drop?.id === chatId ? drag.drop.pos : null;
   const isDragSource = !!drag.dragId && drag.dragId === chatId;
   const isFullscreen = fullscreenId === chatId;
   const isHidden = !!fullscreenId && fullscreenId !== chatId;
@@ -332,9 +337,18 @@ const LeafView = memo(function LeafView({
         // File drops belong to the chat composer: never treat them as
         // window moves so the panel overlay keeps the event.
         if (isFileDrag(e.dataTransfer.types)) return;
-        // Root edge wins over leaf zones: the dragged window's own space
+        const internal = drag.dragId && drag.dragId !== chatId;
+        let hasExternal = false;
+        try {
+          const types = Array.from(e.dataTransfer.types ?? []);
+          hasExternal = types.includes(CHAT_DRAG_MIME) || types.includes("text/plain");
+        } catch {
+          hasExternal = false;
+        }
+        // Root edge wins over leaf zones for any chat drag (internal move
+        // or external tab/sidebar drag): the dragged window's own space
         // counts as empty, so the remaining tree decides the landing zone.
-        if (drag.dragId) {
+        if (drag.dragId || hasExternal) {
           const rootPos = rootEdgeForPoint(e, e.currentTarget as HTMLElement);
           if (rootPos) {
             e.preventDefault();
@@ -350,20 +364,16 @@ const LeafView = memo(function LeafView({
           drag.setDrop((prev) => (prev?.id === chatId ? null : prev));
           return;
         }
-        const internal = drag.dragId && drag.dragId !== chatId;
-        let hasExternal = false;
-        try {
-          const types = Array.from(e.dataTransfer.types ?? []);
-          hasExternal = types.includes(CHAT_DRAG_MIME) || types.includes("text/plain");
-        } catch {
-          hasExternal = false;
-        }
         if (!internal && !hasExternal) return;
         e.preventDefault();
         e.stopPropagation();
         e.dataTransfer.dropEffect = "move";
-        const pos = posForPoint(e, e.currentTarget as HTMLElement);
-        // Full: a new chat cannot split in, but center drop replaces the target.
+        const rawPos = posForPoint(e, e.currentTarget as HTMLElement);
+        // External tab/sidebar drags never replace on center: map center to a
+        // beside split so dropping creates a new window next to the target.
+        // Internal moves (dragId set) keep swap/replace on center.
+        const pos = (!internal && rawPos === "center") ? "right" : rawPos;
+        // Full: a new chat cannot split in (external center already maps to split above).
         if (!internal) {
           const st = useStore.getState();
           const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds;
@@ -392,6 +402,8 @@ const LeafView = memo(function LeafView({
         // Trust the shown preview so the result matches what the user saw:
         // recomputing from drop coordinates can disagree by a few pixels.
         const shown = drag.drop;
+        // External tab/sidebar drags keep dragId null (id only in dataTransfer).
+        const isExternal = !drag.dragId;
         drag.setDragId(null);
         drag.setDrop(null);
         if (!from) return;
@@ -400,7 +412,9 @@ const LeafView = memo(function LeafView({
           return;
         }
         if (shown?.id === chatId && from !== chatId) {
-          useStore.getState().dropChatOnto(from, chatId, shown.pos);
+          // External center never replaces: split beside instead (openBeside-style).
+          const edgePos = isExternal && shown.pos === "center" ? "right" : shown.pos;
+          useStore.getState().dropChatOnto(from, chatId, edgePos);
           return;
         }
         const rootPos = rootEdgeForPoint(e, e.currentTarget as HTMLElement);
@@ -409,7 +423,8 @@ const LeafView = memo(function LeafView({
           return;
         }
         if (from === chatId) return;
-        const pos = posForPoint(e, e.currentTarget as HTMLElement);
+        const rawPos = posForPoint(e, e.currentTarget as HTMLElement);
+        const pos = isExternal && rawPos === "center" ? "right" : rawPos;
         useStore.getState().dropChatOnto(from, chatId, pos);
       }}
     >
@@ -427,7 +442,7 @@ const LeafView = memo(function LeafView({
           <div className="chat-drop-empty-page">
             <span className="chat-drop-empty-title">{drag.dragId ? chatTitleOf(drag.dragId) : "Chat"}</span>
             <span className="chat-drop-hint">
-              {dropPos === "center" ? "Release to focus here" : "Release to open here"}
+              {dropPos === "center" && drag.dragId ? "Release to focus here" : "Release to open here"}
             </span>
           </div>
         </div>
@@ -744,14 +759,13 @@ export function ChatWindows() {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     // Gaps between panes (resize bars, split padding) also accept root-edge
-    // drops so the full-width highlight works even off-leaf.
-    if (dragId) {
-      const rootPos = rootEdgeForStackPoint(e, stackRef.current);
-      if (rootPos) {
-        setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
-      } else {
-        setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID ? null : prev));
-      }
+    // drops so the full-width highlight works even off-leaf. Applies to both
+    // internal moves and external tab/sidebar drags (which keep dragId null).
+    const rootPos = rootEdgeForStackPoint(e, stackRef.current);
+    if (rootPos) {
+      setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
+    } else {
+      setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID ? null : prev));
     }
   };
 
@@ -793,9 +807,11 @@ export function ChatWindows() {
     }
     // Gap drop (resize bars, split padding): trust the last shown leaf
     // preview so the result matches the highlight the user saw.
+    // External center never replaces: split beside instead.
     if (curDrop && curDrop.id !== CHAT_ROOT_DROP_ID && from !== curDrop.id) {
       e.preventDefault();
-      useStore.getState().dropChatOnto(from, curDrop.id, curDrop.pos);
+      const edgePos = !dragId && curDrop.pos === "center" ? "right" : curDrop.pos;
+      useStore.getState().dropChatOnto(from, curDrop.id, edgePos);
       return;
     }
     const rootPos = rootEdgeForStackPoint(e, stackRef.current);
@@ -855,9 +871,9 @@ export function ChatWindows() {
 
   // Fullscreen keeps every ChatPanel mounted: non-fullscreen windows hide
   // with CSS (display:none) so toggling never remounts panels (no lag).
-  // Preview only while a drag is active: a stale drop without dragId must
-  // never paint an empty page over the panes.
-  const rootDropPos = dragId && drop?.id === CHAT_ROOT_DROP_ID ? drop.pos : null;
+  // A drop target implies an active drag (cleared on dragend/drop), so the
+  // root preview also covers external tab/sidebar drags (dragId stays null).
+  const rootDropPos = drop?.id === CHAT_ROOT_DROP_ID ? drop.pos : null;
   const rootPreview = rootDropPos ? (
     <div className={`chat-root-preview preview-${rootDropPos}`} aria-hidden="true">
       <div className="chat-drop-empty-page">

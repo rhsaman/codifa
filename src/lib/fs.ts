@@ -24,6 +24,7 @@ export const api = {
     window.coder.googleSignIn(clientId, clientSecret, scope),
   selectFolder: () => window.coder.selectFolder(),
   selectFile: () => window.coder.selectFile(),
+  importFile: (absPath: string): Promise<string | null> => window.coder.importFile(absPath),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => window.coder.fsList(root, rel),
   fsWalk: (root: string): Promise<WorkspaceFile[]> => window.coder.fsWalk(root),
   fsRead: (root: string, rel: string): Promise<{ content: string }> => window.coder.fsRead(root, rel),

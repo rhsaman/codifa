@@ -1,6 +1,7 @@
 ---
 name: landing-page-design
 description: Design high-converting landing pages (structure, copy hierarchy, CTA placement).
+fa_keywords: لندینگ, صفحه فرود, landing page design
 ---
 
 # landing-page-design

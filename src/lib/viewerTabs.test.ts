@@ -53,29 +53,34 @@ function resetViewer() {
   memStore.clear()
 }
 
-console.log('1) viewerTabId — file is global, text is chat-scoped:')
+console.log('1) viewerTabId — file and text are chat-scoped:')
 {
-  check('file id is path-based', viewerTabId('file', 'c1') === 'file')
+  check('file id carries chat', viewerTabId('file', 'c1') === 'file:c1')
   check('text id carries chat', viewerTabId('text', 'c1') === 'text:c1')
   check('review stays chat-scoped', viewerTabId('review', 'c9') === 'review:c9')
 }
 
-console.log('2) openFile — one global tab per path, reopen retargets line:')
+console.log('2) openFile — one tab per file per chat, reopen retargets line:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  vt().openFile('src/App.tsx', 10, '/root')
-  vt().openFile('src/App.tsx', 42, '/root')
-  vt().openFile('src/other.ts', undefined, '/root')
+  const c1 = useStore.getState().newChat('ask')
+  vt().openFile('src/App.tsx', 10, '/root', c1)
+  vt().openFile('src/App.tsx', 42, '/root', c1)
+  vt().openFile('src/other.ts', undefined, '/root', c1)
   const tabs = vt().tabs
   check('two file tabs (no stacking)', tabs.length === 2, tabs.length)
-  const app = tabs.find((t) => t.id === 'file:src/App.tsx')
+  const app = tabs.find((t) => t.id === `file:${c1}:src/App.tsx`)
+  check('scoped id carries chat', !!app, tabs.map((t) => t.id))
   check('reopen updates line', app?.fileLine === 42, app?.fileLine)
   check('root captured', app?.fileRoot === '/root', app?.fileRoot)
-  check('active is last opened', vt().activeId === 'file:src/other.ts', vt().activeId)
+  check('active is last opened', vt().activeId === `file:${c1}:src/other.ts`, vt().activeId)
+  const c2 = useStore.getState().newChat('ask')
+  vt().openFile('src/App.tsx', 7, '/root', c2)
+  check('same path in another chat is a separate tab', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
   check('blank path ignored', (() => {
     vt().openFile('   ')
-    return vt().tabs.length === 2
+    return vt().tabs.length === 3
   })())
 }
 
@@ -101,21 +106,25 @@ console.log('3) openText — one tab per chat, reopen updates in place:')
   check('format switches to text', useViewerTabs.getState().tabs.find((t) => t.kind === 'text')?.textFormat === 'text')
 }
 
-console.log('4) visibleTabs — file tabs are global, text tabs follow their chat:')
+console.log('4) visibleTabs — file tabs follow their chat, legacy global stays visible:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
   const c1 = useStore.getState().newChat('ask')
-  vt().openFile('a.ts')
+  vt().openFile('a.ts', undefined, undefined, c1)
   vt().openText('T1', 'b1')
   const c2 = useStore.getState().newChat('ask')
   vt().openText('T2', 'b2')
   const all = vt().tabs
   const v1 = visibleTabs(all, c1)
   const v2 = visibleTabs(all, c2)
-  check('file tab visible in both chats', v1.some((t) => t.kind === 'file') && v2.some((t) => t.kind === 'file'))
+  check('file tab visible only in owning chat', v1.some((t) => t.kind === 'file') && !v2.some((t) => t.kind === 'file'), v2.map((t) => t.id))
   check('chat1 sees its own text', v1.some((t) => t.textBody === 'b1') && !v1.some((t) => t.textBody === 'b2'))
   check('chat2 sees its own text', v2.some((t) => t.textBody === 'b2') && !v2.some((t) => t.textBody === 'b1'))
+  check('legacy global file tab visible everywhere', (() => {
+    const legacy = [{ id: 'file:old.ts', kind: 'file', title: 'old.ts', filePath: 'old.ts', createdAt: Date.now() }] as any[]
+    return visibleTabs(legacy, c1).length === 1 && visibleTabs(legacy, c2).length === 1
+  })())
 }
 
 console.log('5) persist — text bodies are stripped from localStorage:')

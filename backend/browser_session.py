@@ -62,9 +62,13 @@ class _ChatSession:
 _sessions: dict[str, _ChatSession] = {}
 
 # Idle eviction (Whisper pattern): each chat owns a full Chromium process,
-# so idle CLOSED chats are reaped after a window. OPEN chats are exempt and
-# never auto-closed. Timers are per chat_id, eviction uses _force_close only.
+# so idle sessions are reaped after a window of no real use. Closed chats
+# get the short window; open chats a longer one (the user may come back to
+# the tab), but no longer exempt-forever — an opened-then-forgotten chat
+# must not pin a full Chromium (~130MB RSS) indefinitely. Timers are per
+# chat_id, eviction uses _force_close only.
 _BROWSER_IDLE_EVICT_S = 10 * 60
+_OPEN_IDLE_EVICT_S = 30 * 60
 _open_chats: set[str] = set()
 _last_used: dict[str, float] = {}
 _evict_timers: dict[str, asyncio.TimerHandle] = {}
@@ -98,10 +102,19 @@ def set_open_chats(chat_ids: list[str] | set[str] | tuple | None = None) -> None
     _open_chats = new_open
     for key in added:
         _cancel_timer(key)
+        if is_active(key):
+            # Arm the (longer) open-chat window: without this the cancel
+            # above would leave a live session with NO timer — exempt forever.
+            _schedule_evict(key)
     for key in removed:
         if is_active(key):
             _last_used[key] = time.monotonic()
             _schedule_evict(key)
+
+
+def _idle_window(key: str) -> int:
+    """Idle-seconds budget for one chat: open chats get the longer window."""
+    return _OPEN_IDLE_EVICT_S if key in _open_chats else _BROWSER_IDLE_EVICT_S
 
 
 def _cancel_timer(key: str) -> None:
@@ -123,7 +136,7 @@ def _schedule_evict(key: str) -> None:
         return
     try:
         _evict_timers[key] = loop.call_later(
-            _BROWSER_IDLE_EVICT_S, _on_idle_timeout, key
+            _idle_window(key), _on_idle_timeout, key
         )
     except Exception:
         pass
@@ -149,22 +162,40 @@ def _on_idle_timeout(key: str) -> None:
 
 
 async def _evict_if_idle(key: str) -> bool:
-    """Close one chat's browser when closed and idle for the whole window."""
+    """Close one chat's browser when idle for its whole window.
+
+    The window depends on the chat's open state (see _idle_window): a chat
+    the user still has open is only reaped after the longer one. Real use
+    (agent tool call, or a visible panel's status poll) refreshes the clock
+    via _touch, so a browser being watched or driven is never closed.
+    """
     norm = _normalize_chat(key)
-    if norm in _open_chats:
-        if is_active(norm):
-            _schedule_evict(norm)
-        return False
     if not is_active(norm):
         _cancel_timer(norm)
+        # The backend lost the session (page closed under us) but the profile
+        # may still be held by an ORPHANED chrome (ppid 1) from a half-failed
+        # close: reap it so RAM is not leaked until the next launch. Live,
+        # parented holders are left untouched — they belong to a live owner.
+        try:
+            _clear_stale_profile_lock(_profile_dir(norm))
+        except Exception:  # noqa: BLE001, S110 — orphan reaping is best-effort
+            pass
         return False
     last = _last_used.get(norm, 0.0)
-    if time.monotonic() - last < _BROWSER_IDLE_EVICT_S:
+    if time.monotonic() - last < _idle_window(norm):
+        # Touched since the timer was armed (e.g. the window grew when the
+        # chat was opened): wait out the fresh window instead of evicting.
+        _schedule_evict(norm)
         return False
     sess = _sessions.get(norm)
     if sess is None:
         return False
     async with sess.lock:
+        # Re-check under the lock: a tool call or panel poll may have landed
+        # while we waited — in-use wins over eviction.
+        if time.monotonic() - _last_used.get(norm, 0.0) < _idle_window(norm):
+            _schedule_evict(norm)
+            return False
         await _force_close(norm)
     _cancel_timer(norm)
     _last_used.pop(norm, None)
@@ -264,6 +295,12 @@ def status(chat_id: str | None = None) -> dict:
     key = _normalize_chat(chat_id)
     page = _get(key).page
     active = page is not None and not page.is_closed()
+    if active:
+        # A panel polling status (every ~1.2s while visible) is REAL use:
+        # refresh the idle clock so a browser the user is watching is never
+        # auto-closed underneath them. Sync context: _schedule_evict inside
+        # _touch just no-ops when there is no running loop.
+        _touch(key)
     url = ""
     viewport = dict(DEFAULT_VIEWPORT)
     if active:
@@ -282,6 +319,80 @@ def status(chat_id: str | None = None) -> dict:
         "chat": key,
         "cdp": cdp_endpoint(key) if active else None,
     }
+
+
+async def devtools_url(chat_id: str | None = None) -> dict:
+    """Verified DevTools frontend URL for a live session's page target.
+
+    Modern Chromium advertises the appspot-hosted (https) frontend in
+    ``devtoolsFrontendUrl`` — but an https page cannot open the loopback
+    ``ws://`` debugging socket (mixed content), so it dies with "WebSocket
+    disconnected". The bundled inspector served by the debugging port itself
+    (``http://127.0.0.1:PORT/devtools/inspector.html``) has no such problem,
+    so it is preferred and serve-checked; the advertised https URL is only a
+    last-resort fallback. Resolving here (not in the renderer) also sidesteps
+    Chromium's rejection of cross-origin ``/json/list`` fetches.
+    """
+    key = _normalize_chat(chat_id)
+    if not is_active(key):
+        return {"ok": False, "error": "browser is not running"}
+    cdp = cdp_endpoint(key)
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            res = await client.get(f"{cdp}/json/list")
+            targets = res.json() if res.status_code == 200 else []
+            if not isinstance(targets, list):
+                targets = []
+            page = next(
+                (
+                    t
+                    for t in targets
+                    if isinstance(t, dict)
+                    and t.get("type") == "page"
+                    and t.get("devtoolsFrontendUrl")
+                ),
+                None,
+            )
+            if page is None:
+                return {"ok": False, "error": "no debuggable page target"}
+            front = str(page["devtoolsFrontendUrl"]).strip()
+            if front.startswith("devtools://"):
+                # Not openable from an OS browser — no usable frontend.
+                return {"ok": False, "error": "Chromium only exposes a devtools:// frontend"}
+            ws_arg = _devtools_ws_arg(front, page)
+            if not ws_arg:
+                return {"ok": False, "error": "no debugging websocket for the page target"}
+            # Preferred: the bundled inspector from the debugging port — the
+            # http:// origin may open ws:// to the same loopback endpoint.
+            local = f"{cdp}/devtools/inspector.html?ws={ws_arg}"
+            check = await client.get(local.split("?", 1)[0])
+            if check.status_code < 400:
+                return {"ok": True, "url": local}
+            # Last resort: the advertised frontend (works only where the OS
+            # browser allows the loopback ws from its https origin).
+            advertised = front if front.startswith("http") else f"{cdp}{front}"
+            check = await client.get(advertised.split("?", 1)[0])
+            if check.status_code < 400:
+                return {"ok": True, "url": advertised}
+            return {
+                "ok": False,
+                "error": f"DevTools frontend not served (HTTP {check.status_code})",
+            }
+    except Exception as exc:  # noqa: BLE001 — surfaced in the panel status line
+        return {"ok": False, "error": str(exc)}
+
+
+def _devtools_ws_arg(front: str, page: dict) -> str:
+    """``host:port/path`` the inspector frontend should connect to."""
+    match = re.search(r"[?&]ws=([^&]+)", front)
+    if match:
+        return match.group(1)
+    ws_url = str(page.get("webSocketDebuggerUrl") or "").strip()
+    if ws_url.startswith("ws://"):
+        return ws_url[len("ws://") :]
+    return ""
 
 
 def _lock_owner_pid(profile: Path) -> int | None:
@@ -496,8 +607,17 @@ async def _launch_browser(pw, chat_key: str | None = None):
     """
     key = _normalize_chat(chat_key)
     port = int(cdp_endpoint(key).rsplit(":", 1)[1])
+    # Chrome 111+ rejects DevTools websocket clients that send an Origin
+    # header (the bundled inspector page sends its own http origin) with
+    # 403 — "WebSocket disconnected" in Open DevTools. Allow this port's
+    # own origin plus the appspot fallback frontend.
+    allow_origins = (
+        f"--remote-allow-origins=http://127.0.0.1:{port}"
+        ",https://chrome-devtools-frontend.appspot.com"
+    )
     args = [
         f"--remote-debugging-port={port}",
+        allow_origins,
         # New headless mode on a headed launch: the FULL browser build
         # renders (far fewer automation tells than the headless-shell
         # binary) while no window ever opens outside the app.

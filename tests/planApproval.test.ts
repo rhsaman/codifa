@@ -249,7 +249,7 @@ console.log("۷-د) BrowserPanel — فقط یک اینپوت (بدون اینپ
   check("دراپ‌داون‌های Device/Zoom حذف شدند", !html.includes('aria-label="Device"') && !html.includes('aria-label="Zoom"') && !html.includes("Fit to window"))
   check("دکمه ✓ حذف شد (اعمال با Enter)", !html.includes('aria-label="Apply viewport size"'))
   check("استیج فوکوس‌پذیر است (کیبورد صفحه)", html.includes('tabindex="0"'))
-  check("placeholder مثل عکس است", html.includes('placeholder="Enter a URL and press Enter"'))
+  check("placeholder مثل کروم است", html.includes('placeholder="Search or type a URL"'))
   check("دکمه ... هست", html.includes('aria-label="More actions"'))
   check("گزینه Open in default browser هست", html.includes("Open in default browser"))
   check("گزینه Open DevTools هست", html.includes("Open DevTools"))

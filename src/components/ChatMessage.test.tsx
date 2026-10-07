@@ -1,9 +1,13 @@
-// Unit test for user-message edit + resubmit-from-same-point.
+// Unit tests for message edit: user/steer resubmit-from-same-point plus
+// queue edit in place.
 // Contract (shared with the ChatMessage onEdit chunk):
 //   onEdit(messageId: string, newText: string) + `editingDisabled` prop.
 //   Submit path = truncateTo(messageId) then re-add the user message with the
 //   new text, so everything at/below the edited message is dropped and the
 //   turn resubmits from that same point. Empty edits are rejected (no-op).
+//   Steer messages (role user, incl. steerPending) reuse the same path.
+//   Queue path (not yet sent) = in-place text swap, order preserved, message
+//   history untouched (no truncate/resend).
 // Run: npx esbuild src/components/ChatMessage.test.tsx --bundle
 //        --platform=node --format=esm --packages=external
 //        --external:electron --outfile=tests/.tmp-chatmessage.mjs \
@@ -53,6 +57,28 @@ function submitEdit(chatId: string, messageId: string, newText: string): boolean
 
 const messagesOf = (chatId: string) =>
   useStore.getState().chats.find((c) => c.id === chatId)!.messages;
+
+/** Mirror of the handleEditQueued path: in-place text swap, order preserved,
+ *  message history untouched (no truncate/resend). */
+function submitQueuedEdit(chatId: string, qid: string, newText: string): boolean {
+  const st = useStore.getState();
+  const ch = st.chats.find((c) => c.id === chatId);
+  if (!ch) return false;
+  const text = newText.trim();
+  if (!text) return false;
+  const items = (ch.queued ?? []).filter((q) => !q.sent);
+  if (!items.some((q) => q.id === qid)) return false;
+  for (const q of items) st.removeQueuedMessage(chatId, q.id);
+  for (const q of items) {
+    st.queueMessage(chatId, { ...q, text: q.id === qid ? text : q.text });
+  }
+  return true;
+}
+
+const queuedOf = (chatId: string) =>
+  (useStore.getState().chats.find((c) => c.id === chatId)!.queued ?? []).filter(
+    (q) => !q.sent,
+  );
 
 console.log("1) edit middle user message -> history truncated, new text resent:");
 {
@@ -148,11 +174,78 @@ console.log("5) edit styles present in global.css:");
   check("save/cancel buttons (.msg-edit-save/.msg-edit-cancel)", css.includes(".msg-edit-save") && css.includes(".msg-edit-cancel"));
 }
 
+console.log("6) queue edit -> text updated in place, order kept, history untouched:");
+{
+  const s = useStore.getState();
+  const chatId = s.newChat("ask");
+  s.addMessage(chatId, { role: "user", content: "first" });
+  s.addMessage(chatId, { role: "assistant", content: "reply" });
+  s.queueMessage(chatId, { id: "q1", text: "queued one", kind: "queue" });
+  s.queueMessage(chatId, { id: "q2", text: "queued two", kind: "queue" });
+  const beforeMsgs = messagesOf(chatId).map((m) => m.id);
+
+  check("submitQueuedEdit succeeds", submitQueuedEdit(chatId, "q2", "queued two (edited)") === true);
+  const after = queuedOf(chatId);
+  check(
+    "order preserved",
+    after.map((q) => q.id).join(",") === "q1,q2",
+    after.map((q) => q.id),
+  );
+  check(
+    "text updated in place",
+    after[1]!.text === "queued two (edited)",
+    after[1],
+  );
+  check(
+    "untouched item kept its text",
+    after[0]!.text === "queued one",
+    after[0],
+  );
+  check(
+    "message history untouched (no truncate/resend)",
+    messagesOf(chatId).map((m) => m.id).join(",") === beforeMsgs.join(","),
+    messagesOf(chatId).map((m) => m.id),
+  );
+}
+
+console.log("7) queue edit rejected for empty text / unknown id:");
+{
+  const s = useStore.getState();
+  const chatId = s.newChat("ask");
+  s.queueMessage(chatId, { id: "q1", text: "keep me", kind: "queue" });
+  const before = queuedOf(chatId).map((q) => `${q.id}:${q.text}`);
+
+  check("whitespace edit rejected", submitQueuedEdit(chatId, "q1", "   ") === false);
+  check("unknown id rejected", submitQueuedEdit(chatId, "no-such-q", "new text") === false);
+  const after = queuedOf(chatId).map((q) => `${q.id}:${q.text}`);
+  check("queue untouched after rejected edits", after.join(",") === before.join(","), after);
+}
+
+console.log("8) steer message edit -> truncate + resend like user edit:");
+{
+  const s = useStore.getState();
+  const chatId = s.newChat("ask");
+  s.addMessage(chatId, { role: "user", content: "first question" });
+  s.addMessage(chatId, { role: "assistant", content: "first answer" });
+  const steer = s.addMessage(chatId, { role: "user", content: "steer me", steerPending: true });
+
+  check("submitEdit succeeds", submitEdit(chatId, steer.id, "steer me (edited)") === true);
+  const after = messagesOf(chatId);
+  check(
+    "steer truncated and resent with new text",
+    after.length === 3 &&
+      after[2]!.role === "user" &&
+      after[2]!.content === "steer me (edited)" &&
+      after[2]!.id !== steer.id,
+    after.map((m) => m.content),
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`);
   process.exit(1);
 }
-console.log("\nAll user-message edit checks passed");
+console.log("\nAll message edit checks passed");
 // The store keeps timers alive (persistSoon etc.) — force-exit so the script
 // terminates cleanly instead of hanging.
 process.exit(0);

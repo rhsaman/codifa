@@ -1,6 +1,7 @@
 ---
 name: pricing-page
 description: Build persuasive pricing pages with clear plans, comparison and FAQ.
+fa_keywords: صفحه قیمت, صفحه تعرفه, pricing page
 ---
 
 # pricing-page

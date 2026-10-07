@@ -159,6 +159,20 @@ console.log("9) openBeside — new window opens next to focus, never replaces:")
   check("replace keeps sizes", sizesByChat(replaced).a === 1 && sizesByChat(replaced).c === 1);
 }
 
+console.log("10) placement contract — drag/new-chat adds, click+select replaces:");
+{
+  const row = buildFromList(["a", "b"], "row")!;
+  // New chat (+) always opens beside focus, never replaces.
+  const added = openBeside(row, "c", "b", "row");
+  check("new chat adds a window", JSON.stringify(collectChatIds(added)) === JSON.stringify(["a", "b", "c"]));
+  // Click on window b then select c from tab/sidebar replaces b.
+  const replaced = replaceChat(row, "b", "c");
+  check("click+select replaces clicked window", JSON.stringify(collectChatIds(replaced)) === JSON.stringify(["a", "c"]));
+  // External drag onto center must add, not replace (store routes it via openBeside).
+  const external = openBeside(row, "c", "b", "col");
+  check("external drag creates new window", leafCount(external) === 3);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`);
   process.exit(1);

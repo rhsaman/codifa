@@ -41,7 +41,8 @@ const api = {
   ): Promise<{ refreshToken: string; accessToken: string; expiresIn: number }> =>
     ipcRenderer.invoke('oauth:google', clientId, clientSecret, scope),
   selectFolder: (): Promise<string | null> => ipcRenderer.invoke('dialog:select-folder'),
-  selectFile: (): Promise<string | null> => ipcRenderer.invoke('dialog:select-file'),
+  selectFile: (): Promise<string[] | null> => ipcRenderer.invoke('dialog:select-file'),
+  importFile: (absPath: string): Promise<string | null> => ipcRenderer.invoke('file:import', absPath),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => ipcRenderer.invoke('fs:list', root, rel),
   fsWalk: (root: string): Promise<{ rel: string; name: string }[]> =>
     ipcRenderer.invoke('fs:walk', root),
@@ -73,6 +74,7 @@ const api = {
   getDataPath: () => ipcRenderer.invoke('data:path'),
   hasSettingsFile: (): Promise<boolean> => ipcRenderer.invoke('data:has-settings'),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('open:external', url),
+  openExternalChrome: (url: string): Promise<void> => ipcRenderer.invoke('open:external-chrome', url),
   openFileExternal: (
     absPath: string,
     editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp',

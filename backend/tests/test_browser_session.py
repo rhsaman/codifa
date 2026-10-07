@@ -6,6 +6,9 @@ be asserted cheaply.
 """
 
 import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
 import browser_session
@@ -680,3 +683,203 @@ def test_recent_use_prevents_idle_evict(monkeypatch):
     finally:
         _reset_idle_state()
     browser_session._sessions.clear()
+
+
+def test_idle_evict_reaps_open_chat_after_long_window(monkeypatch):
+    """Open chats are no longer exempt forever: past _OPEN_IDLE_EVICT_S of no
+    real use the session is closed too (an opened-then-forgotten chat must not
+    pin a Chromium indefinitely). Within the window it stays alive."""
+    import time as _time
+
+    _reset_idle_state()
+    page = _FakePage()
+    browser_session._get("chat-open").page = page
+    browser_session.set_open_chats(["chat-open"])
+    closed: list[str] = []
+
+    async def _fake_close(chat_id=None):
+        key = browser_session._normalize_chat(chat_id)
+        closed.append(key)
+        sess = browser_session._sessions.get(key)
+        if sess is not None:
+            sess.page = None
+            sess.context = None
+            sess.browser = None
+            sess.pw = None
+
+    monkeypatch.setattr(browser_session, "_force_close", _fake_close)
+    try:
+        # 11 idle minutes: beyond the closed-chat window but within the
+        # open-chat window — still alive.
+        browser_session._last_used["chat-open"] = (
+            _time.monotonic() - browser_session._BROWSER_IDLE_EVICT_S - 1
+        )
+        assert asyncio.run(browser_session._evict_if_idle("chat-open")) is False
+        assert browser_session._get("chat-open").page is page
+        assert closed == []
+        # Past the open-chat window: reaped.
+        browser_session._last_used["chat-open"] = (
+            _time.monotonic() - browser_session._OPEN_IDLE_EVICT_S - 1
+        )
+        assert asyncio.run(browser_session._evict_if_idle("chat-open")) is True
+        assert closed == ["chat-open"]
+    finally:
+        _reset_idle_state()
+
+
+def test_status_poll_touches_session():
+    """A visible panel polls /browser/status every ~1.2s; that counts as real
+    use and refreshes the idle clock so a watched browser is never closed."""
+    _reset_idle_state()
+    page = _FakePage()
+    key = _install_page(page, "chat-watch")
+
+    async def _run():
+        browser_session._last_used[key] = 0.0
+        browser_session.status(key)
+        assert browser_session._last_used[key] > 0.0
+
+    asyncio.run(_run())
+    _reset_idle_state()
+
+
+def test_open_chat_addition_arms_timer_for_active_session(monkeypatch):
+    """Reporting an open chat must (re)arm the eviction timer for a live
+    session — cancelling alone would leave it exempt forever."""
+    _reset_idle_state()
+    page = _FakePage()
+    browser_session._get("chat-late").page = page
+    fired: list[str] = []
+
+    class _FakeHandle:
+        def cancel(self):
+            pass
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def _fake_call_later(delay, cb, key):
+            fired.append((key, delay))
+            return _FakeHandle()
+
+        monkeypatch.setattr(loop, "call_later", _fake_call_later)
+        try:
+            browser_session.set_open_chats(["chat-late"])
+        finally:
+            monkeypatch.setattr(loop, "call_later", real_call_later)
+
+    try:
+        asyncio.run(_run())
+        # Armed once, with the LONGER open-chat window (30 min), not 10.
+        assert fired == [("chat-late", browser_session._OPEN_IDLE_EVICT_S)]
+    finally:
+        _reset_idle_state()
+
+
+class _DevToolsHandler(BaseHTTPRequestHandler):
+    """Mimics Chromium's DevTools HTTP server: /json/list advertises the
+    appspot-style ABSOLUTE https frontend, while the bundled inspector is
+    (optionally) served from the debugging port itself."""
+
+    serve_inspector: ClassVar[bool] = True
+    advertise_port: ClassVar[int] = 0
+
+    def do_GET(self) -> None:
+        if self.path == "/json/list":
+            front = (
+                f"http://127.0.0.1:{_DevToolsHandler.advertise_port}"
+                "/inspector-remote.html?ws=127.0.0.1:9/devtools/page/ABC"
+            )
+            body = json.dumps(
+                [{"type": "page", "devtoolsFrontendUrl": front}]
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/devtools/inspector.html"):
+            if _DevToolsHandler.serve_inspector:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        elif self.path.startswith("/inspector-remote.html"):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def log_message(self, *args) -> None:  # keep test output quiet
+        pass
+
+
+def _start_devtools_stub():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _DevToolsHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_devtools_url_prefers_the_bundled_inspector(monkeypatch):
+    """The local http:// inspector wins over the advertised https frontend —
+    an https page cannot open the loopback ws:// socket (mixed content)."""
+    _install_page(_FakePage(), "c1")
+    srv = _start_devtools_stub()
+    _DevToolsHandler.advertise_port = srv.server_address[1]
+    monkeypatch.setattr(
+        browser_session, "cdp_endpoint", lambda chat=None: f"http://127.0.0.1:{srv.server_address[1]}"
+    )
+    try:
+        out = asyncio.run(browser_session.devtools_url("c1"))
+        assert out["ok"] is True
+        assert out["url"] == (
+            f"http://127.0.0.1:{srv.server_address[1]}"
+            "/devtools/inspector.html?ws=127.0.0.1:9/devtools/page/ABC"
+        )
+
+        # Bundled inspector dropped by the build → fall back to the
+        # advertised frontend, still absolute and verified.
+        _DevToolsHandler.serve_inspector = False
+        out = asyncio.run(browser_session.devtools_url("c1"))
+        assert out["ok"] is True
+        assert out["url"] == (
+            f"http://127.0.0.1:{srv.server_address[1]}"
+            "/inspector-remote.html?ws=127.0.0.1:9/devtools/page/ABC"
+        )
+    finally:
+        _DevToolsHandler.serve_inspector = True
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_devtools_url_errors_when_no_frontend_is_served(monkeypatch):
+    """Neither frontend reachable → readable error instead of a white tab."""
+    _install_page(_FakePage(), "c1")
+    _DevToolsHandler.serve_inspector = False
+    _DevToolsHandler.advertise_port = 1  # nothing listens there → connection error
+    monkeypatch.setattr(
+        browser_session, "cdp_endpoint", lambda chat=None: "http://127.0.0.1:1"
+    )
+    try:
+        out = asyncio.run(browser_session.devtools_url("c1"))
+        assert out["ok"] is False
+        assert out["error"]
+    finally:
+        _DevToolsHandler.serve_inspector = True
+
+
+def test_devtools_url_needs_a_live_session():
+    """With no page there is nothing to inspect — structured error."""
+    browser_session._sessions.clear()
+    out = asyncio.run(browser_session.devtools_url("c1"))
+    assert out["ok"] is False
+    assert "not running" in out["error"]

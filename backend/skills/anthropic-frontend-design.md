@@ -2,6 +2,7 @@
 name: Anthropic Frontend Design
 description: Anthropic's official guide to distinctive, intentional visual design when building new UI or redesigning — aesthetic direction, typography and choices that never look like default templates.
 license: Complete terms in LICENSE.txt
+fa_keywords: هویت بصری متمایز, دیزاین خاص, distinctive visual identity
 ---
 
 # Anthropic Frontend Design

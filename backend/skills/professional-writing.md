@@ -1,6 +1,7 @@
 ---
 name: professional-writing
 description: Write clear, professional emails, reports, articles, and documents with proper structure, tone, and formatting.
+fa_keywords: ایمیل بنویس, نامه بنویس, professional writing, write email
 ---
 
 # professional-writing

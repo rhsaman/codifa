@@ -21,6 +21,8 @@ import { fixZwsp, prepareContent } from "../lib/bidi";
 import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
+import { createPortal } from "react-dom";
+import { commentFileSelection } from "../lib/fileComments";
 
 /** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
  *  dozens of tool rows; one interval driving every live clock keeps CPU and
@@ -781,6 +783,50 @@ export function shouldShowSideBySide(
   return width >= threshold;
 }
 
+/** Build the quoted string for a diff highlight, embedding line info
+ *  directly so no API change is needed. Falls back to `[path] text` when
+ *  no line number is found in the DOM. */
+export function diffQuoteForSelection(
+  container: HTMLElement,
+  sel: Selection,
+  path: string,
+  text: string,
+): string {
+  const nums: number[] = [];
+  const collect = (node: Node | null) => {
+    if (!node) return;
+    const el = node.nodeType === 1 ? (node as Element) : node.parentElement;
+    if (!el || typeof el.closest !== "function") return;
+    const lined = el.closest("[data-lineno]");
+    if (lined) {
+      const n = parseInt(lined.getAttribute("data-lineno") ?? "", 10);
+      if (Number.isFinite(n)) {
+        nums.push(n);
+        return;
+      }
+    }
+    const row = el.closest(".diff-u-row, .diff-line");
+    if (row) {
+      const numText = row.querySelector(".diff-u-num")?.textContent?.trim() ?? "";
+      const n = parseInt(numText, 10);
+      if (numText !== "" && Number.isFinite(n)) {
+        nums.push(n);
+        return;
+      }
+      const all = Array.from(container.querySelectorAll(".diff-u-row, .diff-line"));
+      const idx = all.indexOf(row);
+      if (idx >= 0) nums.push(idx + 1);
+    }
+  };
+  collect(sel.anchorNode);
+  if (sel.focusNode && sel.focusNode !== sel.anchorNode) collect(sel.focusNode);
+  if (nums.length === 0) return `[${path}] ${text}`;
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  if (min === max) return `[${path} line ${min}] ${text}`;
+  return `[${path} lines ${min}-${max}] ${text}`;
+}
+
 /** دیف به سبک کدکس — واکنش‌گرا: در عرض کم تک‌ستونی، در عرض زیاد دوستونی.
  *  هر جفت delete+add به دو خط جدا (قرمز سپس سبز) باز می‌شود.
  *  `query` رخدادهای جست‌وجو را هایلایت می‌کند؛ `activeHit` ایندکس محلی
@@ -794,6 +840,7 @@ export function DiffView({
   activeHit = -1,
   layout = "auto",
   threshold = DIFF_SIDE_BY_SIDE_THRESHOLD,
+  commentable = true,
 }: {
   diff: string;
   path?: string;
@@ -801,10 +848,10 @@ export function DiffView({
   activeHit?: number;
   layout?: DiffLayoutMode;
   threshold?: number;
+  commentable?: boolean;
 }) {
   const rows = parseDiffRows(diff);
   const sideItems = parseSideBySide(diff);
-  if (rows.length === 0) return null;
   const drag = useDragScroll<HTMLDivElement>();
   const measureRef = useRef<HTMLDivElement | null>(null);
   const [measuredWidth, setMeasuredWidth] = useState(0);
@@ -836,6 +883,101 @@ export function DiffView({
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest" });
   }, [activeHit, query, diff]);
+  const chatId = useStore((s) => s.activeChatId);
+  const [box, setBox] = useState<{ base: string; x: number; y: number } | null>(null);
+  const [note, setNote] = useState("");
+  const commentInputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Focus without scrolling so the diff highlight stays put (same as FileViewerPanel).
+  useEffect(() => {
+    if (!box) return;
+    const id = requestAnimationFrame(() => {
+      try {
+        commentInputRef.current?.focus?.({ preventScroll: true } as FocusOptions);
+      } catch {
+        commentInputRef.current?.focus?.();
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [box]);
+  // Outside press dismisses like Esc (no send); presses inside the diff only move the box.
+  useEffect(() => {
+    if (!box) return;
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && typeof t.closest === "function" && t.closest(".fv-comment-float")) return;
+      const container = measureRef.current;
+      if (container && t instanceof Element && container.contains(t)) return;
+      setBox(null);
+      setNote("");
+      try {
+        window.getSelection()?.removeAllRanges();
+      } catch {
+        /* ignore */
+      }
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [box]);
+  if (rows.length === 0) return null;
+  const closeBox = () => {
+    setBox(null);
+    setNote("");
+  };
+  const sendBox = () => {
+    if (!box || !chatId) {
+      closeBox();
+      return;
+    }
+    const filePath = path ?? "diff";
+    const trimmed = note.trim();
+    const quote = trimmed ? `${box.base}\n\nNote: ${trimmed}` : box.base;
+    commentFileSelection(chatId, filePath, quote);
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      /* keep highlight on failure */
+    }
+    closeBox();
+  };
+  const refreshHighlight = () => {
+    if (!commentable) return;
+    const container = measureRef.current;
+    if (!container) return;
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (!sel || !container.contains(sel.anchorNode)) return;
+    if (sel.isCollapsed) {
+      if (box) closeBox();
+      return;
+    }
+    const text = sel.toString().trim();
+    if (!text) {
+      if (box) closeBox();
+      return;
+    }
+    const filePath = path ?? "diff";
+    const base = diffQuoteForSelection(container, sel, filePath, text.slice(0, 500));
+    try {
+      const range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+      const rect = range?.getBoundingClientRect();
+      if (rect && typeof window !== "undefined") {
+        const vw = window.innerWidth || 800;
+        const vh = window.innerHeight || 600;
+        const w = 320;
+        const h = 120;
+        setBox({
+          base,
+          x: Math.min(Math.max(rect.left, 8), Math.max(vw - w - 8, 8)),
+          y: Math.min(Math.max(rect.bottom + 8, 8), Math.max(vh - h - 8, 8)),
+        });
+        setNote("");
+        return;
+      }
+    } catch {
+      /* fall through to default position */
+    }
+    setBox({ base, x: 16, y: 96 });
+    setNote("");
+  };
   // شمارنده‌ی ترتیبی رخدادها در ترتیب رندر خط‌ها.
   let hitCursor = 0;
   const renderRow = (
@@ -993,8 +1135,54 @@ export function DiffView({
       ref={measureRef}
       className="diff-responsive"
       data-layout={showSide ? "side-by-side" : "unified"}
+      onMouseUp={refreshHighlight}
+      onKeyUp={refreshHighlight}
     >
       {showSide ? renderSide() : renderUnified()}
+      {commentable && box && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="fv-comment-float"
+              style={{
+                position: "fixed",
+                left: box.x,
+                top: box.y,
+                zIndex: 9999,
+              }}
+              onMouseUp={(e) => e.stopPropagation()}
+              onKeyUp={(e) => e.stopPropagation()}
+            >
+              <textarea
+                ref={commentInputRef}
+                className="fv-comment-input"
+                dir="auto"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                onMouseUp={(e) => e.stopPropagation()}
+                onKeyUp={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    try {
+                      window.getSelection()?.removeAllRanges();
+                    } catch {
+                      /* ignore */
+                    }
+                    closeBox();
+                  } else if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendBox();
+                  }
+                }}
+                rows={2}
+                placeholder="Write a comment… Enter to send, Esc to cancel"
+                aria-label="Comment on diff highlight"
+              />
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 }

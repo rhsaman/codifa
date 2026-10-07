@@ -157,6 +157,7 @@ from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
 _SEQUENTIAL_TOOLS = {
     "write_file",
     "edit_file",
+    "write_document",
     "run_terminal",
     "confirm_action",
     "create_skill",
@@ -985,8 +986,14 @@ def filter_tools_for_mode(
         for k in ("readFiles", "writeFiles", "runTerminal", "web")
     )
     if has_cap:
-        _READ = {"grep", "glob", "read", "task"}
-        _WRITE = {"write_file", "edit_file", "confirm_action", "git_commit"}
+        _READ = {"grep", "glob", "read", "task", "read_document"}
+        _WRITE = {
+            "write_file",
+            "edit_file",
+            "confirm_action",
+            "git_commit",
+            "write_document",
+        }
         _TERM = {"run_terminal"}
         denied: set[str] = set()
         if not cap.get("readFiles", False):
@@ -1016,6 +1023,7 @@ def filter_tools_for_mode(
                     "run_terminal",
                     "confirm_action",
                     "git_commit",
+                    "write_document",
                 )
             }
         if "run_terminal" in tools:
@@ -1096,6 +1104,12 @@ def filter_tools_for_mode(
             tools["run_terminal"] = _agents._wrap_scoped_terminal(
                 tools["run_terminal"], root, scoped_paths
             )
+    # Stable toolset order across turns (prompt-cache friendly): dict insertion
+    # order varies with mode-filter/scope paths, which would rewrite the tool
+    # schema prefix every turn and force full-price reprocessing. Coder in
+    # particular must keep the same toolset across turns, so sort by name to
+    # keep the bound schema prefix byte-identical (same set, deterministic order).
+    tools = dict(sorted(tools.items(), key=lambda kv: kv[0]))
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
     # what closes the read-only bypass: a plan-mode `task` call can no
@@ -1595,21 +1609,32 @@ def _fit_skill_catalog_lines(
     return lines
 
 
+def _format_skill_body(s: dict) -> str:
+    """One inlined skill (shared by @mentioned and auto-matched skills)."""
+    return (
+        f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
+        f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
+    )
+
+
 def _build_skills_section(
     picked_names: list[str],
     root: str,
     emit: Callable[[dict], None] | None = None,
     catalog: bool = True,
     compact: bool = False,
+    prompt: str = "",
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
     Codex-style progressive disclosure: a compact ``AVAILABLE SKILLS`` catalog
     (name + description only) is ALWAYS in the prompt so the model can
     auto-trigger a skill via the ``load_skill`` tool when the task matches a
-    description. Full bodies are inlined ONLY for @mentioned skills — the
-    model loads any other skill on demand via ``load_skill`` (one tool call
-    instead of a prompt-sized body). An empty catalog adds zero tokens.
+    description. Full bodies are inlined for @mentioned skills and for the
+    few skills ``_agents._auto_pick_skills`` clearly matches to ``prompt``
+    (models rarely call ``load_skill`` unprompted); any other skill is
+    loaded on demand via ``load_skill`` (one tool call instead of a
+    prompt-sized body). An empty catalog adds zero tokens.
 
     When a picked name matches no stored skill (deleted/renamed since the
     mention was made) a ``skill`` event with a ``note`` is emitted via
@@ -1659,6 +1684,31 @@ def _build_skills_section(
         )
         if lines:
             out += _header + "\n".join(lines)
+        auto = (
+            _agents._auto_pick_skills(prompt, all_skills, manual_names)
+            if prompt
+            else []
+        )
+        if auto:
+            cap = _agents._SKILL_AUTO_MAX_BODY_CHARS
+            inline = [s for s in auto if len(s["content"]) <= cap]
+            heavy = [s["name"] for s in auto if len(s["content"]) > cap]
+            logger.info("[skills] auto-matched: %s", ", ".join(s["name"] for s in auto))
+            parts: list[str] = []
+            if inline:
+                parts.append(
+                    "These skills match the user's request and are ALREADY "
+                    "LOADED below — follow their instructions for this task "
+                    "and do NOT call load_skill for them.\n"
+                    + "\n\n".join(_format_skill_body(s) for s in inline)
+                )
+            if heavy:
+                parts.append(
+                    "These skills also match but are too long to inline — "
+                    "call load_skill with each name FIRST: "
+                    + ", ".join(heavy) + "."
+                )
+            out += "\n\n=== AUTO-MATCHED SKILLS ===\n" + "\n\n".join(parts)
     if not manual_names:
         return out
     if not all_skills:
@@ -1704,11 +1754,7 @@ def _build_skills_section(
                 f"renamed: {', '.join(missing)}. The turn runs without them."
             ),
         })
-    bodies = "\n\n".join(
-        f"===== SKILL: {s['name']} =====\nDescription: {s['description'] or ''}"
-        f"\n\n{s['content']}\n===== END SKILL: {s['name']} ====="
-        for s in picked
-    )
+    bodies = "\n\n".join(_format_skill_body(s) for s in picked)
     return out + "\n\n=== ATTACHED SKILLS ===\n" + bodies
 
 
@@ -2112,22 +2158,34 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # single source of file access (spec §2/§13) and saves tokens. The actual
     # scoping is applied via `_scoped_rels` -> `scoped_paths` below.
     if attachments:
+        _att_disp: list[str] = []
         try:
-            _att_rels = [
-                os.path.relpath(
-                    _agents.resolve_safe(root, a), _agents.resolve_safe(root, "")
-                )
-                for a in (attachments or [])
-                if a and os.path.isfile(_agents.resolve_safe(root, a))
-            ]
+            # allow_coder: uploaded files imported from outside the workspace
+            # live under the app data root (uploads/) — readable without a
+            # permission prompt, like any other read under the data root.
+            _base = _agents.resolve_safe(root, "")
+            for a in (attachments or []):
+                if not a:
+                    continue
+                _t = _agents.resolve_safe(root, a, allow_coder=True)
+                if not os.path.isfile(_t):
+                    continue
+                _r = os.path.relpath(_t, _base)
+                # Imported uploads sit OUTSIDE the workspace; a `../../`-relative
+                # form is ambiguous for the model, so show the absolute path —
+                # the read tools resolve both forms.
+                _att_disp.append(_t if _r.startswith("..") else _r)
         except Exception:  # noqa: BLE001
-            _att_rels = []
-        if _att_rels:
+            _att_disp = []
+        if _att_disp:
             workspace_note += (
                 "\n\n=== ATTACHED FILES ===\nThe user attached these file(s) as their "
                 "focus: "
-                + ", ".join("`" + f + "`" for f in _att_rels)
-                + ". They are in SCOPE — read them with the read tool when relevant."
+                + ", ".join("`" + f + "`" for f in _att_disp)
+                + ". They are in SCOPE — read them with the read tool when relevant. "
+                "PDF / Word (.docx) / Excel (.xlsx) attachments must be read with the "
+                "read_document tool (the plain read tool cannot decode them); use "
+                "write_document in Coder mode to create or edit such documents."
             )
     if scoped_paths:
         workspace_note += (
@@ -2215,14 +2273,16 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
     # (name + description) is ALWAYS in the prompt — ultra-compact for
     # small-context models — so the model can auto-trigger skills via
-    # load_skill; @mentioned bodies are inlined in full. Bodies are never
-    # auto-inlined: the model loads anything else on demand via load_skill.
+    # load_skill; @mentioned bodies are inlined in full, plus the few skills
+    # clearly matched to the request in code (_auto_pick_skills); the model
+    # loads anything else on demand via load_skill.
     _skill_section = _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
         catalog=True,
         compact=small_ctx,
+        prompt=prompt,
     )
     system_final += _skill_section
 
@@ -2404,10 +2464,13 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         #     flush=True,
         # )
 
-    # Turn continuity: pin previous-turn outcome evidence at the head so a
-    # short confirmation like "done?" reports from it instead of re-running.
-    # The server prepends it as a system entry; keep it first even after
-    # historyLimit slicing/summarization trims the transcript.
+    # Turn continuity: pin previous-turn outcome evidence NEXT TO the new user
+    # message (transcript tail) so a short confirmation like "done?" reports
+    # from it instead of re-running. Tail, not head: the note text changes
+    # every turn, and a position-0 entry would shift the whole transcript and
+    # break the provider's prompt-cache prefix on every turn start. The tail
+    # placement survives historyLimit slicing/summarization the same way
+    # (they drop the oldest entries, never the newest).
     try:
         import trace_store as _ts
 
@@ -2416,17 +2479,17 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         if _note and not any(
             _note[:40] in str(getattr(m, "content", "")) for m in lc_history
         ):
-            lc_history.insert(0, HumanMessage(content=_note))
+            lc_history.append(HumanMessage(content=_note))
     except Exception:  # noqa: BLE001, S110 — continuity note must never break the turn
         pass
     _is_status_check = _agents._is_status_check(prompt)
     if mode == "coder" and not _is_status_check:
         reuse = _agents._plan_reuse_note(history, prompt)
         if reuse:
-            lc_history.insert(0, HumanMessage(content=reuse))
+            lc_history.append(HumanMessage(content=reuse))
         disc = _agents._plan_discovery_note(history)
         if disc:
-            lc_history.insert(0, HumanMessage(content=disc))
+            lc_history.append(HumanMessage(content=disc))
         # Enforce the test-verification rule at runtime for any code-changing
         # coder task (feature/bugfix/refactor), not only when the prompt
         # literally says "test". This closes the gap the user reported: coder
@@ -2506,6 +2569,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     reuse_tool = _agents._tool_reuse_note(history)
     if reuse_tool:
         lc_history.append(HumanMessage(content=reuse_tool))
+    delegated_note = _delegated_scope_note(history, chat_id)
+    if delegated_note:
+        lc_history.append(HumanMessage(content=delegated_note))
 
     # User content (prompt; images as content parts). Attached FILE
     # contents are no longer force-injected here — they enter via scope + the
@@ -2675,6 +2741,15 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         )
         for name, t in filtered.items()
     ]
+    # Stable toolset order for prompt-cache stability: dict insertion order
+    # varies with mode-filter/MCP-merge paths, which would rewrite the tool
+    # schema prefix every turn and force full-price reprocessing. Sorting by
+    # name keeps the bound schema prefix byte-identical across steps/turns
+    # (observability/perf only — same set, deterministic order).
+    try:
+        lc_tools.sort(key=lambda t: getattr(t, "name", ""))
+    except Exception:  # noqa: BLE001, S110 — order hint must never break turn
+        pass
     _tctx_mark("done")
     try:
         _tctx_total = _tctx_marks.get("done", 0.0)
@@ -3177,12 +3252,95 @@ def _subagent_report_text(task_id: str, report: str, status: str) -> str:
         "stopped": "stopped by the main agent",
     }.get(status, status)
     body = (report or "").strip() or "(no report produced)"
+    # Cap: a verbose sub-agent must not blow the main-agent window — keep the
+    # head (findings) and drop the tail; observability only, no behavior change
+    # to delivery/verification flow.
+    if len(body) > 6000:
+        body = body[:6000] + "\n…[sub-agent report truncated — see task output if needed]"
     return (
         f"[background sub-agent report - task_id={task_id}, status={label}]\n"
         f"{body}\n"
         "Verify the task is actually done before finalizing; if incomplete, "
         "follow up (task_steer/task) or finish it yourself — never claim "
         "completion without verification."
+    )
+
+
+# Delegated scopes per chat: what the main agent already handed to background
+# sub-agents via task(). Recorded in-turn and surfaced as an anti-repeat note
+# so later steps/turns trust the reports instead of re-running glob/grep/read
+# over the same scope.
+_DELEGATED_SCOPES_BY_CHAT: dict[str, list[str]] = {}
+_DELEGATED_SCOPES_MAX = 20
+
+
+def _track_delegated_tasks(chat_id: str, tool_calls: list | None) -> None:
+    """Record scopes delegated to background sub-agents via task().
+
+    Called once per model step right after the assistant message is appended,
+    so the very next step can warn against re-discovering the same scope.
+    Bounded per chat; bookkeeping only, never breaks the turn.
+    """
+    if not chat_id or not tool_calls:
+        return
+    try:
+        scopes = _DELEGATED_SCOPES_BY_CHAT.setdefault(chat_id, [])
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict) or tc.get("name") != "task":
+                continue
+            args = tc.get("args") or {}
+            desc = str(args.get("description") or "").strip()[:120]
+            prompt = str(args.get("prompt") or "").strip()[:160]
+            scope = f"{desc}: {prompt}" if desc and prompt else (desc or prompt)
+            scope = " ".join(scope.split())
+            if scope and scope not in scopes:
+                scopes.append(scope)
+        while len(scopes) > _DELEGATED_SCOPES_MAX:
+            scopes.pop(0)
+    except Exception:  # noqa: BLE001, S110 — bookkeeping never breaks the turn
+        pass
+
+
+def _delegated_scope_note(history: list | None, chat_id: str) -> str:
+    """Anti-repeat note for scopes already delegated to sub-agents.
+
+    Combines in-turn tracked scopes with prior-turn task calls found in history
+    toolActivity. Returns "" when nothing was delegated. Keeps the model from
+    re-running discovery over a scope whose report is already delivered or in
+    flight; only targeted follow-ups for files the report names are allowed.
+    """
+    scopes: list[str] = []
+    seen: set[str] = set()
+    try:
+        for s in _DELEGATED_SCOPES_BY_CHAT.get(chat_id or "", []):
+            if s and s not in seen:
+                seen.add(s)
+                scopes.append(s)
+        for turn in history or []:
+            if not isinstance(turn, dict):
+                continue
+            for a in turn.get("toolActivity") or []:
+                if not isinstance(a, dict) or a.get("tool") != "task":
+                    continue
+                args = a.get("args") or {}
+                desc = str(args.get("description") or "").strip()[:120]
+                if desc and desc not in seen:
+                    seen.add(desc)
+                    scopes.append(desc)
+                if len(scopes) >= _DELEGATED_SCOPES_MAX:
+                    break
+            if len(scopes) >= _DELEGATED_SCOPES_MAX:
+                break
+    except Exception:  # noqa: BLE001, S110 — note is best-effort
+        pass
+    if not scopes:
+        return ""
+    listed = "; ".join(scopes[-8:])
+    return (
+        "Delegated scopes already covered by background sub-agents: "
+        f"{listed}. Do NOT re-run glob/grep/read to re-discover these scopes — "
+        "trust the delivered sub-agent reports and do only targeted follow-ups "
+        "for files they name."
     )
 
 
@@ -4325,6 +4483,26 @@ async def _run_mode_turn(
                         result=str(getattr(ai, "content", "") or "")[:8000],
                     )
                 if usage_ev:
+                    # Per-step usage log for cache-hit and token measurement
+                    # (no behavior change — observability only). WARNING, not
+                    # INFO: the persistent codifa.log handler runs at WARNING+
+                    # and the graph logger inherits the root level, so an INFO
+                    # line would never appear anywhere in a packaged app.
+                    try:
+                        logger.warning(
+                            "[usage] chat=%s step=%s model=%s input=%s cache_read=%s cache_write=%s output=%s reasoning=%s total=%s",
+                            str(state.get("chat_id", "") or chat_id or "")[:8],
+                            steps,
+                            model_id,
+                            usage_ev.get("input_tokens", 0),
+                            usage_ev.get("cache_read_tokens", 0),
+                            usage_ev.get("cache_write_tokens", 0),
+                            usage_ev.get("output_tokens", 0),
+                            usage_ev.get("reasoning_tokens", 0),
+                            usage_ev.get("total_tokens", 0),
+                        )
+                    except Exception:  # noqa: BLE001, S110 — logging never breaks turn
+                        pass
                     # Track the SAME token breakdown the frontend context meter
                     # shows, so auto-compaction fires off the exact value the meter
                     # displays — they always agree. Use the provider-aware
@@ -4679,6 +4857,7 @@ async def _run_mode_turn(
             }
             dedupe_step_tool_call_ids(ai, _reserved_tc_ids)
             msgs.append(ai)
+            _track_delegated_tasks(chat_id, ai.tool_calls)
             # Partition this step's tool calls: read-only ones (grep/glob/read/
             # web/vision/task/...) run CONCURRENTLY via gather -- they cannot
             # race each other since none of them mutate anything. Mutating /

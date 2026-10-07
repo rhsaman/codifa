@@ -49,6 +49,9 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   const [address, setAddress] = useState<string>("");
   const [active, setActive] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
+  // True while a navigation (URL / search / history action) is in flight —
+  // drives the toolbar progress line and the spinning reload icon.
+  const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
   const [viewport, setViewport] = useState<{ w: number; h: number }>({ w: DEFAULT_VIEWPORT_SIZE.width, h: DEFAULT_VIEWPORT_SIZE.height });
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -67,9 +70,9 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   // last manually applied width — like Chrome shrinking the layout viewport
   // when the pane narrows and growing it back up to the set size.
   const [fitToPane, setFitToPane] = useState<boolean>(true);
-  // "..." overflow menu + CDP endpoint for DevTools (from /browser/status).
+  // "..." overflow menu (CDP endpoint for DevTools comes from the backend
+  // on demand — see openDevTools).
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
-  const [cdpUrl, setCdpUrl] = useState<string>("");
   const capWRef = useRef<number>(DEFAULT_VIEWPORT_SIZE.width);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
@@ -147,8 +150,6 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       const st = await sidecarFetch("/browser/status");
       const isActive = st.active === true;
       setActive(isActive);
-      if (typeof st.cdp === "string") setCdpUrl(st.cdp);
-      else if (!isActive) setCdpUrl("");
       if (typeof st.url === "string") {
         // Never surface about:blank in the omnibox — it sticks and the
         // user has to delete it before typing (Chrome shows an empty box).
@@ -246,6 +247,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     const raw = address.trim();
     if (!raw) return;
     setError("");
+    setBusy(true);
     // Omnibox like Chrome: a URL navigates, anything else is a search query —
     // the backend tries Google first, then Bing, then DuckDuckGo.
     try {
@@ -277,6 +279,8 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       // next Enter relaunches instead of erroring forever.
       if (msg.includes("browser is not running")) setActive(false);
       setError(msg);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -284,6 +288,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   async function historyAction(action: "back" | "forward" | "reload"): Promise<void> {
     if (!active) return;
     setError("");
+    setBusy(true);
     try {
       await sidecarFetch("/browser/history", {
         method: "POST",
@@ -297,6 +302,8 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       // next click can relaunch instead of erroring forever.
       if (msg.includes("browser is not running")) setActive(false);
       setError(msg);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -503,7 +510,6 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       setActive(false);
       setImage("");
       setError("");
-      setCdpUrl("");
       setMenuOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -544,31 +550,28 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     }
   }
 
-  // Open DevTools for the live session in the OS browser. Resolves the
-  // inspector frontend URL from the session CDP endpoint when reachable;
-  // falls back to the CDP root (target list) or the current page URL.
+  // Open DevTools for the live session in the OS browser. The backend
+  // resolves AND verifies the frontend URL — the old renderer-side
+  // /json/list fetch was blocked (cross-origin) and silently fell back to
+  // the bare CDP root, which opens as a white page.
   async function openDevTools(): Promise<void> {
     setMenuOpen(false);
     if (!active) return;
     setError("");
     try {
-      let target = cdpUrl;
-      if (target) {
-        try {
-          const res = await fetch(`${target}/json/list`);
-          const list = (await res.json()) as Array<{ devtoolsFrontendUrl?: string }>;
-          const front = list?.[0]?.devtoolsFrontendUrl;
-          if (typeof front === "string" && front) {
-            target = front.startsWith("http") ? front : `${target}${front}`;
-          }
-        } catch {
-          // CDP list unreachable — open the CDP root target list instead.
-        }
-      }
-      const url = target || pageUrl || address.trim();
-      if (!url) return;
-      const opener = (window as unknown as { coder?: { openExternal?: (u: string) => Promise<void> } }).coder?.openExternal;
-      if (typeof opener === "function") await opener.call(window.coder, url);
+      const res = await sidecarFetch("/browser/devtools-url");
+      const url = typeof res.url === "string" ? res.url : "";
+      if (!url) throw new Error(String(res.error || "DevTools URL unavailable"));
+      // The frontend dials a loopback ws:// socket other default browsers
+      // (e.g. Safari) block — open it in Chrome directly when available.
+      const bridge = (window as unknown as {
+        coder?: {
+          openExternalChrome?: (u: string) => Promise<void>;
+          openExternal?: (u: string) => Promise<void>;
+        };
+      }).coder;
+      if (typeof bridge?.openExternalChrome === "function") await bridge.openExternalChrome(url);
+      else if (typeof bridge?.openExternal === "function") await bridge.openExternal(url);
       else window.open(url, "_blank", "noopener");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -587,7 +590,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           disabled={!active}
           onClick={() => void historyAction("back")}
         >
-          ←
+          <BackIcon />
         </button>
         <button
           type="button"
@@ -597,30 +600,35 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           disabled={!active}
           onClick={() => void historyAction("forward")}
         >
-          →
+          <ForwardIcon />
         </button>
         <button
           type="button"
-          className="browser-tool-btn"
+          className={"browser-tool-btn" + (busy ? " browser-tool-btn--spin" : "")}
           title="Reload"
           aria-label="Reload"
           disabled={!active}
           onClick={() => void historyAction("reload")}
         >
-          ⟳
+          <ReloadIcon />
         </button>
-        <input
-          className="browser-omnibox"
-          value={address}
-          onChange={(e) => setAddress(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void go();
-          }}
-          placeholder="Enter a URL and press Enter"
-          spellCheck={false}
-          aria-label="Address"
-          onFocus={(e) => e.currentTarget.select()}
-        />
+        <div className="browser-omnibox-wrap">
+          <span className="browser-omnibox-icon" aria-hidden="true">
+            {!address.trim() ? <GlobeIcon /> : isProbablyUrl(address) ? <LockIcon /> : <SearchIcon />}
+          </span>
+          <input
+            className="browser-omnibox"
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void go();
+            }}
+            placeholder="Search or type a URL"
+            spellCheck={false}
+            aria-label="Address"
+            onFocus={(e) => e.currentTarget.select()}
+          />
+        </div>
         <button
           type="button"
           className="browser-tool-btn"
@@ -629,7 +637,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           disabled={!active}
           onClick={() => void closeSession()}
         >
-          ⏹
+          <StopIcon />
         </button>
         <div className="browser-menu-wrap">
           <button
@@ -641,7 +649,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((v) => !v)}
           >
-            ...
+            <KebabIcon />
           </button>
           <div className="browser-menu" role="menu" hidden={!menuOpen}>
             <button
@@ -669,6 +677,13 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           </div>
         </div>
       </div>
+
+      {/* Chrome-style loading line: fades in under the toolbar while a
+          navigation runs, keeps its 2px slot otherwise (no layout shift). */}
+      <div
+        className={"browser-progress" + (busy ? " browser-progress--on" : "")}
+        aria-hidden="true"
+      />
 
       {/* Width ruler — full-width Chrome DevTools-style graduated bar below
           the toolbar. Hover shows "Laptop - 1024px", drag/keyboard resizes. */}
@@ -851,4 +866,100 @@ export function isProbablyUrl(raw: string): boolean {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return true;
   if (/^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?([/?#]|$)/i.test(s)) return true;
   return /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?([/?#].*)?$/i.test(s);
+}
+
+/* ── Toolbar SVG icons: stroke follows currentColor, crisp at any DPI —
+   replacing the old text glyphs (← ⟳ ⏹ …) which rendered thin and uneven. */
+
+function SvgIcon({ children, size = 16 }: { children: React.ReactNode; size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function BackIcon() {
+  return (
+    <SvgIcon>
+      <path d="M19 12H5" />
+      <path d="M12 19l-7-7 7-7" />
+    </SvgIcon>
+  );
+}
+
+function ForwardIcon() {
+  return (
+    <SvgIcon>
+      <path d="M5 12h14" />
+      <path d="M12 5l7 7-7 7" />
+    </SvgIcon>
+  );
+}
+
+function ReloadIcon() {
+  return (
+    <SvgIcon>
+      <polyline points="23 4 23 10 17 10" />
+      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+    </SvgIcon>
+  );
+}
+
+function StopIcon() {
+  return (
+    <SvgIcon>
+      <rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none" />
+    </SvgIcon>
+  );
+}
+
+function KebabIcon() {
+  return (
+    <SvgIcon>
+      <circle cx="12" cy="5" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="19" r="1.7" fill="currentColor" stroke="none" />
+    </SvgIcon>
+  );
+}
+
+/** Omnibox leading icon: lock for URLs, magnifier for search queries,
+ *  globe while the box is empty (matches what Enter will actually do). */
+function LockIcon() {
+  return (
+    <SvgIcon size={13}>
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </SvgIcon>
+  );
+}
+
+function SearchIcon() {
+  return (
+    <SvgIcon size={13}>
+      <circle cx="11" cy="11" r="7" />
+      <path d="M21 21l-4.35-4.35" />
+    </SvgIcon>
+  );
+}
+
+function GlobeIcon() {
+  return (
+    <SvgIcon size={13}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3a14.5 14.5 0 0 1 0 18 14.5 14.5 0 0 1 0-18z" />
+    </SvgIcon>
+  );
 }

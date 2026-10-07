@@ -97,6 +97,7 @@ export const FILE_BADGES: Record<string, { label: string; bg: string; fg: string
   docx: { label: "W", bg: "#2b579a", fg: "#ffffff" },
   xls: { label: "X", bg: "#217346", fg: "#ffffff" },
   xlsx: { label: "X", bg: "#217346", fg: "#ffffff" },
+  xlsm: { label: "X", bg: "#217346", fg: "#ffffff" },
   ppt: { label: "P", bg: "#d24726", fg: "#ffffff" },
   pptx: { label: "P", bg: "#d24726", fg: "#ffffff" },
   zip: { label: "ZIP", bg: "#b98a3f", fg: "#26221e" },
@@ -141,6 +142,23 @@ export const IMAGE_EXTS = new Set([
 export const AUDIO_EXTS = new Set(["mp3", "wav", "ogg", "flac", "m4a", "aac"]);
 export const VIDEO_EXTS = new Set(["mp4", "mov", "webm", "mkv", "avi"]);
 
+/** Non-code document extensions shown as clickable file chips in chat
+ *  (pdf, Word, Excel, CSV). The viewer panel renders these via the backend
+ *  document reader, so a chip only passes path/line/root (no body preload). */
+export const DOC_EXTS = new Set([
+  "pdf", "doc", "docx", "xls", "xlsx", "xlsm", "csv",
+]);
+
+/** True when a path points to a non-code document (pdf/word/excel/csv).
+ *  Accepts optional `:line` suffixes via splitPathLine. */
+export function isDocPath(raw: string): boolean {
+  if (!raw) return false;
+  const s = raw.replace(INVISIBLE, "").trim();
+  if (!s) return false;
+  const { path } = splitPathLine(s);
+  return DOC_EXTS.has(extOf(path));
+}
+
 /** Accent hues for the media glyph tiles (previously solid fills, now used
  *  only as a tile tint + glyph source so they stay quiet on any theme). */
 const IMAGE_ACCENT = "#a074c4";
@@ -181,7 +199,7 @@ const WHITELIST_EXTRA = new Set([
   "tsv", "rst", "adoc", "tex", "sty", "cfg", "conf", "properties", "plist",
   "aab", "apk", "jar", "war", "dylib", "so", "dll", "exe", "bin", "wasm",
   "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "doc", "docx", "xls",
-  "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2",
+  "xlsx", "xlsm", "ppt", "pptx", "ttf", "otf", "woff", "woff2",
 ]);
 
 /** Extension of a path's basename, lowercased ("" when there is none).

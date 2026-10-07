@@ -100,6 +100,11 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
         if (Array.isArray(msg.toolActivity)) {
           msg.toolActivity = trimToolActivity(msg.toolActivity as ToolActivity[])
         }
+        // Cap base64 image payloads on the persisted copy only (see
+        // MAX_PERSIST_IMAGE_CHARS): keeps chat JSON + heartbeat IPC small.
+        if (Array.isArray(msg.images)) {
+          msg.images = (msg.images as unknown[]).map(trimPersistImageValue) as ChatMessage['images']
+        }
         return msg as unknown as ChatMessage
       })),
     }
@@ -119,6 +124,30 @@ let lastMidStreamPersist = 0
 // payload) stays small even for tool calls with huge args/diffs/results.
 const MAX_TOOL_TEXT = 4000 // summary / diff
 const MAX_TOOL_ARG = 2000 // per string value inside args
+
+// Cap on persisted base64 image payloads so one pasted screenshot (often
+// 1-5MB as data:image/...;base64) doesn't bloat every chats snapshot +
+// heartbeat IPC payload. Only applies to the persisted copy in sanitizeChats;
+// in-memory messages keep the full data URL for render + model context.
+const MAX_PERSIST_IMAGE_CHARS = 100_000
+function trimPersistImageValue(v: unknown): unknown {
+  if (typeof v === 'string') {
+    if (v.length > MAX_PERSIST_IMAGE_CHARS && v.slice(0, 80).includes('base64')) {
+      return v.slice(0, MAX_PERSIST_IMAGE_CHARS) + '…'
+    }
+    return v
+  }
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    for (const k of ['data', 'dataUrl', 'url', 'content'] as const) {
+      const s = o[k]
+      if (typeof s === 'string' && s.length > MAX_PERSIST_IMAGE_CHARS && (s.startsWith('data:') || s.slice(0, 80).includes('base64'))) {
+        return { ...o, [k]: s.slice(0, MAX_PERSIST_IMAGE_CHARS) + '…' }
+      }
+    }
+  }
+  return v
+}
 
 function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
   return acts.map((a) => {
@@ -1092,6 +1121,12 @@ interface State {
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
   setChatSkillNotice: (id: string, notice: string | null) => void
+  /** Revision counter per ABSOLUTE file path, bumped whenever the agent
+   *  writes that file (write_document tool_result / write_file+edit_file
+   *  diff events). The file viewer subscribes to its own path's counter and
+   *  re-fetches, so document edits show up LIVE while the agent works. */
+  docRev: Record<string, number>
+  bumpDocRev: (absPath: string) => void
   /** Per-chat scroll restoration anchor (see Chat.scrollPos). */
   setChatScrollPos: (id: string, pos: { id: string; offset: number; atBottom: boolean } | null) => void
   /** In-memory-only scroll anchor update (no persist) — used by the
@@ -2354,7 +2389,8 @@ export const useStore = create<State>((set, get) => ({
         return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      const chatTree = placeChat(base, activeChatId, st.activeChatId, st.chatLayout)
+      clickedWindowId = null
+      const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
@@ -2383,7 +2419,8 @@ export const useStore = create<State>((set, get) => ({
         return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      const chatTree = placeChat(base, activeChatId, st.activeChatId, st.chatLayout)
+      clickedWindowId = null
+      const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
     })
@@ -3483,6 +3520,14 @@ export const useStore = create<State>((set, get) => ({
   setChatSkillNotice: (id, skillNotice) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, skillNotice } : c)),
+    }))
+  },
+
+  docRev: {},
+
+  bumpDocRev: (absPath) => {
+    set((s) => ({
+      docRev: { ...s.docRev, [absPath]: (s.docRev[absPath] ?? 0) + 1 },
     }))
   },
 

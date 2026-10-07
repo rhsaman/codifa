@@ -143,6 +143,7 @@ import {
   ChatMessageView,
   QueuedCollapsibleText,
   RetryBanner,
+  editQueuedText,
   isCollapsibleText,
 } from "./ChatMessage";
 import { MessageImages } from "./MessageImages";
@@ -2178,6 +2179,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // folds it into the AIMessage's content so a retry knows what was
         // already done without re-executing completed tools.
         preservedToolSummary: m.preservedToolSummary,
+        // Re-send images carried by earlier user messages so the backend can
+        // re-analyze them (vision-cached by content) — without this the model
+        // "forgets" an attached image on the very next turn.
+        ...(m.images?.length
+          ? {
+              images: m.images.map((i) =>
+                i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
+              ),
+            }
+          : {}),
       }));
     // Cast: SearchResultItem fields (title, url, snippet) are valid JSON-
     // serializable keys; the narrower StreamParams type omits them but they
@@ -2214,6 +2225,46 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         cur.push({ kind: "text", text: chunk });
       }
       return cur;
+    };
+
+    // Batched stream rendering: text tokens can arrive many times per second
+    // and each updateMessage triggers a zustand set + transcript render.
+    // Buffer text chunks and flush at most every 75ms (~13 renders/sec)
+    // instead of once per token. Non-text events flush first so tool and
+    // status updates never wait behind the batch window. The final flush runs
+    // in handleEvent (non-text branch) and in the `finally` block below, so
+    // no buffered text is ever lost on abort.
+    let pendingText = "";
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushPendingText = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      if (!pendingText) return;
+      const chunk = pendingText;
+      pendingText = "";
+      const cur = useStore
+        .getState()
+        .chats.find((c) => c.id === chat.id)
+        ?.messages.find((m) => m.id === assistantMsg.id);
+      const prev = cur?.content ?? "";
+      const clean = stripLeadingModeTag(chunk, prev);
+      if (!clean) return;
+      useStore.getState().updateMessage(assistantMsg.id, {
+        content: prev + clean,
+        segments: appendTextSegment(cur?.segments, clean),
+        ...(cur?.retry?.fallback === true ? {} : { retry: null }),
+        thinkingActive: false,
+        statusText: undefined,
+      });
+    };
+    const queueTextChunk = (chunk: string) => {
+      if (!chunk) return;
+      pendingText += chunk;
+      if (!flushTimer) {
+        flushTimer = setTimeout(flushPendingText, 75);
+      }
     };
 
     // Plan-card seal: when a plan_card lands on this bubble the reply is
@@ -2493,20 +2544,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           return;
         store.updateMessage(assistantMsg.id, { retry: null });
       };
+      // Batched text must land before any tool/status/retry update, so cards
+      // never render ahead of the prose that preceded them.
+      if (event.kind !== "text") flushPendingText();
       if (event.kind === "text") {
         // Keep the current "isThinking" flag untouched — a text chunk must not
         // cancel the composer glow while the model is still reasoning.
         useStore.getState().setStreaming(true, useStore.getState().isThinking);
+        // Flush text buffered for the previous bubble before rotating, so it
+        // lands on the sealed bubble instead of the fresh one.
+        if (bubbleSealed) flushPendingText();
         ensureLiveBubble();
-        const prev = findMsg()?.content ?? "";
-        const chunk = stripLeadingModeTag(event.content ?? "", prev);
-        store.updateMessage(assistantMsg.id, {
-          content: prev + chunk,
-          segments: appendTextSegment(findMsg()?.segments, chunk),
-          ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
-          thinkingActive: false,
-          statusText: undefined,
-        });
+        // Buffer raw chunks and flush at most every 75ms (see queueTextChunk
+        // above) instead of one store update per token.
+        queueTextChunk(event.content ?? "");
       } else if (event.kind === "thinking") {
         // Lightweight signal: the backend now emits active:True ONLY when the
         // model actually produces reasoning content. Drive the per-message
@@ -2709,6 +2760,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "tool_result") {
         dropToolRunning(toolRunning);
         clearTransientRetry();
+        // Live document preview: a finished write_document bumps the file's
+        // revision so an open right-panel viewer re-fetches immediately.
+        if (event.tool === "write_document") {
+          const p = (event as { path?: unknown }).path;
+          if (typeof p === "string" && p) {
+            const abs = p.startsWith("/")
+              ? p
+              : `${chat.root || useStore.getState().root}/${p.replace(/^\/+/, "")}`;
+            store.bumpDocRev(abs);
+          }
+        }
         // `resolveToolResult` resolves sub-agent results by branch/call_id even
         // when the parent branch card (or its nested child) is already "done",
         // so late sub-results are never dropped.
@@ -2752,6 +2814,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           return a;
         });
         store.updateMessage(assistantMsg.id, { toolActivity: next });
+        // Live viewer refresh for plain text writes too (the diff carries the
+        // path; an open right-panel viewer re-fetches if it shows this file).
+        if (typeof event.path === "string" && event.path) {
+          const abs = event.path.startsWith("/")
+            ? event.path
+            : `${chat.root || useStore.getState().root}/${event.path.replace(/^\/+/, "")}`;
+          store.bumpDocRev(abs);
+        }
       } else if (event.kind === "compact_start") {
         // Backend is auto-compacting (summarizer running) — show the loading
         // banner under the messages until the compact/compact_failed event lands.
@@ -3064,6 +3134,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // re-set it after the stream closes.
         lastEventAtMs = Date.now();
         lastContentAtMs = Date.now();
+        // Flush any buffered text before resolving cards, so the final
+        // content is complete before the turn closes.
+        flushPendingText();
         resolveStuckCards();
         useStore.getState().updateMessage(assistantMsg.id, { statusText: undefined });
         // Backend reports steers it discarded without injecting
@@ -3136,7 +3209,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           chatId: chat.id,
           prompt: promptWithResume,
           history,
-          attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
+          attachments: atts.map((a) =>
+            // Imported (outside-workspace) files arrive as absolute paths and
+            // are sent as-is; workspace-relative ones get the root prefix.
+            /^(\/|[a-zA-Z]:[\\/])/.test(a)
+              ? a
+              : `${rootDir}/${a.replace(/^\/+/, "")}`,
+          ),
           images: imgs.map((i) =>
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
           ),
@@ -3218,6 +3297,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
     } finally {
       clearInterval(stallTimer);
+      // Final flush: buffered text must land even on abort/error, otherwise
+      // the last ~75ms of tokens would be lost when the stream throws.
+      flushPendingText();
       // Neutralize any stall-timer callback already queued: with a fresh clock
       // its 180s check can't fire and re-show "Still waiting" after the stream
       // has actually ended.
@@ -3822,6 +3904,32 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [],
   );
 
+  // Queue edit (not yet sent): update the queued text in place — no
+  // truncate/resend. Order-preserving: queueMessage appends, so a plain
+  // remove + add would move the edited item to the end; instead remove all
+  // unsent items and re-queue them in the same order with the edited text
+  // swapped in (editQueuedText is the pure, unit-tested swap).
+  const handleEditQueued = useCallback((id: string, newText: string) => {
+    const originId = chatIdRef.current;
+    const s = useStore.getState();
+    const ch = s.chats.find((c) => c.id === originId);
+    if (!ch) return;
+    const items = (ch.queued ?? []).filter((q) => !q.sent);
+    const next = editQueuedText(items, id, newText);
+    if (!next) return;
+    for (const q of items) s.removeQueuedMessage(originId, q.id);
+    for (const q of next) s.queueMessage(originId, { ...q });
+  }, []);
+
+  // Stable identity for memoized children, same pattern as onEdit above.
+  const handleEditQueuedRef = useRef(handleEditQueued);
+  handleEditQueuedRef.current = handleEditQueued;
+
+  const onEditQueued = useMemo(
+    () => (id: string, newText: string) => handleEditQueuedRef.current(id, newText),
+    [],
+  );
+
   const submit = () => {
     const typed = input.trim();
     if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
@@ -3977,10 +4085,29 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       addImage(p, name);
       return;
     }
-    if (!wroot) return;
     const rel = relFromRoot(wroot, p);
-    if (!rel) return;
-    setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
+    if (rel) {
+      setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
+      return;
+    }
+    // Outside-workspace file: import it into the data dir's uploads folder so
+    // the agent can read it (the backend allows reads under the data root
+    // without a permission prompt) instead of silently dropping the file.
+    void api
+      .importFile(p)
+      .then((imported) => {
+        if (!imported) {
+          useStore
+            .getState()
+            .setChatCmdError(
+              chatIdRef.current,
+              `Could not attach "${name}" — restart the app (⌘R or relaunch) to finish updating, then try again.`,
+            );
+          return;
+        }
+        setAttachments((a) => (a.includes(imported) ? a : [...a, imported]));
+      })
+      .catch(() => {});
   };
 
   const hasFileDrag = (e: React.DragEvent) => isFileDrag(e.dataTransfer.types);
@@ -4079,29 +4206,46 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (shot) addShot(shot);
   };
 
-  const attachFile = async () => {
-    const path = await api.selectFile();
-    if (!path) return;
-    const name = path.split(/[\\/]/).pop() || path;
-    // Same normalization as addImage: the backend should always receive a
-    // readable temp PNG path, not the original (possibly HEIC / oversized /
-    // permission-blocked) file.
-    const norm = await api.normalizeImage(path).catch(() => null);
-    const imgPath = norm?.path || path;
-    const dataUrl =
-      norm?.dataUrl ||
-      (await api.readImage(path).catch(() => null)) ||
-      undefined;
-    setImages((imgs) => {
-      const hit = imgs.find((i) => i.origPath === path || i.path === path);
-      if (hit) {
-        if (!dataUrl) return imgs;
-        return imgs.map((i) =>
-          i.origPath === path || i.path === path ? { ...i, dataUrl } : i,
+  /** Attach one picked path: images go through the image pipeline, workspace
+   *  files attach by relative path, and files from outside the workspace are
+   *  imported into the data dir's uploads folder so the agent can read them. */
+  const attachPickedPath = async (p: string) => {
+    const name = p.split(/[\\/]/).pop() || p;
+    const ext = name.split(".").pop()?.toLowerCase() ?? "";
+    if (IMAGE_EXTS.has(ext)) {
+      await addImage(p, name);
+      return;
+    }
+    const rel = relFromRoot(wroot, p);
+    if (rel) {
+      setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
+      return;
+    }
+    const imported = await api.importFile(p).catch(() => null);
+    if (!imported) {
+      // importFile is missing on app bundles started before this feature
+      // shipped (no `file:import` IPC handler). Never fail silently — the
+      // user must know a restart is needed.
+      useStore
+        .getState()
+        .setChatCmdError(
+          chatIdRef.current,
+          `Could not attach "${name}" — restart the app (⌘R or relaunch) to finish updating, then try again.`,
         );
-      }
-      return [...imgs, { path: imgPath, name, dataUrl, origPath: path }];
-    });
+      return;
+    }
+    setAttachments((a) => (a.includes(imported) ? a : [...a, imported]));
+  };
+
+  const attachFile = async () => {
+    // Older Electron main processes still return a single path string —
+    // accept both shapes so the picker never degrades into a no-op.
+    const picked = await api.selectFile().catch(() => null);
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    for (const p of paths) {
+      await attachPickedPath(p);
+    }
   };
 
   const removeImage = (path: string) => {
@@ -4252,7 +4396,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   const startCmd = (at?: number) => {
     const el = textareaRef.current;
-    if (!el || busy) return;
+    // Slash picker stays available while streaming: picking only inserts
+    // text, Enter follows the existing submit/steer/queue path.
+    if (!el) return;
     const pos = at ?? el.selectionStart;
     const prevChar = pos > 0 ? input[pos - 1] : "";
     if (prevChar && !/\s/.test(prevChar)) return;
@@ -4831,7 +4977,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {windowed
                   .map((m: ChatMessage) => (
                     <Fragment key={m.id}>
-                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} />
+                      <ChatMessageView message={m} onRetry={onRetry} onEdit={onEdit} editingDisabled={busy} />
                       {/* Newer messages render tool cards inline via `segments`; only
                         older persisted messages without segments keep the stacked
                         timeline below the bubble. */}
@@ -4917,7 +5063,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       ×
                     </button>
                   </div>
-                  <QueuedCollapsibleText id={q.id} text={q.text} />
+                  <QueuedCollapsibleText id={q.id} text={q.text} onEdit={onEditQueued} />
                   {q.attachments && q.attachments.length > 0 && (
                     <div className="msg-attachments" dir="ltr">
                       {q.attachments.map((a) => (

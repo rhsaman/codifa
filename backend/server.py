@@ -1131,13 +1131,78 @@ async def health() -> dict:
     return {"status": "ok", "version": "1.0.0"}
 
 
+class DocReadRequest(BaseModel):
+    """Read a document for the UI viewer. ``path`` may be workspace-relative
+    or absolute (imported uploads under the data root are allowed).
+    ``format``: text (default) | html (styled Word/Excel view) | pages
+    (PDF pages as JPEG data URLs). ``sheet`` selects one Excel sheet,
+    ``pages`` selects PDF pages like "1-3,7"."""
+
+    root: str = ""
+    path: str = ""
+    format: str = "text"
+    sheet: str = ""
+    pages: str = ""
+
+
+# Small mtime-keyed cache for /doc/read so repeated viewer polls do not
+# re-parse the file while edits still refresh via mtime change.
+_DOC_READ_CACHE: dict[tuple[str, str, str, str], tuple[float, dict]] = {}
+_DOC_READ_CACHE_MAX = 64
+
+
+@app.post("/doc/read")
+async def doc_read(req: DocReadRequest) -> dict:
+    """Extract or render a PDF / Word / Excel / text file for the right-hand
+    file viewer (which cannot parse those formats itself)."""
+    import doc_tools
+    from tools import PathEscapeError, resolve_safe
+
+    p = (req.path or "").strip()
+    if not p:
+        return {"error": "path is required"}
+    try:
+        target = resolve_safe((req.root or "").strip() or os.getcwd(), p, allow_coder=True)
+    except PathEscapeError as exc:
+        return {"error": str(exc)}
+    sheet = (req.sheet or "").strip()
+    pages = (req.pages or "").strip()
+    fmt = (req.format or "text").strip() or "text"
+    cache_key = (target, fmt, sheet, pages)
+    try:
+        mtime = os.path.getmtime(target)
+    except OSError:
+        mtime = -1.0
+    cached = _DOC_READ_CACHE.get(cache_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        if fmt == "html":
+            result = {"html": await asyncio.to_thread(doc_tools.render_document, target, sheet, pages)}
+        elif fmt == "pages":
+            result = {
+                "pages": await asyncio.to_thread(doc_tools.render_pdf_pages, target, pages)
+            }
+        else:
+            content = await asyncio.to_thread(doc_tools.read_document, target, sheet, pages)
+            result = {"content": content}
+        if len(_DOC_READ_CACHE) >= _DOC_READ_CACHE_MAX:
+            _DOC_READ_CACHE.pop(next(iter(_DOC_READ_CACHE)))
+        _DOC_READ_CACHE[cache_key] = (mtime, result)
+        return result
+    except doc_tools.DocError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — surfaced verbatim in the viewer
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 # --- checkpoints (Undo) -------------------------------------------------- #
-# Snapshotهای محتوای قبل از هر write/edit مدل (backend/checkpoints.py).
-# فرانت‌اند لیست را برای دکمه‌ی Undo می‌گیرد و restore فایل‌ها را برمی‌گرداند.
+# Content snapshots before each model write/edit (backend/checkpoints.py).
+# Frontend fetches the list for the Undo button and restore returns files.
 
 
 class CheckpointRestoreRequest(BaseModel):
-    """Restore یک checkpoint در workspace مشخص‌شده."""
+    """Restore a checkpoint in the given workspace."""
 
     root: str
 
@@ -1160,8 +1225,8 @@ async def checkpoints_restore(chat_id: str, seq: int, req: CheckpointRestoreRequ
     out = checkpoints.restore(chat_id, seq, root)
     if "error" in out:
         raise HTTPException(status_code=404, detail=out["error"])
-    # کش خواندنِ فایل‌های restore شده را بی‌اعتبار کن تا read بعدی محتوای
-    # تازه را ببیند، نه bytes کش‌شده‌ی قبل از restore.
+    # Invalidate the read cache for restored files so the next read sees fresh
+    # content instead of bytes cached before restore.
     for entry in out.get("restored", []):
         tools._invalidate_read_cache_for(entry.get("path", ""), root)
     checkpoints.prune(chat_id)
@@ -1265,6 +1330,14 @@ async def browser_status(chat_id: str = "") -> dict:
     import browser_session
 
     return browser_session.status(chat_id)
+
+
+@app.get("/browser/devtools-url")
+async def browser_devtools_url(chat_id: str = "") -> dict:
+    """Verified DevTools frontend URL to open in the OS browser."""
+    import browser_session
+
+    return await browser_session.devtools_url(chat_id)
 
 
 @app.post("/browser/launch")
@@ -2839,7 +2912,18 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             pass
         _effective_history = list(req.history or [])
         if _prev_outcome_note:
-            _effective_history = [{"role": "system", "content": _prev_outcome_note}] + _effective_history
+            # Append at the TAIL, not prepend: the note text changes every
+            # turn, so a position-0 entry shifts the entire transcript and
+            # breaks the provider's prompt-cache prefix on EVERY turn start
+            # (measured: a turn's first step re-read the whole history at
+            # full price, cache_read=0). At the tail it only extends the
+            # prefix, sits right next to the new user message, and
+            # historyLimit trimming (which drops the oldest entries) can
+            # never remove it. role=="system" maps to HumanMessage in
+            # history_to_langchain_messages, so a tail entry is provider-safe.
+            _effective_history = _effective_history + [
+                {"role": "system", "content": _prev_outcome_note}
+            ]
         # Create the agent generator so we can close it on disconnect
         agent_gen = run_agent(
             provider=req.provider,

@@ -695,6 +695,64 @@ function registerIpc(): void {
     }
   })
 
+  // --- open a URL in Google Chrome specifically ------------------------------
+  // The DevTools frontend is built for Chrome and connects back over a
+  // loopback ws:// socket; other default browsers (e.g. Safari) block that
+  // handshake or break the frontend, so "Open DevTools" targets Chrome by
+  // name and only falls back to the default browser without Chrome.
+  ipcMain.handle('open:external-chrome', async (_e, url: string) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return
+    const openWith = (cmd: string, args: string[], wantsExitCode = false) =>
+      new Promise<boolean>((resolve) => {
+        try {
+          const child = spawn(cmd, args, {
+            stdio: 'ignore',
+            detached: process.platform !== 'win32',
+          })
+          child.on('error', () => resolve(false))
+          if (wantsExitCode) {
+            child.on('exit', (code) => resolve(code === 0))
+          } else {
+            child.on('spawn', () => {
+              child.unref()
+              resolve(true)
+            })
+          }
+        } catch {
+          resolve(false)
+        }
+      })
+    let opened = false
+    if (process.platform === 'darwin') {
+      // `open -a` exits non-zero when the app is not installed.
+      opened = await openWith('open', ['-a', 'Google Chrome', url], true)
+    } else if (process.platform === 'win32') {
+      const roots = [
+        process.env['PROGRAMFILES'],
+        process.env['PROGRAMW6432'],
+        process.env['PROGRAMFILES(X86)'],
+        process.env['LOCALAPPDATA'],
+      ]
+      for (const root of roots) {
+        if (!root) continue
+        const exe = path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe')
+        if (fs.existsSync(exe)) {
+          opened = await openWith(exe, [url])
+          break
+        }
+      }
+      if (!opened) opened = await openWith('cmd', ['/c', 'start', 'chrome', url])
+    } else {
+      for (const bin of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
+        if (await openWith(bin, [url])) {
+          opened = true
+          break
+        }
+      }
+    }
+    if (!opened) await shell.openExternal(url)
+  })
+
   // --- open the current file in an EXTERNAL editor --------------------------
   // nvim: send `:edit` to the first running instance over its RPC socket (the
   // app already discovers sockets for the "open in Neovim" label); when
@@ -927,16 +985,16 @@ function registerIpc(): void {
   // --- file selection (attach to the LLM by path; never copied) -------------
   ipcMain.handle('dialog:select-file', async () => {
     if (!mainWindow) return null
+    // NO `filters`: macOS opens the dialog with the FIRST filter active and
+    // grays out everything else — with "Images" first, every non-image file
+    // looked unattachable ("only photos accepted"). No filters = everything
+    // is selectable; the renderer routes images vs files itself.
     const res = await dialog.showOpenDialog(mainWindow, {
-      properties: ['openFile'],
-      title: 'Select an image or file to attach',
-      filters: [
-        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
+      properties: ['openFile', 'multiSelections'],
+      title: 'Select files or images to attach',
     })
     if (res.canceled || res.filePaths.length === 0) return null
-    return res.filePaths[0]
+    return res.filePaths
   })
 
   // --- safe file system -----------------------------------------------------
@@ -961,6 +1019,34 @@ function registerIpc(): void {
   })
   ipcMain.handle('fs:read-image', (_e, absPath: string) => {
     return readImageDataUrl(absPath)
+  })
+
+  // Import an outside file (picked/dropped from outside the workspace) into
+  // <data root>/uploads so the backend's read tools can access it without a
+  // permission prompt (resolve_safe always allows reads under the data root).
+  // The user's project stays untouched; the same file re-imported with the
+  // same name and size reuses the existing copy.
+  ipcMain.handle('file:import', (_e, absPath: string) => {
+    if (typeof absPath !== 'string' || !absPath) return null
+    try {
+      if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) return null
+      const uploadsDir = path.join(getDataRoot(), 'uploads')
+      fs.mkdirSync(uploadsDir, { recursive: true })
+      const base = path.basename(absPath)
+      let dest = path.join(uploadsDir, base)
+      if (fs.existsSync(dest)) {
+        const same = fs.statSync(dest).size === fs.statSync(absPath).size
+        if (!same) {
+          const ext = path.extname(base)
+          const stem = path.basename(base, ext)
+          dest = path.join(uploadsDir, `${stem}-${Date.now().toString(36)}${ext}`)
+        }
+      }
+      fs.copyFileSync(absPath, dest)
+      return dest
+    } catch {
+      return null
+    }
   })
 
   // --- clipboard (reliable copy for the renderer) ---------------------------
@@ -1252,15 +1338,51 @@ async function loadAppState(): Promise<AppState> {
 }
 
 /** Cache the last known app state so a cold start can show it immediately.
- *  Async fire-and-forget: a full-state write must never block the main process
- *  (the old writeFileSync froze the window on every debounced flush). */
+ *  The cache file is a FALLBACK only — the sidecar DB is authoritative and
+ *  every successful flush has already landed there before this runs. With the
+ *  full-history state at ~113MB, stringify alone costs ~0.6s of main-thread
+ *  time (measured), so writing it on EVERY flush (every ~2s while streaming)
+ *  stalls the whole app repeatedly. Throttle: at most one cache write per
+ *  CACHE_WRITE_MIN_S, plus a forced flush on quit — a crash loses at most that
+ *  window of cache freshness, never DB data. */
+const CACHE_WRITE_MIN_S = 60
+let lastCacheWriteAt = 0
+let cacheWriteTimer: ReturnType<typeof setTimeout> | null = null
 function writeStateCache(state: AppState): void {
   try {
     const file = path.join(getDataRoot(), 'app-state-cache.json')
-    void fs.promises.writeFile(file, JSON.stringify(state), 'utf-8')
+    const write = (): void => {
+      lastCacheWriteAt = Date.now()
+      void fs.promises.writeFile(file, JSON.stringify(state), 'utf-8')
+    }
+    if (Date.now() - lastCacheWriteAt >= CACHE_WRITE_MIN_S * 1000) {
+      write()
+      return
+    }
+    // Due but throttled: schedule one trailing write so the file eventually
+    // catches up instead of staying stale until the next flush.
+    if (!cacheWriteTimer) {
+      cacheWriteTimer = setTimeout(
+        () => {
+          cacheWriteTimer = null
+          if (appState) writeStateCache(appState)
+        },
+        CACHE_WRITE_MIN_S * 1000 - (Date.now() - lastCacheWriteAt),
+      )
+    }
   } catch {
     /* non-fatal */
   }
+}
+
+/** Force one cache write now — used on quit so the fallback file is fresh. */
+function flushStateCacheNow(): void {
+  if (cacheWriteTimer) {
+    clearTimeout(cacheWriteTimer)
+    cacheWriteTimer = null
+  }
+  lastCacheWriteAt = 0
+  if (appState) writeStateCache(appState)
 }
 
 function readStateCache(): AppState | null {
@@ -1509,6 +1631,32 @@ async function migrateLegacyStateFrom(root: string): Promise<void> {
   }
 }
 
+/** Log main-process memory every 60s for leak diagnostics.
+ *  console-only output is lost in a packaged app, so the same line is also
+ *  appended to <dataRoot>/main-memory.log (reset at 5MB — diagnostics only,
+ *  roughly 12KB/hour). Best-effort: failures never break the main process. */
+function logMainMemoryUsage(): void {
+  try {
+    const mu = process.memoryUsage()
+    const toMb = (b: number): string => `${(b / 1024 / 1024).toFixed(1)}MB`
+    const metrics = app.getAppMetrics()
+    const totalWorkingSetMb = metrics.reduce((sum, m) => sum + (m.memory?.workingSetSize ?? 0), 0) / 1024
+    const line = `[memory] ${new Date().toISOString()} heapUsed=${toMb(mu.heapUsed)} rss=${toMb(mu.rss)} external=${toMb(mu.external)} arrayBuffers=${toMb(mu.arrayBuffers ?? 0)} processes=${metrics.length} totalWorkingSet=${totalWorkingSetMb.toFixed(1)}MB\n`
+    console.log(line.trim())
+    try {
+      const logPath = path.join(getDataRoot(), 'main-memory.log')
+      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 5 * 1024 * 1024) {
+        fs.writeFileSync(logPath, '')
+      }
+      fs.appendFileSync(logPath, line)
+    } catch {
+      /* data root may not exist yet this early — console output still has it */
+    }
+  } catch {
+    /* non-fatal: diagnostics must never break the main process */
+  }
+}
+
 app.whenReady().then(async () => {
   registerIpc()
   // Grant microphone access in-app so voice input works even on dev-server /
@@ -1538,6 +1686,8 @@ app.whenReady().then(async () => {
   getSidecarUrl().catch((err) => console.error('sidecar startup failed:', err))
   // Track the file open in Neovim (live RPC socket poll; see watchNvimFile).
   watchNvimFile()
+  // Main-process memory diagnostics, logged every 60s.
+  setInterval(logMainMemoryUsage, 60_000)
 })
 
 app.on('window-all-closed', () => {
@@ -1593,6 +1743,9 @@ app.on('before-quit', (e) => {
       if (!stillPending) break
       await new Promise((r) => setTimeout(r, 300))
     }
+    // The cache file is throttled to one write/min during the session; on quit
+    // force one fresh write so the cold-start fallback matches what the DB has.
+    flushStateCacheNow()
     clearTimeout(hardTimer)
     finish()
   }

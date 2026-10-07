@@ -74,6 +74,7 @@ function ReviewFileBody({
           query={query}
           activeHit={activeHit}
           layout={wide ? "side-by-side" : "auto"}
+          commentable
         />
       ) : (
         <div className="review-empty">New file — no diff available yet.</div>

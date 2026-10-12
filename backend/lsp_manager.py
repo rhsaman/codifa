@@ -372,7 +372,10 @@ def classify_lsp_error(exc: BaseException) -> str:
     if "starting" in text or "retry shortly" in text:
         return "starting"
     kind = getattr(exc, "kind", "")
-    if isinstance(kind, str) and kind in ("timeout", "dead", "missing", "unavailable", "starting", "error"):
+    # "error" is the LspError default and carries no signal: never let it
+    # short-circuit the message checks below (a "timed out" message must
+    # classify as "timeout" even when the raise site omitted the kind).
+    if isinstance(kind, str) and kind in ("timeout", "dead", "missing", "unavailable", "starting", "wedged"):
         return kind
     if "timed out" in text or "timeout" in text:
         return "timeout"
@@ -481,6 +484,28 @@ _UPDATE_ATTEMPTED_LOCK = threading.Lock()
 #             "env": {...}, "initialization": {...}}, ...}
 _LSP_CONFIG: dict[str, dict] = {}
 _LSP_CONFIG_LOCK = threading.Lock()
+
+
+# Default initializationOptions for python (pylsp): linters and formatters
+# off, jedi-powered navigation on. Prevents wedge on heavy files while
+# keeping documentSymbol/definition/references/hover fast.
+_DEFAULT_PYTHON_INIT: dict = {
+    "pylsp": {
+        "plugins": {
+            "pycodestyle": {"enabled": False},
+            "pyflakes": {"enabled": False},
+            "pylint": {"enabled": False},
+            "flake8": {"enabled": False},
+            "pydocstyle": {"enabled": False},
+            "autopep8": {"enabled": False},
+            "yapf": {"enabled": False},
+            "rope_autoimport": {"enabled": False},
+            "rope_completion": {"enabled": False},
+            "jedi_completion": {"enabled": False},
+            "mccabe": {"enabled": False},
+        }
+    }
+}
 
 
 def configure_lsp(config: dict | None) -> None:
@@ -649,7 +674,9 @@ class _LspClient:
                 method,
                 time.monotonic() - started,
             )
-            raise LspError(f"{method} timed out after {wait}s") from None
+            raise LspError(
+                f"{method} timed out after {wait}s", kind="timeout"
+            ) from None
         elapsed = time.monotonic() - started
         if isinstance(msg, dict) and "error" in msg:
             err = msg.get("error") or {}
@@ -956,10 +983,31 @@ class LspManager:
         return None
 
     def effective_initialization(self, lang: str) -> dict:
-        """initializationOptions for a language server (empty by default)."""
+        """initializationOptions for a language server (minimal by default)."""
         cfg = _config_for(lang, self._lsp_config)
         init = cfg.get("initialization")
-        return dict(init) if isinstance(init, dict) else {}
+        custom = dict(init) if isinstance(init, dict) else {}
+        # Python default: disable slow linters/formatters so pylsp never
+        # wedges on heavy files (e.g. local_tts.py); symbols/definition/
+        # references/hover only need jedi. Custom config merges on top.
+        if str(lang) == "python":
+            merged: dict = dict(_DEFAULT_PYTHON_INIT)
+            pylsp_custom = custom.get("pylsp")
+            if isinstance(pylsp_custom, dict):
+                base_plugins = dict(merged.get("pylsp", {}).get("plugins", {}))
+                custom_plugins = pylsp_custom.get("plugins")
+                if isinstance(custom_plugins, dict):
+                    base_plugins.update(custom_plugins)
+                merged_plugins = dict(merged.get("pylsp", {}))
+                merged_plugins["plugins"] = base_plugins
+                merged["pylsp"] = merged_plugins
+                for key, value in custom.items():
+                    if key != "pylsp":
+                        merged[key] = value
+            else:
+                merged.update(custom)
+            return merged
+        return custom
 
     def install_hint(self, lang: str) -> str:
         """Human-readable install hint for a missing server binary."""
@@ -1042,6 +1090,71 @@ class LspManager:
         except Exception:  # noqa: BLE001 - check never fails
             return None
 
+    def wait_for_server(self, abs_path: str, timeout_s: float = 30.0) -> bool:
+        """Block until the background start for this file's language finishes.
+
+        Returns True once a live client exists, False when the start failed,
+        the language is unsupported, or ``timeout_s`` elapsed. The LSP tools
+        use this to absorb the lazy-start latency in-process instead of
+        failing the tool call and burning an LLM round-trip on a retry.
+        """
+        try:
+            lang = self._resolve_language(abs_path)
+        except Exception:  # noqa: BLE001 - lookup never fails
+            return False
+        if lang is None:
+            return False
+        deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
+        while True:
+            if self.client_if_running(lang) is not None:
+                return True
+            evt = None
+            try:
+                with _STARTING_LOCK:
+                    evt = _STARTING.get((self._root, str(lang)))
+            except Exception:  # noqa: BLE001 - check never fails
+                return False
+            if evt is None:
+                # No start in progress: kick one off (idempotent) and pick
+                # up the event it registers — or finish now when the start
+                # was synchronous (test seam / already cached).
+                try:
+                    self._client_for(abs_path)
+                except Exception:  # noqa: BLE001 - start never fails the wait
+                    return False
+                if self.client_if_running(lang) is not None:
+                    return True
+                try:
+                    with _STARTING_LOCK:
+                        evt = _STARTING.get((self._root, str(lang)))
+                except Exception:  # noqa: BLE001 - check never fails
+                    return False
+                if evt is None:
+                    return False
+            if evt.is_set():
+                if time.monotonic() >= deadline:
+                    return False
+                # Stale event from a start that already finished (failed,
+                # died, or an earlier manager instance) with no live client
+                # left: drop it — only when it is still the same object, so
+                # a fresh start another thread just registered survives —
+                # and loop; the next iteration kicks a fresh start instead
+                # of failing every wait from now on.
+                try:
+                    with _STARTING_LOCK:
+                        if _STARTING.get((self._root, str(lang))) is evt:
+                            _STARTING.pop((self._root, str(lang)), None)
+                except Exception:  # noqa: BLE001 - cleanup never fails the wait
+                    return False
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                evt.wait(timeout=remaining)
+            except Exception:  # noqa: BLE001 - wait never fails
+                return False
+
     def is_server_running(self, abs_path: str) -> bool:
         """True when the server for a file is already started and alive."""
         try:
@@ -1082,6 +1195,71 @@ class LspManager:
             if binary and shutil.which(binary) is None:
                 return "missing"
         return "stopped"
+
+    def warmup(self, abs_paths: list[str] | None) -> None:
+        """Warm up language servers for file paths in background.
+
+        Starts servers for the distinct languages of the given files in a
+        single daemon thread. Never installs missing binaries, never blocks
+        the caller, and never raises: every check is best-effort so grep and
+        other background paths stay fast.
+        """
+        try:
+            paths = [str(p) for p in (abs_paths or []) if str(p or "").strip()]
+        except Exception:  # noqa: BLE001 - warmup never fails
+            return
+        if not paths:
+            return
+
+        def _run() -> None:
+            try:
+                seen: set[str] = set()
+                for abs_path in paths[:32]:
+                    try:
+                        lang = self._resolve_language(abs_path)
+                    except Exception:  # noqa: BLE001 - lookup never breaks warmup
+                        continue
+                    if not lang or lang in seen:
+                        continue
+                    seen.add(lang)
+                    try:
+                        if self.is_disabled(lang):
+                            continue
+                        if self.client_if_running(lang) is not None:
+                            continue
+                    except Exception:  # noqa: BLE001 - check never breaks warmup
+                        continue
+                    # Capability check without install: skip when the server
+                    # binary is missing. No auto-install is triggered here.
+                    try:
+                        if self._starter is None:
+                            cfg = _config_for(lang, self._lsp_config)
+                            custom = cfg.get("command")
+                            if (
+                                isinstance(custom, list)
+                                and custom
+                                and all(isinstance(c, str) for c in custom)
+                            ):
+                                binary = str(custom[0])
+                            else:
+                                cmd = LANGUAGE_SERVERS.get(lang)
+                                binary = cmd[0] if cmd else ""
+                            if binary and shutil.which(binary) is None:
+                                continue
+                    except Exception:  # noqa: BLE001 - check never breaks warmup
+                        continue
+                    try:
+                        self._client_for(os.path.abspath(abs_path))
+                    except Exception:  # noqa: BLE001 - start never breaks warmup
+                        continue
+            except Exception:  # noqa: BLE001 - warmup never fails
+                pass
+
+        try:
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+        except Exception:  # noqa: BLE001 - spawn never breaks callers
+            pass
 
     def _file_sig(self, abs_path: str) -> tuple[float, int]:
         """File signature for the deterministic result cache (never raises)."""
@@ -1149,7 +1327,7 @@ class LspManager:
             return {}
         out: dict[str, tuple[int, int, str]] = {}
 
-        def _collect(items: Any) -> None:
+        def _collect(items: Any, parent: str = "") -> None:
             if not isinstance(items, list):
                 return
             for item in items:
@@ -1164,13 +1342,33 @@ class LspManager:
                 if not isinstance(start, dict) or not isinstance(end, dict):
                     continue
                 name = str(item.get("name", ""))
-                if name and name not in out:
-                    out[name] = (
+                if not name:
+                    _collect(item.get("children"), parent)
+                    continue
+                qualified = f"{parent}.{name}" if parent else name
+                try:
+                    value = (
                         int(start.get("line", 0)) + 1,
                         int(end.get("line", 0)) + 1,
                         _kind_label(item.get("kind")),
                     )
-                _collect(item.get("children"))
+                except (TypeError, ValueError):
+                    _collect(item.get("children"), qualified)
+                    continue
+                key_name = qualified
+                suffix_n = 2
+                while key_name in out:
+                    key_name = f"{qualified}#{suffix_n}"
+                    suffix_n += 1
+                out[key_name] = value
+                if name != qualified:
+                    plain_key = name
+                    suffix_p = 2
+                    while plain_key in out:
+                        plain_key = f"{name}#{suffix_p}"
+                        suffix_p += 1
+                    out[plain_key] = value
+                _collect(item.get("children"), qualified)
 
         try:
             _collect(result)
@@ -1217,6 +1415,17 @@ class LspManager:
         except Exception:  # noqa: BLE001 - env check never fails
             return
         with _INSTALL_ATTEMPTED_LOCK:
+            if lang in _INSTALL_ATTEMPTED:
+                _prev_event = _INSTALL_EVENTS.get(lang)
+                try:
+                    _prev_done = _prev_event is None or _prev_event.is_set()
+                except Exception:  # noqa: BLE001 - state check never fails
+                    _prev_done = True
+                if _prev_done and has_install_consent(lang):
+                    try:
+                        _INSTALL_ATTEMPTED.discard(lang)
+                    except Exception:  # noqa: BLE001 - reset never fails
+                        pass
             if lang in _INSTALL_ATTEMPTED:
                 is_owner = False
                 event = _INSTALL_EVENTS.get(lang)
@@ -1420,6 +1629,50 @@ class LspManager:
             except Exception:  # noqa: BLE001, S110 - close is best-effort
                 pass
 
+    def evict_server(self, abs_path: str) -> bool:
+        """Close and drop the server for a file's language (wedged server).
+
+        A server that stops answering (repeated timeouts on one request,
+        e.g. stuck analyzing a pathological file) stays wedged for every
+        later call of that language until restart — evicting it lets the
+        next call start a fresh server. Returns True when one was dropped.
+        """
+        try:
+            lang = self._resolve_language(abs_path)
+        except Exception:  # noqa: BLE001 - lookup never fails
+            return False
+        if lang is None:
+            return False
+        with self._sync_lock:
+            uris = [u for u, l in self._uri_lang.items() if l == lang]
+            for uri in uris:
+                self._open_versions.pop(uri, None)
+                self._open_meta.pop(uri, None)
+                self._uri_lang.pop(uri, None)
+        with self._lock:
+            client = self._clients.pop(str(lang), None)
+            self._last_used.pop(str(lang), None)
+        try:
+            with _STARTING_LOCK:
+                evt = _STARTING.get((self._root, str(lang)))
+                if evt is not None and evt.is_set():
+                    _STARTING.pop((self._root, str(lang)), None)
+        except Exception:  # noqa: BLE001 - event cleanup never fails
+            pass
+        if client is None:
+            return False
+        for uri in uris:
+            try:
+                client.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            except Exception:  # noqa: BLE001, S110 - close is best-effort
+                pass
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001, S110 - close is best-effort
+            pass
+        logger.warning("lsp evicted wedged server lang=%s root=%s", lang, self._root)
+        return True
+
     def _client_for(self, abs_path: str) -> Any | None:
         """Return the cached client for a file, starting its server in background."""
         lang = self._resolve_language(abs_path)
@@ -1466,7 +1719,8 @@ class LspManager:
             except Exception:  # noqa: BLE001 - check never fails
                 pass
             try:
-                if time.monotonic() - self._start_failed_at.get(lang, 0.0) < _LSP_START_FAIL_TTL:
+                failed_at = self._start_failed_at.get(lang)
+                if failed_at is not None and time.monotonic() - float(failed_at) < _LSP_START_FAIL_TTL:
                     return None
             except Exception:  # noqa: BLE001 - cache check never fails
                 pass
@@ -1679,6 +1933,52 @@ class LspManager:
             "endLine": int(end.get("line", 0)) + 1,
         }
 
+    def _clamp_position(self, abs_path: str, line1: int, char1: int) -> tuple[int, int]:
+        """Clamp a 1-based line / 0-based character position to file text.
+
+        Reads the file (up to the sync cap) and clamps the character to the
+        target line length so tsserver never sees an out-of-bounds position
+        (which raises a Debug Failure in computePositionOfLineAndCharacter).
+        Raises LspError with a clear message when the line is out of range
+        or the position is not numeric. Returns the 0-based pair to send.
+        """
+        try:
+            line_num = int(line1)
+        except (TypeError, ValueError):
+            raise LspError(
+                f"invalid position: line={line1!r} character={char1!r}", kind="error"
+            ) from None
+        try:
+            char_num = int(char1)
+        except (TypeError, ValueError):
+            raise LspError(
+                f"invalid position: line={line1!r} character={char1!r}", kind="error"
+            ) from None
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_LSP_MAX_BYTES + 1)[:_LSP_MAX_BYTES]
+        except OSError:
+            # File unreadable: sanitize without clamping so callers still
+            # send a non-negative position instead of crashing the server.
+            return (max(0, line_num - 1), max(0, char_num))
+        if text == "":
+            line_lengths = [0]
+        else:
+            raw_lines = text.split("\n")
+            line_lengths = [
+                len(ln[:-1]) if ln.endswith("\r") else len(ln) for ln in raw_lines
+            ]
+        line_count = len(line_lengths)
+        if line_num < 1 or line_num > line_count:
+            raise LspError(
+                f"position out of range: line {line_num} out of range "
+                f"1..{line_count} for {abs_path}",
+                kind="error",
+            )
+        line0 = line_num - 1
+        clamped_char = max(0, min(char_num, line_lengths[line0]))
+        return (line0, clamped_char)
+
     def definition(self, abs_path: str, line1: int, char1: int = 0) -> list[dict]:
         """Definition locations for a 1-based line / 0-based character position.
 
@@ -1687,8 +1987,9 @@ class LspManager:
         server died; returns [] only when the server answered with no
         locations (a genuine empty result).
         """
+        line0, char0 = self._clamp_position(abs_path, line1, char1)
         sig = self._file_sig(abs_path)
-        key = ("definition", abs_path, sig[0], sig[1], int(line1), int(char1))
+        key = ("definition", abs_path, sig[0], sig[1], int(line0 + 1), int(char0))
         cached = self._cache_get(key)
         if isinstance(cached, list):
             return [dict(h) for h in cached]
@@ -1701,7 +2002,7 @@ class LspManager:
                 "textDocument/definition",
                 {
                     "textDocument": {"uri": uri},
-                    "position": {"line": max(0, int(line1) - 1), "character": int(char1)},
+                    "position": {"line": line0, "character": char0},
                 },
                 timeout=self._timeout,
             )
@@ -1718,8 +2019,9 @@ class LspManager:
         Raises LspError on timeout/dead/missing server; returns [] only when
         the server answered with no locations (a genuine empty result).
         """
+        line0, char0 = self._clamp_position(abs_path, line1, char1)
         sig = self._file_sig(abs_path)
-        key = ("references", abs_path, sig[0], sig[1], int(line1), int(char1))
+        key = ("references", abs_path, sig[0], sig[1], int(line0 + 1), int(char0))
         cached = self._cache_get(key)
         if isinstance(cached, list):
             return [dict(h) for h in cached]
@@ -1732,7 +2034,7 @@ class LspManager:
                 "textDocument/references",
                 {
                     "textDocument": {"uri": uri},
-                    "position": {"line": max(0, int(line1) - 1), "character": int(char1)},
+                    "position": {"line": line0, "character": char0},
                     "context": {"includeDeclaration": True},
                 },
                 timeout=self._timeout,
@@ -1749,8 +2051,9 @@ class LspManager:
 
         Raises LspError on timeout/dead/missing server.
         """
+        line0, char0 = self._clamp_position(abs_path, line1, char1)
         sig = self._file_sig(abs_path)
-        key = ("hover", abs_path, sig[0], sig[1], int(line1), int(char1))
+        key = ("hover", abs_path, sig[0], sig[1], int(line0 + 1), int(char0))
         cached = self._cache_get(key)
         if isinstance(cached, str):
             return cached
@@ -1763,7 +2066,7 @@ class LspManager:
                 "textDocument/hover",
                 {
                     "textDocument": {"uri": uri},
-                    "position": {"line": max(0, int(line1) - 1), "character": int(char1)},
+                    "position": {"line": line0, "character": char0},
                 },
                 timeout=self._timeout,
             )
@@ -1855,8 +2158,13 @@ class LspManager:
                     key_name = f"{qualified}#{suffix_n}"
                     suffix_n += 1
                 out[key_name] = value
-                if name not in out:
-                    out[name] = value
+                if name != qualified:
+                    plain_key = name
+                    suffix_p = 2
+                    while plain_key in out:
+                        plain_key = f"{name}#{suffix_p}"
+                        suffix_p += 1
+                    out[plain_key] = value
                 _collect(item.get("children"), qualified)
 
         _collect(result)
@@ -1921,6 +2229,9 @@ class LspManager:
         with self._lock:
             clients = list(self._clients.values())
         for client in clients:
+            caps = getattr(client, "capabilities", {}) or {}
+            if caps and not caps.get("workspaceSymbolProvider"):
+                continue
             for name in wanted:
                 try:
                     result = client.request(
@@ -1987,19 +2298,13 @@ class LspManager:
                 fresh = [d for d in fresh if isinstance(d, dict)]
             except Exception:  # noqa: BLE001 - wait never fails
                 fresh, arrived = [], False
+        caps = getattr(client, "capabilities", {}) or {}
+        # Per LSP spec pull requires an advertised diagnosticProvider;
+        # empty/unknown capabilities means use pushed diagnostics only.
+        supports_pull = bool(caps.get("diagnosticProvider"))
         items: list[dict] = []
         failed: BaseException | None = None
-        try:
-            result = client.request(
-                "textDocument/diagnostic",
-                {"textDocument": {"uri": uri}},
-                timeout=self._timeout,
-            )
-            if isinstance(result, dict) and isinstance(result.get("items"), list):
-                items = [d for d in result["items"] if isinstance(d, dict)]
-        except Exception as exc:  # noqa: BLE001 - any pull failure falls back to pushed
-            failed = exc
-            # A fresh push is authoritative even when empty (clean file).
+        if not supports_pull:
             if arrived:
                 items = fresh
             elif fresh:
@@ -2012,6 +2317,30 @@ class LspManager:
                         items = [d for d in got if isinstance(d, dict)]
                     except Exception:  # noqa: BLE001, S110 - diagnostics are best-effort
                         items = []
+        else:
+            try:
+                result = client.request(
+                    "textDocument/diagnostic",
+                    {"textDocument": {"uri": uri}},
+                    timeout=self._timeout,
+                )
+                if isinstance(result, dict) and isinstance(result.get("items"), list):
+                    items = [d for d in result["items"] if isinstance(d, dict)]
+            except Exception as exc:  # noqa: BLE001 - any pull failure falls back to pushed
+                failed = exc
+                # A fresh push is authoritative even when empty (clean file).
+                if arrived:
+                    items = fresh
+                elif fresh:
+                    items = fresh
+                else:
+                    pushed = getattr(client, "published_diagnostics", None)
+                    if callable(pushed):
+                        try:
+                            got = pushed(uri)
+                            items = [d for d in got if isinstance(d, dict)]
+                        except Exception:  # noqa: BLE001, S110 - diagnostics are best-effort
+                            items = []
         if failed is not None and not items:
             # Pull unsupported (e.g. -32601 Unhandled method): the server
             # never implements pull; pushed (possibly empty) is the answer.

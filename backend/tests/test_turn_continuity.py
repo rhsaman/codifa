@@ -20,7 +20,7 @@ def test_outcome_survives_turn_and_task_change():
     chat = _unique_chat("survive")
     trace_store.next_turn(chat)
     trace_store.record_turn_outcome(
-        chat, "completed", evidence="terminal exit 0: pytest -q", mode="coder"
+        chat, "completed", evidence="terminal exit 0: pytest -q", mode="build"
     )
     # New turn + new task_id must not lose the outcome (keyed by chat only).
     trace_store.next_turn(chat)
@@ -33,11 +33,11 @@ def test_outcome_survives_turn_and_task_change():
 
 def test_completed_note_forbids_reexecution():
     note = trace_store.format_turn_outcome_note(
-        {"turn": 3, "status": "completed", "evidence": "terminal exit 0", "mode": "coder"}
+        {"turn": 3, "status": "completed", "evidence": "terminal exit 0", "mode": "build"}
     )
     assert "completed" in note
     assert "Do NOT re-execute" in note
-    assert _TURN_OUTCOME_MARKER in "[Previous turn 3 (coder) finished: completed.]"
+    assert _TURN_OUTCOME_MARKER in "[Previous turn 3 (build) finished: completed.]"
 
 
 def test_incomplete_note_asks_to_continue_pending_work():

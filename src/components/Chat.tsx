@@ -25,7 +25,7 @@ import {
   historyMeta,
   loadCommandUsage,
   recordCommandUsage,
-  sortCommandsByUsage,
+  bottomAnchoredByUsage,
 } from "../lib/slash";
 import {
   applyToolEvent,
@@ -38,6 +38,7 @@ import {
   bumpToolRunning,
   dropToolRunning,
   isToolRunning,
+  shouldRecoverContentStall,
   shouldShowWaitingForModel,
 } from "../lib/watchdog";
 import { PROVIDER_META } from "../lib/provider-meta";
@@ -90,6 +91,8 @@ import {
   ensureSkillsList,
   invalidateSkillsList,
   setSkillsFetcher,
+  loadSkillUsage,
+  recordSkillUsage,
 } from "../lib/skills";
 import { detectDir, prepareContent } from "../lib/bidi";
 import {
@@ -99,6 +102,7 @@ import {
   uid2,
 } from "../lib/chatSends";
 import { composerScrollPadding, jumpVisibleThreshold } from "../lib/scrollPadding";
+import { combineQuoteAndInput, formatChatQuote, isQuotableSelection } from "../lib/chatQuote";
 import {
   compactInputWidth,
   composerHeight,
@@ -133,7 +137,6 @@ import type {
   ChatMessage,
   McpServerConfig,
   MessageSegment,
-  NvimDiagnostic,
   PastedText,
   SidecarEvent,
   ThinkingLevel,
@@ -163,6 +166,11 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
+import { LocalLiveSession, sanitizeLocalTranscript } from "../lib/localLive";
+import { isHtmlTranscriptJunk } from "../lib/realtimeLive";
+import { playTts, playTtsStream, stopTts, speakableMessageText } from "../lib/tts";
+import type { LiveVoiceState } from "../types";
+const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 
@@ -203,6 +211,7 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
     name: "create-mcp",
     hint: "Create an MCP connector (describe what you want after the command)",
   },
+  { name: "goal", hint: "Set a persistent goal (e.g. /goal all tests pass); /goal clear clears it" },
 ];
 
 /** True when a message asks to create/edit/install/import skills or MCP connectors,
@@ -280,16 +289,38 @@ function relFromRoot(root: string, p: string): string | null {
  *  horizontal anchor so it never overflows the viewport). */
 const CTX_POPOVER_WIDTH = 300;
 
+/** Client-side mirror of the server's GOAL_MAX_EXTRA_TURNS (backend/goals.py).
+ *  The server is authoritative; this just avoids firing one wasted turn on a
+ *  stale [GOAL CONTINUES] marker. Keep in sync with the backend value. */
+const MAX_GOAL_TURNS = 15;
+
+/** Reason text after a backend goal marker, e.g. "[GOAL CONTINUES] <reason>".
+ *  Fed into the next loop prompt as guidance (Claude-style). Capped so a
+ *  verbose judge cannot bloat the prompt. */
+function goalReasonAfter(content: string, marker: string): string {
+  try {
+    const idx = (content ?? "").indexOf(marker);
+    if (idx === -1) return "";
+    const tail = (content ?? "").slice(idx + marker.length).trim();
+    if (!tail) return "";
+    const line = tail.split("\n")[0].trim();
+    return line.slice(0, 300);
+  } catch {
+    return "";
+  }
+}
+
 /** Circular context-usage indicator rendered in the composer next to Send. */
 function ContextRing({ pct }: { pct: number | null }) {
   if (pct === null)
     return <span className="ctx-ring-empty" aria-hidden="true" />;
-  const clamped = Math.min(100, Math.max(0, pct)) / 100;
+  const rounded = Math.min(100, Math.max(0, Math.round(pct)));
+  const clamped = rounded / 100;
   const radius = 6;
   const circumference = 2 * Math.PI * radius;
   return (
     <span className="context-meter-ring" aria-hidden="true">
-      <svg viewBox="0 0 16 16" width="16" height="16">
+      <svg viewBox="0 0 16 16" width="24" height="24" aria-hidden="true">
         <circle cx="8" cy="8" r={radius} className="context-meter-ring-track" />
         <circle
           cx="8"
@@ -300,6 +331,11 @@ function ContextRing({ pct }: { pct: number | null }) {
           strokeDashoffset={circumference * (1 - clamped)}
         />
       </svg>
+      <span
+        className={`context-meter-ring-label${rounded >= 100 ? " triple" : ""}`}
+      >
+        {rounded}
+      </span>
     </span>
   );
 }
@@ -414,38 +450,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const workspaces = useStore((s) => s.workspaces);
   const settings = useStore((s) => s.settings);
   const modes = useMemo(() => allModes(settings), [settings]);
-  const nvimFile = useStore((s) => s.nvimFile);
-  const nvimDiags = useStore((s) => s.nvimDiagnostics);
-  const nvimDiagCounts = useMemo(() => {
-    const counts = { error: 0, warning: 0, info: 0, hint: 0 };
-    for (const d of nvimDiags) {
-      const sev = d.severity;
-      if (sev === 1 || sev === "Error" || sev === "error") counts.error++;
-      else if (sev === 2 || sev === "Warning" || sev === "warning")
-        counts.warning++;
-      else if (sev === 3 || sev === "Information" || sev === "information")
-        counts.info++;
-      else counts.hint++;
-    }
-    return counts;
-  }, [nvimDiags]);
-
   const wroot = chat?.root || root;
-  const nvimRel = useMemo(() => {
-    if (!nvimFile || !wroot) return null;
-    return relFromRoot(wroot, nvimFile);
-  }, [nvimFile, wroot]);
-  // The label always shows when a Neovim file is detected; outside the workspace
-  // we display the absolute path (it just can't be mentioned to the agent).
-  const nvimLabel = nvimFile ? nvimRel || nvimFile : null;
-  // Badge shows only the file name (last path segment); the full path stays in
-  // the tooltip. Trailing slashes are stripped so fugitive://.../.git// → .git.
-  const nvimBadge = nvimLabel
-    ? nvimLabel
-      .replace(/[\\/]+$/, "")
-      .split(/[\\/]/)
-      .pop() || nvimLabel
-    : null;
   const userSystemPrompt = useStore((s) =>
     chat ? (s.settings.systemPrompts?.[chat.mode] ?? "") : "",
   );
@@ -469,7 +474,35 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   // The panel now stays mounted across chat switches (no key={activeChatId}),
   // so per-chat UI state must reset explicitly when the active chat changes.
-  const [input, setInput] = useState(chat?.draft?.input ?? "");
+  const [input, setInput] = useState(() => {
+    const v = chat?.draft?.input ?? "";
+    // Never restore a polluted draft: Next.js/gateway error pages belong in the banner, never in the input.
+    // Narrow to error-page signatures so legitimate code pastes are preserved.
+    const isErrorPage =
+      v.includes('/_next/') ||
+      v.includes('&lt;') ||
+      /preload|fetchpriority/i.test(v) ||
+      /<!doctype/i.test(v) ||
+      (/<link/i.test(v) && /href\s*=|src\s*=|rel\s*=/i.test(v));
+    return isErrorPage ? "" : v;
+  });
+  // Safety net: if a Next.js/gateway error page ever reaches the composer
+  // (e.g. a stale draft saved before filters existed), strip the junk and
+  // keep the clean text. Errors belong in the banner, never in the input.
+  // Narrow to error-page signatures so legitimate code pastes are preserved.
+  useEffect(() => {
+    const isErrorPage =
+      input.includes('/_next/') ||
+      input.includes('&lt;') ||
+      /preload|fetchpriority/i.test(input) ||
+      /<!doctype/i.test(input) ||
+      (/<link/i.test(input) && /href\s*=|src\s*=|rel\s*=/i.test(input));
+    if (input && isErrorPage) {
+      const cut = input.search(/<|\/_next\/|&lt;/);
+      setInput(cut > 0 ? input.slice(0, cut).trimEnd() : "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input]);
   // Compact while the draft fits on one visual line; expanded (input on its
   // own full-width row) once it wraps to several visual lines.
   const [composerExpanded, setComposerExpanded] = useState(false);
@@ -504,7 +537,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
     }
-    setInput(chat?.draft?.input ?? "");
+    const incomingInput = chat?.draft?.input ?? "";
+    // Never restore a polluted draft: HTML error pages belong in the banner, never in the input.
+    setInput(isHtmlTranscriptJunk(incomingInput) || /<\/?[a-z]/i.test(incomingInput) || incomingInput.includes('/_next/') || incomingInput.includes('&lt;') ? "" : incomingInput);
     setAttachments(chat?.draft?.attachments ?? []);
     setImages(chat?.draft?.images ?? []);
     setPastedBlocks(chat?.draft?.pasted ?? []);
@@ -513,7 +548,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setSkillMention(null);
     setSkillMentionQuery("");
     setAskFreeText("");
-    setNvimMentioned(false);
+    setActiveQuote(null);
     // Render enough history so the saved anchor exists on the first paint of
     // the incoming chat (same buffer logic as the mount initializer). Without
     // this, switching back to a scrolled-up chat renders only the last
@@ -650,8 +685,116 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [promptHistory, setPromptHistory] = useState<string[]>(() => loadHistory());
   const [pinnedCmds, setPinnedCmds] = useState<string[]>(() => loadPins());
   // Recently used slash commands (bare names, newest first) — drives the
-  // command popup order so the last used command stays on top.
+  // command popup order bottom-anchored so the last used command sits
+  // just above the input.
   const [commandUsage, setCommandUsage] = useState<string[]>(() => loadCommandUsage());
+  // Keep popup order fresh when usage is recorded from another panel or
+  // after a command runs (storage is the source of truth).
+  useEffect(() => {
+    const refresh = () => setCommandUsage(loadCommandUsage());
+    window.addEventListener('coder:command-usage', refresh);
+    return () => window.removeEventListener('coder:command-usage', refresh);
+  }, []);
+  // Persistent goal auto-drive (Codex / Claude parity):
+  // - Strictly per-chat: each panel drives ONLY its own chat (never activeChatId),
+  //   so a goal in A can never inject turns into B.
+  // - Only an explicit backend [GOAL CONTINUES] judgment drives the next turn.
+  //   Plain stalls (old messages, steers without judgment, aborts, errors) stay
+  //   idle — this is what stops "open window starts working by itself".
+  // - Explicit Stop halts the loop via the persistent `goal.stopped` flag (plus
+  //   the in-memory stoppedMap for the immediate race). Resume clears it.
+  // - First observation per chat per mount is seeded, never sent: historical
+  //   transcripts must not auto-fire on open/switch/reload.
+  // - The turn cap mirrors the server (GOAL_MAX_EXTRA_TURNS): the client never
+  //   fires past it even if a marker is stale, and the judge's reason after
+  //   the marker rides into the next prompt as guidance.
+  const goalAutoRef = useRef<Map<string, string>>(new Map());
+  const goalInitRef = useRef<Set<string>>(new Set());
+  const goalSendingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const ownId = chat?.id;
+    if (!ownId) return;
+    const st = useStore.getState();
+    const ch = st.chats.find((c) => c.id === ownId);
+    const gl = ch?.goal;
+    if (!ch || !gl?.active || gl.paused || gl.stopped) return;
+    const msgs = ch.messages;
+    const last = msgs[msgs.length - 1];
+    if (!last || last.role !== "assistant" || last.streaming) return;
+    const content = last.content ?? "";
+    const autoKey = `${ownId}:${last.id}`;
+    // First observation of this chat in this mount: sync terminal markers so
+    // the bar reflects reality, but NEVER send (no autostart on open/switch).
+    if (!goalInitRef.current.has(ownId)) {
+      goalInitRef.current.add(ownId);
+      if (content.includes("[GOAL CLEARED]") || content.includes("[GOAL IMPOSSIBLE]")) {
+        if (goalAutoRef.current.get(ownId) !== `cleared:${last.id}`) {
+          goalAutoRef.current.set(ownId, `cleared:${last.id}`);
+          st.clearGoal(ch.id);
+        }
+      } else if (content.includes("[GOAL PAUSED]")) {
+        if (goalAutoRef.current.get(ownId) !== `paused:${last.id}`) {
+          goalAutoRef.current.set(ownId, `paused:${last.id}`);
+          st.pauseGoal(ch.id);
+        }
+      } else {
+        goalAutoRef.current.set(ownId, last.id);
+      }
+      return;
+    }
+    if (content.includes("[GOAL CLEARED]") || content.includes("[GOAL IMPOSSIBLE]")) {
+      if (goalAutoRef.current.get(ownId) !== `cleared:${last.id}`) {
+        goalAutoRef.current.set(ownId, `cleared:${last.id}`);
+        st.clearGoal(ch.id);
+      }
+      return;
+    }
+    if (content.includes("[GOAL PAUSED]")) {
+      if (goalAutoRef.current.get(ownId) !== `paused:${last.id}`) {
+        goalAutoRef.current.set(ownId, `paused:${last.id}`);
+        st.pauseGoal(ch.id);
+      }
+      return;
+    }
+    // Codex-style: only [GOAL CONTINUES] continues the loop. Anything else
+    // (interrupted turn, error, steer without judgment, historic message) ends
+    // idle and waits for explicit user Resume/Send.
+    if (!content.includes("[GOAL CONTINUES]")) return;
+    // Client-side mirror of the server cap: never fire past MAX_GOAL_TURNS.
+    // The server is authoritative; this just avoids one wasted turn on a
+    // stale marker. Cap-hit parks the loop as paused (same as [GOAL PAUSED]).
+    if ((gl.turns ?? 0) >= MAX_GOAL_TURNS) {
+      if (goalAutoRef.current.get(ownId) !== `paused:${last.id}`) {
+        goalAutoRef.current.set(ownId, `paused:${last.id}`);
+        st.pauseGoal(ch.id);
+      }
+      return;
+    }
+    // Explicit Stop (persistent flag or in-memory race flag) blocks the loop.
+    let wasStopped = false;
+    try {
+      wasStopped = Boolean(stoppedMapRef.current?.get(ch.id));
+    } catch {
+      wasStopped = false;
+    }
+    if (wasStopped) return;
+    const hasRetry = Boolean((last as { retry?: unknown }).retry);
+    if (hasRetry) return;
+    if (goalAutoRef.current.get(ownId) === last.id) return;
+    if (msgs.some((m) => m.streaming)) return;
+    if (goalSendingRef.current.has(autoKey)) return;
+    goalAutoRef.current.set(ownId, last.id);
+    goalSendingRef.current.add(autoKey);
+    const judgeNote = goalReasonAfter(content, "[GOAL CONTINUES]");
+    const nextPrompt = judgeNote
+      ? `Continue working on the persistent goal: "${gl.condition}". Previous assessment: ${judgeNote}`
+      : `Continue working on the persistent goal: "${gl.condition}".`;
+    void send(nextPrompt, [], [], false, undefined, undefined, false, undefined, ch.id)
+      .finally(() => {
+        goalSendingRef.current.delete(autoKey);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat?.messages, chat?.goal, chat?.id]);
   // Codex-style slash highlight: only the leading "/name" token gets the
   // accent color, args and plain text keep the normal color. A backdrop div
   // mirrors the textarea text (same font/padding/wrap) and paints the token
@@ -690,6 +833,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [skillsLoading, setSkillsLoading] = useState(
     getSkillsList().length === 0,
   );
+  // Recently used skills (slugs, newest first) — drives the @mention popup
+  // order bottom-anchored, like commandUsage for slash.
+  const [skillUsage, setSkillUsage] = useState<string[]>(() => loadSkillUsage());
+  useEffect(() => {
+    const refresh = () => setSkillUsage(loadSkillUsage());
+    window.addEventListener('coder:skill-usage', refresh);
+    return () => window.removeEventListener('coder:skill-usage', refresh);
+  }, []);
   const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
   // Second mount point on the app bar's right end — the balance chip portals
   // there so the wallet sits next to the workspace menu, not mid-bar.
@@ -701,7 +852,46 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setTitlebarRightEl(document.getElementById("titlebar-right"));
   }, []);
   const [recording, setRecording] = useState(false);
+  const [liveState, setLiveState] = useState<LiveVoiceState>('idle');
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const liveSessionRef = useRef<LocalLiveSession | null>(null);
+  const toggleLiveRef = useRef<() => void>(() => {});
+  const [selectedMicId, setSelectedMicId] = useState<string>(() => {
+    try {
+      return localStorage.getItem("codifa:selectedMicDeviceId") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const [micMenuOpen, setMicMenuOpen] = useState(false);
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const micMenuRef = useRef<HTMLDivElement | null>(null);
   const [transcribing, setTranscribing] = useState(false);
+  // Composer action visibility: live voice takes over, streaming shows stop
+  // + dictate mic, typing shows send only, empty shows mic + live buttons.
+  const isLiveVoiceActive = liveState === 'live' || liveState === 'speaking' || liveState === 'connecting';
+  const isStreamingActive = busy || chatHasStreaming;
+  // Only typed text counts as written text; attached photos/files and
+  // collapsed paste cards alone do not: the user attaches first and
+  // dictates the prompt afterwards.
+  const hasText = input.trim().length > 0;
+  const hasAttachment = pastedBlocks.length > 0 || images.length > 0;
+  const hasComposerText = hasText || hasAttachment;
+  const showLiveActive = isLiveVoiceActive;
+  const showStopOnly = !isLiveVoiceActive && isStreamingActive;
+  // Dictate mic stays visible during streaming (hidden only when live is active)
+  // so the user can dictate the next prompt while the agent works.
+  const showDictateDuringStreaming = !isLiveVoiceActive && isStreamingActive;
+  // Send appears only once there is typed/pasted text: attaching a photo/file
+  // alone keeps the mics visible so the prompt can be dictated afterwards.
+  const showSendOnly = !isLiveVoiceActive && !isStreamingActive && hasText;
+  // Attachments alone must not hide the mics: user may attach a file/photo
+  // and then dictate the prompt. Only typed text hides voice buttons.
+  const showVoiceButtons = !isLiveVoiceActive && !isStreamingActive && !hasText;
+  // Live voice button shows whenever the composer is idle (empty input,
+  // not streaming, live not active) so it comes back after Stop. It stays
+  // hidden mid-stream and while typing, unless live is the active session.
+  const showLiveIdle = !isLiveVoiceActive && !isStreamingActive && !hasText;
   const sttProviderId = useStore((s) => s.sttProviderId);
   const sttModel = useStore((s) => s.sttModel);
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
@@ -748,12 +938,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     name: c.name,
   }));
   const atQuery = skillMentionQuery.trim().toLowerCase();
-  const filteredSkills = skillsList.filter(
-    (s) =>
-      !atQuery ||
-      s.name.toLowerCase().includes(atQuery) ||
-      (s.slug && s.slug.toLowerCase().includes(atQuery)) ||
-      s.description.toLowerCase().includes(atQuery),
+  const filteredSkills = bottomAnchoredByUsage(
+    skillsList.filter(
+      (s) =>
+        !atQuery ||
+        s.name.toLowerCase().includes(atQuery) ||
+        (s.slug && s.slug.toLowerCase().includes(atQuery)) ||
+        s.description.toLowerCase().includes(atQuery),
+    ),
+    skillUsage,
+    (s) => s.slug || s.name,
   );
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
@@ -866,6 +1060,72 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return sched;
   };
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Reply-to-selection: floating reply button over selected transcript text.
+  // activeQuote is the pinned quote shown above the composer until sent.
+  const [quoteSel, setQuoteSel] = useState<{ text: string; x: number; y: number } | null>(null);
+  const [activeQuote, setActiveQuote] = useState<string | null>(null);
+  const quoteSelRef = useRef<{ text: string; x: number; y: number } | null>(null);
+  quoteSelRef.current = quoteSel;
+  const refreshQuoteSel = useCallback(() => {
+    const rootEl = scrollRef.current;
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      if (quoteSelRef.current) setQuoteSel(null);
+      return;
+    }
+    const text = sel.toString();
+    if (!isQuotableSelection(text)) {
+      if (quoteSelRef.current) setQuoteSel(null);
+      return;
+    }
+    const anchor = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement ?? null;
+    const focusEl = sel.focusNode instanceof Element ? sel.focusNode : sel.focusNode?.parentElement ?? null;
+    const inTranscript = (el: Element | null) => !!el && !!rootEl && rootEl.contains(el) && !composerRef.current?.contains(el);
+    if (!inTranscript(anchor) && !inTranscript(focusEl)) return;
+    try {
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) return;
+      const x = Math.min(Math.max(rect.left + rect.width / 2, 48), window.innerWidth - 48);
+      const y = Math.max(rect.top - 8, 8);
+      setQuoteSel({ text, x, y });
+    } catch {
+      // ignore invalid ranges
+    }
+  }, []);
+  useEffect(() => {
+    document.addEventListener("selectionchange", refreshQuoteSel);
+    const onScroll = () => {
+      if (quoteSelRef.current) setQuoteSel(null);
+    };
+    document.addEventListener("scroll", onScroll, true);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && quoteSelRef.current) setQuoteSel(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("selectionchange", refreshQuoteSel);
+      document.removeEventListener("scroll", onScroll, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [refreshQuoteSel]);
+  const applyQuoteSel = useCallback(() => {
+    const cur = quoteSelRef.current;
+    if (!cur) return;
+    const block = formatChatQuote(cur.text);
+    if (block) setActiveQuote(block);
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      // ignore
+    }
+    setQuoteSel(null);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.selectionStart = el.selectionEnd = el.value.length;
+    });
+  }, []);
   // Hidden mirror + row/action widths used to count visual lines at the
   // compact input width (layout-independent, so no compact/expanded flip
   // loop). The single-line mirror height is cached (font never changes).
@@ -886,6 +1146,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // navigation moves the highlight while the list scrolls independently.
   const cmdPopupRef = useRef<HTMLDivElement>(null);
   const historyPopupRef = useRef<HTMLDivElement>(null);
+  // Bottom-anchored history: keep the active row visible inside the popup
+  // only (never the window) when navigating from the bottom upward.
+  useEffect(() => {
+    if (!historyOpen) return;
+    scrollPopupRowIntoView(historyPopupRef.current, ".hist-card.kbd");
+  }, [historyOpen, historyIdx]);
   const lastEventAt = useRef(0);
   const toolRunningRef = useRef(0);
   /** When the stall hint first turned on (see the watchdog in `send`); null
@@ -903,10 +1169,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   /** True when a create_mcp tool was called this turn — triggers MCP list refresh on done. */
   const mcpChangedRef = useRef(false);
   const toggleRecordingRef = useRef<() => void>(() => { });
-  /** Whether the open Neovim file is selected to be mentioned on the next send. */
-  const [nvimMentioned, setNvimMentioned] = useState(false);
-  /** Whether the LSP diagnostics popover under the nvim label is open. */
-  const [lspOpen, setLspOpen] = useState(false);
+
   // Transient compact/command/stall banners live on the chat record in the
   // store (not local component state) for the same reason as pendingAsk:
   // `<ChatPanel key={activeChatId} />` remounts on every chat switch, so local
@@ -1066,6 +1329,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return () => window.removeEventListener("coder:command-usage", onUsage);
   }, []);
 
+  // Cross-window skill-usage sync: same pattern for the @mention popup order.
+  useEffect(() => {
+    const onSkillUsage = () => setSkillUsage(loadSkillUsage());
+    window.addEventListener("coder:skill-usage", onSkillUsage);
+    return () => window.removeEventListener("coder:skill-usage", onSkillUsage);
+  }, []);
+
   // Close the skills/MCP popup when clicking outside of it.
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
@@ -1094,35 +1364,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
     return () => {
       cancelled = true;
-    };
-  }, []);
-
-  // Track the file currently open in Neovim (fed by the main-process watcher,
-  // which queries the nvim RPC socket). Only the path is stored here; the label
-  // is shown automatically and the file is sent to the agent only when the user
-  // explicitly clicks/selects it for that message.
-  useEffect(() => {
-    let cancelled = false;
-    window.coder
-      .getNvimFile()
-      .then((f) => {
-        if (cancelled) return;
-        useStore.getState().setNvimFile(f.abs);
-        useStore
-          .getState()
-          .setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
-      })
-      .catch(() => undefined);
-    const unsub = window.coder.onNvimFile((f) => {
-      if (cancelled) return;
-      useStore.getState().setNvimFile(f.abs);
-      useStore
-        .getState()
-        .setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
-    });
-    return () => {
-      cancelled = true;
-      unsub();
     };
   }, []);
 
@@ -1610,13 +1851,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
     };
     const onFlushUi = () => pushToStore(false);
-    // Unmount (chat switch): push + flushNow so the position survives even
-    // mid-stream (persist() is deferred while streaming, so it could be lost).
+    // Unmount (chat switch / minimize): push the position into the store
+    // in-memory only — never flushNow here. A full flush runs sanitizeChats
+    // over every message plus settings encryption on the commit path and
+    // blocks the minimize paint (the reported minimize lag). The debounced
+    // persist after the window action covers disk; the quit path flushes.
     const flush = () => {
       pushToStore(true);
-      if (cid && lastScrollPosRef.current) {
-        useStore.getState().flushNow();
-      }
       // Record a fingerprint of this chat's transcript as the user leaves it:
       // on the next return, a different fingerprint means the agent posted or
       // updated a message while they were away → land on the newest message
@@ -1740,12 +1981,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       toggleRecordingRef.current();
     };
+    const onToggleLive = () => {
+      // Live session has its own shortcut (Ctrl+X then L), separate from
+      // dictation, so the two modes never mix.
+      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
+      toggleLiveRef.current();
+    };
     window.addEventListener("coder:toggle-mode", onToggleMode);
     window.addEventListener("coder:toggle-voice", onToggleVoice);
+    window.addEventListener("coder:toggle-live", onToggleLive);
     window.addEventListener("coder:attach-file", onAttachFile as EventListener);
     return () => {
       window.removeEventListener("coder:toggle-mode", onToggleMode);
       window.removeEventListener("coder:toggle-voice", onToggleVoice);
+      window.removeEventListener("coder:toggle-live", onToggleLive);
       window.removeEventListener(
         "coder:attach-file",
         onAttachFile as EventListener,
@@ -1760,9 +2009,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const matched = COMMANDS.filter(
       (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
     );
-    // Recently used commands first (newest use on top); never-used keep
-    // their original relative order.
-    return sortCommandsByUsage(matched, commandUsage).slice(0, 10);
+    // Bottom-anchored like the recent-prompt popup: oldest on top, newest
+    // just above the bottom (closest to the input). Shows all matches.
+    return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name);
   }, [cmdOpen, cmdQuery, commandUsage]);
 
   const ctxWindow = modelContextWindow(provider, activeModel);
@@ -1776,18 +2025,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [chat, systemPrompt, ctxWindow],
   );
 
-  // opencode's meter compares the latest turn's total against the RAW window
-  // (`limit.context`). The backend auto-compaction threshold is a percentage of
-  // this same raw window (compactAtPercent), so the meter and the trigger agree:
-  // the bar hits the threshold exactly when compaction fires.
-  const ctxPct = contextPercent(contextUsed, ctxWindow);
-
   // Warn (yellow) when used context reaches the auto-compaction threshold
   // (compactAtPercent% of the raw window) — the same point where backend
   // auto-compaction fires.
   const compactAtPercent = settings.compactAtPercent ?? 80;
   const usable =
     ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null;
+
+  // Ring progress is measured against the usable window (auto-compaction
+  // threshold), not the raw window: 100% means compaction fires. E.g. with a
+  // 50% threshold, half the raw window fills the ring and shows 100.
+  const ctxPct =
+    usable != null && usable > 0
+      ? contextPercent(contextUsed, usable)
+      : contextPercent(contextUsed, ctxWindow);
 
   // ---- Context-breakdown popover (hover the ring next to Send) ----
   const [ctxPopoverChatId, setCtxPopoverChatId] = useState<string | null>(null);
@@ -1799,10 +2050,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Real per-turn part sizes reported by the backend's ctx_parts event
   // (system prompt tail, skills section, bound MCP schemas) — keyed by chat.
   type CtxParts = {
+    chat_id?: string;
     mode?: string;
     systemChars?: number;
     skillsChars?: number;
     mcpChars?: number;
+    systemToolsChars?: number;
   };
   const [ctxPartsByChat, setCtxPartsByChat] = useState<Record<string, CtxParts>>({});
   const ctxPopoverCloseTimer = useRef<number | null>(null);
@@ -2499,10 +2752,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // tool schemas — none of which the frontend can measure on its own.
     const real = ctxPartsByChat[chat?.id ?? ""];
     if (real && chat) {
-      return buildContextBreakdown(chat, systemPrompt, ctxWindow, {
+      return buildContextBreakdown(chat, systemPrompt, usable ?? ctxWindow, {
         systemPromptChars: real.systemChars,
         skillsChars: real.skillsChars,
         mcpChars: real.mcpChars,
+        systemToolsChars: real.systemToolsChars,
       });
     }
     // Fallback estimate (before the first turn reports): the AVAILABLE
@@ -2525,7 +2779,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const cfg = mcpCfg[name];
       if (cfg) mcpChars += JSON.stringify(cfg).length;
     }
-    return buildContextBreakdown(chat, systemPrompt, ctxWindow, {
+    return buildContextBreakdown(chat, systemPrompt, usable ?? ctxWindow, {
       skillsChars,
       mcpChars,
     });
@@ -2534,7 +2788,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     ctxPartsByChat,
     chat,
     systemPrompt,
-    ctxWindow,
+    usable,
     input,
     skillsList,
     mcpEnabled,
@@ -2619,6 +2873,29 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const chatId = forChatId ?? chatIdRef.current;
     const chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
+    // Persistent goal: when active and not paused, the condition rides along
+    // with every model prompt (the visible bubble stays clean). `stopped`
+    // does NOT detach the goal — a manual send after Stop still pursues it.
+    const activeGoalForSend = chat.goal?.active && !chat.goal.paused ? chat.goal : null;
+    // Codex-style re-arm: an explicit user turn (anything except the loop's
+    // own "Continue working on the persistent goal" ping) clears the Stop
+    // halt so the loop can drive again after this turn judges CONTINUES.
+    const isGoalLoopPing =
+      typeof text === "string" && text.startsWith("Continue working on the persistent goal:");
+    if (!isGoalLoopPing && chat.goal?.active && !chat.goal.paused && chat.goal.stopped) {
+      try {
+        s.rearmGoal(chat.id);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (activeGoalForSend) {
+      try {
+        s.incrementGoalTurn(chat.id);
+      } catch {
+        /* ignore */
+      }
+    }
     const sendImgs = cleanImagesForSend(imgs);
     stoppedMapRef.current.set(chatId, false);
     // Fresh turn: invalidate any retry armed by the previous turn and allow
@@ -2628,7 +2905,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // don't race). stop() coordinates via stoppedMapRef + chatAborts store.
     let mcpChanged = false;
     // Messages that ask to create/install skills or MCP connectors also grant
-    // the create_skill/create_mcp tools — in EVERY mode (ask, plan, coder).
+    // the create_skill/create_mcp tools — in EVERY mode (ask, plan, build).
     // The grant is sticky across the conversation: check the current message AND
     // the last several chat messages, so a follow-up like "ادامه بده" keeps the
     // tools it was originally granted (the user's install request is still in
@@ -3006,6 +3283,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const WATCHDOG_MAX_RETRIES = 5;
     const WATCHDOG_BASE_BACKOFF_MS = 30_000;
     const STALL_CHECK_INTERVAL_MS = 10_000;
+    // No limit on silence of real content while the socket is alive via
+    // keepalives: a thinking model must never be aborted/resent for thinking
+    // too long. Dead sockets are still caught by the keepalive clock (`limit`).
+    const CONTENT_STALL_LIMIT_MS = Number.POSITIVE_INFINITY;
     const stallTimer = setInterval(() => {
       // An explicit Stop cancels all auto-retry: never re-arm the retry banner
       // or schedule a resend after the user stopped this chat. Without this, a
@@ -3022,15 +3303,45 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // A tool that's still running gets a much longer leash — it's doing real
       // work, not stalled on the provider.
       const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
+      // Silent-thinking models can legitimately emit no content for a long time
+      // while keepalives keep the socket alive. The dead-socket limit above stays
+      // short; the content-stall limit is unbounded for thinking.
+      const contentLimit = isToolRunning(toolRunning)
+        ? 900_000
+        : CONTENT_STALL_LIMIT_MS;
       const elapsed = Date.now() - lastEventAtMs;
       const contentElapsed = Date.now() - lastContentAtMs;
+      // Content-stall recovery: keepalives keep the socket clock fresh, so a
+      // wedged stream (model silent, socket alive) never reaches the dead-
+      // socket path below. Once content has been stale past the limit while the
+      // socket is still "alive", treat it as stalled and fall through to the
+      // auto-retry path instead of showing the pill forever.
+      const contentStalled = shouldRecoverContentStall(
+        contentElapsed,
+        elapsed,
+        contentLimit,
+      );
+      // Active thinking is legitimate silence, however long the reasoning
+      // pass runs: while the thinking window is open the per-message thinking
+      // indicator already explains the wait, so the watchdog must not consider
+      // it at all — no pill, no content-stall recovery. Only a truly dead
+      // socket (no keepalives either, i.e. the backend itself is gone) still
+      // falls through to the stall path below; thinking does not keep a dead
+      // connection alive.
+      const thinkingNow =
+        chatState?.messages.find((m) => m.id === assistantMsg.id)
+          ?.thinkingActive === true;
       // Early feedback (not a retry): after 25s without REAL content the Working
       // pill explains the wait instead of looking frozen. Keepalives refresh
-      // only the socket clock, so long silent thinking still shows the pill.
-      // Cleared by any real event via statusText: undefined in handlers.
-      // Include elapsed seconds and refresh it so a multi-minute model wait
-      // visibly ticks instead of looking stuck.
-      if (shouldShowWaitingForModel(contentElapsed, elapsed, limit)) {
+      // only the socket clock, so a long silent non-thinking wait still shows
+      // the pill. Cleared by any real event via statusText: undefined in
+      // handlers. Include elapsed seconds and refresh it so a multi-minute
+      // model wait visibly ticks instead of looking stuck.
+      if (
+        shouldShowWaitingForModel(contentElapsed, elapsed, limit) &&
+        !contentStalled &&
+        !thinkingNow
+      ) {
         const cur = useStore
           .getState()
           .chats.find((c) => c.id === chat.id)
@@ -3048,7 +3359,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         return;
       }
-      if (elapsed <= limit) {
+      if (elapsed <= limit && !contentStalled) {
         stalledSinceMs = null;
         return;
       }
@@ -3268,6 +3579,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // skill was NOT found (deleted/renamed) — without it the user never
         // learns why the skill silently didn't apply. Stored per-chat (like
         // compactNotice) so it survives a chat switch mid-turn.
+        // AUTO-matched skills (manual:false) are different: the user wants to
+        // see which skills the decision router picked, so they are stamped on
+        // the assistant message and rendered as chips under its bubble.
+        if (!event.manual && event.skills && event.skills.length > 0) {
+          store.updateMessage(assistantMsg.id, { autoSkills: event.skills });
+        }
         if (event.note) {
           useStore.getState().setChatSkillNotice(chat.id, event.note);
         }
@@ -3276,12 +3593,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // above): the active MCP servers are already listed in the prompt's
         // USER-SELECTED SKILLS/TOOLS section, so the note is redundant UI.
       } else if (event.kind === "ctx_parts") {
-        // Real part sizes for the context popover. Store only this chat's own
-        // main turn — a sub-agent building its context must not overwrite it.
+        // Real part sizes for the context popover. Route by the backend's
+        // chat_id (never the viewed chat): a sub-agent building its context
+        // must not overwrite the parent's row, and a background drain must
+        // not land on the chat the user happens to be viewing. No mode guard:
+        // the latest reported sizes win even if the mode switched mid-turn,
+        // otherwise the popover sticks at System tools 0.
         const p = event as unknown as CtxParts;
-        if (chat && (!p.mode || p.mode === chat.mode)) {
-          setCtxPartsByChat((prev) => ({ ...prev, [chat.id]: p }));
-        }
+        const targetId = p.chat_id || chat?.id || "";
+        if (!targetId) return;
+        setCtxPartsByChat((prev) => ({ ...prev, [targetId]: p }));
       } else if (event.kind === "subagent_models") {
         // Debug-only routing info. Deliberately NOT rendered into the chat —
         // the user asked for subagent model lists to stay out of the message.
@@ -3621,7 +3942,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           }
         }
       } else if (event.kind === "mode_changed") {
-        // Backend switched the workflow mode mid-run (plan approval → coder).
+        // Backend switched the workflow mode mid-run (plan approval → build).
         // Sync chat.mode silently (no "[Mode switched]" marker — the backend
         // narrates through the stream) and rotate so the implementation gets
         // its own reply bubble.
@@ -3907,7 +4228,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           root: rootDir,
           mode: chat.mode,
           chatId: chat.id,
-          prompt: promptWithResume,
+          prompt: activeGoalForSend ? `[Active goal: ${activeGoalForSend.condition}] ${promptWithResume}` : promptWithResume,
           history,
           attachments: atts.map((a) =>
             // Imported (outside-workspace) files arrive as absolute paths and
@@ -3941,9 +4262,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerUse,
-          nvimFile:
-            isForeground && nvimMentioned ? nvimRel || undefined : undefined,
-          nvimDiagnostics: isForeground && nvimMentioned ? nvimDiags : undefined,
           vectorDbPath: s.vectorDbPath,
           vectorConfig: {
             ttl_days: s.ragWebTtlDays,
@@ -3955,8 +4273,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
           compactAtPercent: s.settings.compactAtPercent ?? 80,
-        maxSteps: s.maxSteps ?? 0,
           restart: overrides?.restart ?? false,
+          goal: activeGoalForSend?.condition ?? null,
+          goalTurns: typeof activeGoalForSend?.turns === "number" ? activeGoalForSend.turns : 0,
           signal: abort.signal,
         },
         handleEvent,
@@ -4285,9 +4604,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const handleCommand = async (v: string) => {
     const s = useStore.getState();
     const ch = s.chats.find((c) => c.id === s.activeChatId);
-    // Record every submitted slash command in the prompt history so the
-    // ArrowUp popup can offer it again (pins are managed from the popup).
-    setPromptHistory((prev) => recordHistory(v, prev));
+    // Slash commands stay out of the prompt history (they have their own
+    // recent-use popup); pins are managed separately.
     const parsed = parseSlashInput(v);
     const word = parsed && parsed.name ? `/${parsed.name}` : v.split(/\s+/)[0].toLowerCase();
     // Track usage only for known commands so typos never pollute the popup order.
@@ -4396,6 +4714,45 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           [],
           [],
           true,
+          created.id,
+        );
+        break;
+      }
+      case "/goal": {
+        const rest = v.slice("/goal".length).trim();
+        if (!ch) break;
+        if (!rest) {
+          const g = ch.goal;
+          s.addMessage(ch.id, {
+            role: "assistant",
+            content:
+              g?.active
+                ? `Current goal: "${g.condition}"${g.paused ? " (paused)" : " (active)"}${typeof g.turns === "number" ? ` — ${g.turns} turn(s)` : ""}. Use \`/goal clear\` to clear it, \`/goal <condition>\` to replace it.`
+                : "No active goal. Set one with `/goal <condition>` — e.g. `/goal all tests pass`.",
+          });
+          break;
+        }
+        if (rest === "clear") {
+          s.clearGoal(ch.id);
+          s.addMessage(ch.id, { role: "assistant", content: "Goal cleared." });
+          break;
+        }
+        s.setGoal(ch.id, rest);
+        // A persistent goal needs write access to make progress, so move
+        // an ask/plan chat to build automatically when a goal starts.
+        if (ch.mode !== "build") {
+          s.setChatMode(ch.id, "build");
+        }
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(v),
+          mode: "build",
+        });
+        void send(
+          `Follow this persistent goal until it is done or cleared: "${rest}". Treat it as a standing directive for every turn.`,
+          [],
+          [],
+          false,
           created.id,
         );
         break;
@@ -4633,13 +4990,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     [],
   );
 
-  const submit = () => {
-    const typed = input.trim();
-    if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
-    // Record plain prompts too so ArrowUp recalls them (slash commands are
-    // recorded inside handleCommand; this covers normal/steer/queued sends).
-    if (!typed.startsWith("/")) {
-      setPromptHistory((prev) => recordHistory(typed, prev));
+  const submit = (overrideText?: string) => {
+    const typed = (overrideText ?? input).trim();
+    if (!typed && pastedBlocks.length === 0 && images.length === 0 && !activeQuote) return;
+    // Record plain prompts so ArrowUp recalls them; slash commands and
+    // skill mentions stay out (they have their own recent-use popups).
+    if (typed && !typed.startsWith("/")) {
+      const hasSkill = extractMentionSkills(typed, getSkillsList()).skills.length > 0;
+      if (!hasSkill) {
+        setPromptHistory((prev) => recordHistory(typed, prev));
+      }
     }
     if (typed.startsWith("/")) {
       // Slash commands act on the typed text only; pasted cards stay pinned to
@@ -4674,6 +5034,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const selectedSkills: string[] = Array.from(
       extractMentionSkills(v, getSkillsList()).skills,
     );
+    // Record skill uses so the @mention popup sorts recent-first.
+    if (selectedSkills.length > 0) {
+      const list = getSkillsList();
+      let usage = loadSkillUsage();
+      for (const nm of selectedSkills) {
+        const hit = list.find((s) => s.name === nm);
+        usage = recordSkillUsage(hit ? hit.slug || hit.name : nm, usage);
+      }
+      setSkillUsage(usage);
+    }
     // اگر کامپکت در جریان است پیام باید صف شود نه steer مستقیم
     if (chatObj.compacting) {
       ss.queueMessage(chatObj.id, {
@@ -4687,6 +5057,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
       setInput("");
       setPastedBlocks([]);
+      setActiveQuote(null);
       setCmdOpen(null);
       forceScrollToBottom();
       return;
@@ -4697,7 +5068,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // ends without the backend injecting it, the drain re-sends it as the next
     // turn REUSING this same message. The input is NOT consumed by the stream —
     // no abort.
-    if (chatHasStreaming) {
+    // NOTE: read streaming state fresh from the store (not the render closure)
+    // so dictate auto-send during streaming still steers even when the closure
+    // is stale (e.g. recording started before the turn began).
+    const freshChatForSteer = ss.chats.find((c) => c.id === chatObj.id);
+    const freshStreaming = freshChatForSteer?.messages.some((m) => m.streaming) ?? chatHasStreaming;
+    if (freshStreaming) {
       const userMsg = ss.addMessage(chatObj.id, {
         role: "user",
         content: v,
@@ -4709,9 +5085,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
       setInput("");
       setPastedBlocks([]);
+      setActiveQuote(null);
       setCmdOpen(null);
       forceScrollToBottom();
-      void steerChat(chatObj.id, userMsg.id, v, atts, cleanImagesForSend(imgs), {
+      // Mid-run steer must carry the active goal so the agent keeps working
+      // toward it instead of dropping it after the steer turn. The visible
+      // bubble keeps the raw text; only the steer prompt is prefixed.
+      const steerPrompt = chatObj.goal?.active && !chatObj.goal.paused && v.trim().length > 0 && !v.trim().startsWith("/goal")
+        ? `[Active goal: ${chatObj.goal.condition}] ${v}`
+        : v;
+      void steerChat(chatObj.id, userMsg.id, steerPrompt, atts, cleanImagesForSend(imgs), {
         mcpServers: selectedMcpServers,
         skills: selectedSkills,
       });
@@ -4719,13 +5102,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     setInput("");
     setPastedBlocks([]);
+    setActiveQuote(null);
     setCmdOpen(null);
     void send(v, atts, imgs, false, undefined, undefined, true);
   };
 
   const queueForLater = () => {
     const typed = input.trim();
-    if (!typed && pastedBlocks.length === 0 && images.length === 0) return;
+    if (!typed && pastedBlocks.length === 0 && images.length === 0 && !activeQuote) return;
     // Slash commands run immediately and never enter the chat transcript as
     // raw "/..." text, even when queued via the queue button.
     if (typed.startsWith("/")) {
@@ -4745,18 +5129,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const enabled = ss.settings.mcpEnabled ?? [];
     const sel: Record<string, McpServerConfig> = {};
     for (const n of enabled) if (all[n]) sel[n] = all[n];
+    const queuedSkills: string[] = Array.from(
+      extractMentionSkills(v, getSkillsList()).skills,
+    );
+    if (queuedSkills.length > 0) {
+      const list = getSkillsList();
+      let usage = loadSkillUsage();
+      for (const nm of queuedSkills) {
+        const hit = list.find((s) => s.name === nm);
+        usage = recordSkillUsage(hit ? hit.slug || hit.name : nm, usage);
+      }
+      setSkillUsage(usage);
+    }
     ss.queueMessage(chatObj.id, {
       id: uid2(),
       text: v,
       attachments: atts,
       images: imgs,
       mcpServers: sel,
-      skills: Array.from(extractMentionSkills(v, getSkillsList()).skills),
+      skills: queuedSkills,
       kind: "queue",
     });
     forceScrollToBottom();
     setInput("");
     setPastedBlocks([]);
+    setActiveQuote(null);
     setAttachments([]);
     setImages([]);
   };
@@ -4874,8 +5271,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  the input in the composer), then what the user typed. */
   const composePrompt = (typed: string): string => {
     const pasted = pastedBlocks.map((b) => b.text).join("\n\n");
-    if (pasted && typed) return `${pasted}\n\n${typed}`;
-    return typed || pasted;
+    const base = pasted && typed ? `${pasted}\n\n${typed}` : typed || pasted;
+    if (!activeQuote) return base;
+    return combineQuoteAndInput(activeQuote, base);
   };
 
   // "Edit" on a paste card: fold the text back into the textarea (append after
@@ -4979,14 +5377,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const sttCfg = settings.providers.find((p) => p.id === sttProviderId);
       chains.push(sttCfg ? toTranscribeOpts(sttCfg, sttModel) : undefined);
     }
-    for (const fb of sttFallbacks ?? []) {
-      if (fb.providerId === "local") {
-        chains.push(undefined);
-        continue;
+    // Local STT ON means fully offline: never contact a remote STT
+    // provider via fallbacks in the same turn.
+    if (sttProviderId !== "local") {
+      for (const fb of sttFallbacks ?? []) {
+        if (fb.providerId === "local") {
+          chains.push(undefined);
+          continue;
+        }
+        const cfg = settings.providers.find((p) => p.id === fb.providerId);
+        if (!cfg) continue;
+        chains.push(toTranscribeOpts(cfg, fb.model));
       }
-      const cfg = settings.providers.find((p) => p.id === fb.providerId);
-      if (!cfg) continue;
-      chains.push(toTranscribeOpts(cfg, fb.model));
     }
     return { lang, chains };
   };
@@ -5022,7 +5424,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const blob = new Blob(mediaChunksRef.current, { type });
         if (blob.size === 0) {
           console.debug("[voice] empty recording (no audio captured)");
-          window.alert("No audio was captured — check your microphone.");
+          try {
+            const bannerId = chatIdRef.current;
+            if (bannerId) useStore.getState().setChatCmdError(bannerId, "No audio was captured — check your microphone.");
+          } catch {
+            // Banner is best-effort.
+          }
           return;
         }
         setTranscribing(true);
@@ -5047,21 +5454,53 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           }
           if (lastError) throw lastError;
           const finalText = (text ?? "").trim();
-          if (finalText) {
-            setInput((prev) => (prev ? prev.trimEnd() + " " + finalText : finalText));
-            requestAnimationFrame(() => textareaRef.current?.focus());
+          // A gateway HTML error page must never land in the composer.
+          // Errors surface in the banner under messages, never in the input.
+          if (finalText && (isHtmlTranscriptJunk(finalText) || /<\/?[a-z]/i.test(finalText) || finalText.includes('&lt;') || finalText.includes('/_next/') || /preload|fetchpriority/i.test(finalText) || /<[a-z][^<>]*$/i.test(finalText))) {
+            console.debug("[voice] ignoring HTML junk transcription");
+            try {
+              const bannerId = chatIdRef.current;
+              if (bannerId) useStore.getState().setChatCmdError(bannerId, "Transcription returned an error page — please try again.");
+            } catch {
+              // Banner is best-effort.
+            }
+          } else if (finalText) {
+            // Noise gate: single-char Whisper hallucinations from background
+            // noise must never reach the agent as a real turn.
+            if (finalText.length < 2) {
+              console.debug("[voice] ignoring noise fragment");
+              try {
+                const bannerId = chatIdRef.current;
+                if (bannerId) useStore.getState().setChatCmdError(bannerId, "Nothing was recognized — please try again.");
+              } catch {
+                // Banner is best-effort.
+              }
+            } else {
+              // Dictate auto-sends: no extra Enter needed.
+              submit(finalText);
+            }
           } else {
             console.debug("[voice] empty transcription (silence/unrecognized)");
-            window.alert("Nothing was recognized — please try again.");
+            try {
+              const bannerId = chatIdRef.current;
+              if (bannerId) useStore.getState().setChatCmdError(bannerId, "Nothing was recognized — please try again.");
+            } catch {
+              // Banner is best-effort.
+            }
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          window.alert(
+          const friendly =
             `Voice transcription failed: ${msg}\n` +
             (msg.includes("Failed to fetch")
               ? "The local Python server is likely down — restart the app."
-              : "Please try again or check your microphone connection."),
-          );
+              : "Please try again or check your microphone connection.");
+          try {
+            const bannerId = chatIdRef.current;
+            if (bannerId) useStore.getState().setChatCmdError(bannerId, friendly);
+          } catch {
+            // Banner is best-effort.
+          }
         } finally {
           setTranscribing(false);
         }
@@ -5073,9 +5512,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       console.debug("[voice] recording started", { mime: rec.mimeType });
     } catch (err) {
       console.debug("[voice] microphone unavailable:", err);
-      window.alert(
-        `Microphone unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      try {
+        const bannerId = chatIdRef.current;
+        if (bannerId) useStore.getState().setChatCmdError(bannerId, `Microphone unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      } catch {
+        // Banner is best-effort.
+      }
     }
   };
 
@@ -5097,6 +5539,336 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
   toggleRecordingRef.current = toggleRecording;
 
+  // Live voice session (separate from dictate): persistent WebSocket,
+  // auto mic streaming, model playback, server VAD barge-in.
+  const refreshMicDevices = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setMicDevices(devices.filter((d) => d.kind === 'audioinput'));
+    } catch {
+      setMicDevices([]);
+    }
+  };
+  const reportLiveError = (msg: string) => {
+    setLiveError(msg);
+    const id = chatIdRef.current || chat?.id;
+    if (id) {
+      try {
+        useStore.getState().setChatLiveError(id, msg);
+      } catch {
+        // Banner mirror is best-effort.
+      }
+    }
+  };
+  const clearLiveError = () => {
+    setLiveError(null);
+    const id = chatIdRef.current || chat?.id;
+    if (id) {
+      try {
+        useStore.getState().setChatLiveError(id, null);
+      } catch {
+        // Banner mirror is best-effort.
+      }
+    }
+  };
+  const selectMicDevice = async (deviceId: string) => {
+    setSelectedMicId(deviceId);
+    try {
+      localStorage.setItem('codifa:selectedMicDeviceId', deviceId);
+    } catch {
+      // Storage unavailable; keep in-memory selection only.
+    }
+    setMicMenuOpen(false);
+    const live = liveSessionRef.current;
+    if (live && isLiveVoiceActive) {
+      try {
+        await live.setMicrophoneDeviceId(deviceId);
+      } catch (err) {
+        reportLiveError(err instanceof Error ? err.message : String(err));
+      }
+    }
+  };
+  // Offline live voice (no OpenAI): chunked mic VAD -> local/remote STT ->
+  // existing chat pipeline (send) -> local TTS answer. Barge-in stops TTS.
+  const startLive = async () => {
+    if (liveState === 'connecting' || isLiveVoiceActive) return;
+    if (recording) stopRecording();
+    stopTts(LIVE_TTS_OWNER);
+    clearLiveError();
+    setLiveState('connecting');
+    try {
+      const transcribeChunk = async (blob: Blob, lang?: string): Promise<string> => {
+        const { lang: chainLang, chains } = resolveSttChain();
+        // Live has no typed input to sniff, so default to Persian when the
+        // UI is RTL: otherwise short Persian turns go without the fa hint
+        // and Whisper mistranscribes them unlike dictate mode.
+        const effectiveLang = lang ?? chainLang ?? (dir === 'rtl' ? 'fa' : 'fa');
+        let lastError: unknown = null;
+        for (const opts of chains) {
+          try {
+            const text = await transcribeAudio(blob, undefined, effectiveLang, opts);
+            lastError = null;
+            return text;
+          } catch (e) {
+            lastError = e;
+          }
+        }
+        throw lastError ?? new Error('Transcription failed');
+      };
+      // Provider chain + local voice config for live speech (shared by
+      // progressive streaming speech and the full-text fallback).
+      const buildLiveTtsChain = () => {
+        const st = useStore.getState();
+        const providers = st.settings.providers ?? [];
+        const chain: Array<{ kind: string; baseUrl: string; apiKeys?: string[]; model?: string; voice?: string }> = [];
+        const isLocalTts = st.ttsProviderId === 'local';
+        if (!isLocalTts) {
+          const primary = providers.find((p) => p.id === st.ttsProviderId);
+          if (primary) {
+            chain.push({ kind: primary.kind, baseUrl: primary.baseUrl ?? '', apiKeys: [...(primary.apiKeys ?? (primary.apiKey ? [primary.apiKey] : []))], model: st.ttsModel, voice: st.ttsVoice });
+          }
+          for (const fb of st.ttsFallbacks ?? []) {
+            const p = providers.find((x) => x.id === fb.providerId);
+            if (!p) continue;
+            chain.push({ kind: p.kind, baseUrl: p.baseUrl ?? '', apiKeys: [...(p.apiKeys ?? (p.apiKey ? [p.apiKey] : []))], model: fb.model, voice: fb.voice });
+          }
+        }
+        const localCfg = { ttsProviderId: st.ttsProviderId, ttsModel: st.ttsModel, ttsBaseUrl: (st.settings as { ttsBaseUrl?: string }).ttsBaseUrl, ttsVoice: st.ttsVoice };
+        const args = chain.length > 0 ? chain : [{ kind: 'local', baseUrl: localCfg.ttsBaseUrl ?? '', model: localCfg.ttsModel }];
+        return { args, localCfg };
+      };
+      // Live text source for progressive speech: follows the currently
+      // streaming assistant bubble and reports done when it settles, so
+      // speech starts on the first completed sentence instead of waiting
+      // for the full answer. Never replays an older answer: before the new
+      // bubble exists the snapshot is empty and not done.
+      const makeLiveStreamSource = (chatId: string) => {
+        let trackedId: string | null = null;
+        let finalText = '';
+        return {
+          snapshot: () => {
+            try {
+              const st = useStore.getState();
+              const chat = st.chats.find((c) => c.id === chatId);
+              const streaming = chat?.messages.find((m) => m.role === 'assistant' && m.streaming);
+              if (streaming) {
+                trackedId = streaming.id;
+                finalText = streaming.content ?? '';
+                return { text: finalText, done: false };
+              }
+              if (trackedId) {
+                const msg = chat?.messages.find((m) => m.id === trackedId);
+                if (msg) finalText = msg.content ?? finalText;
+                return { text: finalText, done: true };
+              }
+              return { text: '', done: false };
+            } catch {
+              return { text: '', done: false };
+            }
+          },
+        };
+      };
+      const speakAnswer = async (chatId: string): Promise<void> => {
+        const st = useStore.getState();
+        const target = st.chats.find((c) => c.id === chatId);
+        const lastAssistant = target ? [...target.messages].reverse().find((m) => m.role === 'assistant') : undefined;
+        if (!lastAssistant) return;
+        let speakable = '';
+        try {
+          speakable = speakableMessageText(lastAssistant).trim();
+        } catch {
+          speakable = (lastAssistant.content ?? '').trim();
+        }
+        if (!speakable) return;
+        const { args, localCfg } = buildLiveTtsChain();
+        const live = liveSessionRef.current;
+        try {
+          live?.notifySpeaking(true);
+          setLiveState('speaking');
+          await playTts(speakable, args, LIVE_TTS_OWNER, localCfg);
+        } catch (err) {
+          reportLiveError(err instanceof Error ? err.message : String(err));
+        } finally {
+          live?.notifySpeaking(false);
+          if (liveSessionRef.current) setLiveState('live');
+        }
+      };
+      const live = new LocalLiveSession({
+        deviceId: selectedMicId || undefined,
+        lang: dir === 'rtl' ? 'fa' : undefined,
+        transcribe: transcribeChunk,
+        onSpeechStart: () => {
+          // Barge-in: user started talking while the agent answers — stop
+          // TTS playback immediately so the user hears themselves. The
+          // agent stream is aborted only once real transcribed text arrives
+          // (onUserText below), never on mere VAD onset, so a false
+          // positive never kills a good answer for nothing.
+          try {
+            stopTts(LIVE_TTS_OWNER);
+          } catch {
+            // Best-effort.
+          }
+          liveSessionRef.current?.notifySpeaking(false);
+        },
+        onStateChange: (s) => setLiveState(s),
+        onUserText: async (raw) => {
+          const text = sanitizeLocalTranscript(raw).trim();
+          if (!text) return;
+          // Noise gate: never interrupt the agent for a 1-char hallucination.
+          if (text.length < 2) return;
+          if (isHtmlTranscriptJunk(text) || /<\/?[a-z]/i.test(text) || text.includes('&lt;') || text.includes('/_next/') || /preload|fetchpriority/i.test(text) || /<[a-z][^<>]*$/i.test(text)) {
+            reportLiveError('Live transcript returned an error page — please try again.');
+            return;
+          }
+          const targetChatId = chatIdRef.current;
+          try {
+            const st0 = useStore.getState();
+            const liveChat = st0.chats.find((c) => c.id === targetChatId);
+            const liveStreaming = liveChat?.messages.some((m) => m.streaming) ?? false;
+            if (liveStreaming) {
+              const userMsg = st0.addMessage(targetChatId, {
+                role: "user",
+                content: text,
+                steerPending: true,
+              });
+              forceScrollToBottom();
+              await steerChat(targetChatId, userMsg.id, text, [], [], {});
+              return;
+            }
+          } catch {
+            // Fall through to normal send.
+          }
+          // Ensure a still-streaming answer is cancelled before the new
+          // live turn starts (barge-in must not wait for the agent).
+          try {
+            const id = chatIdRef.current;
+            if (id) {
+              try {
+                abortMapRef.current.get(id)?.abort();
+              } catch {
+                // Already aborted.
+              }
+              try {
+                const ctrl = useStore.getState().chatAborts?.[id];
+                if (ctrl && !ctrl.signal.aborted) ctrl.abort();
+              } catch {
+                // Already aborted.
+              }
+            }
+          } catch {
+            // Best-effort.
+          }
+          // Let the aborted stream settle so the backend releases the turn
+          // before the new live message is sent (otherwise the new turn
+          // races the old finally block and never reaches the agent).
+          // Short budget: abort usually settles in 1-2 ticks, so barge-in
+          // feels instant instead of making the user wait out a full answer.
+          try {
+            // Settle budget: the aborted turn must release the backend slot
+            // before the new turn is sent, otherwise the new turn races the
+            // old finally block and never reaches the agent.
+            for (let i = 0; i < 30; i++) {
+              const cur = useStore.getState().chats.find((c) => c.id === targetChatId);
+              const stillStreaming = cur?.messages.some((m) => m.streaming);
+              if (!stillStreaming) break;
+              await new Promise((r) => setTimeout(r, 100));
+            }
+          } catch {
+            // Wait is best-effort.
+          }
+          // Progressive speech: speak the streaming answer from the first
+          // completed sentence instead of waiting for the full text, so the
+          // first audio arrives fast. Falls back to full-text speech only
+          // when streaming speech failed outright.
+          const liveTts = buildLiveTtsChain();
+          const streamFailedP = playTtsStream(
+            makeLiveStreamSource(targetChatId),
+            liveTts.args,
+            LIVE_TTS_OWNER,
+            liveTts.localCfg,
+          ).then(
+            () => false,
+            () => true,
+          );
+          liveSessionRef.current?.notifySpeaking(true);
+          setLiveState('speaking');
+          try {
+            await send(text);
+          } catch (err) {
+            // The aborted turn may still hold the backend slot: settle
+            // briefly and retry once instead of dropping the live turn.
+            try {
+              await new Promise((r) => setTimeout(r, 1500));
+              await send(text);
+            } catch (err2) {
+              stopTts(LIVE_TTS_OWNER);
+              liveSessionRef.current?.notifySpeaking(false);
+              if (liveSessionRef.current) setLiveState('live');
+              reportLiveError(err2 instanceof Error ? err2.message : String(err2));
+              return;
+            }
+          }
+          if (!liveSessionRef.current) {
+            stopTts(LIVE_TTS_OWNER);
+            return;
+          }
+          try {
+            if (await streamFailedP) await speakAnswer(targetChatId);
+          } catch (err) {
+            reportLiveError(err instanceof Error ? err.message : String(err));
+          } finally {
+            liveSessionRef.current?.notifySpeaking(false);
+            if (liveSessionRef.current) setLiveState('live');
+          }
+        },
+        onError: (e) => reportLiveError(e instanceof Error ? e.message : String(e)),
+      });
+      liveSessionRef.current = live;
+      await live.connect();
+    } catch (err) {
+      liveSessionRef.current = null;
+      setLiveState('error');
+      reportLiveError(err instanceof Error ? err.message : String(err));
+    }
+  };
+  const stopLive = () => {
+    try {
+      liveSessionRef.current?.disconnect();
+    } catch {
+      // Disconnect is best-effort; state reset below is what matters.
+    }
+    try {
+      stopTts(LIVE_TTS_OWNER);
+    } catch {
+      // TTS stop is best-effort.
+    }
+    liveSessionRef.current = null;
+    setLiveState('idle');
+  };
+  const toggleLive = () => {
+    if (liveState === 'connecting' || isLiveVoiceActive) stopLive();
+    else void startLive();
+  };
+  toggleLiveRef.current = toggleLive;
+  // Close the mic menu on outside click / Escape.
+  useEffect(() => {
+    if (!micMenuOpen) return;
+    function onDocClick(e: MouseEvent) {
+      if (micMenuRef.current && !micMenuRef.current.contains(e.target as Node)) {
+        setMicMenuOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setMicMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [micMenuOpen]);
+
   const startCmd = (at?: number) => {
     const el = textareaRef.current;
     // Slash picker stays available while streaming: picking only inserts
@@ -5110,11 +5882,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setCmdOpen({ at: pos });
     setSkillMention(null);
     setCmdQuery("");
-    setCmdIndex(0);
+    // Bottom-anchored like history: newest sits just above the bottom.
+    setCmdIndex(Math.max(0, COMMANDS.length - 1));
   };
 
   const acceptCmd = (name: string) => {
     if (!cmdOpen) return;
+    // Record usage on pick (like skills) so the next open sorts recent-last
+    // at the bottom even before the command runs via handleCommand.
+    setCommandUsage(recordCommandUsage(`/${name}`));
     const before = input.slice(0, cmdOpen.at);
     const after = input.slice(cmdOpen.at + 1 + cmdQuery.length);
     const next = `${before}/${name} ${after}`;
@@ -5158,8 +5934,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Only the popup's own scrollTop is adjusted, so the page never jumps.
   useEffect(() => {
     if (!skillMention) return;
-    scrollPopupRowIntoView(skillMentionPopupRef.current, ".mention-item.kbd");
-  }, [skillMention, skillMentionIdx, skillMentionQuery]);
+    scrollPopupRowIntoView(skillMentionPopupRef.current, ".hist-card.kbd");
+  }, [skillMention, skillMentionIdx, skillMentionQuery, filteredSkills.length]);
 
   // Keep the keyboard-highlighted slash-command row visible while
   // navigating with arrows / Ctrl+J/K (same container-only scrolling).
@@ -5176,14 +5952,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   const startSkillMention = (at: number) => {
     setCmdOpen(null);
+    // Fresh usage on every open so the order is always recent-first.
+    setSkillUsage(loadSkillUsage());
     setSkillMention({ at });
     setSkillMentionQuery("");
-    setSkillMentionIdx(0);
+    // Bottom-anchored like history: newest sits just above the bottom.
+    setSkillMentionIdx(Math.max(0, skillsList.length - 1));
     void ensureSkills();
   };
 
   const acceptSkillMention = (skill: SkillRow) => {
     if (!skillMention) return;
+    // Track usage so the next open sorts recent-first (like slash commands).
+    setSkillUsage(recordSkillUsage(skill.slug || skill.name));
     const before = input.slice(0, skillMention.at);
     const after = input.slice(skillMention.at + 1);
     // Replace the partial token after "@" (e.g. "ski") with the skill's slug —
@@ -5253,6 +6034,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const v = e.target.value;
     const prev = input;
     setInput(v);
+    // Typing diverges from the history preview: dismiss the popup but keep
+    // the edited text so the user can refine the previewed row.
+    if (historyOpen) setHistoryOpen(false);
 
     // Trigger popups from the inserted character (works on any keyboard layout
     // / IME, unlike e.key which can differ on Persian etc.).
@@ -5276,7 +6060,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           setCmdOpen(null);
         } else {
           setCmdQuery(after);
-          setCmdIndex(0);
+          const q = after.toLowerCase();
+          const count = COMMANDS.filter(
+            (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
+          ).length;
+          setCmdIndex(Math.max(0, count - 1));
         }
       }
     }
@@ -5290,7 +6078,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           setSkillMention(null);
         } else {
           setSkillMentionQuery(after);
-          setSkillMentionIdx(0);
+          const q = after.trim().toLowerCase();
+          const count = skillsList.filter(
+            (s) =>
+              !q ||
+              s.name.toLowerCase().includes(q) ||
+              (s.slug && s.slug.toLowerCase().includes(q)) ||
+              s.description.toLowerCase().includes(q),
+          ).length;
+          setSkillMentionIdx(Math.max(0, count - 1));
         }
       }
     }
@@ -5399,9 +6195,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return;
     }
     // Prompt history popup: ArrowUp on an empty composer opens the history
-    // (pins first, then recents); ArrowUp/Down navigate, Enter inserts the
-    // row into the input, Escape closes. Only when no other popup owns the
-    // chord and the caret is at the very start (no partial text to lose).
+    // (pins first, then recents); ArrowUp/Down navigate, Enter sends the
+    // row directly, Escape closes. ArrowDown past the bottom-most row
+    // closes the popup and clears the composer. Only when no other popup
+    // owns the chord and the caret is at the very start (no partial text
+    // to lose).
     if (!cmdOpen && !skillMention && !skillOpen && !historyOpen && e.key === "ArrowUp") {
       const el = textareaRef.current;
       const atStart = !el || ((el.selectionStart ?? 0) === 0 && (el.selectionEnd ?? 0) === 0);
@@ -5409,18 +6207,59 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         e.preventDefault();
         e.stopPropagation();
         setHistoryOpen(true);
-        setHistoryIdx(0);
+        // Bottom-anchored: newest sits just above the bottom, selection starts there.
+        // Live preview: the highlighted row appears in the input without Enter.
+        const openRows = historyRows(promptHistory, pinnedCmds);
+        const openIdx = Math.max(0, openRows.length - 1);
+        setHistoryIdx(openIdx);
+        if (openRows[openIdx] !== undefined) {
+          const openPreview = openRows[openIdx];
+          setInput(openPreview);
+          requestAnimationFrame(() => {
+            const previewEl = textareaRef.current;
+            if (previewEl) {
+              previewEl.focus();
+              previewEl.setSelectionRange(openPreview.length, openPreview.length);
+            }
+          });
+        }
         return;
       }
     }
     if (historyOpen) {
+      if (e.key === "Backspace" || e.key === "Delete") {
+        // Delete/Backspace closes the popup (like Esc) but still deletes.
+        setHistoryOpen(false);
+        return;
+      }
       const rows = historyRows(promptHistory, pinnedCmds);
       const d = navChord(e);
       if (d !== 0) {
         e.preventDefault();
         e.stopPropagation();
-        if (rows.length > 0)
-          setHistoryIdx((i) => (i + d + rows.length) % rows.length);
+        if (rows.length > 0) {
+          // Past the bottom-most row, ArrowDown exits history: close the
+          // popup and clear the composer instead of wrapping around.
+          if (d > 0 && historyIdx >= rows.length - 1) {
+            setHistoryOpen(false);
+            setInput("");
+            return;
+          }
+          // Live preview: every highlight appears in the input without Enter.
+          const next = (historyIdx + d + rows.length) % rows.length;
+          setHistoryIdx(next);
+          const preview = rows[next];
+          if (preview !== undefined) {
+            setInput(preview);
+            requestAnimationFrame(() => {
+              const previewEl = textareaRef.current;
+              if (previewEl) {
+                previewEl.focus();
+                previewEl.setSelectionRange(preview.length, preview.length);
+              }
+            });
+          }
+        }
         return;
       }
       if (rows.length > 0 && (e.key === "Enter" || e.key === "Tab")) {
@@ -5428,14 +6267,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         e.stopPropagation();
         const picked = rows[historyIdx] ?? rows[0];
         setHistoryOpen(false);
-        setInput(picked);
-        requestAnimationFrame(() => {
-          const el = textareaRef.current;
-          if (el) {
-            el.focus();
-            el.setSelectionRange(picked.length, picked.length);
-          }
-        });
+        submit(picked);
         return;
       }
       if (e.key === "Escape") {
@@ -5461,6 +6293,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // controller here was the cross-chat kill (Stop in B ended A's stream).
     const originId = chatIdRef.current;
     stoppedMapRef.current.set(originId, true);
+    // Codex-style: an explicit Stop also halts this chat's goal loop. The goal
+    // stays attached (paused=false) for manual sends, but auto-continue stays
+    // idle until the user presses Resume in the goal bar.
+    try {
+      useStore.getState().stopGoal(originId);
+    } catch {
+      /* ignore */
+    }
     // Single cancellation path: drop pending auto-retry timers and bump the
     // epoch so any armed retry firing afterwards is ignored — it never
     // restarts the turn or brings the retry banner back.
@@ -5604,6 +6444,135 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     >
       {titlebarEl && toolbar ? (isFocused ? createPortal(toolbar, titlebarEl) : toolbar) : toolbar}
       {titlebarRightEl && isFocused && createPortal(balanceChip, titlebarRightEl)}
+      {chat?.goal?.active && (() => {
+        // Goal strip pinned above the transcript so the active goal stays
+        // visible while scrolling. Quiet icon buttons; Pause/Clear also abort
+        // the live stream so they take effect immediately, and Resume
+        // continues the goal with a follow-up turn. The play icon shows
+        // whenever the goal is paused/stopped or the stream is idle (e.g.
+        // after the composer stop button), so there is always a visible way
+        // to resume. Codex-style: Stop halts the loop (stopped flag) without
+        // detaching the goal; only Pause/Clear change attachment.
+        const g = chat.goal!;
+        const goalChatId = chat.id;
+        const elapsedMs = Math.max(0, Date.now() - g.startedAt);
+        const mins = Math.floor(elapsedMs / 60000);
+        const elapsed = mins < 1 ? "<1m" : mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
+        const goalIdle = Boolean(g.paused || g.stopped);
+        const onGoalPause = () => {
+          useStore.getState().pauseGoal(goalChatId);
+          stop();
+        };
+        const onGoalResume = () => {
+          goalAutoRef.current.delete(goalChatId);
+                    try {
+                      stoppedMapRef.current?.delete(goalChatId);
+                    } catch {
+                      /* ignore */
+                    }
+          try {
+            goalSendingRef.current.forEach((k) => {
+              if (k.startsWith(`${goalChatId}:`)) goalSendingRef.current.delete(k);
+            });
+          } catch {
+            /* ignore */
+          }
+          // Cap-hit resume grants a fresh turn budget (explicit user action):
+          // without resetting turns the server would instantly re-pause on
+          // the stale counter. setGoal resets turns/flags for the same condition.
+          if ((g.turns ?? 0) >= MAX_GOAL_TURNS) {
+            useStore.getState().setGoal(goalChatId, g.condition);
+          } else {
+            useStore.getState().resumeGoal(goalChatId);
+          }
+          if (!busy) {
+            void send(`Continue working on the persistent goal: "${g.condition}".`, [], [], false, undefined, undefined, false, undefined, goalChatId);
+          }
+        };
+        const onGoalClear = () => {
+          useStore.getState().clearGoal(goalChatId);
+          stop();
+        };
+        const onGoalEdit = () => {
+          setInput(`/goal ${g.condition}`);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        };
+        const ghostBtn = {
+          background: "transparent",
+          border: "1px solid var(--border, #2a2a35)",
+          borderRadius: 6,
+          padding: "4px",
+          fontSize: 12,
+          lineHeight: 1,
+          cursor: "pointer",
+          color: "inherit",
+          opacity: 0.85,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+        };
+        return (
+          <div
+            className="goal-bar"
+            dir="ltr"
+            role="status"
+            aria-label={goalIdle ? "Goal paused" : "Active goal"}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "6px 10px",
+              margin: "8px 12px 0",
+              borderRadius: 10,
+              border: "1px solid var(--border, #2a2a35)",
+              background: "var(--panel, rgba(120, 120, 160, 0.08))",
+              fontSize: 12,
+              minWidth: 0,
+            }}
+          >
+            <span
+              className="goal-dot"
+              aria-hidden="true"
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                flexShrink: 0,
+                background: goalIdle ? "var(--warning, #d9a13b)" : "var(--success, #3fb950)",
+              }}
+            />
+            <span className="goal-label" style={{ fontFamily: "monospace", opacity: 0.8, flexShrink: 0 }}>/goal</span>
+            <span
+              className="goal-cond"
+              dir="auto"
+              title={g.condition}
+              style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              {g.condition}
+            </span>
+            <span className="goal-meta" style={{ opacity: 0.6, flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>
+              {elapsed}{typeof g.turns === "number" ? ` · ${g.turns} turn${g.turns === 1 ? "" : "s"}` : ""}{g.paused ? " · paused" : g.stopped ? " · stopped" : ""}
+            </span>
+            <span className="goal-actions" style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+              {goalIdle || !busy ? (
+                <button type="button" className="goal-btn" style={ghostBtn} onClick={onGoalResume} title="Resume goal" aria-label="Resume goal">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+                </button>
+              ) : (
+                <button type="button" className="goal-btn" style={ghostBtn} onClick={onGoalPause} title="Pause goal" aria-label="Pause goal">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+                </button>
+              )}
+              <button type="button" className="goal-btn" style={ghostBtn} onClick={onGoalEdit} title="Edit goal" aria-label="Edit goal">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 17.25V21h3.75L17.8 9.94l-3.75-3.75L3 17.25zM20.7 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" /></svg>
+              </button>
+              <button type="button" className="goal-btn" style={ghostBtn} onClick={onGoalClear} title="Clear goal" aria-label="Clear goal">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z" /></svg>
+              </button>
+            </span>
+          </div>
+        );
+      })()}
       <div
         className="chat-scroll"
         ref={scrollRef}
@@ -5875,6 +6844,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             compactError ||
             compactNotice ||
             skillNotice ||
+            liveError ||
+            chat?.liveError ||
+            chat?.ttsError ||
             prefixNotice ||
             compacting) && (
               <div className="chat-notices">
@@ -5972,6 +6944,39 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       className="notice-dismiss"
                       onClick={() =>
                         useStore.getState().setChatSkillNotice(chat.id, null)
+                      }
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {(liveError || chat?.liveError) && (
+                  <div className="notice-banner notice-error" dir="ltr">
+                    <span className="notice-icon">⚠</span>
+                    <span className="notice-text">{liveError ?? chat?.liveError}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() => {
+                        setLiveError(null);
+                        if (chat) useStore.getState().setChatLiveError(chat.id, null);
+                      }}
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+                {chat?.ttsError && (
+                  <div className="notice-banner notice-error" dir="ltr">
+                    <span className="notice-icon">⚠</span>
+                    <span className="notice-text">{chat.ttsError}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatTtsError(chat.id, null)
                       }
                       title="Dismiss"
                     >
@@ -6547,9 +7552,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           )}
           <div className="composer-input-wrap">
             {historyOpen && (
-              // Codex-style history: entries render as cards split into a
-              // "Pinned" section (max 3) and a "Recent" section. Click / Enter
-              // inserts the row into the composer (no auto-send).
+              // Terminal-style history: oldest on top, newest just above the
+              // bottom, pins (max 3) last at the very bottom. Click / Enter
+              // sends the row directly via submit.
               <div className="mention-popup history-popup" dir="ltr" ref={historyPopupRef}>
                 {(() => {
                   const rows = historyRows(promptHistory, pinnedCmds);
@@ -6557,24 +7562,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   const recentRows = rows.filter((r) => !pinnedCmds.includes(r));
                   const insert = (row: string) => {
                     setHistoryOpen(false);
-                    // Slash commands get a trailing space so args can be
-                    // typed right away (acceptCmd already does the same).
-                    const next =
-                      isSlashCommand(row) && !/\s$/.test(row) ? `${row} ` : row;
-                    setInput(next);
-                    requestAnimationFrame(() => {
-                      const el = textareaRef.current;
-                      if (el) {
-                        el.focus();
-                        el.setSelectionRange(next.length, next.length);
-                      }
-                    });
+                    submit(row);
                   };
                   const renderCard = (row: string) => {
                     const i = rows.indexOf(row);
                     const pinned = pinnedCmds.includes(row);
                     const slash = isSlashCommand(row);
-                    // Codex-style card lines shared with unit tests.
+                    // Terminal-style row lines shared with unit tests.
                     const title = historyTitle(row);
                     const meta = historyMeta(row);
                     const sub = meta && meta !== title ? meta : null;
@@ -6582,7 +7576,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       <div
                         key={row}
                         className={`hist-card${i === historyIdx ? " kbd" : ""}`}
-                        onMouseEnter={() => setHistoryIdx(i)}
+                        onMouseEnter={() => {
+                          setHistoryIdx(i);
+                          setInput(row);
+                        }}
                         onMouseDown={(e) => {
                           e.preventDefault();
                           insert(row);
@@ -6593,7 +7590,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                             className={`hist-card-icon${slash ? " cmd" : ""}`}
                             aria-hidden="true"
                           >
-                            {slash ? "✦" : "↩"}
+                            {slash ? "✦" : "$"}
                           </span>
                           <span className="hist-card-title">{title}</span>
                           <button
@@ -6618,21 +7615,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       {rows.length === 0 && (
                         <div className="mention-empty">No history yet</div>
                       )}
-                      {pinnedRows.length > 0 && (
-                        <div className="hist-section">
-                          <div className="hist-section-label">Pinned</div>
-                          {pinnedRows.map(renderCard)}
-                        </div>
-                      )}
                       {recentRows.length > 0 && (
                         <div className="hist-section">
-                          <div className="hist-section-label">Recent</div>
+                          <div className="hist-section-label">$ recent</div>
                           {recentRows.map(renderCard)}
+                        </div>
+                      )}
+                      {pinnedRows.length > 0 && (
+                        <div className="hist-section">
+                          <div className="hist-section-label">$ pinned</div>
+                          {pinnedRows.map(renderCard)}
                         </div>
                       )}
                       {rows.length > 0 && (
                         <div className="hist-hint">
-                          ↑↓ navigate · Enter insert · Esc close
+                          ↑↓ navigate · Enter send · Esc close
                         </div>
                       )}
                     </>
@@ -6641,21 +7638,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               </div>
             )}
             {cmdOpen && (
-              <div className="mention-popup history-popup cmd-popup" dir="ltr" ref={cmdPopupRef}>
-                <div className="mention-head">
-                  <span className="mention-head-icon">/</span>
-                  <span>Commands</span>
-                  <span className="mention-head-count">
-                    {filteredCmds.length}
-                  </span>
-                </div>
+              <div className="mention-popup history-popup" dir="ltr" ref={cmdPopupRef}>
                 {filteredCmds.length === 0 && (
                   <div className="mention-empty">No matching commands</div>
                 )}
                 {filteredCmds.map((c, i) => (
                   <div
                     key={c.name}
-                    className={`hist-card cmd-card${i === cmdIndex ? " kbd" : ""}`}
+                    className={`hist-card${i === cmdIndex ? " kbd" : ""}`}
                     onMouseEnter={() => setCmdIndex(i)}
                     onMouseDown={(e) => {
                       e.preventDefault();
@@ -6682,14 +7672,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               </div>
             )}
             {skillMention && (
-              <div className="mention-popup" dir="ltr" ref={skillMentionPopupRef}>
-                <div className="mention-head">
-                  <span className="mention-head-icon">@</span>
-                  <span>Skills</span>
-                  <span className="mention-head-count">
-                    {filteredSkills.length}
-                  </span>
-                </div>
+              <div className="mention-popup history-popup" dir="ltr" ref={skillMentionPopupRef}>
                 {skillsLoading && skillsList.length === 0 && (
                   <div className="mention-empty">Loading skills…</div>
                 )}
@@ -6701,20 +7684,37 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {skillsList.length > 0 && filteredSkills.length === 0 && (
                   <div className="mention-empty">No matching skills</div>
                 )}
-                {filteredSkills.map((s, i) => (
-                  <div
-                    key={s.name}
-                    className={`mention-item skill${i === skillMentionIdx ? " kbd" : ""}`}
-                    onMouseEnter={() => setSkillMentionIdx(i)}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      acceptSkillMention(s);
-                    }}
-                  >
-                    <span className="mention-rel">@{s.slug || s.name}</span>
-                    <span className="mention-hint">{s.description}</span>
+                {filteredSkills.map((s, i) => {
+                  const title = `@${s.slug || s.name}`;
+                  const sub = (s.description || "").trim() ? s.description.trim() : null;
+                  return (
+                    <div
+                      key={s.name}
+                      className={`hist-card${i === skillMentionIdx ? " kbd" : ""}`}
+                      onMouseEnter={() => setSkillMentionIdx(i)}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        acceptSkillMention(s);
+                      }}
+                    >
+                      <div className="hist-card-head">
+                        <span
+                          className="hist-card-icon skill"
+                          aria-hidden="true"
+                        >
+                          @
+                        </span>
+                        <span className="hist-card-title">{title}</span>
+                      </div>
+                      {sub && <div className="hist-card-sub">{sub}</div>}
+                    </div>
+                  );
+                })}
+                {filteredSkills.length > 0 && (
+                  <div className="hist-hint">
+                    ↑↓ navigate · Enter insert · Esc close
                   </div>
-                ))}
+                )}
               </div>
             )}
             {skillOpen && (
@@ -6813,6 +7813,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     })}
                   </div>
                 )}
+              </div>
+            )}
+            {activeQuote && (
+              <div className="paste-cards">
+                <div className="paste-card" dir="ltr">
+                  <button
+                    className="chip-x paste-card-x"
+                    onClick={() => setActiveQuote(null)}
+                    title="Remove reply quote"
+                  >
+                    ×
+                  </button>
+                  <div className="paste-card-preview">
+                    {activeQuote}
+                  </div>
+                  <div className="paste-card-foot">
+                    <span className="paste-card-badge">Replying to</span>
+                  </div>
+                </div>
               </div>
             )}
             {pastedBlocks.length > 0 && (
@@ -7110,6 +8129,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </div>
                 </div>
                 <div className="composer-right-actions" ref={composerRightRef}>
+                  {showLiveActive && (
+                    <button
+                      type="button"
+                      className="live-stop-pill"
+                      onClick={toggleLive}
+                      title="Stop live voice"
+                    >
+                      <span className="live-dots" aria-hidden="true">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                      <span>Stop</span>
+                    </button>
+                  )}
+                  {(showVoiceButtons || showLiveActive) && (
+                  <>
+                  {showVoiceButtons && (
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onClick={toggleRecording}
@@ -7159,6 +8196,154 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       </svg>
                     )}
                   </button>
+                  )}
+                    {(showLiveIdle || showLiveActive) && (
+                    <div className="live-btn-wrap" ref={micMenuRef}>
+                      <button
+                        type="button"
+                        className={`icon-btn attach-btn live-btn${showLiveActive ? " live-active" : ""}`}
+                        onClick={toggleLive}
+                        title={showLiveActive ? "Stop live voice" : "Live voice conversation (Ctrl+X then L)"}
+                      >
+                        {showLiveActive ? (
+                          <span className="wave animate" aria-hidden="true">
+                            <span className="wave-bar" />
+                            <span className="wave-bar" />
+                            <span className="wave-bar" />
+                            <span className="wave-bar" />
+                          </span>
+                        ) : (
+                          <span className="wave" aria-hidden="true">
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M4.5 10v4" />
+                              <path d="M8.5 7v10" />
+                              <path d="M12 4v16" />
+                              <path d="M15.5 7v10" />
+                              <path d="M19.5 10v4" />
+                            </svg>
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="live-chev-btn"
+                        aria-label="Choose microphone"
+                        aria-expanded={micMenuOpen}
+                        onClick={() => {
+                          if (!micMenuOpen) void refreshMicDevices();
+                          setMicMenuOpen((v) => !v);
+                        }}
+                      >
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M6 9l6 6 6-6" />
+                        </svg>
+                      </button>
+                      {micMenuOpen && (
+                        <div className="mic-menu" role="menu" aria-label="Microphone" dir="ltr">
+                          <div className="mic-menu-head">
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                              <line x1="12" y1="19" x2="12" y2="22" />
+                            </svg>
+                            <span className="mic-level"><span className="mic-level-dot" /></span>
+                          </div>
+                          {(() => {
+                            const normalizeMicLabel = (raw: string) => {
+                              let label = (raw || "").trim() || "Microphone";
+                              // Strip trailing USB ids like " (1235:800e)" and leading
+                              // "Default -" prefixes (any dash variant) repeatedly so
+                              // "Default - Default - X (1235:800e)" collapses to "X".
+                              for (let i = 0; i < 5; i++) {
+                                const noUsb = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim();
+                                if (noUsb !== label) {
+                                  label = noUsb || label;
+                                  continue;
+                                }
+                                const noDef = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
+                                if (noDef !== label) {
+                                  label = noDef || label;
+                                  continue;
+                                }
+                                break;
+                              }
+                              label = label.replace(/\s+/g, " ").trim() || "Microphone";
+                              // Guard against a missed prefix leaving "Default - X".
+                              const guard = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
+                              if (guard) label = guard;
+                              label = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim() || label;
+                              return label;
+                            };
+                            const stripDefaultPrefix = normalizeMicLabel;
+                            const seenLabels = new Set<string>();
+                            const uniqueDevices = micDevices.filter((d) => {
+                              const norm = stripDefaultPrefix(d.label || "Microphone").toLowerCase();
+                              if (seenLabels.has(norm)) return false;
+                              seenLabels.add(norm);
+                              return true;
+                            });
+                            const rawFirst = uniqueDevices.length > 0 ? stripDefaultPrefix(uniqueDevices[0].label || "Microphone") : "";
+                            const firstName = rawFirst.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim() || rawFirst;
+                            const rows = [
+                              { id: "", label: firstName ? `Default - ${firstName}` : "Default" },
+                              ...uniqueDevices
+                                .filter((d) => {
+                                  const id = (d.deviceId ?? "").trim();
+                                  // The "default" pseudo-device duplicates the synthetic row.
+                                  if (!id || id.toLowerCase() === "default") return false;
+                                  return true;
+                                })
+                                .map((d, i) => ({
+                                  id: d.deviceId ?? "",
+                                  label: stripDefaultPrefix(d.label || `Microphone ${i + 1}`),
+                                })),
+                            ];
+                            return rows.map((r, i) => {
+                              const active = (selectedMicId || "") === r.id;
+                              return (
+                                <button
+                                  key={`${r.id || "default"}-${i}`}
+                                  type="button"
+                                  role="menuitemradio"
+                                  aria-checked={active}
+                                  className={`mic-item${active ? " active" : ""}`}
+                                  onClick={() => void selectMicDevice(r.id)}
+                                >
+                                  <span className="mic-item-label">{r.label}</span>
+                                  {active && <span className="mic-check" aria-hidden="true">✓</span>}
+                                </button>
+                              );
+                            });
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                    )}
+                  </>
+                  )}
                   {ctxPopoverOpen &&
                     ctxBreakdown &&
                     ctxPopoverPos &&
@@ -7249,25 +8434,73 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       </div>,
                       document.body,
                     )}
-                  {busy ? (
-                    <button
-                      className="send-circle-btn stop-btn"
-                      onClick={stop}
-                      title="Stop"
-                    >
-                      <svg viewBox="0 0 24 24" fill="currentColor">
-                        <rect x="6" y="6" width="12" height="12" rx="2" />
-                      </svg>
-                    </button>
-                  ) : (
+                  {showLiveActive ? null : showStopOnly ? (
+                    <>
+                      <button
+                        className="send-circle-btn stop-btn"
+                        onClick={stop}
+                        title="Stop"
+                      >
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                          <rect x="6" y="6" width="12" height="12" rx="2" />
+                        </svg>
+                      </button>
+                      {showDictateDuringStreaming && (
+                        <button
+                          className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                          onClick={toggleRecording}
+                          title={
+                            transcribing
+                              ? "Transcribing voice…"
+                              : recording
+                                ? "Stop recording (Ctrl+X Space)"
+                                : "Record voice input (Ctrl+X then Space)"
+                          }
+                        >
+                          {recording ? (
+                            <span className="wave animate" aria-hidden="true">
+                              <span className="wave-bar" />
+                              <span className="wave-bar" />
+                              <span className="wave-bar" />
+                              <span className="wave-bar" />
+                            </span>
+                          ) : transcribing ? (
+                            <span className="wave transcribing" aria-hidden="true">
+                              <svg
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              >
+                                <circle cx="12" cy="12" r="10" />
+                                <path d="M8 9l0 6" />
+                                <path d="M12 7l0 10" />
+                                <path d="M16 9l0 6" />
+                              </svg>
+                            </span>
+                          ) : (
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                              <line x1="12" y1="19" x2="12" y2="22" />
+                            </svg>
+                          )}
+                        </button>
+                      )}
+                    </>
+                  ) : showSendOnly ? (
                     <button
                       className="send-circle-btn"
-                      disabled={
-                        !input.trim() &&
-                        pastedBlocks.length === 0 &&
-                        images.length === 0
-                      }
-                      onClick={submit}
+                      onClick={() => submit()}
                       title="Send"
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -7276,7 +8509,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         <line x1="5" y1="13" x2="14" y2="13" />
                       </svg>
                     </button>
-                  )}
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -7284,127 +8517,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         </div>
 
         <div className="composer-footer">
-          {nvimLabel && (
-            <div className="nvim-wrap">
-              <button
-                type="button"
-                className={`nvim-label${nvimMentioned ? " selected" : ""}`}
-                dir="ltr"
-                title={
-                  nvimMentioned
-                    ? "Will be mentioned in your next message — click to deselect"
-                    : `Open in Neovim: ${nvimFile} — click to mention in your next message`
-                }
-                onClick={() => setNvimMentioned((m) => !m)}
-              >
-                <span className="nvim-glyph">nvim</span>
-                <span className="nvim-file">{nvimBadge}</span>
-                {nvimDiagCounts.error +
-                  nvimDiagCounts.warning +
-                  nvimDiagCounts.info +
-                  nvimDiagCounts.hint >
-                  0 && (
-                    <span
-                      className={`nvim-lsp${lspOpen ? " open" : ""}`}
-                      dir="ltr"
-                      role="button"
-                      tabIndex={0}
-                      title="LSP diagnostics — click to view"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setLspOpen((v) => !v);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setLspOpen((v) => !v);
-                        }
-                      }}
-                    >
-                      {nvimDiagCounts.error > 0 && (
-                        <span className="lsp-count lsp-error" title="LSP errors">
-                          {nvimDiagCounts.error}✕
-                        </span>
-                      )}
-                      {nvimDiagCounts.warning > 0 && (
-                        <span
-                          className="lsp-count lsp-warning"
-                          title="LSP warnings"
-                        >
-                          {nvimDiagCounts.warning}!
-                        </span>
-                      )}
-                      {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
-                        <span
-                          className="lsp-count lsp-info"
-                          title="LSP info/hints"
-                        >
-                          {nvimDiagCounts.info + nvimDiagCounts.hint}·
-                        </span>
-                      )}
-                    </span>
-                  )}
-                <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
-              </button>
-              {lspOpen && nvimDiags.length > 0 && (
-                <div
-                  className="nvim-lsp-pop"
-                  dir="ltr"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <div className="nvim-lsp-pop-head">
-                    <span className="nvim-lsp-pop-title">
-                      LSP diagnostics — {nvimBadge}
-                    </span>
-                    <button
-                      type="button"
-                      className="nvim-lsp-pop-close"
-                      onClick={() => setLspOpen(false)}
-                    >
-                      ×
-                    </button>
-                  </div>
-                  <div className="nvim-lsp-pop-list">
-                    {nvimDiags.map((d, i) => {
-                      const sev =
-                        d.severity === 1 ||
-                          d.severity === "Error" ||
-                          d.severity === "error"
-                          ? "error"
-                          : d.severity === 2 ||
-                            d.severity === "Warning" ||
-                            d.severity === "warning"
-                            ? "warning"
-                            : d.severity === 3 ||
-                              d.severity === "Information" ||
-                              d.severity === "information"
-                              ? "info"
-                              : "hint";
-                      const loc = `${(d.lnum ?? 0) + 1}:${(d.col ?? 0) + 1}`;
-                      const src = d.source
-                        ? `${d.source}${d.code != null ? ` ${d.code}` : ""}`
-                        : "";
-                      return (
-                        <div key={i} className={`nvim-diag nvim-diag-${sev}`}>
-                          <span className="nvim-diag-sev">
-                            {sev === "error"
-                              ? "✕"
-                              : sev === "warning"
-                                ? "!"
-                                : "·"}
-                          </span>
-                          <span className="nvim-diag-loc">{loc}</span>
-                          <span className="nvim-diag-msg">{d.message}</span>
-                          {src && <span className="nvim-diag-src">{src}</span>}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
           <span className="composer-footer-right">
             <span className="composer-mode">
               <ModeSelect
@@ -7465,6 +8577,50 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           </span>
         </div>
       </div>
+      {quoteSel && (
+        <button
+          type="button"
+          className="chat-quote-reply"
+          title="Reply to selection"
+          aria-label="Reply to selected text"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={applyQuoteSel}
+          style={{
+            position: "fixed",
+            left: quoteSel.x,
+            top: quoteSel.y,
+            transform: "translate(-50%, -100%)",
+            zIndex: 60,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "6px 10px",
+            borderRadius: 10,
+            border: "1px solid var(--border, #2a2a35)",
+            background: "var(--bg-panel, #313244)",
+            color: "var(--text, #cdd6f4)",
+            boxShadow: "var(--shadow, 0 4px 20px rgba(0,0,0,0.35))",
+            cursor: "pointer",
+            fontSize: 12,
+          }}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9 14L4 9l5-5" />
+            <path d="M4 9h10a5 5 0 015 5v6" />
+          </svg>
+          <span>Reply</span>
+        </button>
+      )}
       {dragOver && (
         <div className="chat-drop-overlay" aria-hidden="true">
           <span>Drop to attach to input</span>

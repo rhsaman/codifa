@@ -478,14 +478,24 @@ function RightPanelContent() {
       className="right-panel"
       role="complementary"
       aria-label="Right panel"
-      style={{ width }}
+      style={{
+        width,
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minHeight: 0,
+        overflow: "hidden",
+      }}
     >
       <div
         className="right-panel-resize-handle"
         title="Drag to resize"
         onMouseDown={startResize}
       />
-      <div className="right-panel-body">
+      <div
+        className="right-panel-body"
+        style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}
+      >
         <ScheduleSection />
         <SubagentsSection />
         <TodosSection />

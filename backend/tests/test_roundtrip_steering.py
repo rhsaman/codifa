@@ -31,7 +31,7 @@ def test_checklist_continuation_rule_prefers_batching():
 
     history = [
         {
-            "mode": "coder",
+            "mode": "build",
             "plan": [{"content": "do the thing", "status": "pending"}],
         }
     ]

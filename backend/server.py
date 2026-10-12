@@ -18,7 +18,7 @@ import re
 import secrets
 import time
 import tracemalloc
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Annotated
 from urllib.parse import quote
 
@@ -165,6 +165,13 @@ PERMISSION_GATES: dict[str, asyncio.Future] = {}
 # Pending multiple-choice / open questions the agent asked the user mid-task.
 # Resolved by /ask/respond and awaited by the agent's ask_user tool.
 ASK_GATES: dict[str, asyncio.Future] = {}
+# Cap (seconds) on CONTINUOUS model silence while the SSE socket stays alive
+# via keepalives. Past it, _with_keepalive raises _ModelSilenceTimeout so the
+# stream is torn down and the frontend auto-resumes from its checkpoint
+# instead of ticking "waiting for model" forever. Kept above the 900s tool
+# deadline so a healthy long-running tool is never killed by it. Not counted
+# while the model's reasoning window is open (see `_with_keepalive`).
+MODEL_SILENCE_CAP_S = 1200
 # Google OAuth sign-in state: generated `state` token -> dict(client_id,
 # client_secret, redirect_uri, expiry). Populated by /oauth/google/start (when
 # the Electron main opens the consent window) and consumed by the callback that
@@ -249,6 +256,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
 
     _spawn_tracked(_bg(), "models-dev-preload")
+
+    async def _warm_local_voices() -> None:
+        # Preload G2P + pocket TTS weights in the background so the first
+        # speaker-icon click never pays the cold-load cost inside the
+        # user-visible request timeout. Best-effort, never crashes startup.
+        try:
+            import asyncio as _aio
+            import local_tts as _warm_mod
+
+            await _aio.to_thread(_warm_mod.warmup_local_tts)
+        except Exception:
+            logger.debug("local TTS warmup spawn failed", exc_info=True)
+
+    # Opt-in: preloading G2P (T5) + pocket weights pins several GB of RAM on
+    # EVERY launch (and again for every extra sidecar), even when TTS is never
+    # used. Default is lazy: the first speaker click loads the models once and
+    # they are evicted after idle. Set TTS_WARMUP_AT_START=1 to restore preload.
+    if os.environ.get("TTS_WARMUP_AT_START", "").strip().lower() in ("1", "true", "yes"):
+        _spawn_tracked(_warm_local_voices(), "local-tts-warmup")
     _stop = await _start_schedule_loop()
     # The embedding ONNX model (~1.1 GB resident) is deliberately NOT preloaded
     # here: it loads lazily on the first real embed call (embeddings._load) and
@@ -599,7 +625,7 @@ async def _execute_schedule(schedule_id: str, run_id: str | None = None) -> None
             api_key=str(provider_cfg.get("apiKey") or ""),
             env_var=str(provider_cfg.get("envVar") or ""),
             root=root,
-            mode=str(task.get("mode") or "coder"),
+            mode=str(task.get("mode") or "build"),
             prompt=prompt,
             history=[],
             permission_gates=None,
@@ -667,7 +693,7 @@ class ScheduleUpsertRequest(BaseModel):
     cron: str = ""
     enabled: bool = True
     root: str = ""
-    mode: str = "coder"
+    mode: str = "build"
     provider_id: str = ""
     model: str = ""
 
@@ -718,7 +744,7 @@ async def schedules_upsert(req: ScheduleUpsertRequest) -> dict:
         "cron": cron,
         "enabled": bool(req.enabled),
         "root": (req.root or "").strip() or str(base.get("root") or ""),
-        "mode": (req.mode or "").strip() or str(base.get("mode") or "coder"),
+        "mode": (req.mode or "").strip() or str(base.get("mode") or "build"),
         "provider_id": (req.provider_id or "").strip(),
         "model": (req.model or "").strip(),
     }
@@ -905,14 +931,6 @@ class ChatRequest(BaseModel):
     # User pre-approved desktop-app control (the `computer` tool's mutating
     # actions) for this session — set by "Always allow" in the UI.
     allow_computer: bool = False
-    # Absolute path of the file currently open in Neovim (auto-mentioned unless
-    # the user disabled it). Resolved against the workspace root; ignored if it
-    # escapes the root or the auto-mention is off.
-    nvim_file: str = ""
-    # LSP diagnostics Neovim reported for the open file (array of dicts with
-    # lnum/col/severity/source/code/message). Summarized into the agent's
-    # context so it can see what's wrong in the active file.
-    nvim_diagnostics: list[dict] = []
     # Chat id (renderer-side) so plans can be stored per chat
     # (<data>/plan/<workspace>/<chat-id>/plan.md) instead of per workspace.
     chat_id: str = ""
@@ -940,12 +958,16 @@ class ChatRequest(BaseModel):
     # The reserved headroom is implicit: `(100 - compact_at_percent)%` of the
     # window is left free. Range 1-99. Default 80.
     compact_at_percent: int = 80
-    # Max tool-loop steps per turn (Settings → General). 0 = backend auto from
-    # the context window (12–40). N > 0 = fixed budget (clamped 5–200).
-    max_steps: int = 0
     # Explicit restart (message retry icon / truncate-and-restart). Skips the
     # interrupted-turn checkpoint and clears it so old tool work is not replayed.
     restart: bool = False
+    # Persistent goal condition for /goal (Claude-style completion-condition).
+    # Plain text or {"condition": ...}; empty/None means no active goal.
+    goal: str | dict | None = None
+    # Cumulative goal turns completed so far (client counter). The server adds
+    # one per judged turn and enforces GOAL_MAX_EXTRA_TURNS authoritatively —
+    # a missing/old client can never spin the loop forever.
+    goal_turns: int = 0
 
 
 class CompactRequest(BaseModel):
@@ -990,6 +1012,7 @@ class ModelsRequest(BaseModel):
     env_var: str = ""
     api_keys: list[str] = []
     base_url: str = ""
+    provider_id: str = ""
 
 
 class ModelTestRequest(ModelsRequest):
@@ -999,7 +1022,7 @@ class ModelTestRequest(ModelsRequest):
 
 
 class ModelDownloadRequest(BaseModel):
-    """Download a managed on-device model (whisper / embedding)."""
+    """Download a managed on-device model (whisper / embedding / piper)."""
 
     kind: str = ""
     model: str = ""
@@ -1020,7 +1043,7 @@ class ModelControlRequest(BaseModel):
 
 
 class TtsRequest(BaseModel):
-    """POST /tts — synthesize text via an OpenAI-compatible /audio/speech endpoint."""
+    """POST /tts — synthesize text via OpenAI-compatible endpoint or local Piper."""
 
     text: str = ""
     provider: str = ""
@@ -1029,6 +1052,11 @@ class TtsRequest(BaseModel):
     env_var: str = ""
     model: str = ""
     voice: str = ""
+    ttsProvider: str = ""
+    ttsProviderId: str = ""
+    ttsModel: str = ""
+    ttsBaseUrl: str = ""
+    ttsVoice: str = ""
 
 
 class PermissionResponse(BaseModel):
@@ -1837,11 +1865,24 @@ async def models_test(req: ModelTestRequest) -> dict:
             req.env_var,
             req.api_keys,
             timeout=MODEL_TEST_CLIENT_TIMEOUT,
+            provider_id=req.provider_id,
+            # Chat-representative max_tokens so the provider's quota
+            # pre-check behaves like a real turn: a tiny cap
+            # can pass while the chat's 32K reservation fails with
+            # 402, producing a false tick. Actual burn stays ~1 token
+            # ("OK"), only the reservation is checked.
+            max_tokens=32000,
+            thinking_level="off",
         )
         text, _usage = await asyncio.wait_for(
             llm_complete(mo, user="Reply with the single word: OK"),
             timeout=MODEL_TEST_TIMEOUT,
         )
+        if not (text or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="empty reply — model returned no content (quota exhausted or route unavailable)",
+            )
     except asyncio.TimeoutError as exc:
         raise HTTPException(
             status_code=400,
@@ -1856,6 +1897,72 @@ async def models_test(req: ModelTestRequest) -> dict:
     return {"ok": True, "reply": (text or "").strip()[:200]}
 
 
+class ModelTestBatchRequest(ModelsRequest):
+    """POST /models/test-batch — probe many models in one round trip."""
+
+    models: list[str] = []
+
+
+@app.post("/models/test-batch")
+async def models_test_batch(req: ModelTestBatchRequest) -> dict:
+    """Probe many models concurrently, same probe as single test.
+
+    Single HTTP round trip for group tests (composer + settings selectors).
+    Each model uses the exact same build_chat_model + llm_complete path as
+    POST /models/test and a real chat turn, so a 402/insufficient-quota
+    failure marks that model as failed instead of ticking it.
+    """
+    models = [str(m or "").strip() for m in (req.models or []) if str(m or "").strip()][:100]
+    if not models:
+        raise HTTPException(status_code=400, detail="no models selected")
+    sem = asyncio.Semaphore(10)
+
+    async def _probe(model: str) -> dict:
+        async with sem:
+            try:
+                mo = build_chat_model(
+                    req.provider,
+                    model,
+                    req.base_url,
+                    req.api_key,
+                    req.env_var,
+                    req.api_keys,
+                    timeout=MODEL_TEST_CLIENT_TIMEOUT,
+                    provider_id=req.provider_id,
+                    # Chat-representative max_tokens so the provider's quota
+                    # pre-check behaves like a real turn: a tiny cap
+                    # can pass while the chat's 32K reservation fails with
+                    # 402, producing a false tick. Actual burn stays ~1 token
+                    # ("OK"), only the reservation is checked.
+                    max_tokens=32000,
+                    thinking_level="off",
+                )
+                text, _usage = await asyncio.wait_for(
+                    llm_complete(mo, user="Reply with the single word: OK"),
+                    timeout=MODEL_TEST_TIMEOUT,
+                )
+                if not (text or "").strip():
+                    return {
+                        "model": model,
+                        "ok": False,
+                        "error": "empty reply — model returned no content (quota exhausted or route unavailable)",
+                    }
+                return {"model": model, "ok": True, "reply": (text or "").strip()[:200]}
+            except asyncio.TimeoutError:
+                return {
+                    "model": model,
+                    "ok": False,
+                    "error": f"timeout — model did not answer in {MODEL_TEST_TIMEOUT}s",
+                }
+            except providers.ProviderError as exc:
+                return {"model": model, "ok": False, "error": str(exc)}
+            except Exception as exc:  # noqa: BLE001 — real provider error per model
+                return {"model": model, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    results = await asyncio.gather(*(_probe(m) for m in models))
+    return {"results": list(results)}
+
+
 # --- managed on-device models (whisper / embedding) --------------------- #
 # Download & removal are user-initiated from Settings → Models (never
 # automatic). Downloads run on a background thread; /models/status is polled
@@ -1864,13 +1971,24 @@ async def models_test(req: ModelTestRequest) -> dict:
 
 @app.post("/models/download")
 async def models_download(req: ModelDownloadRequest) -> dict:
+    if (req.kind or "").strip().lower() == _PIPER_KIND:
+        voice = _normalize_piper_voice_id((req.model or "").strip() or DEFAULT_PIPER_VOICE)
+        if not _local_tts.start_download(voice):
+            raise HTTPException(status_code=400, detail="empty local TTS voice id")
+        return {"ok": True, "kind": _PIPER_KIND, "model": voice}
     import model_download
 
     kind = (req.kind or "").strip() or model_download.KIND_EMBEDDING
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+    if kind not in (
+        model_download.KIND_WHISPER,
+        model_download.KIND_EMBEDDING,
+        model_download.KIND_DECISION,
+    ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     if kind == model_download.KIND_WHISPER:
         default_repo = model_download.WHISPER_DEFAULT_REPO
+    elif kind == model_download.KIND_DECISION:
+        default_repo = model_download.DECISION_DEFAULT_REPO
     else:
         default_repo = model_download.EMBEDDING_DEFAULT_REPO
     model = (req.model or "").strip() or default_repo
@@ -1883,7 +2001,14 @@ async def models_download(req: ModelDownloadRequest) -> dict:
 async def models_status() -> dict:
     import model_download
 
-    return model_download.status()
+    data = model_download.status()
+    try:
+        snapshot = _local_tts.download_snapshot()
+    except Exception:
+        snapshot = {"state": "idle", "model": "", "progress": 0.0, "error": ""}
+    if isinstance(data, dict):
+        return {**data, "piper": snapshot}
+    return {"status": data, "piper": snapshot}
 
 
 @app.get("/models/embedding-status")
@@ -1896,10 +2021,19 @@ async def models_embedding_status() -> dict:
 
 @app.post("/models/remove")
 async def models_remove(req: ModelRemoveRequest) -> dict:
+    kind = (req.kind or "").strip().lower()
+    if kind == _PIPER_KIND:
+        raw = (req.model or "").strip()
+        voice = _normalize_piper_voice_id(raw) if raw else ""
+        removed = _local_tts.remove_files(voice)
+        return {"ok": True, "kind": kind, "removed": removed}
     import model_download
 
-    kind = (req.kind or "").strip().lower()
-    if kind not in (model_download.KIND_WHISPER, model_download.KIND_EMBEDDING):
+    if kind not in (
+        model_download.KIND_WHISPER,
+        model_download.KIND_EMBEDDING,
+        model_download.KIND_DECISION,
+    ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     removed = model_download.remove(kind, req.model)
     return {"ok": True, "kind": kind, "removed": removed}
@@ -1912,6 +2046,8 @@ def _require_model_kind(kind: str) -> str:
     if kind not in (
         model_download.KIND_WHISPER,
         model_download.KIND_EMBEDDING,
+        model_download.KIND_DECISION,
+        _PIPER_KIND,
     ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     return kind
@@ -1919,10 +2055,14 @@ def _require_model_kind(kind: str) -> str:
 
 @app.post("/models/pause")
 async def models_pause(req: ModelControlRequest) -> dict:
-    """مکث دانلود در حال اجرا (بایت‌های گرفته‌شده حفظ می‌شوند)."""
+    """Pause a running model download (downloaded bytes are kept)."""
+    kind = _require_model_kind(req.kind)
+    if kind == _PIPER_KIND:
+        if not _local_tts.pause_download():
+            raise HTTPException(status_code=404, detail="no running download to pause")
+        return {"ok": True, "kind": kind}
     import model_download
 
-    kind = _require_model_kind(req.kind)
     if not model_download.pause_download(kind):
         raise HTTPException(status_code=404, detail="no running download to pause")
     return {"ok": True, "kind": kind}
@@ -1930,10 +2070,14 @@ async def models_pause(req: ModelControlRequest) -> dict:
 
 @app.post("/models/resume")
 async def models_resume(req: ModelControlRequest) -> dict:
-    """ادامه دانلود مکث‌شده از همان نیمه."""
+    """Resume a paused download from the same offset."""
+    kind = _require_model_kind(req.kind)
+    if kind == _PIPER_KIND:
+        if not _local_tts.resume_download():
+            raise HTTPException(status_code=404, detail="no paused download to resume")
+        return {"ok": True, "kind": kind}
     import model_download
 
-    kind = _require_model_kind(req.kind)
     if not model_download.resume_download(kind):
         raise HTTPException(status_code=404, detail="no paused download to resume")
     return {"ok": True, "kind": kind}
@@ -1942,9 +2086,12 @@ async def models_resume(req: ModelControlRequest) -> dict:
 @app.post("/models/cancel")
 async def models_cancel(req: ModelControlRequest) -> dict:
     """Stop an in-flight download; partial files stay for later resume."""
+    kind = _require_model_kind(req.kind)
+    if kind == _PIPER_KIND:
+        _local_tts.cancel_download()
+        return {"ok": True, "kind": kind}
     import model_download
 
-    kind = _require_model_kind(req.kind)
     # Idempotent: stopping when nothing runs is still success so the
     # Stop button never looks dead (no 404 when state already cleared).
     model_download.cancel_download(kind)
@@ -1955,7 +2102,7 @@ async def models_cancel(req: ModelControlRequest) -> dict:
 async def system_prompts() -> dict:
     from agents import MODE_ALIASES, SYSTEM_PROMPTS
 
-    # The frontend looks up canonical mode keys ("ask", "coder", "plan") for the
+    # The frontend looks up canonical mode keys ("ask", "build", "plan") for the
     # context popover, while legacy clients may still ask for "chat"/
     # "codewriter". Return canonical keys first, then append the aliases so both
     # spellings resolve to the same prompt without raising KeyError.
@@ -2103,7 +2250,10 @@ async def mcp_delete(req: McpDeleteRequest) -> dict:
 # transcription simply reloads it lazily.
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
-_WHISPER_IDLE_EVICT_S = 10 * 60
+try:
+    _WHISPER_IDLE_EVICT_S = float(os.environ.get("WHISPER_IDLE_EVICT_S") or 5 * 60)
+except (TypeError, ValueError):
+    _WHISPER_IDLE_EVICT_S = float(5 * 60)
 _whisper_last_used = 0.0
 _whisper_evict_timer: asyncio.TimerHandle | None = None
 
@@ -2149,6 +2299,27 @@ async def _get_whisper_model():
                 import model_download
 
                 if not model_download.whisper_ready():
+                    try:
+                        _wdir = model_download.whisper_dir()
+                    except Exception:
+                        _wdir = "?"
+                    _wsize = 0
+                    _wfiles: list[str] = []
+                    try:
+                        import os as _os
+
+                        if _os.path.isdir(_wdir):
+                            _wfiles = list(sorted(_os.listdir(_wdir))[:20])
+                            for _root, _dirs, _fs in _os.walk(_wdir):
+                                for _f in _fs:
+                                    try:
+                                        _wsize += _os.path.getsize(_os.path.join(_root, _f))
+                                    except OSError:
+                                        continue
+                    except Exception:  # noqa: BLE001, S110 - diagnostic scan is best-effort
+                        pass
+                    print(f"[stt] whisper not ready dir={_wdir} size={_wsize} files={_wfiles}", flush=True)
+                    logger.warning("whisper not ready dir=%s size=%d files=%s", _wdir, _wsize, _wfiles)
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -2180,6 +2351,7 @@ async def transcribe(request: Request) -> dict:
     * Silero VAD trims silence and skips pure-silence clips (no ghost text).
     * An explicit `lang` hint (fa/en) beats auto-detection on short clips.
     * Temperature fallback + conservative thresholds fix repeated-text stutters.
+    * A strict VAD gate + low no-speech threshold reject ambient noise.
     """
     import io
 
@@ -2214,17 +2386,34 @@ async def transcribe(request: Request) -> dict:
         # to a float32 16 kHz PCM array, so any container the browser MediaRecorder
         # emits is handled without extra conversion code here.
         pcm = decode_audio(io.BytesIO(data))
+        # PCM energy gate: pure silence / room tone never reaches Whisper,
+        # so it cannot hallucinate words from noise. Speech RMS sits far
+        # above this floor; silence is ~0.
+        try:
+            import numpy as _np_energy
+
+            _rms = float(_np_energy.sqrt(_np_energy.mean(_np_energy.square(pcm), dtype=_np_energy.float64)))
+        except Exception:  # noqa: BLE001 — energy gate is best-effort
+            _rms = 1.0
+        if _rms < 0.008:
+            return {"text": ""}
+        # Balanced Silero VAD gate: threshold 0.5 keeps quiet word edges
+        # (a stricter gate chopped syllables into wrong words), while
+        # min_speech_duration_ms still drops sub-300ms blips (clicks,
+        # bumps). Ambient-noise rejection lives in the layers that never
+        # chop speech: the PCM energy gate above, the frontend
+        # sustained-onset gate, and the hallucination filter below.
         vad_parameters = {
-            "min_silence_duration_ms": 250,
-            "speech_pad_ms": 200,
+            "threshold": 0.5,
+            "min_speech_duration_ms": 300,
+            "min_silence_duration_ms": 400,
+            "speech_pad_ms": 300,
         }
-        # For Persian, steer the model toward correct punctuation and away
-        # from filler words. The previous prompt ("no punctuation") hurt
-        # readability and accuracy for Persian, so it is replaced here.
-        fa_prompt = (
-            "رونویسی فارسی با نشانه‌گذاری صحیح. متن را بدون کلمات اضافه و "
-            "پرکننده بنویسید:"
-        )
+        # For Persian, steer the model toward correct punctuation. The
+        # prompt must describe the task only: telling the model to drop
+        # "filler" words made it delete real spoken words. The previous
+        # prompt ("no punctuation") hurt readability, so it is replaced.
+        fa_prompt = "رونویسی فارسی با نشانه‌گذاری صحیح:"
         segments, _info = model.transcribe(
             pcm,
             beam_size=10,
@@ -2234,17 +2423,65 @@ async def transcribe(request: Request) -> dict:
             initial_prompt=fa_prompt if lang == "fa" else None,
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
             condition_on_previous_text=False,
+            # Below the 0.6 default so room noise stops becoming ghost
+            # text, but not so low that quiet real words are skipped
+            # (which surfaced as wrong/missing words).
             no_speech_threshold=0.5,
-            compression_ratio_threshold=2.4,
+            compression_ratio_threshold=2.0,
             log_prob_threshold=-0.8,
             without_timestamps=True,
         )
         text = " ".join(seg.text for seg in segments).strip()
+        # Hallucination filter: Whisper loops a token on noise (repeated
+        # words). A real short reply ("yes") is kept; only loops and
+        # single-char ghosts are dropped so noise never becomes text.
+        if len(text) <= 1:
+            return {"text": ""}
+        words = text.split()
+        if len(words) >= 4 and len(set(words)) == 1:
+            return {"text": ""}
+        if len(words) >= 6:
+            repeat = 1
+            for i in range(1, len(words)):
+                if words[i] == words[i - 1]:
+                    repeat += 1
+                    if repeat >= 4:
+                        return {"text": ""}
+                else:
+                    repeat = 1
         return {"text": text}
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from exc
+
+
+def _sniff_audio_upload(data: bytes) -> tuple[str, str]:
+    """Pick a remote-STT filename and MIME matching the recorded bytes.
+
+    Browsers record webm/opus for both live and dictate, but the upload
+    field carries no reliable name. Some OpenAI-compatible STT gateways pick
+    the decoder from the filename extension, so webm bytes forwarded as
+    clip.wav are rejected with "could not process file". Sniff the magic
+    bytes so the forwarded file always carries the right extension.
+    """
+    head = bytes(data[:12])
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "clip.webm", "audio/webm"
+    if head.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WAVE":
+        return "clip.wav", "audio/wav"
+    if head.startswith(b"OggS"):
+        return "clip.ogg", "audio/ogg"
+    if head.startswith(b"fLaC"):
+        return "clip.flac", "audio/flac"
+    if head.startswith(b"ID3") or (
+        len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0
+    ):
+        return "clip.mp3", "audio/mpeg"
+    if len(data) >= 8 and data[4:8] == b"ftyp":
+        return "clip.mp4", "audio/mp4"
+    # Keep the previous contract for unknown bytes.
+    return "clip.wav", "application/octet-stream"
 
 
 async def _transcribe_remote(
@@ -2264,7 +2501,8 @@ async def _transcribe_remote(
     url = f"{base_url.rstrip('/')}/audio/transcriptions"
     key = api_key or providers.env_key(provider_kind, env_var)
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    files = {"file": ("clip.wav", data, "application/octet-stream")}
+    filename, mime = _sniff_audio_upload(data)
+    files = {"file": (filename, data, mime)}
     payload: dict[str, str] = {"model": model or "whisper-1"}
     if lang:
         payload["language"] = lang
@@ -2274,34 +2512,185 @@ async def _transcribe_remote(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"remote transcription failed: {exc}") from exc
     if resp.status_code >= 400:
-        detail = resp.text.strip()[:500] or f"remote transcription failed ({resp.status_code})"
+        # Gateways often return an HTML error page here; strip tags so raw
+        # markup never reaches the frontend (it must not land in the composer).
+        import re as _re_transcribe_html
+
+        raw_detail = resp.text.strip()[:500]
+        raw_detail = _re_transcribe_html.sub(r"<[^>]*>", " ", raw_detail)
+        raw_detail = " ".join(raw_detail.split())[:300]
+        detail = raw_detail or f"remote transcription failed ({resp.status_code})"
         raise HTTPException(status_code=502, detail=detail)
     try:
         body = resp.json()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"remote transcription bad response: {exc}") from exc
-    return {"text": str(body.get("text", "")).strip()}
+    text = str(body.get("text", "")).strip()
+    # Never return HTML error pages as successful transcription: gateways
+    # sometimes embed an HTML page in a 200 JSON payload; it must surface
+    # as an error (banner) instead of polluting the composer input.
+    lowered = text.lower()
+    if text and ("<link" in lowered or "/_next/" in text or "&lt;" in lowered or "<html" in lowered):
+        raise HTTPException(status_code=502, detail="remote transcription returned an error page — please try again")
+    return {"text": text}
+
+
+# Local TTS defaults delegate to backend/local_tts.py (swappable provider).
+# Active provider is pocket-tts-farsi-v2; Piper constants stay as legacy aliases.
+import local_tts as _local_tts
+
+DEFAULT_PIPER_VOICE = _local_tts.default_voice_id()
+PIPER_VOICES_REPO = _local_tts.POCKET_REPO
+_PIPER_KIND = "piper"
+
+
+def _normalize_piper_voice_id(voice_id: str) -> str:
+    """Normalize a local TTS voice id (delegates to local_tts)."""
+    return _local_tts.normalize_voice_id(voice_id)
+
+
+def _piper_voice_dir() -> str:
+    """Return the local TTS model dir (delegates to local_tts)."""
+    return _local_tts.local_tts_dir()
+
+
+def _piper_download_snapshot() -> dict:
+    """Return a JSON-serializable copy of the local TTS download state."""
+    return _local_tts.download_snapshot()
+
+
+def _resolve_tts_voice_id(req: TtsRequest) -> str:
+    """Resolve the requested local voice id (delegates to local_tts)."""
+    return _local_tts.resolve_voice_id(req.model, req.voice, req.ttsModel, req.ttsVoice)
+
+
+def _resolve_piper_voice_path_legacy(voice_id: str) -> str:
+    """Resolve a Piper voice id to a local .onnx file under ~/.codifa/models/piper-voices."""
+    import os
+    from pathlib import Path
+
+    cleaned = (voice_id or "").strip() or DEFAULT_PIPER_VOICE
+    if cleaned.endswith(".onnx.json"):
+        cleaned = cleaned[: -len(".onnx.json")]
+    elif cleaned.endswith(".onnx"):
+        cleaned = cleaned[: -len(".onnx")]
+    if cleaned.lower() == "local":
+        cleaned = DEFAULT_PIPER_VOICE
+    # Direct .onnx path (absolute or relative) wins when it exists.
+    direct = Path(f"{cleaned}.onnx")
+    try:
+        if direct.is_file():
+            return str(direct)
+    except OSError:
+        pass
+    candidates: list[Path] = []
+    env_dir = os.environ.get("PIPER_VOICE_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir) / f"{cleaned}.onnx")
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".codifa" / "models" / f"{cleaned}.onnx",
+            home / ".codifa" / "models" / "piper" / f"{cleaned}.onnx",
+            home / ".codifa" / "models" / "piper-voices" / f"{cleaned}.onnx",
+            Path("models") / "piper" / f"{cleaned}.onnx",
+        ]
+    )
+    for path in candidates:
+        try:
+            if path.is_file():
+                return str(path)
+        except OSError:
+            continue
+    # Cloned piper-voices repo layout (e.g. fa/fa_IR/amir/medium/<voice>.onnx):
+    # lightweight recursive search limited to the piper roots only.
+    search_roots = [
+        home / ".codifa" / "models" / "piper-voices",
+        home / ".codifa" / "models" / "piper",
+    ]
+    for root in search_roots:
+        try:
+            if not root.is_dir():
+                continue
+            for match in root.rglob(f"{cleaned}.onnx"):
+                try:
+                    if match.is_file():
+                        return str(match)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    # Build a helpful error listing every checked location plus what is
+    # actually on disk (filename mismatches are the common cause).
+    checked = [str(p) for p in candidates]
+    present: list[str] = []
+    for root in search_roots:
+        try:
+            if not root.is_dir():
+                continue
+            import os as _os
+
+            for name in sorted(_os.listdir(root))[:20]:
+                present.append(name)
+            break
+        except OSError:
+            continue
+    hint = (
+        f"Piper voice '{cleaned}' is not downloaded. Checked: "
+        f"{'; '.join(checked)}. "
+        f"Place '{cleaned}.onnx' and '{cleaned}.onnx.json' from "
+        f"'{PIPER_VOICES_REPO}' directly under ~/.codifa/models/piper-voices/ "
+        f"(also accepted: ~/.codifa/models/, ~/.codifa/models/piper/, $PIPER_VOICE_DIR, "
+        f"or a cloned repo layout fa/fa_IR/... under piper-voices/). "
+        f"Or download via POST /models/download with kind 'piper' and model '{cleaned}'."
+    )
+    if present:
+        hint += f" Files in piper dir: {', '.join(present)}."
+    raise HTTPException(status_code=400, detail=hint)
+
+
+def _synthesize_piper_wav(text: str, voice_path: str) -> bytes:
+    """Synthesize WAV bytes with the active local TTS provider (pocket v2)."""
+    voice_id = (voice_path or "").strip() or DEFAULT_PIPER_VOICE
+    return _local_tts.synthesize_wav(text, voice_id)
 
 
 @app.post("/tts")
 async def text_to_speech(req: TtsRequest) -> Response:
-    """Synthesize text to speech via an OpenAI-compatible /audio/speech endpoint.
+    """Synthesize text to speech locally (Piper) or via a remote endpoint.
 
-    Local TTS is not supported yet — `provider: local` (or empty) is rejected
-    with a clear 400. Remote providers are forwarded to
-    `POST {base_url}/audio/speech` with {"model", "input", "voice"} and the
-    audio bytes are streamed back (StreamingResponse) as they arrive from the
-    upstream, so the first bytes reach the player without waiting for the full
-    clip. Falls back to a buffered Response only when streaming is unavailable.
+    Local (`provider` or `ttsProvider`/`ttsProviderId` equal to "local"):
+    on-device pocket-tts-farsi-v2 with the bundled default voice (`ttsModel`
+    selects the voice, default `default`). `ttsBaseUrl` is accepted as an
+    optional mirror hint; models are never auto-downloaded
+    (use POST /models/download with kind 'piper').
+    Remote (any other provider): forwarded to `POST {base_url}/audio/speech`
+    with {"model", "input", "voice"} and streamed back as audio bytes.
+    Local failures return a transparent error `detail`; the frontend falls
+    back to a remote provider.
     """
-    import httpx
-
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="missing 'text' field")
     provider_kind = (req.provider or "").strip()
-    if not provider_kind or provider_kind == "local":
-        raise HTTPException(status_code=400, detail="TTS لوکال پشتیبانی نمی‌شود — یک پروایدر ریموت انتخاب کنید")
+    tts_provider = (req.ttsProvider or "").strip()
+    tts_provider_id = (req.ttsProviderId or "").strip()
+    if provider_kind == "local" or tts_provider == "local" or tts_provider_id == "local":
+        import asyncio
+
+        voice_id = _resolve_tts_voice_id(req)
+        # Pocket synthesis (G2P + model load + vocoding) blocks the CPU for
+        # many seconds: run it off the event loop so one speaker-icon click
+        # never hangs the whole server (models/status polls, chat, ...).
+        wav_bytes = await asyncio.to_thread(_local_tts.synthesize_wav, text, voice_id)
+        return Response(content=wav_bytes, media_type="audio/wav")
+    if not provider_kind:
+        # Empty provider is a malformed request, not a remote one: without a
+        # kind there is nothing to route to (kept from the pre-local-TTS
+        # contract so misconfigured callers fail fast with a clear cause).
+        raise HTTPException(status_code=400, detail="missing 'provider' field")
+    import httpx
+
     base_url = (req.base_url or "").strip()
     if not base_url:
         raise HTTPException(status_code=400, detail="remote TTS needs 'base_url'")
@@ -2315,8 +2704,8 @@ async def text_to_speech(req: TtsRequest) -> Response:
     # don't filter (llama.cpp/Ollama/LM Studio just ignore the header).
     headers["User-Agent"] = providers.UA_LADDER[0]
     payload: dict = {"input": text}
-    # مدل/ویس خالی ارسال نمی‌شود: بعضی پروایدرهای 9router مدل یا ویس ندارند
-    # و با دریافت فیلد اضافه خطا می‌دهند. وقتی مقدار هست، مثل قبل فرستاده می‌شود.
+    # Skip empty model/voice: some providers reject unknown extra fields.
+    # When set, they are forwarded as before.
     tts_model = (req.model or "").strip()
     if tts_model:
         payload["model"] = tts_model
@@ -2367,6 +2756,150 @@ async def text_to_speech(req: TtsRequest) -> Response:
     return StreamingResponse(_audio_stream(), media_type=media_type)
 
 
+class RealtimeSessionRequest(BaseModel):
+    """POST /realtime/session — mint an ephemeral realtime token without exposing the master key."""
+
+    provider: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    env_var: str = ""
+    api_keys: dict | list | str | None = None
+    model: str = ""
+    voice: str = ""
+
+
+def _resolve_realtime_key(req: RealtimeSessionRequest) -> str:
+    """Resolve the master key server-side from explicit fields, a key map, or env."""
+    direct = (req.api_key or "").strip()
+    if direct:
+        return direct
+    keys = req.api_keys
+    if isinstance(keys, str) and keys.strip():
+        stripped = keys.strip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                import json as _json_keys
+
+                parsed = _json_keys.loads(stripped)
+                if isinstance(parsed, list):
+                    for value in parsed:
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+                elif isinstance(parsed, dict):
+                    keys = parsed
+                else:
+                    return stripped
+            except Exception:
+                return stripped
+        else:
+            return stripped
+    if isinstance(keys, dict) and keys:
+        provider = (req.provider or "").strip()
+        if provider and isinstance(keys.get(provider), str) and keys[provider].strip():
+            return keys[provider].strip()
+        for fallback in ("default", "openai", "realtime"):
+            value = keys.get(fallback)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in keys.values():
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(keys, list) and keys:
+        for value in keys:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(keys, str) and keys.strip():
+        return keys.strip()
+    return providers.env_key((req.provider or "").strip(), (req.env_var or "").strip()) or ""
+
+
+def _realtime_websocket_url(base_url: str, model: str) -> str:
+    """Derive a realtime websocket URL from an HTTP(S) base URL."""
+    base = base_url.rstrip("/")
+    ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+    if ws_base.endswith("/realtime"):
+        url = ws_base
+    else:
+        url = f"{ws_base}/realtime"
+    if model:
+        url = f"{url}?model={quote(model)}"
+    return url
+
+
+@app.post("/realtime/session")
+async def realtime_session(req: RealtimeSessionRequest) -> dict:
+    """Create an ephemeral realtime session server-side and return only the temporary token."""
+    import httpx
+
+    base_url = (req.base_url or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="remote realtime needs 'base_url'")
+    model = (req.model or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="missing 'model' field")
+    master_key = _resolve_realtime_key(req)
+    if not master_key:
+        raise HTTPException(status_code=400, detail="missing api key for realtime session")
+    url = f"{base_url.rstrip('/')}/realtime/client_secrets"
+    payload: dict = {"session": {"type": "realtime", "model": model}}
+    voice = (req.voice or "").strip()
+    if voice:
+        payload["session"]["audio"] = {"output": {"voice": voice}}
+    headers = {"Authorization": f"Bearer {master_key}"}
+    headers["User-Agent"] = providers.UA_LADDER[0]
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upstream = await client.post(url, headers=headers, json=payload)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"realtime session failed: {exc}") from exc
+    if upstream.status_code >= 400:
+        try:
+            err_body = upstream.text.strip()[:500]
+        except Exception:
+            err_body = ""
+        # Gateways often return an HTML error page here; strip tags so the
+        # frontend hint never shows raw markup.
+        import re as _re_html
+
+        err_body = _re_html.sub(r"<[^>]*>", " ", err_body)
+        err_body = " ".join(err_body.split())[:300]
+        detail = err_body or f"realtime session failed ({upstream.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+    try:
+        body = upstream.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    ephemeral_token = ""
+    expires_at: int | None = None
+    client_secret = body.get("client_secret")
+    if isinstance(client_secret, dict):
+        value = client_secret.get("value")
+        if isinstance(value, str):
+            ephemeral_token = value.strip()
+        raw_expires = client_secret.get("expires_at")
+        if isinstance(raw_expires, (int, float)):
+            expires_at = int(raw_expires)
+    for key in ("ephemeral_token", "token", "client_token", "value"):
+        if not ephemeral_token and isinstance(body.get(key), str):
+            ephemeral_token = body[key].strip()
+    if not ephemeral_token:
+        raise HTTPException(status_code=502, detail="realtime session failed: upstream did not return a token")
+    raw_url = body.get("websocket_url")
+    if isinstance(raw_url, str) and raw_url.strip():
+        websocket_url = raw_url.strip()
+    else:
+        websocket_url = _realtime_websocket_url(base_url, model)
+    if expires_at is None:
+        raw_expires = body.get("expires_at")
+        if isinstance(raw_expires, (int, float)):
+            expires_at = int(raw_expires)
+        else:
+            expires_at = int(time.time()) + 60
+    return {"ephemeral_token": ephemeral_token, "websocket_url": websocket_url, "expires_at": expires_at}
+
+
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
@@ -2381,6 +2914,16 @@ def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
             "The provider didn't send any data for over 5 minutes (read timeout). "
             "Tap Retry to resume from where it left off — or switch to a faster "
             "model in Settings if this keeps happening."
+        )
+    # _ModelSilenceTimeout from _with_keepalive: the socket stayed alive via
+    # keepalives but the model produced nothing for MODEL_SILENCE_CAP_S. The
+    # generic branches below would bury this under a misleading hint, so give
+    # it its own actionable message.
+    if isinstance(exc, _ModelSilenceTimeout):
+        return (
+            "The model went silent mid-stream and the run was closed to recover "
+            f"({exc}). Tap Retry to resume from where it left off, or switch to "
+            "another model in Settings if this keeps happening."
         )
     # A bare `asyncio.TimeoutError` (and similar) has an EMPTY str() — the type
     # name is the only clue. Turn it into a readable timeout message so the user
@@ -2750,12 +3293,197 @@ async def chat_compact(req: CompactRequest, request: Request):
     return {"summary": summary, "keep": int(keep), "usage": compact_usage}
 
 
-async def _with_keepalive(agent_iter, timeout: float = 15.0):
+# --- chat titles (Title generator tool) ----------------------------------- #
+# One tiny LLM call naming a new chat from its first message. Runs on the
+# "title" tool slot (Settings -> Tools), falling back to "compact" then the
+# main model. Input is capped (~500 chars) and output to ~24 tokens so the
+# call costs almost nothing and never touches the main turn's context.
+TITLE_TIMEOUT = 25  # seconds — outer budget for the whole call
+TITLE_CLIENT_TIMEOUT = 20  # seconds — model client ceiling (below the budget)
+
+
+def _clean_title(text: str) -> str | None:
+    """Normalize a raw title reply to one short line (<=4 words, <=60 chars)."""
+    lines = (text or "").strip().splitlines()
+    first = lines[0].strip() if lines else ""
+    first = first.strip("\"'“”‘’").strip()
+    first = re.sub(r"\s+", " ", first)
+    if first.lower().startswith("title:"):
+        first = first[6:].strip().strip("\"'").strip()
+        first = re.sub(r"\s+", " ", first)
+    words = [w for w in first.split(" ") if w]
+    if len(words) > 4:
+        words = words[:4]
+    first = " ".join(words).rstrip(" ,.:;-").strip()
+    if len(first) > 60:
+        first = first[:60].rstrip()
+    return first or None
+
+
+class TitleRequest(BaseModel):
+    """POST /chats/title — name a new chat from its first user message."""
+
+    provider: str = "custom"
+    provider_id: str = ""
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    env_var: str = ""
+    api_keys: list[str] = []
+    subagent_models: dict = {}
+    providers: dict = {}
+    text: str = ""
+    chat_id: str = ""
+
+
+@app.post("/chats/title")
+async def chat_title(req: TitleRequest) -> dict:
+    """Generate a short title for a new chat (fire-and-forget from the UI)."""
+    from agents import _subagent_target as _title_target
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    sub = req.subagent_models if isinstance(req.subagent_models, dict) else {}
+    title_entry = str(sub.get("title") or "").strip()
+    compact_entry = str(sub.get("compact") or "").strip()
+    # Explicit "main model" pick means the parent (main) model, not a
+    # literal model id — without this the provider rejects the call and
+    # the chat silently keeps its default title.
+    _main_labels = ("main model", "main_model", "main")
+    if title_entry.lower() in _main_labels:
+        title_entry = ""
+    if compact_entry.lower() in _main_labels:
+        compact_entry = ""
+    providers_cfg = req.providers if isinstance(req.providers, dict) else {}
+
+    def _lookup(pid: str) -> dict | None:
+        v = providers_cfg.get(pid)
+        return v if isinstance(v, dict) else None
+
+    # Request line at WARNING so it survives the default log level and the
+    # server-only filter (codifa.title passes through, codifa.server does not).
+    _cid = (req.chat_id or "").strip()[-6:] or "-"
+    logging.getLogger("codifa.title").warning(
+        "chat title: request chat=%s text_len=%d title=%r compact=%r",
+        _cid, len(text), title_entry, compact_entry,
+    )
+    # Fallback chain: title slot, then compact slot, then the parent (main)
+    # model. A failing slot model falls through to the next candidate instead
+    # of silently keeping the default title, so one bad slot pick (e.g. a
+    # model id the provider rejects) does not kill the feature.
+    candidates = [e for e in (title_entry, compact_entry) if e]
+    candidates.append("")  # parent (main) model as last resort
+    for cand in candidates:
+        label = cand or "<main>"
+        target = None
+        if cand:
+            try:
+                target = _title_target(
+                    cand,
+                    req.provider,
+                    req.base_url,
+                    req.api_key,
+                    req.env_var,
+                    _lookup,
+                    req.provider_id,
+                    req.api_keys,
+                )
+            except Exception as exc:  # noqa: BLE001 — bad slot entry tries next
+                # Use a dedicated logger name: ServerErrorOnlyFilter drops
+                # WARNING records from codifa.server, so title diagnostics would
+                # never reach codifa.log on the parent logger.
+                logging.getLogger("codifa.title").warning(
+                    "chat title: slot resolve failed (%r): %r", cand, exc
+                )
+                continue
+        if target:
+            kind, model, burl, akey, env, spid, row_keys = target
+            keys = row_keys or req.api_keys
+        elif cand:
+            continue  # unresolvable slot entry falls through to next candidate
+        else:
+            kind, model, burl, akey, env, spid = (
+                req.provider, req.model, req.base_url,
+                req.api_key, req.env_var, req.provider_id,
+            )
+            keys = req.api_keys
+        if not (model or "").strip():
+            logging.getLogger("codifa.title").warning(
+                "chat title: no model resolved (candidate %r), trying next", label
+            )
+            continue
+        try:
+            mo = build_chat_model(
+                kind, model, burl, akey, env, keys,
+                temperature=0.0,
+                # 256 tokens: reasoning-capable free-tier models spend output
+                # budget on thinking; a tiny cap starved them into empty
+                # replies. Still negligible cost — _clean_title caps the result
+                # to one 60-char line and real replies stay a few words.
+                max_tokens=256,
+                thinking_level="off",
+                timeout=TITLE_CLIENT_TIMEOUT,
+                provider_id=spid,
+            )
+            out, title_usage = await asyncio.wait_for(
+                llm_complete(
+                    mo,
+                    system="You name chats. Reply with only a very short title of at most 4 words, plain text.",
+                    user=text[:500],
+                    # Thread the chat id so llm_generate's auto-trace records
+                    # this call in the chat's trace panel like any other call.
+                    chat_id=(req.chat_id or "").strip(),
+                ),
+                timeout=TITLE_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — title never breaks the chat
+            logging.getLogger("codifa.title").warning(
+                "chat title: model call failed (candidate %r): %r", label, exc
+            )
+            continue
+        cleaned = _clean_title(out)
+        if not cleaned:
+            logging.getLogger("codifa.title").warning(
+                "chat title: empty reply (candidate %r raw_len=%d raw=%r), trying next",
+                label, len(out or ""), (out or "")[:200],
+            )
+            continue
+        logging.getLogger("codifa.title").warning(
+            "chat title: ok chat=%s %r",
+            (req.chat_id or "").strip()[-6:] or "-", cleaned,
+        )
+        # usage flows to the sidebar's per-model totals (provider/model only,
+        # like the compact path) — null when the provider reported none.
+        return {"title": cleaned, "usage": title_usage}
+    return {"title": None, "usage": None}
+
+
+class _ModelSilenceTimeout(Exception):
+    """The model stayed silent past MODEL_SILENCE_CAP_S while the socket was
+    still alive (keepalives kept flowing). Raised by `_with_keepalive` so the
+    stream is closed and the frontend can auto-resume from its checkpoint
+    instead of ticking "waiting for model" forever."""
+
+
+async def _with_keepalive(
+    agent_iter,
+    timeout: float = 15.0,
+    max_silence: float | None = None,
+    is_paused: Callable[[], bool] | None = None,
+):
     """Yield agent SSE events, injecting a keepalive sentinel whenever the agent
-    goes silent for `timeout` seconds so idle sockets survive proxy/OS/TCP
-    timeouts mid-stream. The frontend forwards `: `-prefixed lines as a
-    `keepalive` event and refreshes its stall watchdog, so a long-running tool is
-    never mistaken for a dead connection.
+goes silent for `timeout` seconds so idle sockets survive proxy/OS/TCP
+timeouts mid-stream. The frontend forwards `: `-prefixed lines as a
+`keepalive` event and refreshes its stall watchdog, so a long-running tool is
+never mistaken for a dead connection.
+
+    `max_silence` caps the TOTAL continuous silence (measured from the first
+    keepalive, not from stream start): once exceeded, `_ModelSilenceTimeout`
+    is raised so the run is torn down and surfaced as an error event instead of
+    keepaliving forever on a wedged provider stream. `is_paused` suspends the
+    cap while the agent legitimately waits on a permission/ask gate — the user
+    can take arbitrarily long to answer, and that silence is not a stall.
 
     IMPORTANT: `shield` only protects `pending` from the keepalive timeout —
     it does NOT mean a real outer cancellation (client disconnect / aborted
@@ -2768,6 +3496,11 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
     result — the bug behind "interrupts with no log/error and the resume state is
     gone"."""
     pending = None
+    silence_started: float | None = None
+    # True while the model's reasoning window is open (a `thinking active:True`
+    # event arrived and no `active:False` followed). Silence in that window is
+    # legitimate thinking, never a stall, so it is not counted against the cap.
+    thinking_active = False
     try:
         while True:
             if pending is None:
@@ -2779,8 +3512,31 @@ async def _with_keepalive(agent_iter, timeout: float = 15.0):
                 # the try/except CancelledError wrapping the whole loop below.
                 event = await asyncio.wait_for(asyncio.shield(pending), timeout=timeout)
                 pending = None
+                if isinstance(event, dict) and event.get("kind") == "thinking":
+                    thinking_active = bool(event.get("active"))
                 yield event
+                # A real event resets the silence clock: the model produced
+                # something, so any cap accumulated so far no longer counts.
+                silence_started = None
             except asyncio.TimeoutError:
+                if thinking_active:
+                    # Model is thinking: no silence cap, however long it takes.
+                    # Keep the socket alive and don't start/accumulate the clock;
+                    # the next real event (end of thinking / first token) resets it.
+                    silence_started = None
+                    yield {"kind": "_keepalive"}
+                    continue
+                if silence_started is None:
+                    silence_started = time.monotonic()
+                if (
+                    max_silence is not None
+                    and not (is_paused and is_paused())
+                    and time.monotonic() - silence_started > max_silence
+                ):
+                    raise _ModelSilenceTimeout(
+                        f"model silent for {int(time.monotonic() - silence_started)}s "
+                        "(no events while keepalives kept the socket alive)"
+                    )
                 yield {"kind": "_keepalive"}
             except StopAsyncIteration:
                 return
@@ -2842,7 +3598,11 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
       generic crash event.
     """
     ka_count = 0
-    ka_gen = _with_keepalive(agent_gen)
+    ka_gen = _with_keepalive(
+        agent_gen,
+        max_silence=MODEL_SILENCE_CAP_S,
+        is_paused=lambda: bool(PERMISSION_GATES or ASK_GATES),
+    )
     try:
         async for event in ka_gen:
             if event.get("kind") == "_keepalive":
@@ -2932,7 +3692,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     # Safety net: messages that ask to create/install skills or MCP connectors
     # grant the create_skill/create_mcp tools even if the frontend didn't flag
-    # them. Available in EVERY mode (ask, plan, coder) — as long as the current
+    # them. Available in EVERY mode (ask, plan, build) — as long as the current
     # prompt (or the recent history, so a "continue" follow-up keeps the grant)
     # expresses the intent.
     if not req.allow_create:
@@ -2974,6 +3734,50 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             _effective_history = _effective_history + [
                 {"role": "system", "content": _prev_outcome_note}
             ]
+        # Persistent goal (/goal): normalize str|dict to text and carry it
+        # into the run unchanged. System-prompt injection is the guaranteed
+        # channel; the explicit goal kwarg is best-effort for graph-aware
+        # runners (guarded so older run_agent signatures never break).
+        _goal_text = ""
+        _effective_system_prompt = req.system_prompt
+        try:
+            from goals import format_goal_block as _format_goal_block
+            from goals import normalize_goal as _normalize_goal
+
+            _goal_text = _normalize_goal(req.goal)
+            if not _goal_text:
+                # Fallback: the frontend prefixes every prompt with
+                # "[Active goal: <condition>]" while a goal is active,
+                # so the condition rides along even without API changes.
+                import re as _re_goal
+
+                _m = _re_goal.match(r"\s*\[Active goal:\s*(.*?)\]\s*", req.prompt or "")
+                if _m:
+                    _goal_text = _normalize_goal(_m.group(1))
+            _effective_system_prompt = req.system_prompt or ""
+            if _goal_text:
+                _goal_block = _format_goal_block(_goal_text)
+                _effective_system_prompt = (
+                    _effective_system_prompt + "\n\n" + _goal_block
+                    if _effective_system_prompt
+                    else _goal_block
+                )
+        except Exception:  # noqa: BLE001 — goal must never break the stream
+            _goal_text = ""
+            _effective_system_prompt = req.system_prompt
+        _goal_kwargs: dict = {}
+        try:
+            import inspect as _inspect
+
+            if _goal_text and "goal" in _inspect.signature(run_agent).parameters:
+                _goal_kwargs["goal"] = _goal_text
+            if "goal_turns" in _inspect.signature(run_agent).parameters:
+                try:
+                    _goal_kwargs["goal_turns"] = max(0, int(req.goal_turns or 0))
+                except (TypeError, ValueError):
+                    _goal_kwargs["goal_turns"] = 0
+        except Exception:  # noqa: BLE001 — introspection never breaks the run
+            _goal_kwargs = {}
         # Create the agent generator so we can close it on disconnect
         agent_gen = run_agent(
             provider=req.provider,
@@ -2989,7 +3793,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             history=_effective_history,
             attachments=req.attachments,
             images=req.images,
-            system_prompt=req.system_prompt,
+            system_prompt=_effective_system_prompt,
             thinking_level=req.thinking_level,
             model_reasoning=req.model_reasoning,
             mcp_servers=req.mcp_servers,
@@ -3002,8 +3806,6 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             allow_outside=req.allow_outside,
             allow_outside_folders=req.allow_outside_folders,
             allow_computer=req.allow_computer,
-            nvim_file=req.nvim_file,
-            nvim_diagnostics=req.nvim_diagnostics,
             vector_db_path=req.vector_db_path,
             vector_config=req.vector_config,
             retrieval_config=req.retrieval_config,
@@ -3012,8 +3814,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             chat_id=req.chat_id,
             providers=req.providers,
             compact_at_percent=req.compact_at_percent,
-            max_steps=req.max_steps,
             restart=req.restart,
+            **_goal_kwargs,
         )
         try:
             logger.warning(
@@ -3362,11 +4164,61 @@ async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
         raise HTTPException(status_code=500, detail=f"cleanup failed: {exc}") from exc
 
 
+def _start_parent_watchdog() -> None:
+    """Exit when the Electron parent dies, so no orphan sidecar survives.
+
+    A hard restart / crash / kill -9 of the app skips Electron's graceful
+    ``stopSidecar()``, leaving this Python process alive on its old port with
+    torch + TTS + embedding weights resident (GBs each) and any in-flight turn
+    still burning tokens. Electron passes its pid in CODIFA_PARENT_PID; when
+    unset (standalone / tests) no watchdog runs.
+    """
+    import threading
+    import time as _time
+
+    raw = os.environ.get("CODIFA_PARENT_PID", "").strip()
+    try:
+        parent = int(raw) if raw else 0
+    except ValueError:
+        parent = 0
+    if parent <= 1:
+        return
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
+    def _watch() -> None:
+        while True:
+            _time.sleep(3.0)
+            if _alive(parent):
+                continue
+            logger.warning("parent process %s is gone; sidecar exiting", parent)
+            try:
+                import signal as _signal
+
+                os.kill(os.getpid(), _signal.SIGTERM)  # graceful uvicorn shutdown
+            except Exception:  # noqa: BLE001, S110
+                pass
+            _time.sleep(5.0)
+            os._exit(0)  # graceful path hung: hard exit
+
+    threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codifa agent sidecar")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+    _start_parent_watchdog()
 
     # Dump a C-level traceback to stderr on segfault/abort so a hard crash (e.g.
     # in onnxruntime/CTranslate2) is diagnosable instead of silent. The Electron

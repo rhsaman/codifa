@@ -939,6 +939,67 @@ def get_plan(workspace: str, chat_id: str = "") -> dict | None:
         }
 
 
+def save_checklist(workspace: str, chat_id: str, items: list[dict]) -> None:
+    """Persist the live checklist so it survives restarts (one-line memory).
+
+    Stored as ``plan/<ws>/<chat>/checklist.json`` next to ``plan.md``.
+    Best-effort: never raises.
+    """
+    try:
+        with _LOCK:
+            d = _plan_dir(workspace, chat_id)
+            clean: list[dict] = []
+            for it in items or []:
+                if not isinstance(it, dict):
+                    continue
+                content = str(it.get("content", "")).strip()[:200]
+                if not content:
+                    continue
+                status = str(it.get("status", "pending")).strip().lower()
+                if status not in ("pending", "in_progress", "completed"):
+                    status = "pending"
+                clean.append({"content": content, "status": status})
+            _atomic_write_json(os.path.join(d, "checklist.json"), clean)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def get_checklist(workspace: str, chat_id: str = "") -> list[dict]:
+    """Return the persisted checklist for a workspace+chat, or []."""
+    with _LOCK:
+        if not (chat_id or "").strip():
+            return []
+        d = _plan_dir(workspace, chat_id)
+        items = _read_json(os.path.join(d, "checklist.json"))
+    if not isinstance(items, list):
+        return []
+    clean: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content", "")).strip()[:200]
+        if not content:
+            continue
+        status = str(it.get("status", "pending")).strip().lower()
+        if status not in ("pending", "in_progress", "completed"):
+            status = "pending"
+        clean.append({"content": content, "status": status})
+    return clean
+
+
+def delete_checklist(workspace: str, chat_id: str = "") -> bool:
+    """Remove a persisted checklist. True when one was removed."""
+    with _LOCK:
+        if not (chat_id or "").strip():
+            return False
+        target = os.path.join(_plan_dir(workspace, chat_id), "checklist.json")
+        try:
+            os.remove(target)
+        except OSError:
+            return False
+        return not os.path.exists(target)
+
+
 def list_plans() -> list[dict]:
     """Return all saved plans as ``{"workspace", "chat_id", "title", "content"}``."""
     base = plans_dir()
@@ -1088,7 +1149,7 @@ def save_schedule(task: dict) -> dict:
         task["cron"] = str(task.get("cron") or "").strip()
         task["enabled"] = bool(task.get("enabled", True))
         task["root"] = str(task.get("root") or "")
-        task["mode"] = str(task.get("mode") or "coder")
+        task["mode"] = str(task.get("mode") or "build")
         task["provider_id"] = str(task.get("provider_id") or "")
         task["model"] = str(task.get("model") or "")
         if not isinstance(task.get("run_count"), int):

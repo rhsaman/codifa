@@ -28,7 +28,7 @@ import type { SpeakProviderOpts } from "../lib/api";
 import { lspStatusLabel, useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
-import { handleLinkClick } from "../lib/link";
+import { handleLinkClick, splitTextByUrls } from "../lib/link";
 import { sanitizeHtml } from "../lib/sanitizeHtml";
 import {
   ToolCallView,
@@ -283,6 +283,20 @@ function textFromChildren(node: ReactNode): string {
     );
   }
   return "";
+}
+
+/** Open an external URL in the OS browser, preferring Chrome when the
+ * bridge exposes it and falling back to the default external opener. */
+function openExternalPreferred(url: string): void {
+  const coder = window.coder as unknown as {
+    openExternal?: (u: string) => unknown;
+    openExternalChrome?: (u: string) => unknown;
+  };
+  if (coder && typeof coder.openExternalChrome === "function") {
+    void coder.openExternalChrome(url);
+    return;
+  }
+  void coder?.openExternal?.(url);
 }
 
 function codeLang(children: ReactNode): string {
@@ -711,6 +725,56 @@ export const mdComponents = {
     // the chip's props, so the block renders with the path verbatim.
     if (!meta) {
       const text = textFromChildren(props.children);
+      // Inline code that contains an http(s) URL linkifies the URL part and
+      // opens it in the OS browser (Chrome when available). URLs never become
+      // FileChips: looksLikeFilePath already rejects schemes, and this branch
+      // runs first so a URL is never misclassified as a path.
+      if (!text.includes("\n")) {
+        const urlParts = splitTextByUrls(text);
+        if (urlParts.some((p) => typeof p !== "string")) {
+          if (
+            urlParts.length === 1 &&
+            typeof urlParts[0] !== "string"
+          ) {
+            const url = (urlParts[0] as { url: string }).url;
+            return (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => {
+                  handleLinkClick(e, url, openExternalPreferred);
+                }}
+              >
+                {url}
+              </a>
+            );
+          }
+          return (
+            <>
+              {urlParts.map((p, i) =>
+                typeof p === "string" ? (
+                  <code key={i} data-meta={meta}>
+                    {p}
+                  </code>
+                ) : (
+                  <a
+                    key={i}
+                    href={p.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(e) => {
+                      handleLinkClick(e, p.url, openExternalPreferred);
+                    }}
+                  >
+                    {p.url}
+                  </a>
+                ),
+              )}
+            </>
+          );
+        }
+      }
       if (looksLikeFilePath(text)) {
         const { path, line } = splitPathLine(text);
         return <FileChip path={path} line={line} display={text} />;
@@ -770,13 +834,9 @@ export const mdComponents = {
         target="_blank"
         rel="noreferrer"
         onClick={(e) => {
-          // Forward http(s) links to the OS browser; internal anchors keep
-          // their default behaviour inside the app.
-          handleLinkClick(
-            e,
-            props.href,
-            (url) => void window.coder.openExternal(url),
-          );
+          // Forward http(s) links to the OS browser (Chrome when available);
+          // internal anchors keep their default behaviour inside the app.
+          handleLinkClick(e, props.href, openExternalPreferred);
         }}
       />
     );
@@ -1999,8 +2059,6 @@ export const ChatMessageView = memo(
   );
   const [copied, setCopied] = useState(false);
   const { status: ttsStatus, toggle: ttsToggle, stop: ttsStop } = useTtsPlayback();
-  const [ttsError, setTtsError] = useState<string | null>(null);
-  const [ttsRetrying, setTtsRetrying] = useState(false);
 
   const modeLabel = (_id: string) => modeLabelStr;
 
@@ -2018,8 +2076,17 @@ export const ChatMessageView = memo(
   // کلیک تند هرگز دو پخش همزمان نمی‌سازد. حین پخش → pause درجا، حین pause →
   // resume از همان‌جا (نه از اول)، حین لودینگ → لغو. لغو دستی خطا نیست.
   const toggleSpeak = async () => {
-    setTtsError(null);
+    // Clear any previous banner error for this chat before a new attempt.
+    try {
+      const prevChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
+      if (prevChatId) useStore.getState().setChatTtsError(prevChatId, null);
+    } catch {
+      // Banner clear is best-effort.
+    }
     const st = useStore.getState();
+    // A live voice session owns the audio output: never start separate message playback over it.
+    const liveVoice = (st as unknown as { liveVoiceState?: string }).liveVoiceState;
+    if (liveVoice === "live" || liveVoice === "speaking" || liveVoice === "connecting") return;
     const providers = st.settings.providers ?? [];
     // Build the provider chain: primary first, then ordered fallbacks.
     const toSpeakOpts = (
@@ -2034,37 +2101,44 @@ export const ChatMessageView = memo(
       voice,
     });
     const chain: SpeakProviderOpts[] = [];
-    const primary = providers.find((p) => p.id === st.ttsProviderId);
+    const isLocalTts = st.ttsProviderId === "local";
+    // Local mode has no provider entry: the local voice is passed via the
+    // TtsLocalRequest below, so the chain stays empty and no remote call
+    // is ever attempted while local is ON.
+    const primary = isLocalTts ? undefined : providers.find((p) => p.id === st.ttsProviderId);
     if (primary) chain.push(toSpeakOpts(primary, st.ttsModel, st.ttsVoice));
-    for (const fb of st.ttsFallbacks ?? []) {
-      const p = providers.find((x) => x.id === fb.providerId);
-      if (!p) continue;
-      chain.push(toSpeakOpts(p, fb.model, fb.voice));
+    // When the on-device voice is ON, never contact a remote provider.
+    if (!isLocalTts) {
+      for (const fb of st.ttsFallbacks ?? []) {
+        const p = providers.find((x) => x.id === fb.providerId);
+        if (!p) continue;
+        chain.push(toSpeakOpts(p, fb.model, fb.voice));
+      }
     }
-    if (chain.length === 0) {
-      setTtsError("برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید");
+    if (chain.length === 0 && !isLocalTts) {
+      const msg = "برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید";
+      const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
+      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, msg);
       return;
     }
     // Only the final answer is spoken — the working trace (tool narrations,
     // status lines) shown mid-run is never read aloud.
     const speakable = stripBidiMarks(fixZwsp(speakableMessageText(message)));
     if (!speakable.trim()) {
-      setTtsError("متن قابل خواندنی برای پخش نیست");
+      const msg = "متن قابل خواندنی برای پخش نیست";
+      const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
+      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, msg);
       return;
     }
     try {
-      await ttsToggle(speakable, chain);
+      await ttsToggle(speakable, chain, { ttsProviderId: st.ttsProviderId, ttsModel: st.ttsModel, ttsBaseUrl: st.settings?.ttsBaseUrl, ttsVoice: st.ttsVoice });
     } catch (err) {
       const friendly = friendlyTtsError(err);
       if (!friendly) return;
       console.warn("speak failed", err);
-      setTtsError(friendly);
+      const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
+      if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, friendly);
     }
-  };
-
-  const retrySpeak = () => {
-    setTtsRetrying(true);
-    void toggleSpeak().finally(() => setTtsRetrying(false));
   };
 
   // قطع صدا هنگام شروع پیام جدید یا unmount تا پخش قدیمی روی پیام تازه نماند.
@@ -2364,6 +2438,20 @@ export const ChatMessageView = memo(
 
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
+      {!isUser && message.autoSkills && message.autoSkills.length > 0 && (
+        <div className="msg-attachments" dir="ltr">
+          {message.autoSkills.map((sk) => (
+            <span
+              className="attachment-chip"
+              key={`autoskill-${sk}`}
+              title="Auto-loaded skill — picked by the decision model for this turn"
+            >
+              ⚡ {sk}
+            </span>
+          ))}
+        </div>
+      )}
+
       {!isUser && message.interrupted && (
         <div className="msg-interrupted" dir="auto">
           ⚠️ Interrupted — this reply was cut off (e.g. power loss). Send
@@ -2445,7 +2533,6 @@ export const ChatMessageView = memo(
                   className={`msg-copy msg-speak ${ttsStatus === "speaking" ? "speaking" : ""} ${ttsStatus === "loading" ? "loading" : ""} ${ttsStatus === "paused" ? "paused" : ""}`}
                   onClick={toggleSpeak}
                   title={
-                    ttsError ??
                     (ttsStatus === "speaking"
                       ? "توقف موقت"
                       : ttsStatus === "paused"
@@ -2516,19 +2603,6 @@ export const ChatMessageView = memo(
                     </svg>
                   )}
                 </button>
-              )}
-              {ttsError && !isUser && !message.streaming && (
-                <span className="msg-tts-error" role="alert">
-                  <span className="msg-tts-error-text">{ttsError}</span>
-                  <button
-                    className="msg-tts-retry"
-                    onClick={retrySpeak}
-                    disabled={ttsRetrying}
-                    title="تلاش مجدد"
-                  >
-                    {ttsRetrying ? "…" : "تلاش مجدد"}
-                  </button>
-                </span>
               )}
               {!isUser &&
                 !isSummary &&

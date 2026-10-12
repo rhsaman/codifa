@@ -140,3 +140,38 @@ async def test_opencode_still_uses_models_dev(patch_httpx):
     assert models[0]["context"] == 128_000, (
         f"opencode should use models.dev 128K, got {models[0]['context']}"
     )
+
+
+@pytest.mark.asyncio
+async def test_models_dev_catalog_timeout_is_bounded(monkeypatch):
+    """The catalog fetch must never park turn start for tens of seconds.
+
+    Regression: the first turn of a chat stalled ~30s in "Preparing context"
+    because the models.dev fetch used a 30s HTTP timeout. The bound must stay
+    small so a slow network degrades to the cached/empty catalog instead.
+    """
+    import providers as P
+
+    captured: dict = {}
+
+    class _CapturingClient:
+        def __init__(self, *a, **k):
+            captured.update(k)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _FakeResp({})
+
+    monkeypatch.setattr(P.httpx, "AsyncClient", _CapturingClient)
+    monkeypatch.setattr(P, "_models_dev_cache", None)
+    await P._models_dev_catalog()
+    timeout = captured.get("timeout")
+    assert isinstance(timeout, (int, float)), (
+        f"catalog fetch must set an explicit timeout, got {timeout!r}"
+    )
+    assert timeout <= 10.0, f"catalog timeout {timeout}s can park turn start"

@@ -1,15 +1,15 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
-import { markWindowClicked, useStore } from "../lib/store";
-import type { ChatLayout } from "../lib/store";
+import { useStore } from "../lib/store";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
-import { buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, findNodeById, leafCount, normalizeTree, pickNeighborWindow } from "../lib/chatTree";
+import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
 import { focusChatInput } from "../lib/chatFocus";
 import { workspaceDisplayFor } from "../lib/chatWindowMeta";
 import { physicalKey } from "../lib/shortcuts";
 import { syncViewerToChat } from "../lib/viewerTabs";
 import { ChatPanel } from "./Chat";
 import { TabPendingBadges } from "./ChatTabBar";
+import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 import { windowStatusFor } from "../lib/chatWindowStatus";
 import { hasFileDrop, isFileDrag } from "../lib/fileDrag";
 
@@ -61,16 +61,15 @@ function chatTitleOf(id: string): string {
  *  Edges split (left/right/top/bottom), center swaps/focuses. Works for any
  *  current orientation so a horizontal row can still accept a vertical drop
  *  and vice versa. */
-function posForPoint(e: DragEvent, el: HTMLElement): ChatDropPos {
+function posForPoint(e: DragEvent, el: HTMLElement, prev: ChatDropPos | null = null): ChatDropPos {
   const rect = el.getBoundingClientRect();
   const x = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5;
   const y = rect.height > 0 ? (e.clientY - rect.top) / rect.height : 0.5;
-  const edge = 0.25;
-  if (x < edge && x <= y && x <= 1 - y) return "left";
-  if (x > 1 - edge && x >= y && x >= 1 - y) return "right";
-  if (y < edge) return "top";
-  if (y > 1 - edge) return "bottom";
-  return "center";
+  // Hysteresis via resolveLeafPos: inserting the ghost sibling and vacating
+  // the source expand the target leaf, shifting fractions a few px under a
+  // steady cursor. Without the wider exit band the pos flips edge/center
+  // every frame and the empty page flickers in and out.
+  return resolveLeafPos(x, y, prev);
 }
 
 /** Outer-edge threshold for root drops (whole chat area border).
@@ -86,10 +85,13 @@ const ROOT_EDGE_FRACTION = 0.06;
  *  bottom strip (remaining windows stay on top side-by-side). A corner
  *  (near two borders at once) stays leaf-level so a pane can be parked in
  *  the top-right corner instead of forcing a full-width root strip. */
-function rootEdgeForStackPoint(e: DragEvent, stackEl: HTMLElement | null): ChatDropPos | null {
+function rootEdgeForStackPoint(e: DragEvent, stackEl: HTMLElement | null, extraPx = 0): ChatDropPos | null {
   const rect = stackEl?.getBoundingClientRect();
   if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-  const threshold = Math.max(ROOT_EDGE_MIN_PX, Math.min(rect.width, rect.height) * ROOT_EDGE_FRACTION);
+  // extraPx widens the exit band while a root preview shows: leaving the
+  // edge strip must travel further before the preview flips back to a leaf
+  // ghost, otherwise a steady cursor near the border flickers root/leaf.
+  const threshold = Math.max(ROOT_EDGE_MIN_PX, Math.min(rect.width, rect.height) * ROOT_EDGE_FRACTION) + extraPx;
   const leftDist = e.clientX - rect.left;
   const rightDist = rect.right - e.clientX;
   const topDist = e.clientY - rect.top;
@@ -108,9 +110,9 @@ function rootEdgeForStackPoint(e: DragEvent, stackEl: HTMLElement | null): ChatD
   return "bottom";
 }
 
-function rootEdgeForPoint(e: DragEvent, leafEl: HTMLElement): ChatDropPos | null {
+function rootEdgeForPoint(e: DragEvent, leafEl: HTMLElement, extraPx = 0): ChatDropPos | null {
   const stackEl = leafEl.closest?.(".chat-windows") as HTMLElement | null;
-  return rootEdgeForStackPoint(e, stackEl);
+  return rootEdgeForStackPoint(e, stackEl, extraPx);
 }
 
 /** Header drag handle: reorders stacked windows (HTML5 DnD, no extra deps).
@@ -137,6 +139,11 @@ const WindowHeader = memo(function WindowHeader({
   const unreadChats = useStore((s) => s.unreadChats);
   const workspaces = useStore((s) => s.workspaces);
   const workspaceColors = useStore((s) => s.workspaceColors);
+  const dir = useStore((s) => s.dir);
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    setEditing(false);
+  }, [chatId]);
   const status = windowStatusFor(chat, chatId, activeChatId, unreadChats);
   const ws = workspaceDisplayFor(chat?.root, workspaces, workspaceColors);
   const beginDrag = (e: DragEvent) => {
@@ -146,9 +153,41 @@ const WindowHeader = memo(function WindowHeader({
     onDragState(chatId);
   };
   const focus = () => {
-    markWindowClicked(chatId);
     useStore.getState().focusWindow(chatId);
   };
+  // Instant minimize: pointerdown fires on press (~100ms before click which
+  // waits for release). Guarded so the follow-up click never closes twice.
+  const minimizeArmedRef = useRef(false);
+  const doMinimize = useCallback((hideEl?: HTMLElement | null) => {
+    if (minimizeArmedRef.current) return;
+    minimizeArmedRef.current = true;
+    // Optimistic hide: collapse the flex slot synchronously so the remaining
+    // panes expand in the same frame. closest() with a selector list returns
+    // the NEAREST match (the inner section), which would leave an empty flex
+    // slot behind and feel like a two-step lag — so find the leaf first, then
+    // hide its wrapping slot.
+    try {
+      const leaf = hideEl?.closest?.('[data-chat-window]') as HTMLElement | null;
+      const slot = (leaf?.parentElement?.closest?.('.chat-split-child, .chat-window-slot') as HTMLElement | null)
+        ?? (leaf?.parentElement as HTMLElement | null);
+      if (slot) slot.style.display = 'none';
+      else if (leaf) leaf.style.display = 'none';
+    } catch {
+      /* ignore */
+    }
+    onDragState(null);
+    // Run the tree update as a macrotask AFTER paint: rAF fires BEFORE paint,
+    // so scheduling there would still block the sync hide above from painting
+    // and the press would feel laggy. setTimeout lets the collapsed slot paint
+    // first; the React commit (incl. remaining-panel remount) follows.
+    setTimeout(() => {
+      try {
+        useStore.getState().closeWindow(chatId);
+      } finally {
+        minimizeArmedRef.current = false;
+      }
+    }, 0);
+  }, [chatId, onDragState]);
   return (
     <div
       className={"chat-window-head" + (focused ? " focused" : "")}
@@ -161,7 +200,6 @@ const WindowHeader = memo(function WindowHeader({
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          markWindowClicked(chatId);
           useStore.getState().focusWindow(chatId);
         }
       }}
@@ -178,14 +216,32 @@ const WindowHeader = memo(function WindowHeader({
         status.unread && (
           <span className="editor-tab-dot unread" title="New message from the agent — click to view" aria-hidden="true" />
         )}
-      <span
-        className="chat-window-title"
-        draggable={multi}
-        onDragStart={beginDrag}
-        onDragEnd={() => onDragState(null)}
-      >
-        {title}
-      </span>
+      {editing ? (
+        <ChatRenameInput
+          initialValue={title === "New chat" ? "" : title}
+          dir={dir}
+          className="chat-rename-input chat-window-title-input"
+          ariaLabel={`Rename ${title}`}
+          onCommit={(v) => {
+            useStore.getState().renameChat(chatId, normalizeRenameValue(v));
+            setEditing(false);
+          }}
+          onCancel={() => setEditing(false)}
+        />
+      ) : (
+        <span
+          className="chat-window-title"
+          draggable={multi}
+          onDragStart={beginDrag}
+          onDragEnd={() => onDragState(null)}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            setEditing(true);
+          }}
+        >
+          {title}
+        </span>
+      )}
       <span
         className="chat-window-ws"
         style={{ "--ws": ws.color } as CSSProperties}
@@ -234,13 +290,17 @@ const WindowHeader = memo(function WindowHeader({
               e.preventDefault();
               e.stopPropagation();
             }}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              e.stopPropagation();
+              doMinimize(e.currentTarget as HTMLElement);
+            }}
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              // Sync + light: clear preview first, close immediately.
-              // Persist is debounced inside the store (no await here).
-              onDragState(null);
-              useStore.getState().closeWindow(chatId);
+              // Fallback for keyboard / touch without pointerdown.
+              doMinimize(e.currentTarget as HTMLElement);
             }}
           >
             <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
@@ -345,17 +405,30 @@ const LeafView = memo(function LeafView({
         } catch {
           hasExternal = false;
         }
-        // Root edge wins over leaf zones for any chat drag (internal move
-        // or external tab/sidebar drag): the dragged window's own space
-        // counts as empty, so the remaining tree decides the landing zone.
+        // Root edge wins over leaf zones, except external drags at max:
+        // root drops always add a window, so a full grid cannot take one —
+        // fall through to leaf center replace instead of a stale strip.
         if (drag.dragId || hasExternal) {
-          const rootPos = rootEdgeForPoint(e, e.currentTarget as HTMLElement);
+          const rootActive = drag.drop?.id === CHAT_ROOT_DROP_ID;
+          const rootPos = rootEdgeForPoint(e, e.currentTarget as HTMLElement, rootActive ? 24 : 0);
           if (rootPos) {
-            e.preventDefault();
-            e.stopPropagation();
-            e.dataTransfer.dropEffect = "move";
-            drag.setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
-            return;
+            if (!drag.dragId) {
+              const st = useStore.getState();
+              const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds;
+              if (ids.length < CHAT_WINDOW_MAX) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.dataTransfer.dropEffect = "move";
+                drag.setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
+                return;
+              }
+            } else {
+              e.preventDefault();
+              e.stopPropagation();
+              e.dataTransfer.dropEffect = "move";
+              drag.setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
+              return;
+            }
           }
         }
         // The moving window itself is never a drop target: showing a preview
@@ -368,28 +441,31 @@ const LeafView = memo(function LeafView({
         e.preventDefault();
         e.stopPropagation();
         e.dataTransfer.dropEffect = "move";
-        const rawPos = posForPoint(e, e.currentTarget as HTMLElement);
-        // External tab/sidebar drags never replace on center: map center to a
-        // beside split so dropping creates a new window next to the target.
-        // Internal moves (dragId set) keep swap/replace on center.
-        const pos = (!internal && rawPos === "center") ? "right" : rawPos;
-        // Full: a new chat cannot split in (external center already maps to split above).
+        const prevPos = drag.drop?.id === chatId ? drag.drop.pos : null;
+        const rawPos = posForPoint(e, e.currentTarget as HTMLElement, prevPos);
+        // Center drops swap/replace: internal moves swap windows, external
+        // tab/sidebar drags replace the target (no new window, works at max).
+        let pos = rawPos;
+        // Full: a new chat cannot split in, so an external edge becomes a
+        // center replace — the empty page still shows instead of vanishing.
         if (!internal) {
           const st = useStore.getState();
           const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds;
           if (ids.length >= CHAT_WINDOW_MAX && pos !== 'center') {
-            drag.setDrop((prev) => (prev?.id === chatId ? null : prev));
-            return;
+            pos = 'center';
           }
         }
         drag.setDrop((prev) => (prev?.id === chatId && prev.pos === pos ? prev : { id: chatId, pos }));
       }}
       onDragLeave={(e) => {
-        // dragleave fires when moving between children inside the same pane
-        // (transcript nodes): only clear when the pointer truly leaves it,
-        // otherwise the preview flickers and re-renders every few pixels.
-        const to = e.relatedTarget as Node | null;
+        // dragleave fires between children inside the same pane and when the
+        // ghost sibling inserts next to the target: the pointer "leaves" the
+        // leaf for the ghost while still inside the chat area. Clearing here
+        // removes the ghost, shifts layout back, re-triggers dragover, and
+        // flickers rapidly — so only clear when truly leaving the chat area.
+        const to = e.relatedTarget as HTMLElement | null;
         if (to && (e.currentTarget as HTMLElement).contains(to)) return;
+        if (to?.closest?.(".chat-windows")) return;
         drag.setDrop((prev) => (prev?.id === chatId ? null : prev));
       }}
       onDrop={(e) => {
@@ -402,8 +478,6 @@ const LeafView = memo(function LeafView({
         // Trust the shown preview so the result matches what the user saw:
         // recomputing from drop coordinates can disagree by a few pixels.
         const shown = drag.drop;
-        // External tab/sidebar drags keep dragId null (id only in dataTransfer).
-        const isExternal = !drag.dragId;
         drag.setDragId(null);
         drag.setDrop(null);
         if (!from) return;
@@ -412,9 +486,7 @@ const LeafView = memo(function LeafView({
           return;
         }
         if (shown?.id === chatId && from !== chatId) {
-          // External center never replaces: split beside instead (openBeside-style).
-          const edgePos = isExternal && shown.pos === "center" ? "right" : shown.pos;
-          useStore.getState().dropChatOnto(from, chatId, edgePos);
+          useStore.getState().dropChatOnto(from, chatId, shown.pos);
           return;
         }
         const rootPos = rootEdgeForPoint(e, e.currentTarget as HTMLElement);
@@ -423,8 +495,7 @@ const LeafView = memo(function LeafView({
           return;
         }
         if (from === chatId) return;
-        const rawPos = posForPoint(e, e.currentTarget as HTMLElement);
-        const pos = isExternal && rawPos === "center" ? "right" : rawPos;
+        const pos = posForPoint(e, e.currentTarget as HTMLElement);
         useStore.getState().dropChatOnto(from, chatId, pos);
       }}
     >
@@ -432,7 +503,6 @@ const LeafView = memo(function LeafView({
         <WindowHeader chatId={chatId} focused={focused} multi={multi} fullscreen={isFullscreen} onDragState={drag.setDragId} />
       )}
       <div className="chat-window-body" onClick={() => {
-        markWindowClicked(chatId);
         useStore.getState().focusWindow(chatId);
       }}>
         <MemoChatPanel chatId={chatId} dimmed={multi && !focused} />
@@ -442,7 +512,7 @@ const LeafView = memo(function LeafView({
           <div className="chat-drop-empty-page">
             <span className="chat-drop-empty-title">{drag.dragId ? chatTitleOf(drag.dragId) : "Chat"}</span>
             <span className="chat-drop-hint">
-              {dropPos === "center" && drag.dragId ? "Release to focus here" : "Release to open here"}
+              {dropPos === "center" ? (drag.dragId ? "Release to swap" : "Release to replace") : "Release to open here"}
             </span>
           </div>
         </div>
@@ -484,35 +554,102 @@ function SplitView({
     );
   }
   const isRow = node.dir === "row";
+  // Sibling ghost: an edge drop along this split's axis inserts a real flex
+  // sibling next to the target, so the preview shows N equal windows (e.g.
+  // 3 stay 3 equal) instead of an overlay that reads as an extra window.
+  const ghostTargetIdx = node.children.findIndex((c) => c.kind === "leaf" && !!drag.drop && drag.drop.id === c.chatId && drag.drop.pos !== "center");
+  const ghostPos = ghostTargetIdx >= 0 ? drag.drop!.pos : null;
+  const showGhost = ghostTargetIdx >= 0 && ghostPos !== null && !fullscreenId && shouldShowSiblingGhost(node.dir, ghostPos, true);
+  const showNestedGhost = ghostTargetIdx >= 0 && ghostPos !== null && !fullscreenId && shouldShowNestedGhost(node.dir, ghostPos, true);
+  const anyGhost = showGhost || showNestedGhost;
+  const ghostAt = showGhost ? ghostInsertIndex(ghostTargetIdx, ghostPos!) : -1;
+  const ghostTitle = drag.dragId ? chatTitleOf(drag.dragId) : "Chat";
+  // Ghost uses equal flex (1) and siblings equalize too, so the preview
+  // shows N equal panes (e.g. dragging the 3rd window shows 3 equal).
+  const ghostEl = showGhost ? (
+    <div
+      key="__drop-ghost__"
+      className="chat-split-child chat-drop-ghost"
+      style={{ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties}
+      aria-hidden="true"
+    >
+      <div className="chat-drop-ghost-page">
+        <span className="chat-drop-empty-title">{ghostTitle}</span>
+        <span className="chat-drop-hint">Release to open here</span>
+      </div>
+    </div>
+  ) : null;
+  const nestedGhostInner = showNestedGhost ? (
+    <div
+      key="__drop-ghost-nested__"
+      className="chat-split-child chat-drop-ghost"
+      style={{ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties}
+      aria-hidden="true"
+    >
+      <div className="chat-drop-ghost-page">
+        <span className="chat-drop-empty-title">{ghostTitle}</span>
+        <span className="chat-drop-hint">Release to open here</span>
+      </div>
+    </div>
+  ) : null;
+  // Suppress the half-pane overlay only on the ghost target: the ghost sibling
+  // already shows the landing zone with equal flex, so keeping both would
+  // read as an extra window. Other children keep the original drop so a
+  // nested drag source still vacates (its own space counts as empty).
+  const kids: React.ReactNode[] = [];
+  node.children.forEach((child, i) => {
+    if (showGhost && ghostAt === i) kids.push(ghostEl);
+    const isGhostTarget = (showGhost || showNestedGhost) && i === ghostTargetIdx;
+    const childDrag = isGhostTarget ? { ...drag, drop: null } : drag;
+    // Fullscreen keeps every panel mounted: subtrees without the
+    // fullscreen chat hide with CSS instead of unmounting.
+    const childIds = collectChatIds(child);
+    const childHidden = !!fullscreenId && !childIds.includes(fullscreenId);
+    // Internal drag vacates the source slot once an edge preview shows: the dragged
+    // window's own space counts as empty, so the ghost plus the remaining
+    // panes show the final layout (e.g. dragging the 3rd window shows 3
+    // equal panes, not 4). Gated on edge drop so center swap keeps all panes
+    // (swap preserves count) and layout stays stable until a target highlights.
+    // External tab/sidebar drags keep dragId null.
+    const vacated = !childHidden && !fullscreenId && !!drag.drop && drag.drop.pos !== "center" && isVacatedByDrag(childIds, drag.dragId);
+    const hidden = childHidden || vacated;
+    kids.push(
+      <div
+        key={child.id}
+        className={"chat-split-child" + (hidden ? " window-hidden" : "")}
+        style={{ flexGrow: anyGhost && !hidden ? 1 : child.size, flexShrink: 0, flexBasis: 0, ...(hidden ? { display: "none" } : null) } as CSSProperties}
+        aria-hidden={hidden}
+      >
+        {i > 0 && (
+          <div
+            className={`chat-split-resize ${isRow ? "col-bar" : "row-bar"}`}
+            title="Drag to resize"
+            role="separator"
+            aria-orientation={isRow ? "vertical" : "horizontal"}
+            onMouseDown={(e) => {
+              const prev = node.children[i - 1];
+              startTreeResize(e, node.id, prev.id, child.id, prev.size, child.size, isRow);
+            }}
+          />
+        )}
+        {showNestedGhost && i === ghostTargetIdx && !hidden ? (
+          <div className={`chat-split ${dirForPos(ghostPos!) === "row" ? "row" : "col"}`} style={{ flex: "1 1 auto", minHeight: 0, minWidth: 0 } as CSSProperties}>
+            {beforePos(ghostPos!) && nestedGhostInner}
+            <div className="chat-split-child" style={{ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties}>
+              <SplitView node={child} activeChatId={activeChatId} multi={multi} drag={childDrag} fullscreenId={fullscreenId} startTreeResize={startTreeResize} />
+            </div>
+            {!beforePos(ghostPos!) && nestedGhostInner}
+          </div>
+        ) : (
+          <SplitView node={child} activeChatId={activeChatId} multi={multi} drag={childDrag} fullscreenId={fullscreenId} startTreeResize={startTreeResize} />
+        )}
+      </div>
+    );
+  });
+  if (showGhost && ghostAt >= node.children.length) kids.push(ghostEl);
   return (
     <div className={`chat-split ${isRow ? "row" : "col"}`} data-split-id={node.id}>
-      {node.children.map((child, i) => {
-        // Fullscreen keeps every panel mounted: subtrees without the
-        // fullscreen chat hide with CSS instead of unmounting.
-        const childHidden = !!fullscreenId && !collectChatIds(child).includes(fullscreenId);
-        return (
-        <div
-          key={child.id}
-          className={"chat-split-child" + (childHidden ? " window-hidden" : "")}
-          style={{ flexGrow: child.size, flexShrink: 0, flexBasis: 0, ...(childHidden ? { display: "none" } : null) } as CSSProperties}
-          aria-hidden={childHidden}
-        >
-          {i > 0 && (
-            <div
-              className={`chat-split-resize ${isRow ? "col-bar" : "row-bar"}`}
-              title="Drag to resize"
-              role="separator"
-              aria-orientation={isRow ? "vertical" : "horizontal"}
-              onMouseDown={(e) => {
-                const prev = node.children[i - 1];
-                startTreeResize(e, node.id, prev.id, child.id, prev.size, child.size, isRow);
-              }}
-            />
-          )}
-          <SplitView node={child} activeChatId={activeChatId} multi={multi} drag={drag} fullscreenId={fullscreenId} startTreeResize={startTreeResize} />
-        </div>
-        );
-      })}
+      {kids}
     </div>
   );
 }
@@ -756,12 +893,23 @@ export function ChatWindows() {
   const onStackDragOver = (e: DragEvent) => {
     if (isFileDrag(e.dataTransfer.types)) return;
     if (!dragId && !hasExternalChat(e)) return;
+    // Full grid: external root-edge drops would add a window, so suppress
+    // the strip highlight — leaf center replace covers the gap instead.
+    if (!dragId) {
+      const st = useStore.getState();
+      const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds;
+      if (ids.length >= CHAT_WINDOW_MAX) {
+        setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID ? null : prev));
+        return;
+      }
+    }
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     // Gaps between panes (resize bars, split padding) also accept root-edge
     // drops so the full-width highlight works even off-leaf. Applies to both
     // internal moves and external tab/sidebar drags (which keep dragId null).
-    const rootPos = rootEdgeForStackPoint(e, stackRef.current);
+    const rootActive = drop?.id === CHAT_ROOT_DROP_ID;
+    const rootPos = rootEdgeForStackPoint(e, stackRef.current, rootActive ? 24 : 0);
     if (rootPos) {
       setDrop((prev) => (prev?.id === CHAT_ROOT_DROP_ID && prev.pos === rootPos ? prev : { id: CHAT_ROOT_DROP_ID, pos: rootPos }));
     } else {
@@ -807,11 +955,9 @@ export function ChatWindows() {
     }
     // Gap drop (resize bars, split padding): trust the last shown leaf
     // preview so the result matches the highlight the user saw.
-    // External center never replaces: split beside instead.
     if (curDrop && curDrop.id !== CHAT_ROOT_DROP_ID && from !== curDrop.id) {
       e.preventDefault();
-      const edgePos = !dragId && curDrop.pos === "center" ? "right" : curDrop.pos;
-      useStore.getState().dropChatOnto(from, curDrop.id, edgePos);
+      useStore.getState().dropChatOnto(from, curDrop.id, curDrop.pos);
       return;
     }
     const rootPos = rootEdgeForStackPoint(e, stackRef.current);
@@ -890,21 +1036,22 @@ export function ChatWindows() {
       // never shows the wrong chat next to the tree window.
       const only = collectChatIds(chatTree)[0] ?? visibleChatIds[0] ?? activeChatId;
       if (!only) return null;
-      // Single window still accepts a split drop: LeafView shows the
-      // empty-page edge preview so the user sees where the pane lands.
+      // Single window renders through the same SplitView as multi (not a
+      // separate slot branch): after a minimize the tree keeps its split
+      // wrapper (see removeChat), so the remaining LeafView keeps its React
+      // key/parent and is never remounted (the minimize lag). Single styling
+      // comes from the container class; multi=false hides the header.
       return (
         <div
           ref={stackRef}
-          className={"chat-windows single vertical" + (fullscreenId ? " window-full" : "") + (rootDropPos ? ` root-drop-active root-drop-${rootDropPos}` : "")}
+          className={"chat-windows single tree" + (fullscreenId ? " window-full" : "") + (rootDropPos ? ` root-drop-active root-drop-${rootDropPos}` : "")}
           data-testid="chat-windows"
           data-layout={layout}
           onDragOver={onStackDragOver}
           onDragLeave={onStackDragLeave}
           onDrop={onStackDrop}
         >
-          <div className="chat-window-slot" style={{ flex: "1 1 auto" } as CSSProperties}>
-            <LeafView chatId={only} focused multi={false} drag={drag} fullscreenId={fullscreenId} />
-          </div>
+          <SplitView node={chatTree} activeChatId={activeChatId} multi={false} drag={drag} fullscreenId={fullscreenId} startTreeResize={startTreeResize} />
           {rootPreview}
         </div>
       );
@@ -938,14 +1085,76 @@ export function ChatWindows() {
           onDragLeave={onStackDragLeave}
           onDrop={onStackDrop}
     >
-      {visibleChatIds.map((id) => {
-        const focused = id === activeChatId;
-        return (
-          <div key={id} className="chat-window-slot" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties) : undefined}>
-            <LeafView chatId={id} focused={focused} multi={multi} drag={drag} fullscreenId={fullscreenId} />
+      {(() => {
+        // Legacy flat preview mirrors the tree path: the dragged window's own
+        // space counts as empty (vacated slot collapses) and an edge drop
+        // along the stack axis inserts a real flex sibling ghost with equal
+        // size, so 2 windows preview as 2 equal (not 3) and dragging the 3rd
+        // previews 3 equal. External tab/sidebar drags keep dragId null.
+        const targetIdx = visibleChatIds.findIndex((id) => !!drag.drop && drag.drop.id === id && drag.drop.pos !== "center");
+        const targetPos = targetIdx >= 0 ? drag.drop!.pos : null;
+        const parentDir = horizontal ? "row" : "col";
+        const showGhost = targetIdx >= 0 && targetPos !== null && !fullscreenId && shouldShowSiblingGhost(parentDir, targetPos, true);
+        const showNestedGhost = targetIdx >= 0 && targetPos !== null && !fullscreenId && shouldShowNestedGhost(parentDir, targetPos, true);
+        const ghostAt = showGhost ? ghostInsertIndex(targetIdx, targetPos!) : -1;
+        const ghostTitle = drag.dragId ? chatTitleOf(drag.dragId) : "Chat";
+        const ghostSlot = showGhost ? (
+          <div key="__drop-ghost__" className="chat-window-slot chat-drop-ghost" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties) : undefined} aria-hidden="true">
+            <div className="chat-drop-ghost-page">
+              <span className="chat-drop-empty-title">{ghostTitle}</span>
+              <span className="chat-drop-hint">Release to open here</span>
+            </div>
           </div>
-        );
-      })}
+        ) : null;
+        const slots: React.ReactNode[] = [];
+        visibleChatIds.forEach((id, i) => {
+          if (showGhost && ghostAt === i) slots.push(ghostSlot);
+          const focused = id === activeChatId;
+          const vacated = !fullscreenId && !!drag.drop && drag.drop.pos !== "center" && isVacatedByDrag([id], drag.dragId);
+          if (vacated) {
+            slots.push(
+              <div key={id} className="chat-window-slot window-hidden" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0, display: "none" } as CSSProperties) : ({ display: "none" } as CSSProperties)} aria-hidden="true" />
+            );
+            return;
+          }
+          // Suppress the half-pane overlay only on the ghost target: the ghost
+          // sibling already shows the landing zone, so keeping both would read
+          // as an extra window. Other children keep the original drop.
+          const isGhostTarget = (showGhost || showNestedGhost) && i === targetIdx;
+          const leafDrag = isGhostTarget ? { ...drag, drop: null } : drag;
+          if (showNestedGhost && i === targetIdx) {
+            const nestedDirIsRow = dirForPos(targetPos!) === "row";
+            const ghostFirst = beforePos(targetPos!);
+            const nestedGhostSlot = (
+              <div key="__drop-ghost-nested__" className="chat-window-slot chat-drop-ghost" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties) : undefined} aria-hidden="true">
+                <div className="chat-drop-ghost-page">
+                  <span className="chat-drop-empty-title">{ghostTitle}</span>
+                  <span className="chat-drop-hint">Release to open here</span>
+                </div>
+              </div>
+            );
+            slots.push(
+              <div key={id} className="chat-window-slot" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties) : undefined}>
+                <div className={`chat-split ${nestedDirIsRow ? "row" : "col"}`} style={{ flex: "1 1 auto", minHeight: 0, minWidth: 0 } as CSSProperties}>
+                  {ghostFirst && nestedGhostSlot}
+                  <div className="chat-split-child" style={{ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties}>
+                    <LeafView chatId={id} focused={focused} multi={multi} drag={leafDrag} fullscreenId={fullscreenId} />
+                  </div>
+                  {!ghostFirst && nestedGhostSlot}
+                </div>
+              </div>
+            );
+            return;
+          }
+          slots.push(
+            <div key={id} className="chat-window-slot" style={multi ? ({ flexGrow: 1, flexShrink: 0, flexBasis: 0 } as CSSProperties) : undefined}>
+              <LeafView chatId={id} focused={focused} multi={multi} drag={leafDrag} fullscreenId={fullscreenId} />
+            </div>
+          );
+        });
+        if (showGhost && ghostAt >= visibleChatIds.length) slots.push(ghostSlot);
+        return slots;
+      })()}
       {rootPreview}
     </div>
   );

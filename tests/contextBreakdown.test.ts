@@ -11,6 +11,7 @@ import {
   formatBreakdownPercent,
   formatTokensK,
   contextBarSegmentPercent,
+  contextPercent,
 } from '../src/lib/context.ts'
 import type { Chat } from '../src/types.ts'
 
@@ -260,6 +261,31 @@ console.log('۸) real reported parts (ctx_parts) beat estimates:')
   const bd2 = buildContextBreakdown(chat2, 'sys', 10000, { systemPromptChars: 800 })
   const sp2 = bd2.rows.find((r) => r.key === 'systemPrompt')?.tokens
   check('real system prompt preserved on overshoot', sp2 === 200, sp2)
+
+  // ctx_parts with real tool schemas: System tools row must reflect them, never 0.
+  const chat3 = mkChat([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'ok', usage: { inputTokens: 5000, outputTokens: 100, totalTokens: 5100 } },
+  ])
+  const bd3 = buildContextBreakdown(chat3, 'sys', 100000, { systemToolsChars: 12000, mcpChars: 400 })
+  const tools3 = bd3.rows.find((r) => r.key === 'systemTools')?.tokens
+  check('real system tools preserved (12000/4 = 3000)', tools3 === 3000, tools3)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8ب) pre-turn estimate (no backend report yet): the unexplained gap is the
+// unmeasured tool schemas, so it belongs to System tools — never 0 with the
+// remainder dumped into Messages.
+{
+  const chat = mkChat([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'ok' },
+  ])
+  const bd = buildContextBreakdown(chat, 'sys', 100000)
+  const find = (k: string) => bd.rows.find((r) => r.key === k)?.tokens
+  const sum = bd.rows.reduce((s, r) => s + r.tokens, 0)
+  check('rows still sum to the meter total', sum === bd.total, { sum, total: bd.total })
+  check('system tools holds the unmeasured schemas (not 0)', (find('systemTools') ?? 0) > 0, find('systemTools'))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,6 +328,31 @@ console.log('10) formatTokensK: window label keeps percent-consistent precision:
   check('824100 -> "824K"', formatTokensK(824_100) === '824K', formatTokensK(824_100))
   check('2365100 -> "2.37M"', formatTokensK(2_365_100) === '2.37M', formatTokensK(2_365_100))
   check('900 -> "900"', formatTokensK(900) === '900', formatTokensK(900))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('۱۱) threshold-scaled ring: 100% at the auto-compaction threshold:')
+{
+  // Raw window 200k, threshold 50% -> usable 100k. Half the raw window
+  // fills the ring (100), a quarter reads 50.
+  const raw = 200000
+  const usable = Math.round(raw * (50 / 100))
+  const atThreshold = contextPercent(100000, usable)
+  const halfThreshold = contextPercent(50000, usable)
+  check('usable = 50% of raw (100k)', usable === 100000, usable)
+  check('100k used with 50% threshold -> 100 (ring full)', Math.round(atThreshold ?? 0) === 100, atThreshold)
+  check('50k used with 50% threshold -> 50', Math.round(halfThreshold ?? 0) === 50, halfThreshold)
+  // Ring clamps like ContextRing: never above 100.
+  const over = contextPercent(150000, usable)
+  check('over threshold clamps to 100 in the ring', Math.min(100, Math.round(over ?? 0)) === 100, over)
+  // Popover breakdown against the usable window agrees with the ring.
+  const bd = computeContextBreakdown(
+    100000,
+    { messages: 90000, systemTools: 8000, systemPrompt: 1000, skills: 500, mcpTools: 500, meta: 0 },
+    usable,
+    null,
+  )
+  check('breakdown percent = 100 at threshold', bd.percent === 100, bd.percent)
 }
 
 console.log((globalThis as any).__FAILED ? '\n✗ برخی تستها شکست خوردند' : '\n✓ همه تستها پاس شدند')

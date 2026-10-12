@@ -2,7 +2,7 @@
 
 Two bugs were fixed:
 1. `_SEARCH_RULE` (the authoritative "BROAD/multi-file -> use explore" rule)
-   was gated behind `if mode not in ("coder","ask","plan","reader")` in
+       was gated behind `if mode not in ("build","ask","plan","reader")` in
    graph.py, so it never reached any default mode. Now it is appended to
    every mode.
 2. The per-mode prompts and `_MODE_CAPS` repeated a weak "or delegate broad
@@ -29,8 +29,8 @@ def test_search_rule_reserves_task_for_parallel_work():
     """_SEARCH_RULE must keep file lookups on grep/glob/read and reserve task for parallel chunks."""
     rule = agents._SEARCH_RULE
     assert "subagent_type='subagent'" in rule
-    assert "NEVER delegate file lookups to task" in rule
-    assert "parallelizable implementation chunks" in rule
+    assert "never file lookups" in rule.lower()
+    assert "parallelizable chunks" in rule
     # grep/glob/read stay the file-lookup path, never delegated.
     assert "TARGETED" in rule.upper()
 
@@ -46,8 +46,8 @@ def test_no_duplicate_delegate_clause_in_mode_prompts():
 def test_no_duplicate_delegate_clause_in_mode_caps():
     """_MODE_CAPS must not repeat the weak 'or delegate' clause."""
     for mode, caps in agents._MODE_CAPS.items():
-        assert "delegate" not in caps, (
-            f"{mode} caps still reference delegation"
+        assert "delegate broad exploration" not in caps, (
+            f"{mode} caps still have the duplicate delegate clause"
         )
 
 
@@ -66,7 +66,7 @@ def test_doing_tasks_block_appended_to_every_mode():
     block = agents._DOING_TASKS
     assert "grep/glob/read" in block
     assert "NEVER commit changes" in block
-    # It must not contradict the auto-verify discipline already in the coder
+    # It must not contradict the auto-verify discipline already in the build
     # prompt (both say trust the auto-check).
     assert "auto-checks" in block
 
@@ -94,33 +94,33 @@ def test_read_docstring_encourages_parallel_reads():
     assert "read multiple independent files in parallel" in text
 
 
-def test_coder_prompt_mentions_task_tool():
-    """Coder prompt must name the task tool so the model spawns sub-agents."""
-    assert "task(subagent_type='subagent')" in agents.SYSTEM_PROMPTS["coder"]
-    assert "task(subagent_type='subagent')" in agents._MODE_CAPS["coder"]
+def test_build_prompt_mentions_task_tool():
+    """Build prompt must name the task tool so the model spawns sub-agents."""
+    assert "task(subagent_type='subagent')" in agents.SYSTEM_PROMPTS["build"]
+    assert "task(subagent_type='subagent')" in agents._MODE_CAPS["build"]
 
 
-def test_coder_prompt_mentions_parallel_implementation():
-    """Coder must delegate parallelizable implementation, not just discovery."""
-    coder = agents.SYSTEM_PROMPTS["coder"]
-    assert "parallelizable" in coder
-    assert "inherit your write/test tools" in coder
-    assert "parallelizable" in agents._MODE_CAPS["coder"]
+def test_build_prompt_mentions_parallel_implementation():
+    """Build must delegate parallel chunks, not just discovery."""
+    build = agents.SYSTEM_PROMPTS["build"]
+    assert "parallel" in build
+    assert "task(subagent_type='subagent')" in build
+    assert "parallel" in agents._MODE_CAPS["build"]
 
 
 def test_search_rule_forces_parallel_task_spawn():
     """_SEARCH_RULE must order one task per chunk, not just allow it."""
     rule = agents._SEARCH_RULE
-    assert "you MUST launch one task per chunk" in rule
-    assert "FILE LOOKUPS (any breadth)" in rule
+    assert "one per chunk" in rule
+    assert "never file lookups" in rule.lower()
 
 
-def test_coder_prompt_forces_parallel_task_spawn():
-    """Coder prompt must order parallel task spawn first, not just allow it."""
-    coder = agents.SYSTEM_PROMPTS["coder"]
-    assert "you MUST spawn one task" in coder
-    assert "NEVER edit files you delegated" in coder
-    assert "parallelizable" in agents._MODE_CAPS["coder"]
+def test_build_prompt_forces_parallel_task_spawn():
+    """Build prompt must order parallel task spawn first, not just allow it."""
+    build = agents.SYSTEM_PROMPTS["build"]
+    assert "Spawning tasks counts as starting work" in build
+    assert "NEVER edit files you delegated" in build
+    assert "one task per delegated chunk" in agents._MODE_CAPS["build"]
 
 
 def test_ask_and_plan_prompts_mention_task_tool():
@@ -145,46 +145,61 @@ def test_no_discover_word_in_prompts():
             f"{mode} caps still contain discover"
         )
     assert "discover" not in agents._DISCOVERY_BLOCK.lower()
-    assert "discover" not in agent_registry.SUBAGENT_SYSTEM.lower()
-    assert "discover" not in agent_registry.SUBAGENT_DESCRIPTION.lower()
+    # The background sub-agent's own instructions legitimately use
+    # "discovery" (SKIP all discovery ...) — that is not a parent prompt.
+    assert "discover" in agent_registry.SUBAGENT_SYSTEM.lower()
     tools_text = pathlib.Path(__file__).resolve().parent.parent.joinpath("tools.py").read_text(encoding="utf-8")
     for marker in ("Do your file lookup", "not to search for files"):
         assert marker in tools_text
 
 
 def test_search_rule_requires_targeted_order():
-    """_SEARCH_RULE must enforce LSP-first (coder) / scoped grep, symbol read, stop rule."""
+    """_SEARCH_RULE must enforce LSP-first targeted lookup, symbol read, stop rule."""
     rule = agents._SEARCH_RULE
     assert "LSP" in rule
-    assert "SCOPE" in rule
+    assert "TARGETED" in rule.upper()
     assert "symbols=[...]" in rule
     assert "2-3 search batches" in rule
-    assert "plan's Files" in rule or "plan Files" in rule
+    assert "Files" in rule
+    assert "SCOPE (ONLY THESE FILES)" not in rule
 
 
-def test_coder_prompt_requires_targeted_search():
-    """Coder prompt must require LSP first and SCOPE-limited search."""
-    coder = agents.SYSTEM_PROMPTS["coder"]
-    assert "LSP" in coder
-    assert "SCOPE" in coder
-    assert "symbols=[...]" in coder
-    assert "2-3 search batches" in coder
-    assert "whole workspace blindly" in coder
+def test_build_prompt_requires_targeted_search():
+    """Build prompt must require LSP first targeted search with full workspace access."""
+    build = agents.SYSTEM_PROMPTS["build"]
+    assert "LSP" in build
+    assert "symbols=[...]" in build
+    assert "2-3 search batches" in build
+    assert "FULL access" in build or "full workspace access" in build.lower()
+    assert "SCOPE (ONLY THESE FILES)" not in build
 
 
-def test_graph_pins_scope_for_coder():
-    """graph.py must pin SCOPE and targeted search for the coder turn."""
-    import pathlib
+def test_graph_pins_scope_for_build():
+    """graph.py must give the build turn targeted search with full workspace access."""
+    import graph
 
-    text = pathlib.Path(__file__).resolve().parent.parent.joinpath("graph.py").read_text(encoding="utf-8")
-    assert "TARGETED SEARCH (CODER)" in text
-    assert "Search ONLY within them" in text
-    assert "LSP" in text
-    assert "2-3 search batches" in text
+    note = graph._targeted_search_note("build")
+    assert "TARGETED SEARCH (BUILD)" in note
+    assert "full workspace access" in note.lower()
+    assert "Search ONLY within them" not in note
+    assert "SCOPE (ONLY THESE FILES)" not in note
+    assert "LSP" in note
+    assert "2-3 search batches" in note
+
+
+def test_targeted_search_note_covers_all_repo_modes():
+    """Ask/Plan turns get the same LSP-first rule with a convergence tail."""
+    import graph
+
+    for mode in ("ask", "plan"):
+        note = graph._targeted_search_note(mode)
+        assert f"TARGETED SEARCH ({mode.upper()})" in note
+        assert "LSP" in note
+        assert "conclude from what you already hold" in note
 
 
 def test_plan_file_paths_extracts_files_line():
-    """Plan Files line must become an enforceable search scope."""
+    """Plan Files line is a display hint only, never an access gate."""
     history = [
         {
             "role": "assistant",
@@ -197,13 +212,13 @@ def test_plan_file_paths_extracts_files_line():
 
 
 def test_tool_docstrings_require_scope():
-    """grep/glob/read docstrings must require SCOPE-limited, LSP-first search."""
+    """grep/glob/read docstrings must offer full workspace access with targeted guidance."""
     import pathlib
 
     text = pathlib.Path(__file__).resolve().parent.parent.joinpath("tools.py").read_text(encoding="utf-8")
-    assert text.count("SCOPE (ONLY THESE FILES)") >= 3
-    assert "LSP first" in text
-    assert "never scan the whole workspace blindly" in text.lower()
+    assert "SCOPE (ONLY THESE FILES)" not in text
+    assert "full workspace access" in text.lower()
+    assert "LSP" in text
 
 
 

@@ -113,11 +113,15 @@ def test_tts_defaults_model_and_voice(monkeypatch):
     assert captured["json"] == {"input": "hi"}
 
 
-def test_tts_local_rejected():
+def test_tts_empty_provider_rejected():
+    """Empty provider is malformed, not a remote request: fail fast with 400.
+
+    The local provider is a supported path now (see test_tts_local.py);
+    only the empty kind must be rejected.
+    """
     client = TestClient(server.app)
-    for provider in ("", "local"):
-        resp = _post(client, {"text": "hi", "provider": provider, "base_url": "http://x/v1"})
-        assert resp.status_code == 400
+    resp = _post(client, {"text": "hi", "provider": "", "base_url": "http://x/v1"})
+    assert resp.status_code == 400
 
 
 def test_tts_missing_text_rejected():

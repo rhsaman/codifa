@@ -37,14 +37,14 @@ export function normalizeScheduleRunsSeen(raw: unknown): string[] {
   return [...new Set(out)].slice(-MAX_SCHEDULE_RUNS_SEEN)
 }
 import { api } from './fs'
-import { deleteMcp, listMcp, saveMcp } from './api'
+import { deleteMcp, listMcp, requestChatTitle, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
 import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
-import { normalizeUsageEntry } from './usage'
+import { normalizeUsageEntry, normalizeUsageModel } from './usage'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
-import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, replaceChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
+import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -244,7 +244,7 @@ function trimToolActivity(acts: ToolActivity[]): ToolActivity[] {
 }
 
 /** Display labels for the built-in modes (used in the mode-switch history note). */
-const MODE_LABELS: Record<string, string> = { ask: 'Ask', plan: 'Plan', coder: 'Coder' }
+const MODE_LABELS: Record<string, string> = { ask: 'Ask', plan: 'Plan', build: 'Build' }
 
 /** Canonical display label per web-search engine kind — the label saved in a
  *  plugin row is derived metadata, never user-edited, so stale/legacy labels
@@ -275,9 +275,13 @@ function migrateModePrompts(prompts: Record<string, string>): Record<string, str
     out.ask = out.chat
     delete out.chat
   }
-  if ('codewriter' in out && !('coder' in out)) {
-    out.coder = out.codewriter
+  if ('codewriter' in out && !('build' in out)) {
+    out.build = out.codewriter
     delete out.codewriter
+  }
+  // Legacy "coder" key is dropped outright (not mapped to build).
+  if ('coder' in out) {
+    delete out.coder
   }
   return out
 }
@@ -505,35 +509,7 @@ function smartAppendDir(fallback: ChatLayout): ChatSplitDir {
   return treeDirFromLayout(fallback)
 }
 
-// Last window the user explicitly clicked (header/body). Sidebar/tab select
-// and new chat replace this window; with no prior click they open a new one.
-let clickedWindowId: string | null = null
-
-/** Arm click-to-replace for the next explicit open (sidebar/tab/new chat). */
-export function markWindowClicked(id: string): void {
-  clickedWindowId = id
-}
-
-/** Consume the armed replace target when it is still visible. Always disarms. */
-function takeReplaceTarget(base: ChatTreeNode | null, newId: string): string | null {
-  const target = clickedWindowId
-  clickedWindowId = null
-  if (!target || target === newId) return null
-  if (!base || !containsChat(base, target)) return null
-  return target
-}
-
-/** Place an explicitly opened chat: replace the clicked window when armed,
-// otherwise open a new window beside the focused one along the best axis. */
-function placeChat(base: ChatTreeNode | null, newId: string, activeId: string, layout: ChatLayout): ChatTreeNode | null {
-  if (base && containsChat(base, newId)) {
-    clickedWindowId = null
-    return base
-  }
-  const target = takeReplaceTarget(base, newId)
-  if (target && base) return replaceChat(base, target, newId)
-  return openBeside(base, newId, activeId, smartAppendDir(layout))
-}
+/** Explicit opens never replace: hidden chats open beside focus. */
 
 /** Persist a split tree plus its legacy mirrors (visible ids, sizes, layout). */
 function persistTreeMirrors(tree: ChatTreeNode | null, fallbackLayout: ChatLayout): { visibleChatIds: string[]; chatWindowSizes: Record<string, number>; chatLayout: ChatLayout } {
@@ -668,8 +644,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -754,7 +730,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -770,7 +746,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, maxSteps, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1086,9 +1062,6 @@ interface State {
   /** History turn limit sent to the model. 0 = full history (default). */
   historyLimit: number
   setHistoryLimit: (n: number) => void
-  /** Max tool-loop steps per turn. 0 = auto from context window (default). */
-  maxSteps: number
-  setMaxSteps: (n: number) => void
 
   /** Web-search engines for web_search (Settings → Plugins). */
   searchPlugins: SearchPluginConfig[]
@@ -1157,10 +1130,22 @@ interface State {
   setWindowFullscreen: (id: string | null) => void
   toggleWindowFullscreen: (id?: string) => void
   setChatMode: (id: string, mode: AgentMode) => void
-  /** Silent mode sync for backend-driven switches (plan approval → coder via
+  /** Silent mode sync for backend-driven switches (plan approval → build via
    *  the `mode_changed` event): updates chat.mode WITHOUT the "[Mode switched
    *  …]" marker message — the backend already narrates the transition. */
   setChatModeQuiet: (id: string, mode: AgentMode) => void
+  /** Persistent goal actions (Codex Goal mode style). Stored on the chat so the
+   *  goal survives reload via the existing chats persistence. */
+  setGoal: (id: string, condition: string) => void
+  clearGoal: (id: string) => void
+  pauseGoal: (id: string) => void
+  resumeGoal: (id: string) => void
+  /** Halt a chat's goal loop after an explicit Stop (Codex-style): keeps the
+   *  goal attached for manual sends but blocks auto-continue until Resume. */
+  stopGoal: (id: string) => void
+  /** Re-arm a stopped goal loop after an explicit user send (not auto-drive). */
+  rearmGoal: (id: string) => void
+  incrementGoalTurn: (id: string) => void
   setChatRoot: (id: string, root: string) => void
   setChatDraft: (id: string, patch: Partial<ChatDraft>) => void
   setChatThinkingLevel: (id: string, level: ThinkingLevel) => void
@@ -1184,6 +1169,8 @@ interface State {
   setChatCompactNotice: (id: string, notice: string | null) => void
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
+  setChatLiveError: (id: string, error: string | null) => void
+  setChatTtsError: (id: string, error: string | null) => void
   setChatSkillNotice: (id: string, notice: string | null) => void
   /** Revision counter per ABSOLUTE file path, bumped whenever the agent
    *  writes that file (write_document tool_result / write_file+edit_file
@@ -1277,12 +1264,6 @@ interface State {
    *  chats to run concurrently). */
   chatAborts: Record<string, AbortController | null>
   setChatAbort: (chatId: string, abort: AbortController | null) => void
-  /** File open in Neovim (absolute path), fed by the main-process watcher. */
-  nvimFile: string | null
-  setNvimFile: (abs: string | null) => void
-  /** LSP diagnostics for the Neovim file, reported by nvim's language server. */
-  nvimDiagnostics: import('../types').NvimDiagnostic[]
-  setNvimDiagnostics: (diagnostics: import('../types').NvimDiagnostic[]) => void
 }
 
 /**
@@ -1417,7 +1398,6 @@ export const useStore = create<State>((set, get) => ({
   subagentModels: {},
   cacheTtlMinutes: 60,
   historyLimit: 0,
-  maxSteps: 0,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
@@ -1466,10 +1446,6 @@ export const useStore = create<State>((set, get) => ({
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
-  /** Absolute path of the file currently open in Neovim (null if none / unknown). */
-  nvimFile: null,
-  /** LSP diagnostics reported for the Neovim file (empty when none / unknown). */
-  nvimDiagnostics: [],
 
   load: async () => {
     const [settings, chats] = await Promise.all([
@@ -1538,6 +1514,13 @@ export const useStore = create<State>((set, get) => ({
         providerIds,
       )
       const next = migrated ? { ...clean, usage: migrated } : clean
+      // Codex-style: a reload never auto-continues a goal loop. Nothing is
+      // running after a restart, so park every loaded goal in `stopped` — the
+      // user resumes explicitly with the goal bar play button. Prevents the
+      // "open window starts working by itself" report.
+      if (next.goal?.active && !next.goal.paused) {
+        next.goal = { ...next.goal, stopped: true }
+      }
       return next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
     }) as Chat[]
     const prevActiveId = get().activeChatId
@@ -1782,7 +1765,6 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
-      maxSteps: coerceBoundedInt((raw as { maxSteps?: unknown }).maxSteps, 0, 0, 200),
       // Migration: اگه settings قدیمی webSearchTtlDays داشت ولی ragWebTtlDays نداشت،
       // مقدار webSearchTtlDays → ragWebTtlDays منتقل بشه.
       ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 0)
@@ -2298,12 +2280,6 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  setMaxSteps: (n) => {
-    const r = Math.round(n)
-    set({ maxSteps: Number.isFinite(r) ? Math.max(0, Math.min(200, r)) : 0 })
-    get().persist()
-  },
-
   setSearchPlugins: (searchPlugins) => {
     set({ searchPlugins })
     get().persist()
@@ -2435,13 +2411,11 @@ export const useStore = create<State>((set, get) => ({
       // opens a new window (never replaces) placed along the best axis.
       const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
       if (single) {
-        clickedWindowId = null
         persistVisibleChats([activeChatId])
         persistChatTree(null)
         return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      clickedWindowId = null
       const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
@@ -2465,13 +2439,11 @@ export const useStore = create<State>((set, get) => ({
       persistOpenState(openChatIds, activeChatId)
       const single = st.visibleChatIds.length <= 1 && leafCount(st.chatTree) <= 1
       if (single) {
-        clickedWindowId = null
         persistVisibleChats([activeChatId])
         persistChatTree(null)
         return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: [activeChatId], chatTree: null, rightPanelOpen: false }
       }
       const base = ensureTree(st.chatTree, st.visibleChatIds, st.chatLayout)
-      clickedWindowId = null
       const chatTree = openBeside(base, activeChatId, st.activeChatId, smartAppendDir(st.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, st.chatLayout)
       return { workspaces, chats: [...st.chats, chat], activeChatId, openChatIds, visibleChatIds: mirrors.visibleChatIds, chatWindowSizes: mirrors.chatWindowSizes, chatLayout: mirrors.chatLayout, chatTree, rightPanelOpen: false }
@@ -2715,15 +2687,14 @@ export const useStore = create<State>((set, get) => ({
       let chatWindowSizes = s.chatWindowSizes
       let chatLayout = s.chatLayout
       if (single) {
-        clickedWindowId = null
         visibleChatIds = [id]
         chatTree = null
         persistVisibleChats(visibleChatIds)
         persistChatTree(null)
       } else if (!containsChat(chatTree, id)) {
-        // Tab restores into the clicked window, else opens a new pane.
+        // Tab/sidebar select never replaces: hidden chat opens a new window.
         const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-        chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
+        chatTree = openBeside(base, id, s.activeChatId, smartAppendDir(s.chatLayout))
         const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
         visibleChatIds = mirrors.visibleChatIds
         chatWindowSizes = mirrors.chatWindowSizes
@@ -2763,15 +2734,14 @@ export const useStore = create<State>((set, get) => ({
       let chatWindowSizes = s.chatWindowSizes
       let chatLayout = s.chatLayout
       if (single) {
-        clickedWindowId = null
         visibleChatIds = [id]
         chatTree = null
         persistVisibleChats(visibleChatIds)
         persistChatTree(null)
       } else if (!containsChat(chatTree, id)) {
-        // Sidebar/tab select replaces the clicked window, else opens a new one.
+        // Sidebar/tab select never replaces: hidden chat opens a new window.
         const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-        chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
+        chatTree = openBeside(base, id, s.activeChatId, smartAppendDir(s.chatLayout))
         const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
         visibleChatIds = mirrors.visibleChatIds
         chatWindowSizes = mirrors.chatWindowSizes
@@ -2892,7 +2862,6 @@ export const useStore = create<State>((set, get) => ({
       const base = ensureTree(s.chatTree, s.visibleChatIds.length > 0 ? s.visibleChatIds : [s.activeChatId], s.chatLayout)
       const openChatIds = s.openChatIds.includes(id) ? s.openChatIds : [...s.openChatIds, id]
       persistOpenState(openChatIds, id)
-      clickedWindowId = null
       const chatTree = containsChat(base, id) ? base : openBeside(base, id, s.activeChatId, smartAppendDir(s.chatLayout))
       const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
       return {
@@ -2938,7 +2907,12 @@ export const useStore = create<State>((set, get) => ({
         unreadChats: s.unreadChats.filter((cid) => cid !== activeChatId),
       }
     })
-    persistSoon()
+    // No DB persist: closeWindow only touches localStorage mirrors (tree /
+    // visible / sizes / layout / open state) plus transient active/unread —
+    // chats and settings are untouched, so a full snapshot here is pure
+    // overhead on the click path (sanitizeChats over every message + IPC
+    // right before paint = the minimize lag). Mirrors are already written
+    // synchronously above; the next real change persists.
   },
 
   focusWindow: (id) => {
@@ -2954,15 +2928,14 @@ export const useStore = create<State>((set, get) => ({
       let chatLayout = s.chatLayout
       if (!containsChat(chatTree, id)) {
         if (leafCount(chatTree) <= 1 && visibleChatIds.length <= 1) {
-          clickedWindowId = null
           visibleChatIds = [id]
           chatTree = null
           persistVisibleChats(visibleChatIds)
           persistChatTree(null)
         } else {
-          // Focusing a hidden chat replaces the clicked window, else opens new.
+          // Focusing a hidden chat never replaces: open a new window instead.
           const base = ensureTree(chatTree, visibleChatIds, s.chatLayout)
-          chatTree = placeChat(base, id, s.activeChatId, s.chatLayout)
+          chatTree = openBeside(base, id, s.activeChatId, smartAppendDir(s.chatLayout))
           const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
           visibleChatIds = mirrors.visibleChatIds
           chatWindowSizes = mirrors.chatWindowSizes
@@ -3198,6 +3171,77 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  setGoal: (id, condition) => {
+    const text = (condition ?? '').trim()
+    if (!text) return
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id
+          ? { ...c, goal: { condition: text, active: true, paused: false, stopped: false, startedAt: Date.now(), turns: 0 }, updatedAt: Date.now() }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  clearGoal: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, goal: null, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
+
+  pauseGoal: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.goal?.active ? { ...c, goal: { ...c.goal, paused: true, stopped: false }, updatedAt: Date.now() } : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  resumeGoal: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.goal?.active ? { ...c, goal: { ...c.goal, paused: false, stopped: false }, updatedAt: Date.now() } : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  stopGoal: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.goal?.active && !c.goal.paused
+          ? { ...c, goal: { ...c.goal, stopped: true }, updatedAt: Date.now() }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  rearmGoal: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.goal?.active && c.goal.stopped
+          ? { ...c, goal: { ...c.goal, stopped: false }, updatedAt: Date.now() }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  incrementGoalTurn: (id) => {
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.goal?.active && !c.goal.paused
+          ? { ...c, goal: { ...c.goal, turns: (c.goal.turns ?? 0) + 1 } }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
   setChatRoot: (id, root) => {
     set((s) => ({
       root: s.activeChatId === id ? root : s.root,
@@ -3313,6 +3357,22 @@ export const useStore = create<State>((set, get) => ({
   addMessage: (chatId, message) => {
     const id = uid()
     const full: ChatMessage = { ...message, id, createdAt: Date.now() }
+    // Title-generator trigger: first user message of a fresh chat still
+    // titled 'New chat'. System mode-switch notices and assistant hints
+    // don't count — switching to build/plan before the first send adds a
+    // system message, so messages.length would wrongly block the trigger.
+    // `autoTitle` mirrors the slice title the insert below sets, so the
+    // resolve step can tell an untouched auto title (safe to replace) from
+    // a manual rename (must keep).
+    const prev = get().chats.find((c) => c.id === chatId)
+    const autoTitle = message.content.slice(0, 48)
+    const hasPriorUser = !!prev?.messages.some((m) => m.role === 'user')
+    const shouldTitle =
+      message.role === 'user' &&
+      !!prev &&
+      !hasPriorUser &&
+      prev.title === 'New chat' &&
+      message.content.trim() !== ''
     set((s) => {
       if (message.role === 'user') {
         const st = stackFor(chatId)
@@ -3340,6 +3400,82 @@ export const useStore = create<State>((set, get) => ({
       return { chats }
     })
     get().persist()
+    if (shouldTitle) {
+      // Fire-and-forget: runs parallel to the main agent turn, never blocks it.
+      // Trigger line: proves addMessage fired for the first user message.
+      console.info('[title] generating title for new chat', chatId.slice(-6))
+      void (async () => {
+        try {
+          const st = get()
+          const chat = st.chats.find((c) => c.id === chatId)
+          const provider =
+            st.settings.providers.find(
+              (p) => p.id === (chat?.providerId ?? st.settings.activeProviderId),
+            ) ?? st.settings.providers[0]
+          if (!provider) return
+          const res = await requestChatTitle({
+            provider,
+            subagentModels: st.subagentModels ?? {},
+            providers: Object.fromEntries(
+              (st.settings.providers ?? []).map((p) => [p.id, p]),
+            ),
+            text: message.content.slice(0, 1000),
+            chatId,
+          })
+          const title = typeof res?.title === 'string' ? res.title.trim() : ''
+          if (title) {
+            // Apply first: usage bookkeeping must never block the rename.
+            try {
+              const cur = get().chats.find((c) => c.id === chatId)
+              if (!cur) {
+                console.info('[title] chat gone — skipping apply')
+              } else if (
+                cur.title !== 'New chat' &&
+                cur.title !== autoTitle &&
+                (cur.title || '').trim() !== ''
+              ) {
+                console.info('[title] title changed meanwhile — keeping it:', cur.title)
+              } else {
+                get().renameChat(chatId, title)
+                console.info('[title] applied title:', title, chatId.slice(-6))
+              }
+            } catch (err) {
+              console.warn('[title] apply failed — keeping auto title', err)
+            }
+          }
+          const cu = res?.usage
+          if (cu) {
+            try {
+              // Bill the title call under the provider/model that actually ran
+              // it (provider_id > kind > chat provider), mirroring the compact
+              // path — the sidebar then lists it like every other model call.
+              const pid = cu.provider_id || cu.provider || provider.id
+              const usageModel = normalizeUsageModel(pid, cu.model || provider.model || 'main')
+              get().accrueChatUsage(chatId, pid, usageModel, {
+                input: cu.input_tokens ?? 0,
+                output: cu.output_tokens ?? 0,
+                cacheRead: cu.cache_read_tokens ?? 0,
+                cacheWrite: cu.cache_write_tokens ?? 0,
+              })
+            } catch (err) {
+              console.warn('[title] usage accrue failed', err)
+            }
+          }
+        } catch (err) {
+          // Never swallow: a silent catch is why "no logs" was undebuggable.
+          console.warn('[title] title flow failed — keeping auto title', err)
+        }
+      })()
+    } else if (
+      message.role === 'user' &&
+      !!prev &&
+      !hasPriorUser &&
+      message.content.trim() !== ''
+    ) {
+      // First user message but the trigger guard blocked (title already left
+      // 'New chat'): log once so a silent no-title is diagnosable.
+      console.info('[title] trigger skipped — current title:', prev.title)
+    }
     return full
   },
 
@@ -3569,6 +3705,18 @@ export const useStore = create<State>((set, get) => ({
     }))
   },
 
+  setChatLiveError: (id, liveError) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, liveError } : c)),
+    }))
+  },
+
+  setChatTtsError: (id, ttsError) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, ttsError } : c)),
+    }))
+  },
+
   setChatSkillNotice: (id, skillNotice) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, skillNotice } : c)),
@@ -3598,9 +3746,20 @@ export const useStore = create<State>((set, get) => ({
   // position into the store right before a flush writes the snapshot — no
   // redundant write, no recursion into persist().
   setChatScrollPosMem: (id, pos) => {
-    set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, scrollPos: pos } : c)),
-    }))
+    set((s) => {
+      const cur = s.chats.find((c) => c.id === id)?.scrollPos ?? null
+      const same =
+        (cur === null && pos === null) ||
+        (cur !== null &&
+          pos !== null &&
+          cur.id === pos.id &&
+          cur.offset === pos.offset &&
+          cur.atBottom === pos.atBottom)
+      if (same) return {}
+      return {
+        chats: s.chats.map((c) => (c.id === id ? { ...c, scrollPos: pos } : c)),
+      }
+    })
   },
 
   setPrefixNotice: (prefixNotice) => {
@@ -3823,8 +3982,6 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({ settings: { ...s.settings, compactAtPercent: percent } }))
     get().persist()
   },
-  setNvimFile: (abs) => set({ nvimFile: abs }),
-  setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),
 }))
 
 /**

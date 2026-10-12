@@ -294,9 +294,9 @@ console.log("۸) setChatModeQuiet — سوییچ بی‌صدا بدون پیام
 {
   const id = useStore.getState().newChat("plan")
   const before = useStore.getState().chats.find((c) => c.id === id)!.messages.length
-  useStore.getState().setChatModeQuiet(id, "coder")
+  useStore.getState().setChatModeQuiet(id, "build")
   const chat = useStore.getState().chats.find((c) => c.id === id)!
-  check("mode عوض شد", chat.mode === "coder")
+  check("mode عوض شد", chat.mode === "build")
   check("پیام مارکر اضافه نشد", chat.messages.length === before)
   // کنتراست: setChatMode مارکر می‌گذارد
   useStore.getState().setChatMode(id, "plan")

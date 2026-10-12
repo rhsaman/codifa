@@ -128,17 +128,6 @@ const api = {
     ipcRenderer.on('migrate:progress', listener)
     return () => ipcRenderer.removeListener('migrate:progress', listener)
   },
-  getNvimFile: (): Promise<{ abs: string | null; diagnostics: unknown[] }> => ipcRenderer.invoke('nvim:get'),
-  onNvimFile: (
-    cb: (f: { abs: string | null; diagnostics: unknown[] }) => void,
-  ): (() => void) => {
-    const listener = (
-      _e: Electron.IpcRendererEvent,
-      f: { abs: string | null; diagnostics: unknown[] },
-    ): void => cb(f)
-    ipcRenderer.on('nvim:file', listener)
-    return () => ipcRenderer.removeListener('nvim:file', listener)
-  },
   checkForUpdates: (): Promise<UpdateInfo> => ipcRenderer.invoke('updater:check'),
   startUpdate: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('updater:start'),
   onUpdateProgress: (cb: (p: UpdateProgress) => void): (() => void) => {

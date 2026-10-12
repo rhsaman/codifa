@@ -263,20 +263,20 @@ def test_chat_model_settings_output_cap_parity(monkeypatch):
         )
 
     # Unknown output limit (max_output=0) -> 32k regardless of ctx.
-    assert asyncio.run(_get("coder", 0))["max_tokens"] == 32_000
-    assert asyncio.run(_get("coder", 32_000))["max_tokens"] == 32_000
+    assert asyncio.run(_get("build", 0))["max_tokens"] == 32_000
+    assert asyncio.run(_get("build", 32_000))["max_tokens"] == 32_000
     # Known large output limit is capped at opencode's 32k ceiling.
     async def _big_max_output(*a, **k):
         return 200_000
 
     monkeypatch.setattr(_providers, "model_max_output", _big_max_output)
-    assert asyncio.run(_get("coder", 200_000))["max_tokens"] == 32_000
+    assert asyncio.run(_get("build", 200_000))["max_tokens"] == 32_000
     # A small known output limit is honored (not clamped to 32k).
     async def _small_max_output(*a, **k):
         return 8_192
 
     monkeypatch.setattr(_providers, "model_max_output", _small_max_output)
-    assert asyncio.run(_get("coder", 200_000))["max_tokens"] == 8_192
+    assert asyncio.run(_get("build", 200_000))["max_tokens"] == 8_192
     # ask mode still caps at 8k on top of the 32k ceiling.
     assert asyncio.run(_get("ask", 200_000))["max_tokens"] == 8_000
 

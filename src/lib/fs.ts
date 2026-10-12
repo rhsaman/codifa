@@ -1,5 +1,3 @@
-import type { NvimDiagnostic } from '../types'
-
 export interface FileEntry {
   name: string
   kind: 'file' | 'dir' | 'link'
@@ -98,15 +96,6 @@ export const api = {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   },
-  getNvimFile: (): Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }> =>
-    window.coder.getNvimFile() as Promise<{ abs: string | null; diagnostics: NvimDiagnostic[] }>,
-  onNvimFile: (
-    cb: (f: { abs: string | null; diagnostics: NvimDiagnostic[] }) => void,
-  ): (() => void) =>
-    window.coder.onNvimFile(
-      (f: { abs: string | null; diagnostics: unknown[] }) =>
-        cb(f as { abs: string | null; diagnostics: NvimDiagnostic[] }),
-    ),
 }
 
 const SKIP_DIRS = new Set([

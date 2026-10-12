@@ -12,6 +12,7 @@ import asyncio
 import contextvars
 import difflib
 import glob as _pyglob
+import html
 import json
 import logging
 import os
@@ -59,18 +60,33 @@ MAX_FILES = 10_000
 MAX_TERMINAL_OUTPUT = 10_000
 TERMINAL_TIMEOUT = 120
 TERMINAL_TIMEOUT_MAX = 300
+# Tools a read-only research sub-agent must never receive: anything that can
+# create, edit, delete, commit, confirm, run shell commands, manage tasks,
+# or prompt the user. Web research tools (web_search/fetch_url) are
+# intentionally NOT in this set.
+_SUBAGENT_STRIPPED_TOOLS = frozenset({
+    "write_file",
+    "edit_file",
+    "write_document",
+    "confirm_action",
+    "git_commit",
+    "run_terminal",
+    "terminal_stop",
+    "terminal_logs",
+    "create_skill",
+    "create_mcp",
+    "task",
+    "task_steer",
+    "task_stop",
+    "update_plan",
+    "vision",
+    "ask_user",
+    "request_permission",
+    "computer",
+})
 _LONG_RUNNING_CMD_RE = re.compile(
     r"\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck)\S*"
     r"|pytest|vitest|jest|tsc|cargo\s+(?:test|build)|go\s+(?:test|build)|mvn|gradle)\b"
-)
-# Sub-agents NEVER run tests: the main agent runs all tests after merging
-# reports. Matches test runners only (build/lint/typecheck stay allowed
-# so a sub-agent can still verify syntax without running the suite).
-_SUBAGENT_NO_TEST_RE = re.compile(
-    r"\b(?:pytest|vitest|jest|ava|xo|playwright test|cypress run"
-    r"|flutter test|dart test|go test|cargo test|mvn test|gradle test"
-    r"|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test)\b",
-    re.IGNORECASE,
 )
 MAX_WEB_SEARCH_RESULTS = 10
 WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
@@ -87,6 +103,20 @@ _GREP_PER_FILE_CAP = 8  # max hits shown per file when a dump truncates across m
 _DEF_BODY_MAX_LINES = 60  # per-definition body lines expanded inline in grep hits
 _DEF_BODY_MAX_COUNT = 6  # max definition bodies expanded inline per grep call
 _LSP_REF_CAP = 40  # max reference locations returned per call (grouped by file)
+_LSP_REF_INLINE_CAP = 25  # hits whose source line is inlined in lsp_references
+_LSP_REF_INLINE_MAX_CHARS = 160  # per-line cap for inlined reference lines
+_LSP_SYMBOLS_CAP = 400  # max document-symbol rows returned by lsp_symbols
+_LSP_START_WAIT_S = 30.0  # in-tool wait for a lazy LSP start (initialize handshake)
+# Keywords that never carry symbol information: a position snapped onto one
+# (e.g. character=0 on "async def foo") makes the LSP answer empty, costing
+# the model extra round-trips to re-guess the column.
+_LSP_SKIP_WORDS = frozenset({
+    "async", "await", "def", "class", "return", "yield", "import", "from",
+    "const", "let", "var", "function", "export", "default", "public",
+    "private", "protected", "static", "final", "void", "new", "type",
+    "interface", "struct", "impl", "fn", "pub", "use", "package", "self",
+    "cls", "this",
+})
 
 # Formatted results include output limits in their keys. In-flight sharing
 # covers only raw scans, scoped to a workspace, event loop and edit generation.
@@ -94,11 +124,127 @@ _parent_search_cache: dict[tuple[str, ...], str] = {}
 _search_generations: dict[str, int] = {}
 _search_inflight: dict[tuple, asyncio.Task[dict]] = {}
 
-# Live checklist per chat (session-only, in-memory). update_plan merges the
-# incoming full list with the stored one so a mid-run steer EDITS the open
-# plan instead of replacing it, and completed steps are never reverted to
-# pending/in_progress (the todo-redo bug). Frontend replaces its view with
-# the emitted merged list (single source of truth here).
+# Search enforcement: hard limits for disciplined search behavior.
+_MAX_GREP_ALTERNATIVES = 3
+_MAX_SEARCH_BATCHES_WITHOUT_EDIT = 3
+_SEARCH_BATCHES: dict[tuple[str, str], int] = {}
+_SEARCH_BATCH_GENERATIONS: dict[tuple[str, str], int] = {}
+
+
+def _count_grep_alternatives(combined: str) -> int:
+    """Count top-level grep alternatives separated by unescaped '|'.
+
+    Ignores escaped pipes (\\|), pipes inside [...] character classes,
+    pipes inside (...) groups (a grouped alternation like `(popup|slash)`
+    is ONE concept, not two), and empty alternatives from '||' or
+    leading/trailing '|'.
+    """
+    if not combined:
+        return 1
+    parts: list[str] = []
+    buf: list[str] = []
+    in_class = False
+    depth = 0
+    i = 0
+    n = len(combined)
+    while i < n:
+        ch = combined[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(combined[i + 1])
+            i += 2
+            continue
+        if ch == "[" and not in_class:
+            in_class = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "]" and in_class:
+            in_class = False
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(" and not in_class:
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")" and not in_class and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "|" and not in_class and not depth:
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    count = sum(1 for p in parts if p != "")
+    return max(1, count)
+
+
+def _search_budget_key(root: str, chat_id: str = "") -> tuple[str, str]:
+    """Scope the search budget by chat and workspace root."""
+    return (str(chat_id or ""), str(root or ""))
+
+
+def _sync_search_budget(root: str, chat_id: str = "") -> int:
+    """Sync the search batch counter with the edit generation.
+
+    Edits bump the search generation to invalidate cached scans, so a
+    generation change means an edit happened and the counter resets.
+    The counter is scoped by (chat_id, root) so one chat never blocks
+    another, and make_tool_callbacks resets it per turn.
+    """
+    key = _search_budget_key(root, chat_id)
+    gen_key = str(root or "")
+    try:
+        current_gen = int(_search_generations.get(gen_key, 0) or 0)
+    except Exception:  # noqa: BLE001 - generation check never breaks search
+        return int(_SEARCH_BATCHES.get(key, 0) or 0)
+    last_gen = _SEARCH_BATCH_GENERATIONS.get(key)
+    if last_gen is None:
+        _SEARCH_BATCH_GENERATIONS[key] = current_gen
+        return int(_SEARCH_BATCHES.get(key, 0) or 0)
+    if last_gen != current_gen:
+        _SEARCH_BATCH_GENERATIONS[key] = current_gen
+        _SEARCH_BATCHES[key] = 0
+        return 0
+    return int(_SEARCH_BATCHES.get(key, 0) or 0)
+
+
+def _note_search_batch(root: str, chat_id: str = "") -> int:
+    """Record one search batch and return the new count."""
+    key = _search_budget_key(root, chat_id)
+    if key not in _SEARCH_BATCH_GENERATIONS:
+        try:
+            _SEARCH_BATCH_GENERATIONS[key] = int(_search_generations.get(str(root or ""), 0) or 0)
+        except Exception:  # noqa: BLE001 - generation check never breaks search
+            _SEARCH_BATCH_GENERATIONS[key] = 0
+    count = int(_SEARCH_BATCHES.get(key, 0) or 0) + 1
+    _SEARCH_BATCHES[key] = count
+    return count
+
+
+def _search_budget_message(count: int) -> str:
+    """Mandatory message when the search batch budget is exceeded."""
+    return (
+        f"SEARCH BUDGET EXCEEDED: {count} search batches used without an edit "
+        f"(max {_MAX_SEARCH_BATCHES_WITHOUT_EDIT}). Stop searching. Read specific "
+        "files with read(symbols=[...]/ranges=[...]) in ONE call or make an edit "
+        "before searching again. Search rule: LSP first, else ONE scoped grep "
+        "path=backend include=*.py, then read symbols/ranges only. "
+        "Batch searches, no blind scans."
+    )
+
+# Live checklist per chat (in-memory, mirrored to disk while open).
+# update_plan merges the incoming full list with the stored one so a mid-run
+# steer EDITS the open plan instead of replacing it, and completed steps are
+# never reverted to pending/in_progress (the todo-redo bug). Frontend replaces
+# its view with the emitted merged list (single source of truth here).
 _PLAN_BY_CHAT: dict[str, list[dict]] = {}
 # Mutating tool calls since the last update_plan, per chat (module-global so
 # it survives across turns/callback rebuilds, unlike _plan_nudge_state).
@@ -107,6 +253,122 @@ _PLAN_BY_CHAT: dict[str, list[dict]] = {}
 _PLAN_MUTATING_SINCE_UPDATE: dict[str, int] = {}
 # Last successful terminal run per chat for duplicate suppression.
 _TERMINAL_LAST_RUN: dict[str, dict] = {}
+# Read windows already delivered to a chat this session: (tool, abs_target,
+# offset, limit). A repeat read of an unchanged window returns a tiny
+# "unchanged" stub pointing at the earlier result instead of resending full
+# bytes — saves tokens without an extra round-trip. Per chat so one chat's
+# history never hides content from another; cleared with the chat and on edit
+# of the file.
+_READ_SEEN_BY_CHAT: dict[str, set[tuple]] = {}
+# Served line ranges for the CURRENT turn: chat_id -> {abs_target ->
+# [(start, end), ...]}. A read whose requested window lies fully inside an
+# already-served range of the same unchanged file returns a one-line stub
+# instead of resending bytes (live traces re-read overlapping windows of
+# one file step after step). Reset per turn in make_tool_callbacks:
+# cross-turn re-reads stay full because turn-start trimming may have
+# replaced the earlier result with a placeholder.
+_READ_RANGES_BY_CHAT: dict[str, dict[str, list[tuple[int, int]]]] = {}
+# Lone single-window read CALLS per file this turn: chat_id -> {abs_target ->
+# count}. A 3rd+ lone call on one file in one turn returns a batch-gate stub
+# (no content) demanding ONE ranges=[...] batch — live traces paged one
+# window per round-trip, each re-sending the whole context. Multi-window or
+# multi-file calls never count; reset per turn and on edit like the map above.
+_READ_LONE_CALLS_BY_CHAT: dict[str, dict[str, int]] = {}
+
+
+def _read_range_covered(chat_id: str, target: str, start: int, end: int) -> tuple[int, int] | None:
+    """Covering (start, end) served this turn for ``target``, if any."""
+    try:
+        ranges = _READ_RANGES_BY_CHAT.get((chat_id or "").strip(), {}).get(target)
+    except Exception:  # noqa: BLE001 - lookup never breaks a read
+        return None
+    for s, e in ranges or []:
+        if start >= s and end <= e:
+            return (s, e)
+    return None
+
+
+def _note_read_range(chat_id: str, target: str, start: int, end: int) -> None:
+    """Record a served window, merging overlaps/adjacency to keep it small."""
+    cid = (chat_id or "").strip()
+    if not cid or end < start:
+        return
+    try:
+        ranges = _READ_RANGES_BY_CHAT.setdefault(cid, {}).setdefault(target, [])
+        merged: list[tuple[int, int]] = []
+        for s, e in ranges:
+            if e < start - 1 or s > end + 1:
+                merged.append((s, e))
+                continue
+            start = min(start, s)
+            end = max(end, e)
+        merged.append((start, end))
+        merged.sort()
+        _READ_RANGES_BY_CHAT[cid][target] = merged
+    except Exception:  # noqa: BLE001, S110 - range mark never breaks a read
+        pass
+
+
+# Per-turn per-file served-line cap: past this many served lines of ONE
+# file in ONE turn, further windows of that file return a stub pointing at
+# grep/lsp_symbols — live traces paged a whole 8300-line file in 29 windows
+# (~70K tokens in a single step) where a targeted lookup was the right
+# move. Cleared with the served ranges on edit and at every new turn.
+_READ_TURN_FILE_LINE_CAP = 3000
+
+
+def _read_lines_served(chat_id: str, target: str) -> int:
+    """Lines of ``target`` already served this turn (from merged ranges)."""
+    ranges = _READ_RANGES_BY_CHAT.get((chat_id or "").strip(), {}).get(target)
+    return sum(e - s + 1 for s, e in ranges or [])
+
+
+def _read_uncovered_intervals(chat_id: str, target: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Not-yet-served sub-intervals of [start, end] for ``target`` this turn."""
+    try:
+        served = sorted(_READ_RANGES_BY_CHAT.get((chat_id or "").strip(), {}).get(target) or [])
+    except Exception:  # noqa: BLE001 - lookup never breaks a read
+        return [(start, end)]
+    uncovered: list[tuple[int, int]] = []
+    cur = start
+    for s, e in served:
+        if e < cur or s > end:
+            continue
+        if s > cur:
+            uncovered.append((cur, min(s - 1, end)))
+        cur = max(cur, e + 1)
+        if cur > end:
+            break
+    if cur <= end:
+        uncovered.append((cur, end))
+    # Gap bridging: swallow small unserved slivers next to served ranges so a
+    # shifted re-read leaves nothing for yet another round-trip. Bounded by gap cap.
+    if uncovered:
+        try:
+            gap = int(_READ_JOIN_GAP)
+        except Exception:  # noqa: BLE001 - bridging never breaks a read
+            gap = 0
+        if gap > 0:
+            bridged: list[tuple[int, int]] = []
+            for us, ue in uncovered:
+                ns, ne = us, ue
+                prev = max((e for s, e in served if e < us), default=None)
+                if prev is not None and us - prev - 1 <= gap:
+                    ns = prev + 1
+                nxt = min((s for s, e in served if s > ue), default=None)
+                if nxt is not None and nxt - ue - 1 <= gap:
+                    ne = nxt - 1
+                bridged.append((ns, ne))
+            bridged.sort()
+            merged: list[list[int]] = [[bridged[0][0], bridged[0][1]]]
+            for a, b in bridged[1:]:
+                if a <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            uncovered = [(a, b) for a, b in merged]
+    return uncovered
+
 
 # Background terminal jobs: job_id -> {pid, command, log_file, started_at,
 # status, returncode}. Module-global so stop/logs work across turns.
@@ -123,6 +385,13 @@ def clear_chat_state(chat_id: str) -> None:
     _PLAN_BY_CHAT.pop(cid, None)
     _PLAN_MUTATING_SINCE_UPDATE.pop(cid, None)
     _TERMINAL_LAST_RUN.pop(cid, None)
+    _READ_SEEN_BY_CHAT.pop(cid, None)
+    _READ_RANGES_BY_CHAT.pop(cid, None)
+    _READ_LONE_CALLS_BY_CHAT.pop(cid, None)
+    for k in [k for k in list(_SEARCH_BATCHES.keys()) if isinstance(k, tuple) and k[0] == cid]:
+        _SEARCH_BATCHES.pop(k, None)
+    for k in [k for k in list(_SEARCH_BATCH_GENERATIONS.keys()) if isinstance(k, tuple) and k[0] == cid]:
+        _SEARCH_BATCH_GENERATIONS.pop(k, None)
 
 
 async def _shared_search(
@@ -173,6 +442,20 @@ def _invalidate_read_cache_for(path: str, root: str) -> None:
         # but grep/glob entries for this root may still exist — fall through.
         norm = None
     _search_generations[root] = _search_generations.get(root, 0) + 1
+    # Search budget: an edit resets the counter for every chat scoped to
+    # this root (scoped keys are (chat_id, root) tuples).
+    try:
+        _gen = int(_search_generations.get(root, 0) or 0)
+        for k in list(_SEARCH_BATCHES.keys()):
+            if isinstance(k, tuple) and len(k) == 2 and k[1] == str(root or ""):
+                _SEARCH_BATCHES[k] = 0
+        for k in list(_SEARCH_BATCH_GENERATIONS.keys()):
+            if isinstance(k, tuple) and len(k) == 2 and k[1] == str(root or ""):
+                _SEARCH_BATCH_GENERATIONS[k] = _gen
+        _SEARCH_BATCHES.pop(str(root or ""), None)
+        _SEARCH_BATCH_GENERATIONS.pop(str(root or ""), None)
+    except Exception:  # noqa: BLE001, S110 - budget reset never breaks edit
+        pass
     stale = [
         k
         for k in _parent_search_cache
@@ -181,6 +464,25 @@ def _invalidate_read_cache_for(path: str, root: str) -> None:
     ]
     for k in stale:
         del _parent_search_cache[k]
+    if norm is not None:
+        # The file changed: any chat that already saw it must get full bytes
+        # on the next read, not the "unchanged" stub.
+        try:
+            for _seen in _READ_SEEN_BY_CHAT.values():
+                for _k in [k for k in _seen if len(k) > 1 and k[0] == "read" and k[1] == norm]:
+                    _seen.discard(_k)
+        except Exception:  # noqa: BLE001, S110 - seen purge never breaks edit
+            pass
+        try:
+            for _ranges in _READ_RANGES_BY_CHAT.values():
+                _ranges.pop(norm, None)
+        except Exception:  # noqa: BLE001, S110 - range purge never breaks edit
+            pass
+        try:
+            for _lone in _READ_LONE_CALLS_BY_CHAT.values():
+                _lone.pop(norm, None)
+        except Exception:  # noqa: BLE001, S110 - lone-call purge never breaks edit
+            pass
 
 
 def _normalize_search_scope(path: str) -> str:
@@ -925,6 +1227,8 @@ def _writes_outside_root(command: str) -> str | None:
         (r"(^|[\s;|&])(brew|apt|apt-get|port|nix-env|pacman|dnf|yum|zypper)\b", "system package manager"),
         (r"(^|[\s;|&])pip3?\s+install\b", "pip install"),
         (r"(^|[\s;|&])uv\s+(pip|tool)\s+install\b", "uv install"),
+        (r"(^|[\s;|&])uv\s+add\b", "uv add"),
+        (r"(^|[\s;|&])uv\s+sync\b", "uv sync"),
         (r"(^|[\s;|&])npm\s+(-\S+\s+)*install\s+(-\S+\s+)*-g\b", "global npm install"),
         (r"(^|[\s;|&])npm\s+(-\S+\s+)*i\s+(-\S+\s+)*-g\b", "global npm install"),
         (r"(^|[\s;|&])pnpm\s+(-\S+\s+)*(-g|--global)\b", "global pnpm install"),
@@ -941,9 +1245,24 @@ def _writes_outside_root(command: str) -> str | None:
         if re.search(pattern, command):
             return (
                 f"runs {label}, which installs/modifies state outside the workspace. "
-                "Ask the user for permission (request_permission) before installing anything."
+                "Do NOT report 'not installed' and stop. "
+                "Ask the user for permission (request_permission) before installing anything "
+                "and WAIT for the grant, then retry this same command."
             )
     return None
+
+
+def _is_install_action(action: str) -> bool:
+    """True when a permission/confirm action is really an install request."""
+    text = str(action or "").lower()
+    return "install" in text or "uv add" in text or "uv sync" in text
+
+
+_MISSING_DEP_RE = re.compile(
+    r"(modulenotfounderror|no module named|command not found|not installed|"
+    r"cannot find module|no such package|package not found)",
+    re.IGNORECASE,
+)
 
 
 def _terminal_bg_log_dir() -> str:
@@ -1280,9 +1599,10 @@ def run_terminal(
     reason = _blocked_terminal(real_command)
     if reason:
         return {"command": real_command, "error": reason}
-    if not (permit or {}).get("outside"):
+    _permit = permit or {}
+    if not _permit.get("outside"):
         reason = _escapes_root(real_command, root, permit)
-        if reason is None:
+        if reason is None and not _permit.get("install"):
             reason = _writes_outside_root(real_command)
         if reason:
             return {
@@ -1578,6 +1898,12 @@ _SMALL_FILE_LINES = 300
 # Mirrors llm._READ_ADJACENT_GAP — the advisory "read ONE wide window" nudge
 # for that case is routinely ignored, so the join is enforced here instead.
 _READ_JOIN_GAP = 100
+# Repeat-file prefetch: a second window of the SAME file in the SAME turn
+# signals paging (one window per step = one round-trip each). The fresh serve
+# path extends beyond the request by this many lines so the next page is
+# already in context. Bounded by the per-turn per-file cap; small enough to
+# cost less than another full round-trip re-sending the whole context.
+_READ_PREFETCH_LINES = 400
 # File map for blind head reads: a head read (offset 1) of more than
 # _HEAD_MAP_MIN_LINES lines with a bulk limit returns structure instead of a
 # 12k-token import dump — the first _HEAD_MAP_ROWS lines plus the symbol
@@ -2732,40 +3058,134 @@ def _expand_unicode_char(ch: str) -> str:
     return ch
 
 
-def _normalize_canonical(text: str) -> tuple[str, list[int]]:
+# HTML character references (entities) that decode to plain ASCII text —
+# the model often copies a line from rendered HTML output (browser tool,
+# fetch_url, a web page) where '&' appears as '&' (or a numeric
+# reference like '&#38;'), then uses it as old_string against a file that
+# holds the raw '&'. Matching must tolerate BOTH directions, so both the
+# file view and the needle are decoded to the same canonical form.
+_HTML_ENTITY_RE = re.compile(
+    r"&(?:#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]{1,31});"
+)
+
+
+def _decode_html_entities(text: str) -> tuple[str, list[int], list[int]]:
+    """Decode HTML character references, mapping each output char back to
+    its ORIGINAL offset (the reference's start) so splicing stays
+    byte-precise on the file's real text.
+
+    Returns ``(decoded, origin, origin_end)``: ``origin[i]`` is the start
+    offset of the source range that produced output char ``i`` and
+    ``origin_end[i]`` is its end (exclusive). Plain chars span one byte;
+    a decoded reference spans the WHOLE reference, so a needle ending on
+    a decoded char splices the full ``&...;`` run out of the file.
+
+    Unknown/invalid references pass through untouched (html.unescape
+    semantics); a bare '&' without a ';' never matches the pattern.
+    """
+    out: list[str] = []
+    origin: list[int] = []
+    origin_end: list[int] = []
+    pos = 0
+    while pos < len(text):
+        m = _HTML_ENTITY_RE.match(text, pos)
+        if m:
+            decoded = html.unescape(m.group(0))
+            if decoded and decoded != m.group(0):
+                # Every decoded char maps to the WHOLE reference range;
+                # the splice replaces the entire reference with new_string.
+                for ch in decoded:
+                    out.append(ch)
+                    origin.append(m.start())
+                    origin_end.append(m.end())
+                pos = m.end()
+                continue
+        out.append(text[pos])
+        origin.append(pos)
+        origin_end.append(pos + 1)
+        pos += 1
+    return "".join(out), origin, origin_end
+
+
+def _expand_spans_over_entities(
+    content: str, spans: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Widen spans that cut through an HTML character reference.
+
+    A byte-exact (or whitespace-tolerant) hit can end — or start — in
+    the middle of a ``&...;`` reference when the needle carries the
+    decoded char; splicing such a span leaves a dangling ``amp;`` tail
+    behind and corrupts the file. Expand any boundary strictly inside
+    a decodable reference to the reference's edge. Files without
+    ``&``/``;`` skip the scan entirely.
+    """
+    if not spans or "&" not in content or ";" not in content:
+        return spans
+    refs = [
+        (m.start(), m.end())
+        for m in _HTML_ENTITY_RE.finditer(content)
+        if html.unescape(m.group(0)) != m.group(0)
+    ]
+    if not refs:
+        return spans
+    out: list[tuple[int, int]] = []
+    for s, e in spans:
+        for rs, re_ in refs:
+            if rs < s < re_:
+                s = rs
+            if rs < e < re_:
+                e = re_
+        out.append((s, e))
+    return out
+
+
+def _normalize_canonical(text: str) -> tuple[str, list[int], list[int]]:
     """Line-preserving canonical view: unicode + interior-whitespace tolerant.
 
     Each line is NFKC-normalized, zero-width chars removed, smart quotes and
     dashes expanded to ASCII, interior horizontal-whitespace runs collapsed
-    to a single space, and leading/trailing whitespace stripped — like
+    to a single space, and leading/trailing whitespace stripped - like
     ``_normalize_indent_insensitive`` but also tolerant to ``...`` vs
     ``…``, ``--`` vs em-dash, smart quotes, NBSP/tabs. Origin maps every
-    kept char back to its original offset so splicing stays byte-precise.
+    kept char back to its original offset so splicing stays byte-precise;
+    ``origin_end`` carries the end of each char's source range so a
+    needle ending on a decoded HTML entity splices the whole reference.
     """
     norm: list[str] = []
     origin: list[int] = []
+    origin_end: list[int] = []
     pos = 0
     for i, raw_line in enumerate(text.split("\n")):
         if i:
             norm.append("\n")
             origin.append(pos - 1)
+            origin_end.append(pos)
         line = unicodedata.normalize("NFKC", raw_line)
         line = _ZERO_WIDTH_RE.sub("", line)
+        line, line_origin, line_origin_end = _decode_html_entities(line)
+        # line_origin is relative to this line; shift to absolute file
+        # offsets (exact when NFKC/zero-width removal is identity, which
+        # holds for plain ASCII code; exotic unicode may drift by a char).
+        base = pos
         expanded: list[str] = []
         expanded_origin: list[int] = []
+        expanded_origin_end: list[int] = []
         for idx, ch in enumerate(line):
             for ech in _expand_unicode_char(ch):
                 expanded.append(ech)
-                expanded_origin.append(pos + idx)
+                expanded_origin.append(base + line_origin[idx])
+                expanded_origin_end.append(base + line_origin_end[idx])
         # Collapse horizontal runs to one space, then strip both ends.
         collapsed: list[str] = []
         collapsed_origin: list[int] = []
+        collapsed_origin_end: list[int] = []
         k = 0
         while k < len(expanded):
             if expanded[k] in _CANON_WS_CHARS:
                 if collapsed and collapsed[-1] != " ":
                     collapsed.append(" ")
                     collapsed_origin.append(expanded_origin[k])
+                    collapsed_origin_end.append(expanded_origin_end[k])
                 elif not collapsed:
                     pass
                 while k < len(expanded) and expanded[k] in _CANON_WS_CHARS:
@@ -2773,37 +3193,46 @@ def _normalize_canonical(text: str) -> tuple[str, list[int]]:
                 continue
             collapsed.append(expanded[k])
             collapsed_origin.append(expanded_origin[k])
+            collapsed_origin_end.append(expanded_origin_end[k])
             k += 1
         while collapsed and collapsed[-1] == " ":
             collapsed.pop()
             collapsed_origin.pop()
+            collapsed_origin_end.pop()
         while collapsed and collapsed[0] == " ":
             collapsed.pop(0)
             collapsed_origin.pop(0)
+            collapsed_origin_end.pop(0)
         norm.append("".join(collapsed))
         origin.extend(collapsed_origin)
+        origin_end.extend(collapsed_origin_end)
         pos += len(raw_line) + 1
-    return "".join(norm), origin
+    return "".join(norm), origin, origin_end
 
 
-def _normalize_reflow(text: str) -> tuple[str, list[int]]:
+def _normalize_reflow(text: str) -> tuple[str, list[int], list[int]]:
     """Whole-text reflow view: all whitespace runs collapse to one space.
 
     Used when the model re-wrapped a block (joined lines or split one line
-    into several) — the token sequence is identical but ``\\n`` placement
+    into several) - the token sequence is identical but ``\\n`` placement
     differs. Unicode is expanded like ``_normalize_canonical``. Origin maps
-    back so the splice still covers the file's original lines.
+    back so the splice still covers the file's original lines;
+    ``origin_end`` carries each char's source-range end (HTML entities).
     """
     flat = unicodedata.normalize("NFKC", text)
     flat = _ZERO_WIDTH_RE.sub("", flat)
+    flat, flat_origin, flat_origin_end = _decode_html_entities(flat)
     expanded: list[str] = []
     expanded_origin: list[int] = []
+    expanded_origin_end: list[int] = []
     for idx, ch in enumerate(flat):
         for ech in _expand_unicode_char(ch):
             expanded.append(ech)
-            expanded_origin.append(idx)
+            expanded_origin.append(flat_origin[idx])
+            expanded_origin_end.append(flat_origin_end[idx])
     norm: list[str] = []
     origin: list[int] = []
+    origin_end: list[int] = []
     k = 0
     ws_all = _CANON_WS_CHARS + "\n"
     while k < len(expanded):
@@ -2811,19 +3240,23 @@ def _normalize_reflow(text: str) -> tuple[str, list[int]]:
             if norm and norm[-1] != " ":
                 norm.append(" ")
                 origin.append(expanded_origin[k])
+                origin_end.append(expanded_origin_end[k])
             while k < len(expanded) and expanded[k] in ws_all:
                 k += 1
             continue
         norm.append(expanded[k])
         origin.append(expanded_origin[k])
+        origin_end.append(expanded_origin_end[k])
         k += 1
     while norm and norm[-1] == " ":
         norm.pop()
         origin.pop()
+        origin_end.pop()
     while norm and norm[0] == " ":
         norm.pop(0)
         origin.pop(0)
-    return "".join(norm), origin
+        origin_end.pop(0)
+    return "".join(norm), origin, origin_end
 
 
 def _at_line_start(norm: str, j: int) -> bool:
@@ -2835,10 +3268,21 @@ def _at_line_start(norm: str, j: int) -> bool:
 
 
 def _spans_in(
-    norm: str, origin: list[int], needle: str, *, line_anchored: bool
+    norm: str,
+    origin: list[int],
+    needle: str,
+    *,
+    line_anchored: bool,
+    origin_end: list[int] | None = None,
 ) -> list[tuple[int, int]]:
     """Original byte spans of every non-overlapping hit of ``needle`` in the
-    normalized view, mapped back through ``origin``."""
+    normalized view, mapped back through ``origin``.
+
+    ``origin_end`` (optional) carries the END of each normalized char's
+    source range; when given, a hit's end maps through it so a needle
+    ending on a decoded HTML entity splices the WHOLE reference out of
+    the file instead of leaving a dangling ``amp;`` tail behind.
+    """
     spans: list[tuple[int, int]] = []
     if not needle:
         return spans
@@ -2848,7 +3292,12 @@ def _spans_in(
         if j < 0:
             break
         if not line_anchored or _at_line_start(norm, j):
-            spans.append((origin[j], origin[j + len(needle) - 1] + 1))
+            end = (
+                origin_end[j + len(needle) - 1]
+                if origin_end is not None
+                else origin[j + len(needle) - 1] + 1
+            )
+            spans.append((origin[j], end))
         i = j + len(needle)
     return spans
 
@@ -2863,7 +3312,8 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], st
     ``"literal"`` when ``old`` was the DECODED value of a source string
     literal (the caller must re-encode ``new_string`` via
     ``_encode_string_literal`` before splicing).
-    Tiers: byte-exact, then CRLF/trailing-whitespace tolerant, then with
+    Tiers: byte-exact, then HTML-entity tolerant (references decoded on
+    both sides), then CRLF/trailing-whitespace tolerant, then with
     read/grep prefixes and wrapper/note lines removed (line-anchored so a
     stripped fragment can never match mid-line), then indent/unicode
     tolerant, then decoded string-literal, then reflow tolerant (reflow
@@ -2881,18 +3331,39 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], st
         spans.append((j, j + len(old)))
         i = j + len(old)
     if spans:
-        return spans, ""
+        return _expand_spans_over_entities(content, spans), ""
+    # 1b) HTML-entity tolerant — the model often copies a line from rendered
+    # HTML output where '&' appears as a character reference (or vice
+    # versa). Decode references on BOTH sides to the same form and
+    # byte-match; spans map back through origin_end so a needle ending on
+    # a decoded char splices the WHOLE reference. Runs before the
+    # whitespace tiers so an entity prefix can never match mid-reference
+    # and leave a dangling tail behind.
+    _dc, _dc_origin, _dc_origin_end = _decode_html_entities(content)
+    _do, _, _ = _decode_html_entities(old)
+    if _dc != content or _do != old:
+        spans = _spans_in(
+            _dc, _dc_origin, _do,
+            line_anchored=False, origin_end=_dc_origin_end,
+        )
+        if spans:
+            return spans, ""
     # 2) same text modulo CRLF / trailing whitespace.
     c_norm, c_origin = _normalize_for_match(content)
     o_norm, _ = _normalize_for_match(old)
-    spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=False)
+    spans = _expand_spans_over_entities(
+        content, _spans_in(c_norm, c_origin, o_norm, line_anchored=False)
+    )
     if spans:
         return spans, ""
     # 3) decorations stripped — only runs when stripping changed something.
     decorated = _undecorate_tool_text(old)
     if decorated != old:
         o_norm, _ = _normalize_for_match(decorated)
-        spans = _spans_in(c_norm, c_origin, o_norm, line_anchored=True)
+        spans = _expand_spans_over_entities(
+            content,
+            _spans_in(c_norm, c_origin, o_norm, line_anchored=True),
+        )
         if spans:
             return spans, "decorated"
     # 4) leading-indent insensitive — the model often retypes a block at
@@ -2903,23 +3374,40 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], st
     # "xfoo".
     c_stripped, c_stripped_origin = _normalize_indent_insensitive(content)
     o_stripped, _ = _normalize_indent_insensitive(old)
-    spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
+    spans = _expand_spans_over_entities(
+        content,
+        _spans_in(
+            c_stripped, c_stripped_origin, o_stripped, line_anchored=True
+        ),
+    )
     if spans:
         return spans, ""
     if decorated != old:
         o_stripped, _ = _normalize_indent_insensitive(decorated)
-        spans = _spans_in(c_stripped, c_stripped_origin, o_stripped, line_anchored=True)
+        spans = _expand_spans_over_entities(
+            content,
+            _spans_in(
+                c_stripped, c_stripped_origin, o_stripped,
+                line_anchored=True,
+            ),
+        )
         if spans:
             return spans, "decorated"
     # 5) unicode + interior-whitespace tolerant, line-preserving.
-    c_canon, c_canon_origin = _normalize_canonical(content)
-    o_canon, _ = _normalize_canonical(old)
-    spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
+    c_canon, c_canon_origin, c_canon_origin_end = _normalize_canonical(content)
+    o_canon, _, _ = _normalize_canonical(old)
+    spans = _spans_in(
+        c_canon, c_canon_origin, o_canon,
+        line_anchored=True, origin_end=c_canon_origin_end,
+    )
     if spans:
         return spans, ""
     if decorated != old:
-        o_canon, _ = _normalize_canonical(decorated)
-        spans = _spans_in(c_canon, c_canon_origin, o_canon, line_anchored=True)
+        o_canon, _, _ = _normalize_canonical(decorated)
+        spans = _spans_in(
+            c_canon, c_canon_origin, o_canon,
+            line_anchored=True, origin_end=c_canon_origin_end,
+        )
         if spans:
             return spans, "decorated"
     # 6) decoded string-literal — the model copied the VALUE of a source
@@ -2940,16 +3428,20 @@ def _match_old_string(content: str, old: str) -> tuple[list[tuple[int, int]], st
     # Spans overlapping a string literal without covering it are rejected:
     # they are decoded-value prefixes, not code — splicing them would
     # corrupt the literal's escapes.
-    c_flow, c_flow_origin = _normalize_reflow(content)
-    o_flow, _ = _normalize_reflow(old)
+    c_flow, c_flow_origin, c_flow_origin_end = _normalize_reflow(content)
+    o_flow, _, _ = _normalize_reflow(old)
     if len(o_flow) >= 10:
-        spans = _spans_outside_literals(content, c_flow, c_flow_origin, o_flow)
+        spans = _spans_outside_literals(
+            content, c_flow, c_flow_origin, o_flow, origin_end=c_flow_origin_end,
+        )
         if spans:
             return spans, ""
     if decorated != old:
-        o_flow, _ = _normalize_reflow(decorated)
+        o_flow, _, _ = _normalize_reflow(decorated)
         if len(o_flow) >= 10:
-            spans = _spans_outside_literals(content, c_flow, c_flow_origin, o_flow)
+            spans = _spans_outside_literals(
+                content, c_flow, c_flow_origin, o_flow, origin_end=c_flow_origin_end,
+            )
             if spans:
                 return spans, "decorated"
     return [], ""
@@ -3030,7 +3522,12 @@ def _encode_string_literal(value: str, quote: str) -> str:
 
 
 def _spans_outside_literals(
-    content: str, norm: str, origin: list[int], needle: str
+    content: str,
+    norm: str,
+    origin: list[int],
+    needle: str,
+    *,
+    origin_end: list[int] | None = None,
 ) -> list[tuple[int, int]]:
     """Reflow hits that do not partially overlap a string literal.
 
@@ -3039,7 +3536,7 @@ def _spans_outside_literals(
     literal's escapes. Fully-covered literals (a reflowed block that
     happens to contain a whole string) are kept.
     """
-    spans = _spans_in(norm, origin, needle, line_anchored=False)
+    spans = _spans_in(norm, origin, needle, line_anchored=False, origin_end=origin_end)
     if not spans:
         return []
     literals = [(m.start(), m.end()) for m in _STRING_LITERAL_RE.finditer(content)]
@@ -3143,7 +3640,7 @@ def _edit_not_unique_error(
         "error": (
             f"{prefix}old_string is not unique ({len(spans)} occurrences){extra} — "
             "include more surrounding context to make it unique, or pass "
-            "replace_all=true to replace every occurrence. "
+            "replace_all=true (call-level or per-edit) to replace every occurrence. "
             f"Occurrences in '{path}' (line numbers are metadata — copy clean text "
             "from read without adding line numbers):\n" + body
         ),
@@ -3288,6 +3785,7 @@ def edit_file_batch(
     path: str,
     edits: list[dict] | str,
     permit: dict | None = None,
+    replace_all: bool = False,
 ) -> dict:
     """Apply several old_string->new_string replacements to ``path`` atomically.
 
@@ -3295,7 +3793,9 @@ def edit_file_batch(
     written ONCE, so N changes to the same file cost one tool call, one
     checkpoint, one diff and one verify instead of N sequential read/write
     cycles. Either every edit applies or nothing is written (atomic).
-    Each item is ``{"old_string": ..., "new_string": ..., "replace_all": bool}``.
+    Each item is ``{"old_string": ..., "new_string": ..., "replace_all": bool}``;
+    an item without its own flag inherits the call-level ``replace_all`` (an
+    explicit per-item flag always wins).
     Matching is tolerant per edit like ``edit_file`` (copied read/grep
     decorations are stripped and mapped back); when an edit fails because an
     earlier edit in the same batch rewrote its target, the error says so
@@ -3357,7 +3857,7 @@ def edit_file_batch(
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: must be an object"}
         old_string = item.get("old_string", "")
         new_string = item.get("new_string", "")
-        replace_all = bool(item.get("replace_all", False))
+        item_replace_all = bool(item.get("replace_all", replace_all))
         if not isinstance(old_string, str) or not isinstance(new_string, str):
             return {"path": path, "error": f"edit {idx + 1}/{len(edits)}: old_string/new_string must be strings"}
         if not old_string:
@@ -3377,13 +3877,13 @@ def edit_file_batch(
                 path, old_string, new_content,
                 prefix=f"edit {idx + 1}/{len(edits)}: ",
             )
-        if len(spans) > 1 and not replace_all:
+        if len(spans) > 1 and not item_replace_all:
             return _edit_not_unique_error(
                 path, new_content, spans, prefix=f"edit {idx + 1}/{len(edits)}: "
             )
         _clean_new = _undecorate_tool_text(new_string)
         replacement = _clean_new if (mode or _clean_new != new_string) else new_string
-        apply = spans if replace_all else spans[:1]
+        apply = spans if item_replace_all else spans[:1]
         if mode == "literal":
             quote = new_content[apply[0][0]]
             replacement = _encode_string_literal(new_string, quote)
@@ -3393,7 +3893,12 @@ def edit_file_batch(
             new_content = _splice_reindented(new_content, apply, old_base_text, replacement)
         total_occ += len(apply)
     if new_content == content:
-        return {"path": path, "error": "edits leave the file unchanged"}
+        return {
+            "path": path,
+            "error": "edits leave the file unchanged — every old_string already equals its "
+            "new_string in the current file (check for HTML-entity decoding, e.g. '&' "
+            "vs '&', or re-read the file and copy the exact current text)",
+        }
     try:
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(new_content)
@@ -3410,7 +3915,7 @@ def edit_file_batch(
 
 
 # --------------------------------------------------------------------------- #
-# Automatic post-edit verification (Coder mode)
+# Automatic post-edit verification (Build mode)
 # --------------------------------------------------------------------------- #
 # Cheap, best-effort syntax/type checks run right after write_file/edit_file
 # succeeds, with the result appended INLINE to that same tool's return string.
@@ -3523,7 +4028,14 @@ def _verify_typescript(root: str) -> str | None:
 
 
 def _verify_lsp_diagnostics(root: str, target: str) -> str | None:
-    """Best-effort LSP diagnostics for one file, or None when unavailable."""
+    """Blocking LSP diagnostics for one file, or None when clean/unavailable.
+
+    Only ``error``/``warning`` severities are reported: ``info``/``hint``
+    (e.g. unused-variable hints) never turned a successful edit into
+    ``AUTO-VERIFY FAILED`` — that mislabel sent the model into a
+    fix-and-re-verify loop over pre-existing notes instead of moving on.
+    Real type errors still surface via tsc/syntax checks.
+    """
     try:
         from lsp_manager import get_manager as _get_lsp_mgr_verify
 
@@ -3535,18 +4047,23 @@ def _verify_lsp_diagnostics(root: str, target: str) -> str | None:
         return None
     if not diags:
         return None
+    blocking = [d for d in diags if str(d.get("severity") or "").lower() in ("error", "warning")]
+    if not blocking:
+        return None
+    suppressed = len(diags) - len(blocking)
     lines = []
-    for d in diags[:8]:
+    for d in blocking[:8]:
         line = f"{d.get('path')}:{d.get('line')} [{d.get('severity')}] {d.get('message')}"
         if d.get("source"):
             line += f" ({d.get('source')})"
         lines.append(line)
-    more = f"\n\u2026({len(diags) - 8} more)" if len(diags) > 8 else ""
-    return f"{len(diags)} LSP diagnostic(s):\n" + "\n".join(lines) + more
+    more = f"\n\u2026({len(blocking) - 8} more)" if len(blocking) > 8 else ""
+    suffix = f" (+{suppressed} hint/info suppressed, non-blocking)" if suppressed else ""
+    return f"{len(blocking)} LSP diagnostic(s){suffix}:\n" + "\n".join(lines) + more
 
 
 def verify_edit(root: str, path: str, permit: dict | None = None) -> str | None:
-    """Best-effort post-write verification for Coder mode's write_file/edit_file.
+    """Best-effort post-write verification for Build mode's write_file/edit_file.
 
     Dispatches by extension: .py gets an instant AST syntax check; .json gets an
     instant json.loads check; .ts/.tsx get a debounced project-wide typecheck.
@@ -3600,8 +4117,10 @@ def _format_plan_nudge_suffix(due: bool) -> str:
         return ""
     return (
         "\n\n💡 Reminder: your checklist still has open steps after "
-        "tool calls — call update_plan now with the SAME full list, marking "
-        "any step you've actually finished 'completed' (and the next one 'in_progress')."
+        "tool calls — batch update_plan with your NEXT tool calls in the SAME step "
+        "(never solo just for a tick), marking finished steps 'completed' "
+        "(and the next one 'in_progress'). Done work already stays in context "
+        "via the tool results above."
     )
 
 
@@ -4719,6 +5238,34 @@ def make_tool_callbacks(
     # per-chat state to disk via state_db. Previously chat_id was accepted but
     # never captured, so update_plan could only emit to the UI — never save.
     _chat_id = chat_id
+    # Restart-proof memory: reload the persisted checklist into the session
+    # store so the nudge backstop and completion gate keep working after a
+    # process restart wiped the in-memory copy.
+    if _chat_id and not _PLAN_BY_CHAT.get(_chat_id):
+        try:
+            _ws0 = _state_db.workspace_slug_for_root(root)
+            _disk0 = _state_db.get_checklist(_ws0, _chat_id)
+            if _disk0 and not all(
+                isinstance(it, dict) and it.get("status") == "completed"
+                for it in _disk0
+            ):
+                _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in _disk0]
+        except Exception:  # noqa: BLE001, S110 — hydration never breaks tools
+            pass
+    # Per-turn reset of the advisory search budget for this (chat, root).
+    # Callbacks are rebuilt every turn, so a workspace-global counter must
+    # not leak across turns and block Ask/Plan after 3 calls. Sub-agent
+    # turns reuse the parent scope and must not wipe it.
+    try:
+        if not _SUB_AGENT_CTX.get():
+            _turn_key = (str(chat_id or ""), str(root or ""))
+            _SEARCH_BATCHES[_turn_key] = 0
+            _SEARCH_BATCH_GENERATIONS[_turn_key] = int(_search_generations.get(str(root or ""), 0) or 0)
+            if _chat_id:
+                _READ_RANGES_BY_CHAT[_chat_id] = {}
+                _READ_LONE_CALLS_BY_CHAT[_chat_id] = {}
+    except Exception:  # noqa: BLE001, S110 - turn reset never breaks tools
+        pass
     # snapshot بازِ این turn: اولین write در turn یک checkpoint seq جدید می‌سازد
     # و بقیه‌ی writeهای همان turn به همان seq اضافه می‌شوند (تجمیع per-turn).
     # make_tool_callbacks به‌ازای هر turn دوباره صدا زده می‌شود، پس این state
@@ -5041,7 +5588,7 @@ def make_tool_callbacks(
         max(10, ctx // 500)
         terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_000, tool_out_chars * 1))
     else:
-        tool_out_chars = MAX_READ_BYTES
+        tool_out_chars = min(MAX_READ_BYTES, 8_000)
         terminal_out_chars = MAX_TERMINAL_OUTPUT
     tool_out_chars = min(tool_out_chars, MAX_READ_BYTES)
 
@@ -5058,9 +5605,11 @@ def make_tool_callbacks(
     # Read-window hygiene (code-enforced, not prompt-only). Session telemetry
     # showed ~70% of tool calls were `read`, one call per model step, and most
     # windows either overlapped an earlier one or slid a few lines past it —
-    # every extra step re-sends the whole context. Overlapping/adjacent
-    # windows of the SAME file inside one call are merged into one block.
-    # Small files / EOF are unaffected (the excerpt reader stops at EOF).
+    # every extra step re-sends the whole context. Overlapping/adjacent/nearby
+    # (gap under _READ_JOIN_GAP) windows of the SAME file inside one call are
+    # merged into one block, bridging the gap so no follow-up read is needed
+    # for the sliver between them. Small files / EOF are unaffected (the
+    # excerpt reader stops at EOF).
     def _widen_and_merge_windows(
         wins: list[tuple[str, int, int]],
     ) -> list[tuple[str, int, int]]:
@@ -5074,7 +5623,9 @@ def make_tool_callbacks(
             ss.sort()
             merged = [ss[0]]
             for a, b in ss[1:]:
-                if a <= merged[-1][1] + 1:
+                # Bridge near-adjacent windows (gap <= _READ_JOIN_GAP): fetch
+                # the gap too — each extra read call costs a full round-trip.
+                if a <= merged[-1][1] + 1 + _READ_JOIN_GAP:
                     merged[-1][1] = max(merged[-1][1], b)
                 else:
                     merged.append([a, b])
@@ -5179,37 +5730,152 @@ def make_tool_callbacks(
         except Exception:  # noqa: BLE001, S110 - progress never breaks tools
             pass
 
-    def _lsp_resolve_position(target: str, line: int, character: int, symbol: str) -> tuple[int, int]:
-        """Resolve the LSP column from the symbol text on the same line.
+    def _read_line_text(path: str, ln: int) -> str:
+        """One line's text (1-indexed), or "" when unreadable/out of range."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for i, raw in enumerate(fh, start=1):
+                    if i == ln:
+                        return raw.rstrip("\n")
+                    if i > ln:
+                        break
+        except OSError:
+            pass
+        return ""
+
+    async def _lsp_resolve_position(target: str, line: int, character: int, symbol: str) -> tuple[int, int]:
+        """Resolve the LSP position (line + column) for a symbol request.
 
         Column guesses are the top failure mode: when `symbol` is given, read
         that line and use the symbol offset instead of the raw `character`.
-        Falls back to `character` when the line or symbol cannot be read.
+        When the symbol is NOT on that line (e.g. the model guessed line 1),
+        resolve it from the file's document symbols instead — answering the
+        request directly instead of returning empty and costing a full LLM
+        round-trip. Without a usable symbol the column snaps to the nearest
+        identifier on the line that is NOT a language keyword — a position on
+        "async"/"def" answers empty. Falls back to the raw `character` when
+        nothing resolves.
         """
         want = str(symbol or "").strip()
         try:
             ln = max(1, int(line or 1))
         except (TypeError, ValueError):
             return int(line or 1), int(character or 0)
-        if not want:
-            return ln, int(character or 0)
         try:
+            text = await asyncio.to_thread(_read_line_text, target, ln)
+        except Exception:  # noqa: BLE001 - read never breaks resolution
             text = ""
-            with open(target, "r", encoding="utf-8", errors="replace") as fh:
-                for i, raw in enumerate(fh, start=1):
-                    if i == ln:
-                        text = raw.rstrip("\n")
-                        break
-        except OSError:
-            return ln, int(character or 0)
+        if text and want:
+            idx = text.find(want)
+            if idx < 0:
+                idx = text.lower().find(want.lower())
+            if idx >= 0:
+                return ln, idx
+        # Symbol not on the given line (or no line text): resolve it from the
+        # file's document symbols so the call still answers directly.
+        if want:
+            try:
+                from lsp_manager import get_manager as _get_lsp_mgr_pos
+
+                _pm = _get_lsp_mgr_pos(root)
+                _syms = await asyncio.to_thread(_pm.document_symbols_if_running, target)
+                _exact: tuple[int, int] | None = None
+                _fuzzy: tuple[int, int] | None = None
+                for _sn, _sv in (_syms or {}).items():
+                    try:
+                        _ss = int(_sv[0])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if _sn == want and _exact is None:
+                        _exact = (_ss, 0)
+                    elif _fuzzy is None and want.lower() in str(_sn).lower():
+                        _fuzzy = (_ss, 0)
+                _resolved = _exact or _fuzzy
+                if _resolved is not None:
+                    # Re-resolve the column on the symbol's own line (finds the
+                    # name there; no further recursion).
+                    return await _lsp_resolve_position(target, _resolved[0], 0, want)
+            except Exception:  # noqa: BLE001, S110 - fallback never breaks the call
+                pass
         if not text:
             return ln, int(character or 0)
-        idx = text.find(want)
-        if idx < 0:
-            idx = text.lower().find(want.lower())
-        if idx >= 0:
-            return ln, idx
-        return ln, int(character or 0)
+        # Snap to the nearest non-keyword identifier on the line.
+        want_col = int(character or 0)
+        best: tuple[int, int] | None = None
+        for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text):
+            if m.group(0) in _LSP_SKIP_WORDS:
+                continue
+            col = max(m.start(), min(want_col, m.end() - 1))
+            dist = abs(col - want_col)
+            if best is None or dist < best[0]:
+                best = (dist, col)
+        if best is not None:
+            return ln, best[1]
+        return ln, want_col
+
+    async def _lsp_call_with_wait(target: str, method: str, *args):
+        """Call an LspManager method, absorbing lazy-start latency in-process.
+
+        The first LSP call for a language returns a 'server starting' error
+        while a daemon thread runs the initialize handshake. Waiting here
+        (bounded by _LSP_START_WAIT_S) and retrying once lets the SAME tool
+        call succeed, instead of returning a retry error that costs a full
+        LLM round-trip (every request re-sends the whole context). A
+        transient timeout (server busy indexing) is retried once in-tool
+        for the same reason.
+        """
+        from lsp_manager import get_manager as _get_lsp_mgr_wait
+
+        mgr = _get_lsp_mgr_wait(root)
+        fn = getattr(mgr, method, None)
+        if fn is None:
+            raise AttributeError(f"lsp manager has no method {method}")
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except Exception as exc:
+            _txt = str(exc or "").lower()
+            if "starting" in _txt or "retry shortly" in _txt:
+                try:
+                    ready = await asyncio.to_thread(
+                        mgr.wait_for_server, target, _LSP_START_WAIT_S
+                    )
+                except Exception:  # noqa: BLE001 — wait is best-effort
+                    ready = False
+                if not ready:
+                    raise
+                return await asyncio.to_thread(fn, *args)
+            # Transient timeout: the server is up but busy (workspace
+            # indexing, queued didOpen). One in-tool retry absorbs it
+            # instead of returning an error that costs a full LLM
+            # round-trip to redo. A SECOND timeout means the server is
+            # wedged: evict it so later calls start fresh instead of every
+            # LSP call for this language burning double the timeout.
+            def _is_timeout(e: BaseException) -> bool:
+                try:
+                    from lsp_manager import classify_lsp_error as _classify_wait
+
+                    return _classify_wait(e) == "timeout"
+                except Exception:  # noqa: BLE001 — classification is best-effort
+                    return "timed out" in str(e or "").lower()
+
+            if not _is_timeout(exc):
+                raise
+            try:
+                return await asyncio.to_thread(fn, *args)
+            except Exception as exc2:  # classified below
+                if not _is_timeout(exc2):
+                    raise
+                try:
+                    await asyncio.to_thread(mgr.evict_server, target)
+                except Exception:  # noqa: BLE001, S110 — eviction is best-effort
+                    pass
+                from lsp_manager import LspError as _LspErr
+
+                raise _LspErr(
+                    f"{method} timed out twice — wedged server evicted, "
+                    f"a fresh one starts on the next call",
+                    kind="wedged",
+                ) from exc2
 
     def _lsp_error_text(tool: str, filePath: str, line: int, character: int, exc: Exception) -> str:
         """Precise LSP failure message so the model never falls back to blind grep.
@@ -5226,19 +5892,49 @@ def make_tool_callbacks(
         except Exception:  # noqa: BLE001 - classification never fails
             kind = "error"
         base = f"{filePath}:{line}:{character}"
+        # Never suggest lsp_symbols when lsp_symbols itself failed (circular).
+        _alt = (
+            "grep scoped to this file for exact names"
+            if tool == "lsp_symbols"
+            else "lsp_symbols for exact names"
+        )
         if kind == "timeout":
             return (
                 f"ERROR {tool} {base}: request timed out ({exc}). "
                 f"The server is running but slow - retry this same call once; "
                 f"do NOT report no results and do NOT fall back to a blind workspace grep."
             )
+        if kind == "wedged":
+            return (
+                f"ERROR {tool} {base}: the language server wedged (timed out "
+                f"twice) and was stopped; a fresh server starts on the next "
+                f"call. Retry this same call once; if it still times out, "
+                f"read the file directly - never a blind workspace grep."
+            )
         if kind == "dead":
             return (
                 f"ERROR {tool} {base}: language server died ({exc}). "
                 f"Retry this same call once (the server restarts on demand); "
-                f"if it persists, use lsp_symbols for the file, not a blind grep."
+                f"if it persists, use {_alt}, not a blind grep."
             )
         if kind == "missing":
+            try:
+                from lsp_manager import LspManager as _LangMgr
+
+                _lang = _LangMgr.language_for(str(filePath)) or ""
+            except Exception:  # noqa: BLE001 - language lookup never fails
+                _lang = ""
+            if _lang:
+                return (
+                    f"ERROR {tool} {base}: {exc}. "
+                    f"This is the only case where the install hint applies. "
+                    f"Do NOT report 'not installed' and stop. "
+                    f"Ask the user with confirm_action(action='install language server for {_lang}', "
+                    f"reason='needed for {tool} on this file type') and WAIT. "
+                    f"If CONFIRMED, retry this same {tool} call shortly (install runs in background); "
+                    f"if DENIED, explain what is unavailable and continue without it. "
+                    f"Do NOT blind-grep the workspace for the definition."
+                )
             return (
                 f"ERROR {tool} {base}: {exc}. "
                 f"This is the only case where the install hint applies; "
@@ -5256,7 +5952,7 @@ def make_tool_callbacks(
             return (
                 f"ERROR {tool} {base}: pull diagnostics not supported by this server ({exc}). "
                 f"Do NOT retry the pull - the pushed batch (possibly empty = clean) is authoritative; "
-                f"use lsp_symbols for exact names, never a blind workspace grep."
+                f"use {_alt}, never a blind workspace grep."
             )
         if kind == "unavailable":
             return (
@@ -5266,7 +5962,7 @@ def make_tool_callbacks(
             )
         return (
             f"ERROR {tool} {base}: {exc}. "
-            f"Retry once; if it persists use lsp_symbols for exact names."
+            f"Retry once; if it persists use {_alt}."
         )
 
     async def write_file_tool(path: str, content: str) -> str:
@@ -5351,13 +6047,18 @@ def make_tool_callbacks(
         )
 
     async def update_plan(items: list[dict]) -> str:
-        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in. If a checklist already exists (from history or a previous update_plan), EDIT it: resend the SAME items with updated statuses, adding/removing only what the new message changed — never start a fresh duplicate list. NEVER revert a 'completed' step back to pending/in_progress. NEVER send update_plan alone: always batch it with your next tool calls in the SAME step (parallel calls)."""
+        """Set/update your step-by-step live checklist for the CURRENT multi-step task. For trivial single-step changes skip it. Call with the full list (status='pending'), then re-call with the SAME list marking finished 'completed' and current 'in_progress'. Item: 'content' (short imperative phrase) + 'status' ('pending'|'in_progress'|'completed'). Write items in the SAME language the user is writing in. If a checklist already exists (from history or a previous update_plan), EDIT it: resend the SAME items with updated statuses, adding/removing only what the new message changed — never start a fresh duplicate list. NEVER revert a 'completed' step back to pending/in_progress. Display-only for the user panel — your own memory of done work is the tool results already in context, not this list. NEVER send update_plan alone for a tick: only batch it with the next real tool calls in the SAME step (parallel calls), or skip it."""
         emit({"kind": "tool", "tool": "update_plan", "args": {}})
         normalized: list[dict] = []
         for it in items or []:
             if not isinstance(it, dict):
                 continue
-            content = str(it.get("content", "")).strip()
+            content = str(
+                it.get("content", "")
+                or it.get("text", "")
+                or it.get("title", "")
+                or it.get("name", "")
+            ).strip()
             status = str(it.get("status", "pending")).strip().lower()
             if status not in ("pending", "in_progress", "completed"):
                 status = "pending"
@@ -5441,6 +6142,15 @@ def make_tool_callbacks(
                 _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in normalized]
             else:
                 _PLAN_BY_CHAT[_chat_id] = [dict(it) for it in normalized]
+            try:
+                _ws = _state_db.workspace_slug_for_root(root)
+                if all(it.get("status") == "completed" for it in normalized):
+                    # Finished lists need no restart memory; keep the disk clean.
+                    _state_db.delete_checklist(_ws, _chat_id)
+                else:
+                    _state_db.save_checklist(_ws, _chat_id, normalized)
+            except Exception:  # noqa: BLE001, S110 — persistence never breaks tools
+                pass
             if all(it.get("status") == "completed" for it in normalized):
                 # Turn continuity: keep the completed checklist as evidence so
                 # the next turn can report from it instead of re-executing.
@@ -5469,9 +6179,9 @@ def make_tool_callbacks(
         _plan_nudge_state["has_in_progress"] = any(
             i["status"] == "in_progress" for i in normalized
         )
-        # Session-only (in-memory per chat, see _PLAN_BY_CHAT): never on disk,
-        # so stale todos cannot reload on every message. The merged list is the
-        # single source of truth — the frontend replaces its view with it.
+        # The merged list is the single source of truth — the frontend replaces
+        # its view with it. Open checklists also persist next to plan.md so a
+        # restart resumes progress; finished ones are removed from disk.
         emit({"kind": "plan", "items": normalized})
         done = sum(1 for i in normalized if i["status"] == "completed")
         emit(
@@ -5481,12 +6191,7 @@ def make_tool_callbacks(
                 "summary": f"{done}/{len(normalized)} done",
             }
         )
-        _ret = f"Plan updated: {len(normalized)} steps, {done} completed."
-        if done < len(normalized):
-            _ret += (
-                " Batch rule: NEVER send update_plan alone when there IS next "
-                "work -- always batch it with your next tool calls in the SAME step."
-            )
+        _ret = f"Plan updated: {done}/{len(normalized)} done."
         if _repeat_without_progress:
             _ret += (
                 f" Note: you re-sent the SAME checklist without advancing any status, "
@@ -5841,15 +6546,25 @@ def make_tool_callbacks(
         )
 
     async def edit_file_tool(
-        path: str,
+        path: str = "",
         old_string: str = "",
         new_string: str = "",
         replace_all: bool = False,
         edits: list[dict] | None = None,
+        filePath: str = "",
+        file_path: str = "",
     ) -> str:
         """Replace an exact piece of text in an existing file with new text. `old_string` must match the file's current content exactly (including whitespace/indentation) and, by default, must be unique in the file — include enough surrounding lines to make it unique. Prefer this over write_file for any change to an existing file; only use write_file for brand-new files or a full intentional rewrite. Decorations copied from read/grep output (`2096 | ` line prefixes, trailing spaces, wrapper notes) are stripped automatically when they block the match — copying clean text still works best.
 
-        BATCH: to apply several changes to the SAME file, pass `edits` (a list of {"old_string","new_string","replace_all"} objects) instead of firing one edit_file call per change — all edits apply atomically in list order with ONE checkpoint/diff/verify. Either every edit applies or nothing is written."""
+        BATCH: to apply several changes to the SAME file, pass `edits` (a list of {"old_string","new_string","replace_all"} objects) instead of firing one edit_file call per change — all edits apply atomically in list order with ONE checkpoint/diff/verify. Either every edit applies or nothing is written. The call-level `replace_all` is the default for every edit that does not set its own flag, so replace_all=true + edits=[...] replaces ALL occurrences of each old_string (no 'not unique' error)."""
+        # Normalize path aliases and validate early with a friendly error
+        # instead of a schema validation failure with no guidance.
+        if not path:
+            path = filePath or file_path or ""
+        if not str(path or "").strip():
+            msg = "missing required 'path' argument (e.g. path='src/x.ts')"
+            emit(_error_result("edit_file", msg))
+            return f"ERROR editing: {msg}"
         emit(
             {
                 "kind": "tool",
@@ -5859,7 +6574,7 @@ def make_tool_callbacks(
         )
         try:
             if edits:
-                result = edit_file_batch(root, path, edits, permit)
+                result = edit_file_batch(root, path, edits, permit, replace_all=replace_all)
             else:
                 result = edit_file(root, path, old_string, new_string, replace_all, permit)
         except PathEscapeError as exc:
@@ -5985,7 +6700,7 @@ def make_tool_callbacks(
         return out or [""]
 
     async def grep_tool(
-        pattern: str,
+        pattern: str = "",
         patterns: list[str] | None = None,
         path: str = "",
         paths: list[str] | None = None,
@@ -5993,7 +6708,7 @@ def make_tool_callbacks(
         includes: list[str] | None = None,
         max_results: int = 50,
     ) -> str:
-        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths/include to them — omitting path scans the whole workspace and is REJECTED in that case; order is LSP first, else ONE scoped grep, then symbols read. If you know a filename fragment or extension, use glob first, never grep for filenames. Filename-fragment search must use glob first, never grep for filenames; forbid broad OR patterns with >3 alternatives mixing languages (e.g. `foo|bar|baz|qux` across .py/.ts/.css) — split into targeted greps instead. If you know a function/class/method NAME, do NOT grep — use lsp_symbols or read(symbols=[...]) instead.
+        """Search file CONTENTS using a regular expression. `pattern` is a REGEX (matched case-insensitively, per line), so combine alternatives with `foo|bar` (full syntax like `function\\s+\\w+` works). BATCH: pass every extra alternative via `patterns` (a list) so they all run in the SAME call — e.g. pattern='foo', patterns=['bar','baz'] is ONE grep for 'foo|bar|baz' — NEVER fire one grep per term; `pattern` may be omitted when `patterns` is non-empty. `path` optionally restricts to a subdirectory (omit = whole workspace); pass `paths` (a list of extra subdirectories) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one grep per scope. `include` optionally filters files by glob, e.g. `*.ts` or `*.{ts,tsx}`; pass `includes` (a list of extra file filters) to scan SEVERAL filters in the SAME call — e.g. include='*.ts', includes=['*.py'] — NEVER fire one grep per file filter. `max_results` caps how many matches are returned (default 50). Respects .gitignore; skips hidden/binary files. You have full workspace access; prefer targeted lookups with path/include. Order is LSP first, else ONE targeted grep, then symbols read. If you know a filename fragment or extension, use glob first, never grep for filenames. Filename-fragment search must use glob first, never grep for filenames; an UNSCOPED pattern with >3 top-level alternatives is REFUSED — scope it with path/include or split into targeted greps instead (pipes inside (...) groups count as ONE alternative). If you know a function/class/method NAME, do NOT grep — use lsp_symbols or read(symbols=[...]) instead.
 
 Returns each match with ±3 lines of surrounding code (the matching line marked with `>`), so you usually do NOT need a follow-up `read` just to see context. When the hit list is small (6 or fewer shown) the full enclosing definition body (up to 60 lines, via LSP) is inlined instead of the snippet — do NOT follow up with `read` for those; the body is already above. Only read when you need more than the shown body or need to edit the file. If you know a function/class/method NAME, do NOT grep for it — use lsp_symbols(filePath) or read(filePath, symbols=[...]) instead (or read(symbols=[...]) without filePath for a project-wide lookup). Output is capped by `max_results` and the context budget; if there are more matches a truncation note tells you to read the shown files instead of re-grepping. Use this tool (NOT shell `grep`/`rg`) to find files containing specific patterns — see the SEARCH STRATEGY rule for targeted-vs-broad guidance. For an open-ended search that may require multiple rounds of grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -6004,6 +6719,67 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         includes = _coerce_str_list(includes)
         # همه‌ی الگوها در یک regex ترکیبی → یک اسکن دیسک، یک ToolMessage.
         combined = "|".join(_dedup_patterns(pattern, patterns))
+        if not str(combined or "").strip():
+            # Batch-only calls omit `pattern`; with nothing to search for,
+            # fail friendly — a TypeError here burns a full retry step
+            # (~22K tokens in a live trace).
+            msg = "empty pattern: pass pattern='...' or patterns=[...]"
+            emit(_error_result("grep", msg))
+            return f"ERROR searching: {msg}"
+        # Search enforcement: an UNSCOPED >3-alternative OR spray scans the
+        # whole workspace and dumps a match list the model then re-greps
+        # instead of converging (live trace: 9-alternative greps returning
+        # 176/148-match dumps step after step). Refuse it — the refusal IS
+        # the guidance and costs one cheap step instead of a broad scan.
+        # A SCOPED broad grep (path/include present) still runs with a warn:
+        # the scope already targets it.
+        _alt_count = _count_grep_alternatives(combined)
+        if _alt_count > _MAX_GREP_ALTERNATIVES:
+            _scope_given = any(
+                str(_s or "").strip()
+                for _s in (path, include, *(paths or []), *(includes or []))
+            )
+            if not _scope_given:
+                msg = (
+                    f"broad pattern refused: {combined!r} has {_alt_count} "
+                    f"top-level alternatives (max {_MAX_GREP_ALTERNATIVES}) and "
+                    "no path/include scope. Target it: pass path='subdir' and/or "
+                    "include='*.ext' (batched patterns are fine once scoped), or "
+                    "narrow to <=3 alternatives of ONE concept. For a known "
+                    "function/class name use lsp_symbols or read(symbols=[...]) "
+                    "instead; for a filename use glob."
+                )
+                emit(_error_result("grep", msg))
+                return f"ERROR searching: {msg}"
+            _id_like = all(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(alt))
+                for alt in combined.split("|")
+            )
+            _hint = (
+                f"Identifier grep ({_alt_count} names): lsp_symbols(filePath='...', query='Name') "
+                "or read(symbols=[...]) resolves each name to its definition "
+                "with line ranges in ONE call — grep only finds text mentions."
+                if _id_like
+                else "Prefer LSP/read(symbols=[...]) for names, glob for "
+                "filenames, or split into <=3-alternative greps."
+            )
+            emit(
+                {
+                    "kind": "warn",
+                    "content": (
+                        f"Broad grep ({_alt_count} alternatives, scoped). {_hint}"
+                    ),
+                }
+            )
+        # Warn-only budget: this tool never hard-blocks grep (Ask/Plan/
+        # subagents must not be blocked). Coder discipline is enforced by
+        # the per-turn gate in graph.py (_search_gate_text). Sub-agent
+        # searches do not consume the parent budget.
+        if not _SUB_AGENT_CTX.get():
+            _budget_count = _sync_search_budget(root, _chat_id)
+            if _budget_count >= _MAX_SEARCH_BATCHES_WITHOUT_EDIT:
+                emit({"kind": "warn", "content": _search_budget_message(_budget_count)})
+            _note_search_batch(root, _chat_id)
         # Symbol-first fast path: plain identifier -> workspace/symbol first
         # so a simple name lookup merges grep+LSP into one call.
         _sym_generation = _search_generations.get(root, 0)
@@ -6427,6 +7203,22 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         raw = f"MATCHES for {combined!r}\n" + "\n\n".join(lines) + note
         if _search_generations.get(root, 0) == generation:
             _parent_search_cache[cache_key] = raw
+        # Fire-and-forget LSP warmup: start servers for matched files in a
+        # background daemon thread (no install, no blocking) so follow-up
+        # read/symbol calls hit warm servers.
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_warmup
+
+            _warm_mgr = _get_lsp_mgr_warmup(root)
+            _warm_paths = [
+                os.path.join(root, str(m.get("file")))
+                for m in matches[:20]
+                if isinstance(m.get("file"), str) and m.get("file")
+            ]
+            if _warm_paths:
+                _warm_mgr.warmup(_warm_paths)
+        except Exception:  # noqa: BLE001, S110 - warmup never breaks grep
+            pass
         # Send the structured results too (not just the summary) so a reconnect
         # can replay the tool without re-executing it (re-execution wastes
         # context). `items` carries the actual rows the model needs to see.
@@ -6446,7 +7238,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
-        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default. LONG-LIVED SERVERS (any stack): prefix the project's own start command (found in its manifest, never assumed) with `bg:` (e.g. `bg: <project launch command>`) — it starts detached and returns immediately with a job_id; logs go to the OS temp dir; read output with `terminal_logs <job_id>` and stop it with `terminal_stop <job_id>`. If a dependency must be installed first, ask permission with request_permission and explain why before installing."""
+        """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default. LONG-LIVED SERVERS (any stack): prefix the project's own start command (found in its manifest, never assumed) with `bg:` (e.g. `bg: <project launch command>`) — it starts detached and returns immediately with a job_id; logs go to the OS temp dir; read output with `terminal_logs <job_id>` and stop it with `terminal_stop <job_id>`. If a dependency is missing, do NOT report 'not installed' and stop — ask permission with request_permission (explain why), WAIT, then retry the install and the original command."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         _stripped_cmd = (command or "").strip()
         _low_cmd = _stripped_cmd.lower()
@@ -6578,17 +7370,23 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         return _final
 
     async def glob_tool(
-        pattern: str,
+        pattern: str = "",
         patterns: list[str] | None = None,
         path: str = "",
         paths: list[str] | None = None,
         max_results: int = 100,
     ) -> str:
-        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, restrict path/paths to them — omitting path scans the whole workspace and is REJECTED in that case; order is LSP first in coder mode, else ONE scoped glob/grep, then symbols read. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your file lookup (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; filename-fragment search must use glob first, never grep for filenames; forbid broad OR patterns with >3 alternatives mixing languages — split into targeted globs via patterns=[...] instead; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
+        """Find FILES by glob pattern. `pattern` is a glob like `**/*.js`, `src/**/*.ts`, or `*.test.py` (use `**` to match across directories). BATCH: pass every extra glob via `patterns` (a list) so they all run in the SAME call — e.g. pattern='**/*.test.py', patterns=['**/*.spec.ts'] is ONE glob — NEVER fire one glob per pattern when they share a path; `pattern` may be omitted when `patterns` is non-empty. `path` optionally narrows the subtree (omit = whole workspace); pass `paths` (a list of extra subtrees) to scan SEVERAL scopes in the SAME call — e.g. path='src', paths=['backend','tools'] — NEVER fire one glob per scope. `max_results` caps how many paths are returned (default 100). Returns matching relative paths only (no file contents). Respects .gitignore; skips hidden/binary files. You have full workspace access; prefer targeted lookups with path/include. Order is LSP first in build mode, else ONE targeted glob/grep, then symbols read. Runs on the MAIN model — matches are returned directly so the agent can read them itself. Do your file lookup (glob + grep) FIRST, then read only the files you need — do NOT alternate search and read. Use this tool when you need to find files by name patterns; filename-fragment search must use glob first, never grep for filenames; forbid broad OR patterns with >3 alternatives mixing languages — split into targeted globs via patterns=[...] instead; for an open-ended search that may require multiple rounds of globbing and grepping, combine alternatives with `foo|bar` to collapse multiple searches into one. When you already know the patterns you need, speculatively fire several globs in the SAME turn (parallel tool calls) rather than one at a time; for an open-ended search that may require multiple rounds of globbing and grepping, batch them into ONE call via patterns/paths/includes instead of firing one call per term."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         patterns = _coerce_str_list(patterns)
         paths = _coerce_str_list(paths)
         all_patterns = _dedup_patterns(pattern, patterns)
+        if not [p for p in all_patterns if str(p or "").strip()]:
+            # Batch-only calls omit `pattern`; with no glob at all, fail
+            # friendly — a TypeError here burns a full retry step.
+            msg = "empty pattern: pass pattern='...' or patterns=[...]"
+            emit(_error_result("glob", msg))
+            return f"ERROR globbing: {msg}"
         # نمایش تک‌الگویی برای سازگاری پیام‌ها؛ برای batch همه‌ی الگوها با |.
         disp = all_patterns[0] if len(all_patterns) == 1 else "|".join(all_patterns)
         # چند scope در همان فراخوانی: path + paths=[...] → یک glob برای همه.
@@ -6611,6 +7409,22 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 _deduped_paths.append(_np)
         all_paths = _deduped_paths
         scope = "|".join(all_paths) if len(all_paths) > 1 else (all_paths[0] if all_paths else "")
+        # Search enforcement: reject workspace-wide glob, a scope is required.
+        if not scope:
+            _scope_msg = (
+                "Workspace-wide glob is not allowed. Provide path=... to scope "
+                "the search (e.g. path=backend) and batch patterns via "
+                "patterns=[...]. Search rule: LSP first, else ONE scoped grep "
+                "path=backend include=*.py, then read symbols/ranges only."
+            )
+            emit(_error_result("glob", _scope_msg))
+            return f"ERROR running glob {disp!r}: {_scope_msg}"
+        # Advisory-only budget (same as grep_tool): never hard-block glob.
+        if not _SUB_AGENT_CTX.get():
+            _glob_budget = _sync_search_budget(root, _chat_id)
+            if _glob_budget >= _MAX_SEARCH_BATCHES_WITHOUT_EDIT:
+                emit({"kind": "warn", "content": _search_budget_message(_glob_budget)})
+            _note_search_batch(root, _chat_id)
         generation = _search_generations.get(root, 0)
         cache_key = ("glob", "|".join(all_patterns), scope, "", root, str(max_results))
         cached = _parent_search_cache.get(cache_key)
@@ -6765,19 +7579,58 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
     ) -> str:
         """File map instead of a blind head dump (see _HEAD_MAP_* above).
 
-        Fast path: no LSP/symbol work here. Plain reads must never wait on
-        the language server, so the map serves head lines directly with
-        paging guidance. Envelope matches normal read blocks.
+        Best-effort symbol index via document_symbols_if_running (never
+        starts a server): head lines plus name + line-range per definition
+        so the model can read exact symbols next. Falls back to head lines
+        plus a grep pointer when no server is running. Envelope matches
+        normal read blocks.
         """
-        # No LSP import, no document_symbols call, no thread hop: serve the
-        # already-fetched head lines directly to keep cold first-read fast.
-        _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
-        _body = (
-            "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
-            + f"\n\n(file map: {filePath} has {total} lines, no indexable "
-            f"symbols. Use grep to locate what you need, then read exact "
-            f"ranges.)"
-        )
+        _map_syms: dict = {}
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_map
+            _map_mgr = _get_lsp_mgr_map(root)
+            _map_syms = await asyncio.to_thread(_map_mgr.document_symbols_if_running, target) or {}
+        except Exception:  # noqa: BLE001 - map never breaks on LSP
+            _map_syms = {}
+        if _map_syms:
+            try:
+                _map_items: list[tuple[str, int, int]] = []
+                for _mn, _mv in _map_syms.items():
+                    try:
+                        _ms, _me = int(_mv[0]), int(_mv[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    _map_items.append((_mn, _ms, _me))
+                _map_items.sort(key=lambda t: (t[1], t[2] - t[1]))
+                _map_shown = _map_items[:_HEAD_MAP_MAX_SYMBOLS]
+                _rows = head_lines[:_HEAD_MAP_ROWS]
+                _head = "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+                _idx = "\n".join(f"{_n} L{_s}-{_e}" for _n, _s, _e in _map_shown)
+                _ex = ", ".join(f"'{_n}'" for _n, _, _ in _map_shown[:4])
+                _body = (
+                    f"{_head}\n\n(file map: {filePath} has {total} lines. "
+                    f"Symbols:\n{_idx}\n"
+                    f"Read definitions with symbols=[{_ex}] or "
+                    f"ranges=[\"{filePath}:start:count\", ...] in one call.)"
+                )
+                if len(_map_items) > len(_map_shown):
+                    _body += f"\n(+{len(_map_items) - len(_map_shown)} more symbols — grep for exact names.)"
+            except Exception:  # noqa: BLE001 — fall back to plain map
+                _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
+                _body = (
+                    "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+                    + f"\n\n(file map: {filePath} has {total} lines, no indexable "
+                    f"symbols. Use grep to locate what you need, then read exact "
+                    f"ranges.)"
+                )
+        else:
+            _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
+            _body = (
+                "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
+                + f"\n\n(file map: {filePath} has {total} lines, no indexable "
+                f"symbols. Use grep to locate what you need, then read exact "
+                f"ranges.)"
+            )
         _summary = f"file map · {total} lines"
         _last = int(_rows[-1]["line"])
         if not quiet:
@@ -6792,6 +7645,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{_body}\n</content>"
         try:
+            if _chat_id:
+                _READ_SEEN_BY_CHAT.setdefault(_chat_id, set()).add(cache_key)
+        except Exception:  # noqa: BLE001, S110 - seen mark never breaks read
+            pass
+        _note_read_range(_chat_id, target, 1, _last)
+        try:
             _parent_search_cache[cache_key] = raw
         except Exception:  # noqa: BLE001, S110 — cache never breaks a read
             pass
@@ -6801,6 +7660,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         filePath: str, offset: int, limit: int, _main_name: str,
         quiet: bool = False, allow_head_map: bool = True,
         _cache_hits: list[str] | None = None,
+        _cap_exempt: bool = False,
     ) -> str:
         """Read ONE file/dir path and emit its own tool_result/error event.
         Shared by the single-path and batch branches of read_tool below so
@@ -6838,6 +7698,33 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         if cached is not None:
             if _cache_hits is not None:
                 _cache_hits.append(filePath)
+            try:
+                _seen_before = _READ_SEEN_BY_CHAT.get(_chat_id or "")
+            except Exception:  # noqa: BLE001 - stub never breaks a read
+                _seen_before = None
+            if _seen_before is not None and cache_key in _seen_before:
+                if not quiet:
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "read",
+                            "summary": "cached-unchanged",
+                            "model": _main_name,
+                        }
+                    )
+                return " ".join(
+                    [
+                        f"<path>{filePath}</path>",
+                        "(unchanged: this exact window was already returned",
+                        "earlier in this chat - reuse that result instead of",
+                        f"re-reading: {filePath} offset {offset} limit {limit})",
+                    ]
+                )
+            try:
+                if _chat_id:
+                    _READ_SEEN_BY_CHAT.setdefault(_chat_id, set()).add(cache_key)
+            except Exception:  # noqa: BLE001, S110 - seen mark never breaks read
+                pass
             if not quiet:
                 emit(
                     {
@@ -6864,6 +7751,11 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         if os.path.isdir(target):
             raw = await _read_dir_tool(target, filePath, offset, limit, _main_name, quiet=quiet)
             _parent_search_cache[cache_key] = raw
+            try:
+                if _chat_id:
+                    _READ_SEEN_BY_CHAT.setdefault(_chat_id, set()).add(cache_key)
+            except Exception:  # noqa: BLE001, S110 - seen mark never breaks read
+                pass
             return raw
         if not os.path.exists(target):
             msg = "file not found" + _did_you_mean(target, filePath)
@@ -6877,11 +7769,161 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             return f"ERROR reading {filePath}: {msg}"
         offset = int(offset or 1)
         limit = int(limit or 2000)
+        # Covering-window dedup (this turn, unchanged file): a window fully
+        # inside an already-served range returns a one-line stub — live
+        # traces re-read overlapping windows of the same file step after
+        # step and every re-send cost bytes on each later request.
+        # Partial overlap is trimmed: only the not-yet-served intervals are
+        # fetched in one scan, so shifted re-reads (e.g. 1-200 then 150-350)
+        # serve just the new lines instead of the full window again.
+        _req_end = offset + limit - 1
+        _covered = _read_range_covered(_chat_id or "", target, offset, _req_end)
+        if _covered is not None:
+            if _cache_hits is not None:
+                _cache_hits.append(filePath)
+            if not quiet:
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "read",
+                        "summary": "cached-unchanged",
+                        "model": _main_name,
+                    }
+                )
+            return " ".join(
+                [
+                    f"<path>{filePath}</path>",
+                    f"(unchanged: lines {offset}-{_req_end} were already",
+                    f"returned earlier in this turn (served lines {_covered[0]}-{_covered[1]}",
+                    "of this file) - reuse that result instead of re-reading.",
+                    "Each separate read call costs a full round-trip:",
+                    "batch ALL remaining windows of this file in ONE read call with",
+                    'ranges=["path:start:count", ...], never one window per step.)',
+                ]
+            )
+
+        # Partial-overlap dedup: serve only not-yet-served intervals so a
+        # shifted re-read of one file never resends the overlap.
+        if not (allow_head_map and offset == 1 and limit >= _HEAD_MAP_MIN_LIMIT):
+            try:
+                _uncovered = _read_uncovered_intervals(_chat_id or "", target, offset, offset + limit - 1)
+            except Exception:  # noqa: BLE001 - dedup never breaks a read
+                _uncovered = [(offset, offset + limit - 1)]
+            if _uncovered != [(offset, offset + limit - 1)]:
+                if not _uncovered:
+                    if _cache_hits is not None:
+                        _cache_hits.append(filePath)
+                    if not quiet:
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "read",
+                                "summary": "cached-unchanged",
+                                "model": _main_name,
+                            }
+                        )
+                    return " ".join(
+                        [
+                            f"<path>{filePath}</path>",
+                            f"(unchanged: lines {offset}-{offset + limit - 1} were already",
+                            "returned earlier in this turn - reuse that result instead of re-reading)",
+                        ]
+                    )
+                if (
+                    not _cap_exempt
+                    and _read_lines_served(_chat_id or "", target) >= _READ_TURN_FILE_LINE_CAP
+                ):
+                    if not quiet:
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "read",
+                                "summary": "read-cap",
+                                "model": _main_name,
+                            }
+                        )
+                    return " ".join(
+                        [
+                            f"<path>{filePath}</path>",
+                            f"(read cap: ~{_READ_TURN_FILE_LINE_CAP} lines of this file were",
+                            "already served this turn - do NOT page the rest of the file.",
+                            "Reuse the windows already in this conversation; for anything",
+                            "else locate it with grep (path+include) or lsp_symbols, then",
+                            "read(symbols=[...]) the exact definitions in one call.)",
+                        ]
+                    )
+                _delta_parts: list[str] = []
+                for _us, _ue in _uncovered:
+                    try:
+                        _ex = await asyncio.to_thread(_read_lines_excerpt, target, _us, _ue - _us + 1)
+                    except Exception:  # noqa: BLE001, S112 - one bad interval never breaks read
+                        continue
+                    if _ex.get("error") or not _ex.get("lines"):
+                        continue
+                    _delta_parts.append("\n".join(f"{_r['line']} | {_r['text']}" for _r in _ex["lines"]))
+                    _note_read_range(_chat_id, target, _us, _ue)
+                if _delta_parts:
+                    try:
+                        _served_ranges = _READ_RANGES_BY_CHAT.get((_chat_id or "").strip(), {}).get(target) or []
+                        _served_desc = ", ".join(f"{_s}-{_e}" for _s, _e in sorted(_served_ranges)[:6])
+                    except Exception:  # noqa: BLE001 - note never breaks read
+                        _served_desc = ""
+                    _new_desc = ", ".join(f"{_s}-{_e}" for _s, _e in _uncovered)
+                    _body = "\n\n...\n".join(_delta_parts)
+                    _body += (
+                        f"\n\n({filePath}: serving only new lines {_new_desc}; "
+                        f"overlap already served this turn ({_served_desc}) is reused from earlier result - "
+                        "do not re-read it. Each separate read call costs a full round-trip: "
+                        "batch ALL remaining windows of this file in ONE read call with "
+                        "ranges=[\"path:start:count\", ...], never one window per step.)"
+                    )
+                    if not quiet:
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool": "read",
+                                "summary": f"{sum(_e - _s + 1 for _s, _e in _uncovered)} new lines",
+                                "model": _main_name,
+                                "results": [{"path": filePath, "content": _body[:8000]}],
+                            }
+                        )
+                    _raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{_body}\n</content>"
+                    try:
+                        if _chat_id:
+                            _READ_SEEN_BY_CHAT.setdefault(_chat_id, set()).add(cache_key)
+                    except Exception:  # noqa: BLE001, S110 - seen mark never breaks read
+                        pass
+                    try:
+                        _parent_search_cache[cache_key] = _raw
+                    except Exception:  # noqa: BLE001, S110 - cache never breaks a read
+                        pass
+                    return _raw
         # Block-snapped over-read: fetch up to _SNAP_LOOKAHEAD lines past the
         # requested limit (bulk reads >= 1000 lines are exempt — they already
         # cover whole regions) so the window can end on a block boundary
         # instead of mid-function. The byte cap still bounds total output.
         want = limit + _SNAP_LOOKAHEAD if limit < 1000 else limit
+        # Repeat-file prefetch (cross-step round-trip saver): a second window
+        # of the SAME file in the SAME turn means the model is paging one
+        # window per step. Extend this serve forward (bounded) so the next
+        # page arrives now instead of costing another full round-trip.
+        try:
+            _already = (_READ_RANGES_BY_CHAT.get((_chat_id or "").strip(), {}).get(target) or [])
+        except Exception:  # noqa: BLE001 - prefetch never breaks a read
+            _already = []
+        if _already and limit < 1000:
+            try:
+                _pref = int(_READ_PREFETCH_LINES)
+            except Exception:  # noqa: BLE001 - prefetch never breaks a read
+                _pref = 0
+            if _pref > 0:
+                try:
+                    _served_total = sum(e - s + 1 for s, e in _already)
+                except Exception:  # noqa: BLE001 - prefetch never breaks a read
+                    _served_total = 0
+                if _served_total < _READ_TURN_FILE_LINE_CAP:
+                    want = min(want + _pref, _served_total + want + _pref)
+                    want = min(want, limit + _SNAP_LOOKAHEAD + _pref)
 
         # Cold-miss fast path: serve file bytes directly with one streaming
         # read. No coalesce delay, no workspace scan, no LSP/symbol work.
@@ -6910,6 +7952,34 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     _htotal, _main_name, quiet, cache_key,
                 )
             # Small after all: fall through to the normal path below.
+        # Per-turn per-file served-line cap: past the cap, further windows
+        # of this file return a stub — the model should locate code with
+        # grep/lsp_symbols instead of paging a whole large file window by
+        # window. Symbol windows (_cap_exempt) always serve: they ARE the
+        # targeted lookup this stub points at.
+        if (
+            not _cap_exempt
+            and _read_lines_served(_chat_id or "", target) >= _READ_TURN_FILE_LINE_CAP
+        ):
+            if not quiet:
+                emit(
+                    {
+                        "kind": "tool_result",
+                        "tool": "read",
+                        "summary": "read-cap",
+                        "model": _main_name,
+                    }
+                )
+            return " ".join(
+                [
+                    f"<path>{filePath}</path>",
+                    f"(read cap: ~{_READ_TURN_FILE_LINE_CAP} lines of this file were",
+                    "already served this turn - do NOT page the rest of the file.",
+                    "Reuse the windows already in this conversation; for anything",
+                    "else locate it with grep (path+include) or lsp_symbols, then",
+                    "read(symbols=[...]) the exact definitions in one call.)",
+                ]
+            )
         # Small files come back whole from the offset: one read instead of
         # offset/limit paging across two or more round-trips. Larger files
         # snap to the first block boundary past the requested limit.
@@ -6926,26 +7996,54 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         body = "\n".join(f"{ln['line']} | {ln['text']}" for ln in lines)
         last = lines[-1]["line"]
         more = last < total
+        # Offset-read enrichment: enclosing symbol(s) with line ranges so
+        # the model knows which definition the window sits in (e.g. in
+        # read_tool L6963-7271). Best-effort via document_symbols_if_running
+        # which never starts a server and never breaks the read.
+        _read_enclosing = ""
+        try:
+            from lsp_manager import get_manager as _get_lsp_mgr_read
+            _read_mgr = _get_lsp_mgr_read(root)
+            _read_syms = await asyncio.to_thread(_read_mgr.document_symbols_if_running, target) or {}
+            if _read_syms:
+                _read_over: list[tuple[str, int, int]] = []
+                for _rn, _rv in _read_syms.items():
+                    try:
+                        _rsi, _rei = int(_rv[0]), int(_rv[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if _rei < start or _rsi > last:
+                        continue
+                    _read_over.append((_rn, _rsi, _rei))
+                if _read_over:
+                    _read_over.sort(key=lambda t: (t[1], t[2] - t[1]))
+                    _read_over = _read_over[:3]
+                    _read_enclosing = ", ".join(f"{_n} L{_s}-{_e}" for _n, _s, _e in _read_over)
+        except Exception:  # noqa: BLE001 - enrichment never breaks read
+            _read_enclosing = ""
         if quiet:
             # Batch member: one compact position marker. The batch call
             # carries the paging guidance once at the end, so per-block
             # guidance is not repeated for every file.
-            body += f"\n\n({filePath}: lines {start}-{last} of {total})"
+            body += f"\n\n({filePath}: lines {start}-{last} of {total}" + (f"; in {_read_enclosing}" if _read_enclosing else "") + ")"
         elif cut:
             body += (
                 f"\n\n(Output capped at {MAX_READ_EXCERPT_BYTES // 1024} KB. "
-                f"Showing lines {start}-{last}. Read the needed sections with "
-                f"symbols=[...] or ranges=[\"path:start:count\", ...] in one call.)"
+                f"Showing lines {start}-{last}."
+                + (f" In {_read_enclosing}." if _read_enclosing else "")
+                + " Read the needed sections with "
+                "symbols=[...] or ranges=[\"path:start:count\", ...] in one call.)"
             )
         elif more:
             body += (
-                f"\n\n(Showing lines {start}-{last} of {total}. "
-                f"Read all needed sections with symbols=[...] or "
-                f"ranges=[\"path:start:count\", ...] in one call, "
-                f"or locate them with grep first.)"
+                f"\n\n(Showing lines {start}-{last} of {total}."
+                + (f" In {_read_enclosing}." if _read_enclosing else "")
+                + " Read all needed sections with symbols=[...] or "
+                + "ranges=[\"path:start:count\", ...] in one call, "
+                + "or locate them with grep first.)"
             )
         else:
-            body += f"\n\n(End of file - total {total} lines)"
+            body += f"\n\n(End of file - total {total} lines" + (f"; in {_read_enclosing}" if _read_enclosing else "") + ")"
         if not quiet:
             emit(
                 {
@@ -6957,6 +8055,12 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 }
             )
         raw = f"<path>{filePath}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
+        try:
+            if _chat_id:
+                _READ_SEEN_BY_CHAT.setdefault(_chat_id, set()).add(cache_key)
+        except Exception:  # noqa: BLE001, S110 - seen mark never breaks read
+            pass
+        _note_read_range(_chat_id, target, start, last)
         _parent_search_cache[cache_key] = raw
         return raw
 
@@ -6968,13 +8072,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         ranges: list[str] | None = None,
         symbols: list[str] | None = None,
     ) -> str:
-        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from LSP or scoped glob/grep) — not to search for files. SCOPE: when SCOPE (ONLY THESE FILES) or the plan's Files are present, read ONLY those files via symbols=[...] or ranges=[...] — never scan the whole workspace blindly. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
+        """Read a file (verbatim code) or, if `filePath` is a directory, list its entries. `filePath` is workspace-relative. For FILES: `offset` is the 1-indexed line to start at (default 1) and `limit` caps the number of lines returned (default 2000) — page large files with offset/limit. For DIRECTORIES: lists entries one per line (subdirs marked with a trailing `/`), paged by offset/limit. Use AFTER you know the exact path (from LSP or targeted glob/grep) — not to search for files. You have full workspace access; read any workspace file via symbols=[...] or ranges=[...]. Runs on the MAIN model — contents are returned directly so the agent can read them itself.
 
-        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer).
+        BATCH: pass `filePaths` (a list of additional workspace-relative paths) to read multiple independent files in parallel — read several files in ONE call instead of one read_tool call per file — e.g. filePath="a.ts", filePaths=["a.test.ts", "a.stories.ts"] reads all three together, in parallel. offset/limit apply to every path in the batch equally; for a path that needs a DIFFERENT window, pass `ranges` (a list of "path:offset:limit" strings, e.g. ranges=["tools.py:3380:220", "agents.py:810:80"]) — every listed path is read with its own window in the SAME call. Shorthand forms "start:end" (an inclusive line range on the single file being read; "start:count" when count < start) and "[start,end]" are accepted too. Prefer batching related files (a component + its test + its types) instead of one call per file — same effect as firing several reads in parallel, but a single tool call. Avoid tiny repeated slices (e.g. 30-line chunks) — if you need more context, read a larger window (limit=300+) instead of paging 30 lines at a time; only narrow offset/limit when you truly need a small, specific region. Every read — single-file or multi-file — runs this same batch pipeline (one position marker per file, one guidance footer). Repeated lone single-window reads of one file in a turn are batch-gated from the 3rd call on — collect every window you still need and re-issue them as ONE ranges=[...] call.
 
 SYMBOLS: pass `symbols` (a list of function/class/method names, e.g. symbols=["DiffView", "parseSideBySide"]) to read those definitions from `filePath` in ONE call instead of guessing line numbers — names come from LSP. OMIT `filePath` and each name is looked up across the whole project: one definition is read directly (no grep needed); a name defined in several files returns the candidate list — then pass filePath. Each window snaps to its block end and small files (<=300 lines) come back whole, so no follow-up read is needed. `symbols` wins over offset/limit for `filePath`. `symbols` and `ranges` combine in the SAME call when you need both definitions and raw windows — never a ranges call plus a separate symbols call on the same file.
 
-WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. A head read (offset 1, limit 400+) of a file over 400 lines returns a FILE MAP (first 40 lines + definition list) instead of a bulk dump — read definitions via symbols=[...] in one call, never re-read the head for content. Make the FIRST read of a file decisive — never open with a narrow slice and page forward one window per step (read 1-200, then 217-350, …). When you need more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
+WINDOWS: every window is extended past the requested limit to its block end (closing bracket at column 0, max 40 extra lines) and files with <=300 lines are returned whole — a window never ends mid-function. A head read (offset 1, limit 400+) of a file over 400 lines returns a FILE MAP (first 40 lines + definition list) instead of a bulk dump — read definitions via symbols=[...] in one call, never re-read the head for content. Past ~3000 served lines of one file in a turn, further windows of it return a read-cap stub — locate with grep/lsp_symbols and read(symbols=[...]) instead of paging the whole file. Make the FIRST read of a file decisive — never open with a narrow slice and page forward one window per step (read 1-200, then 217-350, …). When you need more lines beyond the window, read all needed sections with `symbols=[...]` or `ranges=[...]` in ONE call, or locate them with grep first.
 
 When you need to read several files, read multiple independent files in parallel (pass them all in one call) rather than one at a time."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -6986,18 +8090,117 @@ When you need to read several files, read multiple independent files in parallel
         # jobs is a list (not a dict keyed by path) so repeated same-file ranges
         # (e.g. ["tools.py:640:60","tools.py:2089:80"]) both run.
         jobs: list[tuple[str, int, int]] = []
+        _bad_ranges: list[str] = []
+        # Live traces showed two off-spec forms the strict "path:offset:limit"
+        # parser silently dropped — each drop cost a full retry round
+        # (~25K tokens): "[start, end]" (a JSON-array window) and
+        # "offset:limit" with no path. Both now resolve against the
+        # single target file; anything still unparseable is REPORTED so
+        # the model corrects in one step instead of re-reading blind.
+        _range_target = str(filePath or "").strip() or (
+            filePaths[0] if len(filePaths) == 1 else ""
+        )
         for spec in ranges or []:
-            parts = str(spec).split(":")
+            if isinstance(spec, dict):
+                # Live trace (build mode): the model emitted JSON-object
+                # windows ({"start": 790, "end": 830}) instead of
+                # "path:start:count" strings; the strict parser dropped all
+                # of them and the retry round tripped the search budget.
+                # Accept the dict form against the single target file (or
+                # the dict's own path/filePath key), same as the other
+                # off-spec forms below.
+                _dp = str(spec.get("path") or spec.get("filePath") or "").strip()
+                _do = spec.get("start") if spec.get("start") is not None else spec.get("offset")
+                _de = spec.get("end")
+                _dl = spec.get("limit")
+                _tgt = _dp or _range_target
+                if _do is None or not str(_do).strip().isdigit() or not _tgt:
+                    _bad_ranges.append(json.dumps(spec, ensure_ascii=False))
+                    continue
+                _o = int(str(_do).strip())
+                if _de is not None and str(_de).strip().isdigit() and int(_de) >= _o:
+                    jobs.append((_tgt, _o, int(_de) - _o + 1))
+                elif _dl is not None and str(_dl).strip().isdigit() and int(_dl) > 0:
+                    jobs.append((_tgt, _o, int(_dl)))
+                else:
+                    _bad_ranges.append(json.dumps(spec, ensure_ascii=False))
+                continue
+            s = str(spec).strip()
+            m_pair = re.fullmatch(r"\[\s*(\d+)\s*,\s*(\d+)\s*\]", s)
+            if m_pair:
+                _o, _e = int(m_pair.group(1)), int(m_pair.group(2))
+                if _range_target and _e >= _o:
+                    jobs.append((_range_target, _o, _e - _o + 1))
+                else:
+                    _bad_ranges.append(s)
+                continue
+            parts = s.split(":")
+            if len(parts) == 2:
+                # Live traces show the model writes "start:end" (an inclusive
+                # line range, e.g. "3930:3985") far more often than
+                # "start:count". Disambiguate by order: end >= start means an
+                # inclusive range; count < start means offset:count.
+                if (
+                    _range_target
+                    and parts[0].strip().isdigit()
+                    and parts[1].strip().isdigit()
+                ):
+                    _a, _b = int(parts[0]), int(parts[1])
+                    if _b >= _a:
+                        jobs.append((_range_target, _a, _b - _a + 1))
+                    else:
+                        jobs.append((_range_target, _a, _b))
+                else:
+                    _bad_ranges.append(s)
+                continue
             if len(parts) != 3:
+                _bad_ranges.append(s)
                 continue
             p, o, l = parts[0].strip(), parts[1].strip(), parts[2].strip()
             if not p or not o.isdigit() or not l.isdigit():
+                _bad_ranges.append(s)
                 continue
             jobs.append((p, int(o), int(l)))
+        # Bare-path fallback (live trace): the model dropped the directory
+        # prefix ("tools.py" for "backend/tools.py") when every batch member
+        # lives in the same directory. Retry unresolvable range paths against
+        # the parent dirs of the known batch files before reporting missing.
+        if jobs:
+            _known_dirs: list[str] = []
+            for _kp in ([filePath] if str(filePath or "").strip() else []) + [
+                str(x) for x in (filePaths or []) if str(x).strip()
+            ]:
+                _kd = str(_kp).rsplit("/", 1)[0] if "/" in str(_kp) else ""
+                if _kd and _kd not in _known_dirs:
+                    _known_dirs.append(_kd)
+            for _ji, (_jp, _jo, _jl) in enumerate(jobs):
+                if _jp in (str(filePath or "").strip(), *(str(x) for x in (filePaths or []))):
+                    continue
+                if not _known_dirs:
+                    continue
+                try:
+                    resolve_safe(root, _jp, allow_coder=True, permit=permit)
+                    continue  # resolves fine as-is
+                except PathEscapeError:
+                    _bad_ranges.append(_jp)
+                    continue
+                except Exception:  # noqa: BLE001, S110 - probe only
+                    pass
+                for _kd in _known_dirs:
+                    _cand = f"{_kd}/{_jp}"
+                    try:
+                        resolve_safe(root, _cand, allow_coder=True, permit=permit)
+                        jobs[_ji] = (_cand, _jo, _jl)
+                        break
+                    except Exception:  # noqa: BLE001, S112 - probe only
+                        continue
         # `symbols=[...]` resolves to concrete windows on filePath via the
         # LSP manager — one call instead of guessing line numbers.
         _symbol_missing: list[str] = []
         _symbol_ambiguous: list[str] = []
+        # Paths whose windows came from symbols= resolution: targeted
+        # lookups stay exempt from the per-turn read cap.
+        _sym_paths: set[str] = set()
         if symbols and not str(filePath or "").strip() and not filePaths:
             # No filePath: look each name up across the project via the symbol
             # index. A unique definition becomes a window in ITS file (one
@@ -7046,6 +8249,7 @@ When you need to read several files, read multiple independent files in parallel
                     _symbol_missing.append(_nm)
                     continue
                 jobs.extend((_rel, _o, _l) for _o, _l in _w_hit)
+                _sym_paths.add(_rel)
             if not jobs:
                 _msg = "ERROR reading symbols=: "
                 if _symbol_ambiguous:
@@ -7077,6 +8281,7 @@ When you need to read several files, read multiple independent files in parallel
                     f"{', '.join(_symbol_missing)}. Use lsp_symbols or grep for exact names."
                 )
             jobs.extend((filePath, _o, _l) for _o, _l in _wins)
+            _sym_paths.add(filePath)
         base_paths = ([filePath] if str(filePath or "").strip() else []) + [
             p for p in (filePaths or []) if p and p != filePath
         ]
@@ -7108,6 +8313,10 @@ When you need to read several files, read multiple independent files in parallel
             _seen_tasks.add(_t)
             _uniq_tasks.append(_t)
         tasks = _uniq_tasks
+        # Window count BEFORE merging: two near windows of one file merge
+        # into one task, but the CALL was still a batch — the lone-read
+        # gate below judges the call, not the merged task list.
+        _pre_merge_windows = len(tasks)
         # Every requested window is served in full; re-reads re-serve.
         tasks = _widen_and_merge_windows(tasks)
         emit(
@@ -7124,6 +8333,42 @@ When you need to read several files, read multiple independent files in parallel
                 "model": _main_name,
             }
         )
+        # Same-turn lone-read batch gate: a 3rd+ single-window call on one
+        # file in one turn is the paging anti-pattern the user reported —
+        # one window per round-trip, each re-sending the whole context. The
+        # first two lone calls serve (the 2nd via the delta path); from the
+        # 3rd on, only a real batch (2+ windows in ONE call) serves.
+        _cid = (_chat_id or "").strip()
+        if _cid and _pre_merge_windows <= 1 and not symbols:
+            _gp = tasks[0][0]
+            try:
+                _gt = resolve_safe(root, _gp, allow_coder=True, permit=permit)
+                _lone_n = _READ_LONE_CALLS_BY_CHAT.get(_cid, {}).get(_gt, 0)
+                _gt_ok = os.path.isfile(_gt)
+            except Exception:  # noqa: BLE001 - gate never breaks read
+                _gt, _lone_n, _gt_ok = None, 0, False
+            if _gt is not None and _gt_ok:
+                if _lone_n >= 2:
+                    emit(
+                        {
+                            "kind": "tool_result",
+                            "tool": "read",
+                            "summary": "batch-gate",
+                            "model": _main_name,
+                        }
+                    )
+                    return " ".join(
+                        [
+                            f"<path>{_gp}</path>",
+                            f"(batch gate: {_gp} was already read {_lone_n}x this turn,",
+                            "one window per call. Each separate read call costs a full",
+                            "round-trip. Collect EVERY window you still need and re-issue",
+                            "ONE read call with ranges=[\"path:start:count\", ...] listing",
+                            "2+ windows (add a tiny second window if you need only one) —",
+                            "single-window repeats of this file stay stubbed this turn.)",
+                        ]
+                    )
+                _READ_LONE_CALLS_BY_CHAT.setdefault(_cid, {})[_gt] = _lone_n + 1
         # Read every target concurrently — same asyncio.gather pattern used for
         # parallel read-only tool calls elsewhere in the graph, just applied
         # WITHIN one tool call instead of across several parallel tool calls.
@@ -7139,7 +8384,8 @@ When you need to read several files, read multiple independent files in parallel
             *(
                 _read_target(p, o, l, _main_name, quiet=True,
                              allow_head_map=(p not in job_paths),
-                             _cache_hits=_cache_hit_paths)
+                             _cache_hits=_cache_hit_paths,
+                             _cap_exempt=(p in _sym_paths))
                 for p, o, l in tasks
             )
         )
@@ -7199,17 +8445,25 @@ When you need to read several files, read multiple independent files in parallel
                     " Files differ in size — use ranges=[\"path:start:count\", ...] "
                     "with a per-file window, not one shared offset/limit."
                 )
+            _ok_paths = list(dict.fromkeys(p for p, _ in _oks))
+            _total_paths = list(dict.fromkeys(p for p, _, _ in tasks))
             emit(
                 {
                     "kind": "tool_result",
                     "tool": "read",
-                    "summary": f"{len(_oks)}/{len(results)} files · missing: "
-                    + ", ".join(p for p, _ in _errs),
+                    "summary": f"{len(_ok_paths)}/{len(_total_paths)} files · missing: "
+                    + ", ".join(dict.fromkeys(p for p, _ in _errs)),
                     "model": _main_name,
-                    "results": [{"path": p} for p, _ in _oks],
+                    "results": [{"path": p} for p in _ok_paths],
                 }
             )
             _partial = "\n\n".join(r for _, r in _oks) + "\n\n" + _foot
+            if _bad_ranges:
+                _partial += (
+                    "\n\n(unparsed ranges ignored: "
+                    + ", ".join(_bad_ranges)
+                    + ")"
+                )
             return _partial
         if not _errs:
             # One assembly point for fresh and fully-cached serves: the cache
@@ -7220,6 +8474,13 @@ When you need to read several files, read multiple independent files in parallel
                 "\n\n(Batch complete — page further windows with "
                 "ranges=[\"path:start:count\", ...] in one call.)"
             )
+            if _bad_ranges:
+                _out += (
+                    "\n\n(unparsed ranges ignored: "
+                    + ", ".join(_bad_ranges)
+                    + ' — use "path:start:count", "start:count" for the'
+                    + " single file, or \"[start,end]\".)"
+                )
             if _symbol_missing:
                 _out += (
                     "\n\n(symbols not found: "
@@ -7244,19 +8505,22 @@ When you need to read several files, read multiple independent files in parallel
                     }
                 )
                 return _out
+            _unique_paths = list(dict.fromkeys(p for p, _, _ in tasks))
             emit(
                 {
                     "kind": "tool_result",
                     "tool": "read",
-                    "summary": f"{len(results)} file" + ("s" if len(results) != 1 else ""),
+                    "summary": f"{len(_unique_paths)} file" + ("s" if len(_unique_paths) != 1 else ""),
                     "model": _main_name,
                     # Single-file reads keep the old content preview on the
                     # card (used to come from the single branch's per-file
                     # event); multi-file batches stay path-only so one card
                     # can't balloon to N×8KB in the trace.
+                    # Same-file multi-window reads emit one entry per unique
+                    # path so RESULTS never lists the same file N times.
                     "results": [
-                        {"path": p, **({"content": r[:8000]} if len(results) == 1 else {})}
-                        for (p, _, _), r in zip(tasks, results)
+                        {"path": p, **({"content": results[0][:8000]} if len(results) == 1 else {})}
+                        for p in _unique_paths
                     ],
                 }
             )
@@ -7316,7 +8580,7 @@ When you need to read several files, read multiple independent files in parallel
     async def task_tool(
         description: str, prompt: str, subagent_type: str = "subagent", task_id: str = ""
     ) -> str:
-        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent runs in an isolated context with the parent's full tool set and returns a compact report. Use it for parallelizable work (independent implementation chunks) and multi-step delegated tasks (sub-agents NEVER run tests — the main agent runs all tests); launch several in parallel with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
+        """Delegate a task to the background sub-agent (opencode-style `task` tool). The sub-agent is a read-only researcher (search/read/web only — no edits, no terminal) running in an isolated context; it returns a compact report. Use it ONLY for several parallel chunks needing DIFFERENT research (sub-agents NEVER run tests — the main agent edits and runs all tests after merging reports); launch one task per chunk in ONE parallel block with different prompts. `description`: 3-5 word summary of the task (shown in the UI). `prompt`: the full task description. `subagent_type`: optional, defaults to 'subagent' (legacy 'general'/'explore' are accepted as aliases). `task_id`: optional, to resume a previous task (sessions are ephemeral — ignored)."""
         # --- opencode-style task tool dispatch ---
         # Assign the branch id up-front so the task card itself carries it; the
         # sub-agent's internal grep/glob/read events are tagged with the same
@@ -7607,8 +8871,11 @@ When you need to read several files, read multiple independent files in parallel
         _parent_tools = _PARENT_TOOLS_CTX.get()
         _tool_source = _parent_tools if _parent_tools is not None else _tools
         _reg_tools = agent_tools(subagent_type)
+        # Code guarantee (not just prompt): sub-agents are read-only
+        # researchers, even when the parent is coder. They report evidence;
+        # the main agent applies edits and runs tests.
         if _reg_tools is not None:
-            _allowed = set(_reg_tools)
+            _allowed = set(_reg_tools) - _SUBAGENT_STRIPPED_TOOLS
             _sub_tools = {
                 name: _sub_wrap(name, fn)
                 for name, fn in _tool_source.items()
@@ -7618,74 +8885,20 @@ When you need to read several files, read multiple independent files in parallel
             _sub_tools = {
                 name: _sub_wrap(name, fn)
                 for name, fn in _tool_source.items()
-                if name not in ("task", "update_plan", "vision")
+                if name not in ("task", "update_plan", "vision", *sorted(_SUBAGENT_STRIPPED_TOOLS))
             }
-        # Keep the background sub-agent from searching via the shell and from
-        # running tests: code search/inspection must go through grep/glob/read
-        # (slow + token-heavy via run_terminal), and all tests are run by the
-        # main agent after merging reports (single test authority avoids
-        # duplicate runs and conflicting results). The sub-agent inherits
-        # exactly the parent's mode-filtered toolset (plan/ask parents have no
-        # write tools to inherit), so coder parents can delegate implementation
-        # chunks fully — edits yes, tests no.
-        if resolve_agent(subagent_type) == "subagent" and "run_terminal" in _sub_tools:
-            _orig_terminal = _tool_source.get("run_terminal")
-
-            async def _readonly_terminal(
-                command: str, timeout: int = TERMINAL_TIMEOUT
-            ) -> str:
-                # The sub-agent must search via grep/glob/read, not by
-                # shelling out through run_terminal (slow + token-heavy).
-                # git working-tree inspection stays allowed (read-only).
-                # Tests are forbidden here: the main agent runs all tests
-                # after merging sub-agent reports.
-                _first = (
-                    command.strip().split()[0].lower()
-                    if command.strip().split()
-                    else ""
-                )
-                if _first != "git" and _is_terminal_search(command):
-                    return (
-                        "ERROR: code search/inspection via run_terminal is not "
-                        "allowed in the sub-agent — use grep/glob/read for "
-                        "targeted lookups batched in ONE call "
-                        "(patterns/paths/includes, filePaths, ranges+symbols)."
-                    )
-                if _SUBAGENT_NO_TEST_RE.search(command or ""):
-                    return (
-                        "ERROR: test runs are not allowed in the "
-                        "sub-agent — report files changed and let the main "
-                        "agent run all tests after merging reports."
-                    )
-                return await _orig_terminal(command=command, timeout=timeout)
-
-            _sub_tools["run_terminal"] = _readonly_terminal
-        # Delegation grants scope: file paths named in the task itself are
-        # auto-authorized for this sub-agent, so the user never attaches them.
-        _scope_ctx = None
-        _scope_token = None
-        try:
-            from agents import _TASK_EXTRA_SCOPE_CTX as _scope_ctx_mod
-
-            _scope_ctx = _scope_ctx_mod
-            _scope_combined = f"{description or ''}\n{prompt or ''}"
-            _scope_found: list[str] = []
-            for _scope_m in re.findall(
-                r"[\w./-]+\.(?:ts|tsx|js|jsx|py|css|scss|json|md|html|go|rs|rb|c|h|cpp|sql|sh)",
-                _scope_combined,
-            ):
-                _scope_q = str(_scope_m or "").strip().strip("`").lstrip("/")
-                while _scope_q.startswith("./"):
-                    _scope_q = _scope_q[2:]
-                _scope_q = _scope_q.lstrip("/")
-                if _scope_q and len(_scope_q) < 160 and _scope_q not in _scope_found:
-                    _scope_found.append(_scope_q)
-                if len(_scope_found) >= 20:
-                    break
-            if _scope_found:
-                _scope_token = _scope_ctx.set(frozenset(_scope_found))
-        except Exception:  # noqa: BLE001 — extra scope never breaks spawn
-            _scope_token = None
+        # Defense in depth: strip even if a future registry/parent set re-adds them.
+        for _stripped in _SUBAGENT_STRIPPED_TOOLS:
+            _sub_tools.pop(_stripped, None)
+        # Web research stays available: re-add from the full registry when the
+        # allowlist wants it but the mode-filtered parent dropped it.
+        for _web_tool in ("web_search", "fetch_url"):
+            if _web_tool in _allowed and _web_tool not in _sub_tools and _web_tool in _tools:
+                _sub_tools[_web_tool] = _sub_wrap(_web_tool, _tools[_web_tool])
+        # Sub-agents have no terminal at all: run_terminal is stripped above,
+        # so no shell search/test path exists to guard. Research uses
+        # grep/glob/read/LSP plus web_search/fetch_url; the main agent runs
+        # all tests after merging reports.
         _token = _SUB_AGENT_CTX.set(True)
         _branch_token = _SUB_AGENT_BRANCH_CTX.set(branch)
         _depth_token = _TASK_DEPTH_CTX.set(_TASK_DEPTH_CTX.get() + 1)
@@ -7732,8 +8945,8 @@ When you need to read several files, read multiple independent files in parallel
                     "user questions; do not call the task tool."
                 )
                 _sys += (
-                    "\n\nSEARCH DISCIPLINE: targeted search only — LSP first in coder mode, "
-                    "then ONE scoped grep, then symbols/ranges read only; NEVER "
+                    "\n\nSEARCH DISCIPLINE: targeted search only — LSP first in build mode, "
+                    "then ONE targeted grep, then symbols/ranges read only; NEVER "
                     "blind-scan. BATCH like the main agent: ONE grep via "
                     "patterns/paths/includes, ONE read via filePaths, ONE read via "
                     "ranges+symbols. NEVER run tests — report files changed and "
@@ -7834,11 +9047,6 @@ When you need to read several files, read multiple independent files in parallel
             # available — the note only suggests a cheaper retry, it never
             # claims direct search is unavailable.
             _tee_emit(_error_result("task", f"sub-agent failed: {_last_exc}"))
-            try:
-                if _scope_token is not None and _scope_ctx is not None:
-                    _scope_ctx.reset(_scope_token)
-            except Exception:  # noqa: BLE001, S110 — bookkeeping only
-                pass
             _SUB_AGENT_CTX.reset(_token)
             _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
             _TASK_DEPTH_CTX.reset(_depth_token)
@@ -7848,11 +9056,6 @@ When you need to read several files, read multiple independent files in parallel
             except Exception:  # noqa: BLE001, S110 — bookkeeping only
                 pass
             return _note
-        try:
-            if _scope_token is not None and _scope_ctx is not None:
-                _scope_ctx.reset(_scope_token)
-        except Exception:  # noqa: BLE001, S110 — bookkeeping only
-            pass
         _SUB_AGENT_CTX.reset(_token)
         _SUB_AGENT_BRANCH_CTX.reset(_branch_token)
         _TASK_DEPTH_CTX.reset(_depth_token)
@@ -8063,7 +9266,7 @@ When you need to read several files, read multiple independent files in parallel
         return f'<task id="{_tid}" state="completed">\n<task_result>\n{_output}\n</task_result>\n</task>'
 
     async def web_search_tool(query: str, max_results: int = 5) -> str:
-        """Search the web AND fetch the full page content of the top results (not just a snippet) before answering. Results are cached for 24h, so repeating the exact same query costs no extra call. If you need several searches, fire all `web_search` calls in the SAME turn (parallel tool calls) — combine alternatives with `foo|bar` to collapse several searches into one. Only reach for `fetch_url` afterward for a specific URL that wasn't among the top results."""
+        """Search the web AND fetch the full page content of the top results (not just a snippet) before answering. Results are cached for 24h, so repeating the exact same query costs no extra call. If you need several searches, fire all `web_search` calls in the SAME turn (parallel tool calls) — combine alternatives with `foo|bar` to collapse several searches into one. Only reach for `fetch_url` afterward for a specific URL that wasn't among the top results. NEVER use this tool when the user asks (in any language) to open/show/visit a site (e.g. 'open digikala') — those requests MUST use browser_navigate instead."""
         # The model that will distill the results: the web sub-agent, or the
         # MAIN model once this slot has fallen back earlier in the turn.
         _web_runner = main_model if _fallback_state.get("web") else web_model
@@ -8444,7 +9647,7 @@ When you need to read several files, read multiple independent files in parallel
     async def request_permission_tool(
         action: str, path: str = "", reason: str = ""
     ) -> str:
-        """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors come inline — never call this for them.) GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
+        """Request permission to read, search or act OUTSIDE the workspace root (e.g. ~/.config, /Users/..., $HOME, system paths). Call and WAIT BEFORE touching anything outside the project folder. (Skills/plans/MCP connectors come inline — never call this for them.) Also use it BEFORE installing any missing dependency (even workspace-local like `uv add`) — never just report 'not installed' and stop: ask, WAIT, then retry. GRANTED → proceed; DENIED → MUST NOT access — explain what you needed and why, then continue inside the workspace. `action` = short phrase like 'read config', 'run command'."""
         # Paths INSIDE the workspace root need no outside-workspace permission
         # prompt — the agent can read, search and act there freely. Auto-grant
         # so the UI never pops a needless dialog for in-workspace work; only
@@ -8502,6 +9705,22 @@ When you need to read several files, read multiple independent files in parallel
         finally:
             permission_gates.pop(pid, None)
         if granted:
+            try:
+                _low_perm_action = str(action or "").lower()
+                if "language server" in _low_perm_action:
+                    from lsp_manager import LANGUAGE_SERVERS as _perm_lang_servers
+                    from lsp_manager import grant_install_consent as _perm_grant_lsp
+
+                    for _perm_lang in _perm_lang_servers:
+                        if str(_perm_lang).lower() in _low_perm_action:
+                            _perm_grant_lsp(_perm_lang)
+            except Exception:  # noqa: BLE001, S110 - consent grant never breaks permission
+                pass
+            try:
+                if permit is not None and _is_install_action(action):
+                    permit["install"] = True
+            except Exception:  # noqa: BLE001, S110 - install flag never breaks permission
+                pass
             # مجوز per-folder: به‌جای باز کردن کل فضای بیرون از ریشه، فقط
             # پوشه‌ی درخواستی (نزدیک‌ترین والد موجودِ مسیر) به لیست پوشه‌های
             # مجاز اضافه می‌شود. پوشه‌های دیگر همچنان مجوز جداگانه می‌خواهند.
@@ -8559,6 +9778,22 @@ When you need to read several files, read multiple independent files in parallel
         finally:
             permission_gates.pop(pid, None)
         if granted:
+            try:
+                _low_action = str(action or "").lower()
+                if "language server" in _low_action:
+                    from lsp_manager import LANGUAGE_SERVERS as _lang_servers
+                    from lsp_manager import grant_install_consent as _grant_lsp
+
+                    for _lname in _lang_servers:
+                        if str(_lname).lower() in _low_action:
+                            _grant_lsp(_lname)
+            except Exception:  # noqa: BLE001, S110 - consent grant never breaks confirm
+                pass
+            try:
+                if permit is not None and _is_install_action(action):
+                    permit["install"] = True
+            except Exception:  # noqa: BLE001, S110 - install flag never breaks confirm
+                pass
             emit(
                 {
                     "kind": "tool_result",
@@ -9026,7 +10261,7 @@ When you need to read several files, read multiple independent files in parallel
     # Narrow, argument-validated git wrappers (no shell, list-argv subprocess
     # only — see git_tools.py). They bypass the terminal's git-write blacklist
     # on purpose: the model can commit without shelling out, and the mode
-    # filter (graph.filter_tools_for_mode) keeps git_commit coder-only.
+    # filter (graph.filter_tools_for_mode) keeps git_commit build-only.
     async def git_status_tool() -> str:
         """Show the git working-tree status: current branch and every modified/staged/untracked file. Use this before committing or when the user asks what changed."""
         emit({"kind": "tool", "tool": "git_status", "args": {}})
@@ -9804,7 +11039,9 @@ When you need to read several files, read multiple independent files in parallel
         Uses the lazily-started language server for the file type — no
         workspace scan. `line` is 1-based, `character` is 0-based. Pass
         `symbol` (identifier text on that line) to resolve the column from
-        the line text instead of guessing `character`.
+                the line text instead of guessing `character`; without a symbol the
+                column snaps to the nearest identifier on the line (keywords
+                skipped), so an approximate `character` still resolves.
         Returns `path:line:character` locations (small hit lists inline the definition body so no follow-up read is needed). Empty means the server
         answered with no locations (genuine miss); timeout/dead/missing are
         ERRORs with a precise next action, never a silent empty."""
@@ -9824,16 +11061,9 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_definition", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
-        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
-            from lsp_manager import get_manager as _get_lsp_mgr_def
-
-            hits = await asyncio.to_thread(
-                _get_lsp_mgr_def(root).definition,
-                target,
-                _line_no,
-                _char_no,
-            )
+            hits = await _lsp_call_with_wait(target, "definition", target, _line_no, _char_no)
         except Exception as exc:  # noqa: BLE001
             _lsp_announce_done(_lsp_lang, False)
             _msg = _lsp_error_text("lsp_definition", filePath, _line_no, _char_no, exc)
@@ -9933,10 +11163,13 @@ When you need to read several files, read multiple independent files in parallel
         Uses the lazily-started language server for the file type — no
         workspace scan. `line` is 1-based, `character` is 0-based. Pass
         `symbol` (identifier text on that line) to resolve the column from
-        the line text instead of guessing `character`.
+                the line text instead of guessing `character`; without a symbol the
+                column snaps to the nearest identifier on the line (keywords
+                skipped), so an approximate `character` still resolves.
         Timeout is an ERROR with retry (never "No references found"); empty
         means the server answered with no locations. At most 40 locations
-        are returned, grouped by file with a "+N more" footer."""
+        are returned, grouped by file with a "+N more" footer; each shown
+        hit carries its source line inline so no follow-up read is needed."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {
@@ -9953,16 +11186,9 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_references", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
-        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
-            from lsp_manager import get_manager as _get_lsp_mgr_ref
-
-            hits = await asyncio.to_thread(
-                _get_lsp_mgr_ref(root).references,
-                target,
-                _line_no,
-                _char_no,
-            )
+            hits = await _lsp_call_with_wait(target, "references", target, _line_no, _char_no)
         except Exception as exc:  # noqa: BLE001
             _lsp_announce_done(_lsp_lang, False)
             _msg = _lsp_error_text("lsp_references", filePath, _line_no, _char_no, exc)
@@ -9992,9 +11218,26 @@ When you need to read several files, read multiple independent files in parallel
                 "model": _main_name,
             }
         )
-        _out = "\n".join(
-            f"{h.get('path')}:{h.get('line')}:{h.get('character', 0)}" for h in _shown_hits
-        )
+        # Inline each shown hit's source line so the model can verify the
+        # call sites WITHOUT a follow-up read per file — every saved read is
+        # a saved LLM round-trip (each request re-sends the whole context).
+        _ref_rows: list[str] = []
+        for _h in _shown_hits[:_LSP_REF_INLINE_CAP]:
+            _line_txt = ""
+            try:
+                _h_abs = os.path.join(root, str(_h.get("path") or ""))
+                _ex = await asyncio.to_thread(
+                    _read_lines_excerpt, _h_abs, int(_h.get("line") or 1), 1
+                )
+                if not _ex.get("error") and _ex.get("lines"):
+                    _line_txt = str(_ex["lines"][0].get("text") or "").strip()
+            except Exception:  # noqa: BLE001 - inline text is best-effort
+                _line_txt = ""
+            _row = f"{_h.get('path')}:{_h.get('line')}:{_h.get('character', 0)}"
+            if _line_txt:
+                _row += f"  |  {_line_txt[:_LSP_REF_INLINE_MAX_CHARS]}"
+            _ref_rows.append(_row)
+        _out = "\n".join(_ref_rows)
         if _hidden_n > 0:
             _groups = ", ".join(f"{p} ({len(v)})" for p, v in sorted(_by_file.items())[:8])
             _out += (
@@ -10009,7 +11252,9 @@ When you need to read several files, read multiple independent files in parallel
         Uses the lazily-started language server for the file type — no
         workspace scan. `line` is 1-based, `character` is 0-based. Pass
         `symbol` (identifier text on that line) to resolve the column from
-        the line text instead of guessing `character`."""
+                the line text instead of guessing `character`; without a symbol the
+                column snaps to the nearest identifier on the line (keywords
+                skipped), so an approximate `character` still resolves."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {
@@ -10026,16 +11271,9 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_hover", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
-        _line_no, _char_no = _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
+        _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
-            from lsp_manager import get_manager as _get_lsp_mgr_hover
-
-            text = await asyncio.to_thread(
-                _get_lsp_mgr_hover(root).hover,
-                target,
-                _line_no,
-                _char_no,
-            )
+            text = await _lsp_call_with_wait(target, "hover", target, _line_no, _char_no)
         except Exception as exc:  # noqa: BLE001
             _lsp_announce_done(_lsp_lang, False)
             _msg = _lsp_error_text("lsp_hover", filePath, _line_no, _char_no, exc)
@@ -10062,20 +11300,23 @@ When you need to read several files, read multiple independent files in parallel
         )
         return text
 
-    async def lsp_symbols_tool(filePath: str) -> str:
+    async def lsp_symbols_tool(filePath: str, query: str = "") -> str:
         """List definitions in one file via LSP document symbols.
 
         Uses the lazily-started language server for the file type — no
-        workspace scan. Returns `- kind name (Lstart-end)` lines. When the
-        server binary is missing it is installed automatically on first
-        use — WAIT for the install (retry this same call) instead of
-        searching files without LSP."""
+        workspace scan. Returns `- kind name (Lstart-end)` lines. Pass
+        `query` (case-insensitive name substring) to filter: big files
+        return at most 400 rows plus a `(+N more)` footer, so re-call with
+        a query instead of paging the whole list. When the server binary
+        is missing it is installed automatically on first use — WAIT for
+        the install (retry this same call) instead of searching files
+        without LSP."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
         emit(
             {
                 "kind": "tool",
                 "tool": "lsp_symbols",
-                "args": {"filePath": filePath},
+                "args": {"filePath": filePath, "query": query},
                 "model": _main_name,
             }
         )
@@ -10087,11 +11328,7 @@ When you need to read several files, read multiple independent files in parallel
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
         try:
-            from lsp_manager import get_manager as _get_lsp_mgr_sym
-
-            syms = await asyncio.to_thread(
-                _get_lsp_mgr_sym(root).document_symbols, target
-            )
+            syms = await _lsp_call_with_wait(target, "document_symbols", target)
         except Exception as exc:  # noqa: BLE001
             _lsp_announce_done(_lsp_lang, False)
             _msg = _lsp_error_text("lsp_symbols", filePath, 1, 0, exc)
@@ -10126,15 +11363,36 @@ When you need to read several files, read multiple independent files in parallel
                 f"(server answered empty - try grep scoped to the file for exact names.)"
             )
         rows = sorted(syms.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+        _want = str(query or "").strip().lower()
+        if _want:
+            rows = [(n, v) for n, v in rows if _want in str(n).lower()]
+        _total = len(rows)
+        _shown = rows[:_LSP_SYMBOLS_CAP]
+        _hidden = _total - len(_shown)
+        _label = f" matching {query!r}" if _want else ""
         emit(
             {
                 "kind": "tool_result",
                 "tool": "lsp_symbols",
-                "summary": f"{len(rows)} symbol(s)",
+                "summary": f"{_total} symbol(s){_label}",
                 "model": _main_name,
             }
         )
-        return "\n".join(f"- {kind} {name} (L{start}-{end})" for name, (start, end, kind) in rows)
+        if not _shown:
+            return (
+                f"No symbols matching {query!r} in {filePath} "
+                f"(file has {len(syms)} symbols). Re-call without query, or "
+                f"grep scoped to this file for the exact name."
+            )
+        _out = "\n".join(
+            f"- {kind} {name} (L{start}-{end})" for name, (start, end, kind) in _shown
+        )
+        if _hidden > 0:
+            _out += (
+                f"\n(+{_hidden} more symbols not shown — re-call with query= "
+                f"to filter by name substring.)"
+            )
+        return _out
 
     async def lsp_diagnostics_tool(filePath: str) -> str:
         """Diagnostics for one file via LSP (pull, else last pushed batch).
@@ -10161,11 +11419,7 @@ When you need to read several files, read multiple independent files in parallel
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
         try:
-            from lsp_manager import get_manager as _get_lsp_mgr_diag
-
-            diags = await asyncio.to_thread(
-                _get_lsp_mgr_diag(root).diagnostics, target
-            )
+            diags = await _lsp_call_with_wait(target, "diagnostics", target)
         except Exception as exc:  # noqa: BLE001
             _lsp_announce_done(_lsp_lang, False)
             _msg = _lsp_error_text("lsp_diagnostics", filePath, 1, 0, exc)

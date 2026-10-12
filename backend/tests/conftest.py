@@ -184,7 +184,7 @@ def run_events(mock_server, workspace):
     """Factory: run the REAL agent against the mock and collect its events."""
     base, _mock = mock_server
 
-    async def _run(prompt, *, history=None, subagent_models=None, mode="coder",
+    async def _run(prompt, *, history=None, subagent_models=None, mode="build",
                    chat_id=None, **kw):
         # Unique chat_id per call by default so state_db (saved plans, turn
         # resume) cannot leak across tests. Tests that need a STABLE chat_id

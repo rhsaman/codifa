@@ -1,10 +1,10 @@
 // Strip a stray mode tag the model may echo at the very start of its reply.
 //
 // Some models learned (from older history that carried mode markers) to prefix
-// their answer with a mode tag such as ``[Mode: Coder]`` or ``<!-- mode:ask -->``
+// their answer with a mode tag such as ``[Mode: Build]`` or ``<!-- mode:ask -->``
 // even though the authoritative mode is already declared by the system prompt
 // (``=== CURRENT MODE: … ===``). We strip BOTH formats for ALL modes
-// (ask/plan/coder/reader) so the button and the chat text never disagree.
+// (ask/plan/build/reader) so the button and the chat text never disagree.
 //
 // Only strip on the FIRST chunk (prev === "") so we never touch real content
 // that arrives mid-stream.

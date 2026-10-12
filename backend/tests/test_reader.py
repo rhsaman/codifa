@@ -1,5 +1,5 @@
-"""Reader agent: routes explicitly-specified files (attachment / open Neovim
-file / a named file in the message) to a dedicated read-only agent that reads
+"""Reader agent: routes explicitly-specified files (attachment /
+a named file in the message) to a dedicated read-only agent that reads
 ONLY the needed parts -- deterministically, with NO repo-wide glob/grep and NO
 extra LLM calls (the answer is a single LLM call, like Explore's final step).
 
@@ -52,16 +52,6 @@ def test_route_reader_for_attachment(tmp_path):
     assert (
         _route_ask_entry(
             {"request": "explain this", "attachments": ["backend/graph.py"], "root": root}
-        )
-        == "reader"
-    )
-
-
-def test_route_reader_for_nvim(tmp_path):
-    root = _repo(tmp_path)
-    assert (
-        _route_ask_entry(
-            {"request": "explain this", "nvim_file": "backend/graph.py", "root": root}
         )
         == "reader"
     )
@@ -565,9 +555,83 @@ async def test_read_ranges_same_file_two_windows(tmp_path):
     assert "14 | line14" in out
     assert "30 | line30" in out
     assert "34 | line34" in out
-    # مرزهای هر بازه رعایت شده‌اند.
-    assert "15 | line15" not in out
-    assert "35 | line35" not in out
+    # مرزهای هر بازه رعایت شده‌اند (snap ممکن است چند خط مرزی اضافه کند).
+    assert "9 | line9" not in out
+    assert "40 | line40" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_partial_overlap_serves_only_new_lines_tracked2(tmp_path):
+    """Same file, overlapping windows, same turn: only NEW lines served.
+
+    Regression for the user's report: one file read several times with
+    different ranges (e.g. 1-200 then 150-350) re-sent the overlap every
+    time. Now the second read serves only the uncovered delta and points
+    at the earlier result for the overlap — no byte is re-sent."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 401)))
+    root = str(tmp_path)
+    cbs = tools.make_tool_callbacks(root, lambda event: None, chat_id="overlap-read-chat")
+    read = cbs["read"]
+    first = await read(filePath="a.py", offset=1, limit=200)
+    assert "1 | line1" in first
+    assert "200 | line200" in first
+    second = await read(filePath="a.py", offset=150, limit=200)
+    # New tail served, overlap NOT re-sent.
+    assert "201 | line201" in second
+    assert "349 | line349" in second
+    assert "150 | line150" not in second
+    assert "new lines 201-349" in second
+    assert "overlap already served this turn" in second
+    # Fully-covered lone re-read (3rd lone call this turn) hits the batch
+    # gate first — still no content re-sent, plus the batching instruction.
+    third = await read(filePath="a.py", offset=10, limit=20)
+    assert "batch gate" in third
+    assert "10 | line10" not in third
+
+
+@pytest.mark.asyncio
+async def test_read_batch_gate_blocks_third_single_window(tmp_path):
+    """3rd single-window read of a same-turn file returns a batch-gate stub.
+
+    The user's trace showed the model paging one window per round-trip.
+    The gate forces batching: only batch calls (filePaths/ranges/symbols)
+    may keep reading the file; a lone repeat read is stubbed with the
+    batching instruction."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 1001)))
+    root = str(tmp_path)
+    cbs = tools.make_tool_callbacks(root, lambda event: None, chat_id="batch-gate-chat")
+    read = cbs["read"]
+    first = await read(filePath="a.py", offset=1, limit=100)
+    assert "1 | line1" in first
+    assert "batch gate" not in first
+    second = await read(filePath="a.py", offset=400, limit=100)
+    assert "batch gate" not in second
+    assert "400 | line400" in second
+    # Third single-window read: gated, demands batching.
+    third = await read(filePath="a.py", offset=800, limit=50)
+    assert "batch gate" in third
+    assert "800 | line800" not in third
+    # A lone single-range re-issue stays gated (still one window per call).
+    lone = await read(filePath="a.py", ranges=["a.py:800:50"])
+    assert "batch gate" in lone
+    assert "800 | line800" not in lone
+    # A real batch (2+ windows in ONE call) passes the gate and serves.
+    fourth = await read(filePath="a.py", ranges=["a.py:800:50", "a.py:1:5"])
+    assert "800 | line800" in fourth
+
+
+@pytest.mark.asyncio
+async def test_read_uncovered_intervals_math():
+    """Unit: uncovered-interval subtraction over served ranges."""
+    from tools import _note_read_range, _read_uncovered_intervals
+
+    cid = "overlap-math-chat"
+    tools._READ_RANGES_BY_CHAT.pop(cid, None)
+    _note_read_range(cid, "/abs/a.py", 1, 200)
+    assert _read_uncovered_intervals(cid, "/abs/a.py", 150, 349) == [(201, 349)]
+    assert _read_uncovered_intervals(cid, "/abs/a.py", 10, 20) == []
+    assert _read_uncovered_intervals(cid, "/abs/a.py", 1, 500) == [(201, 500)]
+    tools._READ_RANGES_BY_CHAT.pop(cid, None)
 
 
 @pytest.mark.asyncio
@@ -697,6 +761,125 @@ def test_edit_file_batch_tolerant_second_edit(tmp_path):
     assert res.get("ok"), res
     assert res["edits_applied"] == 2
     assert (tmp_path / "b.py").read_text() == "ONE\nTWO\nthree\n"
+
+
+def test_edit_file_batch_call_level_replace_all(tmp_path):
+    """Regression: the call-level replace_all flag was silently ignored for
+    batch edits (only the per-item flag was read), so a multi-occurrence
+    old_string failed with 'not unique' even with replace_all=true set on
+    the call itself."""
+    (tmp_path / "a.py").write_text("dup\nmid\ndup\n")
+    res = tools.edit_file_batch(
+        str(tmp_path),
+        "a.py",
+        [{"old_string": "dup", "new_string": "UNIQ"}],
+        replace_all=True,
+    )
+    assert res.get("ok"), res
+    assert res["occurrences"] == 2
+    assert (tmp_path / "a.py").read_text() == "UNIQ\nmid\nUNIQ\n"
+
+
+# Entity sequences are built at RUNTIME (never written literally in this
+# source file): the tool-call pipeline HTML-decodes literal '&...;'
+# sequences inside string arguments before they reach the file, which
+# silently turned earlier versions of these tests into no-op byte matches.
+_AMP = "&" + "amp;"      # decodes to '&'
+_AMP_NUM = "&#" + "38;"   # numeric reference, decodes to '&'
+
+
+@pytest.mark.parametrize(
+    "file_text,old_string,new_string,expected",
+    [
+        # File holds the RAW '&' but the model copied the entity from rendered
+        # HTML output (browser tool / fetch_url) — the exact agent-reported
+        # failure where a whole 4-edit batch rolled back over one '&'.
+        (
+            'const q = "a&b";\nconst r = 2;\n',
+            f'const q = "a{_AMP}b";\nconst r = 2;',
+            'const q = "a&b";\nconst r = 3;',
+            'const q = "a&b";\nconst r = 3;\n',
+        ),
+        # Opposite direction: the file holds the entity (HTML/JSX source)
+        # and the model typed the decoded character.
+        (
+            f'<p>a{_AMP}b</p>\n',
+            "<p>a&b</p>",
+            "<p>NEW</p>",
+            "<p>NEW</p>\n",
+        ),
+        # Numeric references decode the same way.
+        (
+            'x = "a&b"\n',
+            f'x = "a{_AMP_NUM}b"',
+            'x = "c&d"',
+            'x = "c&d"\n',
+        ),
+        # A needle ENDING on the decoded char must splice the WHOLE entity
+        # reference out of the file (no dangling 'amp;' tail left behind).
+        (
+            f'<p>a{_AMP}b</p>\n',
+            "<p>a&",
+            "<p>NEW",
+            "<p>NEWb</p>\n",
+        ),
+    ],
+)
+def test_edit_file_tolerant_html_entities(tmp_path, file_text, old_string, new_string, expected):
+    """old_string copied from rendered HTML (entities vs raw chars) must
+    still edit instead of failing with 'old_string not found'."""
+    (tmp_path / "a.py").write_text(file_text)
+    res = tools.edit_file(str(tmp_path), "a.py", old_string, new_string)
+    assert res.get("ok"), res
+    assert (tmp_path / "a.py").read_text() == expected
+
+
+def test_edit_file_batch_entity_mismatch_does_not_rollback(tmp_path):
+    """Regression: one entity-mismatched edit in a batch must not fail the
+    whole atomic batch — the other edits must still apply."""
+    (tmp_path / "b.py").write_text(f"one\nconst q = \"a{_AMP}b\";\nthree\n")
+    res = tools.edit_file_batch(
+        str(tmp_path),
+        "b.py",
+        [
+            {"old_string": "one", "new_string": "ONE"},
+            {"old_string": f'const q = "a{_AMP}b";', "new_string": 'const q = "a&b";'},
+            {"old_string": "three", "new_string": "THREE"},
+        ],
+    )
+    assert res.get("ok"), res
+    assert res["edits_applied"] == 3
+    assert (tmp_path / "b.py").read_text() == 'ONE\nconst q = "a&b";\nTHREE\n'
+
+
+def test_edit_file_batch_item_flag_overrides_call_level(tmp_path):
+    """An explicit per-item replace_all=False overrides a call-level True and
+    still surfaces the not-unique error for that item (atomic: no write)."""
+    (tmp_path / "a.py").write_text("dup\nmid\ndup\n")
+    res = tools.edit_file_batch(
+        str(tmp_path),
+        "a.py",
+        [{"old_string": "dup", "new_string": "UNIQ", "replace_all": False}],
+        replace_all=True,
+    )
+    assert "error" in res and "not unique" in res["error"], res
+    assert (tmp_path / "a.py").read_text() == "dup\nmid\ndup\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_file_tool_forwards_call_level_replace_all_to_batch(tmp_path):
+    """The tool wrapper must forward its own replace_all to edit_file_batch —
+    the exact bug that made the model hit 'not unique' six times in a row
+    while already passing replace_all=true on the call."""
+    (tmp_path / "a.py").write_text("dup\nmid\ndup\n")
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda event: None)
+    out = await cbs["edit_file"](
+        path="a.py",
+        edits=[{"old_string": "dup", "new_string": "UNIQ"}],
+        replace_all=True,
+    )
+    assert "Successfully edited" in out, out
+    assert (tmp_path / "a.py").read_text() == "UNIQ\nmid\nUNIQ\n"
 
 
 @pytest.mark.parametrize(
@@ -926,4 +1109,50 @@ async def test_read_symbols_missing(tmp_path):
     read, _ = _make_read(root)
     out = await read(filePath="m.py", symbols=["nope"])
     assert out.startswith("ERROR")
-    assert "nope" in out
+
+
+def _make_tracked_read(root, chat_id):
+    """Build the real `read` tool with range tracking enabled (needs chat_id)."""
+    captured = []
+    cbs = tools.make_tool_callbacks(root, captured.append, chat_id=chat_id)
+    return cbs["read"], captured
+
+
+@pytest.mark.asyncio
+async def test_read_partial_overlap_serves_only_new_lines(tmp_path):
+    """Shifted re-read of one file serves only new lines, not the overlap."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
+    read, _ = _make_tracked_read(str(tmp_path), "re-read-partial")
+    r1 = await read(filePath="a.py", offset=1, limit=200)
+    assert "1 | line1" in r1
+    assert "200 | line200" in r1
+    r2 = await read(filePath="a.py", offset=150, limit=200)
+    assert "150 | line150" not in r2
+    assert "201 | line201" in r2
+    assert "349 | line349" in r2
+    assert "new lines" in r2
+
+
+@pytest.mark.asyncio
+async def test_read_shifted_window_bridges_small_gap(tmp_path):
+    """A shifted re-read with a small unserved sliver fetches the sliver too."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
+    read, _ = _make_tracked_read(str(tmp_path), "re-read-bridge")
+    await read(filePath="a.py", offset=1, limit=200)
+    r2 = await read(filePath="a.py", offset=250, limit=150)
+    assert "201 | line201" in r2
+    assert "249 | line249" in r2
+    assert "399 | line399" in r2
+    assert "1 | line1" not in r2
+
+
+@pytest.mark.asyncio
+async def test_read_batch_bridges_nearby_windows(tmp_path):
+    """Nearby ranges= windows of one file in ONE call merge into one fetch."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
+    read, _ = _make_tracked_read(str(tmp_path), "re-read-batch")
+    out = await read(filePath="a.py", ranges=["a.py:1:50", "a.py:100:50"])
+    assert "1 | line1" in out
+    assert "75 | line75" in out
+    assert "149 | line149" in out
+    assert "Batch complete" in out

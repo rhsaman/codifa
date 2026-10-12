@@ -77,7 +77,7 @@ class EvalTask:
     prompt: str
     files: dict[str, str] = field(default_factory=dict)
     checks: list[Check] = field(default_factory=list)
-    mode: str = "coder"
+    mode: str = "build"
     timeout: float = 600.0
     mock_script: list[list[dict] | None] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)

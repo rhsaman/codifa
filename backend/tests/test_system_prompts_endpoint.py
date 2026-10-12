@@ -1,6 +1,6 @@
 """تست endpoint: GET /system-prompts
 
-فرانت با کلیدهای canonical مودها (`ask`, `coder`, `plan`) دنبال پرامپت
+فرانت با کلیدهای canonical مودها (`ask`, `build`, `plan`) دنبال پرامپت
 سیستم می‌گردد؛ اندپوینت باید هم این کلیدها و هم aliasهای قدیمی
 (`chat`, `codewriter`) را برگرداند تا ردیف System prompt در پاپ‌اور
 Context windows صفر نماند.
@@ -39,3 +39,13 @@ def test_system_prompts_includes_legacy_aliases():
     for alias, canonical in MODE_ALIASES.items():
         assert alias in data, f"legacy alias {alias!r} missing"
         assert data[alias] == SYSTEM_PROMPTS[canonical]
+
+
+def test_build_prompt_contains_structure_rules():
+    """Lock the build system-prompt structure rules."""
+    client = TestClient(server.app)
+    data = client.get("/system-prompts").json()
+    text = data["build"].lower()
+    assert "read the project structure" in text
+    assert "single responsibility" in text
+    assert "early exit" in text

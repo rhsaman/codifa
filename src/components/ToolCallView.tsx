@@ -559,9 +559,27 @@ export const FileResultLinks = memo(function FileResultLinks({
   items: Array<Record<string, unknown>>;
 }) {
   if (!items || items.length === 0) return null;
+  // Dedupe identical entries (same file + line + text). A read with several
+  // ranges on one file emits one result per window, so without this the list
+  // shows the same path N times. Distinct lines (grep hits) keep their own
+  // rows since the line/text part of the key differs.
+  const seen = new Set<string>();
+  const deduped: Array<Record<string, unknown>> = [];
+  for (const it of items) {
+    const file = String(it.file ?? it.path ?? "");
+    if (!file) continue;
+    const line =
+      it.line !== undefined && it.line !== null ? String(it.line) : "";
+    const text = String(it.text ?? "");
+    const key = `${file}\0${line}\0${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(it);
+  }
+  if (deduped.length === 0) return null;
   const VISIBLE = 3;
-  const visible = items.slice(0, VISIBLE);
-  const extra = items.length - visible.length;
+  const visible = deduped.slice(0, VISIBLE);
+  const extra = deduped.length - visible.length;
   return (
     <ul className="file-results" dir="ltr">
       {visible.map((it, i) => {
@@ -595,7 +613,7 @@ export const FileResultLinks = memo(function FileResultLinks({
                   // Markdown list so the side panel renders every path as a
                   // clickable file chip (inline `code` -> FileChip) instead of
                   // a wall of raw text.
-                  items
+                  deduped
                     .map((it) => {
                       const f = String(it.file ?? it.path ?? "");
                       const ln = it.line != null ? `:${String(it.line)}` : "";

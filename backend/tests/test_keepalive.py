@@ -9,7 +9,9 @@ any network, server, or LLM.
 """
 import asyncio
 
-from server import _with_keepalive
+import pytest
+
+from server import _ModelSilenceTimeout, _with_keepalive
 
 
 async def _silent_gen(delay: float, events):
@@ -69,3 +71,85 @@ async def test_empty_generator_yields_nothing():
     gen = _with_keepalive(_silent_gen(0.0, []), timeout=0.01)
     collected = [e async for e in gen]
     assert collected == []
+
+
+async def test_silence_cap_closes_stream_with_exception():
+    """Past `max_silence` of continuous silence the wrapper raises
+    `_ModelSilenceTimeout` instead of keepaliving forever, so the stream is
+    torn down and the frontend can auto-resume from its checkpoint."""
+    gen = _with_keepalive(
+        _silent_gen(0.2, [{"kind": "token", "content": "a"}]),
+        timeout=0.01,
+        max_silence=0.05,
+    )
+    with pytest.raises(_ModelSilenceTimeout):
+        async for _ in gen:
+            pass
+
+
+async def test_silence_cap_suspended_while_paused():
+    """`is_paused` suspends the cap: waiting on a permission/ask gate is
+    legitimate silence (the user can take arbitrarily long), so keepalives
+    keep flowing and no exception fires."""
+    gen = _with_keepalive(
+        _silent_gen(0.08, [{"kind": "token", "content": "a"}]),
+        timeout=0.01,
+        max_silence=0.05,
+        is_paused=lambda: True,
+    )
+    collected = [e async for e in gen]
+    assert collected[0] == {"kind": "_keepalive"}
+    assert collected[-1] == {"kind": "token", "content": "a"}
+
+
+async def test_real_event_resets_silence_clock():
+    """A real event mid-stream resets the silence clock: several short gaps,
+    each under the cap, must NOT add up to a cap breach."""
+
+    async def gappy():
+        for _ in range(4):
+            await asyncio.sleep(0.03)
+            yield {"kind": "token", "content": "x"}
+
+    gen = _with_keepalive(gappy(), timeout=0.01, max_silence=0.06)
+    collected = [e async for e in gen]
+    kinds = [e.get("kind") for e in collected]
+    assert kinds.count("token") == 4
+
+
+async def test_silence_cap_not_counted_while_thinking():
+    """While the model's reasoning window is open (`thinking active:True`),
+    silence far beyond `max_silence` is legitimate thinking: keepalives keep
+    flowing, no `_ModelSilenceTimeout`, and the stream completes normally."""
+
+    async def thinking_then_long_silence():
+        yield {"kind": "thinking", "active": True}
+        await asyncio.sleep(0.2)  # 4x the cap
+        yield {"kind": "thinking", "active": False}
+        yield {"kind": "token", "content": "a"}
+
+    gen = _with_keepalive(
+        thinking_then_long_silence(), timeout=0.01, max_silence=0.05
+    )
+    collected = [e async for e in gen]
+    kinds = [e.get("kind") for e in collected]
+    assert "_keepalive" in kinds
+    assert collected[-1] == {"kind": "token", "content": "a"}
+
+
+async def test_silence_cap_applies_after_thinking_ends():
+    """Once thinking is closed (`active:False`), the old behaviour is kept: a
+    genuinely wedged stream (silence past the cap) still raises."""
+
+    async def thinking_closed_then_silence():
+        yield {"kind": "thinking", "active": True}
+        yield {"kind": "thinking", "active": False}
+        await asyncio.sleep(0.2)
+        yield {"kind": "token", "content": "a"}
+
+    gen = _with_keepalive(
+        thinking_closed_then_silence(), timeout=0.01, max_silence=0.05
+    )
+    with pytest.raises(_ModelSilenceTimeout):
+        async for _ in gen:
+            pass

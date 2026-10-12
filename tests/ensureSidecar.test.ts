@@ -119,9 +119,9 @@ console.log('۵) رویداد sidecar:dead از سمت Electron → کش پاک 
 console.log('۶) normalizeSystemPromptKeys: legacy backend keys → canonical mode ids:')
 {
   const { normalizeSystemPromptKeys } = await import('../src/lib/api')
-  const legacy = normalizeSystemPromptKeys({ chat: 'ask prompt', codewriter: 'coder prompt' })
+  const legacy = normalizeSystemPromptKeys({ chat: 'ask prompt', codewriter: 'build prompt' })
   check('chat maps to ask', legacy.ask === 'ask prompt', legacy)
-  check('codewriter maps to coder', legacy.coder === 'coder prompt', legacy)
+  check('codewriter maps to build', legacy.build === 'build prompt', legacy)
   check('legacy keys dropped', !('chat' in legacy) && !('codewriter' in legacy), legacy)
   const both = normalizeSystemPromptKeys({ ask: 'new prompt', chat: 'old prompt' })
   check('canonical key wins over legacy', both.ask === 'new prompt', both)

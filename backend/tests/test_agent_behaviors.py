@@ -39,7 +39,7 @@ async def test_agent_runs_tool_and_returns_result_to_model(run_events, mock_serv
         })),
         text_reply("Done. Created app.py."),
     ]
-    events = await run_events("create app.py with a foo function", mode="coder")
+    events = await run_events("create app.py with a foo function", mode="build")
     tool_results = [
         e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "write_file"
     ]
@@ -88,17 +88,17 @@ async def test_agent_surfaces_provider_failure(run_events, mock_server, monkeypa
     )
 
 
-async def test_coder_does_not_force_test_run_without_terminal(run_events, mock_server):
-    """Coder is implementation-only and has NO terminal (it MUST NOT run shell /
+async def test_build_does_not_force_test_run_without_terminal(run_events, mock_server):
+    """Build is implementation-only and has NO terminal (it MUST NOT run shell /
     tests — verification is Plan mode's job, which keeps a read-only terminal).
-    Therefore a test-related coder task that finishes without running any test
+    Therefore a test-related build task that finishes without running any test
     command must NOT trigger the forced run-and-see-green follow-up: there is no
     terminal to run on, so forcing would be dead code. This locks in the new
-    architecture (coder relies on Plan for verification)."""
+    architecture (build relies on Plan for verification)."""
     _base, mock = mock_server
     # The model replies immediately and never calls run_terminal (it can't — the
-    # coder toolset has no terminal). No forced test-verification follow-up may fire.
-    # (coder-without-plan runs the discovery pipeline first, hence the leading
+    # build toolset has no terminal). No forced test-verification follow-up may fire.
+    # (build-without-plan runs the discovery pipeline first, hence the leading
     # discovery stub.)
     mock.script = [text_reply("discovery"), text_reply("تمام شد.")]
     events = await run_events("تست بنویس برای پروژه")
@@ -106,14 +106,14 @@ async def test_coder_does_not_force_test_run_without_terminal(run_events, mock_s
     retries = [e for e in events if e.get("kind") == "retry"]
     assert not any(
         "test" in (e.get("reason") or "").lower() for e in retries
-    ), f"coder must not force a test run (no terminal): retries={retries}"
-    # Coder has NO terminal: it must never execute run_terminal, and it must not
+    ), f"build must not force a test run (no terminal): retries={retries}"
+    # Build has NO terminal: it must never execute run_terminal, and it must not
     # spawn a verification follow-up. (We assert behavior, not raw HTTP request
     # count — the langchain client can issue more than one wire request per turn.)
     assert not any(
         e.get("kind") == "tool" and e.get("tool") == "run_terminal" for e in events
-    ), "coder must not have a terminal to run tests on"
-    assert _text(events).strip(), "coder must still finish with a reply"
+    ), "build must not have a terminal to run tests on"
+    assert _text(events).strip(), "build must still finish with a reply"
 
 
 async def test_agent_skips_test_verification_when_tests_were_run(run_events, mock_server):
@@ -278,32 +278,32 @@ def test_plan_output_contract_requires_summary():
         "plan contract must require the summary in the plan's own language"
 
 
-def test_coder_output_contract_executes_plan_not_replans():
-    """Coder mode must EXECUTE an existing plan instead of emitting a new
+def test_build_output_contract_executes_plan_not_replans():
+    """Build mode must EXECUTE an existing plan instead of emitting a new
     '## Plan' document, revise it only on explicit request, and plan-then-
-    execute only when none exists — the 'coder wrote a plan instead of
+    execute only when none exists — the     'build wrote a plan instead of
     implementing' bug."""
     from agents import _MODE_OUTPUT, _mode_declare
 
-    contract = _MODE_OUTPUT["coder"]
-    assert contract, "coder must declare an output contract"
+    contract = _MODE_OUTPUT["build"]
+    assert contract, "build must declare an output contract"
     low = contract.lower()
     assert "## plan" in low, "contract must name the plan document form"
     assert "implement" in low or "execute" in low, "contract must demand doing the work"
     assert "only when the user" in low, "revision must be gated on an explicit ask"
     assert "no plan" in low, "contract must cover the plan-less case"
     # The contract ships inside the per-turn mode declaration.
-    assert contract in _mode_declare("coder")
+    assert contract in _mode_declare("build")
 
 
 def test_followup_edits_plan_and_never_restarts_it():
     """A follow-up request ('do X too') must EDIT the existing plan in BOTH plan
-    and coder mode — keep the old items, add the new one — and a fresh plan may
+    and build mode — keep the old items, add the new one — and a fresh plan may
     replace it ONLY on an explicit 'discard the old plan' instruction (the
     'follow-up wiped the previous plan' bug)."""
     from agents import _MODE_OUTPUT, _mode_declare
 
-    for mode in ("plan", "coder"):
+    for mode in ("plan", "build"):
         contract = _MODE_OUTPUT[mode]
         low = contract.lower()
         assert "only when the user explicitly" in low, (
@@ -315,12 +315,12 @@ def test_followup_edits_plan_and_never_restarts_it():
         assert contract in _mode_declare(mode), (
             f"{mode}: contract must ship in the per-turn mode declaration"
         )
-    assert "keep every existing item" in _MODE_OUTPUT["coder"].lower()
+    assert "keep every existing item" in _MODE_OUTPUT["build"].lower()
     assert "keep every still-valid item" in _MODE_OUTPUT["plan"].lower()
 
 
 async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace):
-    """The Coder must be told the exact frontend test command (e.g.
+    """The Build mode must be told the exact frontend test command (e.g.
     `npm run test:frontend`) for a JS/TS workspace so it runs the tests itself —
     the graph no longer runs an automatic test gate."""
     (workspace / "package.json").write_text(
@@ -329,29 +329,29 @@ async def test_agent_runs_frontend_test_gate(run_events, mock_server, workspace)
     )
     _base, mock = mock_server
     mock.script = [text_reply("done")]
-    await run_events("یک کامپوننت بنویس", mode="coder")
+    await run_events("یک کامپوننت بنویس", mode="build")
     # The test command must appear in the messages sent to the model (injected
-    # by detect_test_commands() into the Coder's test-verification prompt).
+    # by detect_test_commands() into the Build mode's test-verification prompt).
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
     joined = json.dumps(all_messages, ensure_ascii=False)
     assert "test:frontend" in joined, (
-        "coder must be instructed to run the frontend test command; "
+        "build must be instructed to run the frontend test command; "
         f"messages did not contain it: {joined[:500]}"
     )
 
 
 async def test_agent_runs_flutter_test_gate(run_events, mock_server, workspace):
-    """The Coder must be told to run `flutter test` for a Flutter project."""
+    """The Build mode must be told to run `flutter test` for a Flutter project."""
     (workspace / "pubspec.yaml").write_text(
         "name: demo\ndependencies:\n  flutter:\n", encoding="utf-8"
     )
     _base, mock = mock_server
     mock.script = [text_reply("done")]
-    await run_events("یک ویجت بنویس", mode="coder")
+    await run_events("یک ویجت بنویس", mode="build")
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
     joined = json.dumps(all_messages, ensure_ascii=False)
     assert "flutter test" in joined, (
-        "coder must be instructed to run flutter test; "
+        "build must be instructed to run flutter test; "
         f"messages did not contain it: {joined[:500]}"
     )
 
@@ -374,7 +374,7 @@ async def test_live_test_injects_live_rule_not_unit_tests(run_events, mock_serve
     """A live user-like test must inject LIVE TEST RULE and suppress the unit-test rule."""
     _base, mock = mock_server
     mock.script = [text_reply("done")]
-    await run_events("تست لایو انجام بده و مثل کاربر چک کن", mode="coder")
+    await run_events("تست لایو انجام بده و مثل کاربر چک کن", mode="build")
     all_messages = [m for body in mock.captured for m in body.get("messages", [])]
     joined = json.dumps(all_messages, ensure_ascii=False)
     assert "LIVE TEST RULE" in joined

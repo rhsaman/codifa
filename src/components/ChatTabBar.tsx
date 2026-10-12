@@ -6,6 +6,7 @@ import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "../lib/tabBar";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
+import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 
 function CloseIcon() {
   return (
@@ -212,6 +213,7 @@ export function ChatTabBar() {
   );
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
   // Keep the active tab visible when the bar overflows (many open tabs).
@@ -271,7 +273,7 @@ export function ChatTabBar() {
             role="tab"
             aria-selected={active}
             tabIndex={0}
-            draggable
+            draggable={editingId !== id}
             className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging" : ""}${dropCls}`}
             title={title}
             onClick={() => useStore.getState().openChat(id)}
@@ -340,7 +342,30 @@ export function ChatTabBar() {
               meta?.unread && (
                 <span className="editor-tab-dot unread" aria-hidden="true" />
               )}
-            <span className="editor-tab-label" dir={dir}>{title}</span>
+            {editingId === id ? (
+              <ChatRenameInput
+                initialValue={rawTitle === "New chat" ? "" : rawTitle}
+                dir={dir}
+                className="chat-rename-input editor-tab-rename-input"
+                ariaLabel={`Rename ${title}`}
+                onCommit={(v) => {
+                  useStore.getState().renameChat(id, normalizeRenameValue(v));
+                  setEditingId(null);
+                }}
+                onCancel={() => setEditingId(null)}
+              />
+            ) : (
+              <span
+                className="editor-tab-label"
+                dir={dir}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  setEditingId(id);
+                }}
+              >
+                {title}
+              </span>
+            )}
             <button
               type="button"
               className="editor-tab-close"

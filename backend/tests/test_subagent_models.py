@@ -4,9 +4,9 @@ Covers the fix: when a Settings -> Tools entry equals the parent (main)
 model -- either by name or via the "main model" literal -- the subagent must
 run on the main model -- NOT silently fall back to another slot's default.
 
-Slots: web / compact / vision. vision defaults to None; the others
-default to the parent (main) model. (The former "search" slot was removed:
-grep/glob/read/terminal-search now run on the main model directly.)
+Slots: web / compact / vision / decision. vision defaults to None; the
+others default to the parent (main) model. (The former "search" slot was
+removed: grep/glob/read/terminal-search now run on the main model directly.)
 
 Run: cd backend && uv run python -m pytest tests/test_subagent_models.py -q
 """
@@ -117,6 +117,21 @@ def test_web_compact_default_to_parent_when_unset():
     assert _name(web) == "main-model"
     assert _name(compact) == "main-model"
     assert vision is None
+
+
+def test_decision_slot_falls_back_to_parent():
+    # The decision (skill-router) slot falls back to the MAIN model when
+    # unset -- the compact slot is NOT consulted (that fallback was removed
+    # per the Settings -> Tools contract: empty = main model).
+    decision = resolve_subagent_model(PROVIDER, None, BASE, KEY, ENV, "main-model")
+    assert _name(decision) == "main-model"
+
+
+def test_decision_slot_uses_picked_model():
+    # A picked decision model (e.g. a tiny local router like Laya) resolves
+    # to that exact model, never to the parent.
+    decision = resolve_subagent_model(PROVIDER, "laya", BASE, KEY, ENV, "main-model")
+    assert _name(decision) == "laya"
 
 
 def test_provider_slash_model_strips_prefix():

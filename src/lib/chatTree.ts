@@ -42,9 +42,10 @@ export function clampSize(n: number): number {
 export const CHAT_WINDOW_MIN_W = 400
 export const CHAT_WINDOW_MIN_H = 320
 /** Soft cap for drag-created splits: beyond this every pane would drop below
- *  the minimum size, so edge drops stop splitting (center drops still swap).
- *  Explicit opens (new chat, sidebar/tab select) always add a window. */
-export const CHAT_WINDOW_MAX = 4
+ *  the minimum size, so edge drops stop splitting (center drops still
+ *  replace/swap). Explicit opens (new chat, sidebar/tab select) always add
+ *  a window. */
+export const CHAT_WINDOW_MAX = 6
 
 export function makeLeaf(chatId: string, size = 1, id?: string): ChatTreeLeaf {
   return { kind: 'leaf', id: id ?? nid('leaf'), chatId, size: clampSize(size) }
@@ -150,18 +151,12 @@ export function findParentOfChat(
   return findParent(node, leaf.id)
 }
 
-function collapse(node: ChatTreeNode): ChatTreeNode | null {
-  if (node.kind === 'leaf') return node
-  if (node.children.length === 0) return null
-  if (node.children.length === 1) {
-    const only = node.children[0]
-    // Preserve the outer size so sibling proportions survive the collapse.
-    return { ...only, size: clampSize(node.size) } as ChatTreeNode
-  }
-  return node
-}
-
-/** Remove a chat leaf; collapses single-child splits. Null when empty. */
+/** Remove a chat leaf. Null when empty.
+ *  Single-child splits are KEPT (never collapsed): collapsing would change
+ *  the React parent chain of every remaining window, unmounting and
+ *  remounting their ChatPanels on every minimize (the minimize lag). Keeping
+ *  the split wrapper preserves each remaining LeafView instance by key, so
+ *  minimizing only unmounts the minimized panel. */
 export function removeChat(
   node: ChatTreeNode | null,
   chatId: string,
@@ -176,7 +171,8 @@ export function removeChat(
     if (next !== c) changed = true
   }
   if (!changed) return node
-  return collapse({ ...node, children })
+  if (children.length === 0) return null
+  return { ...node, children }
 }
 
 /** Swap the chat ids of two visible leaves (center drop of a window). */
@@ -220,7 +216,12 @@ export function replaceChat(
 /** Drop normalization: keeps order, drops unknown/dupe ids. Pure for tests.
  *  The seen set is threaded through nested splits so a chat kept anywhere
  *  earlier (even inside another split) is dropped on later occurrences: one
- *  chat never renders in two windows. */
+ *  chat never renders in two windows.
+ *  Identity-stable: when nothing is dropped and every size is already
+ *  clamped, the original node reference is returned so store subscribers can
+ *  bail out without re-rendering (e.g. the post-minimize validation pass).
+ *  Single-child splits are kept (never collapsed) so remaining windows keep
+ *  their React instances across minimize. */
 export function normalizeTree(
   node: ChatTreeNode | null,
   validIds: Set<string>,
@@ -230,15 +231,19 @@ export function normalizeTree(
   if (node.kind === 'leaf') {
     if (!validIds.has(node.chatId) || seen.has(node.chatId)) return null
     seen.add(node.chatId)
-    return { ...node, size: clampSize(node.size) }
+    const size = clampSize(node.size)
+    return size === node.size ? node : { ...node, size }
   }
   const children: ChatTreeNode[] = []
+  let changed = false
   for (const c of node.children) {
     const next = normalizeTree(c, validIds, seen)
     if (next) children.push(next)
+    if (next !== c) changed = true
   }
   if (children.length === 0) return null
-  return collapse({ ...node, children })
+  if (!changed) return node
+  return { ...node, children }
 }
 
 /** Build a flat split from an ordered id list (migration / fallback). */
@@ -547,4 +552,70 @@ export function pickNeighborWindow(
 export function toggleFullscreenId(current: string | null, target: string): string | null {
   if (!target) return current
   return current === target ? null : target
+}
+
+/** Whether a split child's slot is vacated by the in-progress internal drag.
+ *  Pure for tests. The dragged window's own space counts as empty while
+ *  dragging, so its wrapping flex slot collapses and the remaining panes
+ *  expand: the drop preview then shows the final layout (e.g. 2 panes)
+ *  instead of looking like an extra window next to the dimmed source.
+ *  External tab/sidebar drags keep dragId null and never vacate. */
+export function isVacatedByDrag(childChatIds: string[], dragId: string | null): boolean {
+  if (!dragId) return false
+  return childChatIds.length === 1 && childChatIds[0] === dragId
+}
+
+/** Landing index for a sibling ghost placeholder next to the drop target.
+ *  Pure for tests. Edge drops insert before (left/top) or after
+ *  (right/bottom) the target so the ghost participates in flex layout with
+ *  equal size instead of overlaying half a pane. */
+export function ghostInsertIndex(targetIndex: number, pos: ChatDropPos): number {
+  return beforePos(pos) ? targetIndex : targetIndex + 1
+}
+
+/** Whether the drop preview should render as a sibling ghost placeholder.
+ *  Pure for tests. Only for edge drops onto a direct-child leaf along the
+ *  parent split axis: the ghost becomes a real flex sibling with equal size,
+ *  so dragging shows N equal windows (e.g. 3 stay 3 equal) instead of an
+ *  overlay that reads as an extra window. Center and cross-axis drops keep
+ *  the overlay highlight. */
+export function shouldShowSiblingGhost(parentDir: ChatSplitDir, pos: ChatDropPos, isDirectChild: boolean): boolean {
+  if (!isDirectChild) return false
+  if (pos === 'center') return false
+  return dirForPos(pos) === parentDir
+}
+
+/** Resolve a leaf drop position from normalized pointer fractions with hysteresis.
+ *  Pure for tests. Entering an edge needs x/y past 0.25, but staying in the
+ *  same edge tolerates drift to 0.34: vacating the drag source and inserting
+ *  the ghost sibling expand the target leaf, which shifts fractions by a few
+ *  px under a steady cursor — without the wider exit band the preview flips
+ *  edge/center every frame and the empty page flickers in and out. */
+export function resolveLeafPos(x: number, y: number, prev: ChatDropPos | null): ChatDropPos {
+  const enter = 0.25
+  const exit = 0.34
+  const lx = prev === 'left' ? exit : enter
+  const rx = prev === 'right' ? 1 - exit : 1 - enter
+  const ty = prev === 'top' ? exit : enter
+  const by = prev === 'bottom' ? 1 - exit : 1 - enter
+  if (x < lx && x <= y && x <= 1 - y) return 'left'
+  if (x > rx && x >= y && x >= 1 - y) return 'right'
+  if (y < ty) return 'top'
+  if (y > by) return 'bottom'
+  return 'center'
+}
+
+/** Whether the drop preview should render as a nested ghost inside the target leaf.
+ *  Pure for tests. Edge drops across the parent split axis (e.g. top/bottom
+ *  onto a row child) cannot insert a flex sibling along the parent axis;
+ *  instead the target slot splits along the drop axis with an equal-size
+ *  ghost next to the target content, so dragging still previews N equal
+ *  panes with the source vacated instead of an overlay that reads as extra.
+ *  Center and along-axis drops never nest (sibling ghost or swap). */
+export function shouldShowNestedGhost(parentDir: ChatSplitDir, pos: ChatDropPos, isDirectChild: boolean): boolean {
+  if (!isDirectChild) return false
+  if (pos === 'center') return false
+  const need = dirForPos(pos)
+  if (!need) return false
+  return need !== parentDir
 }

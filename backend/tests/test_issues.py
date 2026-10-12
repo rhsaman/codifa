@@ -62,8 +62,8 @@ async def main():
         # ---- Issue 1a: output-discipline instructions reach the model ----
         _, cap_ask = await one_turn("ask", "where is foo defined")
         assert system_text(cap_ask, "OUTPUT DISCIPLINE"), "ask prompt missing OUTPUT DISCIPLINE"
-        _, cap_coder = await one_turn("coder", "fix the bug in app.py")
-        assert system_text(cap_coder, "REPLY DISCIPLINE"), "coder prompt missing REPLY DISCIPLINE"
+        _, cap_build = await one_turn("build", "fix the bug in app.py")
+        assert system_text(cap_build, "REPLY DISCIPLINE"), "build prompt missing REPLY DISCIPLINE"
         _, cap_plan = await one_turn("plan", "make a plan to add a toggle")
         plan_sys = system_text(cap_plan, "OUTPUT DISCIPLINE")
         assert plan_sys and "Files:" in (system_text(cap_plan, "Files:") or ""), \
@@ -79,8 +79,8 @@ async def main():
         expected_narrow = min(broad_budget, max(2048, broad_budget // 2))
         assert expected_narrow < broad_budget  # sanity: cap is tighter than broad
 
-        _, cap_narrow = await one_turn("coder", "find where foo is defined and fix it")
-        _, cap_broad = await one_turn("coder", "how does the whole architecture work end to end")
+        _, cap_narrow = await one_turn("build", "find where foo is defined and fix it")
+        _, cap_broad = await one_turn("build", "how does the whole architecture work end to end")
         narrow_body = cap_narrow[0]
         broad_body = cap_broad[0]
         n_max = narrow_body.get("max_completion_tokens", narrow_body.get("max_tokens"))
@@ -91,30 +91,30 @@ async def main():
             f"broad task max output {b_max} != full budget {broad_budget}"
         print(f"  issues/1b OK: narrow output capped at {n_max}, broad keeps {b_max}")
 
-        # ---- Issue 2: Plan→Coder handoff injects Plan's files ----
+        # ---- Issue 2: Plan→Build handoff injects Plan's files ----
         history = [
             {"role": "user", "content": "plan a settings toggle feature"},
             {"role": "assistant", "mode": "plan", "content":
                 "## Plan\n1. Add a toggle card in app.tsx.\n2. Wire state in store.ts.\n"
                 "Files: src/app.tsx, src/lib/store.ts"},
         ]
-        _, cap_handoff = await one_turn("coder", "implement the plan", history=history)
+        _, cap_handoff = await one_turn("build", "implement the plan", history=history)
         note = system_text(cap_handoff, "already identified these files as relevant")
-        assert note, "Plan→Coder discovery note not injected"
+        assert note, "Plan→Build discovery note not injected"
         assert "src/app.tsx" in note and "src/lib/store.ts" in note, \
             f"Plan files missing from the note:\n{note[:300]!r}"
         assert "Do NOT re-run glob/grep" in note or "read/grep" in note, "note must steer to verification"
-        print("  issues/2 OK: Plan files injected; Coder steered to verify, not rediscover")
+        print("  issues/2 OK: Plan files injected; Build steered to verify, not rediscover")
 
         # ---- Issue 3: parallel_tool_calls allowlist ----
-        _, cap_custom = await one_turn("coder", "add a toggle button", provider="custom")
+        _, cap_custom = await one_turn("build", "add a toggle button", provider="custom")
         assert cap_custom[0].get("parallel_tool_calls") is True, \
             "custom request must carry parallel_tool_calls=True"
         # ollama is NOT in the allowlist: the field must be absent, and the run
         # must still complete even when a hypothetical gateway rejects the field.
         mock.reject_parallel = True
         try:
-            _, cap_ollama = await one_turn("coder", "add a toggle button", provider="ollama")
+            _, cap_ollama = await one_turn("build", "add a toggle button", provider="ollama")
         finally:
             mock.reject_parallel = False
         assert "parallel_tool_calls" not in cap_ollama[0], \

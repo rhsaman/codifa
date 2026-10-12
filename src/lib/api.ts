@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -106,7 +106,7 @@ export interface ModelsResult {
 export function providerKeys(cfg: Pick<ProviderConfig, 'apiKeys'> & { apiKey?: string }): string[] {
   const raw = Array.isArray(cfg.apiKeys) ? cfg.apiKeys : []
   const out = raw.filter((k): k is string => typeof k === 'string' && k.trim() !== '')
-  if (out.length === 0 && typeof cfg.apiKey === 'string' && cfg.apiKey.trim() !== '') out.push(cfg.apiKey)
+  if (typeof cfg.apiKey === 'string' && cfg.apiKey.trim() !== '' && !out.includes(cfg.apiKey.trim())) out.push(cfg.apiKey.trim())
   return out
 }
 
@@ -118,13 +118,70 @@ export interface TranscribeProviderOpts {
   model?: string
 }
 
-/** Remote TTS provider details forwarded to POST /tts. */
+/** TTS provider details forwarded to POST /tts. kind 'local' = on-device Piper. */
 export interface SpeakProviderOpts {
   kind: string
   baseUrl: string
   apiKeys?: string[]
   model?: string
   voice?: string
+}
+
+/**
+ * Mint an ephemeral realtime voice session via the sidecar.
+ * The master API key stays server-side; only the short-lived token
+ * is returned to the browser for the WebSocket connection.
+ */
+export async function createRealtimeSession(
+  opts: RealtimeSessionRequest,
+): Promise<RealtimeSessionResponse> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const body: Record<string, string> = {
+    provider: opts.kind,
+    base_url: opts.baseUrl,
+  }
+  const keys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
+  if (keys.length > 0) body.api_keys = JSON.stringify(keys)
+  if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
+  if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
+  const post = async (base: string): Promise<RealtimeSessionResponse> => {
+    const res = await fetch(`${base}/realtime/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(
+        (data as { detail?: string }).detail || `realtime session failed (${res.status})`,
+      )
+    }
+    const data = (await res.json()) as {
+      ephemeral_token?: string
+      ephemeralToken?: string
+      websocket_url?: string
+      websocketUrl?: string
+      expires_at?: string
+      expiresAt?: string
+    }
+    const ephemeralToken = data.ephemeral_token ?? data.ephemeralToken ?? ''
+    const websocketUrl = data.websocket_url ?? data.websocketUrl ?? ''
+    const expiresAt = data.expires_at ?? data.expiresAt ?? ''
+    if (!ephemeralToken || !websocketUrl) throw new Error('realtime session failed (bad response)')
+    return { ephemeralToken, websocketUrl, expiresAt }
+  }
+  try {
+    return await post(url)
+  } catch (err) {
+    if (err instanceof TypeError) {
+      sidecarUrl = null
+      const retryUrl = await ensureSidecar()
+      if (retryUrl && retryUrl !== url) return await post(retryUrl)
+    }
+    throw err
+  }
 }
 
 /**
@@ -158,15 +215,24 @@ export async function speakTextStream(
 ): Promise<Blob> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  // Local Piper TTS (kind 'local'): send provider 'local' with the Piper
+  // voice id in model (default fa_IR-amir-medium); remote path unchanged.
+  const isLocalTts = opts.kind === 'local'
   const body: Record<string, string> = {
     text,
-    provider: opts.kind,
-    base_url: opts.baseUrl,
+    provider: isLocalTts ? 'local' : opts.kind,
   }
-  if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
-  if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
-  const speakKeys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
-  if (speakKeys.length > 0) body.api_keys = JSON.stringify(speakKeys)
+  if (isLocalTts) {
+    body.model = (opts.model ?? '').trim() || 'default'
+    if ((opts.baseUrl ?? '').trim()) body.base_url = (opts.baseUrl ?? '').trim()
+    if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
+  } else {
+    body.base_url = opts.baseUrl
+    if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
+    if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
+    const speakKeys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
+    if (speakKeys.length > 0) body.api_keys = JSON.stringify(speakKeys)
+  }
   const timeoutSignal = AbortSignal.timeout(120_000)
   const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
   const signal =
@@ -248,7 +314,7 @@ async function postTtsChunks(
 }
 
 /** Split long text into sentence chunks for queued TTS playback. */
-export function splitTtsSentences(text: string, maxLen = 280): string[] {
+export function splitTtsSentences(text: string, maxLen = 160): string[] {
   const clean = (text ?? '').replace(/\s+/g, ' ').trim()
   if (!clean) return []
   // Only true sentence boundaries (. ! ? … ؟) — splitting on colon/semicolon
@@ -317,7 +383,13 @@ export async function transcribeAudio(
       )
     }
     const data = (await res.json()) as { text: string }
-    return (data.text ?? '').trim()
+    const cleanText = (data.text ?? '').trim()
+    // Never return HTML error pages as transcription: surface as an error
+    // so the caller shows a banner/alert instead of polluting the composer.
+    if (cleanText && (cleanText.includes('<link') || cleanText.includes('/_next/') || cleanText.includes('&lt;') || /<\/?[a-z]/i.test(cleanText))) {
+      throw new Error('Transcription returned an error page — please try again.')
+    }
+    return cleanText
   } catch (err) {
     // A network-level failure (TypeError) means the sidecar is unreachable —
     // its cached URL is stale. Drop the cache and retry once against a freshly
@@ -338,7 +410,13 @@ export async function transcribeAudio(
           )
         }
         const data = (await res.json()) as { text: string }
-        return (data.text ?? '').trim()
+        const retryText = (data.text ?? '').trim()
+        // Same HTML-error guard as the first attempt: a gateway HTML page
+        // must surface as an error, never as composer text.
+        if (retryText && (retryText.includes('<link') || retryText.includes('/_next/') || retryText.includes('&lt;') || /<\/?[a-z]/i.test(retryText))) {
+          throw new Error('Transcription returned an error page — please try again.')
+        }
+        return retryText
       }
     }
     throw err
@@ -413,6 +491,7 @@ export async function testModel(cfg: ProviderConfig, model: string): Promise<Mod
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const body: Record<string, unknown> = {
     provider: cfg.kind,
+    provider_id: cfg.id ?? '',
     base_url: cfg.baseUrl ?? '',
     api_keys: providerKeys(cfg),
     model,
@@ -430,6 +509,40 @@ export async function testModel(cfg: ProviderConfig, model: string): Promise<Mod
     throw new Error((data as { detail?: string }).detail || `model test failed (${res.status})`)
   }
   return (await res.json()) as ModelTestResult
+}
+
+export interface ModelTestBatchItem {
+  model: string
+  ok: boolean
+  reply: string
+  error: string
+}
+
+/** Probe many models in ONE round trip (POST /models/test-batch). Same probe
+ *  as single test per model, so 402/insufficient-quota marks that model failed. */
+export async function testModelsBatch(cfg: ProviderConfig, models: string[]): Promise<ModelTestBatchItem[]> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const uniq = [...new Set(models.filter((m) => typeof m === 'string' && m.trim() !== ''))].slice(0, 100)
+  if (uniq.length === 0) return []
+  const res = await fetch(`${url}/models/test-batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      provider: cfg.kind,
+      provider_id: cfg.id ?? '',
+      base_url: cfg.baseUrl ?? '',
+      api_keys: providerKeys(cfg),
+      models: uniq,
+    }),
+    signal: AbortSignal.timeout(75_000),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error((data as { detail?: string }).detail || `model batch test failed (${res.status})`)
+  }
+  const data = (await res.json()) as { results?: ModelTestBatchItem[] }
+  return Array.isArray(data.results) ? data.results : []
 }
 function providerRequestKey(cfg: ProviderConfig): string {
   return [
@@ -543,10 +656,6 @@ export interface StreamParams {
   /** User pre-approved desktop-app control (the `computer` tool's mutating
    *  actions) for this session/workspace — set by "Always allow". */
   allowComputer?: boolean
-  /** Absolute path of the file currently open in Neovim (auto-mentioned). */
-  nvimFile?: string
-  /** LSP diagnostics for the Neovim file, so the agent can see its issues. */
-  nvimDiagnostics?: NvimDiagnostic[]
   /** Directory for the per-workspace RAG vector store ("" = backend default). */
   vectorDbPath?: string
   /** Size / TTL bounds for the RAG store (max_docs, max_chunks, ttl_days). */
@@ -559,12 +668,16 @@ export interface StreamParams {
   /** Auto-compaction threshold as a percentage of the raw context window.
    *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`. */
   compactAtPercent?: number
-  /** Max tool-loop steps per turn. 0/undefined = backend auto from ctx. */
-  maxSteps?: number
   /** Explicit restart (message retry icon / truncate-and-restart). Backend
    *  clears the interrupted-turn checkpoint and starts fresh instead of
    *  resuming old tool work. Omit/false for normal sends and banner resumes. */
   restart?: boolean
+  /** Persistent goal condition (/goal). Sent explicitly so the backend judges
+   *  the turn even when the prompt prefix is lost (retry/resume paths). */
+  goal?: string | null
+  /** Cumulative goal turns so far (client counter). The server enforces the
+   *  max authoritatively; this lets it continue counting across requests. */
+  goalTurns?: number
   signal?: AbortSignal
 }
 
@@ -677,17 +790,15 @@ export async function streamChat(
           allow_outside: params.allowOutside ?? false,
           allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
-          nvim_file: params.nvimFile ?? "",
-          nvim_diagnostics: params.nvimDiagnostics ?? [],
           vector_db_path: params.vectorDbPath ?? "",
           vector_config: params.vectorConfig ?? null,
           subagent_models: params.subagentModels ?? {},
           providers: params.providers ?? {},
           // Single auto-compaction threshold as a percentage of the raw window.
           compact_at_percent: params.compactAtPercent ?? 80,
-          // Max tool-loop steps per turn (Settings → General, 0 = backend auto).
-          max_steps: params.maxSteps ?? 0,
           restart: params.restart ?? false,
+          goal: params.goal ?? null,
+          goal_turns: params.goalTurns ?? 0,
           context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
         }),
       })
@@ -918,6 +1029,71 @@ export async function cancelSteer(chatId: string, id: string): Promise<void> {
   }
 }
 
+/** Token usage of a title call, billed under the provider/model that ran it. */
+export interface ChatTitleUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  model?: string
+  provider?: string
+  provider_id?: string
+}
+
+/** Generate a short chat title from the first user message (Settings → Tools → Title generator).
+ *  Fire-and-forget: returns null title (and null usage) when the sidecar is
+ *  unreachable or the model fails, so the caller keeps its default title.
+ *  Never throws. */
+export async function requestChatTitle(params: {
+  provider: ProviderConfig
+  subagentModels?: Record<string, string>
+  providers?: Record<string, ProviderConfig>
+  text: string
+  chatId?: string
+}): Promise<{ title: string | null; usage: ChatTitleUsage | null }> {
+  const none = { title: null, usage: null }
+  const url = await ensureSidecar()
+  if (!url) {
+    console.warn('[title] sidecar unreachable — keeping default chat title')
+    return none
+  }
+  try {
+    const res = await fetch(`${url}/chats/title`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: params.provider.kind,
+        provider_id: params.provider.id,
+        api_keys: providerKeys(params.provider),
+        base_url: params.provider.baseUrl,
+        model: params.provider.model,
+        subagent_models: params.subagentModels ?? {},
+        providers: params.providers ?? {},
+        text: params.text,
+        chat_id: params.chatId ?? '',
+      }),
+      // Long budget so the backend fallback chain (title, compact, main)
+      // fits inside one request; fire-and-forget so it never blocks the turn.
+      signal: AbortSignal.timeout(90_000),
+    })
+    if (!res.ok) {
+      console.warn(`[title] sidecar answered ${res.status} — keeping default chat title`)
+      return none
+    }
+    const data = (await res.json().catch(() => ({}))) as {
+      title?: unknown
+      usage?: ChatTitleUsage | null
+    }
+    const title = typeof data.title === 'string' ? data.title.trim() : ''
+    if (!title) console.warn('[title] empty title reply — keeping default chat title')
+    else console.info('[title] got title:', title, (params.chatId ?? '').slice(-6))
+    return { title: title || null, usage: data.usage ?? null }
+  } catch (err) {
+    console.warn('[title] request failed — keeping default chat title', err)
+    return none
+  }
+}
+
 /** Read a document for the file viewer. format: "text" (default) | "html"
  *  (styled Word/Excel view) | "pages" (PDF pages as JPEG data URLs).
  *  `sheet` selects one Excel sheet, `pages` selects PDF pages like "1-3,7".
@@ -1067,9 +1243,22 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
   }
 }
 
-// ---- Managed on-device models (whisper / embedding) ------------ //
+// ---- Managed on-device models (whisper / embedding / local TTS) -- //
+// Local TTS kind stays "piper" for backend API compat; it now serves
+// pocket-tts-farsi-v2 with a bundled default voice.
 
-export type ManagedModelKind = "whisper" | "embedding"
+export type ManagedModelKind = "whisper" | "embedding" | "piper" | "decision"
+
+export interface PiperStatus {
+  state: string
+  model: string
+  progress: number
+  error?: string
+  size?: number
+  downloaded_bytes?: number
+  total_bytes?: number
+  speed_bps?: number
+}
 
 export interface ModelDirInfo {
   repo: string
@@ -1100,6 +1289,8 @@ export interface ModelKindStatus {
 export interface ModelsStatus {
   whisper: ModelKindStatus
   embedding: ModelKindStatus
+  decision?: ModelKindStatus
+  piper?: PiperStatus
 }
 
 /** Kick off a background model download (Settings → Models). */
@@ -1127,6 +1318,8 @@ export async function getModelsStatus(): Promise<ModelsStatus> {
   return {
     whisper: data.whisper ?? { dirs: [] },
     embedding: data.embedding ?? { dirs: [] },
+    decision: data.decision,
+    piper: data.piper,
   }
 }
 
@@ -1255,7 +1448,7 @@ export async function getSkillFile(name: string, file: string): Promise<string |
  *  both spellings are present; the legacy key is dropped. */
 const LEGACY_PROMPT_KEYS: Record<string, string> = {
   chat: 'ask',
-  codewriter: 'coder',
+  codewriter: 'build',
 }
 
 export function normalizeSystemPromptKeys(

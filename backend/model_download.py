@@ -35,6 +35,7 @@ BACKEND_DIR = _MODULE_DIR
 
 KIND_WHISPER = "whisper"
 KIND_EMBEDDING = "embedding"
+KIND_DECISION = "decision"
 
 # Download tuning for slow / filtered networks (applied in start_download):
 # fewer parallel file workers = steadier per-file speed and less connection
@@ -52,6 +53,7 @@ os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 WHISPER_DEFAULT_REPO = "Systran/faster-whisper-medium"
 EMBEDDING_DEFAULT_REPO = "intfloat/multilingual-e5-base"
+DECISION_DEFAULT_REPO = "convaiinnovations/laya"
 # Subfolder of the models root holding huggingface_hub's own cache layout.
 _HUB_CACHE_DIRNAME = "hub-cache"
 
@@ -85,6 +87,7 @@ def _models_dir() -> str:
         with _MIGRATE_LOCK:
             if not _migrated:
                 _migrate_legacy_models(target)
+                _migrate_decision_dir_name(target)
                 _migrated = True
     return target
 
@@ -122,6 +125,21 @@ def _embedding_dir(repo: str) -> str:
     return os.path.join(_models_dir(), f"models--{slug}") if slug else ""
 
 
+def _decision_dirname(repo: str) -> str:
+    """Decision-model folder name: the official release layout
+    ``<model>--<org>--<name>`` (e.g. ``laya--convaiinnovations--laya``),
+    so a manually downloaded copy is found without any rename."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
+    model = str(repo).strip().split("/")[-1]
+    return f"{model}--{slug}" if slug else ""
+
+
+def _decision_dir(repo: str) -> str:
+    """Absolute path of the decision-model folder ('' for a blank repo)."""
+    name = _decision_dirname(repo)
+    return os.path.join(_models_dir(), name) if name else ""
+
+
 def _migrate_legacy_models(target_root: str | None = None) -> None:
     """Move models previously stored under ``backend/whisper`` /
     ``backend/models--*`` into the data-root ``models/`` folder so an app that
@@ -151,6 +169,27 @@ def _migrate_legacy_models(target_root: str | None = None) -> None:
             shutil.move(src, dest)
         except Exception:  # noqa: BLE001, S112 — migration must never crash startup
             continue
+
+
+def _migrate_decision_dir_name(root: str | None = None) -> None:
+    """Rename a pre-fix ``models--<repo>`` decision download to the release
+    layout ``<model>--<org>--<name>`` so it keeps being found. Skipped when the
+    release-layout folder already exists (never touches user data).
+
+    Computes the old name inline: calling ``_embedding_dir`` here would
+    re-enter ``_models_dir`` mid-migration (the ``_migrated`` flag is still
+    unset at that point) and recurse forever.
+    """
+    root = root or _raw_models_root()
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", DECISION_DEFAULT_REPO.replace("/", "--")).strip("-")
+    old = os.path.join(root, f"models--{slug}")
+    new = os.path.join(root, _decision_dirname(DECISION_DEFAULT_REPO))
+    if not os.path.isdir(old) or os.path.isdir(new):
+        return
+    try:
+        os.rename(old, new)
+    except OSError:  # migration must never crash startup
+        pass
 
 
 # --- live download state (one entry per kind) --------------------------- #
@@ -507,9 +546,13 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
 
     if kind == KIND_WHISPER:
         dest = whisper_dir()
+    elif kind == KIND_DECISION:
+        dest = _decision_dir(repo)
     else:
         dest = _embedding_dir(repo)
     _set_downloading(kind, repo, base_url, _dir_size(dest))
+    # NOTE: decision (Laya) downloads use the release folder layout
+    # laya--<org>--<name>, so pause/resume/remove work through the same helpers.
     tqdm_class = _make_tqdm_class(kind, controls)
 
     def _run() -> None:
@@ -606,6 +649,8 @@ def remove(kind: str, repo: str) -> bool:
             controls["pause"].clear()
     if kind == KIND_WHISPER:
         target = whisper_dir()
+    elif kind == KIND_DECISION:
+        target = _decision_dir(repo)
     else:
         target = _embedding_dir(repo)
     if not os.path.isdir(target):
@@ -649,8 +694,28 @@ def whisper_ready() -> bool:
         return False
     for name in ("model.bin", "model.safetensors", "model.onnx"):
         try:
-            if os.path.isfile(os.path.join(wdir, name)) and os.path.getsize(os.path.join(wdir, name)) > 0:
+            top = os.path.join(wdir, name)
+            if os.path.isfile(top) and os.path.getsize(top) > 0:
                 return True
+            # Snapshot layouts may nest weights one level deeper
+            # (e.g. snapshots/<hash>/model.bin) after a mirror download.
+            # Shallow walk only (top + one level): a full recursive walk over
+            # a multi-GB models tree adds seconds before every transcribe.
+            try:
+                for child in os.listdir(wdir):
+                    cand = os.path.join(wdir, child)
+                    try:
+                        if os.path.isfile(cand):
+                            continue
+                        if not os.path.isdir(cand):
+                            continue
+                        nested = os.path.join(cand, name)
+                        if os.path.isfile(nested) and os.path.getsize(nested) > 0:
+                            return True
+                    except OSError:
+                        continue
+            except OSError:
+                continue
         except OSError:
             continue
     return False
@@ -684,6 +749,10 @@ def embedding_dirs() -> list[dict]:
         if not os.path.isdir(root):
             continue
         repo = name[len("models--") :].replace("--", "/")
+        if repo == DECISION_DEFAULT_REPO:
+            # The decision model (Laya) has its own Settings card; never list
+            # it there as an (always-incomplete) embedding build.
+            continue
         out.append(
             {
                 "repo": repo,
@@ -695,12 +764,95 @@ def embedding_dirs() -> list[dict]:
     return out
 
 
+def decision_model_dir() -> str:
+    """Absolute path to a ready Laya decision-model dir; '' when none.
+
+    Prefers the newest ready dir from :func:`decision_dirs` and resolves it
+    to the concrete folder holding the weights (a ``snapshots/<rev>``
+    subdir or the flat repo root), mirroring ``embeddings.model_dir``.
+    """
+    for entry in decision_dirs():
+        if not entry.get("ready"):
+            continue
+        name = str(entry.get("dir") or "")
+        if not name:
+            continue
+        root = os.path.join(_models_dir(), name)
+        snapshots = os.path.join(root, "snapshots")
+        if os.path.isdir(snapshots):
+            for rev in sorted(os.listdir(snapshots), reverse=True):
+                cand = os.path.join(snapshots, rev)
+                if os.path.isdir(cand) and _dir_has_weights(cand):
+                    return cand
+        if _dir_has_weights(root):
+            return root
+    return ""
+
+
+def decision_dirs() -> list[dict]:
+    """Downloaded decision-model dirs (Laya).
+
+    The folder uses the official release layout ``<model>--<org>--<name>``
+    (e.g. ``laya--convaiinnovations--laya``) so a manually downloaded copy
+    is found as-is; the decision slot is pinned to the default Laya repo
+    (there is no per-repo picker for it), so at most one dir can exist.
+    """
+    out: list[dict] = []
+    root_dir = _models_dir()
+    name = _decision_dirname(DECISION_DEFAULT_REPO)
+    root = os.path.join(root_dir, name)
+    if name and os.path.isdir(root):
+        out.append(
+            {
+                "repo": DECISION_DEFAULT_REPO,
+                "dir": name,
+                "size": _dir_size(root),
+                "ready": _decision_ready(root),
+            }
+        )
+    return out
+
+
+def _decision_ready(root: str) -> bool:
+    """True when ``root`` holds a usable decision model (snapshots or flat).
+
+    Laya ships safetensors weights plus tokenizer/config files; a half-
+    downloaded dir (only configs / .cache partials) must report incomplete so
+    the Settings card keeps offering Download (= resume via HTTP Range).
+    """
+    snapshots = os.path.join(root, "snapshots")
+    if os.path.isdir(snapshots):
+        for d in os.listdir(snapshots):
+            cand = os.path.join(snapshots, d)
+            if not os.path.isdir(cand):
+                continue
+            if _dir_has_weights(cand):
+                return True
+        return False
+    return _dir_has_weights(root)
+
+
+def _dir_has_weights(root: str) -> bool:
+    """Non-empty weight file (safetensors / bin / onnx) directly under root."""
+    for name in ("model.safetensors", "pytorch_model.bin", "model.bin", "model.onnx"):
+        try:
+            if os.path.isfile(os.path.join(root, name)) and os.path.getsize(os.path.join(root, name)) > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def status() -> dict:
     """Complete state for the Settings UI: per-kind download status + dirs."""
     _migrate_legacy_models()
     embed: dict = {"dirs": embedding_dirs()}
     if download_state(KIND_EMBEDDING):
         embed["running"] = download_state(KIND_EMBEDDING)
+
+    decision: dict = {"dirs": decision_dirs()}
+    if download_state(KIND_DECISION):
+        decision["running"] = download_state(KIND_DECISION)
 
     whisper: dict = {"dirs": []}
     if download_state(KIND_WHISPER):
@@ -716,7 +868,7 @@ def status() -> dict:
                 "ready": whisper_ready(),
             }
         ]
-    out = {"whisper": whisper, "embedding": embed}
+    out = {"whisper": whisper, "embedding": embed, "decision": decision}
     try:
         _tripwire_external_deletion(out)
     except Exception:  # noqa: BLE001, S110 — diagnostics never break status
@@ -746,7 +898,10 @@ def _tripwire_external_deletion(status_out: dict) -> None:
     the app (system cleaner, another process, manual delete).
     """
     ready_now: set[str] = set()
-    for _section in (status_out.get("embedding") or {},):
+    for _section in (
+        status_out.get("embedding") or {},
+        status_out.get("decision") or {},
+    ):
         for _d in (_section.get("dirs") or []):
             _name = str((_d or {}).get("dir") or "")
             if _name and (_d or {}).get("ready"):

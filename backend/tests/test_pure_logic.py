@@ -59,27 +59,25 @@ def test_skills_section_no_picks_returns_empty(monkeypatch):
     assert graph._build_skills_section([], "/x") == ""
 
 
-def test_skills_section_catalog_lists_names_and_descriptions(monkeypatch):
-    """کاتالوگ پیش‌فرض: نام + توضیح همهٔ اسکیل‌ها بدون بدنه‌ها."""
+def test_skills_section_no_catalog_without_picks(monkeypatch):
+    """بدون انتخاب روتر: هیچ کاتالوگی در پرامپت مدل اصلی نیست."""
     monkeypatch.setattr(agents, "_load_skills", lambda _r: [
         _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A"),
         _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B"),
     ])
-    out = graph._build_skills_section([], "/x")
-    assert "AVAILABLE SKILLS" in out
-    assert "Alpha" in out and "توضیح آلفا" in out
-    assert "Beta" in out and "توضیح بتا" in out
-    assert "BODY-A" not in out and "BODY-B" not in out, "بدنه‌ها نباید در کاتالوگ باشند"
-    assert "load_skill" in out, "راهنمای auto-trigger باید ابزار را معرفی کند"
+    assert graph._build_skills_section([], "/x") == ""
 
 
-def test_skills_section_catalog_disabled(monkeypatch):
-    """catalog=False (مدل‌های با کانتکست کوچک): کاتالوگ ساخته نمی‌شود."""
+def test_skills_section_router_picks_inline_bodies(monkeypatch):
+    """انتخاب روتر: فقط بدنهٔ همان اسکیل‌ها تزریق می‌شود، بدون کاتالوگ."""
     monkeypatch.setattr(agents, "_load_skills", lambda _r: [
-        _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
+        _skill("file://skills/a/skill.md", "Alpha", "توضیح آلفا", "BODY-A"),
+        _skill("file://skills/b/skill.md", "Beta", "توضیح بتا", "BODY-B"),
     ])
-    out = graph._build_skills_section([], "/x", catalog=False)
-    assert out == ""
+    out = graph._build_skills_section([], "/x", prompt="summarize this", auto_names=["Alpha"])
+    assert "BODY-A" in out
+    assert "BODY-B" not in out, "اسکیل انتخاب‌نشده نباید تزریق شود"
+    assert "AVAILABLE SKILLS" not in out, "کاتالوگی در پرامپت نیست"
 
 
 def test_skills_section_picked_skill_body_inlined(monkeypatch):
@@ -91,7 +89,7 @@ def test_skills_section_picked_skill_body_inlined(monkeypatch):
     out = graph._build_skills_section(["Alpha"], "/x")
     assert "BODY-A" in out
     assert "BODY-B" not in out, "اسکیل انتخاب‌نشده نباید تزریق شود"
-    assert "AVAILABLE SKILLS" in out, "کاتالوگ باید همراه انتخاب دستی باشد"
+    assert "AVAILABLE SKILLS" not in out, "کاتالوگی در پرامپت نیست"
 
 
 def test_skills_section_duplicate_picks_inlined_once(monkeypatch):
@@ -109,8 +107,7 @@ def test_skills_section_unknown_pick_returns_empty(monkeypatch):
         _skill("file://skills/a/skill.md", "Alpha", "توضیح", "BODY-A"),
     ])
     out = graph._build_skills_section(["ناموجود"], "/x")
-    assert "BODY-A" not in out
-    assert "AVAILABLE SKILLS" in out
+    assert out == "", "انتخاب ناشناخته: نه بدنه، نه کاتالوگ"
 
 
 def test_skills_section_missing_pick_emits_skill_event(monkeypatch):
@@ -259,6 +256,34 @@ def test_is_live_test_task_detects_user_like_requests():
 
 
 # ---------------------------------------------------------------------------
+# ctx_parts_event (context popover part sizes)
+# ---------------------------------------------------------------------------
+
+
+def test_ctx_parts_event_reports_native_and_mcp_chars():
+    from types import SimpleNamespace
+
+    mcp_tool = SimpleNamespace(
+        name="browser_navigate",
+        description="navigate the browser",
+        args={"url": "https://x.example"},
+        metadata={"mcp_server": "playwright"},
+    )
+    native_tool = SimpleNamespace(
+        name="read",
+        description="read a file",
+        args={"path": "src/a.ts"},
+        metadata={},
+    )
+    ev = graph.ctx_parts_event("ask", "SYSTEMSKILLS", "SKILLS", [mcp_tool, native_tool], "chat-1")
+    assert ev["kind"] == "ctx_parts"
+    assert ev["chat_id"] == "chat-1"
+    assert ev["systemChars"] == len("SYSTEM")
+    assert ev["mcpChars"] > 0
+    assert ev["systemToolsChars"] > 0
+
+
+# ---------------------------------------------------------------------------
 # ctx_parts_event / mcp_schema_chars (real per-turn sizes for the popover)
 # ---------------------------------------------------------------------------
 
@@ -266,9 +291,9 @@ def test_is_live_test_task_detects_user_like_requests():
 def test_ctx_parts_event_splits_skills_out_of_system_prompt():
     """Skills section is reported separately; systemChars excludes it."""
     section = "=== SKILLS ===\n- Alpha: desc"
-    event = graph.ctx_parts_event("coder", "PROMPT-BODY" + section, section, [])
+    event = graph.ctx_parts_event("build", "PROMPT-BODY" + section, section, [])
     assert event["kind"] == "ctx_parts"
-    assert event["mode"] == "coder"
+    assert event["mode"] == "build"
     assert event["systemChars"] == len("PROMPT-BODY")
     assert event["skillsChars"] == len(section)
     assert event["mcpChars"] == 0

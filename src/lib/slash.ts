@@ -84,6 +84,9 @@ export function prettySlashLabel(text: string): string {
       return args ? `Create skill: ${args}` : 'Create skill'
     case 'create-mcp':
       return args ? `Create connector: ${args}` : 'Create connector'
+    case 'goal':
+      if (args === 'clear') return 'Clear goal'
+      return args ? `Goal: ${args}` : 'Set a persistent goal'
     case '':
       return '/'
     default:
@@ -200,27 +203,67 @@ export function recordCommandUsage(input: string, prev?: string[]): string[] {
   return next
 }
 
-/** Sort command rows by recent usage: used commands first (newest use first),
- *  never-used commands keep their original relative order. Matching stays the
- *  caller's job — this only reorders. */
-export function sortCommandsByUsage<T extends { name: string }>(commands: T[], usage: string[]): T[] {
-  if (usage.length === 0) return [...commands]
+/** Generic recent-first sort by usage: used items first (newest use first),
+ *  never-used keep their original relative order. Shared by the command and
+ *  skill popups so both sort the same way. Matching stays the caller's job. */
+export function sortByRecentUsage<T>(items: T[], usage: string[], keyOf: (item: T) => string): T[] {
+  if (usage.length === 0) return [...items]
   const rank = new Map<string, number>()
   usage.forEach((n, i) => {
     const key = n.trim().toLowerCase()
     if (key && !rank.has(key)) rank.set(key, i)
   })
-  return [...commands]
-    .map((c, idx) => ({ c, idx, r: rank.has(c.name.toLowerCase()) ? (rank.get(c.name.toLowerCase()) as number) : Number.POSITIVE_INFINITY }))
+  return [...items]
+    .map((item, idx) => {
+      const k = keyOf(item).toLowerCase()
+      return { item, idx, r: rank.has(k) ? (rank.get(k) as number) : Number.POSITIVE_INFINITY }
+    })
     .sort((a, b) => (a.r !== b.r ? a.r - b.r : a.idx - b.idx))
-    .map((x) => x.c)
+    .map((x) => x.item)
 }
 
-/** Ordered popup rows: pins first (in pin order), then history minus pinned. */
+/** Bottom-anchored popup order (terminal-style, like the recent-prompt popup):
+ *  oldest on top, newest just above the bottom. Unused items keep their
+ *  original order on top; used items sit at the bottom oldest-first with the
+ *  newest last (closest to the input). Shared by the command and skill popups. */
+export function bottomAnchoredByUsage<T>(items: T[], usage: string[], keyOf: (item: T) => string): T[] {
+  if (usage.length === 0) return [...items]
+  const rank = new Map<string, number>()
+  usage.forEach((n, i) => {
+    const key = n.trim().toLowerCase()
+    if (key && !rank.has(key)) rank.set(key, i)
+  })
+  return [...items]
+    .map((item, idx) => {
+      const k = keyOf(item).toLowerCase()
+      const r = rank.has(k) ? (rank.get(k) as number) : Number.POSITIVE_INFINITY
+      return { item, idx, r }
+    })
+    .sort((a, b) => {
+      const aUsed = a.r !== Number.POSITIVE_INFINITY
+      const bUsed = b.r !== Number.POSITIVE_INFINITY
+      if (aUsed !== bUsed) return aUsed ? 1 : -1
+      if (!aUsed) return a.idx - b.idx
+      if (a.r !== b.r) return b.r - a.r
+      return a.idx - b.idx
+    })
+    .map((x) => x.item)
+}
+
+/** Sort command rows by recent usage: used commands first (newest use first),
+ *  never-used commands keep their original relative order. Matching stays the
+ *  caller's job — this only reorders. */
+export function sortCommandsByUsage<T extends { name: string }>(commands: T[], usage: string[]): T[] {
+  return sortByRecentUsage(commands, usage, (c) => c.name)
+}
+
+/** Ordered popup rows bottom-anchored (terminal-style): oldest history first
+ *  at the top, newest just above the bottom, pins last at the very bottom.
+ *  `history` arrives newest-first, so the unpinned rest is reversed. */
 export function historyRows(history: string[], pins: string[]): string[] {
   const pinned = pins.filter((p) => p.trim().length > 0)
-  const rest = history.filter((h) => !pinned.includes(h))
-  return [...pinned, ...rest]
+  const rest = history.filter((h) => !pinned.includes(h)).reverse()
+  return [...rest, ...pinned]
 }
 
 /** Short card title for a history row (Codex-style popup card): the raw slash

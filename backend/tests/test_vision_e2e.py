@@ -256,3 +256,30 @@ async def test_vision_respects_total_budget(monkeypatch):
         "vision should stop retrying once the total budget is exhausted"
     assert elapsed < 3.0, \
         f"vision analysis blew past the 0.3s budget (took {elapsed:.1f}s)"
+
+
+@pytest.mark.asyncio
+async def test_vision_timeout_note_does_not_claim_no_vision_support(run_events, monkeypatch):
+    # A vision prefetch TIMEOUT is transient slowness, not a missing
+    # capability: the note must say so and point at the `vision` tool,
+    # never claim the model "does not support images".
+    import asyncio
+
+    async def _hang(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(graph, "_vision_analyze", _hang)
+    mock.script = [text_reply("FINAL_ANSWER")]
+    await run_events(
+        "what do you see in this image?",
+        mode="ask",
+        subagent_models={"vision": "mock-model"},
+        images=[{"path": "x.png", "dataUrl": "data:image/png;base64,AAAA"}],
+    )
+    body_text = "\n".join(_all_text(b) for b in mock.captured)
+    assert "timed out" in body_text, \
+        "timeout note should name the timeout cause"
+    assert "vision" in body_text and "tool" in body_text, \
+        "timeout note should point the agent at the `vision` tool retry"
+    assert "does not support images" not in body_text, \
+        "a timeout must never claim the model lacks vision support"

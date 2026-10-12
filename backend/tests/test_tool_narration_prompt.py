@@ -11,7 +11,7 @@ tool call.
 from agent_registry import agent_system
 from agents import _UNIVERSAL_RULES, SYSTEM_PROMPTS
 
-_MAIN_MODES = ("ask", "plan", "coder", "reader")
+_MAIN_MODES = ("ask", "plan", "build", "reader")
 _SUBAGENTS = ("subagent",)
 
 

@@ -190,12 +190,12 @@ async def test_task_subagent_gets_catalog_for_any_prompt():
 
 
 # ---------------------------------------------------------------------------
-# Compact catalog + staged load_skill matching (autoload hardening)
+# Router picks + staged load_skill matching (autoload hardening)
 # ---------------------------------------------------------------------------
 
 
-def test_compact_catalog_always_present(monkeypatch):
-    """Compact catalog (small-context) still lists names and descriptions."""
+def test_router_pick_inlines_body_without_catalog(monkeypatch):
+    """A router pick inlines that skill's body only — no catalog in the prompt."""
     import graph as G
 
     monkeypatch.setattr(
@@ -205,16 +205,15 @@ def test_compact_catalog_always_present(monkeypatch):
              "content": _SKILL_BODY},
         ],
     )
-    out = G._build_skills_section([], "/x", catalog=True, compact=True)
-    assert "AVAILABLE SKILLS" in out
+    out = G._build_skills_section([], "/x", prompt="find movies", auto_names=["Movie Finder"])
+    assert "AVAILABLE SKILLS" not in out
     assert "Movie Finder" in out
-    assert _SKILL_BODY not in out
+    assert _SKILL_BODY in out
     assert "load_skill" in out
-    assert len(out) <= 900
 
 
-def test_catalog_lists_every_skill_for_huge_store(monkeypatch):
-    """Full and compact catalogs list every skill with its full description."""
+def test_subagent_catalog_lists_every_skill_for_huge_store(monkeypatch):
+    """The sub-agent catalog (its only skill discovery) lists every skill."""
     import graph as G
 
     many = [
@@ -222,14 +221,10 @@ def test_catalog_lists_every_skill_for_huge_store(monkeypatch):
         for i in range(40)
     ]
     monkeypatch.setattr(G._agents, "_load_skills", lambda _r: many)
-    for out in (
-        G._build_skills_section([], "/x", catalog=True),
-        G._build_skills_section([], "/x", catalog=True, compact=True),
-        skills_catalog_block(),
-    ):
-        for i in range(40):
-            assert f"skill-{i}" in out
-        assert "d" * 180 in out
+    out = skills_catalog_block()
+    for i in range(40):
+        assert f"skill-{i}" in out
+    assert "d" * 180 in out
 
 
 def test_load_skill_staged_match_keyword_and_fuzzy():

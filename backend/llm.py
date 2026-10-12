@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -305,7 +306,7 @@ def _is_key_error(exc: Exception) -> bool:
                 status = int(m.group(1))
             except (TypeError, ValueError):
                 status = None
-    if status in (401, 403, 429):
+    if status in (401, 402, 403, 429):
         return True
     low = str(exc).lower()
     # Never treat context overflow as a key error, even when the message
@@ -336,6 +337,12 @@ def _is_key_error(exc: Exception) -> bool:
             "rate_limit",
             "quota",
             "quota_exceeded",
+            "insufficient_quota",
+            "insufficient balance",
+            "insufficient_balance",
+            "insufficient funds",
+            "insufficient_funds",
+            "payment required",
             "resource exhausted",
         )
     )
@@ -384,14 +391,14 @@ def build_chat_model(
 
     model_class = meta.get("model_class") or "openai"
     headers = _extra_headers(provider, base_url, cache, session_id)
-    to = model_timeout(provider=provider, total=timeout or 900)
+    to = model_timeout(provider=provider, total=timeout or _DEFAULT_STEP_TIMEOUT_S)
     # LangChain's ChatOpenAI only accepts a SCALAR `timeout` (total seconds);
     # passing an `httpx.Timeout` object is silently ignored, leaving the request
     # with no timeout (it hangs until the client gives up). Use the scalar total.
-    # Default raised to 900s so a single model step that thinks silently for up
-    # to 15 min is not cut off (the old 300s ceiling killed long reasoning/slow
-    # provider steps mid-turn).
-    lc_timeout = timeout or 900
+    # Default is effectively unlimited (24h) so a model that thinks silently is
+    # never cut off (older 300s/900s ceilings killed long reasoning steps
+    # mid-turn and triggered client-side resends).
+    lc_timeout = timeout or _DEFAULT_STEP_TIMEOUT_S
     tkwargs = _thinking_kwargs(provider, model, thinking_level, model_reasoning)
     reasoning_effort = tkwargs.pop("reasoning_effort", None)
     # parallel_tool_calls is NOT sent by default: several OpenRouter free-tier
@@ -506,8 +513,11 @@ def build_chat_model(
     # stream_chunk_timeout: maximum seconds between two consecutive streaming
     # chunks.  The default in langchain_openai is 120 s, which is too aggressive
     # for slow providers (e.g. minimax-m3 can pause > 2 min while the model
-    # thinks silently).  Allow overriding via env; 150 s is a safe default.
-    _chunk_timeout = int(os.environ.get("STREAM_CHUNK_TIMEOUT", "150"))
+    # thinks silently).  Allow overriding via env; default is effectively
+    # unlimited (24h) so thinking is never cut off.
+    _chunk_timeout = int(
+        os.environ.get("STREAM_CHUNK_TIMEOUT", str(_DEFAULT_STEP_TIMEOUT_S))
+    )
     lc_kwargs: dict[str, Any] = {
         "model": model,
         "openai_api_base": base or None,
@@ -519,6 +529,10 @@ def build_chat_model(
         "stream_chunk_timeout": _chunk_timeout,
         "model_kwargs": tkwargs,
         "default_headers": headers or None,
+        # Own HTTP client (short keep-alive, bounded read timeout) instead of
+        # langchain-openai's process-wide cached one: after a network flap the
+        # shared pool kept dead sockets and every chat failed until app restart.
+        "http_async_client": _get_async_http_client(lc_timeout, _chunk_timeout),
     }
     if reasoning_effort is not None:
         lc_kwargs["reasoning_effort"] = reasoning_effort
@@ -538,6 +552,140 @@ def build_chat_model(
     # under delta.reasoning (opencode) don't leak it into the visible content.
     m = _stamp_provider(ReasoningChatOpenAI(**lc_kwargs), provider, provider_id)
     return _stamp_key_fallback(m, provider, model, base_url, keys, extra_keys, _bk)
+
+
+# Effectively no timeout for one model step (24h) and for the silence between
+# stream chunks: a thinking model must never be cut off for thinking too long.
+_DEFAULT_STEP_TIMEOUT_S = 86400
+
+_http_clients: dict[int, Any] = {}
+_http_clients_lock = threading.Lock()
+
+
+def _tcp_keepalive_options() -> list[tuple[int, int, int]]:
+    """Socket options so the OS probes the peer and reports a *really* dead
+    connection (half-open after a VPN/NAT drop) — independent of how long the
+    model thinks. A healthy peer ACKs the probes, so silent thinking never trips
+    this; only a truly broken connection does (~idle+intvl*cnt seconds)."""
+    import socket
+
+    opts: list[tuple[int, int, int]] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    # Idle before first probe differs per platform: TCP_KEEPALIVE on macOS,
+    # TCP_KEEPIDLE on Linux. Missing constants are skipped.
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+        socket, "TCP_KEEPALIVE", None
+    )
+    if idle is not None:
+        opts.append((socket.IPPROTO_TCP, idle, 60))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 20))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3))
+    return opts
+
+
+def _env_proxy_set() -> bool:
+    return any(
+        os.environ.get(k)
+        for k in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+    )
+
+
+def _get_async_http_client(total: float, chunk_timeout: float) -> Any:
+    """Shared ``httpx.AsyncClient`` for OpenAI-compatible providers.
+
+    - ``keepalive_expiry`` is short so idle pooled sockets (killed silently by
+      NAT / VPN switches) are closed before they can be reused.
+    - The read timeout is bounded (a half-open socket would otherwise hang for
+      the full 900s request timeout, which is the "waiting for model" freeze).
+    - TCP keepalive probes detect a really dead connection (no time limit on
+      thinking). A custom transport is used only when no env proxy is set, so
+      env proxies are still honoured.
+    """
+    import httpx
+
+    read = max(float(chunk_timeout or 0) + 30.0, 180.0)
+    if total:
+        read = min(read, float(total))
+    key = int(read)
+    with _http_clients_lock:
+        client = _http_clients.get(key)
+        if client is not None and not client.is_closed:
+            return client
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=20.0,
+        )
+        extra: dict[str, Any] = {}
+        if not _env_proxy_set():
+            # Passing `transport=` disables httpx's env-proxy handling, so only
+            # do it when there is no env proxy to honour.
+            extra["transport"] = httpx.AsyncHTTPTransport(
+                limits=limits, socket_options=_tcp_keepalive_options()
+            )
+        else:
+            extra["limits"] = limits
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(read, connect=15.0, write=60.0, pool=30.0),
+            follow_redirects=True,
+            **extra,
+        )
+        _http_clients[key] = client
+        return client
+
+
+def reset_http_clients() -> None:
+    """Forget the cached HTTP clients so the next build opens fresh sockets.
+
+    Old clients are NOT closed: other chats may still be streaming on them.
+    """
+    with _http_clients_lock:
+        _http_clients.clear()
+
+
+def _is_connection_dropped(exc: BaseException) -> bool:
+    """True for transport-level failures (dead socket, reset, DNS, lost upstream)."""
+    import httpx
+
+    try:
+        import openai
+
+        _types: tuple[type, ...] = (httpx.TransportError, openai.APIConnectionError)
+    except Exception:  # noqa: BLE001
+        _types = (httpx.TransportError,)
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, _types):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    low = str(exc).lower()
+    return any(
+        s in low
+        for s in (
+            "connection error",
+            "upstream connection lost",
+            "connection reset",
+            "server disconnected",
+            "remote protocol error",
+        )
+    )
+
+
+def rebuild_model_fresh(model: Any) -> Any:
+    """Rebuild ``model`` on a brand-new HTTP pool (same key / settings)."""
+    reset_http_clients()
+    keys, _rest = model_key_fallback(model)
+    return _clone_model_with_key(model, keys[0] if keys else "")
 
 
 def _stamp_key_fallback(
@@ -1188,7 +1336,7 @@ async def chat_model_settings(
     parallel-tool-calls flag. Heavy reasoning/usage bookkeeping is dropped (the
     LangGraph runner tracks usage itself).
     """
-    temp = {"ask": 0.4, "plan": 0.3, "coder": 0.2}.get(mode, 0.4)
+    temp = {"ask": 0.4, "plan": 0.3, "build": 0.2}.get(mode, 0.4)
 
     max_output = 0
     try:
@@ -1236,7 +1384,6 @@ def provider_prompt_cache(provider: str) -> bool:
 # Shared LangChain execution helpers (one-shot completion + tool loop)
 # ---------------------------------------------------------------------------
 
-import inspect
 
 from langchain_core.messages import (
     AIMessage,
@@ -2111,8 +2258,9 @@ class _BatchStreakTracker:
 # Touches of the SAME file / grep scope across steps in one turn. The model
 # pages one file step after step (symbols, then a head window, then another
 # window) instead of finishing it in one decisive call — and every such step
-# is a full round-trip even when the result is a 2-line stub.
-_REVISIT_STREAK_TOUCHES = 3
+# is a full round-trip even when the result is a 2-line stub. Threshold 2:
+# the first re-touch already burns a round-trip, so remind immediately.
+_REVISIT_STREAK_TOUCHES = 2
 
 
 def _revisit_ranges(path: str) -> str:
@@ -2229,6 +2377,41 @@ class _RevisitStreakTracker:
             "step after step (each step is a full round-trip):\n"
             + "\n".join(lines[:3])
         )
+
+
+def _normalized_call_sig(name: str, args: dict) -> str:
+    """Loop-guard signature: tool name + only the args that define the work.
+
+    For read/grep/glob, windowing args (offset/limit/ranges) and cosmetic
+    variants are dropped so "same file, different window" counts as a repeat
+    — the model paging one file step after step is the loop shape we must
+    catch. Other tools keep the full args (exact-arg repeats only).
+    """
+    name = str(name or "").lower()
+    args = args or {}
+    if name == "read":
+        paths = [str(p) for p in [args.get("filePath"), *list(args.get("filePaths") or [])] if p]
+        return f"read:{'|'.join(sorted(set(paths)))}"
+    if name == "grep":
+        # Keep the pattern: different terms on one scope are DIFFERENT work
+        # (the revisit tracker nudges that shape softly); only the exact
+        # same scope+pattern repeat is a doom-loop. Cosmetic args (max_results)
+        # collapse so the repeat is still caught.
+        scope = f"{args.get('path') or ''}|{args.get('include') or ''}"
+        return f"grep:{scope}|{args.get('pattern') or ''}"
+    if name == "glob":
+        pats = "|".join(
+            sorted(
+                str(p)
+                for p in [args.get("pattern") or "", *list(args.get("patterns") or [])]
+                if p
+            )
+        )
+        return f"glob:{pats}|{args.get('path') or ''}"
+    try:
+        return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+    except Exception:  # noqa: BLE001 — signature must never fail
+        return f"{name}:{args!r}"
 
 
 def _read_windows(args: dict) -> list[tuple[str, int, int]]:
@@ -2613,6 +2796,62 @@ async def langchain_tool_loop(
         }
         dedupe_step_tool_call_ids(ai, _reserved_tc_ids)
         msgs.append(ai)
+        # --- doom-loop guard (opencode's repeated-call detector) ---
+        # NORMALIZED signature: read keeps only the file identity (windowing
+        # args dropped), grep/glob keep scope+pattern — so paging one file
+        # window after window counts as a repeat, the near-miss loop shape the
+        # exact-args guard missed. Runs BEFORE execution so a repeated step is
+        # short-circuited instead of re-burning tool I/O for the same result.
+        _step_sig = "|".join(
+            _normalized_call_sig(tc.get("name") or "", tc.get("args") or {})
+            for tc in tcs
+        )
+        if _step_sig == _last_call_sig:
+            _same_call_streak += 1
+        else:
+            _same_call_streak = 1
+            _last_call_sig = _step_sig
+        if _same_call_streak >= _DOOM_LOOP_LIMIT:
+            # Hard stop: the model is stuck. Inject as HumanMessage (not
+            # SystemMessage) so it lands mid-list without violating chat
+            # templates that require SystemMessage only at position 0
+            # (e.g. Qwen3.5 / llama.cpp).
+            msgs.append(
+                HumanMessage(
+                    content=(
+                        "[steering] You have issued the same tool call 3 times "
+                        "in a row (same file/scope) — this is a loop. Stop "
+                        "calling tools and report your findings in text now."
+                    )
+                )
+            )
+            break
+        if _same_call_streak >= 2:
+            # Second consecutive identical step: cheap transient nudge (next
+            # request only) + repeat short-circuit — point the model back at
+            # the transcript instead of re-executing the identical calls.
+            _transient.clear()
+            _transient.append(
+                HumanMessage(
+                    content=(
+                        "[steering] You just repeated the previous step's tool "
+                        "call (same file/scope). Its result is already in the "
+                        "transcript above — do NOT re-run it. Change your "
+                        "approach or report your findings in text now."
+                    )
+                )
+            )
+            for tc in tcs:
+                append_tool_result(
+                    msgs,
+                    (
+                        "[repeat] This call is identical to the previous "
+                        "step's call — its result is already in the transcript "
+                        "above. Do not re-issue it; use what you already hold."
+                    ),
+                    tc.get("id", ""),
+                )
+            continue
         # ── Deduplicate identical tool calls ──────────────────────────
         # The model sometimes outputs the same (name, args) pair twice in one
         # step.  Execute each unique call once and reuse the result for the
@@ -2735,33 +2974,6 @@ async def langchain_tool_loop(
             _transient.append(HumanMessage(content=_batch_hint.strip()))
         if _is_plan_only_step(tcs) and not _plan_only_step_marks_progress(tcs):
             _transient.append(HumanMessage(content=_PLAN_ONLY_NUDGE))
-        # --- doom-loop guard (opencode's repeated-call detector) ---
-        # Build a signature of THIS step's tool calls; if it matches the previous
-        # step exactly N times in a row, the model is looping — inject a hard
-        # stop so it reports findings instead of burning more tokens.
-        _step_sig = "|".join(
-            f"{tc.get('name')}:{json.dumps(tc.get('args') or {}, sort_keys=True, ensure_ascii=False)}"
-            for tc in tcs
-        )
-        if _step_sig == _last_call_sig:
-            _same_call_streak += 1
-        else:
-            _same_call_streak = 1
-            _last_call_sig = _step_sig
-        if _same_call_streak >= _DOOM_LOOP_LIMIT:
-            # Inject as HumanMessage (not SystemMessage) so it lands mid-list
-            # without violating chat templates that require SystemMessage only
-            # at position 0 (e.g. Qwen3.5 / llama.cpp).
-            msgs.append(
-                HumanMessage(
-                    content=(
-                        "[steering] You have issued the same tool call 3 times in a row "
-                        "with identical arguments — this is a loop. Stop calling tools "
-                        "and report your findings in text now."
-                    )
-                )
-            )
-            break
         # Reclaim the sub-agent's isolated context mid-run before it overflows
         # and the whole task fails. Mirrors graph._maybe_auto_compact but works
         # directly on the LangChain message list (no state/queue), so a sub-agent

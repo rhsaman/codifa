@@ -115,12 +115,12 @@ async def test_throttle_retry_continues_without_resume(run_events, monkeypatch):
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
     ]
-    # The coder agent writes first (request 0); its trailing text reply is
+    # The build agent writes first (request 0); its trailing text reply is
     # request 1. Throttle that so the turn retries from the REAL transcript
     # (the write result is already in `messages`).
     mock.error_at = {1: (429, "Rate limit exceeded. Please try again later.")}
 
-    events = await run_events("create app.py with a foo function", mode="coder")
+    events = await run_events("create app.py with a foo function", mode="build")
 
     retries = _retry_events(events)
     assert retries, "expected an auto-retry event after the throttle"
@@ -151,16 +151,18 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
         tool_call("write_file", json.dumps({"path": "app.py", "content": "def foo():\n    return 42\n"})),
         text_reply("Done"),
     ]
-    # The coder agent writes first (request 0); two consecutive throttles on its
+    # The build agent writes first (request 0); two consecutive throttles on its
     # trailing text replies (request indices 1 and 2).
-    mock.error_at = {1: (429, "Rate limit exceeded. Please try again later."),
-                     2: (429, "Rate limit exceeded. Please try again later.")}
+    mock.error_at = {
+(429, "Rate limit exceeded. Please try again later."),
+(429, "Rate limit exceeded. Please try again later."),
+    }
 
-    events = await run_events("create app.py with a foo function", mode="coder")
+    events = await run_events("create app.py with a foo function", mode="build")
 
     retries = _retry_events(events)
     assert len(retries) == 2, f"expected 2 auto-retries, got {len(retries)}"
-    # Same reconnecting=True contract as the single-retry test: the frontend
+    # Same reconnecting=True contract as single-retry test: the frontend
     # relies on this flag to distinguish backend self-heal from user restart.
     assert all(e.get("reconnecting") is True for e in retries), (
         f"every backend retry event must include reconnecting=True, got: {retries}"
@@ -213,7 +215,7 @@ async def test_500_active_output_then_retries(run_events, monkeypatch):
     # درخواست دوم (index 1) 429 → retry (چون agent قبلاً output داشته).
     mock.error_at = {1: (429, "rate limited")}
 
-    events = await run_events("create a.py", mode="coder")
+    events = await run_events("create a.py", mode="build")
 
     retries = _retry_events(events)
     assert retries, \
@@ -281,7 +283,7 @@ async def test_retry_gives_up_at_max_attempts(run_events, monkeypatch):
         agents._RETRY_MAX_ATTEMPTS + 2
     )}
 
-    events = await run_events("hi", mode="coder")
+    events = await run_events("hi", mode="build")
 
     retries = _retry_events(events)
     giveups = [e for e in events if e.get("kind") == "retry_giveup"]
@@ -332,13 +334,13 @@ async def test_retry_counter_resets_after_progress(run_events, monkeypatch):
     # reset) → this is the 3rd IDLE failure → the whole-turn wall (3) is hit
     # → giveup instead of another retry event.
     mock.error_at = {
-        0: (429, "Rate limit exceeded."),
-        1: (429, "Rate limit exceeded."),
-        3: (429, "Rate limit exceeded."),
-        4: (429, "Rate limit exceeded."),
+(429, "Rate limit exceeded."),
+(429, "Rate limit exceeded."),
+(429, "Rate limit exceeded."),
+(429, "Rate limit exceeded."),
     }
 
-    events = await run_events("create a.py", mode="coder")
+    events = await run_events("create a.py", mode="build")
 
     retries = _retry_events(events)
     giveups = [e for e in events if e.get("kind") == "retry_giveup"]
@@ -443,7 +445,7 @@ async def test_client_abort_stops_cleanly_no_error_event(mock_server, workspace)
         base_url=base,
         api_key="test",
         root=str(workspace),
-        mode="coder",
+        mode="build",
         prompt="say hi",
         history=[],
         chat_id="pytest-abort",

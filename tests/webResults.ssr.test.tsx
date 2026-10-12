@@ -162,6 +162,36 @@ check('مورد چهارم (module_3) نمایش داده نشد', !manyHtml.inc
 check('خط truncate (more) نمایش داده شد', manyHtml.includes('more'))
 check('تعداد محدود (۳ آیتم + ۱ more) رعایت شد', (manyHtml.match(/class="file-result"/g) || []).length === 3)
 
+console.log('8) FileResultLinks: duplicate read results deduped to one row:')
+{
+  const dupItems = [
+    { path: 'backend/tools.py' },
+    { path: 'backend/tools.py' },
+    { path: 'backend/tools.py' },
+  ] as never
+  let dupHtml = ''
+  try {
+    dupHtml = renderToString(<FileResultLinks tool="read" items={dupItems} />)
+    check('rendered', dupHtml.length > 0)
+  } catch (e) {
+    check('rendered', false, e)
+  }
+  check('single unique row', (dupHtml.match(/class="file-result"/g) || []).length === 1, dupHtml.slice(0, 500))
+  check('no more button for deduped singles', !dupHtml.includes('more'))
+  const distinctItems = [
+    { file: 'a.py', line: 1, text: 'x = 1' },
+    { file: 'a.py', line: 2, text: 'y = 2' },
+  ] as never
+  let distinctHtml = ''
+  try {
+    distinctHtml = renderToString(<FileResultLinks tool="grep" items={distinctItems} />)
+    check('distinct rendered', distinctHtml.length > 0)
+  } catch (e) {
+    check('distinct rendered', false, e)
+  }
+  check('distinct lines kept as two rows', (distinctHtml.match(/class="file-result"/g) || []).length === 2, distinctHtml.slice(0, 500))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

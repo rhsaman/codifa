@@ -74,7 +74,7 @@ async def run_scenario(monkeypatch, scenario):
     monkeypatch.setattr(graph, "_clear_turn_checkpoint", AsyncMock())
     monkeypatch.setattr(graph._agents, "_drain_steer", AsyncMock(return_value=[]))
     queue = asyncio.Queue()
-    reply = await graph._run_mode_turn({"chat_id": "آزمون", "context_window": 0}, "coder", queue)
+    reply = await graph._run_mode_turn({"chat_id": "آزمون", "context_window": 0}, "build", queue)
     assert reply == "انجام شد"
     assert not any(e.get("kind") == "error" for e in list(queue._queue))
     return requests, executions, checkpoints

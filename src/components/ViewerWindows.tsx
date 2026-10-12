@@ -435,7 +435,10 @@ export function ViewerWindows() {
 
   if (panelMode) {
     return (
-      <div className="panel-pane">
+      <div
+        className="panel-pane"
+        style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}
+      >
         <ScheduleSection />
         <SubagentsSection />
         <TodosSection />

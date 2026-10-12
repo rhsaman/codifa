@@ -68,7 +68,7 @@ def test_cheap_truncation_skips_rerun_until_regrow():
 
 def test_computer_filtered_without_grant_or_intent():
     tools = {"computer": lambda: None, "read": lambda: None, "grep": lambda: None}
-    out = graph.filter_tools_for_mode("coder", dict(tools), {}, set(), True, False, prompt="fix the bug")
+    out = graph.filter_tools_for_mode("build", dict(tools), {}, set(), True, False, prompt="fix the bug")
     assert "computer" not in out
     assert "read" in out
 
@@ -77,7 +77,7 @@ def test_computer_kept_with_allow_computer():
     """The toggle ON keeps the tool bound regardless of prompt content."""
     tools = {"computer": lambda: None, "read": lambda: None}
     out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False,
+        "build", dict(tools), {}, set(), True, False,
         prompt="fix the database table", allow_computer=True,
     )
     assert "computer" in out
@@ -90,7 +90,7 @@ def test_computer_hard_toggle_prompt_intent_does_not_bind():
     tool even for an explicit desktop request."""
     tools = {"computer": lambda: None, "read": lambda: None}
     out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False, prompt="take a screenshot of the desktop app",
+        "build", dict(tools), {}, set(), True, False, prompt="take a screenshot of the desktop app",
     )
     assert "computer" not in out
 
@@ -99,7 +99,7 @@ def test_computer_hard_toggle_history_intent_does_not_bind():
     tools = {"computer": lambda: None, "read": lambda: None}
     history = [{"role": "user", "content": "look at my open chrome tabs"}]
     out = graph.filter_tools_for_mode(
-        "coder", dict(tools), {}, set(), True, False, prompt="continue", history=history,
+        "build", dict(tools), {}, set(), True, False, prompt="continue", history=history,
     )
     assert "computer" not in out
 

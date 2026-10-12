@@ -69,6 +69,7 @@ console.log('3) تب Tools: لیبل مدل ابزارها اسم پراویدر
           name: 'justwoker',
           kind: 'custom',
           apiKey: '',
+          apiKeys: [],
           baseUrl: 'http://localhost:8080/v1',
           model: 'main-m',
           pricingMap: {},
@@ -97,6 +98,7 @@ console.log('3) تب Tools: لیبل مدل ابزارها اسم پراویدر
   )
   check('پیشوند تکراری جمع می‌شود', toolModelLabel('custom-abc123/custom-abc123/my-model', providers) === 'justwoker/my-model')
   check('مقدار خالی → Main model', toolModelLabel('', providers) === 'Main model')
+  check('laya → Laya (local)', toolModelLabel('laya', providers) === 'Laya (local)')
   check('id ناشناخته به‌صورت خام برمی‌گردد', toolModelLabel('other/m', providers) === 'other/m')
   check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0, networkCalls)
 }
@@ -113,8 +115,8 @@ console.log('4) toolModelTarget: هایلایت فقط روی ردیف provider/
       // دو provider که هر دو مدل همنام «mimo-v2.5» را دارند — دقیقاً
       // سناریوی باگ: قبلاً انتخاب یکی، هر دو ردیف را هایلایت می‌کرد.
       providers: [
-        { id: 'kiraai', name: 'KiraAI', kind: 'custom', apiKey: '', baseUrl: 'https://a/v1', model: 'mimo-v2.5', pricingMap: {} },
-        { id: 'exp-labs', name: 'ExperientialLabs', kind: 'custom', apiKey: '', baseUrl: 'https://b/v1', model: 'mimo-v2.5', pricingMap: {} },
+        { id: 'kiraai', name: 'KiraAI', kind: 'custom', apiKey: '', apiKeys: [], baseUrl: 'https://a/v1', model: 'mimo-v2.5', pricingMap: {} },
+        { id: 'exp-labs', name: 'ExperientialLabs', kind: 'custom', apiKey: '', apiKeys: [], baseUrl: 'https://b/v1', model: 'mimo-v2.5', pricingMap: {} },
       ],
     },
   })
@@ -147,8 +149,20 @@ console.log('4) toolModelTarget: هایلایت فقط روی ردیف provider/
   // حالت‌های بدون ردیف متناظر
   check('مقدار خالی → null', toolModelTarget('', providers, active) === null)
   check('«main model» → null', toolModelTarget('main model', providers, active) === null)
+  check('«laya» → null (local, no provider row)', toolModelTarget('laya', providers, active) === null)
   check('provider ناشناخته → null', toolModelTarget('other/mimo-v2.5', providers, active) === null)
   check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0)
+}
+
+console.log('5) Decision model UI (Tools selector + Models Laya card):')
+{
+  networkCalls = 0
+  const toolsHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="tools" />)
+  check('Tools tab shows the Decision model selector', toolsHtml.includes('Decision model'))
+  const modelsHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="models" />)
+  check('Models tab shows the Laya download card', modelsHtml.includes('Decision model (Laya)'))
+  check('Models tab Laya card offers Download', modelsHtml.includes('Download'))
+  check('No network calls while rendering', networkCalls === 0, networkCalls)
 }
 
 if (failed > 0) {

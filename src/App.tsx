@@ -23,15 +23,17 @@ import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePlatform } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePlatform, prefixMoveDir } from './lib/shortcuts'
 import { resolveChatClose } from './lib/chatClose'
-import { collectChatIds } from './lib/chatTree'
+import { collectChatIds, pickNeighborWindow } from './lib/chatTree'
+import { focusChatInput } from './lib/chatFocus'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
 import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 import { WindowStripCluster } from './components/WindowStripCluster'
+import { WorkspaceMenuButton } from './components/WorkspaceMenuButton'
 import { TerminalPanel } from './components/TerminalPanel'
 
 export default function App() {
@@ -253,6 +255,51 @@ export default function App() {
       if (prefixActiveRef.current) {
         cancelPrefix()
         const k = physicalKey(e)
+        // Ctrl+X then H/J/K/L moves the focused chat window vim-style
+        // (swaps with the neighbor). Wins over other `l` bindings when a
+        // neighbor exists; otherwise falls through so Ctrl+X L still
+        // toggles the live session in single-window mode.
+        const moveDir = prefixMoveDir(k)
+        if (moveDir) {
+          const t = e.target as HTMLElement | null
+          const inDialog = !!t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')
+          if (!inDialog && !t?.closest?.('.terminal-panel')) {
+            const st = useStore.getState()
+            const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
+            if (ids.length > 1) {
+              const els = document.querySelectorAll<HTMLElement>('[data-chat-window]')
+              const centers: Record<string, { x: number; y: number }> = {}
+              els.forEach((el) => {
+                const id = el.getAttribute('data-chat-window')
+                if (!id) return
+                if (el.classList.contains('window-hidden') || el.getAttribute('aria-hidden') === 'true') return
+                const r = el.getBoundingClientRect()
+                if (r.width <= 0 || r.height <= 0) return
+                centers[id] = { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+              })
+              const target = pickNeighborWindow(centers, st.activeChatId, moveDir)
+              if (target) {
+                e.preventDefault()
+                e.stopPropagation()
+                st.dropChatOnto(st.activeChatId, target, 'center')
+                const after = useStore.getState().activeChatId
+                if (after) requestAnimationFrame(() => focusChatInput(after))
+                return
+              }
+            }
+          }
+          // No neighbor to move toward: h/j/k do nothing, l falls through
+          // to the live toggle below so single-window behavior is unchanged.
+          if (k !== 'l') return
+        }
+        // Live session has a dedicated toggle (coder:toggle-live), separate
+        // from dictation (coder:toggle-voice) so the modes never mix.
+        // Ctrl+X then L toggles the live session only (when no window move happened).
+        if (k === 'l') {
+          e.preventDefault()
+          window.dispatchEvent(new CustomEvent('coder:toggle-live'))
+          return
+        }
         const sc = PREFIX_SHORTCUTS[k]
         if (sc) {
           e.preventDefault()
@@ -322,16 +369,38 @@ export default function App() {
             }
           }
         }
-        const typing =
-          !inTerminal &&
+        if (inDialog) {
+          e.preventDefault()
+          e.stopPropagation()
+          return
+        }
+        if (inTerminal) {
+          e.preventDefault()
+          e.stopPropagation()
+          window.dispatchEvent(new CustomEvent('coder:close-terminal-tab'))
+          return
+        }
+        // Always swallow Ctrl+W so the app itself never closes. A single
+        // chat window closes its own tab (draft survives in the sidebar);
+        // typing in other inputs is swallowed without closing to avoid
+        // eating a draft mid-sentence.
+        e.preventDefault()
+        e.stopPropagation()
+        const ownWinEl = t?.closest?.('[data-chat-window]') as HTMLElement | null
+        const ownWinId = ownWinEl?.getAttribute('data-chat-window') || null
+        if (ownWinId) {
+          const stOwn = useStore.getState()
+          const treeIdsOwn = stOwn.chatTree ? collectChatIds(stOwn.chatTree) : stOwn.visibleChatIds
+          const action = resolveChatClose(ownWinId, treeIdsOwn, stOwn.activeChatId)
+          if (action?.kind === 'window') stOwn.closeWindow(action.id)
+          else if (action && action.id) stOwn.closeChatTab(action.id)
+          return
+        }
+        const typingInInput =
           !!t &&
           (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
-        if (!typing) {
-          e.preventDefault()
-          if (inTerminal) {
-            window.dispatchEvent(new CustomEvent('coder:close-terminal-tab'))
-            return
-          }
+        if (typingInInput) return
+        {
           const vt = useViewerTabs.getState()
           if (vt.activeId) vt.closeViewer(vt.activeId)
           else {
@@ -435,6 +504,7 @@ export default function App() {
                 role="banner"
               >
                 <WindowStripCluster />
+                <WorkspaceMenuButton root={activeChatRoot} />
                 <div id="titlebar-toolbar" />
                 <UpdateButton />
                 {/* Empty stretch that carries the window drag region: the bar

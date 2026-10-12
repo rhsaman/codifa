@@ -22,14 +22,14 @@ const SYSTEM = 'system prompt base'
 console.log('۱) سوییچ mode نباید کانتکست را کم کند (بدون MODE_HISTORY_CAPS):')
 {
   // opencode has NO per-mode history cap — the full history is sent every turn
-  // regardless of mode. So estimateContextTokens must be identical for ask/coder.
+  // regardless of mode. So estimateContextTokens must be identical for ask/build.
   const msgs = Array.from({ length: 20 }, (_, i) => ({
     role: i % 2 === 0 ? 'user' : 'assistant',
     content: `message number ${i} with some reasonable length text`,
   }))
   const ask = estimateContextTokens(mkChat(msgs, 'ask'), SYSTEM, 200000)
-  const coder = estimateContextTokens(mkChat(msgs, 'coder'), SYSTEM, 200000)
-  check('ask و coder یکسان محاسبه می‌کنند (سقف به‌ازای mode نداریم)', ask === coder, { ask, coder })
+  const build = estimateContextTokens(mkChat(msgs, 'build'), SYSTEM, 200000)
+  check('ask و build یکسان محاسبه می‌کنند (سقف به‌ازای mode نداریم)', ask === build, { ask, build })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 // Store-level test: a retry (restart-from-message) must run in the CURRENT
 // chat mode, NOT the mode the old message was created in. The user can switch
-// mode (e.g. Plan → Coder) and then hit retry; the re-sent turn must use the
+// mode (e.g. Plan → Build) and then hit retry; the re-sent turn must use the
 // new mode, and the freshly created user bubble must record that mode.
 // Run: npx esbuild test/retryMode.test.ts --bundle --platform=node --format=esm \
 //        --packages=external --outfile=test/.tmp-retry-mode.mjs --external:electron \
@@ -51,8 +51,8 @@ console.log('1) retry بعد از تغییر مود → از مود فعلی ا�
     retry: { attempt: 3, maxAttempts: 3, delay: 0, reason: 'boom', gaveUp: true },
   })
 
-  // User switches to CODER mode (like clicking the mode tab / Tab key).
-  s.setChatMode(chatId, 'coder')
+  // User switches to BUILD mode (like clicking the mode tab / Tab key).
+  s.setChatMode(chatId, 'build')
 
   const ch = () => useStore.getState().chats.find((c) => c.id === chatId)!.messages
   const plan = planRetry(ch(), u1.id, 'message')
@@ -60,20 +60,20 @@ console.log('1) retry بعد از تغییر مود → از مود فعلی ا�
   if (plan?.action === 'restart') {
     // Mimic restartFromMessage: truncate, then send() re-creates the user bubble.
     check('truncateTo موفق', useStore.getState().truncateTo(u1.id) === true)
-    // send() reads chat.mode (now 'coder') and stamps it on the new user bubble.
+    // send() reads chat.mode (now 'build') and stamps it on the new user bubble.
     const freshUser = useStore.getState().addMessage(chatId, {
       role: 'user',
       content: plan.target.content,
       mode: useStore.getState().chats.find((c) => c.id === chatId)!.mode,
     })
     check(
-      'پیام کاربرِ جدید مود فعلی (coder) را دارد، نه مود قدیمی (plan)',
-      freshUser.mode === 'coder',
+      'پیام کاربرِ جدید مود فعلی (build) را دارد، نه مود قدیمی (plan)',
+      freshUser.mode === 'build',
       freshUser.mode,
     )
     check(
-      'مود چت همچنان coder است (تغییر نکرده)',
-      useStore.getState().chats.find((c) => c.id === chatId)!.mode === 'coder',
+      'مود چت همچنان build است (تغییر نکرده)',
+      useStore.getState().chats.find((c) => c.id === chatId)!.mode === 'build',
     )
   }
 }

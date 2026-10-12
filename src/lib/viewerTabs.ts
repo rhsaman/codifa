@@ -3,7 +3,7 @@ import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
 import { useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
-import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, loadChatTree as loadPersistedViewerTreeRaw, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
+import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
 export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text'
 
@@ -122,6 +122,10 @@ interface ViewerTabsState {
    *  verbatim (terminal logs read better raw). */
   openText: (title: string, body: string, format?: 'md' | 'text') => void
   closeViewer: (id: string) => void
+  /** Close all viewer tabs, or only the tabs visible in one chat.
+   *  Closed tabs land in the "Recently closed" list so they can be
+   *  reopened from the tab-list menu. */
+  closeAllViewers: (chatId?: string) => void
   setActiveViewer: (id: string) => void
   /** Last active viewer tab per chat (chatId -> tab id). Multi-window focus
    *  restores each chat's own tab when it becomes focused, so the right
@@ -686,6 +690,48 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       return { tabs, activeId, closedTabs, lastActiveByChat, viewerTree, focusedViewerId }
     }),
+  closeAllViewers: (chatId) =>
+    set((s) => {
+      const toClose = chatId ? visibleTabs(s.tabs, chatId) : s.tabs
+      if (toClose.length === 0) return {}
+      const closeIds = new Set(toClose.map((t) => t.id))
+      const tabs = s.tabs.filter((t) => !closeIds.has(t.id))
+      const activeId = s.activeId && closeIds.has(s.activeId) ? (tabs[0]?.id ?? null) : s.activeId
+      const closedTabs = [
+        ...toClose.map((tab) => ({ tab, closedAt: Date.now() })),
+        ...s.closedTabs.filter((c) => !closeIds.has(c.tab.id)),
+      ].slice(0, CLOSED_CAP)
+      persist(tabs, activeId, closedTabs)
+      const lastActiveByChat = { ...s.lastActiveByChat }
+      for (const removed of toClose) {
+        if (removed.chatId && lastActiveByChat[removed.chatId] && closeIds.has(lastActiveByChat[removed.chatId])) {
+          delete lastActiveByChat[removed.chatId]
+        }
+      }
+      let viewerTree = s.viewerTree
+      let focusedViewerId = s.focusedViewerId
+      if (viewerTree && toClose.some((t) => viewerTreeContains(viewerTree, t.id))) {
+        const valid = new Set(tabs.map((t) => t.id))
+        let tree: ChatTreeNode | null = viewerTree
+        for (const t of toClose) {
+          tree = removeViewerLeaf(tree, t.id)
+          if (!tree) break
+        }
+        viewerTree = normalizeViewerTreeRaw(tree, valid)
+        if (!viewerTree && tabs.length > 0) {
+          const fallback = activeId && valid.has(activeId) ? activeId : tabs[0]?.id
+          viewerTree = fallback ? buildViewerTree([fallback], 'row') : null
+        }
+        persistViewerTree(viewerTree)
+        const ids = viewerTree ? collectViewerTabIds(viewerTree) : []
+        if ((focusedViewerId && closeIds.has(focusedViewerId)) || (focusedViewerId && !ids.includes(focusedViewerId))) {
+          focusedViewerId = activeId ?? ids[0] ?? null
+        }
+      } else if (focusedViewerId && closeIds.has(focusedViewerId)) {
+        focusedViewerId = activeId
+      }
+      return { tabs, activeId, closedTabs, lastActiveByChat, viewerTree, focusedViewerId }
+    }),
   setActiveViewer: (id) =>
     set((s) => {
       const tab = s.tabs.find((t) => t.id === id)
@@ -860,7 +906,17 @@ export function syncViewerToChat(chatId: string): void {
   if (visible.length === 0) return
   const target = resolveViewerForChat(visible, vt.lastActiveByChat, chatId)
   if (target && vt.activeId !== target) {
-    vt.setActiveViewer(target)
+    // Chat switch must not exit panel mode (todos/schedules): update the
+    // background active tab so leaving the panel shows the right tab,
+    // but keep panelMode untouched.
+    const tab = vt.tabs.find((t) => t.id === target)
+    const lastActiveByChat = tab?.chatId
+      ? { ...vt.lastActiveByChat, [tab.chatId]: target }
+      : vt.lastActiveByChat
+    const focusedViewerId =
+      vt.viewerTree && viewerLeafCount(vt.viewerTree) > 1 ? vt.focusedViewerId : target
+    persist(vt.tabs, target, vt.closedTabs)
+    useViewerTabs.setState({ activeId: target, lastActiveByChat, focusedViewerId })
   }
 }
 

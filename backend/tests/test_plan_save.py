@@ -162,7 +162,7 @@ async def test_plan_revision_saves_streamed_text(tmp_path, monkeypatch):
     assert saved[0].startswith("## Plan")
     assert "second step" in saved[1], saved[1]
     assert result["plan"].startswith("## Plan")
-    assert result["mode"] == "coder"
+    assert result["mode"] == "build"
 
 
 @pytest.mark.asyncio
@@ -375,8 +375,8 @@ async def test_plan_save_uses_loader_workspace_slug(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_coder_node_emits_plan_card_when_writing_plan(tmp_path, monkeypatch):
-    from graph import coder_node
+async def test_build_node_emits_plan_card_when_writing_plan(tmp_path, monkeypatch):
+    from graph import build_node
 
     plan_body = "## Plan\n1. do the thing\nFiles: backend/graph.py"
 
@@ -391,15 +391,15 @@ async def test_coder_node_emits_plan_card_when_writing_plan(tmp_path, monkeypatc
     monkeypatch.setattr(graph, "_run_mode_turn", fake_turn)
 
     q: asyncio.Queue = asyncio.Queue()
-    state = {"_queue": q, "root": str(tmp_path), "chat_id": "c-coder", "mode": "coder"}
-    result = await coder_node(state)
+    state = {"_queue": q, "root": str(tmp_path), "chat_id": "c-build", "mode": "build"}
+    result = await build_node(state)
 
     assert saved.get("content", "").startswith("## Plan"), saved
     kinds = []
     while not q.empty():
         kinds.append(q.get_nowait().get("kind"))
     assert "plan_card" in kinds, kinds
-    assert result["coder_result"] == "implemented the thing"
+    assert result["build_result"] == "implemented the thing"
 
 
 @pytest.mark.asyncio
@@ -434,3 +434,57 @@ def test_plan_items_from_persian_digits():
     assert items[0]["content"] == "قدم اول"
     assert items[1]["content"] == "قدم دوم"
     assert items[2]["content"] == "قدم سوم"
+
+
+def test_plan_progress_line_is_one_line():
+    # Cheap resume memory: a single short line, not the full checklist.
+    from graph import _plan_progress_line, _plan_status_message
+
+    plan = [
+        {"content": "step one", "status": "completed"},
+        {"content": "step two", "status": "in_progress"},
+        {"content": "step three", "status": "pending"},
+    ]
+    line = _plan_progress_line(plan)
+    assert line.startswith("1/3 done")
+    assert "step two" in line
+    assert "\n" not in line
+    assert len(line) < 160
+    msg = _plan_status_message(plan)
+    assert msg is not None
+    assert "\n- [" not in str(msg.content)
+
+
+@pytest.mark.asyncio
+async def test_update_plan_persists_and_hydrates(tmp_path, monkeypatch):
+    # Open checklist survives a restart: update_plan writes checklist.json,
+    # and fresh callbacks reload it so the nudge backstop keeps working.
+    import tools as tools_mod
+    from tools import make_tool_callbacks
+
+    monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
+    chat = "c-persist-hydrate"
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)
+    tools = make_tool_callbacks(
+        root=str(tmp_path), emit=lambda _e: None, main_model=None, chat_id=chat
+    )
+    await tools["update_plan"](
+        [
+            {"content": "step one", "status": "pending"},
+            {"content": "step two", "status": "pending"},
+        ]
+    )
+    import state_db
+
+    ws = state_db.workspace_slug_for_root(str(tmp_path))
+    assert len(state_db.get_checklist(ws, chat)) == 2
+    # Simulate a process restart: drop the in-memory copy only.
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools2 = make_tool_callbacks(
+        root=str(tmp_path), emit=lambda _e: None, main_model=None, chat_id=chat
+    )
+    out = await tools2["write_file"](path="n.txt", content="hello")
+    assert "checklist still has open steps" in out, out
+    tools_mod._PLAN_BY_CHAT.pop(chat, None)
+    tools_mod._PLAN_MUTATING_SINCE_UPDATE.pop(chat, None)

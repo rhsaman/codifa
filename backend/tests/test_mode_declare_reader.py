@@ -41,8 +41,8 @@ def test_reader_note_includes_output_contract_scoping():
 
 
 def test_all_four_modes_declare_distinct_caps():
-    notes = {m: _mode_declare(m) for m in ("ask", "plan", "coder", "reader")}
+    notes = {m: _mode_declare(m) for m in ("ask", "plan", "build", "reader")}
     # هر چهار مد باید برچسب متفاوت و تواناییِ متمایز داشته باشن
-    assert notes["ask"] != notes["plan"] != notes["coder"] != notes["reader"]
+    assert notes["ask"] != notes["plan"] != notes["build"] != notes["reader"]
     for m, note in notes.items():
         assert f"=== CURRENT MODE: {m.capitalize()} ===" in note

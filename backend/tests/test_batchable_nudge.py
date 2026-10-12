@@ -595,8 +595,11 @@ class _CoveredReadLoopModel:
 
 
 def test_loop_serves_repeated_reads_without_stop():
-    """Repeated overlapping reads are all served; no coverage stop order
-    is ever injected and the loop runs to the model's own budget."""
+    """Repeated reads of the SAME file (window after window) are the paging
+    loop the normalized signature must catch: the first read executes, the
+    second is short-circuited with a [repeat] pointer back to the transcript,
+    and the third breaks the loop with the steering message. No coverage
+    stop order is ever injected."""
     model = _CoveredReadLoopModel(steps=8)
     reads: list[dict] = []
 
@@ -616,8 +619,11 @@ def test_loop_serves_repeated_reads_without_stop():
         )
     )
     assert not model.saw_stop, "no coverage stop order must reach the model"
-    assert len(reads) == model._max, (
-        f"every repeat must execute, but only {len(reads)} ran"
+    # The repeat short-circuit serves steps 2+ from the transcript, so the
+    # tool only really executes ONCE; the loop breaks at the 3rd identical
+    # step with the steering message (never a coverage stop order).
+    assert len(reads) == 1, (
+        f"repeat short-circuit failed: {len(reads)} reads ran (want 1)"
     )
 
 
@@ -738,26 +744,12 @@ async def test_coalesce_io_falls_back_to_single_outside_step():
 
 
 @pytest.mark.asyncio
-async def test_scoped_read_batch_partial_scope():
-    """رگرسیون wrapper اسکوپ‌شده: یک مسیر خارج از اسکوپ در batch نباید کل
-    batch را رد کند — مسیرهای مجاز خوانده می‌شوند و مسیر رد‌شده در فوتر
-    گزارش می‌شود (رفع «خواندن دسته‌ای خطا داد» → برگشت به read های جدا)."""
+async def test_no_scope_wrapper_anymore():
+    """Scope gate is removed: every workspace file is readable, no wrapper filters paths."""
     import agents as _agents
 
-    async def fake_read(filePath, offset=1, limit=2000, filePaths=None, ranges=None, **kw):
-        paths = [filePath, *(filePaths or [])]
-        return "\n\n".join(f"<path>{p}</path>\nOK" for p in paths)
-
-    wrapped = _agents._wrap_scoped_read(fake_read, {"a.py", "b.py"})
-    # یک مسیر خارج از اسکوپ (c.py) — بقیه باید خوانده شوند.
-    out = await wrapped(filePath="a.py", filePaths=["b.py", "c.py"])
-    assert "<path>a.py</path>" in out
-    assert "<path>b.py</path>" in out
-    assert "<path>c.py</path>" not in out  # مسیر خارج از اسکوپ اجرا نشد
-    assert "c.py" in out  # اما در فوتر گزارش شد
-    # همه‌ی مسیرها خارج از اسکوپ → خطای واضح (نه سکوت).
-    out2 = await wrapped(filePath="x.py")
-    assert out2.startswith("ERROR")
+    assert not hasattr(_agents, "_wrap_scoped_read")
+    assert not hasattr(_agents, "_scoped_rels")
 
 
 def test_revisit_read_reminds_on_every_later_touch():

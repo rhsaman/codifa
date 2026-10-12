@@ -28,10 +28,37 @@ def _silent_wav() -> bytes:
     return buf.getvalue()
 
 
+def _tone_wav() -> bytes:
+    """A loud 1s 440Hz tone: passes the PCM energy gate in tests."""
+    import math
+    import struct
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        frames = b"".join(
+            struct.pack("<h", int(16000 * math.sin(2 * math.pi * 440 * i / 16000)))
+            for i in range(16000)
+        )
+        wf.writeframes(frames)
+    return buf.getvalue()
+
+
 def _post(client, data: dict):
     return client.post(
         "/transcribe",
         files={"audio": ("clip.wav", _silent_wav(), "audio/wav")},
+        data=data,
+    )
+
+
+def _post_tone(client, data: dict):
+    """POST a loud tone (passes the silence gate) for local-model tests."""
+    return client.post(
+        "/transcribe",
+        files={"audio": ("clip.wav", _tone_wav(), "audio/wav")},
         data=data,
     )
 
@@ -120,11 +147,74 @@ def test_no_provider_field_uses_local():
     fake_model = SimpleNamespace(transcribe=fake_transcribe)
     with patch.object(server, "_get_whisper_model", AsyncMock(return_value=fake_model)):
         client = TestClient(server.app)
-        resp = _post(client, {"lang": "fa"})
+        resp = _post_tone(client, {"lang": "fa"})
 
     assert resp.status_code == 200
     assert resp.json()["text"] == "سلام دنیا"
     assert captured.get("beam_size") == 10
+
+
+def test_remote_filename_matches_audio_content():
+    """Webm uploads must be forwarded as clip.webm, not clip.wav.
+
+    Browsers record webm/opus; some OpenAI-compatible STT gateways pick the
+    decoder from the filename extension and reject webm bytes named clip.wav
+    with "could not process file" (live voice failed while dictate kept
+    working on a lenient path).
+    """
+    client = TestClient(server.app)
+    captured: dict = {}
+
+    async def fake_post(self, url, headers=None, files=None, data=None):
+        captured.update({"files": files})
+        resp = SimpleNamespace(status_code=200, text='{"text":"hi"}')
+        resp.json = lambda: {"text": "hi"}
+        return resp
+
+    webm = bytes([0x1A, 0x45, 0xDF, 0xA3]) + b"\x00" * 64
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        resp = client.post(
+            "/transcribe",
+            files={"audio": ("clip", webm, "audio/webm")},
+            data={
+                "provider": "custom",
+                "base_url": "http://localhost:20128/v1",
+                "model": "whisper-1",
+            },
+        )
+
+    assert resp.status_code == 200
+    name, _payload, mime = captured["files"]["file"]
+    assert name == "clip.webm"
+    assert mime == "audio/webm"
+
+
+def test_remote_wav_keeps_wav_filename():
+    """Real wav bytes keep the previous clip.wav contract."""
+    client = TestClient(server.app)
+    captured: dict = {}
+
+    async def fake_post(self, url, headers=None, files=None, data=None):
+        captured.update({"files": files})
+        resp = SimpleNamespace(status_code=200, text='{"text":"hi"}')
+        resp.json = lambda: {"text": "hi"}
+        return resp
+
+    wav = b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 64
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        resp = client.post(
+            "/transcribe",
+            files={"audio": ("clip", wav, "audio/wav")},
+            data={
+                "provider": "custom",
+                "base_url": "http://localhost:20128/v1",
+                "model": "whisper-1",
+            },
+        )
+
+    assert resp.status_code == 200
+    name, _payload, _mime = captured["files"]["file"]
+    assert name == "clip.wav"
 
 
 if __name__ == "__main__":

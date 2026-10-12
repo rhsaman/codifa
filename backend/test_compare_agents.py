@@ -44,7 +44,7 @@ async def run_our_agent(
     workspace: str,
     provider: str = "openrouter",
     model: str = "qwen3-coder-480b",
-    mode: str = "coder",
+    mode: str = "build",
 ) -> AgentResult:
     """Run our agent on a task and collect metrics."""
     print(f"\n{'='*60}")
@@ -105,8 +105,6 @@ async def run_our_agent(
             permission_gates=None,
             ask_gates=None,
             allow_outside=False,
-            nvim_file="",
-            nvim_diagnostics=None,
             vector_db_path="",
             vector_config=None,
             retrieval_config=None,

@@ -492,7 +492,7 @@ export interface BreakdownEstimateOptions {
  *  meta is those compacted summaries themselves (they stay in the transcript
  *  but are no longer resent as messages); skills/MCP come from the real
  *  configs the caller passes in. No fixed floors — the uncovered remainder is
- *  attributed to systemTools by buildContextBreakdown. */
+ *  attributed to messages by buildContextBreakdown. */
 export function estimateBreakdownParts(
   chat: Chat | null,
   systemPrompt: string,
@@ -517,6 +517,15 @@ export function estimateBreakdownParts(
   for (const m of settled) {
     msgChars += m.content.length
     if (m.thinking) msgChars += m.thinking.length
+    // Past tool results are re-sent every turn (AIMessage tool_calls +
+    // ToolMessages), so they occupy context like talk content. Count them
+    // here, otherwise the gap lands on System tools and inflates it.
+    for (const act of m.toolActivity ?? []) {
+      msgChars += act.tool.length
+      if (act.args) msgChars += JSON.stringify(act.args).length
+      if (act.summary) msgChars += act.summary.length
+      if (act.diff) msgChars += act.diff.length
+    }
   }
   if (live) {
     msgChars += live.content.length
@@ -529,10 +538,12 @@ export function estimateBreakdownParts(
     }
   }
   const messages = Math.round(msgChars / CHARS_PER_TOKEN)
+  // Match estimateContextChars builtin-prompt floor so the fallback estimate
+  // attributes the base prompt to System prompt, not to System tools gap.
   const systemPromptTokens =
     opts.systemPromptChars != null
       ? Math.round(opts.systemPromptChars / CHARS_PER_TOKEN)
-      : Math.round(systemPrompt.length / CHARS_PER_TOKEN)
+      : Math.round((systemPrompt.length + 16000) / CHARS_PER_TOKEN)
   const systemToolsTokens =
     opts.systemToolsChars != null
       ? Math.round(opts.systemToolsChars / CHARS_PER_TOKEN)
@@ -552,8 +563,9 @@ export function estimateBreakdownParts(
 
 /** Full breakdown for the composer popup: estimated parts reconciled against
  *  the real meter total (provider total when available). The gap the frontend
- *  cannot measure (built-in prompt tail + tool schemas) is attributed to
- *  System tools; a too-big local estimate is shrunk proportionally. */
+ *  cannot measure (full history bodies vs. card summaries, backend-only turn
+ *  notes) is attributed to Messages; a too-big local estimate is shrunk
+ *  proportionally. */
 export function buildContextBreakdown(
   chat: Chat | null,
   systemPrompt: string,
@@ -572,15 +584,28 @@ export function buildContextBreakdown(
     parts.skills +
     parts.mcpTools +
     parts.meta
+  const hasRealTools = opts.systemToolsChars != null
   let scaled = parts
   if (actual > 0 && known !== actual) {
     if (known <= 0) {
-      // Nothing measurable: the whole total is built-in prompt/tool schemas.
+      // Nothing measurable locally and no backend report yet: the total is
+      // dominated by the bound tool schemas (re-sent every turn) plus
+      // history/prompt — attribute it to System tools as the schema estimate
+      // so the row never sticks at 0 before the first turn reports real
+      // sizes via systemToolsChars.
       scaled = { ...parts, systemTools: actual }
     } else if (known < actual) {
-      // The gap is the built-in prompt / tool schemas the frontend cannot
-      // see: attribute it to System tools so rows add up to the real total.
-      scaled = { ...parts, systemTools: parts.systemTools + (actual - known) }
+      // Gap between the provider total and the local estimate. Without a
+      // backend report the gap is mostly the unmeasured tool schemas, so it
+      // belongs to System tools. With measured schemas (systemToolsChars)
+      // the gap is history the frontend cannot measure (full tool-result
+      // bodies vs. card summaries, backend-only turn notes), so it belongs
+      // to Messages.
+      if (hasRealTools) {
+        scaled = { ...parts, messages: parts.messages + (actual - known) }
+      } else {
+        scaled = { ...parts, systemTools: parts.systemTools + (actual - known) }
+      }
     } else {
       // The local estimate overshoots the provider total (cache/history diff).
       // Absorb the excess from the ESTIMATED parts first (messages/meta) so

@@ -14,10 +14,6 @@ import { ProviderTestButton } from './ProviderTestButton'
 import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
 
-const KIND_LABELS: Record<ProviderKind, string> = Object.fromEntries(
-  Object.values(PROVIDER_META).map((m) => [m.kind, m.label]),
-) as Record<ProviderKind, string>
-
 const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .filter((m) => m.builtin)
   .map((m) => m.kind)
@@ -27,14 +23,6 @@ const NEW_SKILL_KEY = '__new_skill__'
 function isProviderConfigured(p: ProviderConfig): boolean {
   if (providerMeta(p.kind).local) return true
   return providerApiKeys(p).length > 0
-}
-
-/** توضیح کوتاه بر اساس kind */
-function providerDescription(p: ProviderConfig): string {
-  const n = providerApiKeys(p).length
-  if (n > 0) return `${n} key${n === 1 ? '' : 's'}`
-  if (p.baseUrl) return p.baseUrl.replace(/^https?:\/\//, '').slice(0, 40)
-  return KIND_LABELS[p.kind] || p.kind
 }
 
 function modelLabelForOpts(providerId: string, m: string): string {
@@ -54,6 +42,7 @@ function bareModelFor(p: ProviderConfig, m: string): string {
 // raw provider id / kind ("custom-xyz/model" → "My Provider/model").
 export function toolModelLabel(current: string, providers: ReadonlyArray<ProviderConfig>): string {
   if (!current) return 'Main model'
+  if (current === 'laya') return 'Laya (local)'
   const slash = current.indexOf('/')
   if (slash > 0) {
     const pid = current.slice(0, slash)
@@ -88,6 +77,7 @@ export function toolModelTarget(
 ): { providerId: string; model: string } | null {
   if (!current) return null
   if (current === 'main model' || current === 'main_model' || current === 'main') return null
+  if (current === 'laya') return null
   const slash = current.indexOf('/')
   if (slash > 0) {
     const pid = current.slice(0, slash)
@@ -289,6 +279,15 @@ function ToolModelSelect({
               >
                 {noneLabel}
               </button>
+              {agent === 'decision' && (!q || 'laya (local)'.includes(q)) && (
+                <button
+                  className={`model-select-item ${current === 'laya' ? 'current' : ''}`}
+                  onMouseDown={(e) => { e.preventDefault(); onSelect(agent, 'laya'); closeMenu(); inputRef.current?.blur() }}
+                  type="button"
+                >
+                  Laya (local)
+                </button>
+              )}
               {visibleProviders.map(({ p, models }) => {
                 const isOpen = q ? true : expanded.has(p.id)
                 return (
@@ -541,7 +540,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setManualModelContext = useStore((s) => s.setManualModelContext)
   const setManualModelReasoning = useStore((s) => s.setManualModelReasoning)
   const removeManualModel = useStore((s) => s.removeManualModel)
-  const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
   const removeMode = useStore((s) => s.removeMode)
   const fontSize = useStore((s) => s.fontSize)
@@ -549,9 +547,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const dataPath = useStore((s) => s.dataPath)
   const setDataPath = useStore((s) => s.setDataPath)
   const whisperModel = useStore((s) => s.whisperModel)
-  const whisperBaseUrl = useStore((s) => s.whisperBaseUrl)
   const setWhisperModel = useStore((s) => s.setWhisperModel)
-  const setWhisperBaseUrl = useStore((s) => s.setWhisperBaseUrl)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -574,13 +570,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
-  const maxSteps = useStore((s) => s.maxSteps ?? 0)
-  const setMaxSteps = useStore((s) => s.setMaxSteps)
   const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
   const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
   const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
   const setRagWebTtlDays = useStore((s) => s.setRagWebTtlDays)
-  const root = useStore((s) => s.root)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
 
@@ -715,23 +708,51 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     void refreshModels()
     const id = setInterval(
       () => void refreshModels(),
-      mStatus?.whisper?.running || mStatus?.embedding?.running ? 1000 : 2500,
+      mStatus?.whisper?.running || mStatus?.embedding?.running || mStatus?.decision?.running || mStatus?.piper?.state === 'downloading' ? 1000 : 2500,
     )
     return () => clearInterval(id)
-  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running])
+  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running, mStatus?.decision?.running, mStatus?.piper?.state])
 
-  const isRunning = (kind: 'whisper' | 'embedding') =>
-    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
-    'downloading'
+  const piperRunState = (): ModelRunState | undefined => {
+    const p = mStatus?.piper
+    if (!p) return undefined
+    if (p.state === 'downloading')
+      return { state: 'downloading', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', percent: (p.progress ?? 0) * 100, downloaded_bytes: p.downloaded_bytes ?? 0, total_bytes: p.total_bytes ?? 0, speed_bps: p.speed_bps ?? 0 }
+    if (p.state === 'paused')
+      return { state: 'paused', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', percent: (p.progress ?? 0) * 100, downloaded_bytes: p.downloaded_bytes ?? 0, total_bytes: p.total_bytes ?? 0, speed_bps: p.speed_bps ?? 0 }
+    if (p.state === 'error')
+      return { state: 'error', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', error: p.error }
+    return undefined
+  }
 
-  const runState = (kind: ManagedModelKind): ModelRunState | undefined =>
-    (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running
+  const isRunning = (kind: 'whisper' | 'embedding' | 'piper' | 'decision') => {
+    if (kind === 'piper') return mStatus?.piper?.state === 'downloading'
+    if (kind === 'decision') return mStatus?.decision?.running?.state === 'downloading'
+    return (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
+      'downloading'
+  }
+
+  const runState = (kind: ManagedModelKind): ModelRunState | undefined => {
+    if (kind === 'piper') return piperRunState()
+    if (kind === 'decision') return mStatus?.decision?.running
+    return (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running
+  }
 
   const embeddingStatus = mStatus?.embedding
 
-  const actDownload = async (kind: 'whisper' | 'embedding') => {
-    const repo = kind === 'whisper' ? whisperModel : 'intfloat/multilingual-e5-base'
-    const base = kind === 'whisper' ? whisperBaseUrl : ''
+  const actDownload = async (kind: 'whisper' | 'embedding' | 'piper' | 'decision') => {
+    const pocketDefault = 'mehdi-hf/pocket-tts-farsi-v2'
+    const rawTts = (ttsModel ?? '').trim()
+    const pocketRepo = rawTts.includes('/') ? rawTts : pocketDefault
+    const repo =
+      kind === 'whisper'
+        ? whisperModel
+        : kind === 'piper'
+          ? pocketRepo
+          : kind === 'decision'
+            ? 'convaiinnovations/laya'
+            : 'intfloat/multilingual-e5-base'
+    const base = kind === 'piper' ? ((settings as { ttsBaseUrl?: string }).ttsBaseUrl ?? '') : ''
     setModelsMsg('')
     try {
       await downloadModel(kind, repo, base)
@@ -776,7 +797,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
   }
 
-  const actRemove = async (kind: 'whisper' | 'embedding', repo: string) => {
+  const actRemove = async (kind: 'whisper' | 'embedding' | 'piper' | 'decision', repo: string) => {
     setModelsMsg('')
     try {
       await removeModel(kind, repo)
@@ -802,8 +823,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const [skillDeletedFiles, setSkillDeletedFiles] = useState<Record<string, string[]>>({})
   // Currently viewed/edited extra file per skill key ('' = main skill.md).
   const [skillActiveFile, setSkillActiveFile] = useState<Record<string, string>>({})
-  // Extra file currently being fetched per skill key (shows a loading hint).
-  const [skillFileLoading, setSkillFileLoading] = useState<Record<string, string>>({})
   // New-file name input per skill key.
   const [skillNewFileName, setSkillNewFileName] = useState<Record<string, string>>({})
   const [skillsMsg, setSkillsMsg] = useState('')
@@ -959,9 +978,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (local !== undefined) return
     if (key === NEW_SKILL_KEY) return
     if (!getSkillServerFiles(key).includes(next)) return
-    setSkillFileLoading((prev) => ({ ...prev, [key]: next }))
     void getSkillFile(key, next).then((content) => {
-      setSkillFileLoading((prev) => (prev[key] === next ? { ...prev, [key]: '' } : prev))
       if (content === null) {
         setSkillsMsg(`Could not load ${next}.`)
         setSkillActiveFile((prev) => (prev[key] === next ? { ...prev, [key]: '' } : prev))
@@ -2354,7 +2371,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
             <div className="hint">
               Pick separate models for the built-in tools (web, vision,
-              compact, explore, schedule). Leave a field empty to use the main model (the one chosen in the
+              compact, decision, subagent, schedule, title). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
@@ -2382,6 +2399,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               onSelect={setSubagentModel}
             />
             <ToolModelSelect
+              agent="decision"
+              label="Decision model"
+              desc="Tiny router that picks which skills to auto-load for a message (semantic matching, not keywords). Falls back to the main model. Download Laya in the Models tab."
+              current={subagentModels.decision || ''}
+              onSelect={setSubagentModel}
+            />
+            <ToolModelSelect
               agent="subagent"
               label="Sub-agent model"
               desc="Background sub-agent spawned via the task tool (research, code search, delegated work). Falls back to the main model."
@@ -2395,6 +2419,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               current={subagentModels.schedule || ''}
               onSelect={setSubagentModel}
             />
+            <ToolModelSelect
+              agent="title"
+              label="Title generator"
+              desc="Tiny model that names a new chat in the background from the first message. Falls back to the compact model."
+              current={subagentModels.title || ''}
+              onSelect={setSubagentModel}
+            />
           </div>
         </>
         )}
@@ -2406,9 +2437,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <label>On-device Models</label>
               </div>
               <div className="hint models-intro">
-                These models run fully offline on your device. Download uses an
-                optional HuggingFace mirror (empty ={' '}
-                <code>huggingface.co</code>). Status and progress refresh
+                These models run fully offline on your device. Status and progress refresh
                 automatically.
               </div>
               {modelsMsg && <div className="hint models-msg">{modelsMsg}</div>}
@@ -2416,7 +2445,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="model-card">
                 <div className="model-card-head">
                   <div className="model-card-titles">
-                    <span className="model-card-title">Speech to Text</span>
+                    <span className="model-card-title">Speech to Text (STT)</span>
                     <span className="model-card-desc">Offline voice input, speech to text</span>
                   </div>
                   <ModelBadge status={mStatus?.whisper} />
@@ -2424,8 +2453,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <div className="model-card-body">
                   <label className="field-label">Model (HF repo id)</label>
                   <input value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} dir="ltr" placeholder="Systran/faster-whisper-medium" />
-                  <label className="field-label">Mirror base URL (optional)</label>
-                  <input value={whisperBaseUrl} onChange={(e) => setWhisperBaseUrl(e.target.value)} dir="ltr" placeholder="e.g. https://hf-mirror.com" />
                   <ModelProgress running={runState('whisper')} />
                   <ModelStatusLine status={mStatus?.whisper} running={isRunning('whisper')} onRemove={() => actRemove('whisper', whisperModel)} />
                   <ModelControls
@@ -2461,61 +2488,127 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
               </div>
 
+              <div className="model-card">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Decision model (Laya)</span>
+                    <span className="model-card-desc">Tiny local router that picks which skills to auto-load (semantic matching). Used by the Decision model in the Tools tab.</span>
+                  </div>
+                  <ModelBadge status={mStatus?.decision} />
+                </div>
+                <div className="model-card-body">
+                  <ModelProgress running={runState('decision')} />
+                  <ModelStatusCard
+                    status={mStatus?.decision}
+                    running={isRunning('decision')}
+                    emptyHint="Not downloaded — skill auto-matching stays keyword-based until you download it."
+                    onRemove={(repo) => actRemove('decision', repo)}
+                  />
+                  <ModelControls
+                    running={runState('decision')}
+                    canDownload={!(mStatus?.decision?.dirs ?? []).some((d) => d.ready)}
+                    onDownload={() => actDownload('decision')}
+                    onPause={() => actPause('decision')}
+                    onResume={() => actResume('decision')}
+                    onCancel={() => actCancel('decision')}
+                  />
+                </div>
+              </div>
+
               <div className="model-card model-card-voice">
                 <div className="model-card-head">
                   <div className="model-card-titles">
-                    <span className="model-card-title">Voice</span>
-                    <span className="model-card-desc">Speech to text and text to speech provider</span>
+                    <span className="model-card-title">Text to Speech (Pocket Farsi v2)</span>
+                    <span className="model-card-desc">Offline Persian voice for reading answers aloud</span>
+                  </div>
+                  <ModelBadge status={{ dirs: mStatus?.piper?.state === 'done' ? [{ repo: mStatus.piper.model || 'mehdi-hf/pocket-tts-farsi-v2', dir: '', size: mStatus?.piper?.size ?? 0, ready: true }] : [], running: runState('piper') }} />
+                </div>
+                <div className="model-card-body">
+                  <label className="field-label">Voice id (Pocket Farsi v2)</label>
+                  <input value={(() => { const v = (ttsModel ?? '').trim(); if (!v || v.includes('/') || v.includes('\\') || v.toLowerCase() === 'local' || v === 'tts-1' || v === 'tts-1-hd' || v.startsWith('fa_IR') || v.endsWith('.onnx') || v.endsWith('.onnx.json')) return 'default'; return v })()} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="default" />
+                  <ModelProgress running={runState('piper')} />
+                  <ModelStatusLine status={{ dirs: mStatus?.piper?.state === 'done' ? [{ repo: mStatus.piper.model || 'mehdi-hf/pocket-tts-farsi-v2', dir: '', size: mStatus?.piper?.size ?? 0, ready: true }] : [], running: runState('piper') }} running={isRunning('piper')} onRemove={() => actRemove('piper', ((ttsModel ?? '').trim() && (ttsModel ?? '').includes('/') ? (ttsModel ?? '').trim() : 'mehdi-hf/pocket-tts-farsi-v2'))} />
+                  <ModelControls
+                    running={runState('piper')}
+                    canDownload={mStatus?.piper?.state !== 'done' && mStatus?.piper?.state !== 'downloading'}
+                    onDownload={() => actDownload('piper')}
+                    onPause={() => actPause('piper')}
+                    onResume={() => actResume('piper')}
+                    onCancel={() => actCancel('piper')}
+                  />
+
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Speech to Text (STT)</span>
+                    <span className="model-card-desc">Voice input transcription</span>
+                  </div>
+                  <div className="voice-switch-wrap">
+                    <span className={`voice-status ${sttProviderId === 'local' ? 'on' : 'off'}`}>{sttProviderId === 'local' ? 'Local ON' : 'Local OFF'}</span>
+                  <label className="plugin-switch voice-switch" title={sttProviderId === 'local' ? 'Disable local STT' : 'Enable local STT'}>
+                    <input
+                      type="checkbox"
+                      checked={sttProviderId === 'local'}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          try { if (sttProviderId && sttProviderId !== 'local') localStorage.setItem('codifa.lastRemoteStt', sttProviderId) } catch { /* storage is best-effort */ }
+                          setSttProviderId('local')
+                        } else {
+                          let saved = ''
+                          try { saved = localStorage.getItem('codifa.lastRemoteStt') ?? '' } catch { saved = '' }
+                          const next = saved && providers.some((p) => p.id === saved) ? saved : (providers[0]?.id ?? '')
+                          setSttProviderId(next)
+                        }
+                      }}
+                    />
+                    <span className="plugin-switch-track" />
+                  </label>
                   </div>
                 </div>
                 <div className="model-card-body">
                   <div className="hint">
-                    Which provider transcribes voice input and reads answers aloud.{' '}
-                    <code>Local Whisper</code> is fully offline; the rest go to that
-                    provider's OpenAI-compatible endpoint.
+                    {sttProviderId === 'local'
+                      ? 'Local STT is ON — on-device Whisper is used. Turn the switch off to use the remote provider below.'
+                      : 'Local STT is OFF — the remote provider below is used. Turn the switch on for fully offline Whisper.'}
                   </div>
-                  <label className="field-label">STT provider</label>
-                  <select value={sttProviderId} onChange={(e) => setSttProviderId(e.target.value)} dir="ltr">
-                    <option value="local">Local Whisper — Offline</option>
-                    {providers.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                      </option>
-                    ))}
-                  </select>
-                  {sttProviderId !== 'local' && (
-                    <>
+                  <div className="voice-section">
+                    <div className="voice-field">
+                      <label className="field-label">STT provider</label>
+                    <select value={sttProviderId === 'local' ? (() => { try { const s = localStorage.getItem('codifa.lastRemoteStt') ?? ''; return s && providers.some((p) => p.id === s) ? s : (providers[0]?.id ?? '') } catch { return providers[0]?.id ?? '' } })() : sttProviderId} onChange={(e) => {
+                      // While local is ON the dropdown edits the remembered remote
+                      // provider so the external config is never wiped.
+                      if (sttProviderId === 'local') {
+                        try { localStorage.setItem('codifa.lastRemoteStt', e.target.value) } catch { /* best-effort */ }
+                        return
+                      }
+                      setSttProviderId(e.target.value)
+                    }} dir="ltr" disabled={sttProviderId === 'local'}>
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                        </option>
+                      ))}
+                    </select>
+                    </div>
+                    <div className="voice-field">
                       <label className="field-label">STT model</label>
-                      <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
-                    </>
-                  )}
-                  <label className="field-label">TTS provider</label>
-                  <select value={ttsProviderId} onChange={(e) => setTtsProviderId(e.target.value)} dir="ltr">
-                    <option value="">Not selected</option>
-                    {providers.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                      </option>
-                    ))}
-                  </select>
-                  {ttsProviderId && (
-                    <>
-                      <label className="field-label">TTS model</label>
-                      <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
-                      <label className="field-label">TTS voice</label>
-                      <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
-                    </>
-                  )}
+                    <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" disabled={sttProviderId === 'local'} />
+                    </div>
+                  </div>
+                  {sttProviderId !== 'local' && (
+                  <div className="voice-fallbacks">
                   <label className="field-label">STT fallbacks</label>
                   <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
                   {sttFallbacks.map((fb, i) => (
-                    <div key={i}>
+                    <div key={i} className="voice-fallback-card">
                       <select value={fb.providerId} onChange={(e) => {
                         const next = [...sttFallbacks]
                         next[i] = { ...next[i], providerId: e.target.value }
                         setSttFallbacks(next)
                       }} dir="ltr">
-                        <option value="local">Local Whisper — Offline</option>
                         {providers.map((p) => (
                           <option key={p.id} value={p.id}>
                             {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
@@ -2529,14 +2622,84 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                           setSttFallbacks(next)
                         }} dir="ltr" placeholder="whisper-1" />
                       )}
-                      <button type="button" className="btn secondary" onClick={() => setSttFallbacks(sttFallbacks.filter((_, j) => j !== i))}>Remove</button>
+                      <button type="button" className="btn tiny secondary voice-remove-btn" onClick={() => setSttFallbacks(sttFallbacks.filter((_, j) => j !== i))}>Remove</button>
                     </div>
                   ))}
-                  <button type="button" className="btn secondary" onClick={() => setSttFallbacks([...sttFallbacks, { providerId: 'local', model: '' }])}>Add STT fallback</button>
+                  <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setSttFallbacks([...sttFallbacks, { providerId: providers[0]?.id ?? '', model: '' }])}>+ Add STT fallback</button>
+                  </div>)}
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Text to Speech (TTS)</span>
+                    <span className="model-card-desc">Voice output synthesis</span>
+                  </div>
+                  <div className="voice-switch-wrap">
+                    <span className={`voice-status ${ttsProviderId === 'local' ? 'on' : 'off'}`}>{ttsProviderId === 'local' ? 'Local ON' : 'Local OFF'}</span>
+                  <label className="plugin-switch voice-switch" title={ttsProviderId === 'local' ? 'Disable local TTS' : 'Enable local TTS'}>
+                    <input
+                      type="checkbox"
+                      checked={ttsProviderId === 'local'}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          try { if (ttsProviderId && ttsProviderId !== 'local') localStorage.setItem('codifa.lastRemoteTts', ttsProviderId) } catch { /* storage is best-effort */ }
+                          setTtsProviderId('local')
+                        } else {
+                          let saved = ''
+                          try { saved = localStorage.getItem('codifa.lastRemoteTts') ?? '' } catch { saved = '' }
+                          const next = saved && providers.some((p) => p.id === saved) ? saved : ''
+                          setTtsProviderId(next)
+                        }
+                      }}
+                    />
+                    <span className="plugin-switch-track" />
+                  </label>
+                  </div>
+                </div>
+                <div className="model-card-body">
+                  <div className="hint">
+                    {ttsProviderId === 'local'
+                      ? 'Local TTS is ON — on-device Persian voice is used. Turn the switch off to use the remote provider below.'
+                      : 'Local TTS is OFF — the remote provider below is used. Turn the switch on for fully offline voice.'}
+                  </div>
+                  <div className="voice-section">
+                    <div className="voice-field">
+                      <label className="field-label">TTS provider</label>
+                    <select value={ttsProviderId === 'local' ? (() => { try { const s = localStorage.getItem('codifa.lastRemoteTts') ?? ''; return s && providers.some((p) => p.id === s) ? s : '' } catch { return '' } })() : ttsProviderId} onChange={(e) => {
+                      // While local is ON the dropdown edits the remembered remote
+                      // provider so the external config is never wiped.
+                      if (ttsProviderId === 'local') {
+                        try { localStorage.setItem('codifa.lastRemoteTts', e.target.value) } catch { /* best-effort */ }
+                        return
+                      }
+                      setTtsProviderId(e.target.value)
+                    }} dir="ltr" disabled={ttsProviderId === 'local'}>
+                      <option value="">Not selected</option>
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                        </option>
+                      ))}
+                    </select>
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">TTS model</label>
+                    <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" disabled={ttsProviderId === 'local'} />
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">TTS voice</label>
+                    <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" disabled={ttsProviderId === 'local'} />
+                    </div>
+                  </div>
+
+                  {ttsProviderId !== 'local' && (
+                  <div className="voice-fallbacks">
                   <label className="field-label">TTS fallbacks</label>
                   <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
                   {ttsFallbacks.map((fb, i) => (
-                    <div key={i}>
+                    <div key={i} className="voice-fallback-card">
                       <select value={fb.providerId} onChange={(e) => {
                         const next = [...ttsFallbacks]
                         next[i] = { ...next[i], providerId: e.target.value }
@@ -2559,10 +2722,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         next[i] = { ...next[i], voice: e.target.value }
                         setTtsFallbacks(next)
                       }} dir="ltr" placeholder="alloy" />
-                      <button type="button" className="btn secondary" onClick={() => setTtsFallbacks(ttsFallbacks.filter((_, j) => j !== i))}>Remove</button>
+                      <button type="button" className="btn tiny secondary voice-remove-btn" onClick={() => setTtsFallbacks(ttsFallbacks.filter((_, j) => j !== i))}>Remove</button>
                     </div>
                   ))}
-                  <button type="button" className="btn secondary" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>Add TTS fallback</button>
+                  <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>+ Add TTS fallback</button>
+                  </div>)}
                 </div>
               </div>
             </div>
@@ -2624,33 +2788,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <span className="font-size-label">200</span>
               </div>
               <div className="hint">Default: 0 (full history).</div>
-            </div>
-
-            <div className="field">
-              <div className="field-head">
-                <label>Max agent steps</label>
-                <span className="field-value-badge">{maxSteps === 0 ? 'Auto' : maxSteps}</span>
-              </div>
-              <div className="hint">
-                How many tool-calling steps the agent may take per turn before it is
-                forced to stop and summarize. 0 = automatic from the model's context
-                window (12–40 steps; default). Higher = longer tasks finish in one turn
-                but burn more tokens when the model loops. Range 0–200. Applies on the
-                next message.
-              </div>
-              <div className="font-size-row">
-                <span className="font-size-label">Auto</span>
-                <RangeSlider
-                  min={0}
-                  max={200}
-                  step={1}
-                  value={maxSteps}
-                  onChange={setMaxSteps}
-                  ariaLabel="Max agent steps"
-                />
-                <span className="font-size-label">200</span>
-              </div>
-              <div className="hint">Default: 0 (auto).</div>
             </div>
         </>
         )}
@@ -2818,15 +2955,18 @@ function ModelStatusLine({
   )
 }
 
-/** Embedding card: lists every downloaded repo build with its own Remove. */
+/** Embedding/decision card: lists every downloaded repo build with its own Remove. */
 function ModelStatusCard({
   status,
   running,
   onRemove,
+  emptyHint,
 }: {
   status?: import('../lib/api').ModelKindStatus
   running: boolean
   onRemove: (repo: string) => void
+  /** Shown when nothing is downloaded yet; defaults to the embedding hint. */
+  emptyHint?: string
 }) {
   if (status?.running?.state === 'paused')
     return <div className="hint">Paused — Resume continues from where it stopped.</div>
@@ -2841,7 +2981,7 @@ function ModelStatusCard({
   if (dirs.length === 0)
     return (
       <div className="hint">
-        Not downloaded — RAG memory &amp; web recall stay off until you download one.
+        {emptyHint ?? 'Not downloaded — RAG memory & web recall stay off until you download one.'}
       </div>
     )
   return (

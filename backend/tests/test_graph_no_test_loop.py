@@ -1,8 +1,8 @@
-"""Graph assembly: the Coder runs the project's tests itself (via run_terminal),
+"""Graph assembly: the Build mode runs the project's tests itself (via run_terminal),
 so the graph must NOT contain an automatic test/debug loop.
 
 Verifies that ``build_graph`` compiles without a ``test`` or ``debug`` node and
-that the Coder tail routes straight to ``review`` -> ``done``.
+that the Build tail routes straight to ``review`` -> ``done``.
 """
 
 import graph as G
@@ -25,31 +25,31 @@ def test_no_test_or_debug_nodes():
     assert "debug" not in nodes
 
 
-def test_coder_routes_to_review_then_done():
+def test_build_routes_to_review_then_done():
     nodes, edges = _graph_nodes_edges()
-    assert "coder" in nodes
+    assert "build" in nodes
     assert "review" in nodes
     assert "done" in nodes
-    assert ("coder", "review") in edges
+    assert ("build", "review") in edges
     assert ("review", "done") in edges
 
 
-def test_review_approved_with_coder_result():
+def test_review_approved_with_build_result():
     # A produced implementation is approved; no test gate is consulted.
     class _Q:
         def put_nowait(self, _):
             pass
 
-    out = G.review_node({"_queue": _Q(), "coder_result": "done", "plan": ""})
+    out = G.review_node({"_queue": _Q(), "build_result": "done", "plan": ""})
     assert out["review_result"] == "APPROVED"
 
 
-def test_review_needs_work_without_coder_result():
+def test_review_needs_work_without_build_result():
     class _Q:
         def put_nowait(self, _):
             pass
 
-    out = G.review_node({"_queue": _Q(), "coder_result": "", "plan": ""})
+    out = G.review_node({"_queue": _Q(), "build_result": "", "plan": ""})
     assert out["review_result"].startswith("NEEDS WORK")
 
 

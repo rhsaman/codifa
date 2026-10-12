@@ -167,3 +167,64 @@ export function extractMentionSkills(
 
   return { skills: Array.from(found), cleaned: out }
 }
+
+// Recently used skills (slugs, newest first) — drives the @mention popup
+// order so the last used skill stays on top, mirroring commandUsage in
+// src/lib/slash.ts. Pure functions + localStorage persistence, unit-testable
+// without React.
+
+const SKILL_USAGE_KEY = 'coder:skillUsage'
+
+export const MAX_SKILL_USAGE = 20
+
+function skillStorage(): Storage | null {
+  try {
+    if (typeof localStorage !== 'undefined') return localStorage
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/** Load persisted skill usage (slugs, newest first). Empty array when unavailable. */
+export function loadSkillUsage(): string[] {
+  const s = skillStorage()
+  if (!s) return []
+  try {
+    const raw = s.getItem(SKILL_USAGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return arr
+      .filter((x) => typeof x === 'string')
+      .map((x) => (x as string).trim().toLowerCase().replace(/^@/, ''))
+      .filter((x) => x.length > 0)
+      .slice(0, MAX_SKILL_USAGE)
+  } catch {
+    return []
+  }
+}
+
+/** Record a skill use at the front (dedupe, cap length). Accepts a slug,
+ *  display name, or "@slug" token. Returns the new list. */
+export function recordSkillUsage(skill: string, prev?: string[]): string[] {
+  const base = prev ?? loadSkillUsage()
+  const name = skill.trim().toLowerCase().replace(/^@/, '')
+  if (!name) return base
+  const next = [name, ...base.filter((x) => x !== name)].slice(0, MAX_SKILL_USAGE)
+  const s = skillStorage()
+  try {
+    s?.setItem(SKILL_USAGE_KEY, JSON.stringify(next))
+  } catch {
+    /* ignore */
+  }
+  // Notify every mounted chat panel so its skill popup re-sorts immediately.
+  try {
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('coder:skill-usage'))
+    }
+  } catch {
+    /* ignore */
+  }
+  return next
+}

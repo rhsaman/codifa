@@ -24,3 +24,23 @@ async def test_ranges_and_symbols_in_one_call(tmp_path):
     assert "1 | line1" in out, out
     assert "def target_fn():" in out, out
     assert "Batch complete" in out, out
+
+
+async def test_same_file_ranges_emit_unique_result(tmp_path):
+    import tools
+
+    _ws(str(tmp_path))
+    captured = []
+    cbs = tools.make_tool_callbacks(str(tmp_path), captured.append)
+    out = await cbs["read"](
+        "m.py", ranges=["m.py:1:10", "m.py:100:10", "m.py:200:10"]
+    )
+    assert "Batch complete" in out, out
+    result_events = [
+        e for e in captured if e.get("kind") == "tool_result" and e.get("tool") == "read"
+    ]
+    assert result_events, captured
+    last = result_events[-1]
+    paths = [r.get("path") for r in (last.get("results") or [])]
+    assert paths == ["m.py"], paths
+    assert last.get("summary") == "1 file", last

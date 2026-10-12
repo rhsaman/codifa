@@ -266,7 +266,19 @@ export function ViewerTabListButton() {
   const closed = useViewerTabs((s) => s.closedTabs);
   const activeChatId = useStore((s) => s.activeChatId);
   const sections = buildViewerTabListSections(tabs, closed, activeId, activeChatId);
-  return <TabListButton sections={sections} label="Tab list" />;
+  const visibleCount = visibleTabs(tabs, activeChatId).length;
+  return (
+    <TabListButton
+      sections={sections}
+      label="Tab list"
+      footer={{
+        label: visibleCount > 0 ? `Close all tabs (${visibleCount})` : "No open tabs",
+        title: "Close all tabs of the active chat (kept in Recently closed)",
+        disabled: visibleCount === 0,
+        onPress: () => useViewerTabs.getState().closeAllViewers(activeChatId),
+      }}
+    />
+  );
 }
 
 /** VSCode-style tab bar for the right editor group (diff / trace / inbox).
@@ -275,7 +287,6 @@ export function ViewerTabBar() {
   const allTabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const activeChatId = useStore((s) => s.activeChatId);
-  const viewerFull = useViewerTabs((s) => s.fullscreen);
   // Chat-scoped tabs: only the active chat's group is rendered in this bar.
   const tabs = visibleTabs(allTabs, activeChatId);
   const shownActiveId = tabs.find((t) => t.id === activeId)?.id ?? tabs[0]?.id ?? null;

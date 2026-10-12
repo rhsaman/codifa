@@ -113,22 +113,85 @@ export function stopTts(owner?: number) {
 // یک جمله کند/خراب نباید کل پاسخ را وسط پخش گیر بیندازد: هر جمله سقف زمانی
 // خودش را دارد با یک تلاش مجدد، و جمله‌ای که باز هم نیامد رد می‌شود تا بقیه
 // پاسخ پخش شود. نگهبان پخش هم Audioی گیرکرده (بدون end/error) را رد می‌کند.
-const SENTENCE_FETCH_TIMEOUT_MS = 45_000
+const SENTENCE_FETCH_TIMEOUT_MS = 20_000
 // Number of full rounds over the provider chain before giving up on a sentence.
 // Delay between rounds (abort-aware). Exported as mutable `let` plus
 // `setTtsRetryConfig` so tests can shrink the delay.
-export let TTS_RETRY_ATTEMPTS = 5
-export let TTS_RETRY_DELAY_MS = 5_000
+// Tuned for fast first audio: a slow sentence fails fast (20s) and retries
+// once after 1s instead of stalling the speaker icon for minutes.
+export let TTS_RETRY_ATTEMPTS = 2
+export let TTS_RETRY_DELAY_MS = 1_000
 
 /** Override retry tuning (mainly for tests to shrink the delay). */
-export function setTtsRetryConfig(cfg: { attempts?: number; delayMs?: number }): void {
-  if (cfg.attempts !== undefined) TTS_RETRY_ATTEMPTS = cfg.attempts
-  if (cfg.delayMs !== undefined) TTS_RETRY_DELAY_MS = cfg.delayMs
+export function setTtsRetryConfig(cfg: Record<string, unknown>): void {
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined
+  const attempts =
+    num(cfg.attempts) ?? num(cfg.maxAttempts) ?? num(cfg.max_attempts) ?? num(cfg.retries)
+  if (attempts !== undefined) TTS_RETRY_ATTEMPTS = Math.max(1, Math.floor(attempts))
+  const delay =
+    num(cfg.delayMs) ?? num(cfg.delay) ?? num(cfg.baseDelayMs) ?? num(cfg.retryDelayMs) ?? num(cfg.retryDelay)
+  if (delay !== undefined) TTS_RETRY_DELAY_MS = Math.max(0, delay)
 }
 
 /** Normalize a single provider opts or a primary+fallback chain into a chain. */
 function toTtsChain(opts: SpeakProviderOpts | SpeakProviderOpts[]): SpeakProviderOpts[] {
   return Array.isArray(opts) ? opts : [opts]
+}
+
+/** Local TTS request settings (mirrors Settings tts* fields without importing the store). */
+export interface TtsLocalRequest {
+  ttsProviderId?: string
+  ttsModel?: string
+  ttsBaseUrl?: string
+  ttsVoice?: string
+}
+
+/** Default local voice id used when ttsModel is empty (pocket-tts-farsi-v2). */
+export const LOCAL_TTS_DEFAULT_MODEL = 'default'
+
+/**
+ * Local-first single-sentence fetch (STT-style fallback).
+ * When cfg.ttsProviderId is 'local', try the on-device voice once via
+ * speakTextStream (kind 'local', model ttsModel or default, baseUrl ttsBaseUrl);
+ * any throw (missing model / sidecar down) falls through to the remote
+ * fallback chain via fetchSentenceRobust. Non-local ids delegate directly
+ * to fetchSentenceRobust so remote behavior is unchanged.
+ */
+export async function fetchSentenceWithLocalFallback(
+  sentence: string,
+  cfg: TtsLocalRequest,
+  fallback: SpeakProviderOpts | SpeakProviderOpts[],
+  signal: AbortSignal,
+): Promise<Blob> {
+  const remote = toTtsChain(fallback)
+  if (cfg.ttsProviderId !== 'local') return fetchSentenceRobust(sentence, remote, signal)
+  const rawModel = (cfg.ttsModel ?? '').trim()
+  const rawVoice = (cfg.ttsVoice ?? '').trim()
+  // Only a real local voice id is sent; remote TTS model ids (containing
+  // '/' or known remote names), remote voices (e.g. 'alloy') and the 'local'
+  // provider id would otherwise shadow the bundled pocket voice. Legacy
+  // Piper ids ('fa_IR-*') resolve to the pocket default voice server-side.
+  const isLocalVoiceId = (v: string): boolean => {
+    if (!v) return false
+    if (v.toLowerCase() === 'local') return false
+    if (v.includes('/') || v.includes('\\')) return false
+    if (v === 'tts-1' || v === 'tts-1-hd') return false
+    if (v.endsWith('.onnx') || v.endsWith('.onnx.json')) return false
+    return true
+  }
+  const resolvedVoice = [rawModel, rawVoice].find(isLocalVoiceId) ?? LOCAL_TTS_DEFAULT_MODEL
+  const localOpts: SpeakProviderOpts = {
+    kind: 'local',
+    baseUrl: (cfg.ttsBaseUrl ?? '').trim(),
+    model: resolvedVoice,
+  }
+  try {
+    return await speakTextStream(sentence, localOpts, undefined, signal)
+  } catch (err) {
+    // Local ON means fully offline: never contact a remote provider.
+    throw err
+  }
 }
 
 /** Abort-aware sleep between retry rounds; throws immediately when aborted. */
@@ -209,6 +272,10 @@ export function fetchSentenceRobust(
 const PLAYBACK_WATCHDOG_MIN_MS = 20_000
 const PLAYBACK_WATCHDOG_PER_BYTE_MS = 0.25
 const PLAYBACK_WATCHDOG_MAX_MS = 180_000
+// Natural pause between spoken sentences: back-to-back chunks with no gap
+// sound rushed, as if the playback rate went up. Abort-aware (barge-in
+// skips it instantly via the shared controller signal).
+const INTER_SENTENCE_GAP_MS = 350
 
 /**
  * پخش متن با مالک مشخص. ویس قبلی (هر پیام/چت) اول قطع می‌شود؛ اگر حین fetch
@@ -223,6 +290,7 @@ export async function playTts(
   text: string,
   opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
+  local?: TtsLocalRequest,
 ): Promise<void> {
   stopTtsGlobal()
   const controller = new AbortController()
@@ -234,16 +302,29 @@ export async function playTts(
   notifyTts()
   // Normalize single opts or primary+fallback chain into a chain.
   const chain = toTtsChain(opts)
+  // Local-first fetch (STT-style): with the on-device voice selected, try it
+  // once per sentence (default model fa_IR-amir-medium), then fall back to the
+  // remote chain on any error. Remote selection uses the chain directly.
+  const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
+    local && local.ttsProviderId === 'local'
+      ? fetchSentenceWithLocalFallback(sentence, local, chain, signal)
+      : fetchSentenceRobust(sentence, chain, signal)
   const sentences = splitTtsSentences(text)
   // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
   const queue = sentences.length > 1 ? sentences : [text]
+  // NOTE: local sentences are NOT merged into batches anymore. The Persian
+  // G2P strips punctuation, so the backend cannot see sentence boundaries
+  // inside a merged batch and its natural pacing (~120 ms gap) landed
+  // mid-sentence at arbitrary word boundaries. Per-sentence requests keep
+  // every pause on a real sentence boundary; the backend synthesis lock
+  // serializes them and stays ahead of playback (RTF ~0.33 warm).
   // پیش‌واکشی دو جمله جلوتر حین پخش جمله فعلی تا مکث بین جمله‌ها حذف شود:
   // دانلود N+1 و N+2 موازی با پخش N انجام می‌شود، پس پایان N بلافاصله جمله
   // بعدی شروع می‌شود و پخش وسط صحبت گیر نمی‌کند.
   const pending = new Map<number, Promise<Blob>>()
   const ensureFetch = (idx: number) => {
     if (idx >= queue.length || pending.has(idx) || controller.signal.aborted) return
-    const job = fetchSentenceRobust(queue[idx], chain, controller.signal)
+    const job = fetchOne(queue[idx], controller.signal)
     // رد پس‌زمینه تا await بعدی unhandled نماند.
     job.catch(() => {})
     pending.set(idx, job)
@@ -260,7 +341,7 @@ export async function playTts(
       pending.delete(i)
       let blob: Blob
       try {
-        blob = job ? await job : await fetchSentenceRobust(queue[i], chain, controller.signal)
+        blob = job ? await job : await fetchOne(queue[i], controller.signal)
       } catch (err) {
         if (activeSeq !== seq || controller.signal.aborted) return
         // جمله خراب رد می‌شود — بقیه پاسخ هنوز پخش می‌شود.
@@ -272,6 +353,15 @@ export async function playTts(
       if (blob.size === 0) continue
       await playBlobChunk(blob, seq, controller)
       playedAny = true
+      // Breathe between sentences so long answers do not sound rushed.
+      // Skipped after the final chunk so playback idles promptly.
+      if (i < queue.length - 1 && !controller.signal.aborted && activeSeq === seq) {
+        try {
+          await sleepAbortAware(INTER_SENTENCE_GAP_MS, controller.signal)
+        } catch {
+          return
+        }
+      }
     }
   } catch (err) {
     if (activeAbort === controller) activeAbort = null
@@ -287,6 +377,121 @@ export async function playTts(
   if (stillMine) stopTtsGlobal()
   // هیچ جمله‌ای پخش نشد (همه fetchها خراب): خطای آخر بالا می‌رود تا دکمه
   // «تلاش مجدد» نمایش داده شود — نه سکوت بی‌دلیل.
+  if (!playedAny && lastErr && stillMine) throw lastErr
+}
+
+const LIVE_STREAM_POLL_MS = 350
+// Max consecutive fetch failures for one sentence before it is skipped, so a
+// poisoned sentence never stalls live speech forever.
+const LIVE_STREAM_MAX_FAILS = 2
+
+/** Live text source for progressive speech: current text plus completion flag. */
+export interface TtsStreamSource {
+  snapshot: () => { text: string; done: boolean }
+}
+
+/**
+ * Speak a streaming answer progressively (live voice mode).
+ * Completed sentences are fetched and played as soon as they arrive instead
+ * of waiting for the full text, so speech starts fast. The trailing partial
+ * sentence is held back until it completes or the source reports done.
+ * Honors the same global owner/sequence protocol as playTts: a newer
+ * playback or stop aborts the stream silently.
+ */
+export async function playTtsStream(
+  source: TtsStreamSource,
+  opts: SpeakProviderOpts | SpeakProviderOpts[],
+  owner: number,
+  local?: TtsLocalRequest,
+): Promise<void> {
+  stopTtsGlobal()
+  const controller = new AbortController()
+  activeAbort = controller
+  const seq = ++seqCounter
+  activeSeq = seq
+  activeOwner = owner
+  activeStatus = 'loading'
+  notifyTts()
+  const chain = toTtsChain(opts)
+  const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
+    local && local.ttsProviderId === 'local'
+      ? fetchSentenceWithLocalFallback(sentence, local, chain, signal)
+      : fetchSentenceRobust(sentence, chain, signal)
+  let played = 0
+  let failStreak = 0
+  let playedAny = false
+  let lastErr: unknown = null
+  const stale = () => activeSeq !== seq || controller.signal.aborted
+  // Prefetch up to 3 sentences ahead while the current one plays, so the
+  // next sentence starts the moment the current one ends (no dead air
+  // between sentences while a fresh fetch runs).
+  const pending = new Map<number, Promise<Blob>>()
+  const ensureFetch = (idx: number, sentence: string) => {
+    if (idx < played || pending.has(idx) || controller.signal.aborted) return
+    const job = fetchOne(sentence, controller.signal)
+    // رد پس‌زمینه تا await بعدی unhandled نماند.
+    job.catch(() => {})
+    pending.set(idx, job)
+  }
+  try {
+    for (;;) {
+      if (stale()) return
+      const snap = source.snapshot()
+      const sentences = splitTtsSentences(stripMarkdownForTts(snap.text ?? ''))
+      // Hold back the trailing sentence while streaming: it is still growing.
+      const ready = snap.done ? sentences.length : Math.max(0, sentences.length - 1)
+      // Keep the prefetch window full: sentences already completed but not
+      // yet played download in the background during playback.
+      for (let i = played; i < Math.min(ready, played + 3); i++) {
+        ensureFetch(i, sentences[i])
+      }
+      if (ready > played) {
+        let blob: Blob
+        const job = pending.get(played)
+        pending.delete(played)
+        try {
+          blob = job ? await job : await fetchOne(sentences[played], controller.signal)
+        } catch (err) {
+          if (stale()) return
+          lastErr = err
+          failStreak++
+          // Skip a poisoned sentence instead of retrying it forever.
+          if (failStreak >= LIVE_STREAM_MAX_FAILS) {
+            played++
+            failStreak = 0
+          }
+          continue
+        }
+        if (stale()) return
+        failStreak = 0
+        played++
+        if (blob.size === 0) continue
+        await playBlobChunk(blob, seq, controller)
+        if (stale()) return
+        playedAny = true
+        try {
+          await sleepAbortAware(INTER_SENTENCE_GAP_MS, controller.signal)
+        } catch {
+          return
+        }
+        continue
+      }
+      if (snap.done) break
+      try {
+        await sleepAbortAware(LIVE_STREAM_POLL_MS, controller.signal)
+      } catch {
+        return
+      }
+    }
+  } catch (err) {
+    if (activeAbort === controller) activeAbort = null
+    if (stale()) return
+    stopTtsGlobal()
+    throw err
+  }
+  if (activeAbort === controller) activeAbort = null
+  const stillMine = activeSeq === seq
+  if (stillMine) stopTtsGlobal()
   if (!playedAny && lastErr && stillMine) throw lastErr
 }
 
@@ -318,6 +523,13 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
     }
     activeUrl = url
     const audio = new Audio(url)
+    // Pin the rate: back-to-back chunk playback must never inherit a
+    // non-1.0 rate, otherwise long answers sound rushed after a while.
+    try {
+      audio.playbackRate = 1
+    } catch {
+      // Ignore — the default rate already applies.
+    }
     activeAudio = audio
     // Free this sentence's ObjectURL + audio element as soon as playback
     // finishes (end/error/abort). A finished Audio keeps its decoded buffer and
@@ -478,6 +690,7 @@ export async function toggleTts(
   text: string,
   opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
+  local?: TtsLocalRequest,
 ): Promise<void> {
   if (activeOwner === owner) {
     if (activeStatus === 'speaking') {
@@ -493,7 +706,7 @@ export async function toggleTts(
       return
     }
   }
-  await playTts(text, opts, owner)
+  await playTts(text, opts, owner, local)
 }
 
 /** پخش‌کننده TTS هر پیام — همه نمونه‌ها روی یک پخش سراسری سوارند. */
@@ -520,15 +733,15 @@ export function useTtsPlayback() {
   }, [myId])
 
   const play = useCallback(
-    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
-      await playTts(text, opts, myId)
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[], local?: TtsLocalRequest) => {
+      await playTts(text, opts, myId, local)
     },
     [myId],
   )
 
   const toggle = useCallback(
-    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
-      await toggleTts(text, opts, myId)
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[], local?: TtsLocalRequest) => {
+      await toggleTts(text, opts, myId, local)
     },
     [myId],
   )

@@ -165,7 +165,7 @@ def test_qualifying_plan_body_rejects_prose():
     # A mere mention must never overwrite the saved plan.
     assert graph._qualifying_plan_body("Blocked on the C# plan review.") == ""
     # A line-anchored header qualifies (same rule as _split_plan_reply);
-    # coder_node additionally refuses to overwrite an already-saved plan,
+    # build_node additionally refuses to overwrite an already-saved plan,
     # so a "### Plan vs actual" summary section is harmless there.
     assert "### Plan vs actual" in graph._qualifying_plan_body(
         "Done.\n### Plan vs actual\nAll good."
@@ -256,9 +256,9 @@ async def _run_plan_turn(model, state):
         _graph.build_turn_context = orig
 
 
-def test_plan_turn_with_delivered_plan_ignores_coder_checklist():
+def test_plan_turn_with_delivered_plan_ignores_build_checklist():
     """Replay of the observed loop: update_plan ran during scouting (7 items,
-    all pending — Coder's future work), then ## Plan was delivered. The
+    all pending — Build's future work), then ## Plan was delivered. The
     completion gate must NOT force re-emits; the turn ends after one pass."""
     import tools as _tools_mod
 

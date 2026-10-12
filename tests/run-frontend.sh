@@ -144,10 +144,15 @@ chatLag|tests/chatLag.test.ts|--packages=external --external:electron
 diffResponsive|tests/diffResponsive.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 chatLoad|tests/chatLoad.test.ts|--packages=external --external:electron
 chatTabAskBadge|tests/chatTabAskBadge.test.ts|--jsx=automatic --packages=external --external:electron
+chatRenameInput|tests/chatRenameInput.test.ts|--jsx=automatic --packages=external --external:electron
+titleGenerator|tests/titleGenerator.test.ts|--packages=external --external:electron
 time|tests/time.test.ts|-
 fileSuggest|tests/fileSuggest.test.ts|--packages=external --external:electron
 textViewer|tests/textViewer.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 composerLayout|tests/composerLayout.test.ts|-
+chatQuote|src/lib/chatQuote.test.ts|
+cmuxNvim|tests/cmuxNvim.test.ts|-
+historySubmit|tests/historySubmit.test.ts|-
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

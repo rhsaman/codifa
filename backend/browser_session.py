@@ -630,6 +630,17 @@ async def _launch_browser(pw, chat_key: str | None = None):
     ]
     profile = _profile_dir(key)
     profile.mkdir(parents=True, exist_ok=True)
+    # Pre-launch recovery: a leftover SingletonLock from a half-failed close
+    # would fail BOTH channel attempts and push the turn past the 8s MCP
+    # connect timeout (continuing without MCP tools). Clear it up-front so
+    # the first attempt can take the profile immediately. Launch runs only
+    # when this sidecar holds no live session, so force=True is safe here —
+    # same guarantee as the post-failure sweep below. Per-chat profile
+    # isolation is preserved: only this chat's profile dir is touched.
+    try:
+        _clear_stale_profile_lock(profile, force=True)
+    except Exception:  # noqa: BLE001, S110 — pre-launch cleanup is best-effort
+        pass
     errors: list[str] = []
     for sweep in range(2):
         blocked = False

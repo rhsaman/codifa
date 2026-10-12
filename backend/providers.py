@@ -700,7 +700,11 @@ async def _models_dev_catalog() -> dict:
     if _models_dev_cache and now - _models_dev_cache[0] < MODELS_DEV_CACHE_TTL:
         return _models_dev_cache[1]
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Bounded for fast turn start: the catalog is large and the first
+        # turn would otherwise park Preparing context for tens of seconds
+        # on a slow network. On timeout the last good cache (or empty) is
+        # used — same fallback as before, just faster.
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(MODELS_DEV_API)
             resp.raise_for_status()
             data = resp.json()

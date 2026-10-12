@@ -30,3 +30,15 @@ export function shouldShowWaitingForModel(
 ): boolean {
   return contentElapsed > earlyMs && socketElapsed <= limitMs
 }
+
+/** True when content is stale past the stall limit while the socket stays
+ * alive (keepalives keep flowing): the stream is wedged, not merely slow —
+ * the caller should abort and auto-resume from the checkpoint instead of
+ * showing the "waiting for model" pill forever. */
+export function shouldRecoverContentStall(
+  contentElapsed: number,
+  socketElapsed: number,
+  limitMs: number,
+): boolean {
+  return contentElapsed > limitMs && socketElapsed <= limitMs
+}

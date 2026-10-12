@@ -38,7 +38,9 @@
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).openExternal = async () => {}
 
-const { buildGroups } = await import("../src/components/Sidebar")
+export {}
+
+const { buildGroups, toggleGroupSelection } = await import("../src/components/Sidebar")
 
 const workspaces = [{ key: "/demo", label: "Demo", root: "/demo", color: "#4f8" }]
 const chats = [
@@ -75,6 +77,20 @@ console.log("۲) تیک‌زدن چندتایی چت‌ها و حذف یک‌ج�
   // The bulk-delete button only appears once chats are selected; with no
   // selection the group still carries its full chat list.
   check("لیست چت‌ها کامل است (آماده برای حالت انتخاب)", group?.chats?.length === 2)
+}
+
+console.log("۳) انتخاب/لغو همه چت‌های یک ورک‌اسپیس:")
+{
+  const ids = ["c1", "c2"]
+  const selectedAll = toggleGroupSelection(new Set(), ids)
+  check("از حالت خالی، همه تیک می‌خورند", selectedAll.has("c1") && selectedAll.has("c2"))
+  const deselected = toggleGroupSelection(selectedAll, ids)
+  check("تکرار، تیک همه را برمی‌دارد", deselected.size === 0)
+  const partial = toggleGroupSelection(new Set(["c1", "other"]), ids)
+  check(
+    "انتخاب جزئی به انتخاب کامل می‌رسد و گروه دیگر دست نمی‌خورد",
+    partial.has("c1") && partial.has("c2") && partial.has("other"),
+  )
 }
 
 if (failed > 0) {

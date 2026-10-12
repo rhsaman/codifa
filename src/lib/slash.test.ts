@@ -15,6 +15,7 @@ import {
   recordCommandUsage,
   loadCommandUsage,
   sortCommandsByUsage,
+  sortByRecentUsage,
   MAX_HISTORY,
   MAX_PINS,
 } from "./slash"
@@ -84,10 +85,11 @@ console.log("5) togglePin caps at 3, toggle off removes:")
   check("toggle off removes", !pins.includes("/new") && pins.length === 2, pins)
 }
 
-console.log("6) historyRows puts pins first:")
+console.log("6) historyRows bottom-anchored (oldest top, pins bottom):")
 {
   const rows = historyRows(["b", "a"], ["/compact"])
-  check("pin first", rows[0] === "/compact", rows)
+  check("oldest first", rows[0] === "a" && rows[1] === "b", rows)
+  check("pin last at bottom", rows[rows.length - 1] === "/compact", rows)
   check("no duplicate pin", rows.filter((r) => r === "/compact").length === 1, rows)
 }
 
@@ -167,6 +169,23 @@ console.log("10) command usage persists across popup opens (storage round-trip):
     if (prevStorage === undefined) delete g.localStorage
     else g.localStorage = prevStorage
   }
+}
+
+console.log("11) /goal persistent goal labels:")
+{
+  const gp = parseSlashInput("/goal all tests pass")
+  check("goal name is goal", gp?.name === "goal", gp)
+  check("goal args kept", gp?.args === "all tests pass", gp)
+  check("goal label with args", prettySlashLabel("/goal all tests pass") === "Goal: all tests pass")
+  check("goal label bare", prettySlashLabel("/goal") === "Set a persistent goal")
+}
+
+console.log("12) sortByRecentUsage (shared command/skill sort):")
+{
+  const items = [{ slug: "b" }, { slug: "a" }, { slug: "c" }]
+  const sorted = sortByRecentUsage(items, ["a"], (x) => x.slug)
+  check("used first", sorted[0].slug === "a", sorted.map((x) => x.slug))
+  check("unused keep order", sorted[1].slug === "b" && sorted[2].slug === "c", sorted.map((x) => x.slug))
 }
 
 if (failed > 0) {

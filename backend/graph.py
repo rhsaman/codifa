@@ -5,12 +5,12 @@ Explicit state machine:
     Router
     +-- Ask   (web_search / fetch_url / vision / read / grep / glob)
     +-- Plan  (web_search / fetch_url / vision / glob / grep / read / terminal)
-    +-- Coder (edit_file / write_file / create / delete)
+    +-- Build (edit_file / write_file / create / delete)
               -> Review -> Done
 
-The Coder runs the project's tests itself (via run_terminal) before finishing —
+The Build mode runs the project's tests itself (via run_terminal) before finishing —
 there is NO automatic test/debug loop in the graph. The graph only routes
-Coder -> Review -> Done.
+Build -> Review -> Done.
 
 The graph controls the *high-level* flow (routing, the tool-permission
 boundaries). Each node runs ONE LLM turn for its mode via a
@@ -48,6 +48,11 @@ from typing import Any, TypedDict
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Cheap file-token extractor for the turn-start LSP warmup: matches file-ish
+# tokens (src/app.py, backend/tools.py, ./x.ts) in the prompt so the right
+# language server starts before the first lsp_* tool call needs it.
+_PATH_TOKEN_RE = re.compile(r"(?:[\w.-]+/)*[\w.-]+\.[A-Za-z]{1,5}")
 
 
 def _env_timeout(name: str, default_s: float) -> float:
@@ -108,15 +113,18 @@ from llm import (
     _batchable_nudge,
     _BatchStreakTracker,
     _clone_model_with_key,
+    _is_connection_dropped,
     _is_key_error,
     _is_parallel_calls_error,
     _is_plan_only_step,
     _is_reasoning_effort_error,
     _is_stream_options_error,
     _is_temperature_error,
+    _normalized_call_sig,
     _plan_only_step_marks_progress,
     _remap_reasoning_effort,
     _RevisitStreakTracker,
+    rebuild_model_fresh,
     _strip_parallel_calls,
     _strip_stream_options,
     _strip_temperature,
@@ -141,7 +149,11 @@ from tool_message_projection import (
 
 # Alias kept for existing call sites; logic lives in tool_message_projection.
 _stable_tool_order = stable_tool_order
-from tools import _PARENT_TOOLS_CTX, make_tool_callbacks
+from tools import (
+    _MAX_SEARCH_BATCHES_WITHOUT_EDIT,
+    _PARENT_TOOLS_CTX,
+    make_tool_callbacks,
+)
 
 # Tool calls in this set mutate persistent state (files, terminal, saved
 # memory/skills/connectors) or block on a real human (ask_user) -- they run
@@ -169,6 +181,130 @@ _SEQUENTIAL_TOOLS = {
     "ask_user",
     "computer",
 }
+
+# Build search guard (main agent loop only; Ask/Plan and sub-agents are never
+# gated). After _MAX_SEARCH_BATCHES_WITHOUT_EDIT steps made of grep/glob with
+# no edit in between, further search calls are refused with a message that
+# points at the symbols earlier results already surfaced, so the model edits
+# instead of searching again. Targeted read is NOT budgeted: it self-limits
+# (covering-window stubs + per-file per-turn line cap in tools.py) and a live
+# trace showed budgeting it made the model fight the guard for 3 wasted rounds
+# instead of converging on the answer it already had the coordinates for.
+# Any edit (including update_plan) re-arms the budget.
+_SEARCH_TOOLS = frozenset({"grep", "glob"})
+_EDIT_TOOLS = frozenset({"edit_file", "write_file", "update_plan"})
+_SEARCH_REFUSAL_PREFIX = "SEARCH BUDGET EXCEEDED"
+_SEARCH_HINT_SYMBOLS = 3
+# Header of an annotated grep hit: `path:line: in NAME (Lstart-end)`.
+_GREP_SYMBOL_HIT_RE = re.compile(
+    r"^(?P<path>[^\s:][^:\n]*):\d+: in (?P<name>[^\s(]+) \(L\d+-\d+\)",
+    re.MULTILINE,
+)
+
+
+def _is_search_refusal(content: Any) -> bool:
+    """True for a search-budget refusal, which must never be replayed as a result."""
+    return str(content or "").startswith(_SEARCH_REFUSAL_PREFIX)
+
+
+def _recent_symbol_hits(
+    msgs: list, limit: int = _SEARCH_HINT_SYMBOLS
+) -> list[tuple[str, str]]:
+    """Newest-first (path, symbol) pairs from `in NAME (L..)` grep annotations."""
+    seen: set[tuple[str, str]] = set()
+    hits: list[tuple[str, str]] = []
+    for m in reversed(msgs):
+        if not isinstance(m, ToolMessage):
+            continue
+        for found in _GREP_SYMBOL_HIT_RE.finditer(str(m.content or "")):
+            key = (found.group("path"), found.group("name"))
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(key)
+            if len(hits) >= limit:
+                return hits
+    return hits
+
+
+def _search_refusal_text(search_steps: int, msgs: list) -> str:
+    """Refusal text for a search past the budget, with ready-to-use read calls."""
+    text = (
+        f"{_SEARCH_REFUSAL_PREFIX}: {search_steps} search steps without an edit "
+        f"(max {_MAX_SEARCH_BATCHES_WITHOUT_EDIT}). No more grep/glob until you "
+        "edit. Targeted read(symbols=[...]/ranges=[...]) calls are still allowed — "
+        "use them to finish what you hold, then edit now with edit_file/write_file "
+        "(or update_plan for the checklist step). If the task cannot proceed, say "
+        "what is missing instead of searching again."
+    )
+    by_file: dict[str, list[str]] = {}
+    for path, name in _recent_symbol_hits(msgs):
+        by_file.setdefault(path, []).append(name)
+    if by_file:
+        calls = "; ".join(
+            f"read(filePath={path!r}, symbols={names!r})"
+            for path, names in by_file.items()
+        )
+        text += f" From earlier results: {calls}."
+    return text
+
+
+def _search_gate_text(
+    mode: str | None, search_steps: int, call_names: list[str], msgs: list
+) -> str | None:
+    """Refusal text when a build step would search past the budget, else None."""
+    if (mode or "") != "build":
+        return None
+    if search_steps < _MAX_SEARCH_BATCHES_WITHOUT_EDIT:
+        return None
+    if not any(name in _SEARCH_TOOLS for name in call_names):
+        return None
+    return _search_refusal_text(search_steps, msgs)
+
+
+def _soft_search_nudge(mode: str, search_batches: int) -> str | None:
+    """Soft model-visible search-budget message for ask mode, else None.
+
+    Build refuses past the budget (hard gate) and plan converges via the
+    scout budget plus the plan-done hint; ask had nothing, so an ask turn
+    could spray searches step after step. Past the budget the nudge repeats
+    every 4th search step. Calls still run — read-only modes are never
+    gated, only steered back to answering.
+    """
+    if (mode or "") != "ask":
+        return None
+    if search_batches < _MAX_SEARCH_BATCHES_WITHOUT_EDIT:
+        return None
+    if (search_batches - _MAX_SEARCH_BATCHES_WITHOUT_EDIT) % 4:
+        return None
+    return (
+        f"SEARCH BUDGET: {search_batches} search steps this turn. You have "
+        "enough context — answer now from what you already hold instead of "
+        "searching again."
+    )
+
+
+def _targeted_search_note(mode: str) -> str:
+    """LSP-first search guidance appended to the workspace note.
+
+    Every repo-access mode (ask/plan/build) gets the same core rule — a
+    precise LSP jump before any grep — so blind OR-grep sprays don't happen
+    in plan/ask turns either. Only the closing directive differs: build
+    converges to editing, read-only modes converge to the answer/plan.
+    """
+    tail = (
+        " After at most 2-3 search batches start editing in the SAME turn."
+        if (mode or "") == "build"
+        else " After at most 2-3 search batches, conclude from what you already hold."
+    )
+    return (
+        f"\n\n=== TARGETED SEARCH ({str(mode or 'ASK').upper()}) ===\n"
+        "Start from LSP (lsp_definition/references/hover/symbols) for a precise jump, "
+        "then ONE targeted grep with context if needed, then read only the pointed windows via symbols=[...] or "
+        "ranges=[...]. You have full workspace access; prefer targeted lookups with path/include."
+        + tail
+    )
+
 
 # ---------------------------------------------------------------------------
 # Native interrupted-turn resume (LangGraph checkpointer)
@@ -254,6 +390,28 @@ def _unanswered_tool_calls(msgs: list, calls: list) -> list:
 _CHECKPOINT_EVERY_N_STEPS = 1
 _CHECKPOINT_MIN_GROWTH_CHARS = 20_000
 _checkpoint_state: dict[str, dict] = {}
+# In-flight background checkpoint save per thread: while a save is running,
+# a newer one is skipped (the next due save catches up) so saves never pile
+# up behind a slow sqlite write and never block the turn's critical path.
+_checkpoint_save_tasks: dict[str, asyncio.Task] = {}
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Done-callback for detached background tasks: log a swallowed exception
+    instead of letting it surface only as "Task exception was never retrieved"."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("background task failed: %s: %s", type(exc).__name__, exc)
+
+
+# Repetition-loop scan stride for the streaming loop: _is_repeating()
+# re-scans the reply tail on every call, so checking on EVERY chunk makes a
+# long answer quadratic. A repeated unit is at most 200 chars (3 consecutive
+# copies at most 600), so a 240-char stride can never skip a live loop; the
+# stream-end check still catches anything shorter.
+_REPEAT_SCAN_STRIDE = 240
 
 
 def _checkpoint_due(thread_id: str, msgs: list, *, force: bool = False) -> bool:
@@ -302,19 +460,50 @@ async def _save_turn_checkpoint_valid(
         ToolMessage(content=_INTERRUPTED_TOOL_PLACEHOLDER, tool_call_id=tc["id"])
         for tc in _unanswered_tool_calls(msgs, pending_calls)
     ]
-    _ckpt_t0 = time.monotonic()
-    await _save_turn_checkpoint(thread_id, list(msgs) + patch, mode=mode, plan=plan)
-    try:
-        _ckpt_dt = time.monotonic() - _ckpt_t0
-        if _ckpt_dt > 1.0:
-            logger.warning(
-                "[ckpt-timing] thread=%s slow_save=%.1fs msgs=%d",
-                str(thread_id or "")[:16],
-                _ckpt_dt,
-                len(msgs),
-            )
-    except Exception:  # noqa: BLE001, S110 — timing never breaks save
-        pass
+    # Snapshot the transcript NOW (the loop keeps mutating `msgs` while the
+    # save runs in the background) and hand the snapshot to a detached task so
+    # the per-step sqlite write never sits on the turn's critical path. A
+    # forced save (turn end / last sequential tool) still awaits so the
+    # durable state is guaranteed before the turn finishes.
+    _snapshot = list(msgs) + patch
+    _prev = _checkpoint_save_tasks.get(thread_id)
+    if _prev is not None and not _prev.done():
+        if force:
+            # The final save must land; wait for the in-flight one first so
+            # two concurrent writers never interleave on the same thread.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await _prev
+        else:
+            # A save is already running for this thread: skip — the next due
+            # save (throttling re-arms every step) persists the newer state.
+            return
+
+    async def _bg_save() -> None:
+        _ckpt_t0 = time.monotonic()
+        try:
+            await _save_turn_checkpoint(thread_id, _snapshot, mode=mode, plan=plan)
+        finally:
+            _checkpoint_save_tasks.pop(thread_id, None)
+            try:
+                _ckpt_dt = time.monotonic() - _ckpt_t0
+                if _ckpt_dt > 1.0:
+                    logger.warning(
+                        "[ckpt-timing] thread=%s slow_save=%.1fs msgs=%d",
+                        str(thread_id or "")[:16],
+                        _ckpt_dt,
+                        len(_snapshot),
+                    )
+            except Exception:  # noqa: BLE001, S110 — timing never breaks save
+                pass
+
+    _task = asyncio.create_task(_bg_save())
+    _checkpoint_save_tasks[thread_id] = _task
+    if force:
+        await _task
+    else:
+        # Detached: a crash of the save must never kill the turn. The task
+        # removes itself from the registry on completion.
+        _task.add_done_callback(_log_task_exception)
 
 
 def _sanitize_trailing_tool_calls(msgs: list) -> list:
@@ -390,17 +579,39 @@ def _latest_plan_from_history(history: list | None) -> list[dict]:
     return []
 
 
+def _plan_progress_line(plan: list[dict]) -> str:
+    """One-line checklist progress (cheap resume memory, ~20 tokens).
+
+    E.g. ``"2/5 done — current: write tests"`` so a resumed turn knows where
+    to continue without re-reading the full checklist.
+    """
+    done = sum(
+        1 for it in plan if isinstance(it, dict) and it.get("status") == "completed"
+    )
+    total = len(plan)
+    current = ""
+    for it in plan:
+        if not isinstance(it, dict):
+            continue
+        if it.get("status") in ("in_progress", "pending"):
+            current = str(it.get("content", "")).strip()[:120]
+            if current:
+                break
+    if current:
+        return f"{done}/{total} done — current: {current}"
+    return f"{done}/{total} done"
+
+
 def _plan_status_message(plan: list[dict]) -> HumanMessage | None:
-    """Fold a checklist into a resume message so completed steps are not redone."""
+    """Fold checklist progress into a one-line resume note."""
     if not plan:
         return None
-    lines = [f"- [{it['status']}] {it['content']}" for it in plan]
     return HumanMessage(
         content=(
-            "[Task checklist statuses — do NOT re-execute completed steps; "
-            "continue pending/in_progress via update_plan with the SAME items:\n"
-            + "\n".join(lines)
-            + "]"
+            "[Checklist progress "
+            + _plan_progress_line(plan)
+            + " — do NOT re-execute completed steps; continue pending steps "
+            "via update_plan with the SAME items.]"
         )
     )
 
@@ -467,14 +678,14 @@ def _parse_checkpoint_ts(ts_raw) -> float | None:
 # produce a silently broken first reply. Drop and start fresh instead.
 # TTL is 12h (was 2h): a checkpoint left overnight by an interrupted turn
 # must still resume instead of redoing all tool work. Size cap is 120 tool
-# messages (was 40): a real coder turn easily does 15-20 read/grep calls and
+# messages (was 40): a real build turn easily does 15-20 read/grep calls and
 # long multi-file tasks exceed 40 without being a loop — the repetition guard
 # (tool-signature based) already stops stuck loops, so the size guard only
 # catches absurd transcripts.
 _RESUME_MAX_AGE_S = 12 * 60 * 60  # 12 hours
 # سیاست حد ابزار: این حد فقط «تعداد فراخوانی» را می‌شمارد، نه حجم توکن را؛
 # پنجرهٔ کانتکست را auto-compact (آستانهٔ درصدی) محافظت می‌کند. یک turn واقعی
-# coder به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد، پس حدِ پایین (مثل ۸) عملاً
+# build به‌راحتی ۱۵-۲۰ فراخوانی read/grep دارد، پس حدِ پایین (مثل ۸) عملاً
 # چک‌پوینت را همیشه می‌انداخت و رزومهٔ واقعی بی‌استفاده می‌شد — همان
 # «کانتکست کم می‌شود بعد از استپ» که کاربر می‌دید.
 _RESUME_MAX_TOOL_CALLS = 120
@@ -710,8 +921,6 @@ class AgentState(TypedDict, total=False):
     # کفِ permit["folders"] در هر rebuild ابزار دوباره تزریق می‌شود.
     allow_outside_folders: list[str]
     allow_create: bool
-    nvim_file: str
-    nvim_diagnostics: list
     skills: list[str]
     vector_db_path: str
     vector_config: dict
@@ -721,7 +930,6 @@ class AgentState(TypedDict, total=False):
     providers: dict
     reserved: int | None
     compact_at_percent: int | None
-    max_steps: int
     # MCP connectors the user toggled on in the composer chip. Passed through
     # verbatim from the UI request; consumed by build_turn_context to attach
     # live MCP tools. MUST be declared on the state or LangGraph drops it
@@ -735,7 +943,7 @@ class AgentState(TypedDict, total=False):
     grep_results: list
     read_context: str
     plan: str
-    coder_result: str
+    build_result: str
     changed_files: list[str]
     review_result: str
     final_response: str
@@ -752,7 +960,7 @@ class AgentState(TypedDict, total=False):
     # run_graph._drive (decides whether to clear the durable resume file). MUST
     # be declared on the state or LangGraph drops it before the node runs.
     _run_flags: dict
-    # Shared in-memory permit dict ({"outside", "computer"}) — survives coder
+    # Shared in-memory permit dict ({"outside", "computer"}) — survives build
     # node re-entry within a turn. Rebuilding tools with a fresh dict would
     # lose grants made via "Always allow" / an in-turn Allow-once, re-prompting
     # the user on every agent step.
@@ -763,6 +971,13 @@ class AgentState(TypedDict, total=False):
     # not replay the discarded turn. Resume (banner Retry / watchdog /
     # reconnect) leaves this False so the checkpoint is reused.
     restart: bool
+    # Persistent goal condition (/goal). Plain text; empty means no active goal.
+    # MUST be declared or LangGraph drops it before nodes run (same rule
+    # as mcp_servers / _run_flags above).
+    goal: str
+    # Bounded auto-continue bookkeeping for an unmet goal.
+    goal_turns: int
+    goal_continue: bool
     # Previous turn's mode + whether it differs (mode-switch re-orientation).
     # MUST be declared or LangGraph drops them before nodes run (same rule
     # as mcp_servers / _run_flags above).
@@ -800,7 +1015,21 @@ def history_to_langchain_messages(
     # (مثلاً «1»). دو ToolMessage با یک tool_call_id خطای provider
     # «Duplicate function_call_output for call_id» را می‌سازد.
     used_ids: set[str] = set()
-    for turn in history or []:
+    # Progress attaches ONLY to the latest plan-carrying turn: every historic
+    # turn re-injecting its own full checklist multiplied tokens per message.
+    _latest_plan_idx = -1
+    for _i, _t in enumerate(history or []):
+        if (
+            isinstance(_t, dict)
+            and _t.get("role") == "assistant"
+            and isinstance(_t.get("plan"), list)
+            and any(
+                isinstance(_p, dict) and str(_p.get("content", "")).strip()
+                for _p in _t.get("plan")
+            )
+        ):
+            _latest_plan_idx = _i
+    for _turn_idx, turn in enumerate(history or []):
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
         # Non-visible recap of completed tools from a previously interrupted
@@ -814,24 +1043,17 @@ def history_to_langchain_messages(
         # assistant content (same mechanism as preserved_summary).
         _plan_items = turn.get("plan") or []
         _plan_note = ""
-        if role == "assistant" and isinstance(_plan_items, list) and _plan_items:
-            _plan_lines = []
-            for _pi in _plan_items:
-                if not isinstance(_pi, dict):
-                    continue
-                _pt = str(_pi.get("content", "")).strip()
-                if not _pt:
-                    continue
-                _ps = str(_pi.get("status", "pending")).strip().lower()
-                if _ps not in ("pending", "in_progress", "completed"):
-                    _ps = "pending"
-                _plan_lines.append(f"- [{_ps}] {_pt[:200]}")
-            if _plan_lines:
-                _plan_note = (
-                    "\n[Task checklist statuses — do NOT re-execute completed steps:\n"
-                    + "\n".join(_plan_lines)
-                    + "]"
-                )
+        if (
+            role == "assistant"
+            and isinstance(_plan_items, list)
+            and _plan_items
+            and _turn_idx == _latest_plan_idx
+        ):
+            _plan_note = (
+                "\n[Checklist progress "
+                + _plan_progress_line(_plan_items)
+                + " — do NOT re-execute completed steps.]"
+            )
         tool_activity = turn.get("toolActivity") or []
         # Reconstruct assistant tool calls from the carried toolActivity so a
         # resumed turn continues instead of redoing completed work.
@@ -960,7 +1182,7 @@ def history_to_langchain_messages(
 # The UI/toolbar mode is authoritative. We only honor an explicit slash command
 # (/plan, /code, /ask, /reader) in the prompt — never infer the mode from
 # keywords (that would override the user's explicit selection and make the agent
-# think it's in Coder while the user picked Plan). See ``router`` below.
+# think it's in Build while the user picked Plan). See ``router`` below.
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +1193,6 @@ def filter_tools_for_mode(
     mode: str,
     tools: dict[str, Callable],
     cap: dict | None,
-    scoped_paths: set[str],
     allow_create: bool,
     allow_outside: bool,
     prompt: str = "",
@@ -982,7 +1203,7 @@ def filter_tools_for_mode(
     """Return the mode-appropriate subset of ``tools``.
 
     Mirrors the original agents.py gating exactly: capability-driven denying
-    (readFiles/writeFiles/runTerminal/web), the coder-only write restriction,
+    (readFiles/writeFiles/runTerminal/web), the build-only write restriction,
     plan-mode persistence (handled by the plan_build node, not a tool), ask-mode drops (read/memory/trivial-prompt schemas),
     ``allow_create`` gating of skill/MCP creation, and file-scope stripping.
     """
@@ -1019,7 +1240,7 @@ def filter_tools_for_mode(
                 tools["run_terminal"]
             )
     else:
-        if mode != "coder":
+        if mode != "build":
             tools = {
                 n: fn
                 for n, fn in tools.items()
@@ -1048,10 +1269,10 @@ def filter_tools_for_mode(
         tools = {n: fn for n, fn in tools.items() if n not in _WEB}
 
     # Repo search tools (grep/glob/read/task) are now available to the Main
-    # Agent for every mode that needs repo access (coder/plan/ask/reader). The
+    # Agent for every mode that needs repo access (build/plan/ask/reader). The
     # LLM decides iteratively which to call — there is NO mandatory
     # glob->grep->read order (this matches OpenCode). Write/terminal tools stay
-    # coder-only (handled in the blocks above); non-coder modes therefore keep
+    # build-only (handled in the blocks above); non-build modes therefore keep
     # only read/search/web/vision capabilities. The background sub-agent reuses
     # the same tool runtime in an isolated context.
     if mode == "ask" and _agents._trivial_prompt(prompt):
@@ -1075,49 +1296,16 @@ def filter_tools_for_mode(
     if "computer" in tools and not allow_computer:
         tools = {n: fn for n, fn in tools.items() if n != "computer"}
     # LSP tools are available in every mode with repo access
-    # (coder/plan/ask/reader): precise jump helps answering and planning
-    # too, not just editing. Write/terminal tools stay coder-only (handled
-    # above), so LSP remains read-only outside coder mode.
+        # (build/plan/ask/reader): precise jump helps answering and planning
+    # too, not just editing. Write/terminal tools stay build-only (handled
+    # above), so LSP remains read-only outside build mode.
 
-    # Coder plan scope: plan Files are the enforceable search scope, so grep/
-    # glob/read wrappers reject whole-workspace scans (missing path) and
-    # limit search to these files instead of blind repo-wide sweeps.
-    if mode == "coder":
-        try:
-            _plan_scope = _agents._plan_file_paths(history or [])
-        except Exception:  # noqa: BLE001 — scope must never break filtering
-            _plan_scope = []
-        if _plan_scope:
-            scoped_paths = set(scoped_paths or set()) | {
-                str(p).strip().lstrip("/").lstrip("./")
-                for p in _plan_scope
-                if str(p or "").strip()
-            }
-    scoped = bool(scoped_paths)
-    if scoped:
-        # Scoped requests keep grep/glob/read bound but limited to the scope.
-        # Dropping glob entirely surfaced as "unknown tool 'glob'"; instead
-        # wrap it like grep/read so out-of-scope calls get an actionable
-        # scoped error. The sub-agent inherits these same scoped tools, so no
-        # manual grep loop forms in the main context.
-        if "grep" in tools:
-            tools["grep"] = _agents._wrap_scoped_search(tools["grep"], scoped_paths)
-        if "glob" in tools:
-            tools["glob"] = _agents._wrap_scoped_glob(tools["glob"], scoped_paths)
-        if "read" in tools:
-            tools["read"] = _agents._wrap_scoped_read(tools["read"], scoped_paths)
-        if (
-            "run_terminal" in tools
-            and has_cap
-            and cap.get("runTerminal")
-            and not cap.get("writeFiles")
-        ):
-            tools["run_terminal"] = _agents._wrap_scoped_terminal(
-                tools["run_terminal"], root, scoped_paths
-            )
+    # Full workspace access: every file inside the workspace is readable
+    # without any scope gate. Only outside-workspace access needs permission
+    # (handled by the permission gates in tools.py).
     # Stable toolset order across turns (prompt-cache friendly): dict insertion
     # order varies with mode-filter/scope paths, which would rewrite the tool
-    # schema prefix every turn and force full-price reprocessing. Coder in
+    # schema prefix every turn and force full-price reprocessing. Build in
     # particular must keep the same toolset across turns, so sort by name to
     # keep the bound schema prefix byte-identical (same set, deterministic order).
     tools = dict(sorted(tools.items(), key=lambda kv: kv[0]))
@@ -1136,11 +1324,11 @@ def merge_mcp_tools(
 ) -> bool:
     """Merge live MCP tools into the mode-filtered tool set.
 
-    Returns True when a browser MCP (Playwright) toolset is live. In that case
-    the built-in ``web_search`` tool is REMOVED — the browser replaces it for
-    web research (a soft preference alone loses to the static prompts that
-    push web_search). When ``cap`` denies web access, browser MCP tools are
-    dropped instead (they are web access too).
+    Returns True when a browser MCP (Playwright) toolset is live. Both
+    ``web_search`` and browser tools stay available — the model picks per
+    need (fast lookup via web_search, explicit open-site requests or
+    JS-heavy pages via the browser). When ``cap`` denies web access,
+    browser MCP tools are dropped instead (they are web access too).
     """
     cap = cap or {}
     browser_live = any(is_browser_mcp_tool(getattr(t, "name", "")) for t in mcp_tools)
@@ -1150,8 +1338,6 @@ def merge_mcp_tools(
         ]
     for t in mcp_tools:
         filtered[t.name] = t
-    if browser_live:
-        filtered.pop("web_search", None)
     return browser_live
 
 
@@ -1175,9 +1361,9 @@ def _mcp_server_of(t: Any) -> str:
 def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     """Per-turn note telling the model which MCP connectors are live.
 
-    When a browser MCP (Playwright) is connected the note also states the
-    WEB RESEARCH RULE: web_search is disabled this turn and all web research
-    must be done by driving the browser tools.
+    When a browser MCP (Playwright) is connected the note adds a selection
+    guide: both web_search and browser tools stay available and the model
+    picks per need.
     """
     servers = sorted({s for s in (_mcp_server_of(t) for t in mcp_tools) if s})
     note = (
@@ -1188,14 +1374,39 @@ def _mcp_tools_note(mcp_tools: list, browser_live: bool) -> str:
     )
     if browser_live:
         note += (
-            "\nWEB RESEARCH RULE: a browser MCP (Playwright) is connected, so the "
-            "built-in web_search tool is DISABLED this turn — do NOT call it. Do ALL "
-            "web research by driving the browser: browser_navigate (open a URL or a "
-            "search-engine results page), browser_snapshot / browser_evaluate (read "
-            "the page), browser_click / browser_type / browser_fill_form (interact). "
+            "\nWEB RESEARCH GUIDE: both the built-in web_search and the browser "
+            "MCP (Playwright) are available — pick per need. Use web_search ONLY for "
+            "fast fact lookup. When the user asks (in any language) to open/show/visit a site "
+            "(e.g. 'open digikala'), you MUST call "
+            "browser_navigate — never answer an open-site request with web_search "
+            "alone. Use the browser also when the page needs JS rendering/interaction "
+            "(browser_snapshot / browser_evaluate to read, browser_click / "
+            "browser_type / browser_fill_form to interact). "
             "fetch_url stays available for pulling a KNOWN url as markdown."
         )
     return note
+
+
+def _tool_def_chars(t: Any) -> int:
+    """Characters of one bound tool definition (name + description + args schema)."""
+    total = len(str(getattr(t, "name", "") or ""))
+    total += len(str(getattr(t, "description", "") or ""))
+    try:
+        schema = getattr(t, "args_schema", None)
+        if schema is not None:
+            try:
+                js = schema.model_json_schema() if hasattr(schema, "model_json_schema") else {}
+            except Exception:  # noqa: BLE001 — schema dump never breaks the turn
+                js = {}
+            total += len(json.dumps(js, ensure_ascii=False, default=str))
+            return total
+    except Exception:  # noqa: BLE001, S110 — fall back to plain args dict
+        pass
+    args = getattr(t, "args", None)
+    if not isinstance(args, dict):
+        args = {}
+    total += len(json.dumps(args, ensure_ascii=False, default=str))
+    return total
 
 
 def mcp_schema_chars(tools: list | None) -> int:
@@ -1205,33 +1416,37 @@ def mcp_schema_chars(tools: list | None) -> int:
     This is the MCP footprint the provider counts as tool definitions —
     separate from the connector config JSON the frontend can already see.
     """
-    total = 0
-    for t in tools or []:
-        total += len(str(getattr(t, "name", "") or ""))
-        total += len(str(getattr(t, "description", "") or ""))
-        args = getattr(t, "args", None)
-        if not isinstance(args, dict):
-            args = {}
-        total += len(json.dumps(args, ensure_ascii=False, default=str))
-    return total
+    return sum(_tool_def_chars(t) for t in (tools or []))
 
 
 def ctx_parts_event(
-    mode: str, system_final: str, skill_section: str, tools: list | None
+    mode: str,
+    system_final: str,
+    skill_section: str,
+    tools: list | None,
+    chat_id: str = "",
 ) -> dict:
     """Frontend-facing report of the real per-turn context part sizes.
 
     ``systemChars`` excludes the skills section (reported separately in
     ``skillsChars``) so the popover rows never double-count it.
+    ``systemToolsChars`` is the measured native tool-schema footprint and
+    ``mcpChars`` the MCP one — the frontend must show these instead of
+    attributing the whole unexplained gap to System tools.
     """
     system = str(system_final or "")
     section = str(skill_section or "")
+    all_tools = list(tools or [])
+    mcp = [t for t in all_tools if _mcp_server_of(t)]
+    native = [t for t in all_tools if not _mcp_server_of(t)]
     return {
         "kind": "ctx_parts",
+        "chat_id": str(chat_id or ""),
         "mode": str(mode or ""),
         "systemChars": max(0, len(system) - len(section)),
         "skillsChars": len(section),
-        "mcpChars": mcp_schema_chars(tools),
+        "mcpChars": sum(_tool_def_chars(t) for t in mcp),
+        "systemToolsChars": sum(_tool_def_chars(t) for t in native),
     }
 
 
@@ -1242,11 +1457,11 @@ def _mcp_note_for_turn(mcp_tools: list, browser_live: bool, chat_id: str) -> str
     """Full MCP note on first sight / server change, one-line reminder after.
 
     The connector list + naming rules rarely change mid-chat, so resending
-    the full block every turn is pure input-token overhead. The behavioral
-    rule (web_search disabled when a browser MCP is live) IS repeated in the
-    short form — dropping it would risk the model calling a disabled tool and
-    burning a full wasted round trip, which costs more than the reminder.
-    Per-chat signature cache; any server-set change re-sends the full note.
+    the full block every turn is pure input-token overhead. The selection
+    guide (web_search vs browser tools) IS repeated in the short form —
+    dropping it would risk the model always reaching for one tool when the
+    other fits better. Per-chat signature cache; any server-set change
+    re-sends the full note.
     """
     servers = sorted({s for s in (_mcp_server_of(t) for t in mcp_tools) if s})
     sig = ",".join(servers) + ("|browser" if browser_live else "")
@@ -1257,7 +1472,7 @@ def _mcp_note_for_turn(mcp_tools: list, browser_live: bool, chat_id: str) -> str
     if sig and cache.get(chat_id) == sig:
         short = f"MCP connectors live: {', '.join(servers)} (tools callable under short names)."
         if browser_live:
-            short += " web_search is DISABLED — do web research via browser tools only."
+            short += " Use web_search ONLY for fast lookup; when the user asks to open/show/visit a site you MUST call browser_navigate, never web_search alone."
         return short
     if len(cache) > 500:
         cache.clear()
@@ -1563,8 +1778,8 @@ async def _vision_analyze_cached(
 # Code/file token pattern: an English identifier, path or filename means the
 # turn plausibly needs code tools/symbols. Used by ``_obvious_non_code_turn``
 # to fast-skip the symbol map on obvious chit-chat. Skill selection does NOT
-# key on it: the AVAILABLE SKILLS catalog is always present, so short
-# non-English task prompts are covered without any hard-coded keyword list.
+# key on it: the decision router matches by meaning, so short non-English
+# task prompts are covered without any hard-coded keyword list.
 _TASK_SIGNAL_RE = r"[A-Za-z_][A-Za-z0-9_]{2,}|[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}"
 
 
@@ -1659,97 +1874,225 @@ def _skill_generic_norm(text: str) -> str:
     )
 
 
-def _skill_generic_stems(text: str) -> set[str]:
-    """Lower-cased word stems (first 6 chars) from skill/request data only."""
-    out: set[str] = set()
+_SKILL_ROUTE_SYSTEM = (
+    "You route a coding-agent request to reusable skills. You get a SKILLS list "
+    "(name: description) and a REQUEST, often Persian and often vague. Match by "
+    "MEANING and intent, never literal words: a vague non-English complaint about "
+    "an ugly UI fits a design/redesign skill; condensing long content fits a "
+    "summarization skill. Reply with ONLY a JSON array of at most 2 exact skill "
+    "names whose description fits what the request needs, for example "
+    "[\"summarization\"], or [] when no skill fits. Plain bug fixes, refactors, "
+    "debugging and questions about code fit no skill. No prose, no markdown."
+)
+_SKILL_ROUTE_CACHE: dict[str, list[str]] = {}
+_SKILL_ROUTE_CACHE_MAX = 64
+_SKILL_ROUTE_TIMEOUT = 12.0  # seconds; a slow router must never stall the turn
+_SKILL_ROUTE_MIN_CHARS = 3  # short vague requests still route; chit-chat skips
+_SKILL_ROUTE_FAIL_LIMIT = 3  # consecutive failures before the router pauses
+_SKILL_ROUTE_PAUSE_SECS = 120.0  # retry soon: a paused router disables auto-load
+_SKILL_ROUTE_CATALOG_MAX_CHARS = 6000  # tiny local decision models have small windows
+_skill_route_state: dict[str, float] = {"fails": 0, "paused_until": 0.0}
+
+#: Sentinel router_model marking the downloaded on-device Laya router.
+#: It is a plain string (never a LangChain model) so _route_skills can
+#: branch to the local path without touching any provider.
+_LAYA_LOCAL_MODEL: Any = "laya-local"
+
+
+def _is_laya_decision(entry: Any) -> bool:
+    """True when the decision slot picks the downloaded local Laya model."""
     try:
-        stop = set(getattr(_agents, "_SKILL_AUTO_STOP", frozenset()))
-    except Exception:  # noqa: BLE001
-        stop = frozenset()
-    for tok in re.findall(r"\w+", _skill_generic_norm(text)):
-        if len(tok) < 3 or tok.isdigit() or tok in stop:
-            continue
-        out.add(tok[:6])
-    return out
+        from laya_router import is_laya_entry
+    except Exception:  # noqa: BLE001 — fail-open, use the parent model
+        return isinstance(entry, str) and entry.strip().lower() == "laya"
+    return is_laya_entry(entry)
 
 
-def _skill_generic_phrase_in(norm_text: str, phrase: str) -> bool:
-    """True when ``phrase`` occurs in ``norm_text`` (both normalized)."""
-    key = _skill_generic_norm(phrase).strip()
-    return len(key) >= 2 and re.search(r"(?<!\w)" + re.escape(key), norm_text) is not None
+def _parse_skill_route(raw: str, rows: list[dict], max_n: int) -> list[str] | None:
+    """Known skill names from the router reply; None when it has no JSON array."""
+    by: dict[str, str] = {}
+    for s in rows:
+        name = str(s.get("name") or "").strip()
+        for key in (name, str(s.get("slug") or "").strip()):
+            if key:
+                by.setdefault(key.casefold(), name)
+    m = re.search(r"\[[^\[\]]*\]", str(raw or ""), re.DOTALL)
+    if not m:
+        # Tolerant fallback: the main model often answers in prose
+        # (Persian explanation + skill name) instead of a JSON array.
+        # Match known skill names as substrings so the turn still loads.
+        text_fold = str(raw or "").casefold()
+        found: list[str] = []
+        for key_fold, name in by.items():
+            if key_fold and key_fold in text_fold and name not in found:
+                found.append(name)
+                if len(found) >= max_n:
+                    break
+        return found if found else None
+    try:
+        items = json.loads(m.group(0))
+    except ValueError:
+        items = re.findall(r'"([^"]+)"', m.group(0))
+    out: list[str] = []
+    for it in items if isinstance(items, list) else []:
+        name = by.get(str(it).strip().casefold())
+        if name and name not in out:
+            out.append(name)
+    return out[:max_n]
 
 
-def _skill_generic_score(skill: dict, p_stems: set[str], norm: str) -> int:
-    """Score a skill from its own data only (name/slug/description/fa_keywords)."""
-    name_stems = _skill_generic_stems(f"{skill.get('name', '')} {skill.get('slug', '')}")
-    hits = len(p_stems & name_stems)
-    score = 2 * hits
-    if hits and len(name_stems) == 1:
-        score += 2
-    desc_stems = _skill_generic_stems(skill.get("description", "")) - name_stems
-    score += min(len(p_stems & desc_stems), 2)
-    for kw in skill.get("fa_keywords") or []:
-        kw_n = _skill_generic_norm(kw).strip()
-        if not kw_n:
-            continue
-        if _skill_generic_phrase_in(norm, kw):
-            score += 4
-            break
-        if _skill_generic_phrase_in(kw_n, norm.strip()[:120]):
-            score += 4
-            break
-        kw_words = {w for w in re.findall(r"\w+", kw_n) if len(w) >= 2}
-        p_words = {w for w in re.findall(r"\w+", norm) if len(w) >= 2}
-        if not kw_words or not p_words:
-            continue
-        inter = kw_words & p_words
-        if len(kw_words) == 1 and inter:
-            score += 4
-            break
-        if len(inter) >= 2:
-            score += 4
-            break
-    return score
+async def _route_skills(
+    prompt: str,
+    skills: list[dict],
+    model: Any,
+    chat_id: str = "",
+    emit: Callable[[dict], None] | None = None,
+) -> list[str] | None:
+    """Ask the decision model which skills this request needs (semantic match).
 
-
-def _skill_generic_pick(prompt: str, skills: list[dict], exclude=()) -> list[dict]:
-    """Data-driven fallback when the deterministic auto-pick returns nothing.
-
-    Scores ONLY from each skill's own data (name/slug/description/fa_keywords)
-    with no hardcoded concept map, so any task — including vague or Persian-only
-    requests — resolves via the skill data itself. Persian-only prompts with no
-    Latin stems still match via ``fa_keywords`` substring. Thresholds mirror the
-    deterministic picker so a single generic word never qualifies.
+    The decision slot picks the router: the downloaded on-device Laya model
+    or an external model (empty slot = the main model). An embedding
+    prefilter first narrows any store size to the top candidates so the
+    router always sees the most relevant slice. Returns skill names (``[]``
+    = none needed) or ``None`` when routing is unavailable — no model,
+    timeout, bad reply, or paused after repeated failures — so the caller
+    inlines nothing (no keyword fallback).
     """
+    text = (prompt or "").strip()
+    rows = [s for s in skills or [] if str(s.get("name") or "").strip()]
+    try:
+        from skill_prefilter import prefilter_skills as _prefilter_skills
+
+        rows = _prefilter_skills(text, rows)
+    except Exception as exc:  # noqa: BLE001 — prefilter is best-effort
+        logger.debug("[skills] prefilter failed: %s", exc)
     try:
         max_n = int(getattr(_agents, "_SKILL_AUTO_MAX", 2))
     except Exception:  # noqa: BLE001
         max_n = 2
+    if model is None or not rows or max_n <= 0 or len(text) < _SKILL_ROUTE_MIN_CHARS:
+        return None
+    with contextlib.suppress(Exception):
+        if _agents._SKILL_META_RE.search(_skill_generic_norm(text)):
+            return []  # a request about making/editing skills loads none
+    now = time.monotonic()
+    if _skill_route_state["paused_until"] > now:
+        return None
+    lines = []
+    for s in rows:
+        desc = str(s.get("description") or "").strip()[:140]
+        kws = ", ".join(str(k) for k in (s.get("fa_keywords") or [])[:3])
+        lines.append(f"- {s['name']}: {desc}" + (f" (also: {kws})" if kws else ""))
+    catalog = "\n".join(lines)
+    # Tiny local decision models (a few hundred M params) have small context
+    # windows; an oversized catalog would fail EVERY routing call, pause the
+    # router and silently disable auto-load again. Cut at a line boundary.
+    if len(catalog) > _SKILL_ROUTE_CATALOG_MAX_CHARS:
+        catalog = catalog[:_SKILL_ROUTE_CATALOG_MAX_CHARS].rsplit("\n", 1)[0]
+    key = hashlib.md5((catalog + "\n" + text[:1500]).encode("utf-8")).hexdigest()
+    if key in _SKILL_ROUTE_CACHE:
+        return list(_SKILL_ROUTE_CACHE[key])
+
+    def _fail(reason: object) -> None:
+        _skill_route_state["fails"] += 1
+        if _skill_route_state["fails"] >= _SKILL_ROUTE_FAIL_LIMIT:
+            _skill_route_state["fails"] = 0
+            _skill_route_state["paused_until"] = now + _SKILL_ROUTE_PAUSE_SECS
+            logger.warning(
+                "[skills] router paused %ds after repeated failures: %s",
+                int(_SKILL_ROUTE_PAUSE_SECS),
+                reason,
+            )
+
+    # Local Laya path: the decision slot picked the downloaded on-device
+    # router. No provider call, no usage event (local models are free) —
+    # only a trace entry. Unavailability returns None so the caller inlines
+    # nothing (no keyword fallback). The shared result cache above already
+    # ran, so cache hits never reach this branch. ``rows`` are the
+    # prefiltered top candidates, not raw store order.
+    if isinstance(model, str) and model == _LAYA_LOCAL_MODEL:
+        try:
+            from laya_router import predict as _laya_predict
+
+            _laya_names = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _laya_predict, text, rows, str(chat_id or "")
+                ),
+                timeout=_SKILL_ROUTE_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — routing never breaks
+            _fail(exc)
+            return None
+        if _laya_names is None:
+            _fail("laya unavailable")
+            # Surface the miss in Trace: the local path emits no usage and
+            # no catalog, so without this entry an unavailable snapshot looks
+            # like the router never ran at all.
+            try:
+                import trace_store as _decision_trace
+
+                _decision_trace.append(
+                    str(chat_id or ""),
+                    "llm",
+                    "decision · laya unavailable",
+                    detail={"sub": True},
+                    model="laya-local",
+                    prompt=text[:1500],
+                    error="laya snapshot missing or failed to load",
+                )
+            except Exception:  # noqa: BLE001, S110 — trace never breaks routing
+                pass
+            return None
+        _skill_route_state["fails"] = 0
+        _SKILL_ROUTE_CACHE[key] = list(_laya_names)
+        if len(_SKILL_ROUTE_CACHE) > _SKILL_ROUTE_CACHE_MAX:
+            _SKILL_ROUTE_CACHE.pop(next(iter(_SKILL_ROUTE_CACHE)))
+        return list(_laya_names)
     try:
-        min_score = int(getattr(_agents, "_SKILL_AUTO_MIN_SCORE", 4))
-    except Exception:  # noqa: BLE001
-        min_score = 4
-    if max_n <= 0 or not skills:
-        return []
-    norm = _skill_generic_norm(prompt)[:1200]
-    if len(norm.strip()) < 3:
-        return []
+        raw, _usage = await asyncio.wait_for(
+            llm_generate(
+                model,
+                system=_SKILL_ROUTE_SYSTEM,
+                user=f"SKILLS:\n{catalog}\n\nREQUEST:\n{text[:1500]}",
+                sub=True,
+                chat_id=str(chat_id or ""),
+            ),
+            timeout=_SKILL_ROUTE_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
+        _fail(exc)
+        return None
+    # Forward the decision-call usage so Model Usage accrues it like any
+    # other sub-call. Local decision models never go through llm_generate,
+    # so they emit nothing here by construction.
+    if _usage is not None and emit is not None:
+        try:
+            emit(_usage)
+        except Exception:  # noqa: BLE001, S110 — usage never breaks routing
+            pass
+    names = _parse_skill_route(raw, rows, max_n)
+    if names is None:
+        _fail("unparseable reply")
+        return None
     try:
-        if getattr(_agents, "_SKILL_META_RE", None) is not None and _agents._SKILL_META_RE.search(norm):
-            return []
-    except Exception:  # noqa: BLE001
+        import trace_store as _decision_trace
+
+        _decision_trace.append(
+            str(chat_id or ""),
+            "llm",
+            f"decision · {', '.join(names) or '-'}",
+            detail={"sub": True},
+            model=str(getattr(model, "model_name", "") or "decision")[:80],
+            prompt=text[:1500],
+            result=", ".join(names),
+        )
+    except Exception:  # noqa: BLE001, S110 — trace never breaks routing
         pass
-    p_stems = _skill_generic_stems(norm)
-    skip = {str(n).casefold() for n in exclude}
-    scored: list[tuple[int, int, dict]] = []
-    for i, s in enumerate(skills or []):
-        if str(s.get("name") or "").casefold() in skip:
-            continue
-        sc = _skill_generic_score(s, p_stems, norm)
-        if sc >= min_score:
-            scored.append((-sc, i, s))
-    scored.sort(key=lambda t: (t[0], t[1]))
-    return [s for _, _, s in scored[:max_n]]
+    _skill_route_state["fails"] = 0
+    _SKILL_ROUTE_CACHE[key] = list(names)
+    if len(_SKILL_ROUTE_CACHE) > _SKILL_ROUTE_CACHE_MAX:
+        _SKILL_ROUTE_CACHE.pop(next(iter(_SKILL_ROUTE_CACHE)))
+    return names
 
 
 def _format_skill_body(s: dict) -> str:
@@ -1767,20 +2110,19 @@ def _build_skills_section(
     picked_names: list[str],
     root: str,
     emit: Callable[[dict], None] | None = None,
-    catalog: bool = True,
-    compact: bool = False,
     prompt: str = "",
+    auto_names: list[str] | None = None,
 ) -> str:
     """Assemble the SKILLS section for ``build_turn_context``.
 
-    Codex-style progressive disclosure: a compact ``AVAILABLE SKILLS`` catalog
-    (name + description only) is ALWAYS in the prompt so the model can
-    auto-trigger a skill via the ``load_skill`` tool when the task matches a
-    description. Full bodies are inlined for @mentioned skills and for the
-    few skills ``_agents._auto_pick_skills`` clearly matches to ``prompt``
-    (models rarely call ``load_skill`` unprompted); any other skill is
-    loaded on demand via ``load_skill`` (one tool call instead of a
-    prompt-sized body). An empty catalog adds zero tokens.
+    Only what the decision router picked (``auto_names``) and what the user
+    explicitly attached (``picked_names``) is inlined — full bodies, exactly
+    like an @mention. There is NO ``AVAILABLE SKILLS`` catalog in the
+    main-model prompt and NO keyword fallback: the router (external decision
+    model or local Laya over prefiltered candidates) is the only automatic
+    selector, so its output needs no second guess. Anything else is loaded
+    on demand via the ``load_skill`` tool (one tool call instead of a
+    prompt-sized body). No picks at all adds zero tokens.
 
     When a picked name matches no stored skill (deleted/renamed since the
     mention was made) a ``skill`` event with a ``note`` is emitted via
@@ -1795,9 +2137,9 @@ def _build_skills_section(
     manual_names = list(dict.fromkeys(
         n.strip().casefold() for n in picked_names if n and n.strip()
     ))
-    # Load the DB only when something needs it: the catalog or a manual pick.
-    # (catalog=False + no picks = zero skill tokens AND zero DB reads.)
-    if not catalog and not manual_names:
+    # Load the DB only when something needs it: a router pick or a manual
+    # pick. (No picks = zero skill tokens AND zero DB reads.)
+    if not manual_names and not auto_names:
         return ""
     all_skills = _agents._load_skills(root)
     if all_skills:
@@ -1813,73 +2155,49 @@ def _build_skills_section(
                         _hit = _files_map.get(str(_s.get("slug") or "").strip().casefold(), [])
                     _s["files"] = list(_hit or [])
     out = ""
-    if catalog and all_skills:
-        if compact:
-            _max_skills = _SKILL_CATALOG_COMPACT_MAX_SKILLS
-            _line_max = _SKILL_CATALOG_COMPACT_LINE_MAX
-            _total_max = _SKILL_CATALOG_COMPACT_MAX_CHARS
-            _header = (
-                "\n\n=== AVAILABLE SKILLS ===\n"
-                "Skills are reusable instruction bundles. When the task "
-                "clearly needs a skill below, call the load_skill tool "
-                "with that skill's name FIRST and follow its instructions; "
-                "a single shared word is NOT a match (e.g. LSP / Language "
-                "Server does NOT match learning a programming language); "
-                "when nothing clearly matches, load none.\n"
-            )
-        else:
-            _max_skills = _SKILL_CATALOG_MAX_SKILLS
-            _line_max = _SKILL_CATALOG_LINE_MAX
-            _total_max = _SKILL_CATALOG_MAX_CHARS
-            _header = (
-                "\n\n=== AVAILABLE SKILLS ===\n"
-                "Skills are reusable instruction bundles. When the user's task "
-                "clearly needs one of the skills below, call the load_skill tool "
-                "with that skill's name FIRST and follow its instructions. A "
-                "single shared word is NOT a match (e.g. LSP / Language Server "
-                "does NOT match learning a programming language). When "
-                "the user explicitly @mentions a skill, its full body is already "
-                "inlined below — do NOT load it again. When nothing clearly "
-                "matches, load none.\n"
-            )
-        lines = _fit_skill_catalog_lines(
-            all_skills, _header, _total_max, _line_max, _max_skills
+    auto: list[dict] = []
+    via = "-"
+    if prompt and auto_names:
+            _by: dict[str, dict] = {}
+            for _s in all_skills:
+                for _k in (_s.get("name"), _s.get("slug")):
+                    if _k:
+                        _by.setdefault(str(_k).strip().casefold(), _s)
+            for _n in auto_names:
+                _s = _by.get(str(_n).strip().casefold())
+                if (
+                    _s is not None
+                    and str(_s.get("name") or "").strip().casefold() not in manual_names
+                    and _s not in auto
+                ):
+                    auto.append(_s)
+            via = "router"
+        # No keyword fallback: when the router returns nothing, nothing is
+        # inlined. The router is the only automatic selector.
+    if prompt and all_skills:
+        logger.info(
+            "[skills] store=%d auto=%s via=%s",
+            len(all_skills),
+            ", ".join(s["name"] for s in auto) or "-",
+            via if auto else "-",
         )
-        if lines:
-            out += _header + "\n".join(lines)
-        auto = (
-            _agents._auto_pick_skills(prompt, all_skills, manual_names)
-            if prompt
-            else []
+    if auto:
+        if emit is not None:
+            emit({
+                "kind": "skill",
+                "skills": [s["name"] for s in auto],
+                "manual": False,
+            })
+        out += (
+            "\n\n=== AUTO-MATCHED SKILLS ===\n"
+            "These skills match the user's request and are ALREADY "
+            "LOADED below — follow their instructions for this task "
+            "and do NOT call load_skill for them. When a skill lists "
+            "Extra files, the main body is enough unless the task needs "
+            "a listed file — then call load_skill with file=<name> for "
+            "that specific file only (saves tokens).\n"
+            + "\n\n".join(_format_skill_body(s) for s in auto)
         )
-        if not auto and prompt:
-            try:
-                auto = _skill_generic_pick(prompt, all_skills, manual_names)
-            except Exception:  # noqa: BLE001 — fallback never breaks the turn
-                auto = []
-        if auto:
-            cap = _agents._SKILL_AUTO_MAX_BODY_CHARS
-            inline = [s for s in auto if len(s["content"]) <= cap]
-            heavy = [s["name"] for s in auto if len(s["content"]) > cap]
-            logger.info("[skills] auto-matched: %s", ", ".join(s["name"] for s in auto))
-            parts: list[str] = []
-            if inline:
-                parts.append(
-                    "These skills match the user's request and are ALREADY "
-                    "LOADED below — follow their instructions for this task "
-                    "and do NOT call load_skill for them. When a skill lists "
-                    "Extra files, the main body is enough unless the task needs "
-                    "a listed file — then call load_skill with file=<name> for "
-                    "that specific file only (saves tokens).\n"
-                    + "\n\n".join(_format_skill_body(s) for s in inline)
-                )
-            if heavy:
-                parts.append(
-                    "These skills also match but are too long to inline — "
-                    "call load_skill with each name FIRST: "
-                    + ", ".join(heavy) + "."
-                )
-            out += "\n\n=== AUTO-MATCHED SKILLS ===\n" + "\n\n".join(parts)
     if not manual_names:
         return out
     if not all_skills:
@@ -1993,6 +2311,111 @@ def _slice_history_by_turns(history: list, n: int) -> list:
     return list(history)
 
 
+def _truncate_old_tool_results(messages: list, keep_steps: int = 3, max_chars: int = 1000) -> int:
+    """Truncate old tool results so turn-start context stays bounded.
+
+    Keeps the last ``keep_steps`` assistant tool-call steps verbatim and
+    replaces older tool contents longer than ``max_chars`` with a short
+    placeholder that keeps the tool name and args, so a re-issue is a
+    single targeted call instead of a blind re-search. Results the recent
+    conversation still refers to are never truncated. Returns the number
+    of messages truncated. Never raises.
+    """
+    try:
+        step_ids: list[set[str]] = []
+        call_meta: dict[str, tuple[str, dict]] = {}
+        for _m in messages or []:
+            _tcs = getattr(_m, "tool_calls", None)
+            if _tcs:
+                _ids = set()
+                for tc in _tcs:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        _ids.add(tc.get("id"))
+                        call_meta[tc.get("id")] = (str(tc.get("name") or "tool"), tc.get("args") or {})
+                if _ids:
+                    step_ids.append(_ids)
+        keep: set[str] = set()
+        for _ids in step_ids[-keep_steps:]:
+            keep |= _ids
+        recent_refs: set[str] = set()
+        try:
+            recent_non_tool = [m for m in messages if getattr(m, "type", "") != "tool"][-3:]
+            for _m in recent_non_tool:
+                _rc = str(getattr(_m, "content", "") or "")
+                if len(_rc) > 8_000:
+                    _rc = _rc[:4_000] + "\n…\n" + _rc[-4_000:]
+                for _tok in re.findall(r"[\w\-.]+/[\w\-.]+|[\w\-.]+\.\w{1,5}", _rc):
+                    _t = _tok.strip("./-")
+                    if len(_t) >= 4:
+                        recent_refs.add(_t)
+                for _tok in re.findall(r"[a-z]+(?:_[a-z0-9]+)+", _rc):
+                    if len(_tok) >= 4:
+                        recent_refs.add(_tok)
+                for _tok in re.findall(r"[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+", _rc):
+                    if len(_tok) >= 4:
+                        recent_refs.add(_tok)
+                if len(recent_refs) > 200:
+                    break
+        except Exception:  # noqa: BLE001 — exemption is best-effort
+            recent_refs = set()
+        count = 0
+        _total_msgs = len(messages or [])
+        # Even kept/referenced results are capped so the last steps cannot
+        # blow up turn-start context (continuation-turn inflation: several
+        # 60k verbatim results = ~60k tokens on step 1).
+        _keep_cap = 8000
+        for _mi, _m in enumerate(messages or []):
+            if getattr(_m, "type", "") != "tool":
+                continue
+            _tid = getattr(_m, "tool_call_id", "")
+            _c = getattr(_m, "content", "") or ""
+            if not isinstance(_c, str):
+                continue
+            if _c.startswith("[truncated ") and _c.endswith("re-issue if still needed]"):
+                continue
+            _is_keep = _tid in keep
+            _is_exempt = (
+                not _is_keep
+                and _total_msgs - _mi <= 40
+                and bool(recent_refs)
+                and any(_ref in _c for _ref in recent_refs)
+            )
+            if _is_keep or _is_exempt:
+                if len(_c) > _keep_cap:
+                    try:
+                        _m.content = (
+                            _c[:_keep_cap]
+                            + "\n[truncated for turn-start — re-read with offset/limit if needed]"
+                        )
+                    except Exception:  # noqa: BLE001, S112 — one bad message never blocks
+                        continue
+                    count += 1
+                continue
+            if len(_c) <= max_chars:
+                continue
+            # Age rule: results older than ~40 messages always truncate even
+            # when referenced — the placeholder keeps name/args so re-issue
+            # is cheap. Without this a common token (e.g. a filename still
+            # mentioned in chat) keeps EVERY old result verbatim and the
+            # turn-start context never shrinks (continuation-turn inflation).
+            _name, _args = call_meta.get(_tid, (getattr(_m, "name", "") or "tool", {}))
+            try:
+                _arg_str = json.dumps(_args, ensure_ascii=False, sort_keys=True)[:160]
+            except Exception:  # noqa: BLE001 — placeholder must never fail
+                _arg_str = str(_args)[:160]
+            _ph = f"[truncated {_name}({_arg_str}) ({len(_c)} chars) — re-issue if still needed]"
+            if len(_c) <= len(_ph) + 20:
+                continue
+            try:
+                _m.content = _ph
+            except Exception:  # noqa: BLE001, S112 — one bad message never blocks
+                continue
+            count += 1
+        return count
+    except Exception:  # noqa: BLE001 — truncation never breaks the turn
+        return 0
+
+
 def _today_stamp() -> str:
     """Turn-local date stamp for the user turn.
 
@@ -2040,16 +2463,34 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     try:
         from lsp_manager import configure_lsp as _configure_lsp
         _configure_lsp(state.get("lsp_config") or {})
-    except Exception:  # noqa: BLE001 - lsp config never breaks the turn
+    except Exception:  # noqa: BLE001, S110 — lsp config never breaks the turn
         pass
     cap = state.get("cap") or {}
     allow_create = bool(state.get("allow_create"))
     allow_outside = bool(state.get("allow_outside"))
     attachments = state.get("attachments")
     images = state.get("images")
-    nvim_file = state.get("nvim_file", "")
     skills = state.get("skills")
     system_extra = (state.get("system_prompt") or "").strip()
+
+    # Fire-and-forget LSP warmup: start servers for the files this turn is
+    # about (paths mentioned in the prompt) in
+    # background daemon threads. The cold-start handshake then overlaps with
+    # the FIRST LLM round-trip instead of blocking the first lsp_* tool call
+    # and adding its full startup latency to the turn's wall time.
+    try:
+        from lsp_manager import get_manager as _get_lsp_mgr_turn
+
+        _warm_paths = _PATH_TOKEN_RE.findall(str(prompt or ""))
+        _warm_abs = [
+            p if os.path.isabs(p) else os.path.join(root, p)
+            for p in _warm_paths
+            if str(p or "").strip()
+        ]
+        if _warm_abs:
+            _get_lsp_mgr_turn(root).warmup(_warm_abs)
+    except Exception:  # noqa: BLE001, S110 - warmup never breaks the turn
+        pass
 
     # Gather images from the CURRENT turn AND every earlier message in the
     # conversation that carried an image. History is converted to text only
@@ -2076,20 +2517,25 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     image_uris = _deduped
 
     # Context window (resolve live when the UI did not supply one).
+    # Bounded so a slow catalog/provider never parks Preparing context for
+    # tens of seconds; on timeout ctx stays 0 (full prompt, safe fallback).
     ctx = int(state.get("context_window") or 0)
     if ctx <= 0:
         try:
             from providers import model_context
 
-            ctx = await model_context(
-                state["provider"],
-                state["model_name"],
-                state["base_url"],
-                state["api_key"],
-                state["env_var"],
-                state.get("api_keys"),
+            ctx = await asyncio.wait_for(
+                model_context(
+                    state["provider"],
+                    state["model_name"],
+                    state["base_url"],
+                    state["api_key"],
+                    state["env_var"],
+                    state.get("api_keys"),
+                ),
+                timeout=10.0,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — includes the 10s timeout above
             ctx = 0
     ctx = max(0, ctx)
     # Small-context mode: when the model's window is below the threshold we
@@ -2140,6 +2586,36 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         thinking_level=_parent_thinking,
         model_reasoning=_parent_reasoning,
     )
+    # Skill routing is a tiny classification call on the dedicated "decision"
+    # slot (Settings -> Tools), falling back to the main model when unset.
+    # It is a SEPARATE sub-call (sub=True): the main model's prompt and token
+    # usage stay exactly the same. Thinking/reasoning tokens only make it
+    # blow the routing timeout — after a few timeouts the router pauses and
+    # auto-matched skills silently stop loading — so the router always runs
+    # on a plain non-thinking variant of the resolved slot.
+    _decision_entry = subagent_models.get("decision")
+    if _is_laya_decision(
+        _decision_entry if isinstance(_decision_entry, str) else ""
+    ):
+        # Downloaded on-device Laya router: no provider call, no usage.
+        router_model = _LAYA_LOCAL_MODEL
+    else:
+        router_model = resolve_subagent_model(
+            state["provider"],
+            _decision_entry,
+            state["base_url"],
+            state["api_key"],
+            state["env_var"],
+            state["model_name"],
+            provider_lookup=_provider_lookup,
+            # Slightly above _SKILL_ROUTE_TIMEOUT so the outer wait_for
+            # stays the binding bound; routing never stalls the turn.
+            timeout=_SKILL_ROUTE_TIMEOUT + 8.0,
+            parent_provider_id=state.get("provider_id", ""),
+            parent_api_keys=state.get("api_keys"),
+            thinking_level="",
+            model_reasoning=False,
+        )
     vision_model = resolve_subagent_model(
         state["provider"],
         subagent_models.get("vision"),
@@ -2218,12 +2694,10 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         history=state.get("history") or [],
     )
 
-    scoped_paths = _agents._scoped_rels(root, attachments, nvim_file)
     filtered = filter_tools_for_mode(
         mode,
         tools,
         cap,
-        scoped_paths,
         allow_create,
         allow_outside,
         prompt=prompt,
@@ -2255,6 +2729,38 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             vision_model, image_uris, str(chat_id or "")
         )
 
+    # Start independent prefetches early so their wall time overlaps the MCP
+    # connect below instead of adding up sequentially. Same models and prompts
+    # (routing quality unchanged) — only the overlap changes.
+    _skill_task = None
+    if prompt:
+        try:
+            _skill_task = asyncio.create_task(
+                _route_skills(
+                    prompt,
+                    _agents._load_skills(root),
+                    router_model,
+                    chat_id=str(chat_id or ""),
+                    emit=lambda ev: queue.put_nowait(ev),
+                )
+            )
+        except Exception:  # noqa: BLE001 — routing never breaks the turn
+            _skill_task = None
+    _vision_task = None
+    try:
+        _prefetch_early = vision_model or model
+        if image_uris and _prefetch_early:
+            _vision_task = asyncio.create_task(
+                asyncio.wait_for(
+                    _vision_analyze_cached(
+                        _prefetch_early, image_uris, chat_id
+                    ),
+                    timeout=15.0,
+                )
+            )
+    except Exception:  # noqa: BLE001 — vision prefetch never breaks the turn
+        _vision_task = None
+
     mcp_tools: list = []
     mcp_cleanup = None
     _mcp_servers = state.get("mcp_servers") or {}
@@ -2262,19 +2768,30 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         # Native tool names are reserved: an MCP tool whose short name
         # collides with one of them falls back to its fully qualified
         # mcp__<server>__<tool> binding (see _make_tool).
-        mcp_tools, mcp_cleanup = await build_mcp_tools(
-            _mcp_servers,
-            lambda ev: queue.put_nowait(ev),
-            reserved_names=set(filtered),
-            analyze_images=_analyze_mcp_images,
-            # The turn prompt feeds snapshot compaction: browser snapshots
-            # keep the lines relevant to what was actually asked.
-            task=str(prompt or ""),
-            chat_id=str(chat_id or ""),
-        )
+        # Bounded so a slow MCP server never parks Preparing context for
+        # tens of seconds; on timeout the turn proceeds without MCP tools.
+        try:
+            mcp_tools, mcp_cleanup = await asyncio.wait_for(
+                build_mcp_tools(
+                    _mcp_servers,
+                    lambda ev: queue.put_nowait(ev),
+                    reserved_names=set(filtered),
+                    analyze_images=_analyze_mcp_images,
+                    # The turn prompt feeds snapshot compaction: browser snapshots
+                    # keep the lines relevant to what was actually asked.
+                    task=str(prompt or ""),
+                    chat_id=str(chat_id or ""),
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[turn-ctx] mcp connect timed out after 8s, continuing without MCP tools")
+            mcp_tools, mcp_cleanup = [], None
+        except Exception:  # noqa: BLE001 — MCP must never break the turn
+            mcp_tools, mcp_cleanup = [], None
     browser_mcp_live = merge_mcp_tools(filtered, mcp_tools, cap)
     _tctx_mark("mcp")
-    # Whether the `vision` tool survived mode filtering (e.g. coder mode
+    # Whether the `vision` tool survived mode filtering (e.g. build mode
     # strips it). When it is NOT available we must fall back to attaching the
     # image directly to the main model, otherwise the model could never see it.
     vision_tool_available = "vision" in filtered
@@ -2286,21 +2803,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "search or act on anything outside it. Skills, plans and MCP connectors are "
         "given to you inline."
     )
-    if nvim_file:
-        with contextlib.suppress(Exception):
-            tgt = _agents.resolve_safe(root, nvim_file)
-            if tgt and os.path.isfile(tgt):
-                nvim_rel = os.path.relpath(tgt, _agents.resolve_safe(root, ""))
-                workspace_note += (
-                    f"\n\n=== NEOVIM (OPEN EDITOR) ===\nThe user currently has `{nvim_rel}` "
-                    "open in Neovim -- this file is their ACTIVE FOCUS."
-                )
-    # Attached files are UNIFIED with Neovim: they enter the agent exactly like
-    # the Neovim open file -- as a scoped path + a focus note -- so the agent
-    # reads them on demand via the read/grep tools instead of force-reading
-    # their full contents into the prompt. This keeps the tool runtime the
-    # single source of file access (spec §2/§13) and saves tokens. The actual
-    # scoping is applied via `_scoped_rels` -> `scoped_paths` below.
+    if mode in ("build", "plan", "ask"):
+        workspace_note += _targeted_search_note(mode)
+    # Attached files are shown as a focus note; the agent reads them on demand
+    # via the read/grep tools instead of force-reading their full contents
+    # into the prompt.
     if attachments:
         _att_disp: list[str] = []
         try:
@@ -2326,36 +2833,18 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 "\n\n=== ATTACHED FILES ===\nThe user attached these file(s) as their "
                 "focus: "
                 + ", ".join("`" + f + "`" for f in _att_disp)
-                + ". They are in SCOPE — read them with the read tool when relevant. "
+                + ". Focus on them — read them with the read tool when relevant. "
                 "PDF / Word (.docx) / Excel (.xlsx) attachments must be read with the "
                 "read_document tool (the plain read tool cannot decode them); use "
-                "write_document in Coder mode to create or edit such documents."
+                "write_document in Build mode to create or edit such documents."
             )
-    if scoped_paths:
-        workspace_note += (
-            "\n\n=== SCOPE (ONLY THESE FILES) ===\nThe user explicitly scoped this "
-            "request to ONLY these files: "
-            + ", ".join("`" + f + "`" for f in sorted(scoped_paths))
-            + ". You MUST work ONLY with these files. Search ONLY within them: "
-            "grep/glob/read MUST use path/include limited to these files: ONE scoped grep with context, then "
-            "symbols=[...] or ranges=[...] — never scan the whole workspace blindly."
-        )
-    if mode == "coder":
-        workspace_note += (
-            "\n\n=== TARGETED SEARCH (CODER) ===\nStart from LSP (lsp_definition/references/hover/symbols) for a precise jump, "
-            "then ONE scoped grep (path/include limited to SCOPE or the plan's Files) "
-            "with context if needed, then read only the pointed windows via symbols=[...] or "
-            "ranges=[...]. Whole-workspace grep/glob without path is rejected — always pass path/include. Never scan the whole workspace blindly; after at most "
-            "2-3 search batches start editing in the SAME turn."
-        )
-
     base_prompt = (
         _agents.SYSTEM_PROMPTS.get(mode, _agents.SYSTEM_PROMPTS["ask"])
         + _agents._UNIVERSAL_RULES
         + _agents._DOING_TASKS
-        + (_agents._LENGTH_RULE if mode in ("plan", "coder") else "")
-        + (_agents._TEST_DIR_RULE if mode in ("plan", "coder") else "")
-        + (_agents._TEST_STYLE_RULE if mode in ("plan", "coder") else "")
+        + (_agents._LENGTH_RULE if mode in ("plan", "build") else "")
+        + (_agents._TEST_DIR_RULE if mode in ("plan", "build") else "")
+        + (_agents._TEST_STYLE_RULE if mode in ("plan", "build") else "")
     )
     # Language directive depends on the CURRENT prompt (Persian/English
     # detection), so it must NOT live in the system prompt — otherwise the cache
@@ -2387,12 +2876,12 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "visible file paths / filenames / code / text EXACTLY as analyzed; never "
             "invent or omit what the image shows."
         )
-    if mode in ("ask", "plan", "coder"):
+    if mode in ("ask", "plan", "build"):
         system_final += _agents._DISCOVERY_BLOCK
     if mode == "reader":
         system_final += (
-            "\n\nFOCUSED READING: the user pointed you at specific file(s) (open in "
-            "Neovim, attached, or @mentioned). They are in SCOPE -- read them with the "
+            "\n\nFOCUSED READING: the user pointed you at specific file(s) (attached "
+            "or @mentioned). Read them with the "
             "read tool (and grep/read within them as needed) to answer. The search "
             "tools are available, but stay focused on the pointed-at files unless the "
             "user asks to broaden. vision / skills / MCP connectors are available on "
@@ -2413,31 +2902,66 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     if project_memory:
         system_final += project_memory
 
-    # Skills: Codex-style progressive disclosure. The AVAILABLE SKILLS catalog
-    # (name + description) is ALWAYS in the prompt — ultra-compact for
-    # small-context models — so the model can auto-trigger skills via
-    # load_skill; @mentioned bodies are inlined in full, plus the few skills
-    # clearly matched to the request in code (_auto_pick_skills); the model
-    # loads anything else on demand via load_skill.
+    # Skills: only the decision router's picks plus @mentioned bodies are
+    # inlined in full — no AVAILABLE SKILLS catalog, no keyword fallback.
+    # The model loads anything else on demand via load_skill.
+    _routed: list[str] | None = None
+    if _skill_task is not None:
+        try:
+            # Started early so the routing round-trip overlapped the MCP
+            # connect above; same model and prompt, quality unchanged.
+            _routed = await _skill_task
+        except Exception:  # noqa: BLE001 — routing never breaks the turn
+            _routed = None
+    elif prompt:
+        try:
+            _routed = await _route_skills(
+                prompt,
+                _agents._load_skills(root),
+                router_model,
+                chat_id=str(chat_id or ""),
+                emit=lambda ev: queue.put_nowait(ev),
+            )
+        except Exception:  # noqa: BLE001 — routing never breaks the turn
+            _routed = None
     _skill_section = _build_skills_section(
         skills or [],
         root,
         emit=lambda ev: queue.put_nowait(ev),
-        catalog=True,
-        compact=small_ctx,
         prompt=prompt,
+        auto_names=_routed,
     )
     system_final += _skill_section
 
-    if chat_id and mode in ("plan", "coder"):
+    if chat_id and mode in ("plan", "build"):
         try:
             saved = _agents._load_saved_plan(root, chat_id=chat_id, prompt=prompt)
         except Exception:  # noqa: BLE001
             saved = ""
         if saved:
             system_final += saved
+    # Persistent goal (/goal): same pattern as plan persistence — append the
+    # active goal block so every mode works toward the completion condition.
+    try:
+        from goals import format_goal_block as _format_goal_block
+        from goals import normalize_goal as _normalize_goal
 
-    # No code-map injection: coder uses on-demand LSP tools (opencode-style lazy manager).
+        _goal_text = _normalize_goal(state.get("goal"))
+        if not _goal_text:
+            # Fallback: the frontend prefixes the prompt with
+            # "[Active goal: <condition>]" so the goal survives
+            # even when the runner was called without a goal kwarg.
+            import re as _re_goal2
+
+            _pm = _re_goal2.match(r"\s*\[Active goal:\s*(.*?)\]\s*", str(state.get("prompt") or ""))
+            if _pm:
+                _goal_text = _normalize_goal(_pm.group(1))
+        if _goal_text:
+            system_final += "\n\n" + _format_goal_block(_goal_text)
+    except Exception:  # noqa: BLE001, S110 — goal injection never breaks the turn
+        pass
+
+    # No code-map injection: build uses on-demand LSP tools (opencode-style lazy manager).
 
     # No pre-injected workspace scout: discovery is the agent's job now (it has
     # glob/grep/read and the Explore sub-agent), matching the OpenCode-style
@@ -2480,6 +3004,11 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             lc_history.insert(0, HumanMessage(content=_summary))
     else:
         lc_history = history_to_langchain_messages(history, current_mode=mode)
+    # Bound turn-start context even right after a manual /compact: the mid-turn
+    # cheap truncation only runs later, so without this the first step re-sends
+    # the full history at full price.
+    with contextlib.suppress(Exception):
+        _truncate_old_tool_results(lc_history)
     # Small-context: tighter cap on tool outputs in the history transcript.
     # Anything over the cap gets a marker so the model knows it was trimmed
     # and can re-read with offset/limit if it needs the rest.
@@ -2530,7 +3059,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     except Exception:  # noqa: BLE001, S110 — continuity note must never break the turn
         pass
     _is_status_check = _agents._is_status_check(prompt)
-    if mode == "coder" and not _is_status_check:
+    if mode == "build" and not _is_status_check:
         reuse = _agents._plan_reuse_note(history, prompt)
         if reuse:
             lc_history.append(HumanMessage(content=reuse))
@@ -2582,8 +3111,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 ),
             )
         # Enforce the test-verification rule at runtime for any code-changing
-        # coder task (feature/bugfix/refactor), not only when the prompt
-        # literally says "test". This closes the gap the user reported: coder
+        # build task (feature/bugfix/refactor), not only when the prompt
+        # literally says "test". This closes the gap the user reported: build
         # must write/update and run tests before finishing, even on ordinary
         # code work — but only for changes that alter behavior/logic, not pure
         # cosmetic/refactor/doc edits. The pure-logic predicates live in agents.py.
@@ -2597,7 +3126,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                     f"and run the project's frontend command (npm run test:frontend / "
                     f"npx vitest run / npx jest). "
                 )
-            # Tell the Coder the EXACT commands so it can run the project's
+            # Tell the Build mode the EXACT commands so it can run the project's
             # tests itself (there is no automatic test gate in the graph) —
             # but scope them to the END of the task: iterating on the full
             # suite burns minutes per run, so targeted files come first.
@@ -2665,8 +3194,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         lc_history.append(HumanMessage(content=delegated_note))
 
     # User content (prompt; images as content parts). Attached FILE
-    # contents are no longer force-injected here — they enter via scope + the
-    # focus note above and are read on demand (unified with Neovim). No workspace
+    # contents are no longer force-injected here — they enter via the
+    # focus note above and are read on demand. No workspace
     # scout is injected either; the agent discovers via its tools.
     user_parts: list[Any] = []
     if prompt:
@@ -2729,7 +3258,7 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             "instructions) and stop."
         )
     # LSP tools are available in all modes with repo access
-    # (coder/plan/ask/reader): precise jump helps answering and planning
+    # (build/plan/ask/reader): precise jump helps answering and planning
     # too, not just editing.
     # SERVER-SIDE vision analysis of attached images. Prefer the dedicated
     # vision model, but FALL BACK to the main model (mirroring the `vision`
@@ -2739,8 +3268,60 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
     # than attaching raw bytes that would just 400.
     prefetch_model = vision_model or model
     _analysis = None
+    _vision_failure: str | None = None
+
+    def _classify_vision_prefetch_error(exc: BaseException) -> str:
+        # Distinguish a real image-rejection (text-only model) from transient
+        # failures so the user-facing note never claims a capable model
+        # "does not support images" when it only timed out or errored.
+        low = str(exc or "").lower()
+        if "unknown variant" in low and "image_url" in low:
+            return "image_rejected"
+        if "image_url" in low and any(
+            k in low
+            for k in (
+                "field is required",
+                "not supported",
+                "does not support",
+                "unexpected",
+                "unrecognized",
+            )
+        ):
+            return "image_rejected"
+        return f"error:{exc}"
+
+    if _vision_task is not None:
+        try:
+            # Started early so the vision round-trip overlapped MCP/skill work.
+            _analysis = await _vision_task
+            if not _analysis:
+                _vision_failure = "error:empty response"
+        except asyncio.TimeoutError:
+            logger.warning("[turn-ctx] vision analysis timed out after 15s, continuing without prefetch")
+            _analysis = None
+            _vision_failure = "timeout"
+        except Exception as _vexc:  # noqa: BLE001 — vision prefetch never breaks the turn
+            _analysis = None
+            _vision_failure = _classify_vision_prefetch_error(_vexc)
+    elif image_uris and prefetch_model:
+        try:
+            # Bounded so a slow vision provider never parks Preparing context
+            # for tens of seconds; on timeout the turn proceeds and the
+            # dedicated vision tool covers the image on demand.
+            _analysis = await asyncio.wait_for(
+                _vision_analyze_cached(prefetch_model, image_uris, chat_id),
+                timeout=15.0,
+            )
+            if not _analysis:
+                _vision_failure = "error:empty response"
+        except asyncio.TimeoutError:
+            logger.warning("[turn-ctx] vision analysis timed out after 15s, continuing without prefetch")
+            _analysis = None
+            _vision_failure = "timeout"
+        except Exception as _vexc:  # noqa: BLE001 — vision prefetch never breaks the turn
+            _analysis = None
+            _vision_failure = _classify_vision_prefetch_error(_vexc)
     if image_uris and prefetch_model:
-        _analysis = await _vision_analyze_cached(prefetch_model, image_uris, chat_id)
         if _analysis:
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
@@ -2751,7 +3332,20 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 "into your reply; do not invent or omit them. If a design skill is "
                 "mentioned, apply its guidance to render what the image depicts."
             )
-        else:
+        elif _vision_failure == "timeout":
+            user_parts.append(
+                f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
+                f"image(s) but the vision model "
+                f"({getattr(prefetch_model, 'model_name', '') or 'unknown'}) could "
+                f"not analyze them (timed out after 15s — transient slowness, NOT a "
+                f"missing capability). ACTION: call the `vision` tool to analyze the "
+                f"image(s) on demand and ground your answer on its report. Do NOT "
+                f"claim the model lacks vision support. If the retry also times out, "
+                f"tell the user to try a faster Vision model in "
+                f"Settings → Subagents → Vision, or paste the image's text directly. "
+                f"Do NOT guess what the image contains.]"
+            )
+        elif _vision_failure == "image_rejected":
             user_parts.append(
                 f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
                 f"image(s) but the vision model "
@@ -2760,6 +3354,21 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 f"misconfigured. ACTION: tell the user to set a Vision model in "
                 f"Settings → Subagents → Vision, or paste the image's text directly. "
                 f"Do NOT guess what the image contains.]"
+            )
+        else:
+            _detail = _vision_failure or "error:unknown"
+            if _detail.startswith("error:"):
+                _detail = _detail[len("error:"):].strip()[:300] or "unknown error"
+            user_parts.append(
+                f"[ATTACHED IMAGE ANALYSIS — the user attached {len(image_uris)} "
+                f"image(s) but the vision model "
+                f"({getattr(prefetch_model, 'model_name', '') or 'unknown'}) could "
+                f"not analyze them ({_detail}). This is a transient/provider failure, "
+                f"NOT proof the model lacks vision support. ACTION: call the `vision` "
+                f"tool to analyze the image(s) on demand and ground your answer on "
+                f"its report. If it keeps failing, tell the user to check the Vision "
+                f"model in Settings → Subagents → Vision, or paste the image's text "
+                f"directly. Do NOT guess what the image contains.]"
             )
     elif image_uris:
         # No model available at all (only if `model` itself failed to build).
@@ -2798,12 +3407,14 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
             str(c.get("text", "")) for c in user_content if isinstance(c, dict)
         )
         _full_prompt = f"[system]\n{system_final}\n\n[user]\n{_prompt_text}"
+        # Trace storage is observability only: never write megabytes per turn.
+        _trace_prompt = _full_prompt if len(_full_prompt) <= 50000 else _full_prompt[:50000] + "\n...(trace prompt truncated)"
         trace_store.append(
             str(chat_id or ""),
             "prompt",
             f"{mode} · {len(_full_prompt)} chars",
             detail={"mode": mode, "system_chars": len(str(system_final)), "user_chars": len(str(_prompt_text))},
-            prompt=_full_prompt,
+            prompt=_trace_prompt,
         )
 
     with contextlib.suppress(Exception):
@@ -2823,23 +3434,71 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
 
     # Convert the mode-filtered fns to LangChain StructuredTools. MCP tools are
     # already StructuredTools (built in build_mcp_tools), so they pass through.
+    def _short_desc(fn: Any, name: str) -> str:
+        # Opencode-style minimal schemas: tool schemas are re-sent every turn,
+        # so verbose docstrings dominate context (see "System tools" meter).
+        # Prefer the first English line (Persian costs ~2x tokens), cap 140.
+        doc = (getattr(fn, "__doc__", "") or name).strip()
+        for line in doc.split("\n"):
+            s = line.strip()
+            if len(s) >= 20 and s.isascii():
+                return s[:140]
+        head = doc.split("\n\n")[0].strip().split("\n")[0].strip()
+        return head[:140] if head else name
+
     lc_tools = [
         (
             t
             if isinstance(t, StructuredTool)
             else StructuredTool.from_function(
-                coroutine=t, name=name, description=(t.__doc__ or name)
+                coroutine=t, name=name, description=_short_desc(t, name)
             )
         )
         for name, t in filtered.items()
     ]
+    # Trim verbose arg-schema field descriptions (re-sent every turn like the
+    # tool description). Keeps capability, drops the per-turn token tax.
+    for _t in lc_tools:
+        try:
+            _schema = getattr(_t, "args_schema", None)
+            _fields = getattr(_schema, "model_fields", None) if _schema else None
+            if _fields:
+                for _f in _fields.values():
+                    _d = getattr(_f, "description", None)
+                    if isinstance(_d, str) and len(_d) > 40:
+                        _f.description = _d[:40].rstrip() + " …"
+                    try:
+                        if getattr(_f, "examples", None):
+                            _f.examples = None
+                        _ft = getattr(_f, "title", None)
+                        if isinstance(_ft, str) and len(_ft) > 40:
+                            _f.title = _ft[:40]
+                    except Exception:  # noqa: BLE001, S110 - schema trim never breaks turn
+                        pass
+        except Exception:  # noqa: BLE001, S110 - schema trim never breaks turn
+            pass
     # Stable toolset order for prompt-cache stability: dict insertion order
     # varies with mode-filter/MCP-merge paths, which would rewrite the tool
-    # schema prefix every turn and force full-price reprocessing. Sorting by
-    # name keeps the bound schema prefix byte-identical across steps/turns
-    # (observability/perf only — same set, deterministic order).
+    # schema prefix every turn and force full-price reprocessing. The rank
+    # below is deterministic given the same set (cache-stable) while sorting
+    # LSP tools first, then read/grep/glob, then the rest — nudging the model
+    # toward precise jumps over blind scans with the fewest LLM requests.
+    _LSP_FIRST = (
+        "lsp_definition", "lsp_references", "lsp_hover",
+        "lsp_symbols", "lsp_diagnostics",
+    )
+    _SEARCH_NEXT = ("read", "grep", "glob")
+
+    def _tool_rank(t) -> tuple[int, str]:
+        name = str(getattr(t, "name", "") or "")
+        if name in _LSP_FIRST:
+            return (0, name)
+        if name in _SEARCH_NEXT:
+            return (1, name)
+        return (2, name)
+
     try:
-        lc_tools.sort(key=lambda t: getattr(t, "name", ""))
+        lc_tools.sort(key=_tool_rank)
     except Exception:  # noqa: BLE001, S110 — order hint must never break turn
         pass
     _tctx_mark("done")
@@ -2870,7 +3529,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                 mode,
                 str(system_final),
                 _skill_section,
-                [t for t in filtered.values() if _mcp_server_of(t)],
+                lc_tools,
+                str(chat_id or ""),
             )
         )
 
@@ -2881,7 +3541,6 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         "lc_tools": lc_tools,
         "system_final": system_final,
         "ctx": ctx,
-        "scoped_paths": scoped_paths,
         "web_model": web_model,
         "compact_model": compact_model,
         "vision_model": vision_model,
@@ -3139,15 +3798,32 @@ async def _summarize_history_head(
     if compact_model is None:
         # Fallback without an LLM: keep the last few user messages + first line
         # of each assistant reply so the model still has the gist.
-        _parts = [
-            f"{t.get('role')}: {str(t.get('content', ''))[:200]}" for t in older[-12:]
-        ]
+        # Checklist progress is folded in so the post-compact model knows
+        # completed vs pending without re-reading or an extra roundtrip.
+        _parts = []
+        for t in older[-12:]:
+            _p = f"{t.get('role')}: {str(t.get('content', ''))[:200]}"
+            try:
+                _pl = t.get("plan")
+                if isinstance(_pl, list) and _pl:
+                    _p += f"\n[Checklist progress {_plan_progress_line(_pl)}]"
+            except Exception:
+                pass
+            _parts.append(_p)
         _summary = "[Compacted earlier context]\n" + "\n".join(_parts)
     else:
         try:
-            _serialized = "\n\n".join(
-                f"{t.get('role')}: {t.get('content', '')}" for t in older
-            )
+            _ser_parts = []
+            for t in older:
+                _sp = f"{t.get('role')}: {t.get('content', '')}"
+                try:
+                    _pl2 = t.get("plan")
+                    if isinstance(_pl2, list) and _pl2:
+                        _sp += f"\n[Checklist progress {_plan_progress_line(_pl2)}]"
+                except Exception:
+                    pass
+                _ser_parts.append(_sp)
+            _serialized = "\n\n".join(_ser_parts)
             _summary, _ = await llm_generate(
                 compact_model,
                 system=(
@@ -3599,7 +4275,6 @@ async def _maybe_auto_compact(
         1, min(99, int(compact_at_percent if compact_at_percent is not None else 80))
     )
     threshold = int(ctx * _pct / 100)
-    dicts = _agents._messages_to_dicts(msgs)
     # Auto-compaction fires off the SAME token breakdown the context meter
     # displays (tracked on `state["last_context_tokens"]` at the usage-emit
     # site), so the meter and the compaction trigger always agree. The breakdown
@@ -3613,11 +4288,23 @@ async def _maybe_auto_compact(
     # it lags one step, so a mid-turn tool result that blows past the window isn't
     # compacted until after the next (overflowing) model call. Use a live estimate
     # of the CURRENT transcript as a floor so compaction fires BEFORE the next call.
-    live_total = _estimate_prompt_tokens(msgs)
-    if live_total is None or live_total <= 0:
-        # Fallback to the char estimate when the local estimate is unavailable
-        # (e.g. un-tokenizable message content, or local models with no usage).
-        live_total = sum(_agents._estimate_tokens(d["content"]) for d in dicts)
+    # Cheap gate first: when the provider-reported usage already exceeds the
+    # threshold the outcome is decided without any full-transcript pass. The
+    # live estimate (and its rare fallback) only runs below the threshold,
+    # where it can still flip the decision. This keeps the per-step cost of
+    # the common far-from-overflow case to a single estimate pass instead of
+    # estimate + full dict serialization.
+    live_total = 0
+    if (last_context_tokens or 0) < threshold:
+        live_total = _estimate_prompt_tokens(msgs) or 0
+        if live_total <= 0:
+            # Fallback to the char estimate when the local estimate is
+            # unavailable (e.g. un-tokenizable message content, or local
+            # models with no usage).
+            live_total = sum(
+                _agents._estimate_tokens(d["content"])
+                for d in _agents._messages_to_dicts(msgs)
+            )
     total = max(last_context_tokens or 0, live_total or 0)
     if total <= 0:
         total = live_total or 0
@@ -3644,7 +4331,7 @@ async def _maybe_auto_compact(
     # re-sent on every following step), so shed them early. LLM summarization
     # still fires at the full threshold.
     _cheap_pct = max(5, _pct // 4)  # e.g. 80 → 20
-    cheap_threshold = int(ctx * _cheap_pct / 100)
+    cheap_threshold = min(int(ctx * _cheap_pct / 100), 40_000)
     if total >= cheap_threshold:
         _last_cheap = state.get("_cheap_truncated_at")
         _regrow = max(10_000, int(ctx * 5 / 100))
@@ -3653,7 +4340,7 @@ async def _maybe_auto_compact(
             # Keep whole tool steps, not a fixed count of ToolMessages:
             # collect tool_call ids of the last assistant steps and keep
             # all their results verbatim.
-            _KEEP_STEPS = 6
+            _KEEP_STEPS = 3
             _step_ids: list[set[str]] = []
             for _m in msgs:
                 _tcs = getattr(_m, "tool_calls", None)
@@ -3710,20 +4397,42 @@ async def _maybe_auto_compact(
             except Exception:  # noqa: BLE001 — exemption is best-effort
                 _recent_refs = set()
             _truncated_any = False
+            # Same keep-cap as turn-start truncation: even kept/referenced
+            # results never stay fully verbatim past 8k.
+            _keep_cap = 8000
             for _i, _m in enumerate(msgs):
                 if not isinstance(_m, ToolMessage):
                     continue
                 _tid = getattr(_m, "tool_call_id", "")
-                if _tid in _keep_ids:
-                    continue
                 _c = getattr(_m, "content", "")
                 _cs = str(_c)
-                if len(_cs) <= 120:
-                    continue
                 if _cs.startswith("[truncated ") and _cs.endswith("re-issue if still needed]"):
                     continue
-                if _recent_refs and any(_ref in _cs for _ref in _recent_refs):
+                _is_keep = _tid in _keep_ids
+                _is_exempt = (
+                    not _is_keep
+                    and len(msgs) - _i <= 40
+                    and bool(_recent_refs)
+                    and any(_ref in _cs for _ref in _recent_refs)
+                )
+                if _is_keep or _is_exempt:
+                    if len(_cs) > _keep_cap:
+                        with contextlib.suppress(Exception):
+                            msgs[_i] = _m.model_copy(
+                                update={
+                                    "content": _cs[:_keep_cap]
+                                    + "\n[truncated for turn-start — re-read with offset/limit if needed]"
+                                }
+                            )
+                            _truncated_any = True
                     continue
+                if len(_cs) <= 120:
+                    continue
+                # Age rule: results older than ~10 steps always truncate even
+                # when referenced — the placeholder keeps path:line/args so
+                # re-issue is cheap. Without this a common token (e.g. a
+                # filename still mentioned in chat) keeps EVERY old result
+                # verbatim and context never shrinks.
                 _name, _args = _call_meta.get(_tid, (getattr(_m, "name", "") or "tool", {}))
                 try:
                     _arg_str = json.dumps(_args, ensure_ascii=False, sort_keys=True)[:160]
@@ -3751,6 +4460,7 @@ async def _maybe_auto_compact(
     # --- end cheap truncation -------------------------------------------
     if total < threshold:
         return 0
+    dicts = _agents._messages_to_dicts(msgs)
     # opencode prune: clear old tool outputs (not the whole turn) before the
     # heavier summarization pass, so a large-but-not-overflowing transcript
     # still sheds context. Runs in place on the serialized history.
@@ -3804,7 +4514,22 @@ async def _run_mode_turn(
     a bounded context auto-compact. Returns the final reply text.
     """
     chat_id = state.get("chat_id", "")
-    ctx = state.get("context_window") or 0
+    ctx = int(state.get("context_window") or 0)
+    if ctx <= 0:
+        try:
+            from providers import model_context
+
+            ctx = await model_context(
+                state.get("provider"),
+                state.get("model_name"),
+                state.get("base_url"),
+                state.get("api_key"),
+                state.get("env_var"),
+                state.get("api_keys"),
+            )
+        except Exception:  # noqa: BLE001 - context fallback never breaks turn
+            ctx = 0
+    ctx = max(0, int(ctx or 0))
     cap = state.get("cap") or {}
     root = state.get("root", "")
     # The `mode` parameter is authoritative for THIS turn. `reader_answer` and
@@ -3813,6 +4538,10 @@ async def _run_mode_turn(
     # otherwise a previous node's mode would leak into this turn's system prompt.
     state = dict(state)
     state["mode"] = mode
+    # Reuse the already-resolved window so build_turn_context skips its own
+    # model_context network call (duplicate resolution cost every turn).
+    if ctx > 0 and not state.get("context_window"):
+        state["context_window"] = ctx
     # Ambient chat id for trace_store so sub-agent llm_generate calls (which
     # never receive chat_id explicitly) still land on the right chat.
     _trace_token = None
@@ -3894,21 +4623,13 @@ async def _run_mode_turn(
     # is undesirable. Transient throttles are retried below without any such
     # injection.
 
-    # User override from Settings → General ("Max agent steps", 0 = auto).
-    # Threaded through ChatRequest.max_steps → run_agent → state["max_steps"],
-    # same plumbing as compact_at_percent. Clamped 5–200; 0 falls back to the
-    # ctx-derived auto budget below.
-    _max_steps_override = 0
-    with contextlib.suppress(Exception):
-        _max_steps_override = int(state.get("max_steps") or 0)
-    if _max_steps_override > 0:
-        MAX_STEPS = max(5, min(_max_steps_override, 200))
-    else:
-        # Auto budget: each step re-sends the full transcript, so fewer steps
-        # saves tokens — but too few steps forces a "continue" turn, which costs
-        # a whole extra round-trip. 12–50 finishes normal multi-file work in
-        # ONE turn (no continue needed) while still capping runaway loops.
-        MAX_STEPS = max(12, min(int(ctx) // 4000 if ctx else 24, 50))
+    # No user-configurable step budget: the old 12-50 auto cap cut real
+    # tasks in half ("step limit reached" mid-task). A single high internal
+    # safety ceiling remains so a model that never stops calling tools (fresh
+    # args every step — invisible to the repetition guard) cannot burn
+    # unbounded tokens. Real tasks finish in single-digit steps; 200 is a
+    # runaway guard, never a task budget.
+    MAX_STEPS = 200
     async def _execute_tool(name: str, args: dict, call_id: str = "", step: int = 0) -> str:
         import inspect
 
@@ -4023,6 +4744,11 @@ async def _run_mode_turn(
                         _cid = tc.get("id")
                         for mm in messages:
                             if isinstance(mm, ToolMessage) and mm.tool_call_id == _cid:
+                                # A budget refusal is not a result: replaying it
+                                # would keep refusing after an edit re-arms the
+                                # budget.
+                                if _is_search_refusal(mm.content):
+                                    break
                                 return mm.content
         return None
 
@@ -4064,6 +4790,19 @@ async def _run_mode_turn(
             # History is otherwise cleared (checkpoint already holds the full
             # transcript) to avoid duplicating the prompt.
             _resume_plan = _latest_plan_from_history(state.get("history"))
+            if not _resume_plan:
+                # Restart-proof memory: the in-memory checklist dies with the
+                # process, but update_plan persists it next to plan.md.
+                try:
+                    _ws = state_db.workspace_slug_for_root(root)
+                    _disk_plan = state_db.get_checklist(_ws, str(chat_id or ""))
+                    if _disk_plan and not all(
+                        isinstance(it, dict) and it.get("status") == "completed"
+                        for it in _disk_plan
+                    ):
+                        _resume_plan = _disk_plan
+                except Exception:  # noqa: BLE001, S110 — fallback never breaks resume
+                    pass
             _resume_plan_msg = _plan_status_message(_resume_plan)
             if _resume_plan_msg is not None:
                 messages = list(messages) + [_resume_plan_msg]
@@ -4105,7 +4844,7 @@ async def _run_mode_turn(
         # the already-done work instead of re-running the tools from scratch.
         # The checkpoint is cleared on a clean finish (see run_graph._drive).
         # --- Repetition-loop guard (opencode-aligned) -----------------------
-        # opencode stops a degenerate loop via MAX_STEPS + finish_reason=="length"
+        # opencode stops a degenerate loop via a step budget + finish_reason=="length"
         # and has no text-comparison guard. We keep a guard but base it on the
         # TOOL-CALL SIGNATURE (name + args), not emitted text: a real loop repeats
         # the SAME tool call with IDENTICAL arguments, whereas genuine multi-step
@@ -4162,17 +4901,19 @@ async def _run_mode_turn(
         # past this the turn is looping, not discovering.
         _PLAN_SCOUT_BUDGET = 8
         _compact_count = 0
+        # Per-turn search guard (build only): counts steps that call grep/glob/read
+        # without an intervening edit; see _search_gate_text.
+        _search_batches = 0
         while steps < MAX_STEPS:
             steps += 1
             _step_t0 = time.monotonic()
             _llm_wait_s = 0.0
             _tool_exec_s = 0.0
             _ckpt_save_s = 0.0
-            # Hard guardrail (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
+            # Runaway guard (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
             # final allowed step, force the model to stop tool-calling and
             # summarize instead of burning more reads/searches. Without this the
-            # loop just breaks at MAX_STEPS and returns an empty reply, so the
-            # model never learns it should stop and tends to spam reads first.
+            # loop just breaks at the ceiling and returns an empty reply.
             if steps >= MAX_STEPS:
                 msgs.append(AIMessage(content=_agents._MAX_STEPS_PROMPT))
             # Deliver any background sub-agent report that finished since the
@@ -4235,7 +4976,6 @@ async def _run_mode_turn(
                             _steer_skills,
                             root,
                             emit=lambda ev: queue.put_nowait(ev),
-                            catalog=False,
                         )
                         if _skill_section:
                             msgs.append(HumanMessage(content=_skill_section))
@@ -4279,6 +5019,9 @@ async def _run_mode_turn(
                 # only cuts ~75% of the wasted text, the rest still hits the UI.
                 _reply_buf = ""
                 _chunk_idx = 0
+                # Next buffer length at which the repetition guard re-scans
+                # (stride-throttled; see _REPEAT_SCAN_STRIDE).
+                _rep_check_at = 0
                 # Track the cumulative length of text we've actually emitted as
                 # `kind: "text"` events. The stream-end re-emit path (when a
                 # reasoning-capable model sent no real reasoning field) needs
@@ -4367,23 +5110,25 @@ async def _run_mode_turn(
                         # itself with no tool call). The tool-call guard below
                         # only watches signatures, so this catches the no-tool
                         # case; we abort mid-stream instead of dumping it all.
-                        # Check on EVERY chunk (not every Nth) — a fast model
-                        # can push a full 80x loop out in fewer than N chunks,
-                        # so a throttled cadence only cuts ~75% of the wasted
-                        # text and the rest still hits the UI.
+                        # Stride-throttled (see _REPEAT_SCAN_STRIDE): a repeated
+                        # unit is at most 200 chars, so a 240-char stride can
+                        # never skip a live loop while a long answer stays
+                        # linear instead of quadratic.
                         _reply_buf += content
                         _chunk_idx += 1
-                        if _is_repeating(_reply_buf):
-                            queue.put_nowait(
-                                {
-                                    "kind": "warn",
-                                    "content": (
-                                        "The model entered a text repetition loop; "
-                                        "showing partial output."
-                                    ),
-                                }
-                            )
-                            break
+                        if len(_reply_buf) >= _rep_check_at:
+                            _rep_check_at = len(_reply_buf) + _REPEAT_SCAN_STRIDE
+                            if _is_repeating(_reply_buf):
+                                queue.put_nowait(
+                                    {
+                                        "kind": "warn",
+                                        "content": (
+                                            "The model entered a text repetition loop; "
+                                            "showing partial output."
+                                        ),
+                                    }
+                                )
+                                break
                         # Gateways that null reasoning_content and stream CoT as
                         # plain content before the real answer: while reasoning is
                         # enabled and we haven't seen a genuine reasoning field,
@@ -4438,18 +5183,20 @@ async def _run_mode_turn(
                                     )
                                 _reply_buf += t
                                 _chunk_idx += 1
-                                if _is_repeating(_reply_buf):
-                                    queue.put_nowait(
-                                        {
-                                            "kind": "warn",
-                                            "content": (
-                                                "The model entered a text "
-                                                "repetition loop; showing "
-                                                "partial output."
-                                            ),
-                                        }
-                                    )
-                                    break
+                                if len(_reply_buf) >= _rep_check_at:
+                                    _rep_check_at = len(_reply_buf) + _REPEAT_SCAN_STRIDE
+                                    if _is_repeating(_reply_buf):
+                                        queue.put_nowait(
+                                            {
+                                                "kind": "warn",
+                                                "content": (
+                                                    "The model entered a text "
+                                                    "repetition loop; showing "
+                                                    "partial output."
+                                                ),
+                                            }
+                                        )
+                                        break
                                 if _model_reasoning and not _saw_real_reasoning:
                                     _now = time.monotonic()
                                     if not _drop_t0:
@@ -4634,6 +5381,19 @@ async def _run_mode_turn(
                     _no_pc = True
                     model = _strip_parallel_calls(model)
                     continue
+                # Dropped connection (network flap / VPN switch / dead keep-alive
+                # socket): the pooled sockets are poisoned and every retry on the
+                # same pool fails identically until the app restarts. Rebuild the
+                # model on a fresh HTTP pool; the retry wrapper then re-runs it.
+                if _is_connection_dropped(exc):
+                    try:
+                        model = rebuild_model_fresh(model)
+                        logger.warning(
+                            "[run_graph] connection dropped chat=%s: rebuilt model on a fresh HTTP pool",
+                            state.get("chat_id", ""),
+                        )
+                    except Exception:  # noqa: BLE001 — never mask the original error
+                        logger.debug("[run_graph] fresh-pool rebuild failed", exc_info=True)
                 # 9router-style key fallback: on key errors (invalid/expired/
                 # rate-limited) rebuild with the NEXT key and retry the step.
                 if _is_key_error(exc):
@@ -4669,46 +5429,10 @@ async def _run_mode_turn(
                 # tracebacks (the old behavior looked like a silent
                 # "instant disconnect" to the user). The checkpoint is left
                 # behind so a Retry resumes from the already-done tool work.
-                _low = str(exc).lower()
-                if isinstance(exc, asyncio.TimeoutError) or "timed out" in _low:
-                    queue.put_nowait(
-                        {
-                            "kind": "warn",
-                            "content": (
-                                "The model request timed out before producing any "
-                                "output. Tap Retry to resume from the last "
-                                "checkpoint, or switch to a faster model in Settings."
-                            ),
-                        }
-                    )
-                    if run_flags is not None:
-                        with contextlib.suppress(Exception):
-                            run_flags["error"] = True
-                    return reply or ""
-                if (
-                    isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout))
-                    or "connection refused" in _low
-                    or "name or service not known" in _low
-                    or "connection reset" in _low
-                    or "connection was closed" in _low
-                    or "remote protocol error" in _low
-                ):
-                    _endpoint = (state.get("base_url") or "").strip()
-                    _hint = f" at {_endpoint}" if _endpoint else ""
-                    queue.put_nowait(
-                        {
-                            "kind": "error",
-                            "content": (
-                                f"Couldn't reach the model provider{_hint}. "
-                                "Check Settings → Providers or your network, then "
-                                "tap Retry."
-                            ),
-                        }
-                    )
-                    if run_flags is not None:
-                        with contextlib.suppress(Exception):
-                            run_flags["error"] = True
-                    return reply or ""
+                # Timeouts and dropped/refused connections are NOT surfaced here:
+                # they re-raise into the run_graph retry loop, which retries up
+                # to _RETRY_MAX_ATTEMPTS (10) times, 30s apart, and only then
+                # emits `retry_giveup` (checkpoint is kept for a manual Retry).
                 raise
             if not getattr(ai, "tool_calls", None):
                 meta = getattr(ai, "response_metadata", {}) or {}
@@ -4828,7 +5552,7 @@ async def _run_mode_turn(
                             _pending_todos = _stored
                     except Exception:  # noqa: BLE001, S110 — gate must never break turn
                         pass
-                # Plan mode delivers ## Plan plus an all-pending Coder
+                # Plan mode delivers ## Plan plus an all-pending Build
                 # checklist: those items are never the planner's work, so a
                 # delivered plan ends the turn instead of re-looping it.
                 _pending_gate_enabled = False  # TEMP-REVERT-CHECK
@@ -4860,16 +5584,17 @@ async def _run_mode_turn(
                     continue
                 reply = (reply or "") + _partial
                 break
-            # --- Repetition-loop detection (tool-call signature) -------------
-            # A real loop repeats the SAME tool call with IDENTICAL arguments on
-            # every step. Genuine multi-step work varies the args (e.g. reading
-            # different files), so it never trips this guard. The old text
-            # comparison false-positived on models that emit similar phrasing
-            # while doing real work.
-            _tool_sig = json.dumps(
-                [(tc.get("name"), tc.get("args")) for tc in (ai.tool_calls or [])],
-                sort_keys=True,
-                ensure_ascii=False,
+            # --- Repetition-loop detection (normalized tool-call signature) -----
+            # A real loop repeats the SAME tool call on every step. Exact-arg
+            # comparison missed the near-miss shape: the model paging ONE file
+            # window after window (same path, different offset/limit) looped
+            # forever. The signature is normalized per tool (read/grep/glob keep
+            # only the file/scope identity), so those near-miss repeats now
+            # count. Genuine multi-step work (different files) still never trips
+            # this guard.
+            _tool_sig = "|".join(
+                _normalized_call_sig(tc.get("name") or "", tc.get("args") or {})
+                for tc in (ai.tool_calls or [])
             )
             if _tool_sig and _tool_sig == _last_tool_sig:
                 _repeat_count += 1
@@ -5009,6 +5734,24 @@ async def _run_mode_turn(
                     len(_dup_ids),
                 )
             _pending = _deduped
+            # Build search guard: refuse search calls past the budget (the
+            # advisory nudge below is ignored by weaker models). Other calls in
+            # the same step still run; any edit re-arms the budget.
+            _gate_text = _search_gate_text(
+                mode,
+                _search_batches,
+                [(tc.get("name") or "") for tc in _pending],
+                msgs,
+            )
+            if _gate_text:
+                queue.put_nowait({"kind": "warn", "content": _gate_text})
+                _kept_calls = []
+                for _tc in _pending:
+                    if (_tc.get("name") or "") in _SEARCH_TOOLS:
+                        append_tool_result(msgs, _gate_text, _tc.get("id", ""))
+                    else:
+                        _kept_calls.append(_tc)
+                _pending = _kept_calls
             # NOTE: Each tool function (via make_tool_callbacks) emits its own
             # {"kind": "tool"} event internally. We do NOT emit here to avoid
             # duplicate UI cards — previously this pre-execution emit AND the
@@ -5125,6 +5868,26 @@ async def _run_mode_turn(
                         {"kind": "warn", "content": _batch_hint.strip()}
                     )
                 _transient_msgs.append(HumanMessage(content=_batch_hint.strip()))
+            # Per-turn search guard: build refuses past the budget (the gate
+            # before execution enforces it); plan converges via the scout
+            # budget above; ask gets a soft model-visible nudge so discovery
+            # converges instead of spraying searches step after step.
+            _step_names = {(tc.get("name") or "") for tc in (_pending or [])}
+            if (mode or "") == "build":
+                if _step_names & _EDIT_TOOLS:
+                    _search_batches = 0
+                elif _step_names & _SEARCH_TOOLS:
+                    _search_batches += 1
+                    if _search_batches >= _MAX_SEARCH_BATCHES_WITHOUT_EDIT:
+                        _search_msg = _search_refusal_text(_search_batches, msgs)
+                        queue.put_nowait({"kind": "warn", "content": _search_msg})
+                        _transient_msgs.append(HumanMessage(content=_search_msg))
+            elif (mode or "") == "ask" and _step_names & _SEARCH_TOOLS:
+                _search_batches += 1
+                _soft_msg = _soft_search_nudge("ask", _search_batches)
+                if _soft_msg:
+                    queue.put_nowait({"kind": "warn", "content": _soft_msg})
+                    _transient_msgs.append(HumanMessage(content=_soft_msg))
             if _plan_scout_hint:
                 queue.put_nowait(
                     {"kind": "warn", "content": _plan_scout_hint.strip()}
@@ -5218,7 +5981,7 @@ async def _run_mode_turn(
                 pass
             _step_progress += 1
         # Final delivery: a report that landed while the last step ran, or a
-        # turn that hit MAX_STEPS with jobs still in flight, must never be
+        # turn that ended with jobs still in flight, must never be
         # silently dropped. Wait, then inject whatever arrived; while jobs are
         # still running, wait again (bounded rounds, each emitting a
         # still-waiting status) instead of finalizing early. If reports
@@ -5253,7 +6016,7 @@ async def _run_mode_turn(
     # (bad request / quota exhausted / auth) surface as a fatal error event
     # without burning the retry budget.
     # Subagent runs use mode "subagent"; the main turn uses
-    # ask/coder/plan/reader. Tag retry events only for subagents so the UI can
+    # ask/build/plan/reader. Tag retry events only for subagents so the UI can
     # show "Sub-agent failed — using main model" instead of a generic hiccup.
     def _retry_event_agent(state):
         mode = state.get("mode")
@@ -5624,7 +6387,7 @@ def detect_test_commands(root: str) -> list[str]:
     elif os.path.isfile(os.path.join(root, "Makefile")):
         cmds.append("make test")
     # C/C++ files without CMake/Make have no standard test runner; leave cmds
-    # empty so the Coder is told there are no project tests to run.
+    # empty so the Build is told there are no project tests to run.
 
     return cmds
 
@@ -5687,19 +6450,19 @@ def detect_frontend_stack(root: str) -> str:
 
 
 def router(state: AgentState) -> dict:
-    """Determine the requested mode (ASK / PLAN / CODER / READER).
+    """Determine the requested mode (ASK / PLAN / BUILD / READER).
 
     The UI/toolbar mode is authoritative. We only honor an explicit slash
     command (/plan, /code, /ask, /reader) in the prompt — never infer the
     mode from keywords like "write/fix/edit" (that would override the user's
-    explicit Plan selection and make the agent think it's in Coder).
+    explicit Plan selection and make the agent think it's in Build).
     """
     prompt = state.get("request", "") or ""
     text = prompt.strip().lower()
     if text.startswith("/plan") and (len(text) == 5 or text[5] in " \n\t"):
         return {"mode": "plan"}
     if text.startswith("/code") and (len(text) == 5 or text[5] in " \n\t"):
-        return {"mode": "coder"}
+        return {"mode": "build"}
     if text.startswith("/ask") and (len(text) == 4 or text[4] in " \n\t"):
         return {"mode": "ask"}
     if text.startswith("/reader") and (len(text) == 7 or text[7] in " \n\t"):
@@ -5714,27 +6477,27 @@ async def ask_node(state: AgentState) -> dict:
     return {"final_response": reply}
 
 
-async def coder_entry(state: AgentState) -> dict:
-    # If a plan already exists (in state or persisted), Coder implements from it
-    # and skips the repo-discovery pipeline. Otherwise Coder runs discovery just
-    # like plan, then implements from the gathered context. The coder->test->
-    # debug->coder loop never re-enters this node, so discovery runs at most once.
+async def build_entry(state: AgentState) -> dict:
+    # If a plan already exists (in state or persisted), Build implements from it
+    # and skips the repo-discovery pipeline. Otherwise Build runs discovery just
+    # like plan, then implements from the gathered context. The build->test->
+    # debug->build loop never re-enters this node, so discovery runs at most once.
     return {}
 
 
-def _route_coder_entry(state: AgentState) -> str:
-    # Coder now performs its own repo exploration via grep/glob/read tools
+def _route_build_entry(state: AgentState) -> str:
+    # Build now performs its own repo exploration via grep/glob/read tools
     # directly (OpenCode-style), so it never needs the removed discovery
     # pipeline. It simply implements (from a plan when one exists).
-    return "coder"
+    return "build"
 
 
-async def coder_node(state: AgentState) -> dict:
+async def build_node(state: AgentState) -> dict:
     queue = state["_queue"]
     recorder = _RecordingQueue(queue)
     # Same-run approved plan: plan_build ran just before in this graph run,
     # so the plan lives in state (not yet in history, and disk lookup alone
-    # is not enough to orient the model). Hand it explicitly so Coder
+    # is not enough to orient the model). Hand it explicitly so Build
     # implements instead of writing a new '## Plan' document.
     approved_plan = state.get("plan") or ""
     extra = ""
@@ -5750,25 +6513,25 @@ async def coder_node(state: AgentState) -> dict:
                 f"{approved_plan.strip()}"
             )
     reply = await _run_mode_turn(
-        state, "coder", recorder, extra_instruction=extra, run_flags=state.get("_run_flags")
+        state, "build", recorder, extra_instruction=extra, run_flags=state.get("_run_flags")
     )
     if not isinstance(reply, str):
         reply = "" if reply is None else str(reply)
-    # A '## Plan' written in Coder mode (plan-then-execute when none exists)
+    # A '## Plan' written in Build mode (plan-then-execute when none exists)
     # must produce the same clickable Plan card as plan mode — otherwise it
     # renders as plain chat text and never reaches the right-side viewer.
     turn_text = recorder.text() or reply
     if isinstance(turn_text, str) and turn_text.strip():
-        import re as _re_coder_plan
+        import re as _re_build_plan
 
         # Line-anchored header only: a passing "C# plan" / "the plan is ..."
         # mention in a summary must never touch the saved plan.
-        if _re_coder_plan.search(
+        if _re_build_plan.search(
             r"^#{1,3}\s*(plan|پلن)\b",
             turn_text,
-            _re_coder_plan.IGNORECASE | _re_coder_plan.MULTILINE,
+            _re_build_plan.IGNORECASE | _re_build_plan.MULTILINE,
         ):
-            # Persist a coder-written plan only when none is saved yet
+            # Persist a build-written plan only when none is saved yet
             # (plan-then-execute when none exists): never silently overwrite
             # an approved/saved plan with a "### Plan vs actual" section
             # from a summary.
@@ -5776,20 +6539,20 @@ async def coder_node(state: AgentState) -> dict:
                 _existing = _agents._load_saved_plan(
                     state.get("root", ""), chat_id=state.get("chat_id", "")
                 )
-            except Exception:  # noqa: BLE001 — lookup must never break coder
+            except Exception:  # noqa: BLE001 — lookup must never break build
                 _existing = ""
             if not (_existing or "").strip():
                 try:
                     _persist_plan_text(queue, state.get("root", ""), state.get("chat_id", ""), turn_text)
                 except Exception:  # noqa: BLE001, S110 — the card must never break the run
                     pass
-    return {"coder_result": reply, "final_response": reply}
+    return {"build_result": reply, "final_response": reply}
 
 
 def _shared_permit(state: dict, allow_outside: bool) -> dict:
     """Flags and allowed folders shared across tool rebuilds within one turn.
 
-    The coder node in LangGraph re-runs every step and ``make_tool_callbacks``
+    The build node in LangGraph re-runs every step and ``make_tool_callbacks``
     is rebuilt with a fresh dict; without this shared dict, an "Always allow"
     grant or an in-turn approval would be lost on the next step and the
     permission dialog would reappear for every call. A fresh dict is created
@@ -5817,25 +6580,25 @@ def _shared_permit(state: dict, allow_outside: bool) -> dict:
 def review_node(state: AgentState) -> dict:
     """Verify the implementation against the request / plan.
 
-    Read-only. Produces a structured review result. The Coder is responsible for
+    Read-only. Produces a structured review result. The Build mode is responsible for
     running the project's tests itself (via run_terminal) before finishing, so
     the graph does not run a separate test gate — the review just checks that an
     implementation was produced.
     """
     queue = state["_queue"]
     plan = state.get("plan", "")
-    coder = state.get("coder_result", "")
+    build = state.get("build_result", "")
     notes = []
-    if not coder:
+    if not build:
         notes.append("no implementation produced")
-    if plan and "## Plan" not in plan and not coder:
+    if plan and "## Plan" not in plan and not build:
         notes.append("no plan/implementation to review")
     result = "APPROVED" if not notes else "NEEDS WORK: " + "; ".join(notes)
     queue.put_nowait({"kind": "review", "result": result})
     return {"review_result": result}
 
 
-def done_node(state: AgentState) -> dict:
+async def done_node(state: AgentState) -> dict:
     """Finalize the run.
 
     The terminal ``done`` SSE event is emitted by ``server.event_gen``'s
@@ -5848,6 +6611,102 @@ def done_node(state: AgentState) -> dict:
     final = state.get("final_response", "")
     if state.get("review_result"):
         final = final + "\n\n[Review] " + state["review_result"]
+    # Persistent goal judge (Claude-style completion-condition check).
+    # A small fast model (the compact/subagent slot, else the parent model)
+    # grades the ASSISTANT's work only — user messages are excluded so the
+    # goal's own reminder pings can never self-clear it. Any judge failure
+    # resolves to not_met (fail closed). Bounded auto-continue: at most
+    # GOAL_MAX_EXTRA_TURNS extra turns; the counter is seeded per request
+    # from the client's cumulative turns (server is authoritative).
+    try:
+        from goals import GOAL_JUDGE_SYSTEM, GOAL_MAX_EXTRA_TURNS
+        from goals import build_goal_transcript as _build_goal_transcript
+        from goals import normalize_goal as _normalize_goal2
+        from goals import parse_goal_judge_output as _parse_goal_verdict
+
+        _goal_text2 = _normalize_goal2(state.get("goal"))
+        if not _goal_text2:
+            # Same prompt-prefix fallback as build_turn_context above.
+            import re as _re_goal3
+
+            _pm2 = _re_goal3.match(r"\s*\[Active goal:\s*(.*?)\]\s*", str(state.get("prompt") or ""))
+            if _pm2:
+                _goal_text2 = _normalize_goal2(_pm2.group(1))
+        if _goal_text2:
+            _turns = state.get("goal_turns", 0) or 0
+            try:
+                _turns = int(_turns)
+            except (TypeError, ValueError):
+                _turns = 0
+            if _turns >= GOAL_MAX_EXTRA_TURNS:
+                final = final + "\n\n[GOAL PAUSED] Max extra turns reached — stopping auto-continue."
+                return {"final_response": final, "goal_continue": False}
+            try:
+                _hist = state.get("history") or []
+            except Exception:  # noqa: BLE001, S110 — history is best-effort
+                _hist = []
+            _transcript = _build_goal_transcript(_hist, final)
+            if not _transcript:
+                _status, _reason = "not_met", "No assistant output yet — keep working."
+            else:
+                _status, _reason = "not_met", "Goal not yet met — continuing."
+                try:
+                    _judge_model = resolve_subagent_model(
+                        state.get("provider", ""),
+                        (state.get("subagent_models") or {}).get("compact"),
+                        state.get("base_url", ""),
+                        state.get("api_key", ""),
+                        state.get("env_var", ""),
+                        state.get("model_name", ""),
+                        provider_lookup=lambda pid: (state.get("providers") or {}).get(pid),
+                        timeout=30,
+                        parent_provider_id=state.get("provider_id", ""),
+                        parent_api_keys=state.get("api_keys"),
+                        thinking_level="",
+                        model_reasoning=False,
+                    )
+                except Exception:  # noqa: BLE001, S110 — judge never breaks the run
+                    _judge_model = None
+                if _judge_model is None:
+                    _status, _reason = "not_met", "Goal not yet met — continuing."
+                else:
+                    try:
+                        from llm import llm_generate as _llm_generate
+
+                        _judge_user = (
+                            f"GOAL: {_goal_text2}\n\n"
+                            f"TRANSCRIPT (assistant work only):\n{_transcript}"
+                        )
+                        _raw, _usage = await asyncio.wait_for(
+                            _llm_generate(
+                                _judge_model,
+                                system=GOAL_JUDGE_SYSTEM,
+                                user=_judge_user,
+                                sub=True,
+                                chat_id=str(state.get("chat_id") or ""),
+                            ),
+                            timeout=35,
+                        )
+                        _verdict = _parse_goal_verdict(str(_raw or ""))
+                        if _verdict is not None:
+                            _status = _verdict.get("status", "not_met")
+                            _reason = _verdict.get("reason", "") or _reason
+                    except Exception:  # noqa: BLE001, S110 — fail closed to not_met
+                        _status, _reason = "not_met", "Goal not yet met — continuing."
+            if _status == "met":
+                final = final + "\n\n[GOAL CLEARED] " + (_reason or "Completion condition met.")
+                return {"final_response": final, "goal_continue": False}
+            if _status == "impossible":
+                final = final + "\n\n[GOAL IMPOSSIBLE] " + (_reason or "Goal cannot be achieved.")
+                return {"final_response": final, "goal_continue": False}
+            final = final + "\n\n[GOAL CONTINUES] " + (_reason or "Goal not yet met — continuing.")
+            return {
+                "final_response": final,
+                "goal_continue": True,
+                "goal_turns": _turns + 1,
+            }
+    except Exception:  # noqa: BLE001, S110 — judge must never break the run
+        pass
     return {"final_response": final}
 
 
@@ -6716,12 +7575,13 @@ MAX_EXPLORE_READ_CHARS = 24_000
 
 def _explicit_files(state: AgentState) -> list[str]:
     """Workspace-relative paths the user explicitly pointed at THIS turn:
-    attachments + the open Neovim file + any file named directly in the request.
+    attachments plus any file named directly in the request.
     Used both for routing (ask -> reader) and for the reader's read set."""
     root = state["root"]
-    attachments = state.get("attachments")
-    nvim_file = state.get("nvim_file", "")
-    files = list(_agents._scoped_rels(root, attachments, nvim_file))
+    files: list[str] = []
+    for a in state.get("attachments") or []:
+        if a and str(a).strip() and str(a) not in files:
+            files.append(str(a))
     for f in _resolve_file_refs([state.get("request", "")], root):
         if f not in files:
             files.append(f)
@@ -6954,8 +7814,8 @@ async def ask_entry(state: AgentState) -> dict:
 
 
 def _route_ask_entry(state: AgentState) -> str:
-    # When the user explicitly points at file(s) THIS turn -- an attachment, the
-    # open Neovim file, or a file named directly in the message -- the question is
+    # When the user explicitly points at file(s) THIS turn -- an attachment or
+    # a file named directly in the message -- the question is
     # about THOSE files, so route to the Reader agent, which reads only the needed
     # parts (no repo-wide discovery / glob).
     if _explicit_files(state):
@@ -7102,9 +7962,10 @@ PLAN_APPROVE_TOKEN = "__plan_approve__"
 PLAN_DISMISS_TOKEN = "__plan_dismiss__"
 # Capability map applied to the run when the user approves the plan: the request
 # arrived with Plan-mode (read-only) caps from the UI, and filter_tools_for_mode
-# trusts that map — without this upgrade the Coder turn that starts in the SAME
+# trusts that map — without this upgrade the Build turn that starts in the SAME
 # stream would have its write/edit/terminal tools stripped.
-CODER_CAPS = {"readFiles": True, "writeFiles": True, "runTerminal": True, "web": True}
+BUILD_CAPS = {"readFiles": True, "writeFiles": True, "runTerminal": True, "web": True}
+CODER_CAPS = BUILD_CAPS  # legacy alias
 
 
 def _split_plan_reply(reply: str) -> tuple[str, str]:
@@ -7428,12 +8289,12 @@ async def plan_build(state: AgentState) -> dict:
                 if answer == PLAN_APPROVE_TOKEN:
                     approved = True
                     try:
-                        queue.put_nowait({"kind": "mode_changed", "mode": "coder"})
+                        queue.put_nowait({"kind": "mode_changed", "mode": "build"})
                     except Exception:  # noqa: BLE001, S110 — UI sync only
                         pass
                     break
                 # Dismiss (or empty): keep the saved plan, end plan mode. The
-                # user can switch to Coder manually later.
+                # user can switch to Build manually later.
                 if not answer or answer == PLAN_DISMISS_TOKEN:
                     break
                 # Edit request: revise the plan with the planner, then re-ask.
@@ -7469,19 +8330,19 @@ async def plan_build(state: AgentState) -> dict:
     return {
         "plan": reply,
         "plan_attempts": attempts,
-        # Approved → this run continues into the Coder node (implementation
+        # Approved → this run continues into the Build node (implementation
         # starts in the SAME stream, ZCode-style); _route_plan_build sees the
         # switched mode and routes accordingly.
-        "mode": "coder" if approved else state.get("mode", "plan"),
-        **({"cap": dict(CODER_CAPS)} if approved else {}),
+        "mode": "build" if approved else state.get("mode", "plan"),
+        **({"cap": dict(BUILD_CAPS)} if approved else {}),
     }
 
 
 def _route_plan_build(state: AgentState) -> str:
     # Plan mode is a read-only deliverable: present the plan once and STOP, so
-    # the user can review / extend it or switch to Coder manually. Other modes
-    # (e.g. coder invoked with a plan in history) jump straight to coder.
-    return "done" if state.get("mode") == "plan" else "coder"
+    # the user can review / extend it or switch to Build manually. Other modes
+    # (e.g. build invoked with a plan in history) jump straight to build.
+    return "done" if state.get("mode") == "plan" else "build"
 
 
 def _route_mode(state: AgentState) -> str:
@@ -7491,7 +8352,7 @@ def _route_mode(state: AgentState) -> str:
 def build_graph():
     """Compile the LangGraph state machine for the agent workflow.
 
-    OpenCode-style architecture: every agent mode (coder/plan/ask/reader) has
+    OpenCode-style architecture: every agent mode (build/plan/ask/reader) has
     direct access to the grep/glob/read tool runtime and decides iteratively
     which to call — there is NO forced derive stage and NO separate explore
     pipeline. Broad exploration is delegated to an isolated Explore subagent via
@@ -7499,9 +8360,9 @@ def build_graph():
     """
     g = StateGraph(AgentState)
     g.add_node("router", router)
-    g.add_node("coder", coder_node)
-    g.add_node("coder_entry", coder_entry)
-    g.add_conditional_edges("coder_entry", _route_coder_entry, {"coder": "coder"})
+    g.add_node("build", build_node)
+    g.add_node("build_entry", build_entry)
+    g.add_conditional_edges("build_entry", _route_build_entry, {"build": "build"})
     g.add_node("review", review_node)
     g.add_node("done", done_node)
     # ASK flow: general assistant with repo tools; answers directly, searching
@@ -7533,7 +8394,7 @@ def build_graph():
     g.add_conditional_edges(
         "plan_build",
         _route_plan_build,
-        {"plan_build": "plan_build", "coder": "coder", "done": "done"},
+        {"plan_build": "plan_build", "build": "build", "done": "done"},
     )
 
     g.add_edge(START, "router")
@@ -7543,14 +8404,14 @@ def build_graph():
         {
             "ask": "ask_entry",
             "plan": "plan_understand",
-            "coder": "coder_entry",
+            "build": "build_entry",
             "reader": "reader_read",
         },
     )
 
-    # CODER tail: Coder runs the project's tests itself (via run_terminal) before
+    # BUILD tail: Build runs the project's tests itself (via run_terminal) before
     # finishing, so there is no automatic test/debug loop here — just review.
-    g.add_edge("coder", "review")
+    g.add_edge("build", "review")
     g.add_edge("review", "done")
     g.add_edge("done", END)
     return g.compile()

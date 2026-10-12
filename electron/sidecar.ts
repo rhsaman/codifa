@@ -155,6 +155,10 @@ async function doStart(): Promise<SidecarHandle> {
     // AES key used to decrypt secrets (API keys / OAuth creds) that the
     // renderer stores encrypted in settings.json. In-memory only, never on disk.
     CODER_SECRET_KEY: getSecretsKey(),
+    // Lets the sidecar exit by itself if this process dies without a graceful
+    // stopSidecar() (kill -9, crash, dev restart) — otherwise it lingers as an
+    // orphan holding GBs of RAM and a stale port.
+    CODIFA_PARENT_PID: String(process.pid),
   }
   if (runner) {
     child = spawn(runner.cmd, [...runner.args, path.join(backendDir, 'server.py'), '--port', String(port)], {

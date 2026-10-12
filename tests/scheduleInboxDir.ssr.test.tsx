@@ -51,7 +51,7 @@ useStore.setState({
   dir: "rtl",
   scheduleInboxOpen: true,
   schedules: [
-    { id: "s1", name: "task", prompt: "p", cron: "", enabled: true, root: "", mode: "coder" },
+    { id: "s1", name: "task", prompt: "p", cron: "", enabled: true, root: "", mode: "build" },
   ] as any,
   scheduleInboxSelected: "s1",
   scheduleRunsSeen: [],

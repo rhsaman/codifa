@@ -108,8 +108,8 @@ console.log("۶) unseenRunCountForTask — بج هر تسک:")
 console.log("۷) pickInboxTask — بج با پنل خالی همراه نشود:")
 {
   const tasks = [
-    { id: "s1", name: "اول", prompt: "p", cron: "", enabled: true, root: "", mode: "coder" },
-    { id: "s2", name: "دوم", prompt: "p", cron: "", enabled: true, root: "", mode: "coder" },
+    { id: "s1", name: "اول", prompt: "p", cron: "", enabled: true, root: "", mode: "build" },
+    { id: "s2", name: "دوم", prompt: "p", cron: "", enabled: true, root: "", mode: "build" },
   ] as any
   const runs = [
     { id: "b", schedule_id: "s2", status: "done", started_at: 2 },

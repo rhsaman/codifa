@@ -59,17 +59,16 @@ async def test_grep_returns_path_line_text():
     # پس خط ۲ (setup_one) نمایش داده نمی‌شه — این رفتار درسته.
 
 
-async def test_grep_annotates_enclosing_symbol():
-    """Each hit names its enclosing symbol with range — straight to
-    read(symbols=[...]) with no line guessing. The `path:line:` prefix
-    stays intact for existing consumers."""
+async def test_grep_plain_path_line_form():
+    """Grep is a plain text search: `path:line:` + context body only.
+    Enclosing-symbol labels moved to the LSP hover tool (on demand), so
+    no ` in Name (L..)` suffix is appended anymore."""
     root = _make_ws()
     cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
     out = await cbs["grep"]("TARGET")
     assert "app.py:4:" in out
-    assert "in alpha (L1-4)" in out
-    out2 = await cbs["grep"]("gamma")
-    assert "in gamma (L7-8)" in out2
+    assert "return compute()  # TARGET" in out
+    assert " in alpha (" not in out
 
 
 async def test_grep_snippet_stays_bounded():
@@ -188,9 +187,11 @@ async def test_glob_paths_batch_scans_multiple_scopes():
 def _make_glob_ws():
     d = tempfile.mkdtemp()
     root = os.path.join(d, "ws")
-    os.makedirs(root)
+    # Files live in a subdir: glob enforces a scope (path=...), so tests
+    # must pass one instead of scanning the whole workspace.
+    os.makedirs(os.path.join(root, "pkg"))
     for name in ("a.py", "b.ts", "c.test.ts"):
-        with open(os.path.join(root, name), "w") as f:
+        with open(os.path.join(root, "pkg", name), "w") as f:
             f.write("x = 1\n")
     return root
 
@@ -199,12 +200,88 @@ async def test_glob_patterns_batch_merges_results():
     """چند glob در یک فراخوانی → نتایج merge و بدون تکرار."""
     root = _make_glob_ws()
     cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
-    out = await cbs["glob"]("*.py", patterns=["*.ts"])
+    out = await cbs["glob"]("*.py", path="pkg", patterns=["*.ts"])
     assert out.startswith("GLOB MATCHES for '*.py|*.ts'"), out
     assert "a.py" in out
     assert "b.ts" in out
     assert "c.test.ts" in out
     # بدون patterns رفتار تک‌الگویی می‌ماند.
-    single = await cbs["glob"]("*.py")
+    single = await cbs["glob"]("*.py", path="pkg")
     assert single.startswith("GLOB MATCHES for '*.py'"), single
     assert "b.ts" not in single
+
+
+async def test_grep_batch_only_call_without_primary_pattern():
+    """Regression (live trace): the model batched via patterns=[...] and
+    omitted `pattern` entirely; the old required-positional signature raised
+    TypeError and burned a full ~22K-token retry step."""
+    root = _make_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"](patterns=["TARGET", "gamma"])
+    assert out.startswith("MATCHES for 'TARGET|gamma'"), out
+
+
+async def test_grep_no_pattern_at_all_is_friendly_error():
+    """Neither pattern nor patterns: readable error, never a TypeError."""
+    root = _make_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]()
+    assert out.startswith("ERROR"), out
+    assert "empty pattern" in out
+
+
+async def test_glob_batch_only_call_without_primary_pattern():
+    """Same regression class for glob: a patterns-only call must work."""
+    root = _make_glob_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["glob"](patterns=["*.py", "*.ts"], path="pkg")
+    assert out.startswith("GLOB MATCHES for '*.py|*.ts'"), out
+
+
+def test_count_grep_alternatives_top_level_only():
+    """Only depth-0 pipes split alternatives: a grouped alternation like
+    `(popup|slash)` is ONE concept (live trace miscounted a 2-concept
+    pattern as 11 alternatives and the guard fired on a legit grep)."""
+    import tools as _tools
+
+    c = _tools._count_grep_alternatives
+    assert c("foo") == 1
+    assert c("foo|bar") == 2
+    assert c("a|b|c|d") == 4
+    assert c("(a|b|c)") == 1
+    assert c("(a|b|c)|d") == 2
+    assert c(r'className="[^"]*(popup|slash|mention)[^"]*"') == 1
+    assert c("[a|b]") == 1
+    assert c(r"a\|b") == 1
+    assert c("a||b|") == 2
+
+
+async def test_grep_unscoped_broad_pattern_refused():
+    """An unscoped >3-alternative spray is refused with targeting guidance
+    instead of scanning the whole workspace and dumping a match list the
+    model then re-greps (live trace: 9-alternative greps, 176/148 hits)."""
+    root = _make_multi_scope_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]("alpha|beta|TARGET|gamma|delta")
+    assert out.startswith("ERROR searching:"), out
+    assert "path=" in out and "include=" in out
+    assert "lsp_symbols" in out
+
+
+async def test_grep_scoped_broad_pattern_runs():
+    """The same broad pattern WITH a scope runs (warn only) — the scope
+    already targets it."""
+    root = _make_multi_scope_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"]("alpha|beta|TARGET|gamma|delta", path="src")
+    assert out.startswith("MATCHES for"), out
+    assert "src/a.py" in out
+
+
+async def test_grep_grouped_alternatives_not_refused():
+    """A grouped single-concept pattern (pipes only inside (...)) is not
+    broad and must run unscoped."""
+    root = _make_ws()
+    cbs = make_tool_callbacks(root, lambda ev: None, main_model=None)
+    out = await cbs["grep"](r"(alpha|Beta|gamma)")
+    assert out.startswith("MATCHES for"), out

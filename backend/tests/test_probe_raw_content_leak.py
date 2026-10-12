@@ -25,7 +25,7 @@ async def test_probe_raw_content_leak(run_events, mock_server, workspace):
     events = []
     async for ev in run_agent(
         provider="custom", model_name="mock-model", base_url=base,
-        api_key="test", root=str(workspace), mode="coder", prompt="سلام",
+        api_key="test", root=str(workspace), mode="build", prompt="سلام",
         history=[], chat_id="pytest-probe-raw", model_reasoning=True,
     ):
         events.append(ev)

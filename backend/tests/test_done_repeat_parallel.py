@@ -35,7 +35,7 @@ async def test_done_emitted_exactly_once():
         "mode": "ask",
     }
     # Drive the same logic that done_node uses.
-    result = _graph.done_node(state)
+    result = await _graph.done_node(state)
     assert result == {"final_response": "all done"}
     # The fix: done_node no longer puts anything on the queue.
     assert queue.empty(), (

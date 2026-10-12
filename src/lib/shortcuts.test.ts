@@ -4,7 +4,7 @@
 // اجرا: npx esbuild src/lib/shortcuts.test.ts --bundle --platform=node \
 //        --format=esm --outfile=src/lib/.tmp-shortcuts.mjs && node src/lib/.tmp-shortcuts.mjs
 
-import { navChord, panelToggleTarget, shouldFocusSearch } from "./shortcuts"
+import { navChord, panelToggleTarget, prefixMoveDir, shouldFocusSearch } from "./shortcuts"
 
 export {}
 
@@ -82,6 +82,18 @@ console.log('۴) panelToggleTarget — تفکیک سایدبار و پنل را�
   check('Ctrl+Shift+«ذ» (code=KeyB) → right', panelToggleTarget(chord(true, 'KeyB', 'ذ')) === 'right')
   check('بدون Ctrl → null', panelToggleTarget({ code: 'KeyB', key: 'b', ctrlKey: false, metaKey: false, shiftKey: true }) === null)
   check('کلید دیگر → null', panelToggleTarget({ code: 'KeyC', key: 'c', ctrlKey: true, metaKey: false, shiftKey: true }) === null)
+}
+
+console.log('۵) prefixMoveDir — جابه‌جایی پنجره با Ctrl+X then H/J/K/L:')
+{
+  check('h → left', prefixMoveDir('h') === 'left')
+  check('j → down', prefixMoveDir('j') === 'down')
+  check('k → up', prefixMoveDir('k') === 'up')
+  check('l → right', prefixMoveDir('l') === 'right')
+  check('H بزرگ → left', prefixMoveDir('H') === 'left')
+  check('u → null (undo می‌ماند)', prefixMoveDir('u') === null)
+  check('خالی → null', prefixMoveDir('') === null)
+  check('null → null', prefixMoveDir(null) === null)
 }
 
 if (failed > 0) {

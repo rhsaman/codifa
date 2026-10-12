@@ -9,6 +9,8 @@ import {
   containsChat,
   dropOnto,
   dropOntoRoot,
+  ghostInsertIndex,
+  isVacatedByDrag,
   leafCount,
   makeLeaf,
   makeSplit,
@@ -18,6 +20,9 @@ import {
   replaceChat,
   resizePair,
   setNodeSize,
+  resolveLeafPos,
+  shouldShowNestedGhost,
+  shouldShowSiblingGhost,
   sizesByChat,
   toggleFullscreenId,
 } from "./chatTree";
@@ -171,6 +176,80 @@ console.log("10) placement contract — drag/new-chat adds, click+select replace
   // External drag onto center must add, not replace (store routes it via openBeside).
   const external = openBeside(row, "c", "b", "col");
   check("external drag creates new window", leafCount(external) === 3);
+}
+
+console.log("11) normalizeTree — identity-stable when nothing changes:");
+{
+  const root = buildFromList(["a", "b"], "row")!;
+  const same = normalizeTree(root, new Set(["a", "b"]));
+  check("clean tree keeps reference (no extra render after minimize)", same === root);
+  const leaf = makeLeaf("a");
+  const sameLeaf = normalizeTree(leaf, new Set(["a"]));
+  check("clean leaf keeps reference", sameLeaf === leaf);
+}
+
+console.log("12) minimize preserves instances — no collapse on remove/normalize:");
+{
+  const root = buildFromList(["a", "b"], "row")!;
+  const leafA = (root as unknown as { children: unknown[] }).children[0];
+  const pruned = removeChat(root, "b") as unknown as { kind: string; id: string; children: unknown[] } | null;
+  check("remove keeps split wrapper (no collapse)", pruned !== null && pruned.kind === "split" && pruned.children.length === 1);
+  check("remove keeps root id", pruned !== null && (root as unknown as { id: string }).id === pruned.id);
+  check("remaining leaf keeps reference (no remount)", pruned !== null && pruned.children[0] === leafA);
+  check("remaining ids correct", JSON.stringify(collectChatIds(pruned as never)) === JSON.stringify(["a"]));
+  const leafC = makeLeaf("c");
+  const nested = makeSplit("row", [makeLeaf("a"), makeSplit("col", [makeLeaf("b"), leafC])]);
+  const prunedNested = removeChat(nested, "b") as unknown as { kind: string; children: Array<{ kind: string; children: unknown[] }> } | null;
+  const midAfter = prunedNested !== null && prunedNested.kind === "split" ? prunedNested.children[1] : null;
+  check("nested single-child split kept", midAfter !== null && midAfter.kind === "split" && midAfter.children.length === 1);
+  check(
+    "nested remaining leaf keeps reference",
+    midAfter !== null && midAfter.kind === "split" && (midAfter as unknown as { children: unknown[] }).children[0] === leafC,
+  );
+  const singleSplit = makeSplit("row", [makeLeaf("a")]);
+  check("normalize keeps single-child split reference", normalizeTree(singleSplit, new Set(["a"])) === singleSplit);
+}
+
+console.log("13) isVacatedByDrag — dragged slot counts as empty:");
+{
+  check("source leaf vacates", isVacatedByDrag(["b"], "b"));
+  check("other leaf stays", !isVacatedByDrag(["a"], "b"));
+  check("mixed subtree stays", !isVacatedByDrag(["a", "b"], "b"));
+  check("external drag never vacates", !isVacatedByDrag(["b"], null));
+}
+
+console.log("14) sibling ghost — edge drop along axis shows equal panes:");
+{
+  check("row + right on direct child ghosts", shouldShowSiblingGhost("row", "right", true));
+  check("row + bottom stays overlay", !shouldShowSiblingGhost("row", "bottom", true));
+  check("center never ghosts", !shouldShowSiblingGhost("row", "center", true));
+  check("nested target stays overlay", !shouldShowSiblingGhost("row", "right", false));
+  check("right inserts after target", ghostInsertIndex(1, "right") === 2);
+  check("left inserts before target", ghostInsertIndex(1, "left") === 1);
+  check("row + bottom nests across axis", shouldShowNestedGhost("row", "bottom", true));
+  check("row + right never nests along axis", !shouldShowNestedGhost("row", "right", true));
+}
+
+console.log("15) resolveLeafPos — hysteresis stops edge/center flicker:");
+{
+  check("enters left past edge", resolveLeafPos(0.2, 0.5, null) === "left");
+  check("stays left on small drift", resolveLeafPos(0.3, 0.5, "left") === "left");
+  check("leaves left past exit band", resolveLeafPos(0.4, 0.5, "left") === "center");
+  check("center stays center", resolveLeafPos(0.3, 0.5, null) === "center");
+}
+
+console.log("16) six-window max — reorder/swap/replace work, edge add blocked:");
+{
+  const six = buildFromList(["a", "b", "c", "d", "e", "f"], "row")!;
+  check("six leaves", leafCount(six) === 6);
+  const reordered = dropOnto(six, "f", "a", "left");
+  check("internal edge reorder keeps six", leafCount(reordered) === 6 && JSON.stringify(collectChatIds(reordered)) === JSON.stringify(["f", "a", "b", "c", "d", "e"]));
+  const swapped = dropOnto(six, "a", "b", "center");
+  check("internal center swaps", JSON.stringify(collectChatIds(swapped)) === JSON.stringify(["b", "a", "c", "d", "e", "f"]));
+  const blocked = dropOnto(six, "g", "a", "left");
+  check("external edge blocked at max", blocked === six);
+  const replaced = dropOnto(six, "g", "b", "center");
+  check("external center replaces at max", JSON.stringify(collectChatIds(replaced)) === JSON.stringify(["a", "g", "c", "d", "e", "f"]) && leafCount(replaced) === 6);
 }
 
 if (failed > 0) {

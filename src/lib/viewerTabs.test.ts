@@ -33,7 +33,7 @@ const memStore = new Map<string, string>()
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).document = { documentElement: { style: { setProperty: () => {} } } }
 
-const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat } = await import('./viewerTabs')
+const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat } = await import('./viewerTabs')
 const { useStore, normalizeVisibleChats, normalizeChatLayout } = await import('./store')
 
 export {}
@@ -288,6 +288,45 @@ console.log('13) openPlan — one chat-scoped plan tab, auto-opens pane:')
   check('second chat gets own plan tab', vt().tabs.some((t) => t.id === `plan:${c2}`), vt().tabs.map((t) => t.id))
   const v1 = visibleTabs(vt().tabs, c1)
   check('plan tab follows its own chat', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${c2}`), v1.map((t) => t.id))
+}
+
+console.log('14) syncViewerToChat — chat switch keeps panel mode:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+  const c2 = useStore.getState().newChat('ask')
+  vt().openGitDiff(c1)
+  vt().openGitDiff(c2)
+  vt().setPanelMode(true)
+  check('panel mode on', vt().panelMode === true)
+  syncViewerToChat(c2)
+  check('switching chat keeps panel mode', vt().panelMode === true, vt().panelMode)
+  syncViewerToChat(c1)
+  check('switching back keeps panel mode', vt().panelMode === true, vt().panelMode)
+  check('background active tab still follows chat', vt().activeId === `review:${c1}`, vt().activeId)
+}
+
+console.log('15) closeAllViewers — closes only the active chat tabs, keeps history:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+  const c2 = useStore.getState().newChat('ask')
+  vt().openGitDiff(c1)
+  vt().openTraces(c1, 'all')
+  vt().openGitDiff(c2)
+  check('three tabs open', vt().tabs.length === 3, vt().tabs.length)
+  vt().closeAllViewers(c1)
+  check('only other chat tab remains', vt().tabs.length === 1 && vt().tabs[0].id === `review:${c2}`, vt().tabs.map((t) => t.id))
+  check('closed tabs kept for reopen', vt().closedTabs.length === 2, vt().closedTabs.length)
+  check('active falls back to remaining tab', vt().activeId === `review:${c2}`, vt().activeId)
+  vt().closeAllViewers()
+  check('close-all empties the list', vt().tabs.length === 0, vt().tabs.length)
+  check('no-op on empty list', (() => {
+    vt().closeAllViewers()
+    return vt().tabs.length === 0
+  })())
 }
 
 if (failed > 0) {

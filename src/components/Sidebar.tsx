@@ -142,6 +142,22 @@ export function buildGroups<T extends { id: string; root?: string | null; update
   return ordered;
 }
 
+/**
+ * Toggle select-all for one workspace group: selects every id when at least
+ * one is unselected, otherwise deselects the whole group. Keeps selections
+ * from other groups untouched.
+ */
+export function toggleGroupSelection(prev: Set<string>, groupIds: string[]): Set<string> {
+  const next = new Set(prev);
+  const allSelected = groupIds.length > 0 && groupIds.every((id) => next.has(id));
+  if (allSelected) {
+    groupIds.forEach((id) => next.delete(id));
+  } else {
+    groupIds.forEach((id) => next.add(id));
+  }
+  return next;
+}
+
 export function Sidebar() {
   // Lightweight shell: subscribes ONLY to the open flag so Cmd/Ctrl+B flips
   // instantly without touching chats/workspaces. The heavy content (all chat
@@ -886,6 +902,36 @@ function SidebarContent() {
                 )}
                 {selectingWsKey === g.key && (
                   <div className="group-bulk-actions">
+                    <button
+                      className="group-select-all"
+                      title={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all" : "Select all"}
+                      aria-label={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all chats" : "Select all chats"}
+                      aria-pressed={g.chats.length > 0 && selectedInGroup === g.chats.length}
+                      onClick={() => {
+                        setSelectedChats((prev) =>
+                          toggleGroupSelection(
+                            prev,
+                            g.chats.map((c) => c.id),
+                          ),
+                        );
+                      }}
+                    >
+                      <svg
+                        width="13"
+                        height="13"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        {g.chats.length > 0 && selectedInGroup === g.chats.length ? (
+                          <path d="M9 11l3 3L22 4" />
+                        ) : null}
+                        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                      </svg>
+                    </button>
                     <button
                       className="group-delete-selected"
                       title={`Delete ${selectedInGroup} selected conversation(s)`}

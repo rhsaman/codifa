@@ -15,6 +15,7 @@ import os
 import pytest
 
 import checkpoints
+import graph
 import tools
 
 
@@ -171,3 +172,54 @@ def test_edit_file_tool_emits_checkpoint(_fresh_data_dir):
     diffs = [e for e in emitted if e.get("kind") == "diff"]
     assert diffs, "no diff event emitted"
     assert diffs[0].get("checkpoint") == 1
+
+
+@pytest.mark.asyncio
+async def test_turn_checkpoint_save_is_background_and_singleflight(tmp_path, monkeypatch):
+    """Per-step resume saves must not block the turn and must not overlap.
+
+    A non-forced save detaches (returns before the sqlite write finishes) and
+    a second save issued while the first is still running is skipped; a forced
+    save waits for the in-flight one and then lands its own write.
+    """
+    monkeypatch.setenv("CODER_DATA_DIR", str(tmp_path / "data"))
+    saved: list[list] = []
+    release = asyncio.Event()
+
+    async def _fake_save(thread_id, msgs, mode="", plan=None):
+        saved.append(list(msgs))
+        if len(saved) == 1:
+            await release.wait()
+
+    async def _noop_due(thread_id, msgs, *, force=False):
+        return True
+
+    monkeypatch.setattr(graph, "_save_turn_checkpoint", _fake_save)
+    monkeypatch.setattr(graph, "_checkpoint_due", _noop_due)
+    graph._checkpoint_save_tasks.clear()
+
+    msgs = ["m1"]
+    # Non-forced save: returns immediately while the write is still blocked.
+    t0 = asyncio.get_running_loop().time()
+    await asyncio.wait_for(
+        graph._save_turn_checkpoint_valid("t-bg", msgs), timeout=0.5
+    )
+    assert asyncio.get_running_loop().time() - t0 < 0.5
+    # Yield once so the detached task actually starts (create_task schedules,
+    # it does not run) and reaches its blocked sqlite write.
+    await asyncio.sleep(0)
+    assert len(saved) == 1
+    # Second save while the first is in flight: skipped (single-flight).
+    await graph._save_turn_checkpoint_valid("t-bg", ["m1", "m2"])
+    assert len(saved) == 1
+    # Forced save: waits for the in-flight one, then writes its own snapshot.
+    release.set()
+    await asyncio.wait_for(
+        graph._save_turn_checkpoint_valid(
+            "t-bg", ["m1", "m2"], force=True
+        ),
+        timeout=2.0,
+    )
+    assert len(saved) == 2
+    assert saved[1] == ["m1", "m2"]
+    assert not graph._checkpoint_save_tasks

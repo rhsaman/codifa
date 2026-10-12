@@ -46,7 +46,7 @@ function initialState(scenario: string | null) {
   const chat = (extra: Record<string, unknown>) => ({
     id: "c1",
     title: "UI harness chat",
-    mode: "coder",
+    mode: "build",
     root: "/tmp/codifa-ui-harness",
     createdAt: now,
     updatedAt: now,

@@ -264,11 +264,11 @@ def _tool_input_schema(tool: Any) -> dict | None:
     return None
 
 
-# سقف‌های فشرده‌سازی تعریف ابزارها قبل از رسیدن به مدل — هر کاراکتر اضافه با
-# هر turn دوباره فرستاده می‌شود، پس توضیحات چندپاراگرافی سرورهایی مثل
-# Playwright باید کوتاه شوند.
-_DESC_MAX_CHARS = 300
-_FIELD_DESC_MAX_CHARS = 80
+# Tool-definition compression caps before reaching the model — every extra char
+# is re-sent each turn, so multi-paragraph descriptions from servers like
+# Playwright must stay short (see "System tools" meter).
+_DESC_MAX_CHARS = 120
+_FIELD_DESC_MAX_CHARS = 40
 
 # Browser snapshot cap before reaching the model — every extra char is
 # re-sent on every following step; Playwright snapshots easily reach tens
@@ -290,7 +290,7 @@ def _compact_description(text: str, max_chars: int = _DESC_MAX_CHARS) -> str:
     window = text[:max_chars]
     for sep in (". ", ".\n", "\n"):
         idx = window.rfind(sep)
-        if idx >= 24:
+        if idx >= 10:
             return text[: idx + 1].rstrip()
     idx = window.rfind(" ")
     if idx > 24:

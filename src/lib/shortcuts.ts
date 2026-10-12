@@ -78,6 +78,19 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
 };
 
+/** Move direction for a prefix second key (Ctrl+X then H/J/K/L).
+ *  Vim-style: h=left, j=down, k=up, l=right. Pure, for test. */
+export type PrefixMoveDir = "left" | "down" | "up" | "right";
+
+export function prefixMoveDir(key: string | null | undefined): PrefixMoveDir | null {
+  const k = (key ?? "").toLowerCase();
+  if (k === "h") return "left";
+  if (k === "j") return "down";
+  if (k === "k") return "up";
+  if (k === "l") return "right";
+  return null;
+}
+
 /** True on macOS/iOS — decides which half of the Cmd/Ctrl convention a chord
  *  uses (Cmd on Apple platforms, Ctrl elsewhere). */
 export function isApplePlatform(): boolean {
@@ -106,7 +119,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
     keys: "Cmd/Ctrl+Enter",
     label: "Queue the message (sends after the current turn, won't interrupt)",
   },
-  { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Coder)" },
+  { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Build)" },
   { keys: "/", label: "Open command palette" },
   { keys: "Cmd/Ctrl+M", label: "Fullscreen the focused chat window — or the terminal while it has focus (press again to restore)" },
   { keys: "Cmd/Ctrl+T", label: "Start a new chat" },
@@ -115,6 +128,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
   { keys: "Cmd/Ctrl+J", label: "Toggle the terminal panel" },
   { keys: "Ctrl+H/J/K/L", label: "Move between chat windows vim-style (focuses the composer)" },
+  { keys: "Ctrl+X H/J/K/L", label: "Move the focused chat window vim-style (swaps with the neighbor)" },
   {
     keys: "Cmd/Ctrl+W",
     label: "Close the active tab (terminal while it has focus, else viewer, else chat)",

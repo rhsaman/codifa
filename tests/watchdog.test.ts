@@ -3,7 +3,7 @@
 // longer leash until ALL of them finish — a single early result must not clear
 // the "a tool is still running" flag.
 // Run: node tests/watchdog.test.ts
-import { bumpToolRunning, contentElapsedMs, dropToolRunning, isToolRunning, shouldShowWaitingForModel } from '../src/lib/watchdog.ts'
+import { bumpToolRunning, contentElapsedMs, dropToolRunning, isToolRunning, shouldRecoverContentStall, shouldShowWaitingForModel } from '../src/lib/watchdog.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -62,6 +62,19 @@ console.log('4) کیپ‌الایو سوکت را تازه نگه می‌دار�
   check('محتوای تازه -> عدم نمایش', shouldShowWaitingForModel(5_000, 5_000, 300_000) === false)
   check('سوکت مرده -> pill زودهنگام نه (مسیر stall)', shouldShowWaitingForModel(400_000, 400_000, 300_000) === false)
   check('contentElapsedMs تفریق خالص است', contentElapsedMs(1000, 26000) === 25000)
+}
+
+console.log('5) content stale past the limit while the socket stays alive -> recover, not pill:')
+{
+  check('400s stale content, live socket -> true (recover)', shouldRecoverContentStall(400_000, 5_000, 300_000) === true)
+  check('60s stale content -> false (still within limit)', shouldRecoverContentStall(60_000, 5_000, 300_000) === false)
+  check('dead socket -> false (old stall path handles it)', shouldRecoverContentStall(400_000, 400_000, 300_000) === false)
+}
+
+console.log('6) infinite content limit: silent thinking is never a stall, however long:')
+{
+  const limit = Number.POSITIVE_INFINITY
+  check('3600s stale content, live socket -> false (thinking never recovers)', shouldRecoverContentStall(3_600_000, 5_000, limit) === false)
 }
 
 if (failed > 0) {

@@ -24,6 +24,7 @@ import {
   coderDirDelete,
 } from './ipc/fs'
 import { checkForUpdates, startUpdate } from './updater'
+import { buildNvimCommand, buildNvimKeystrokeArgs, isSocketDeniedOutput } from './cmuxNvim'
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
@@ -326,14 +327,30 @@ function spawnDetached(bin: string, args: string[]): Promise<boolean> {
   })
 }
 
-/** Run a CLI to completion and report success (exit 0). Bounded so a wedged
- *  unix socket (cmux) or a stuck Launch Services lookup can't hang the IPC. */
-function runCli(bin: string, args: string[], timeoutMs = 10000): Promise<boolean> {
+/** Run a CLI to completion and capture its combined output. cmux exits 0 even
+ *  when its unix socket refuses an outside process ("Access denied" on
+ *  stdout), so socket-backed callers must treat denied output as failure.
+ *  Bounded so a wedged socket or a stuck Launch Services lookup can't hang
+ *  the IPC. */
+function runCliOutput(bin: string, args: string[], timeoutMs = 10000): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
-    execFile(bin, args, { timeout: timeoutMs, env: { ...process.env, PATH: TOOL_PATH } }, (err) =>
-      resolve(!err),
+    execFile(
+      bin,
+      args,
+      { timeout: timeoutMs, env: { ...process.env, PATH: TOOL_PATH } },
+      (err, stdout, stderr) => {
+        const output = `${String(stdout ?? '')}\n${String(stderr ?? '')}`
+        resolve({ ok: !err && !isSocketDeniedOutput(output), output })
+      },
     )
   })
+}
+
+/** Run a CLI to completion and report success. See runCliOutput: denied
+ *  socket output counts as failure even with exit 0. */
+async function runCli(bin: string, args: string[], timeoutMs = 10000): Promise<boolean> {
+  const r = await runCliOutput(bin, args, timeoutMs)
+  return r.ok
 }
 
 /** First existing .app bundle among `names` in /Applications or ~/Applications. */
@@ -838,17 +855,20 @@ function registerIpc(): void {
         if (which === 'cmux') {
           // Best case: a new workspace whose terminal IS nvim on this file.
           // The CLI talks to cmux over its unix socket, which by default only
-          // admits processes started inside cmux — so this succeeds when
-          // codifa itself runs in a cmux terminal (or CMUX_SOCKET_PASSWORD is
-          // set) and fails elsewhere.
+          // admits processes started inside cmux (control mode "cmuxOnly") —
+          // so this succeeds when codifa itself runs in a cmux terminal (or
+          // outside access is allowed via CMUX_SOCKET_MODE=allowAll) and fails
+          // elsewhere. runCliOutput treats the socket's "Access denied"
+          // output as failure even though the CLI exits 0.
           const cli = resolveToolPath('cmux')
+          const nvimCmd = buildNvimCommand(nvimPath, abs)
           if (cli) {
             const wsArgs = [
               'new-workspace',
               '--cwd',
               dir,
               '--command',
-              `${nvimPath} '${abs.replace(/'/g, `'"'"'`)}'`,
+              nvimCmd,
               '--name',
               path.basename(abs),
               '--focus',
@@ -856,12 +876,23 @@ function registerIpc(): void {
             ]
             if (await runCli(cli, wsArgs)) return { ok: true }
           }
-          // No CLI or the socket refused us: hand the folder to cmux via the
-          // macOS document-open event (cmux declares Folder/Viewer) — no
-          // auth needed, and it launches cmux first if it isn't running.
-          // nvim then has to be started in the new workspace by hand.
-          if (await runCli('open', ['-a', 'cmux', dir], 8000)) return { ok: true }
-          return { ok: false, error: 'Could not open cmux — is cmux installed?' }
+          // Socket refused us (or no CLI): open the folder through cmux's
+          // socket-free path (`cmux <dir>` uses the macOS file-open event —
+          // no auth needed, launches cmux if needed), then type the nvim
+          // command into the new terminal via UI scripting (best-effort:
+          // needs Accessibility permission for the app).
+          const opened = cli
+            ? await runCli(cli, [dir], 8000)
+            : false
+          const openedViaEvent = opened || (await runCli('open', ['-a', 'cmux', dir], 8000))
+          if (!openedViaEvent) return { ok: false, error: 'Could not open cmux — is cmux installed?' }
+          if (await runCli('osascript', buildNvimKeystrokeArgs(nvimCmd), 10000)) return { ok: true }
+          return {
+            ok: false,
+            error:
+              'Opened cmux but could not start nvim there (socket access denied and UI scripting failed). ' +
+              'Start nvim by hand in the new workspace, or set CMUX_SOCKET_MODE=allowAll for one-click open.',
+          }
         }
         if (which === 'ghostty') {
           const bundle = findAppBundle(['Ghostty.app'])

@@ -195,9 +195,7 @@ def test_unattached_skill_body_not_inlined(monkeypatch):
         ],
     )
     section = graph._build_skills_section([], "/x")
-    assert "=== AVAILABLE SKILLS ===" in section
-    assert "Anthropic Frontend Design" in section
-    assert "SECRET-BODY" not in section
+    assert section == "", "no picks: no catalog, no body"
 
 
 def test_unknown_pick_adds_no_catalog(monkeypatch):
@@ -236,7 +234,7 @@ def test_no_picks_skip_skill_load(monkeypatch):
     def boom(root):
         raise AssertionError("DB نباید بارگیری شود")
     monkeypatch.setattr(graph._agents, "_load_skills", boom)
-    assert graph._build_skills_section([], "/x", catalog=False) == ""
+    assert graph._build_skills_section([], "/x") == ""
 
 
 def test_skill_used_but_name_excluded_from_search(monkeypatch):

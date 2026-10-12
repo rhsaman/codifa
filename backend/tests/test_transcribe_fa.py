@@ -51,6 +51,26 @@ def _silent_wav() -> bytes:
     return buf.getvalue()
 
 
+def _tone_wav() -> bytes:
+    """A loud 1s 440Hz tone: passes the PCM energy gate in tests."""
+    import io
+    import math
+    import struct
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        frames = b"".join(
+            struct.pack("<h", int(16000 * math.sin(2 * math.pi * 440 * i / 16000)))
+            for i in range(16000)
+        )
+        wf.writeframes(frames)
+    return buf.getvalue()
+
+
 def _post(client, lang: str | None = None):
     """POST a fake audio file (multipart) like the browser does."""
     data = {}
@@ -58,7 +78,7 @@ def _post(client, lang: str | None = None):
         data["lang"] = lang
     return client.post(
         "/transcribe",
-        files={"audio": ("clip.wav", _silent_wav(), "audio/wav")},
+        files={"audio": ("clip.wav", _tone_wav(), "audio/wav")},
         data=data,
     )
 
@@ -73,6 +93,9 @@ def test_fa_initial_prompt_has_punctuation_guidance():
     assert "فارسی" in (captured.get("initial_prompt") or "")
     # The old prompt told the model "no punctuation"; the new one must not.
     assert "no punctuation" not in (captured.get("initial_prompt") or "")
+    # The prompt must never instruct the model to drop words: a "no filler
+    # words" instruction made Whisper delete real spoken words.
+    assert "پرکننده" not in (captured.get("initial_prompt") or "")
     assert resp.json()["text"] == "سلام دنیا"
 
 
@@ -106,8 +129,54 @@ def test_decoding_params_tightened_for_accuracy():
     # low-confidence / hallucinated output.
     assert captured.get("beam_size") == 10
     assert captured.get("log_prob_threshold") == -0.8
+    # Ambient-noise rejection without chopping quiet words: a middle
+    # no-speech threshold skips segments Whisper flags as
+    # probably-not-speech, but keeps quiet real speech.
     assert captured.get("no_speech_threshold") == 0.5
     assert captured.get("condition_on_previous_text") is False
+    # The Silero VAD gate drops sub-300ms blips (clicks/bumps) so they
+    # never become text, while a moderate threshold keeps quiet word
+    # edges (a stricter gate chopped syllables into wrong words).
+    # Generous silence padding keeps word edges intact for accuracy.
+    vad = captured.get("vad_parameters") or {}
+    assert vad.get("threshold") == 0.5
+    assert vad.get("min_speech_duration_ms") == 300
+    assert vad.get("min_silence_duration_ms") == 400
+    assert vad.get("speech_pad_ms") == 300
+    assert captured.get("compression_ratio_threshold") == 2.0
+
+
+def test_silence_returns_empty_without_model():
+    """Pure silence is gated before Whisper: no ghost text, no model call."""
+    captured: dict = {}
+    client = _make_client(captured)
+    resp = client.post(
+        "/transcribe",
+        files={"audio": ("clip.wav", _silent_wav(), "audio/wav")},
+        data={"lang": "fa"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["text"] == ""
+    assert captured == {}
+
+
+def test_repeated_loop_filtered_as_hallucination():
+    """A Whisper token loop (same word x4) is dropped, never sent to chat."""
+    fake_segment = SimpleNamespace(text="test test test test")
+
+    def fake_transcribe(*_args, **kwargs):
+        return (iter([fake_segment]), SimpleNamespace(language="fa"))
+
+    fake_model = SimpleNamespace(transcribe=fake_transcribe)
+    with patch.object(server, "_get_whisper_model", AsyncMock(return_value=fake_model)):
+        client = TestClient(server.app)
+        resp = client.post(
+            "/transcribe",
+            files={"audio": ("clip.wav", _tone_wav(), "audio/wav")},
+            data={"lang": "fa"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["text"] == ""
 
 
 if __name__ == "__main__":

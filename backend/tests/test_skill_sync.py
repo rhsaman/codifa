@@ -323,36 +323,6 @@ def test_skills_file_endpoint_returns_extra_file(skill_env):
     assert out["content"] == "HELLO-NOTES"
 
 
-def test_generic_pick_matches_persian_sentence():
-    """Generic fallback resolves Persian sentences via fa_keywords (no hardcode)."""
-    import graph
-
-    skills = [
-        {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه", "ترجمه کن"]},
-        {"name": "summarization", "slug": "summarization", "description": "summarize text", "content": "x", "fa_keywords": ["خلاصه", "خلاصه کن"]},
-    ]
-    picks = graph._skill_generic_pick("لطفا این متن را ترجمه کن", skills)
-    assert [s["name"] for s in picks] == ["translation"]
-
-
-def test_generic_pick_has_no_hardcoded_map():
-    """Generic matcher must not carry a hardcoded concept dict."""
-    import graph
-
-    assert not hasattr(graph, "_SKILL_FA_CONCEPTS")
-    assert not hasattr(graph, "_FA_CONCEPTS")
-
-
-def test_generic_pick_vague_english_without_overlap_is_empty():
-    """Vague requests without data overlap must not hallucinate a skill."""
-    import graph
-
-    skills = [
-        {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه"]},
-    ]
-    assert graph._skill_generic_pick("change this icon in header", skills) == []
-
-
 def test_resolve_skill_match_persian_keywords():
     """tools._resolve_skill_match resolves Persian keywords via skill data."""
     skills = [
@@ -365,12 +335,9 @@ def test_resolve_skill_match_persian_keywords():
 
 def test_lsp_fix_does_not_match_learn_from_docs():
     """LSP / Language Server must not resolve to the language-learning skill."""
-    import graph
-
     skills = [
         {"name": "Learn from Docs", "slug": "learn-from-docs", "description": "When the user wants to learn a programming language directly from its official documentation", "content": "x", "fa_keywords": ["learn programming language"]},
         {"name": "translation", "slug": "translation", "description": "translate text", "content": "x", "fa_keywords": ["ترجمه"]},
     ]
     assert tools._resolve_skill_match(skills, "language server") is None
     assert tools._resolve_skill_match(skills, "fix LSP") is None
-    assert graph._skill_generic_pick("fix LSP language server", skills) == []

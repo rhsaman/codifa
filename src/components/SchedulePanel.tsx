@@ -97,7 +97,7 @@ function ScheduleForm(props: {
       cron: finalCron,
       enabled: initial?.enabled ?? true,
       root: root.trim() || defaultRoot,
-      mode: initial?.mode || "coder",
+      mode: initial?.mode || "build",
     });
     setSaving(false);
     if ("error" in out) {
@@ -108,7 +108,29 @@ function ScheduleForm(props: {
   };
 
   return (
-    <div className="schedule-form" dir={dir}>
+    <form
+      className="schedule-form schedule-form-card"
+      dir={dir}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onCancel();
+      }}
+    >
+      <div className="schedule-form-head">
+        <span className="schedule-form-title">{initial ? "Edit task" : "New scheduled task"}</span>
+        <button
+          type="button"
+          className="schedule-form-close"
+          onClick={onCancel}
+          aria-label="Close form"
+          title="Close"
+        >
+          ✕
+        </button>
+      </div>
       <label className="schedule-field">
         <span className="schedule-label">Task name</span>
         <input
@@ -120,20 +142,24 @@ function ScheduleForm(props: {
           dir="auto"
           spellCheck={false}
           autoComplete="off"
+          autoFocus={!initial}
+          maxLength={120}
         />
       </label>
       <label className="schedule-field">
-        <span className="schedule-label">Task prompt</span>
+        <span className="schedule-label">Task prompt <span aria-hidden="true" className="schedule-required">*</span></span>
         <textarea
           className="schedule-input schedule-prompt"
-          placeholder="What should be done?"
+          placeholder="What should the agent do on each run? Be specific — it runs unattended."
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           rows={3}
-          aria-label="Task prompt"
+          aria-label="Task prompt (required)"
+          aria-required="true"
           dir="auto"
           spellCheck={false}
         />
+        <span className="schedule-hint">Runs without you watching — include context, scope and expected output.</span>
       </label>
       <label className="schedule-field">
         <span className="schedule-label">Repeat</span>
@@ -158,14 +184,19 @@ function ScheduleForm(props: {
         </select>
       </label>
       {useCustom && (
-        <input
-          className="schedule-input schedule-mono"
-          placeholder="0 9 * * *"
-          value={customCron}
-          onChange={(e) => setCustomCron(e.target.value)}
-          aria-label="Custom cron"
-          dir="ltr"
-        />
+        <label className="schedule-field">
+          <input
+            className="schedule-input schedule-mono"
+            placeholder="0 9 * * *"
+            value={customCron}
+            onChange={(e) => setCustomCron(e.target.value)}
+            aria-label="Custom cron expression"
+            dir="ltr"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <span className="schedule-hint" dir="ltr">5-field cron in UTC: minute hour day month weekday.</span>
+        </label>
       )}
       <label className="schedule-field">
         <span className="schedule-label">Working directory</span>
@@ -176,18 +207,25 @@ function ScheduleForm(props: {
           onChange={(e) => setRoot(e.target.value)}
           aria-label="Workspace path"
           dir="ltr"
+          spellCheck={false}
+          autoComplete="off"
         />
+        <span className="schedule-hint">The agent runs with this folder as its workspace.</span>
       </label>
-      {error && <div className="schedule-error">{error}</div>}
+      {error && (
+        <div className="schedule-error" role="alert">
+          {error}
+        </div>
+      )}
       <div className="schedule-actions">
-        <button className="btn" onClick={() => void submit()} disabled={saving}>
+        <button type="submit" className="btn" disabled={saving}>
           {saving ? "Saving…" : initial ? "Save" : "Create task"}
         </button>
-        <button className="btn secondary" onClick={onCancel}>
+        <button type="button" className="btn secondary" onClick={onCancel} disabled={saving}>
           Cancel
         </button>
       </div>
-    </div>
+    </form>
   );
 }
 
@@ -199,6 +237,7 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
   const [busy, setBusy] = useState(false);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const dir = useStore((s) => s.dir);
   const activeRoot = useStore((s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root);
   const openInbox = useStore((s) => s.setScheduleInboxOpen);
@@ -285,9 +324,17 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
   }
 
   return (
-    <div className={`schedule-item${task.enabled ? "" : " disabled"}`} dir={dir}>
-      <div className="schedule-item-head" role="button" tabIndex={0}
-        onClick={() => setExpanded((v) => !v)}
+    <div className={`schedule-item${task.enabled ? "" : " disabled"}${running ? " running" : ""}`} dir={dir}>
+      <div
+        className="schedule-item-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-label={`${task.name} — ${expanded ? "collapse" : "expand"}`}
+        onClick={() => {
+          setExpanded((v) => !v);
+          setConfirmingDelete(false);
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -295,43 +342,72 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
           }
         }}
       >
-        <span className="sidebar-panel-chevron">{expanded ? "▾" : "▸"}</span>
-        <span className="schedule-item-name">{task.name}</span>
-        <span className="schedule-item-cron">{task.cron_label || task.cron || "Once"}</span>
+        <span className={`schedule-status-dot${task.enabled ? "" : " paused"}${running ? " running" : ""}`} aria-hidden="true" />
+        <span className="sidebar-panel-chevron" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+        <span className="schedule-item-name" title={task.name}>{task.name}</span>
+        <span className="schedule-item-cron" title={task.cron || undefined}>{task.cron_label || task.cron || "Once"}</span>
       </div>
       <div className="schedule-item-sub">
-        {formatNextRunFa(task.next_run)}
-        {typeof task.run_count === "number" && task.run_count > 0 ? ` · ${task.run_count} runs` : ""}
-        {tokens > 0 ? ` · ${formatTokens(tokens)} tokens` : ""}
+        <span className="schedule-item-next">{formatNextRunFa(task.next_run)}</span>
+        {typeof task.run_count === "number" && task.run_count > 0 ? (
+          <span className="schedule-item-meta"> · {task.run_count} runs</span>
+        ) : null}
+        {tokens > 0 ? (
+          <span className="schedule-item-meta"> · {formatTokens(tokens)} tokens</span>
+        ) : null}
+        {!task.enabled ? <span className="schedule-pill paused">Paused</span> : null}
+        {running ? <span className="schedule-pill running">Running…</span> : null}
       </div>
       {expanded && (
         <div className="schedule-item-body">
-          <div className="schedule-row">
-            <button className="schedule-btn schedule-icon-btn" onClick={() => void runNow()} disabled={busy || running} title="Run now" aria-label="Run now">
+          {task.prompt ? (
+            <p className="schedule-prompt-text" title={task.prompt}>
+              {task.prompt}
+            </p>
+          ) : null}
+          <div className="schedule-row schedule-toolbar" role="toolbar" aria-label={`Actions for ${task.name}`}>
+            <button className="schedule-btn schedule-icon-btn" onClick={() => void runNow()} disabled={busy || running} title={`Run ${task.name} now`} aria-label={`Run ${task.name} now`}>
               {running ? (
                 <span className="spinner" aria-hidden="true" />
               ) : (
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polygon points="6 3 20 12 6 21 6 3" /></svg>
               )}
             </button>
-            <button className="schedule-btn schedule-icon-btn" onClick={() => void toggleEnabled()} disabled={busy} title={task.enabled ? "Pause" : "Resume"} aria-label={task.enabled ? "Pause" : "Resume"}>
+            <button className="schedule-btn schedule-icon-btn" onClick={() => void toggleEnabled()} disabled={busy} title={task.enabled ? `Pause ${task.name}` : `Resume ${task.name}`} aria-label={task.enabled ? `Pause ${task.name}` : `Resume ${task.name}`}>
               {task.enabled ? (
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
               ) : (
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>
               )}
             </button>
-            <button className="schedule-btn schedule-icon-btn" onClick={() => setEditing(true)} title="Edit" aria-label="Edit">
+            <button className="schedule-btn schedule-icon-btn" onClick={() => setEditing(true)} title={`Edit ${task.name}`} aria-label={`Edit ${task.name}`}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /></svg>
             </button>
-            <button className="schedule-btn schedule-icon-btn danger" onClick={() => void remove()} disabled={busy} title="Delete" aria-label="Delete">
+            <button className={`schedule-btn schedule-icon-btn danger${confirmingDelete ? " active" : ""}`} onClick={() => setConfirmingDelete((v) => !v)} disabled={busy} title={`Delete ${task.name}`} aria-label={`Delete ${task.name}`} aria-expanded={confirmingDelete}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
             </button>
-            <button className="schedule-btn schedule-icon-btn" onClick={openInInbox} title="Open in inbox" aria-label="Open in inbox">
+            <button className="schedule-btn schedule-icon-btn" onClick={openInInbox} title={`Open ${task.name} in inbox`} aria-label={`Open ${task.name} in inbox`}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>
             </button>
           </div>
-          {runError && <div className="schedule-error">{runError}</div>}
+          {confirmingDelete ? (
+            <div className="schedule-confirm" role="alert">
+              <span className="schedule-confirm-text">Delete “{task.name}”? This cannot be undone.</span>
+              <div className="schedule-confirm-actions">
+                <button className="schedule-btn danger-solid" onClick={() => void remove()} disabled={busy}>
+                  Delete
+                </button>
+                <button className="schedule-btn" onClick={() => setConfirmingDelete(false)} disabled={busy}>
+                  Keep
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {runError && (
+            <div className="schedule-error" role="alert">
+              {runError}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -411,14 +487,14 @@ export function ScheduleSection() {
         <button
           className="schedule-add-btn"
           title="New task"
-          aria-label="New task"
+          aria-label="New scheduled task"
           onClick={(e) => {
             e.stopPropagation();
             setFormOpen(true);
             setCollapsed(false);
           }}
         >
-          ＋
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
         </button>
       </div>
       {!collapsed && (
@@ -434,16 +510,34 @@ export function ScheduleSection() {
             />
           )}
           {loading && schedules.length === 0 ? (
-            <div className="schedule-runs-empty">Loading…</div>
+            <div className="schedule-loading" aria-live="polite" aria-busy="true">
+              <div className="schedule-skeleton" />
+              <div className="schedule-skeleton short" />
+              <span className="schedule-loading-text">Loading schedules…</span>
+            </div>
           ) : error && schedules.length === 0 && !formOpen ? (
-            <div className="schedule-runs-empty">
-              <span>{error}</span>
+            <div className="schedule-empty" role="alert">
+              <span className="schedule-empty-icon" aria-hidden="true">⚠</span>
+              <p className="schedule-empty-text">{error}</p>
               <button className="btn secondary" onClick={() => void refresh()}>
                 Retry
               </button>
             </div>
           ) : schedules.length === 0 && !formOpen ? (
-            <div className="schedule-runs-empty">No scheduled tasks — press ＋ to create one</div>
+            <div className="schedule-empty">
+              <span className="schedule-empty-icon" aria-hidden="true">⏰</span>
+              <p className="schedule-empty-title">No scheduled tasks yet</p>
+              <p className="schedule-empty-text">Automate recurring work — e.g. a morning report or hourly check.</p>
+              <button
+                className="btn"
+                onClick={() => {
+                  setFormOpen(true);
+                  setCollapsed(false);
+                }}
+              >
+                Create your first task
+              </button>
+            </div>
           ) : (
             schedules.map((t) => <ScheduleRow key={t.id} task={t} tokens={taskTokens[t.id] ?? 0} onChanged={() => void refresh()} />)
           )}

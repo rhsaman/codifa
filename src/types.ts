@@ -22,7 +22,7 @@ export interface ModeCapabilities {
   web: boolean // web_search / fetch_url
 }
 
-/** One agent mode: built-in (ask / plan / coder) or user-created. */
+/** One agent mode: built-in (ask / plan / build) or user-created. */
 export interface AgentModeDef {
   id: AgentMode
   label: string
@@ -124,6 +124,25 @@ export interface TtsFallback {
   voice: string
 }
 
+/** Live voice session state for the realtime speech-to-speech UI. */
+export type LiveVoiceState = 'idle' | 'connecting' | 'live' | 'speaking' | 'closed' | 'error'
+
+/** Request for a realtime voice session (ephemeral token mint). */
+export interface RealtimeSessionRequest {
+  kind: string
+  baseUrl: string
+  apiKeys?: string[]
+  model?: string
+  voice?: string
+}
+
+/** Ephemeral realtime session minted by the sidecar (never contains the master key). */
+export interface RealtimeSessionResponse {
+  ephemeralToken: string
+  websocketUrl: string
+  expiresAt: string
+}
+
 export interface Settings {
   providers: ProviderConfig[]
   activeProviderId: string
@@ -158,14 +177,20 @@ export interface Settings {
   sttModel?: string
   /** Ordered STT fallback targets, tried after the primary STT source fails. */
   sttFallbacks?: SttFallback[]
-  /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). 'local' پشتیبانی نمی‌شود. */
+  /** TTS source: 'local' = on-device Piper fa, otherwise a settings.providers id. */
   ttsProviderId?: string
-  /** Remote TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
+  /** TTS model: Piper voice id when local (default fa_IR-amir-medium), remote model id otherwise. */
   ttsModel?: string
+  /** Optional mirror base URL for downloading the local Piper voice model. */
+  ttsBaseUrl?: string
   /** Remote TTS voice id sent to {base_url}/audio/speech (e.g. alloy). */
   ttsVoice?: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks?: TtsFallback[]
+  /** Live voice (realtime speech-to-speech) model id (e.g. gpt-realtime). */
+  liveModel?: string
+  /** Live voice id used for the realtime session (e.g. alloy). */
+  liveVoice?: string
   /** On-device embedding (RAG memory) model: repo id + optional mirror. */
   embeddingModel?: string
   embeddingBaseUrl?: string
@@ -205,11 +230,6 @@ export interface Settings {
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */
   historyLimit?: number
-  /** Max tool-loop steps per turn. 0 = auto from context window (default:
-   *  12–40 by ctx). N > 0 = fixed budget (clamped 5–200). Applies on the
-   *  next message. Higher = longer tasks finish in one turn but burn more
-   *  tokens when the model loops. */
-  maxSteps?: number
   /** Tool result cache TTL in minutes (default 60). */
   cacheTtlMinutes?: number
   /** Schedule run ids already seen in the inbox (badge state). Persisted so
@@ -328,20 +348,6 @@ export interface ChatUsage {
   entries: ChatUsageEntry[]
 }
 
-/** One Language-Server diagnostic reported by Neovim for the active buffer.
- *  `severity` is 1=Error, 2=Warning, 3=Information, 4=Hint (LSP LSPClient
- *  number) or a string when the server reports it as text. */
-export interface NvimDiagnostic {
-  lnum: number
-  col: number
-  end_lnum?: number
-  end_col?: number
-  severity: number | string
-  source?: string
-  code?: string | number | null
-  message: string
-}
-
 /** Chronological unit of an assistant message. Text is split into slices around
  *  each tool call so the UI can interleave tool cards with the reply (Claude
  *  style) instead of stacking all tools at the top/bottom. `tool` segments
@@ -411,6 +417,9 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
   skills?: string[]
+  /** Skills auto-loaded by the decision router this turn ('skill' event,
+   *  manual:false) — rendered as chips under the assistant bubble. */
+  autoSkills?: string[]
   usage?: TokenUsage
   error?: boolean
   retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
@@ -435,9 +444,6 @@ export interface ChatDraft {
   /** Long texts pasted into the composer, kept as collapsed cards instead of
    *  flooding the textarea. Joined back into the prompt on send. */
   pasted?: PastedText[]
-  /** True while the composer's mention of a Neovim file was active, so a queued
-   *  turn started from another chat can reproduce the mention. */
-  nvimMentioned?: string
 }
 
 /** A long paste captured by the composer as a collapsed card. */
@@ -462,6 +468,22 @@ export interface QueuedMessage {
   kind: 'steer' | 'queue'
   createdAt: number
   sent?: boolean
+}
+
+/** Persistent per-chat goal (Codex Goal mode / Claude /goal style).
+ *  Lives on the chat so it survives reload via the existing chats persistence.
+ *  When active and not paused, the condition is prefixed to every model prompt.
+ *  `stopped` is the Codex-style halt flag: set by an explicit Stop so the
+ *  auto-continue loop stays idle until the user presses Resume. Unlike
+ *  `paused` it does NOT detach the goal from manual sends — a user-typed
+ *  message still carries the goal, but the loop never auto-fires while set. */
+export interface GoalState {
+  condition: string
+  active: boolean
+  paused?: boolean
+  stopped?: boolean
+  startedAt: number
+  turns?: number
 }
 
 export interface Chat {
@@ -502,11 +524,17 @@ export interface Chat {
   compactNotice?: string | null
   compactError?: string | null
   cmdError?: string | null
+  /** Live voice error shown in the transcript banner under messages (never in the composer). */
+  liveError?: string | null
+  /** TTS playback error shown in the transcript banner under messages (never beside the speaker icon). */
+  ttsError?: string | null
   /** Warning that an @mentioned skill was not found (deleted/renamed) — the
    *  'skill' event's `note` field. Per-chat so it survives the ChatPanel
    *  remount on chat switch (same rationale as compactNotice). */
   skillNotice?: string | null
   stalled?: boolean
+  /** Persistent goal for this chat (null = none). New goal replaces the old one. */
+  goal?: GoalState | null
   /** Per-chat scroll restoration anchor: the message id at the top of the
    *  viewport when the user last scrolled, plus the pixel offset from that
    *  message's top to the viewport top. `atBottom` means the user was pinned
@@ -636,7 +664,7 @@ export interface SidecarEvent {
   body?: string
   preamble?: string
   /** mode_changed: the backend switched the chat's workflow mode mid-run
-   *  (plan approval → coder); the frontend syncs chat.mode silently. */
+   *  (plan approval → build); the frontend syncs chat.mode silently. */
   mode?: string
   input_tokens?: number
   output_tokens?: number

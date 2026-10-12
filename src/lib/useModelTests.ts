@@ -1,6 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 import type { ProviderConfig } from "../types";
-import { testModel } from "./api";
+import { providerKeys, testModel, testModelsBatch } from "./api";
 
 /** وضعیت تست یک مدل: idle → testing → ok / fail (با پیام خطای واقعی). */
 export type ModelTestStatus = "idle" | "testing" | "ok" | "fail";
@@ -38,7 +38,7 @@ const listeners = new Set<() => void>();
 const providerRuns = new Set<string>();
 
 function key(cfg: ProviderConfig, model: string): string {
-  return `${cfg.id}/${model}`;
+  return `${cfg.id}/${cfg.kind}/${cfg.baseUrl ?? ""}/${providerKeys(cfg).join(",")}/${model}`;
 }
 
 function subscribe(l: () => void): () => void {
@@ -85,51 +85,139 @@ export async function runModelTest(cfg: ProviderConfig, model: string): Promise<
   }
 }
 
-/** تست همهٔ مدل‌های یک پروایدر با استخر همزمانی محدود — هر نتیجه به‌محض
- *  رسیدن روی دکمهٔ تکی همان مدل می‌نشیند. اجرای همزمان دوم برای همان
- *  پروایدر نادیده گرفته می‌شود. */
+/** تست همهٔ مدل‌های یک پروایدر — یک راندتریپ بچ (سریع) با فالبک تکی. هر نتیجه
+ *  روی دکمهٔ تکی همان مدل می‌نشیند. اجرای همزمان دوم با همان کلید نادیده
+ *  گرفته می‌شود. در هر دو انتخاب‌گر (کامپوزر و تنظیمات) همین مسیر اجرا می‌شود. */
 export async function runProviderTests(
   cfg: ProviderConfig,
   models: string[],
-  pool = 3,
+  pool = 10,
 ): Promise<void> {
-  if (models.length === 0 || providerRuns.has(cfg.id)) return;
-  providerRuns.add(cfg.id);
+  if (models.length === 0 || providerRuns.has(key(cfg, "__all__"))) return;
+  providerRuns.add(key(cfg, "__all__"));
   try {
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      while (cursor < models.length) {
-        const m = models[cursor++];
-        await runModelTest(cfg, m);
+    const uniq = [...new Set(models)];
+    for (const m of uniq) {
+      const k = key(cfg, m);
+      if (snapshot.get(k)?.status !== "testing") setEntry(k, { status: "testing", msg: "" });
+    }
+    try {
+      const results = await testModelsBatch(cfg, uniq);
+      const seen = new Set(results.map((r) => r.model));
+      for (const r of results) {
+        setEntry(key(cfg, r.model), r.ok
+          ? { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" }
+          : { status: "fail", msg: r.error || "model test failed" });
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(pool, models.length) }, worker));
+      const missing = uniq.filter((m) => !seen.has(m));
+      if (missing.length > 0) {
+        let cursor = 0;
+        const worker = async (): Promise<void> => {
+          while (cursor < missing.length) {
+            const m = missing[cursor++];
+            try {
+              const r = await testModel(cfg, m);
+              setEntry(key(cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+            } catch (err) {
+              setEntry(key(cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(pool, missing.length) }, worker));
+      }
+      return;
+    } catch {
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (cursor < uniq.length) {
+          const m = uniq[cursor++];
+          try {
+            const r = await testModel(cfg, m);
+            setEntry(key(cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+          } catch (err) {
+            setEntry(key(cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(pool, uniq.length) }, worker));
+    }
   } finally {
-    providerRuns.delete(cfg.id);
+    providerRuns.delete(key(cfg, "__all__"));
   }
 }
 
-/** تست لیست مختلط (مثل Recent: مدل‌هایی از چند پروایدر مختلف) با استخر
- *  همزمانی محدود — هر نتیجه روی دکمهٔ تکی همان مدل می‌نشیند. اجرای همزمان
- *  دوم با کلید یکسان نادیده گرفته می‌شود. */
+/** تست لیست مختلط (مثل Recent: مدل‌هایی از چند پروایدر مختلف) — گروه‌بندی
+ *  بر اساس کانفیگ پروایدر و یک راندتریپ بچ برای هر گروه (سریع). هر نتیجه روی
+ *  دکمهٔ تکی همان مدل می‌نشیند. اجرای همزمان دوم با کلید یکسان نادیده گرفته
+ *  می‌شود. در هر دو انتخاب‌گر (کامپوزر و تنظیمات) همین مسیر اجرا می‌شود. */
 const mixedRuns = new Set<string>();
+
+function groupKey(cfg: ProviderConfig): string {
+  return [cfg.id, cfg.kind, cfg.baseUrl ?? "", providerKeys(cfg).join(",")].join("|");
+}
 
 export async function runMixedTests(
   entries: MixedTestEntry[],
-  pool = 3,
+  pool = 10,
   runKey = "recent",
 ): Promise<void> {
   if (entries.length === 0 || mixedRuns.has(runKey)) return;
   mixedRuns.add(runKey);
   try {
+    for (const e of entries) {
+      const k = key(e.cfg, e.model);
+      if (snapshot.get(k)?.status !== "testing") setEntry(k, { status: "testing", msg: "" });
+    }
+    const groups = new Map<string, { cfg: ProviderConfig; models: string[] }>();
+    for (const e of entries) {
+      const gk = groupKey(e.cfg);
+      let g = groups.get(gk);
+      if (!g) {
+        g = { cfg: e.cfg, models: [] };
+        groups.set(gk, g);
+      }
+      if (!g.models.includes(e.model)) g.models.push(e.model);
+    }
+    const groupList = [...groups.values()];
     let cursor = 0;
+    const groupPool = Math.min(4, groupList.length);
     const worker = async (): Promise<void> => {
-      while (cursor < entries.length) {
-        const e = entries[cursor++];
-        await runModelTest(e.cfg, e.model);
+      while (cursor < groupList.length) {
+        const g = groupList[cursor++];
+        try {
+          const results = await testModelsBatch(g.cfg, g.models);
+          const seen = new Set(results.map((r) => r.model));
+          for (const r of results) {
+            setEntry(key(g.cfg, r.model), r.ok
+              ? { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" }
+              : { status: "fail", msg: r.error || "model test failed" });
+          }
+          for (const m of g.models.filter((x) => !seen.has(x))) {
+            try {
+              const r = await testModel(g.cfg, m);
+              setEntry(key(g.cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+            } catch (err) {
+              setEntry(key(g.cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+            }
+          }
+        } catch {
+          let inner = 0;
+          const innerWorker = async (): Promise<void> => {
+            while (inner < g.models.length) {
+              const m = g.models[inner++];
+              try {
+                const r = await testModel(g.cfg, m);
+                setEntry(key(g.cfg, m), { status: "ok", msg: r.reply ? `OK — ${r.reply}` : "OK" });
+              } catch (err) {
+                setEntry(key(g.cfg, m), { status: "fail", msg: err instanceof Error ? err.message : String(err) });
+              }
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(pool, g.models.length) }, innerWorker));
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(pool, entries.length) }, worker));
+    await Promise.all(Array.from({ length: Math.max(1, groupPool) }, worker));
   } finally {
     mixedRuns.delete(runKey);
   }
@@ -201,7 +289,7 @@ export function useModelTests() {
     void runProviderTests(cfg, models);
   }, []);
   const runMixed = useCallback((entries: MixedTestEntry[], runKey = "recent"): void => {
-    void runMixedTests(entries, 3, runKey);
+    void runMixedTests(entries, 10, runKey);
   }, []);
   return { getStatus, getSummary, getMixedSummary, run, runAll, runMixed };
 }

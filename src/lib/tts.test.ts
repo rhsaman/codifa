@@ -29,6 +29,7 @@ class MockAudio {
   static instances: MockAudio[] = []
   paused = false
   played = false
+  playedAt = 0
   onended: (() => void) | null = null
   onerror: (() => void) | null = null
   constructor(public url: string) {
@@ -37,6 +38,7 @@ class MockAudio {
   async play() {
     this.played = true
     this.paused = false
+    this.playedAt = Date.now()
     setTimeout(() => {
       if (!this.paused && this.onended) this.onended()
     }, 30)
@@ -95,6 +97,7 @@ let ttsFailRemaining = 0
 // immune to call numbering and retry rounds).
 let failTextIncludes = ''
 const seenBaseUrls: string[] = []
+const seenTexts: string[] = []
 const seenSignals: AbortSignal[] = []
 ;(globalThis as any).fetch = async (url: string, init?: { signal?: AbortSignal; body?: unknown }) => {
   if (url.endsWith('/health')) return new Response('', { status: 200 })
@@ -116,6 +119,7 @@ const seenSignals: AbortSignal[] = []
     } catch {
       // body غیر JSON: نادیده بگیر
     }
+    if (bodyText) seenTexts.push(bodyText)
     if (failTextIncludes && bodyText.includes(failTextIncludes)) throw new Error('synthesis failed (500)')
     if (bodyBaseUrl) seenBaseUrls.push(bodyBaseUrl)
     if (bodyBaseUrl && failBaseUrls.has(bodyBaseUrl)) throw new Error('synthesis failed (500)')
@@ -140,7 +144,7 @@ const seenSignals: AbortSignal[] = []
 }
 
 const ttsMod = await import('./tts')
-const { playTts, stopTts, toggleTts, pauseTts, resumeTts, getTtsSnapshot, friendlyTtsError, stripMarkdownForTts, speakableMessageText } = ttsMod
+const { playTts, playTtsStream, stopTts, toggleTts, pauseTts, resumeTts, getTtsSnapshot, friendlyTtsError, stripMarkdownForTts, speakableMessageText } = ttsMod
 // setter تاخیر retry (با فرض پیاده‌سازی setTtsRetryConfig در tts.ts توسط ساب‌ایجنت tts؛
 // اگر هنوز اضافه نشده باشد undefined است و تست‌های ۲۰/۲۱ آن را گزارش می‌کنند).
 const setTtsRetryConfig = (ttsMod as unknown as { setTtsRetryConfig?: (cfg: Record<string, unknown>) => void }).setTtsRetryConfig
@@ -199,6 +203,42 @@ console.log('۳) نتیجه fetch کهنه پخش نمی‌شود:')
   firstTtsSlow = false
   check('فقط یک Audio (ویس تازه) ساخته شد', MockAudio.instances.length === 1, MockAudio.instances.length)
   check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+  stopTts()
+}
+
+console.log('۴) local per-sentence queue + natural gap + progressive stream:')
+{
+  // Local sentences are NOT merged into batches anymore: the Persian G2P
+  // strips punctuation, so merged batches hid sentence boundaries and the
+  // backend pacing landed mid-sentence. Each sentence is its own request.
+  MockAudio.instances = []
+  seenTexts.length = 0
+  ttsCall = 0
+  const longFa = 'جمله اول برای تست سرعت شروع پخش است. جمله دوم هم به همین اندازه طولانی است تا بچ دوم ساخته شود. جمله سوم مکث طبیعی بین جمله‌ها را بررسی می‌کند.'
+  await playTts(longFa, opts, 40, { ttsProviderId: 'local', ttsModel: 'default' })
+  check('local requests stay per-sentence (no merged batches)', seenTexts.length === 3, seenTexts)
+  check('first local request is one sentence (fast first audio)', (seenTexts[0] ?? '').length <= 130, seenTexts[0])
+  const gap = MockAudio.instances.length >= 2 ? MockAudio.instances[1].playedAt - MockAudio.instances[0].playedAt : -1
+  check('natural pause between sentences', gap >= 300, gap)
+  stopTts()
+}
+
+console.log('۵) progressive speech plays before the stream is done:')
+{
+  // A completed sentence plays while the source is still streaming.
+  MockAudio.instances = []
+  ttsCall = 0
+  let partial = 'First sentence is complete. Second is still'
+  let done = false
+  const src = { snapshot: () => ({ text: partial, done }) }
+  const p = playTtsStream(src, opts, 50)
+  await sleep(200)
+  const earlyCount = MockAudio.instances.length
+  partial = 'First sentence is complete. Second is still growing now.'
+  done = true
+  await p
+  check('first sentence played before stream done', earlyCount >= 1, earlyCount)
+  check('both sentences played total', MockAudio.instances.length === 2, MockAudio.instances.length)
   stopTts()
 }
 

@@ -205,7 +205,10 @@ export function TabListButton({
               className="tab-list-footer"
               title={footer.title}
               disabled={footer.disabled}
-              onClick={() => footer.onPress()}
+              onClick={() => {
+                setOpen(false)
+                footer.onPress()
+              }}
             >
               {footer.label}
             </button>

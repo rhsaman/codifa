@@ -14,7 +14,10 @@ import { SubagentsSection, TodosSection } from "./TodosPanel";
  *  sub-agents, todos) rendered in place of viewer tab content. */
 function PanelPane() {
   return (
-    <div className="panel-pane">
+    <div
+      className="panel-pane"
+      style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}
+    >
       <ScheduleSection />
       <SubagentsSection />
       <TodosSection />

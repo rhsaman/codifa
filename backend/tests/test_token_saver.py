@@ -212,7 +212,44 @@ def test_plan_reuse_note_bans_solo():
     from agents import _plan_reuse_note
 
     history = [
-        {"mode": "coder", "plan": [{"content": "do it", "status": "pending"}]}
+        {"mode": "build", "plan": [{"content": "do it", "status": "pending"}]}
     ]
     note = _plan_reuse_note(history)
     assert "NEVER send update_plan alone" in note, note
+
+
+# --- turn-start truncation (compact still starts heavy) ----------------------
+
+
+def test_truncate_old_tool_results_keeps_recent():
+    msgs = []
+    for i in range(5):
+        tcid = f"t{i}"
+        msgs.append(
+            AIMessage(content="c", tool_calls=[{"id": tcid, "name": "read", "args": {}}])
+        )
+        msgs.append(ToolMessage(content="x" * 5000, tool_call_id=tcid))
+    n = graph._truncate_old_tool_results(msgs)
+    by_id = {m.tool_call_id: str(m.content) for m in msgs if isinstance(m, ToolMessage)}
+    assert n == 2, "5 steps, keep last 3 verbatim -> truncate first 2"
+    assert by_id["t0"].startswith("[truncated read(")
+    assert by_id["t1"].startswith("[truncated read(")
+    assert len(by_id["t4"]) == 5000, "recent step must stay verbatim"
+
+
+def test_update_plan_accepts_text_title_aliases(tmp_path):
+    import asyncio
+
+    import tools
+
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
+    out = asyncio.run(
+        cbs["update_plan"](
+            items=[
+                {"text": "do backend fix", "status": "in_progress"},
+                {"title": "run tests", "status": "pending"},
+            ]
+        )
+    )
+    assert not out.startswith("ERROR"), out
+    assert "2 steps" in out, out

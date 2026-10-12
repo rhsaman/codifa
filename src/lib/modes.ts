@@ -15,12 +15,12 @@ export const BUILTIN_MODES: AgentModeDef[] = [
     id: 'plan',
     label: 'Plan',
     icon: 'list',
-    description: 'Plans the work: scouts the code and lays out concrete steps and changes for Coder mode. Read-only files and terminal, never writes.',
+    description: 'Plans the work: scouts the code and lays out concrete steps and changes for Build mode. Read-only files and terminal, never writes.',
     capabilities: { readFiles: true, writeFiles: false, runTerminal: true, web: true },
   },
   {
-    id: 'coder',
-    label: 'Coder',
+    id: 'build',
+    label: 'Build',
     icon: 'code',
     description: 'Write and edit code, run commands. Full access to your project.',
     capabilities: { readFiles: true, writeFiles: true, runTerminal: true, web: true },
@@ -46,6 +46,6 @@ export const FALLBACK_MODE: AgentModeDef = BUILTIN_MODES[0]
 /** Legacy mode ids from before the modes registry existed. */
 export function normalizeMode(id: AgentMode | undefined): AgentMode {
   if (id === 'chat') return 'ask'
-  if (id === 'codewriter') return 'coder'
+  if (id === 'codewriter') return 'build'
   return id || 'ask'
 }

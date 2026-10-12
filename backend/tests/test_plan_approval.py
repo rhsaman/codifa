@@ -1,6 +1,6 @@
 """Plan approval gate: after plan_build saves a plan it emits a plan_card
 event and raises a deterministic ask-gate (style="plan_approval") so the user
-can Approve (run continues into the Coder node in the same stream), request
+can Approve (run continues into the Build node in the same stream), request
 edits (the planner revises and re-asks), or Dismiss (plan mode ends with the
 plan saved). Headless runs (no ask_gates) keep the old plan-and-stop behavior.
 """
@@ -100,7 +100,7 @@ async def test_plan_title_extracts_heading(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_approval_approve_routes_to_coder(tmp_path, monkeypatch):
+async def test_approval_approve_routes_to_build(tmp_path, monkeypatch):
     gates = {}
     fake, _calls = _reply_factory([PLAN_V1])
     monkeypatch.setattr(graph.state_db, "save_plan", lambda *a, **k: None)
@@ -118,18 +118,18 @@ async def test_approval_approve_routes_to_coder(tmp_path, monkeypatch):
     result = await asyncio.wait_for(task, timeout=2.0)
 
     mode_ev = await _drain_until(q, "mode_changed")
-    assert mode_ev["mode"] == "coder"
-    assert result["mode"] == "coder"
-    # Full routing contract: the approved plan continues into the Coder node.
-    assert _route_plan_build({**state, **result}) == "coder"
-    # The run's capability map must upgrade to full coder access — the request
+    assert mode_ev["mode"] == "build"
+    assert result["mode"] == "build"
+    # Full routing contract: the approved plan continues into the Build node.
+    assert _route_plan_build({**state, **result}) == "build"
+    # The run's capability map must upgrade to full build access — the request
     # arrived with read-only plan caps and filter_tools_for_mode trusts it.
-    assert result["cap"] == graph.CODER_CAPS
+    assert result["cap"] == graph.BUILD_CAPS
     from tools import make_tool_callbacks
 
     plain = make_tool_callbacks(root=str(tmp_path), emit=lambda _e: None, main_model=None)
     kept = graph.filter_tools_for_mode(
-        "coder", dict(plain), result["cap"], set(), False, False
+        "build", dict(plain), result["cap"], False, False
     )
     assert "edit_file" in kept and "write_file" in kept and "run_terminal" in kept
 
@@ -160,7 +160,7 @@ async def test_approval_feedback_revises_plan_and_reasks(tmp_path, monkeypatch):
 
     await _answer_gate(gates, PLAN_APPROVE_TOKEN)
     result = await asyncio.wait_for(task, timeout=2.0)
-    assert result["mode"] == "coder"
+    assert result["mode"] == "build"
     assert result["plan"] == PLAN_V2
 
 

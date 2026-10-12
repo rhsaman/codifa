@@ -63,8 +63,8 @@ def test_is_small_context_handles_garbage():
 # ---- _build_skills_section (کاتالوگ + تزریق انتخاب‌شده‌ها) ----------------
 
 
-def test_skills_section_no_picks_catalog_only(monkeypatch):
-    """بدون انتخاب: فقط کاتالوگ (نام + توضیح) — بدنه‌ها تزریق نمی‌شوند."""
+def test_skills_section_no_picks_no_catalog(monkeypatch):
+    """بدون انتخاب: هیچ کاتالوگی در پرامپت نیست — خروجی خالی."""
     monkeypatch.setattr(
         graph._agents, "_load_skills",
         lambda root: [
@@ -72,13 +72,11 @@ def test_skills_section_no_picks_catalog_only(monkeypatch):
             {"name": "beta", "description": "d", "content": "BODY-BETA"},
         ],
     )
-    out = graph._build_skills_section([], "/x")
-    assert "AVAILABLE SKILLS" in out
-    assert "BODY-ALPHA" not in out and "BODY-BETA" not in out
+    assert graph._build_skills_section([], "/x") == ""
 
 
-def test_skills_section_small_ctx_disables_catalog(monkeypatch):
-    """کانتکست کوچک (catalog=False): کاتالوگ ساخته نمی‌شود تا توکن صرفه‌جویی شود."""
+def test_skills_section_router_pick_no_catalog(monkeypatch):
+    """انتخاب روتر: فقط بدنهٔ همان اسکیل تزریق می‌شود، بدون کاتالوگ."""
     monkeypatch.setattr(
         graph._agents, "_load_skills",
         lambda root: [
@@ -86,7 +84,10 @@ def test_skills_section_small_ctx_disables_catalog(monkeypatch):
             {"name": "beta", "description": "d", "content": "BODY-BETA"},
         ],
     )
-    assert graph._build_skills_section([], "/x", catalog=False) == ""
+    out = graph._build_skills_section([], "/x", prompt="do alpha", auto_names=["alpha"])
+    assert "BODY-ALPHA" in out
+    assert "BODY-BETA" not in out
+    assert "AVAILABLE SKILLS" not in out
 
 
 def test_skills_section_picked_body_full_even_small_ctx(monkeypatch):
@@ -99,7 +100,7 @@ def test_skills_section_picked_body_full_even_small_ctx(monkeypatch):
             {"name": "beta", "description": "d", "content": "BODY-BETA"},
         ],
     )
-    out = graph._build_skills_section(["alpha"], "/x", catalog=False)
+    out = graph._build_skills_section(["alpha"], "/x")
     assert "BODY-ALPHA" in out
     assert "BODY-BETA" not in out
     assert "AVAILABLE SKILLS" not in out

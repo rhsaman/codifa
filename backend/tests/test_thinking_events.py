@@ -81,7 +81,7 @@ async def test_raw_thinking_in_content_does_not_leak(run_events, mock_server, wo
     events = []
     async for ev in run_agent(
         provider="custom", model_name="mock-model", base_url=base,
-        api_key="test", root=str(workspace), mode="coder", prompt="سلام",
+        api_key="test", root=str(workspace), mode="build", prompt="سلام",
         history=[], chat_id="pytest-raw-think", model_reasoning=True,
     ):
         events.append(ev)

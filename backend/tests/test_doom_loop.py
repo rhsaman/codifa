@@ -284,9 +284,103 @@ def test_empty_system_still_emits_system_message_at_index_0():
     )
 
 
+def test_normalized_call_sig_collapses_windowing_args():
+    """The loop-guard signature must treat "same file, different window" as
+    the SAME call: read keeps only the path identity, grep only the scope.
+    Exact-arg repeats of other tools still match; different files never do.
+    """
+    # Same file, different offset/limit/ranges -> identical signature.
+    a = _llm._normalized_call_sig("read", {"filePath": "a.py", "offset": 1, "limit": 100})
+    b = _llm._normalized_call_sig("read", {"filePath": "a.py", "offset": 500, "limit": 50})
+    assert a == b, "same-file windowing must collapse to one signature"
+    # filePaths batch of the same set (order-insensitive) also collapses.
+    c = _llm._normalized_call_sig("read", {"filePaths": ["b.py", "a.py"]})
+    d = _llm._normalized_call_sig("read", {"filePaths": ["a.py", "b.py"]})
+    assert c == d
+    # Different file -> different signature.
+    assert a != _llm._normalized_call_sig("read", {"filePath": "z.py"})
+    # grep: same scope, different pattern -> DIFFERENT signature (varied
+    # searches are genuine work; only scope+pattern repeats are a loop).
+    g1 = _llm._normalized_call_sig("grep", {"pattern": "foo", "path": "src", "include": "*.ts"})
+    g2 = _llm._normalized_call_sig("grep", {"pattern": "bar", "path": "src", "include": "*.ts"})
+    assert g1 != g2
+    # Same scope+pattern, cosmetic arg difference -> same signature.
+    g3 = _llm._normalized_call_sig("grep", {"pattern": "foo", "path": "src", "include": "*.ts", "max_results": 10})
+    assert g1 == g3
+    # Non-windowing tools keep exact args.
+    e1 = _llm._normalized_call_sig("edit_file", {"path": "a.py", "old_string": "x"})
+    e2 = _llm._normalized_call_sig("edit_file", {"path": "a.py", "old_string": "y"})
+    assert e1 != e2
+
+
+def test_near_miss_paging_loop_stops_early():
+    """A model paging ONE file window after window (same path, different
+    offset each step) is the near-miss loop the exact-args guard missed.
+    The normalized signature must count it: the second identical step gets
+    the repeat short-circuit (no tool re-execution), the third breaks the
+    loop with the steering message.
+    """
+
+    class _PagingModel:
+        model_name = "fake-paging"
+
+        def __init__(self):
+            self._offsets = [1, 500, 1000, 1500, 2000]
+            self._i = 0
+            self.executions = 0
+
+        def bind_tools(self, tools):
+            outer = self
+
+            class _Bound:
+                async def ainvoke(self, msgs):
+                    if outer._i >= len(outer._offsets):
+                        return AIMessage(content="done")
+                    off = outer._offsets[outer._i]
+                    outer._i += 1
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "read",
+                                "args": {"filePath": "same.py", "offset": off, "limit": 100},
+                                "id": f"call-{outer._i}",
+                            }
+                        ],
+                    )
+
+            return _Bound()
+
+    model = _PagingModel()
+
+    async def read(**kwargs):
+        model.executions += 1
+        return "file content"
+
+    result = asyncio.run(
+        _llm.langchain_tool_loop(
+            model,
+            system="",
+            user="read the file",
+            tools={"read": read},
+            max_steps=25,
+            ctx=0,
+            emit=None,
+        )
+    )
+    # The 3rd identical (normalized) step breaks the loop; the 2nd was
+    # short-circuited, so the tool only really executed ONCE.
+    assert model.executions == 1, (
+        f"repeat short-circuit failed: tool ran {model.executions} times"
+    )
+    assert isinstance(result, str)
+
+
 if __name__ == "__main__":
     test_doom_loop_stops_after_3_identical_calls()
     test_varied_calls_not_falsely_stopped()
     test_steering_messages_are_human_not_system()
     test_empty_system_still_emits_system_message_at_index_0()
+    test_normalized_call_sig_collapses_windowing_args()
+    test_near_miss_paging_loop_stops_early()
     print("OK")

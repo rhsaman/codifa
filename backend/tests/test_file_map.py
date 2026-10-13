@@ -40,7 +40,7 @@ async def test_head_read_returns_map_not_dump(tmp_path):
     _big_py(str(tmp_path / "big.py"))
     cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
     out = await cbs["read"]("big.py", offset=1, limit=2000)
-    assert "full head not shown" in out, out
+    assert "file map" in out.lower(), out
     assert "1 | " in out and "40 | " in out
     assert "500 | " not in out
     assert "func_0001" in out  # symbol list names real definitions

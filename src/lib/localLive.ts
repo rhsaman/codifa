@@ -31,7 +31,7 @@ export const LOCAL_LIVE_DEFAULTS = {
   silenceMs: 1300,
   minSpeechMs: 500,
   maxChunkMs: 30000,
-  levelThreshold: 0.015,
+  levelThreshold: 0.02,
   frameMs: 100,
 } as const;
 

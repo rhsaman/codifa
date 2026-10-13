@@ -18,7 +18,13 @@ sending no thinking chunks) must NOT glow.
 from agents import run_agent
 
 
-async def _collect(prompt, model_reasoning, mock_server, workspace):
+async def _collect(prompt, model_reasoning, mock_server, workspace, monkeypatch=None):
+    # Isolate from the shared skill store (see test_thinking_signal_closes_on_first_text):
+    # seeded skills would make the skill router consume mock.script[0].
+    if monkeypatch is not None:
+        import graph as _graph
+
+        monkeypatch.setattr(_graph._agents, "_load_skills", lambda _r: [])
     base, mock = mock_server
     # Use a plain text reply (no thinking content) to prove the signal does NOT
     # depend on thinking chunks arriving.
@@ -42,27 +48,34 @@ async def _collect(prompt, model_reasoning, mock_server, workspace):
     return events
 
 
-async def test_reasoning_model_without_reasoning_content_emits_no_thinking_signal(run_events, mock_server, workspace):
+async def test_reasoning_model_without_reasoning_content_emits_no_thinking_signal(run_events, mock_server, workspace, monkeypatch):
     """A reasoning-capable model that produces NO reasoning content (goes
     straight to text) must NOT show a thinking signal — the signal now follows
     real reasoning output, not the model's reasoning flag."""
-    events = await _collect("سلام", True, mock_server, workspace)
+    events = await _collect("سلام", True, mock_server, workspace, monkeypatch)
     thinking = [e for e in events if e.get("kind") == "thinking"]
     assert not thinking, f"thinking signal must not fire without real reasoning, got {thinking}"
 
 
-async def test_non_reasoning_model_emits_no_thinking_signal(run_events, mock_server, workspace):
+async def test_non_reasoning_model_emits_no_thinking_signal(run_events, mock_server, workspace, monkeypatch):
     """A non-reasoning model must NOT glow."""
-    events = await _collect("سلام", False, mock_server, workspace)
+    events = await _collect("سلام", False, mock_server, workspace, monkeypatch)
     thinking = [e for e in events if e.get("kind") == "thinking"]
     assert not thinking, f"non-reasoning model must not emit a thinking signal, got {thinking}"
 
 
-async def test_thinking_signal_closes_on_first_text(run_events, mock_server, workspace):
+async def test_thinking_signal_closes_on_first_text(run_events, mock_server, workspace, monkeypatch):
     """The glow must turn OFF as soon as the model starts emitting text — not
     stay lit through the whole text-generation phase. We script a reasoning
     model that first streams a thinking chunk (no text) then real text, and
     assert the active:False toggle appears right after the first text event."""
+    # Isolate from the shared skill store: when earlier tests seed skills,
+    # the skill router would consume mock.script[0] and the turn would fall
+    # back to the 'default' reply with no thinking signal. Empty skills skip
+    # routing without an LLM call.
+    import graph as _graph
+
+    monkeypatch.setattr(_graph._agents, "_load_skills", lambda _r: [])
     base, mock = mock_server
     # One SSE spec (a single request consumes script[0]): a thinking-only chunk
     # (no text content) followed by two text chunks. The backend must close the
@@ -123,6 +136,9 @@ async def test_long_silent_reasoning_stream_signals_thinking(run_events, mock_se
     fast straight-to-text answer stays signal-free (see the test above). The
     full answer must still arrive at stream end via the re-emit path."""
     import graph as _graph
+
+    # Isolate from the shared skill store (same reason as the tests above).
+    monkeypatch.setattr(_graph._agents, "_load_skills", lambda _r: [])
 
     # Fake clock: every monotonic() call advances 1s, so a multi-chunk dropped
     # stream spans well over the 5s signal delay without any real sleeping.

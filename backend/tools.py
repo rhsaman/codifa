@@ -274,6 +274,31 @@ _READ_RANGES_BY_CHAT: dict[str, dict[str, list[tuple[int, int]]]] = {}
 # window per round-trip, each re-sending the whole context. Multi-window or
 # multi-file calls never count; reset per turn and on edit like the map above.
 _READ_LONE_CALLS_BY_CHAT: dict[str, dict[str, int]] = {}
+# Files surfaced by a search (grep/glob/LSP) this turn: chat_id -> set of
+# workspace-relative paths. A lone single-window read of a file never
+# surfaced this turn is a blind read — it guesses paths and burns a full
+# round-trip each. Reset per turn and on edit like the maps above.
+_SEARCH_SURFACED_BY_CHAT: dict[str, set[str]] = {}
+
+
+def _note_search_surfaced(chat_id: str, paths: Any) -> None:
+    """Mark workspace-relative paths as surfaced by a search this turn."""
+    cid = (chat_id or "").strip()
+    if not cid:
+        return
+    try:
+        bucket = _SEARCH_SURFACED_BY_CHAT.setdefault(cid, set())
+        items = list(paths) if isinstance(paths, (list, tuple, set)) else [paths]
+        for p in items:
+            s = str(p or "").strip()
+            if not s:
+                continue
+            while s.startswith("./"):
+                s = s[2:].strip()
+            if s and s != "/":
+                bucket.add(s.rstrip("/"))
+    except Exception:  # noqa: BLE001, S110 - surfacing never breaks search
+        pass
 
 
 def _read_range_covered(chat_id: str, target: str, start: int, end: int) -> tuple[int, int] | None:
@@ -388,6 +413,7 @@ def clear_chat_state(chat_id: str) -> None:
     _READ_SEEN_BY_CHAT.pop(cid, None)
     _READ_RANGES_BY_CHAT.pop(cid, None)
     _READ_LONE_CALLS_BY_CHAT.pop(cid, None)
+    _SEARCH_SURFACED_BY_CHAT.pop(cid, None)
     for k in [k for k in list(_SEARCH_BATCHES.keys()) if isinstance(k, tuple) and k[0] == cid]:
         _SEARCH_BATCHES.pop(k, None)
     for k in [k for k in list(_SEARCH_BATCH_GENERATIONS.keys()) if isinstance(k, tuple) and k[0] == cid]:
@@ -483,6 +509,22 @@ def _invalidate_read_cache_for(path: str, root: str) -> None:
                 _lone.pop(norm, None)
         except Exception:  # noqa: BLE001, S110 - lone-call purge never breaks edit
             pass
+        # Edited file is known fresh: post-edit verification reads must pass
+        # the search-first gate without a redundant search round-trip.
+        if norm is not None:
+            try:
+                _rel = os.path.relpath(str(norm), str(root or ""))
+            except Exception:  # noqa: BLE001 - relpath never breaks edit
+                _rel = ""
+            if _rel:
+                try:
+                    for _bucket in _SEARCH_SURFACED_BY_CHAT.values():
+                        try:
+                            _bucket.add(_rel)
+                        except Exception:  # noqa: BLE001, S110 - one bucket never breaks edit
+                            pass
+                except Exception:  # noqa: BLE001, S110 - surfacing never breaks edit
+                    pass
 
 
 def _normalize_search_scope(path: str) -> str:
@@ -3749,8 +3791,13 @@ def edit_file(
     if len(spans) > 1 and not replace_all:
         return _edit_not_unique_error(path, content, spans)
 
-    _clean_new = _undecorate_tool_text(new_string)
-    replacement = _clean_new if (mode or _clean_new != new_string) else new_string
+    # Strip read/grep decorations from new_string ONLY when old_string itself
+    # matched in decorated form. A plain (byte-exact / whitespace-tolerant)
+    # match means the model typed real file text, so a line such as
+    # `    1: (429, "x"),` (dict key) must be written verbatim, not mistaken for
+    # a `N:` line-number prefix and silently stripped.
+    _clean_new = _undecorate_tool_text(new_string) if mode == "decorated" else new_string
+    replacement = _clean_new if mode == "decorated" else new_string
     apply = spans if replace_all else spans[:1]
     if mode == "literal":
         # The span covers the whole quoted literal; the replacement must be
@@ -3881,8 +3928,9 @@ def edit_file_batch(
             return _edit_not_unique_error(
                 path, new_content, spans, prefix=f"edit {idx + 1}/{len(edits)}: "
             )
-        _clean_new = _undecorate_tool_text(new_string)
-        replacement = _clean_new if (mode or _clean_new != new_string) else new_string
+        # See edit_file: only a decorated old_string match strips new_string.
+        _clean_new = _undecorate_tool_text(new_string) if mode == "decorated" else new_string
+        replacement = _clean_new if mode == "decorated" else new_string
         apply = spans if item_replace_all else spans[:1]
         if mode == "literal":
             quote = new_content[apply[0][0]]
@@ -5233,6 +5281,8 @@ def make_tool_callbacks(
     store: VectorStore | None = None,
     chat_id: str = "",
     history: list[dict] | None = None,
+    permission_gate_chat: dict | None = None,
+    ask_gate_chat: dict | None = None,
 ) -> dict[str, Callable]:
     # Bind chat_id into the closure so tools (e.g. update_plan) can persist
     # per-chat state to disk via state_db. Previously chat_id was accepted but
@@ -5264,12 +5314,21 @@ def make_tool_callbacks(
             if _chat_id:
                 _READ_RANGES_BY_CHAT[_chat_id] = {}
                 _READ_LONE_CALLS_BY_CHAT[_chat_id] = {}
+                _SEARCH_SURFACED_BY_CHAT[_chat_id] = set()
+                # The chat-lifetime 'exact window already returned' ledger must
+                # reset per turn too, for the same reason as the ranges above:
+                # turn-start trimming / history budgeting replaces earlier read
+                # results with `[truncated ... re-issue if still needed]`, so a
+                # re-issued read of that window must return real bytes. Keeping
+                # the old ledger answered with 'unchanged: already returned' and
+                # no content -> the model re-read the same window step after step.
+                _READ_SEEN_BY_CHAT[_chat_id] = set()
     except Exception:  # noqa: BLE001, S110 - turn reset never breaks tools
         pass
-    # snapshot بازِ این turn: اولین write در turn یک checkpoint seq جدید می‌سازد
-    # و بقیه‌ی writeهای همان turn به همان seq اضافه می‌شوند (تجمیع per-turn).
-    # make_tool_callbacks به‌ازای هر turn دوباره صدا زده می‌شود، پس این state
-    # خودکار per-turn است و نیازی به reset دستی ندارد.
+    # Open snapshot for this turn: the first write in a turn creates a new
+    # checkpoint seq and the rest of the writes in the same turn append to it
+    # (per-turn aggregation). make_tool_callbacks is called again per turn, so
+    # this state is automatically per-turn with no manual reset.
     _ckpt_open: dict = {}
     # Chat history snapshot from memory (passed from graph.py).
     """Build the agent tools bound to ``root`` with an emit callback.
@@ -6192,6 +6251,13 @@ def make_tool_callbacks(
             }
         )
         _ret = f"Plan updated: {done}/{len(normalized)} done."
+        # Non-final ticks must carry the batch reminder so the model does not
+        # waste a round-trip with a solo update_plan when next work exists.
+        if done < len(normalized):
+            _ret += (
+                " Batch with your next tool calls in the SAME step"
+                " (only batch it with the next real tool calls)."
+            )
         if _repeat_without_progress:
             _ret += (
                 f" Note: you re-sent the SAME checklist without advancing any status, "
@@ -6961,9 +7027,27 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
         lines: list[str] = []
         total = 0
         _adaptive = 3 if min(len(matches), max_results) <= 5 else 1
-        # Enclosing-symbol labels now come from the LSP hover tool on demand.
-        # Grep stays a plain text search with no symbol-index import.
-        _enclosing_symbol = None  # type: ignore[assignment]
+        # Enclosing-symbol labels via a lightweight AST fallback (no LSP
+        # import). Only def-line matches get `in Name (L..)` + inlined body;
+        # body matches keep the plain snippet so `path:line:` consumers and
+        # the plain-form test keep matching.
+        def _enclosing_symbol(abs_path: str, line: int):
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as _fh:
+                    _src = _fh.read()
+                _tree = ast.parse(_src)
+                _best = None
+                for _node in ast.walk(_tree):
+                    if isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        _s = int(getattr(_node, "lineno", 0) or 0)
+                        _e = int(getattr(_node, "end_lineno", _s) or _s)
+                        if _s <= int(line or 0) <= _e and (
+                            _best is None or (_e - _s) < (_best[2] - _best[1])
+                        ):
+                            _best = (_node.name, _s, _e)
+                return _best
+            except Exception:
+                return None
         # Pre-initialized so the footers below never hit UnboundLocalError
         # when the annotation branch above is skipped.
         _expanded = 0
@@ -7036,7 +7120,7 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 try:
                     _abs = os.path.join(root, str(mm["file"]))
                     _hit = _enclosing_symbol(_abs, mm["line"])
-                    if _hit is not None:
+                    if _hit is not None and int(_hit[1]) == int(mm["line"]):
                         _suffix = f" in {_hit[0]} (L{_hit[1]}-{_hit[2]})"
                         # The match IS the definition's first line: inline the
                         # body so no follow-up read is needed to see it.
@@ -7235,6 +7319,13 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "model": _main_name,
             }
         )
+        try:
+            _note_search_surfaced(
+                _chat_id,
+                [str(m.get("file") or "") for m in matches[:max_results] if isinstance(m, dict)],
+            )
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks grep
+            pass
         return raw
 
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
@@ -7525,6 +7616,10 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "model": _main_name,
             }
         )
+        try:
+            _note_search_surfaced(_chat_id, list(lines[:max_results]))
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks glob
+            pass
         return raw
 
     def _did_you_mean(target: str, filePath: str) -> str:
@@ -7621,7 +7716,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                     "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
                     + f"\n\n(file map: {filePath} has {total} lines, no indexable "
                     f"symbols. Use grep to locate what you need, then read exact "
-                    f"ranges.)"
+                    f"ranges with ranges=[\"{filePath}:start:count\", ...] or "
+                    f"symbols=[...] in one call.)"
                 )
         else:
             _rows = head_lines[:_HEAD_MAP_ROWS_NO_SYMBOLS]
@@ -7629,7 +7725,8 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
                 "\n".join(f"{ln['line']} | {ln['text']}" for ln in _rows)
                 + f"\n\n(file map: {filePath} has {total} lines, no indexable "
                 f"symbols. Use grep to locate what you need, then read exact "
-                f"ranges.)"
+                f"ranges with ranges=[\"{filePath}:start:count\", ...] or "
+                f"symbols=[...] in one call.)"
             )
         _summary = f"file map · {total} lines"
         _last = int(_rows[-1]["line"])
@@ -8259,7 +8356,22 @@ When you need to read several files, read multiple independent files in parallel
                 return _msg
         elif symbols:
             if not str(filePath or "").strip():
-                return "ERROR reading symbols=: symbols= needs `filePath` (the file holding the symbols) — pass filePath plus symbols=[...] in the SAME call."
+                # symbols= resolves inside ONE file. A single-entry `filePaths`
+                # is unambiguous: use it instead of burning a whole round-trip
+                # on an error (live trace: filePaths + symbols -> error step).
+                _fp_list = [str(x).strip() for x in (filePaths or []) if str(x).strip()]
+                if len(_fp_list) == 1:
+                    filePath = _fp_list[0]
+                else:
+                    _ex = _fp_list[0] if _fp_list else "path/to/file"
+                    _names = ", ".join(repr(str(s)) for s in list(symbols)[:4])
+                    return (
+                        "ERROR reading symbols=: symbols= belongs to ONE file (`filePath`) and "
+                        "cannot be combined with a multi-file `filePaths`. Re-call in ONE step "
+                        f"with one read per file, e.g. read(filePath={_ex!r}, symbols=[{_names}]) "
+                        "(several read calls in the same step run in parallel), or use "
+                        'ranges=["path:start:count", ...] to window several files in one call.'
+                    )
             try:
                 _sym_target = resolve_safe(root, filePath, allow_coder=True, permit=permit)
             except PathEscapeError as exc:
@@ -8343,30 +8455,62 @@ When you need to read several files, read multiple independent files in parallel
             _gp = tasks[0][0]
             try:
                 _gt = resolve_safe(root, _gp, allow_coder=True, permit=permit)
+                # Search-first ordering: a lone single-window read of a file no
+                # search has surfaced this turn is blind — demand one targeted
+                # search first instead of burning a round-trip guessing paths.
+                # symbols=/batch/directory reads are themselves targeted, exempt.
+                try:
+                    _surfaced = _SEARCH_SURFACED_BY_CHAT.get(_cid, set())
+                except Exception:  # noqa: BLE001 - lookup never breaks a read
+                    _surfaced = set()
+                try:
+                    _root_real = os.path.realpath(root)
+                    _gt_real = os.path.realpath(_gt)
+                    _rel_gt = os.path.relpath(_gt_real, _root_real) if os.path.isabs(str(_gt or "")) else str(_gt or "")
+                except Exception:  # noqa: BLE001 - relpath never breaks a read
+                    _rel_gt = str(_gt or "")
+                try:
+                    _gt_is_dir = os.path.isdir(_gt)
+                except Exception:  # noqa: BLE001 - isdir never breaks a read
+                    _gt_is_dir = False
+                _search_first_nudge = False
+                if _rel_gt and _rel_gt not in (_surfaced or set()) and not _gt_is_dir:
+                    try:
+                        _known = _READ_RANGES_BY_CHAT.get(_cid, {})
+                    except Exception:  # noqa: BLE001 - lookup never breaks a read
+                        _known = {}
+                    if _gt not in (_known or {}):
+                        # Non-blocking: serve this read (blocking forces a retry
+                        # round-trip, which is worse than one blind serve). Nudge
+                        # toward search-first for the NEXT read instead.
+                        _search_first_nudge = True
+                        emit(
+                            {
+                                "kind": "warn",
+                                "content": (
+                                    "Blind read served once — next time run ONE targeted search first "
+                                    "(lsp_symbols for a name, glob for a filename, or grep with path/include), "
+                                    "then read with symbols=[...] or ranges=[...] in ONE call."
+                                ),
+                            }
+                        )
                 _lone_n = _READ_LONE_CALLS_BY_CHAT.get(_cid, {}).get(_gt, 0)
                 _gt_ok = os.path.isfile(_gt)
             except Exception:  # noqa: BLE001 - gate never breaks read
                 _gt, _lone_n, _gt_ok = None, 0, False
             if _gt is not None and _gt_ok:
                 if _lone_n >= 2:
+                    # Non-blocking: a stub here forces a retry round-trip, which
+                    # costs MORE than serving. Serve and nudge toward batching.
                     emit(
                         {
-                            "kind": "tool_result",
-                            "tool": "read",
-                            "summary": "batch-gate",
-                            "model": _main_name,
+                            "kind": "warn",
+                            "content": (
+                                f"{_gp} read {_lone_n}x this turn one window per call. "
+                                "Served this time — next time batch ALL remaining windows in ONE "
+                                "ranges=[\"path:start:count\", ...] call."
+                            ),
                         }
-                    )
-                    return " ".join(
-                        [
-                            f"<path>{_gp}</path>",
-                            f"(batch gate: {_gp} was already read {_lone_n}x this turn,",
-                            "one window per call. Each separate read call costs a full",
-                            "round-trip. Collect EVERY window you still need and re-issue",
-                            "ONE read call with ranges=[\"path:start:count\", ...] listing",
-                            "2+ windows (add a tiny second window if you need only one) —",
-                            "single-window repeats of this file stay stubbed this turn.)",
-                        ]
                     )
                 _READ_LONE_CALLS_BY_CHAT.setdefault(_cid, {})[_gt] = _lone_n + 1
         # Read every target concurrently — same asyncio.gather pattern used for
@@ -9687,9 +9831,11 @@ When you need to read several files, read multiple independent files in parallel
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         permission_gates[pid] = fut
-        # پوشه‌ی نرمال‌شده‌ی درخواست (نزدیک‌ترین والد موجود) از سمت بک‌اند
-        # محاسبه و ارسال می‌شود — فرانت‌اند به فایل‌سیستم دسترسی ندارد و
-        # «همیشه اجازه» باید دقیقاً همین پوشه را ثبت کند.
+        if permission_gate_chat is not None:
+            permission_gate_chat[pid] = _chat_id
+        # The normalized requested folder (nearest existing parent) is computed
+        # on the backend and sent along. The frontend has no filesystem access,
+        # so "always allow" must record exactly this folder.
         emit(
             {
                 "kind": "permission",
@@ -9704,6 +9850,8 @@ When you need to read several files, read multiple independent files in parallel
             granted = await fut
         finally:
             permission_gates.pop(pid, None)
+            if permission_gate_chat is not None:
+                permission_gate_chat.pop(pid, None)
         if granted:
             try:
                 _low_perm_action = str(action or "").lower()
@@ -9721,9 +9869,10 @@ When you need to read several files, read multiple independent files in parallel
                     permit["install"] = True
             except Exception:  # noqa: BLE001, S110 - install flag never breaks permission
                 pass
-            # مجوز per-folder: به‌جای باز کردن کل فضای بیرون از ریشه، فقط
-            # پوشه‌ی درخواستی (نزدیک‌ترین والد موجودِ مسیر) به لیست پوشه‌های
-            # مجاز اضافه می‌شود. پوشه‌های دیگر همچنان مجوز جداگانه می‌خواهند.
+            # Per-folder grant: instead of opening the whole outside-root space,
+            # only the requested folder (nearest existing parent of the path)
+            # is added to the allowed list. Other folders still need separate
+            # approval.
             if permit is not None and path:
                 folder = _requested_folder(path)
                 if folder:
@@ -9764,6 +9913,8 @@ When you need to read several files, read multiple independent files in parallel
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         permission_gates[pid] = fut
+        if permission_gate_chat is not None:
+            permission_gate_chat[pid] = _chat_id
         emit(
             {
                 "kind": "permission",
@@ -9777,6 +9928,8 @@ When you need to read several files, read multiple independent files in parallel
             granted = await fut
         finally:
             permission_gates.pop(pid, None)
+            if permission_gate_chat is not None:
+                permission_gate_chat.pop(pid, None)
         if granted:
             try:
                 _low_action = str(action or "").lower()
@@ -9825,11 +9978,15 @@ When you need to read several files, read multiple independent files in parallel
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ask_gates[aid] = fut
+        if ask_gate_chat is not None:
+            ask_gate_chat[aid] = _chat_id
         emit({"kind": "ask", "id": aid, "question": question, "options": clean_options})
         try:
             answer = await fut
         finally:
             ask_gates.pop(aid, None)
+            if ask_gate_chat is not None:
+                ask_gate_chat.pop(aid, None)
         if not answer:
             emit(_error_result("ask_user", "no answer"))
             return "The user submitted an empty answer. Proceed with your best judgment, note the assumption you're making, and mention you can adjust it if wrong."
@@ -11061,6 +11218,10 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_definition", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
+        try:
+            _note_search_surfaced(_chat_id, [str(filePath or "")])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
             hits = await _lsp_call_with_wait(target, "definition", target, _line_no, _char_no)
@@ -11108,6 +11269,10 @@ When you need to read several files, read multiple independent files in parallel
         _loc_lines = [
             f"{h.get('path')}:{h.get('line')}:{h.get('character', 0)}" for h in hits
         ]
+        try:
+            _note_search_surfaced(_chat_id, [str(h.get("path") or "") for h in hits])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         # Inline bodies for few hits so the follow-up read is skipped.
         if len(hits) <= 3:
             try:
@@ -11186,6 +11351,10 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_references", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
+        try:
+            _note_search_surfaced(_chat_id, [str(filePath or "")])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
             hits = await _lsp_call_with_wait(target, "references", target, _line_no, _char_no)
@@ -11208,6 +11377,10 @@ When you need to read several files, read multiple independent files in parallel
         _by_file: dict[str, list[dict]] = {}
         for _h in hits:
             _by_file.setdefault(str(_h.get("path") or ""), []).append(_h)
+        try:
+            _note_search_surfaced(_chat_id, [str(h.get("path") or "") for h in hits])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         _shown_hits = hits[:_LSP_REF_CAP]
         _hidden_n = len(hits) - len(_shown_hits)
         emit(
@@ -11271,6 +11444,10 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_hover", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
+        try:
+            _note_search_surfaced(_chat_id, [str(filePath or "")])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         _line_no, _char_no = await _lsp_resolve_position(target, int(line or 1), int(character or 0), str(symbol or ""))
         try:
             text = await _lsp_call_with_wait(target, "hover", target, _line_no, _char_no)
@@ -11327,6 +11504,10 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_symbols", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
+        try:
+            _note_search_surfaced(_chat_id, [str(filePath or "")])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         try:
             syms = await _lsp_call_with_wait(target, "document_symbols", target)
         except Exception as exc:  # noqa: BLE001
@@ -11418,6 +11599,10 @@ When you need to read several files, read multiple independent files in parallel
             emit(_error_result("lsp_diagnostics", msg))
             return f"ERROR: {msg}"
         _lsp_lang = _lsp_announce_start(target)
+        try:
+            _note_search_surfaced(_chat_id, [str(filePath or "")])
+        except Exception:  # noqa: BLE001, S110 - surfacing never breaks LSP
+            pass
         try:
             diags = await _lsp_call_with_wait(target, "diagnostics", target)
         except Exception as exc:  # noqa: BLE001

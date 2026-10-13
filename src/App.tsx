@@ -481,15 +481,41 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      <div className="app-body">
+    <div
+      className="app"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100vh",
+        maxHeight: "100vh",
+        minHeight: 0,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        className="app-body"
+        style={{
+          flex: "1 1 0",
+          display: "flex",
+          minHeight: 0,
+          minWidth: 0,
+          overflow: "hidden",
+        }}
+      >
         <ErrorBoundary>
           <Sidebar />
           <div className={
             "editor-area" +
             (viewerFull && visibleViewerTabs.length > 0 && !chatFull ? " viewer-full" : "") +
             (chatFull ? " chat-full" : "")
-          }>
+          }
+            style={{
+              flex: "1 1 auto",
+              display: "flex",
+              minHeight: 0,
+              minWidth: 0,
+              overflow: "hidden",
+            }}>
             <section className="chat-group" aria-label="Chats">
               {/* Chat-scoped app bar — spans ONLY the chat column, never the
                   sidebar or the viewer panels. Keeps the `titlebar` class for
@@ -557,7 +583,25 @@ export default function App() {
                 )}
                 <section
                   className="viewer-group"
-                  style={viewerFull ? undefined : ({ flexBasis: splitW, width: splitW } as React.CSSProperties)}
+                  style={
+                    viewerFull
+                      ? {
+                          display: "flex",
+                          flexDirection: "column",
+                          minHeight: 0,
+                          minWidth: 0,
+                          overflow: "hidden",
+                        }
+                      : ({
+                          flexBasis: splitW,
+                          width: splitW,
+                          display: "flex",
+                          flexDirection: "column",
+                          minHeight: 0,
+                          minWidth: 0,
+                          overflow: "hidden",
+                        } as React.CSSProperties)
+                  }
                   aria-label="Viewers"
                 >
                   {/* Pane header: tab-list chevron + viewer tabs + the "+"
@@ -597,7 +641,18 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <div className="viewer-content" key={panelMode ? 'panel' : 'windows'}>
+                  <div
+                    className="viewer-content"
+                    key={panelMode ? 'panel' : 'windows'}
+                    style={{
+                      flex: "1 1 auto",
+                      display: "flex",
+                      flexDirection: "column",
+                      minHeight: 0,
+                      minWidth: 0,
+                      overflow: "hidden",
+                    }}
+                  >
                     <ViewerWindows />
                   </div>
                 </section>

@@ -14,6 +14,14 @@ def _clear_vision_cache():
     graph._VISION_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_skill_router(monkeypatch):
+    # Isolate from the shared skill store: when earlier tests seed skills,
+    # the skill router would consume mock.script[0] with an extra LLM call
+    # and shift mock.captured indices. Empty skills skip routing entirely.
+    monkeypatch.setattr(graph._agents, "_load_skills", lambda _r: [])
+
+
 def _has_image(body: dict) -> bool:
     for msg in body.get("messages", []):
         content = msg.get("content")

@@ -154,8 +154,8 @@ async def test_throttle_retry_twice_no_duplicate_work(run_events, monkeypatch):
     # The build agent writes first (request 0); two consecutive throttles on its
     # trailing text replies (request indices 1 and 2).
     mock.error_at = {
-(429, "Rate limit exceeded. Please try again later."),
-(429, "Rate limit exceeded. Please try again later."),
+        1: (429, "Rate limit exceeded. Please try again later."),
+        2: (429, "Rate limit exceeded. Please try again later."),
     }
 
     events = await run_events("create app.py with a foo function", mode="build")
@@ -334,10 +334,10 @@ async def test_retry_counter_resets_after_progress(run_events, monkeypatch):
     # reset) → this is the 3rd IDLE failure → the whole-turn wall (3) is hit
     # → giveup instead of another retry event.
     mock.error_at = {
-(429, "Rate limit exceeded."),
-(429, "Rate limit exceeded."),
-(429, "Rate limit exceeded."),
-(429, "Rate limit exceeded."),
+        0: (429, "Rate limit exceeded."),
+        1: (429, "Rate limit exceeded."),
+        3: (429, "Rate limit exceeded."),
+        4: (429, "Rate limit exceeded."),
     }
 
     events = await run_events("create a.py", mode="build")

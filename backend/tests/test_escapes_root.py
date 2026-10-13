@@ -105,11 +105,17 @@ def test_temp_dir_always_readable_without_permit(tmp_path) -> None:
     assert "probe-ok" in out.get("content", ""), f"temp log must be readable: {out}"
 
 
-def test_permit_folder_allows_file_tools(tmp_path) -> None:
+def test_permit_folder_allows_file_tools(tmp_path, monkeypatch) -> None:
     """مجوز per-folder در ابزارهای فایل: read/write/edit زیر پوشه‌ی مجاز
     کار می‌کند؛ مسیر بیرونیِ دیگر همچنان PathEscapeError می‌دهد."""
+    import tempfile
+
     from tools import PathEscapeError, read_file, write_file
 
+    # Isolate the OS temp-dir bypass so the sibling path below is truly
+    # outside both the root and the temp dir (tmp_path itself lives under
+    # the real temp dir, so without this every sibling would be allowed).
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "isolated-tmp"))
     root = str(tmp_path)
     allowed_dir = tmp_path.parent / "permitted-files"
     allowed_dir.mkdir(exist_ok=True)

@@ -1,10 +1,13 @@
-"""Tests that the full tool result (`items`) reaches the provider untruncated.
+"""Tests for tool results reconstructed from PAST turns' toolActivity.
 
-The frontend now sends the COMPLETE `toolActivity.items` (store.ts no longer
-trims them), and `history_to_langchain_messages` must reconstruct those into
-ToolMessages verbatim — so the provider receives the full context, not a
-500-char snippet or a 50-row cap. This is the fix for "context sent short /
-a message summarized incompletely".
+Two contracts live together:
+- Flattening: `items` must become readable text (never a python repr),
+  and reasonably-sized results reach the provider intact (the old bugs:
+  500-char snippet cap, 50-item cap).
+- Deterministic cap: oversized PAST-turn results are truncated with a
+  pointer (graph._HISTORY_TOOL_RESULT_MAX_CHARS). Without it one large
+  read/grep output is replayed IN FULL on every step of every later
+  turn -- the 100K+ token request bases measured in live traces.
 """
 
 from langchain_core.messages import ToolMessage
@@ -13,11 +16,9 @@ import graph
 
 
 def test_history_to_langchain_keeps_full_items():
-    # A snippet far longer than the old 500-char cap must survive intact.
-    long_snippet = "y" * 5000
-    many_items = [{"snippet": f"item-{i}-" + "z" * 100} for i in range(100)]
-    # One extra item carries a snippet far longer than the old 500-char cap.
-    many_items.append({"snippet": long_snippet})
+    # 100 TINY items stay well under the deterministic cap: the old 50-item
+    # cap is still gone, and nothing is char-truncated at this size.
+    many_items = [{"snippet": f"item-{i}-" + "z" * 10} for i in range(100)]
     history = [
         {"role": "user", "content": "hi"},
         {
@@ -38,17 +39,90 @@ def test_history_to_langchain_keeps_full_items():
     tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
     assert tool_msgs, "expected a ToolMessage rebuilt from toolActivity"
     content = tool_msgs[0].content
-    # All 100 items survive (the old cap was MAX_TOOL_ITEMS=50). Item 50's
-    # snippet was deliberately replaced with `long_snippet` (see above), so it
-    # no longer contains the "item-50-" prefix — skip that one here.
+    # All 100 items survive (the old cap was MAX_TOOL_ITEMS=50).
     for i in range(100):
-        if i == 50:
-            continue
         assert f"item-{i}-" in content, f"item {i} was dropped from the context"
-    # The full long snippet survives (no 500-char truncation).
-    assert long_snippet in content, "items were truncated before reaching the model"
+    assert "...(truncated history tool result" not in content
     # `items` wins over `summary` — the short summary must not leak in.
     assert "short summary" not in content
+
+
+def test_history_tool_result_capped_deterministically():
+    """An oversized PAST-turn result is capped with a re-run pointer.
+
+    The full output already lived in ITS turn; replaying it verbatim on
+    every later step is what inflated request bases to 100K+ tokens.
+    """
+    big = "y" * 20000
+    history = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "ran a tool",
+            "toolActivity": [
+                {
+                    "tool": "read",
+                    "args": {"path": "a.py"},
+                    "status": "done",
+                    "items": [{"snippet": big}],
+                }
+            ],
+        },
+    ]
+    msgs = graph.history_to_langchain_messages(history)
+    tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
+    content = tool_msgs[0].content
+    cap = graph._HISTORY_TOOL_RESULT_MAX_CHARS
+    assert len(content) < cap + 200, "oversized history result was not capped"
+    assert content.startswith("y" * 100), "cap must keep the head of the result"
+    assert "re-run the tool for the full output" in content
+    assert "20000 chars total" in content
+
+
+def test_history_tool_results_total_budget_stubs_oldest(monkeypatch):
+    """Beyond the TOTAL budget the OLDEST results become stubs while the
+    NEWEST stay verbatim — the request base stays bounded no matter how
+    many tools ran in earlier turns (dozens of 4K-capped results still
+    summed to 150K-token bases in live traces)."""
+    monkeypatch.setattr(graph, "_HISTORY_TOOL_RESULTS_BUDGET_CHARS", 5000)
+    big = "x" * 3000  # under the per-result cap; only the total budget binds
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "old turn",
+            "toolActivity": [
+                {
+                    "tool": "read",
+                    "args": {"path": "old.py"},
+                    "status": "done",
+                    "items": [{"snippet": big}],
+                }
+            ],
+        },
+        {"role": "user", "content": "again"},
+        {
+            "role": "assistant",
+            "content": "new turn",
+            "toolActivity": [
+                {
+                    "tool": "read",
+                    "args": {"path": "new.py"},
+                    "status": "done",
+                    "items": [{"snippet": big}],
+                }
+            ],
+        },
+    ]
+    msgs = graph.history_to_langchain_messages(history)
+    tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 2
+    # Newest result is allocated first from the budget: stays verbatim.
+    assert "x" * 100 in tool_msgs[1].content
+    assert "older tool result omitted" not in tool_msgs[1].content
+    # The oldest (beyond the budget) becomes a short stub with a pointer.
+    assert "older tool result omitted" in tool_msgs[0].content
+    assert len(tool_msgs[0].content) < 200
 
 
 def test_history_items_flattened_to_tool_message():

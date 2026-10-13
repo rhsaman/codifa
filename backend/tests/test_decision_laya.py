@@ -220,6 +220,18 @@ def test_laya_router_entry_helper():
     assert not laya_router.is_laya_entry("")
 
 
+def test_laya_unload_drops_cached_agent(monkeypatch):
+    import laya_router
+
+    monkeypatch.setattr(laya_router, "_resolve_model_dir", lambda prompt: "/laya")
+    monkeypatch.setattr(laya_router, "_get_agent", lambda d: object())
+    laya_router._agent = object()
+    laya_router._agent_dir = "/laya"
+    assert laya_router.unload() is True
+    assert laya_router._agent is None
+    assert laya_router.unload() is False
+
+
 def test_parse_skill_route_tolerant_prose_reply():
     # Main models often answer in prose instead of a JSON array.
     out = graph._parse_skill_route(

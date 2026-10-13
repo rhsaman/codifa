@@ -136,6 +136,64 @@ def test_whisper_idle_eviction(monkeypatch):
     assert server._whisper_model is not None, "recently used model must stay"
 
 
+def test_unload_whisper_manual_drops_cache(monkeypatch):
+    """Manual unload frees the cached model immediately without waiting."""
+    monkeypatch.setattr(server, "_whisper_model", object())
+    monkeypatch.setattr(server, "_whisper_evict_timer", None)
+    assert server.unload_whisper() is True
+    assert server._whisper_model is None
+    assert server.unload_whisper() is False
+
+
+def test_models_unload_frees_all_weights(monkeypatch):
+    """POST /models/unload drops embedding, whisper, TTS and Laya weights."""
+    import embeddings
+    import laya_router
+    import local_tts
+
+    monkeypatch.setattr(server, "_whisper_model", object())
+    monkeypatch.setattr(server, "_whisper_evict_timer", None)
+    monkeypatch.setattr(embeddings, "_CACHE", {"session": object()})
+    monkeypatch.setattr(embeddings, "_active_embeds", 0)
+    monkeypatch.setattr(embeddings, "_evict_timer", None)
+    monkeypatch.setattr(local_tts, "_POCKET_MODEL", object())
+    monkeypatch.setattr(local_tts, "_G2P_MODEL", None)
+    monkeypatch.setattr(local_tts, "_tts_evict_timer", None)
+    monkeypatch.setattr(laya_router, "_agent", object())
+    monkeypatch.setattr(laya_router, "_agent_dir", "/laya")
+    monkeypatch.setattr(laya_router, "_laya_evict_timer", None)
+    client = TestClient(server.app)
+    resp = client.post("/models/unload")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["freed"] == {"embedding": True, "whisper": True, "tts": True, "laya": True}
+    assert server._whisper_model is None
+
+
+def test_index_run_uses_limited_default_budget(monkeypatch, tmp_path):
+    """Empty budget must not wake the embedder for the whole repo."""
+    import indexer
+
+    captured: dict = {}
+
+    def fake_index(store, root, budget=0):
+        captured["budget"] = budget
+        return {"total": 1, "indexed": 1, "pruned": 0, "skipped": 0, "unchanged": 0}
+
+    monkeypatch.setattr(server, "_open_store", lambda root, path: object())
+    monkeypatch.setattr(indexer, "index_workspace", fake_index)
+    # Patch the already-imported reference inside server.index_run.
+    monkeypatch.setattr("indexer.index_workspace", fake_index)
+    client = TestClient(server.app)
+    resp = client.post("/index/run", json={"root": str(tmp_path), "budget": 0})
+    assert resp.status_code == 200
+    assert captured["budget"] == 120
+    resp = client.post("/index/run", json={"root": str(tmp_path), "budget": 9999})
+    assert resp.status_code == 200
+    assert captured["budget"] == 500
+
+
 def test_no_provider_field_uses_local():
     captured: dict = {}
     fake_segment = SimpleNamespace(text="سلام دنیا")
@@ -151,7 +209,7 @@ def test_no_provider_field_uses_local():
 
     assert resp.status_code == 200
     assert resp.json()["text"] == "سلام دنیا"
-    assert captured.get("beam_size") == 10
+    assert captured.get("beam_size") == 5
 
 
 def test_remote_filename_matches_audio_content():
@@ -215,6 +273,39 @@ def test_remote_wav_keeps_wav_filename():
     assert resp.status_code == 200
     name, _payload, _mime = captured["files"]["file"]
     assert name == "clip.wav"
+
+
+def test_models_preload_unknown_kind_rejected():
+    """Unknown preload kinds are a 400, never a silent no-op."""
+    client = TestClient(server.app)
+    resp = client.post("/models/preload", json={"kind": "nope"})
+    assert resp.status_code == 400
+
+
+def test_models_preload_whisper_triggers_load():
+    """Preload fires the Whisper load in the background (live-start path)."""
+    import asyncio as _aio
+
+    client = TestClient(server.app)
+    called = _aio.Event()
+
+    async def fake_get():
+        called.set()
+        return object()
+
+    with patch.object(server, "_get_whisper_model", fake_get):
+        resp = client.post("/models/preload", json={"kind": "whisper"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "kind": "whisper"}
+
+
+def test_models_preload_tts_accepted():
+    """TTS preload is accepted without loading weights in the request."""
+    client = TestClient(server.app)
+    with patch("local_tts.warmup_local_tts", return_value=True):
+        resp = client.post("/models/preload", json={"kind": "tts"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "kind": "tts"}
 
 
 if __name__ == "__main__":

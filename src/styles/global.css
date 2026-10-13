@@ -1427,6 +1427,52 @@ textarea {
   overflow: hidden;
 }
 
+/* Right-panel scroll chain: every flex ancestor must constrain height
+   (min-height: 0 + overflow hidden) so the scrollable body gets a bounded
+   box and overflow-y: auto can actually scroll. Without this the content
+   grows the page and the wheel does nothing. */
+.editor-area,
+.viewer-group,
+.viewer-content {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.editor-area {
+  display: flex;
+  flex: 1 1 auto;
+}
+
+.viewer-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+}
+
+.viewer-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+}
+
+.panel-pane,
+.right-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.right-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
+}
+
 .sidebar-panel.collapsed .sidebar-panel-head {
   margin-bottom: 0;
 }

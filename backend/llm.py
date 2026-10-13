@@ -71,7 +71,7 @@ _stable_tool_order = stable_tool_order
 
 # _strip_think_tags and _is_repeating are imported from _common (single source of truth).
 
-# _THINKING_LEVELS از _common import می‌شود (single source of truth).
+# _THINKING_LEVELS is imported from _common (single source of truth).
 
 
 class ReasoningChatOpenAI(ChatOpenAI):
@@ -2124,11 +2124,11 @@ def _batchable_nudge(tcs: list) -> str:
     if not hints:
         return ""
     return (
-        "\n\n💡 BATCHING REMINDER: these calls could have been ONE parallel step:\n"
+        "\n\n⚠️ BATCHING REMINDER: these calls MUST have been ONE call:\n"
         + "\n".join(f"- {h}" for h in hints)
-        + "\nThose calls already ran — do NOT repeat them. Fire the remaining "
-        "calls together in ONE step (parallel tool calls, or the merged shape "
-        "above when scopes match) to save round-trips."
+        + "\nThose calls already ran — do NOT repeat them. Your NEXT step MUST "
+        "batch ALL remaining searches into ONE call (or parallel calls in ONE "
+        "step when scopes differ). Single-arg calls waste round-trips."
     )
 
 
@@ -2243,14 +2243,15 @@ class _BatchStreakTracker:
             else:
                 lines.append(f"- {_batch_example(name, calls)}")
         return (
-            "\n\n💡 BATCHING REMINDER: you have called {tool} one-at-a-time "
-            "{n} times. Fire the remaining calls together in ONE parallel step:\n".format(
+            "\n\n⚠️ BATCHING REMINDER: you called {tool} one-at-a-time "
+            "{n} times — each single call wastes a full LLM round-trip. "
+            "STOP issuing single calls. Your NEXT step MUST batch:\n".format(
                 tool=" + ".join(name for name, _, _ in fired),
                 n=max(n for _, _, n in fired),
             )
             + "\n".join(lines)
-            + "\nThe example is built from calls that ALREADY ran — do NOT "
-            "re-issue them. Use parallel calls for your NEXT searches."
+            + "\nThe calls above ALREADY ran — do NOT re-issue them. "
+            "Merge ALL remaining searches into ONE step using the shapes above."
         )
 
 
@@ -2608,7 +2609,13 @@ async def langchain_tool_loop(
     # tokens and force it to report findings instead.
     _last_call_sig = None
     _same_call_streak = 0
+    _last_exact_sig = None
+    _same_exact_streak = 0
+    # Exact repeats (same name + same args) hard-stop at 3; paging one file
+    # window-per-step shares the normalized signature but differs in exact
+    # args, so a short survey survives with only a revisit nudge.
     _DOOM_LOOP_LIMIT = 3
+    _DOOM_LOOP_PAGING_LIMIT = 5
     # Cross-step batching tracker: catches the model firing ONE batchable
     # call per step (the common case when parallel_tool_calls is not sent)
     # and reminds it to batch after a few consecutive same-scope steps.
@@ -2806,12 +2813,22 @@ async def langchain_tool_loop(
             _normalized_call_sig(tc.get("name") or "", tc.get("args") or {})
             for tc in tcs
         )
+        _exact_sig = "|".join(
+            f"{tc.get('name') or ''}:{json.dumps(tc.get('args') or {}, sort_keys=True, ensure_ascii=False)}"
+            for tc in tcs
+        )
         if _step_sig == _last_call_sig:
             _same_call_streak += 1
         else:
             _same_call_streak = 1
             _last_call_sig = _step_sig
-        if _same_call_streak >= _DOOM_LOOP_LIMIT:
+        if _exact_sig == _last_exact_sig:
+            _same_exact_streak += 1
+        else:
+            _same_exact_streak = 1
+            _last_exact_sig = _exact_sig
+        _doom_hit = _same_exact_streak >= _DOOM_LOOP_LIMIT or _same_call_streak >= _DOOM_LOOP_PAGING_LIMIT
+        if _doom_hit:
             # Hard stop: the model is stuck. Inject as HumanMessage (not
             # SystemMessage) so it lands mid-list without violating chat
             # templates that require SystemMessage only at position 0
@@ -2826,10 +2843,12 @@ async def langchain_tool_loop(
                 )
             )
             break
-        if _same_call_streak >= 2:
+        if _same_exact_streak >= 2:
             # Second consecutive identical step: cheap transient nudge (next
             # request only) + repeat short-circuit — point the model back at
             # the transcript instead of re-executing the identical calls.
+            # Only exact repeats short-circuit here so paging one file
+            # window-per-step still executes and reaches the revisit nudge.
             _transient.clear()
             _transient.append(
                 HumanMessage(

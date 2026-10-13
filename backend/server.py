@@ -162,9 +162,33 @@ def _log_memory_snapshot(chat_id: str) -> None:
 # /permission/respond endpoint and awaited by the agent's request_permission /
 # confirm_action tools.
 PERMISSION_GATES: dict[str, asyncio.Future] = {}
+# Gate id -> chat_id so the silence-cap pause is per-chat. Without this, a
+# permission pending in chat A would suspend the stall timeout for chat B too,
+# leaving B on "waiting for model" forever while A waits for the user.
+PERMISSION_GATE_CHAT: dict[str, str] = {}
 # Pending multiple-choice / open questions the agent asked the user mid-task.
 # Resolved by /ask/respond and awaited by the agent's ask_user tool.
 ASK_GATES: dict[str, asyncio.Future] = {}
+# Gate id -> chat_id, same per-chat isolation as above.
+ASK_GATE_CHAT: dict[str, str] = {}
+
+
+def _is_paused_for(chat_id: str) -> bool:
+    """True when the given chat waits on a permission/ask gate.
+
+    Previously the keepalive silence cap checked the global gate dicts, so any
+    pending gate in any chat paused the timeout for every chat.
+    """
+    cid = (chat_id or "").strip()
+    if not cid:
+        return bool(PERMISSION_GATES or ASK_GATES)
+    for gid, fut in PERMISSION_GATES.items():
+        if not fut.done() and PERMISSION_GATE_CHAT.get(gid, cid) == cid:
+            return True
+    for gid, fut in ASK_GATES.items():
+        if not fut.done() and ASK_GATE_CHAT.get(gid, cid) == cid:
+            return True
+    return False
 # Cap (seconds) on CONTINUOUS model silence while the SSE socket stays alive
 # via keepalives. Past it, _with_keepalive raises _ModelSilenceTimeout so the
 # stream is torn down and the frontend auto-resumes from its checkpoint
@@ -1082,6 +1106,7 @@ class StateRequest(BaseModel):
 async def permission_respond(req: PermissionResponse) -> dict:
     """Resolve a pending outside-workspace permission / confirm_action request from the agent."""
     fut = PERMISSION_GATES.pop(req.id, None)
+    PERMISSION_GATE_CHAT.pop(req.id, None)
     if fut is None or fut.done():
         raise HTTPException(status_code=404, detail="permission request not found or already resolved")
     fut.set_result(req.allowed)
@@ -1092,6 +1117,7 @@ async def permission_respond(req: PermissionResponse) -> dict:
 async def ask_respond(req: AskResponse) -> dict:
     """Resolve a pending ask_user question (multiple-choice or free-text) from the agent."""
     fut = ASK_GATES.pop(req.id, None)
+    ASK_GATE_CHAT.pop(req.id, None)
     if fut is None or fut.done():
         raise HTTPException(status_code=404, detail="question not found or already answered")
     fut.set_result(req.answer)
@@ -2019,6 +2045,79 @@ async def models_embedding_status() -> dict:
     return embed_status()
 
 
+@app.post("/models/unload")
+async def models_unload() -> dict:
+    """Drop cached local-model weights immediately, freeing idle RAM.
+
+    Unloads the embedding ONNX session (~1.1 GB), the Whisper model
+    (1.5-3 GB), the local TTS weights and the Laya decision weights.
+    Safe anytime; next use reloads lazily. Used by the manual free-memory
+    action in Settings.
+    """
+    freed: dict[str, bool] = {}
+    try:
+        from embeddings import unload as _unload_embed
+
+        freed["embedding"] = bool(_unload_embed())
+    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
+        freed["embedding"] = False
+    try:
+        freed["whisper"] = bool(unload_whisper())
+    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
+        freed["whisper"] = False
+    try:
+        import local_tts as _tts
+
+        _unload_tts = getattr(_tts, "unload", None)
+        freed["tts"] = bool(_unload_tts()) if callable(_unload_tts) else False
+    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
+        freed["tts"] = False
+    try:
+        import laya_router as _laya
+
+        _unload_laya = getattr(_laya, "unload", None)
+        freed["laya"] = bool(_unload_laya()) if callable(_unload_laya) else False
+    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
+        freed["laya"] = False
+    return {"ok": True, "freed": freed}
+
+
+class ModelPreloadRequest(BaseModel):
+    kind: str = ""
+
+
+@app.post("/models/preload")
+async def models_preload(req: ModelPreloadRequest) -> dict:
+    """Warm a local model in the background without blocking the caller.
+
+    Called fire-and-forget when live voice starts, so Whisper/G2P/pocket
+    weights load in parallel with the user speaking instead of inside the
+    first transcription/synthesis timeout. Never pins RAM at boot: it only
+    runs on explicit live/dictate start, and the idle-eviction timers still
+    free the weights after the idle window.
+    """
+    kind = (req.kind or "").strip().lower()
+    if kind in ("whisper", "stt"):
+        async def _warm_stt() -> None:
+            try:
+                await _get_whisper_model()
+            except Exception:
+                logger.debug("whisper preload failed", exc_info=True)
+        _spawn_tracked(_warm_stt(), "whisper-preload")
+        return {"ok": True, "kind": kind}
+    if kind in ("piper", "tts", "pocket", "local-tts"):
+        async def _warm_tts() -> None:
+            try:
+                import local_tts as _warm_mod
+
+                await asyncio.to_thread(_warm_mod.warmup_local_tts)
+            except Exception:
+                logger.debug("local TTS preload failed", exc_info=True)
+        _spawn_tracked(_warm_tts(), "local-tts-preload")
+        return {"ok": True, "kind": kind}
+    raise HTTPException(status_code=400, detail=f"unknown preload kind: {req.kind!r}")
+
+
 @app.post("/models/remove")
 async def models_remove(req: ModelRemoveRequest) -> dict:
     kind = (req.kind or "").strip().lower()
@@ -2251,7 +2350,7 @@ async def mcp_delete(req: McpDeleteRequest) -> dict:
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
 try:
-    _WHISPER_IDLE_EVICT_S = float(os.environ.get("WHISPER_IDLE_EVICT_S") or 5 * 60)
+    _WHISPER_IDLE_EVICT_S = float(os.environ.get("WHISPER_IDLE_EVICT_S") or 60)
 except (TypeError, ValueError):
     _WHISPER_IDLE_EVICT_S = float(5 * 60)
 _whisper_last_used = 0.0
@@ -2289,6 +2388,28 @@ def _evict_whisper_if_idle() -> None:
     import gc
 
     gc.collect()
+
+
+def unload_whisper() -> bool:
+    """Drop the cached Whisper model immediately, freeing 1.5-3 GB RAM.
+
+    Returns True when a loaded model was dropped. Safe anytime; the next
+    transcription reloads lazily. Used by the manual free-memory endpoint.
+    """
+    global _whisper_model, _whisper_evict_timer
+    had_model = _whisper_model is not None
+    _whisper_model = None
+    if _whisper_evict_timer is not None:
+        try:
+            _whisper_evict_timer.cancel()
+        except Exception:  # noqa: BLE001, S110 -- timer cancel never fails
+            pass
+        _whisper_evict_timer = None
+    if had_model:
+        import gc
+
+        gc.collect()
+    return had_model
 
 
 async def _get_whisper_model():
@@ -2395,7 +2516,7 @@ async def transcribe(request: Request) -> dict:
             _rms = float(_np_energy.sqrt(_np_energy.mean(_np_energy.square(pcm), dtype=_np_energy.float64)))
         except Exception:  # noqa: BLE001 — energy gate is best-effort
             _rms = 1.0
-        if _rms < 0.008:
+        if _rms < 0.01:
             return {"text": ""}
         # Balanced Silero VAD gate: threshold 0.5 keeps quiet word edges
         # (a stricter gate chopped syllables into wrong words), while
@@ -2416,12 +2537,12 @@ async def transcribe(request: Request) -> dict:
         fa_prompt = "رونویسی فارسی با نشانه‌گذاری صحیح:"
         segments, _info = model.transcribe(
             pcm,
-            beam_size=10,
+            beam_size=5,
             language=lang,
             vad_filter=True,
             vad_parameters=vad_parameters,
             initial_prompt=fa_prompt if lang == "fa" else None,
-            temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+            temperature=(0.0, 0.2, 0.4),
             condition_on_previous_text=False,
             # Below the 0.6 default so room noise stops becoming ghost
             # text, but not so low that quiet real words are skipped
@@ -3300,6 +3421,25 @@ async def chat_compact(req: CompactRequest, request: Request):
 # call costs almost nothing and never touches the main turn's context.
 TITLE_TIMEOUT = 25  # seconds — outer budget for the whole call
 TITLE_CLIENT_TIMEOUT = 20  # seconds — model client ceiling (below the budget)
+# System prompt for the title call. The raw first message is wrapped as data
+# ("Message: ... / Title:") so the model names the chat instead of answering
+# it — bare user text made some models reply to the question ("Sorry, ...").
+TITLE_SYSTEM = (
+    "You name chats. The text below is the FIRST message of a new chat. "
+    "Do NOT answer it, do NOT explain, do NOT apologize. "
+    "Reply with ONLY a very short noun-phrase title of at most 4 words, "
+    "plain text, no quotes."
+)
+
+
+# Reply openers proving the model answered the message instead of naming the
+# chat ("Sorry, ...", "متأسفانه ..."). Such replies are rejected so the next
+# candidate or the heuristic fallback is used instead.
+_APOLOGY_PREFIXES = (
+    "sorry", "i'm sorry", "i am sorry", "i can't", "i cannot",
+    "as an ai", "unfortunately", "متاسفانه", "متأسفانه",
+    "ببخشید", "شرمنده",
+)
 
 
 def _clean_title(text: str) -> str | None:
@@ -3311,6 +3451,8 @@ def _clean_title(text: str) -> str | None:
     if first.lower().startswith("title:"):
         first = first[6:].strip().strip("\"'").strip()
         first = re.sub(r"\s+", " ", first)
+    if first.lower().startswith(_APOLOGY_PREFIXES):
+        return None
     words = [w for w in first.split(" ") if w]
     if len(words) > 4:
         words = words[:4]
@@ -3429,8 +3571,8 @@ async def chat_title(req: TitleRequest) -> dict:
             out, title_usage = await asyncio.wait_for(
                 llm_complete(
                     mo,
-                    system="You name chats. Reply with only a very short title of at most 4 words, plain text.",
-                    user=text[:500],
+                    system=TITLE_SYSTEM,
+                    user=f"Message:\n{text[:500]}\nTitle:",
                     # Thread the chat id so llm_generate's auto-trace records
                     # this call in the chat's trace panel like any other call.
                     chat_id=(req.chat_id or "").strip(),
@@ -3456,6 +3598,16 @@ async def chat_title(req: TitleRequest) -> dict:
         # usage flows to the sidebar's per-model totals (provider/model only,
         # like the compact path) — null when the provider reported none.
         return {"title": cleaned, "usage": title_usage}
+    # All model candidates failed or replied empty (flaky free-tier routes do
+    # this under load): fall back to the first words of the user's own message
+    # so the chat still gets a short title instead of keeping the long auto
+    # slice. Zero tokens, always available.
+    heuristic = _clean_title(text[:500])
+    if heuristic:
+        logging.getLogger("codifa.title").warning(
+            "chat title: heuristic fallback chat=%s %r", _cid, heuristic,
+        )
+        return {"title": heuristic, "usage": None}
     return {"title": None, "usage": None}
 
 
@@ -3601,7 +3753,7 @@ async def _stream_drive(agent_gen, chat_id: str, model: str, base_url: str):
     ka_gen = _with_keepalive(
         agent_gen,
         max_silence=MODEL_SILENCE_CAP_S,
-        is_paused=lambda: bool(PERMISSION_GATES or ASK_GATES),
+        is_paused=lambda: _is_paused_for(chat_id),
     )
     try:
         async for event in ka_gen:
@@ -3803,6 +3955,8 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             cap=req.cap,
             permission_gates=PERMISSION_GATES,
             ask_gates=ASK_GATES,
+            permission_gate_chat=PERMISSION_GATE_CHAT,
+            ask_gate_chat=ASK_GATE_CHAT,
             allow_outside=req.allow_outside,
             allow_outside_folders=req.allow_outside_folders,
             allow_computer=req.allow_computer,
@@ -3828,7 +3982,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             ):
                 yield chunk
         finally:
-            # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند
+            # Send the terminal done event so the frontend closes the stream.
             # Clear any unconsumed steers for this chat so they don't leak into
             # a future run of the same chat (the frontend re-sends them as the
             # next turn via its own queue). Report them so the frontend can keep
@@ -4052,7 +4206,7 @@ class IndexRunRequest(BaseModel):
     root: str = ""
     vector_db_path: str = ""
     vector_config: dict | None = None
-    budget: int = 0  # 0 = unlimited (index everything this run)
+    budget: int = 0  # 0 = default limited budget (avoid waking embedder on open)
 
 
 class IndexRunResponse(BaseModel):
@@ -4141,11 +4295,24 @@ async def index_run(req: IndexRunRequest) -> IndexRunResponse:
     from indexer import index_workspace
 
     store = _open_store(req.root, req.vector_db_path)
+    # Cap the per-run embed budget so opening a workspace never wakes the
+    # ~1.1 GB embedder for the whole repo; manual runs can still pass an
+    # explicit budget up to the max.
+    _default_budget = 120
+    _max_budget = 500
+    try:
+        raw_budget = int(req.budget or 0)
+    except (TypeError, ValueError):
+        raw_budget = 0
+    if raw_budget <= 0:
+        budget = _default_budget
+    else:
+        budget = min(raw_budget, _max_budget)
     try:
         result = index_workspace(
             store,
             req.root,
-            budget=req.budget or 0,
+            budget=budget,
         )
         return IndexRunResponse(ok=True, **result)
     except Exception as exc:

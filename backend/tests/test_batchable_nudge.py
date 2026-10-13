@@ -595,19 +595,18 @@ class _CoveredReadLoopModel:
 
 
 def test_loop_serves_repeated_reads_without_stop():
-    """Repeated reads of the SAME file (window after window) are the paging
-    loop the normalized signature must catch: the first read executes, the
-    second is short-circuited with a [repeat] pointer back to the transcript,
-    and the third breaks the loop with the steering message. No coverage
-    stop order is ever injected."""
-    model = _CoveredReadLoopModel(steps=8)
+    """Repeated reads of the SAME file (window after window) are served in
+    full — no [repeat] stub, no hard stop for a short survey: the loop runs
+    to the model's own step budget. No coverage stop order is ever
+    injected."""
+    model = _CoveredReadLoopModel(steps=4)
     reads: list[dict] = []
 
     async def _counting_read(**kwargs):
         reads.append(kwargs)
         return "file body"
 
-    asyncio.run(
+    result = asyncio.run(
         _tool_loop(
             model,
             system="",
@@ -619,12 +618,13 @@ def test_loop_serves_repeated_reads_without_stop():
         )
     )
     assert not model.saw_stop, "no coverage stop order must reach the model"
-    # The repeat short-circuit serves steps 2+ from the transcript, so the
-    # tool only really executes ONCE; the loop breaks at the 3rd identical
-    # step with the steering message (never a coverage stop order).
-    assert len(reads) == 1, (
-        f"repeat short-circuit failed: {len(reads)} reads ran (want 1)"
+    # Every window is served in full (4 steps stay under the paging guard),
+    # so the tool really executes once per step and the model finishes on
+    # its own budget with "done" (never a coverage stop order).
+    assert len(reads) == 4, (
+        f"paging reads must all execute: {len(reads)} reads ran (want 4)"
     )
+    assert result == "done", f"loop must run to the model budget, got {result!r}"
 
 
 class _TwoThenOneGrepModel:

@@ -572,6 +572,7 @@ async def test_read_partial_overlap_serves_only_new_lines_tracked2(tmp_path):
     root = str(tmp_path)
     cbs = tools.make_tool_callbacks(root, lambda event: None, chat_id="overlap-read-chat")
     read = cbs["read"]
+    tools._note_search_surfaced("overlap-read-chat", ["a.py"])
     first = await read(filePath="a.py", offset=1, limit=200)
     assert "1 | line1" in first
     assert "200 | line200" in first
@@ -582,42 +583,50 @@ async def test_read_partial_overlap_serves_only_new_lines_tracked2(tmp_path):
     assert "150 | line150" not in second
     assert "new lines 201-349" in second
     assert "overlap already served this turn" in second
-    # Fully-covered lone re-read (3rd lone call this turn) hits the batch
-    # gate first — still no content re-sent, plus the batching instruction.
+    # Fully-covered lone re-read (3rd lone call this turn): delta serves an
+    # unchanged stub (no bytes re-sent) and a batching warn is emitted —
+    # non-blocking, so no retry round-trip is forced.
     third = await read(filePath="a.py", offset=10, limit=20)
-    assert "batch gate" in third
+    assert "unchanged" in third
     assert "10 | line10" not in third
 
 
 @pytest.mark.asyncio
 async def test_read_batch_gate_blocks_third_single_window(tmp_path):
-    """3rd single-window read of a same-turn file returns a batch-gate stub.
+    """3rd+ single-window read of a same-turn file is SERVED + warn.
 
     The user's trace showed the model paging one window per round-trip.
-    The gate forces batching: only batch calls (filePaths/ranges/symbols)
-    may keep reading the file; a lone repeat read is stubbed with the
-    batching instruction."""
+    Blocking the 3rd read with a stub forced a retry round-trip — worse
+    than serving. So the gate is non-blocking: content is served and a
+    batching warn nudges the model to batch NEXT time."""
     (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 1001)))
     root = str(tmp_path)
-    cbs = tools.make_tool_callbacks(root, lambda event: None, chat_id="batch-gate-chat")
+    captured: list[dict] = []
+    cbs = tools.make_tool_callbacks(root, captured.append, chat_id="batch-gate-chat")
     read = cbs["read"]
+    tools._note_search_surfaced("batch-gate-chat", ["a.py"])
     first = await read(filePath="a.py", offset=1, limit=100)
     assert "1 | line1" in first
-    assert "batch gate" not in first
     second = await read(filePath="a.py", offset=400, limit=100)
-    assert "batch gate" not in second
     assert "400 | line400" in second
-    # Third single-window read: gated, demands batching.
+    # Third single-window read of a NEW window: served + batching warn.
     third = await read(filePath="a.py", offset=800, limit=50)
-    assert "batch gate" in third
-    assert "800 | line800" not in third
-    # A lone single-range re-issue stays gated (still one window per call).
+    assert "800 | line800" in third
+    assert any("batch ALL remaining windows" in str(e.get("content", "")) for e in captured if e.get("kind") == "warn")
+    # A lone single-range re-issue of the SAME window hits the delta path:
+    # unchanged stub, no bytes re-sent.
     lone = await read(filePath="a.py", ranges=["a.py:800:50"])
-    assert "batch gate" in lone
     assert "800 | line800" not in lone
-    # A real batch (2+ windows in ONE call) passes the gate and serves.
-    fourth = await read(filePath="a.py", ranges=["a.py:800:50", "a.py:1:5"])
-    assert "800 | line800" in fourth
+    # A lone read of another NEW window still serves (non-blocking) + warn.
+    fifth = await read(filePath="a.py", offset=900, limit=20)
+    assert "900 | line900" in fifth
+    # A real batch (2+ windows in ONE call) serves without any gate warn —
+    # use a fresh file so a.py delta-dedup/prefetch can't interfere.
+    (tmp_path / "b.py").write_text("".join(f"bline{i}\n" for i in range(1, 201)))
+    tools._note_search_surfaced("batch-gate-chat", ["b.py"])
+    fourth = await read(filePath="b.py", ranges=["b.py:10:10", "b.py:50:10"])
+    assert "bline10" in fourth
+    assert "bline50" in fourth
 
 
 @pytest.mark.asyncio
@@ -1123,6 +1132,7 @@ async def test_read_partial_overlap_serves_only_new_lines(tmp_path):
     """Shifted re-read of one file serves only new lines, not the overlap."""
     (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
     read, _ = _make_tracked_read(str(tmp_path), "re-read-partial")
+    tools._note_search_surfaced("re-read-partial", ["a.py"])
     r1 = await read(filePath="a.py", offset=1, limit=200)
     assert "1 | line1" in r1
     assert "200 | line200" in r1
@@ -1138,6 +1148,7 @@ async def test_read_shifted_window_bridges_small_gap(tmp_path):
     """A shifted re-read with a small unserved sliver fetches the sliver too."""
     (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
     read, _ = _make_tracked_read(str(tmp_path), "re-read-bridge")
+    tools._note_search_surfaced("re-read-bridge", ["a.py"])
     await read(filePath="a.py", offset=1, limit=200)
     r2 = await read(filePath="a.py", offset=250, limit=150)
     assert "201 | line201" in r2
@@ -1151,8 +1162,34 @@ async def test_read_batch_bridges_nearby_windows(tmp_path):
     """Nearby ranges= windows of one file in ONE call merge into one fetch."""
     (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 501)))
     read, _ = _make_tracked_read(str(tmp_path), "re-read-batch")
+    tools._note_search_surfaced("re-read-batch", ["a.py"])
     out = await read(filePath="a.py", ranges=["a.py:1:50", "a.py:100:50"])
     assert "1 | line1" in out
     assert "75 | line75" in out
     assert "149 | line149" in out
     assert "Batch complete" in out
+
+
+@pytest.mark.asyncio
+async def test_read_blind_lone_read_gated_search_first(tmp_path):
+    """A lone read with no prior search is SERVED once + warn (non-blocking).
+
+    Blocking a blind read forces a retry round-trip — worse than serving
+    once. The warn nudges search-first for the NEXT read."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 101)))
+    read, captured = _make_tracked_read(str(tmp_path), "blind-gate-chat")
+    out = await read(filePath="a.py", offset=1, limit=50)
+    assert "1 | line1" in out
+    assert any("Blind read served once" in str(e.get("content", "")) for e in captured if e.get("kind") == "warn")
+
+
+@pytest.mark.asyncio
+async def test_read_serves_after_grep_surfaces(tmp_path):
+    """End-to-end: a real grep surfaces the file, then the lone read serves."""
+    (tmp_path / "a.py").write_text("".join(f"line{i}\n" for i in range(1, 101)))
+    cbs = tools.make_tool_callbacks(str(tmp_path), lambda event: None, chat_id="surf-chat")
+    found = await cbs["grep"](pattern="line42", include="*.py")
+    assert "a.py" in found
+    out = await cbs["read"](filePath="a.py", offset=1, limit=50)
+    assert "SEARCH FIRST" not in out
+    assert "1 | line1" in out

@@ -87,6 +87,51 @@ async def _bounded_to_thread(
         )
         raise
 
+
+# Time-to-first-chunk limit for one model step. A request that was sent but
+# produced NOT A SINGLE chunk (reasoning or text) within this window is a hung
+# request (dead gateway/route, upstream silently dropped), not a thinking model:
+# thinking models stream reasoning chunks early. It is retried by the standard
+# 10 x 30s retry loop on a fresh HTTP pool. Once the first chunk arrives there is
+# NO limit between chunks, so a model may think as long as it needs. 0 disables.
+try:
+    _FIRST_CHUNK_TIMEOUT_S = float(os.environ.get("CODIFA_FIRST_CHUNK_TIMEOUT", "300"))
+except ValueError:
+    _FIRST_CHUNK_TIMEOUT_S = 300.0
+
+
+class _FirstChunkTimeout(asyncio.TimeoutError):
+    """No chunk at all arrived for a model step within _FIRST_CHUNK_TIMEOUT_S."""
+
+
+async def _stream_with_first_chunk_timeout(stream, timeout_s: float):
+    """Yield ``stream``'s chunks; bound ONLY the wait for the first one."""
+    it = stream.__aiter__()
+    first = True
+    try:
+        while True:
+            try:
+                if first and timeout_s > 0:
+                    chunk = await asyncio.wait_for(it.__anext__(), timeout_s)
+                else:
+                    chunk = await it.__anext__()
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as exc:
+                if first and timeout_s > 0:
+                    raise _FirstChunkTimeout(
+                        f"no response from the model for {int(timeout_s)}s "
+                        "(not a single chunk arrived)"
+                    ) from exc
+                raise
+            first = False
+            yield chunk
+    finally:
+        _aclose = getattr(it, "aclose", None)
+        if _aclose is not None:
+            with contextlib.suppress(Exception):
+                await _aclose()
+
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -194,6 +239,86 @@ _SEQUENTIAL_TOOLS = {
 _SEARCH_TOOLS = frozenset({"grep", "glob"})
 _EDIT_TOOLS = frozenset({"edit_file", "write_file", "update_plan"})
 _SEARCH_REFUSAL_PREFIX = "SEARCH BUDGET EXCEEDED"
+
+# Build read-only streak guard (main agent loop only). A live trace showed 38
+# single-tool read/grep steps in one turn (21 in a row), each a full LLM request
+# re-sending 160-200k tokens, most of them answered by 'already read' stubs.
+# Advisory nudges are ignored by weaker models, so past this many consecutive
+# exploration-only steps (no edit/terminal/other action) a SINGLE-call
+# exploration step is refused. A step that batches 2+ exploration calls is
+# always allowed (that is the behavior we want) and re-arms part of the budget,
+# so the model is steered to batch instead of fighting the guard.
+# The prefix deliberately differs from _SEARCH_REFUSAL_PREFIX; it is replay-safe
+# because the refusal is only ever produced for calls that were NOT executed.
+_READONLY_EXPLORE_TOOLS = frozenset({
+    "read", "grep", "glob",
+    "lsp_definition", "lsp_references", "lsp_hover",
+    "lsp_symbols", "lsp_diagnostics",
+})
+_MAX_READONLY_STEPS_WITHOUT_ACTION = 2
+_READONLY_BATCH_REARM = 2  # steps of budget a granted batch step gives back
+_READONLY_REFUSAL_PREFIX = "READ BUDGET EXCEEDED"
+
+
+def _is_readonly_refusal(content: Any) -> bool:
+    """True for a read-streak refusal, which must never be replayed as a result."""
+    return str(content or "").startswith(_READONLY_REFUSAL_PREFIX)
+
+
+def _is_batch_call(name: str, args: dict | None) -> bool:
+    """True if tool call has batched args (multiple patterns/paths/ranges/files)."""
+    if not isinstance(args, dict):
+        return False
+    for k in ("patterns", "filePaths", "paths", "includes", "symbols"):
+        val = args.get(k)
+        if isinstance(val, (list, tuple)) and len(val) >= 2:
+            return True
+    ranges = args.get("ranges")
+    if isinstance(ranges, (list, tuple)) and len(ranges) >= 2:
+        return True
+    if isinstance(ranges, dict) and len(ranges) >= 2:
+        return True
+    return False
+
+
+def _readonly_gate_text(
+    mode: str | None, streak: int, calls: list[Any]
+) -> str | None:
+    """Refusal text for an unbatched exploration step past the streak budget.
+
+    Only build mode, only steps made purely of exploration tools, and only a
+    step with a single unbatched call: a real batch (2+ calls or batched args)
+    is never refused.
+    """
+    if (mode or "") != "build":
+        return None
+    if streak < _MAX_READONLY_STEPS_WITHOUT_ACTION:
+        return None
+    if len(calls) >= 2:
+        return None
+    if not calls:
+        return None
+    first = calls[0]
+    if isinstance(first, dict):
+        call_name = (first.get("name") or "").lower()
+        call_args = first.get("args") or {}
+    else:
+        call_name = str(first or "").lower()
+        call_args = {}
+    if call_name not in _READONLY_EXPLORE_TOOLS:
+        return None
+    if _is_batch_call(call_name, call_args):
+        return None
+    return (
+        f"{_READONLY_REFUSAL_PREFIX}: {streak} read/search steps in a row without an "
+        "edit or test run; this single call was NOT executed. Everything you read "
+        "earlier this turn is still in the conversation above (re-reading it only "
+        "returns stubs). Now do ONE of: (1) edit_file/write_file with what you "
+        "hold, (2) run_terminal to test, (3) answer / say what is missing. If you "
+        "truly need more context, send ALL the reads you still need together in "
+        "ONE step (2+ calls: read(ranges=[...]/filePaths=[...]), grep(patterns=[...])) "
+        "- a batched step is always allowed."
+    )
 _SEARCH_HINT_SYMBOLS = 3
 # Header of an annotated grep hit: `path:line: in NAME (Lstart-end)`.
 _GREP_SYMBOL_HIT_RE = re.compile(
@@ -990,6 +1115,84 @@ class AgentState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 
+# Deterministic cap for tool results reconstructed from PAST turns'
+# toolActivity. History results are context, not working data: without a
+# cap, one large read/grep output is replayed IN FULL on every step of
+# every later turn (the 100K+ token request bases measured in live
+# traces). The truncation pointer tells the model it may re-run the tool
+# -- served cheaply by the read-delta / same-term grep-cache layers.
+_HISTORY_TOOL_RESULT_MAX_CHARS = 4000
+# Total char budget for ALL past-turn tool results combined, allocated
+# newest-first. The per-result cap above bounds ONE result; without a total
+# budget, dozens of 4K results still replay on every step (the 150K-token
+# request bases measured in live traces). Results beyond the budget become
+# short stubs with a re-run pointer -- served cheaply by the read-delta /
+# same-term grep-cache layers.
+_HISTORY_TOOL_RESULTS_BUDGET_CHARS = 24000
+
+
+def _flatten_history_tool_result(ta: dict) -> str:
+    """Flatten one toolActivity entry's result into readable text.
+
+    Prefers the full result (``items`` / ``results``) over the summary;
+    either may be a plain string or a list of dicts. Keeps the identifying
+    fields (path/line/title/url) so the model can act without re-running.
+    """
+    raw_items = ta.get("items")
+    if raw_items is None:
+        raw_items = ta.get("results")
+    if isinstance(raw_items, str):
+        result = raw_items
+    elif isinstance(raw_items, list) and raw_items:
+        parts = []
+        for _it in raw_items:
+            if isinstance(_it, dict):
+                _path = _it.get("path") or _it.get("file") or ""
+                _line_no = _it.get("line")
+                _title = _it.get("title") or ""
+                _url = _it.get("url") or ""
+                _body = (
+                    _it.get("snippet")
+                    or _it.get("content")
+                    or _it.get("text")
+                    or _it.get("result")
+                    or _it.get("output")
+                    or ""
+                )
+                if _path and _line_no is not None and _body:
+                    parts.append(f"{_path}:{_line_no}:{_body}")
+                elif _path and _body:
+                    parts.append(f"{_path}: {_body}")
+                elif _path and not _body:
+                    parts.append(str(_path))
+                elif _title and _url and _body:
+                    parts.append(f"{_title} ({_url}): {_body}")
+                elif _title and _body:
+                    parts.append(f"{_title}: {_body}")
+                elif _body:
+                    parts.append(str(_body))
+                else:
+                    parts.append(str(_it))
+            else:
+                parts.append(str(_it))
+        result = "\n".join(parts)
+    else:
+        result = ta.get("summary") or ""
+    # write_file/edit_file store the unified diff on the activity (not in
+    # items) — carry it so the next turn sees what changed without
+    # re-reading the file.
+    _diff = ta.get("diff")
+    if isinstance(_diff, str) and _diff.strip():
+        _diff_text = _diff.strip()
+        if len(_diff_text) > 8000:
+            _diff_text = _diff_text[:8000] + "\n...(diff truncated)"
+        if result:
+            result = f"{result}\nDiff:\n{_diff_text}"
+        else:
+            result = f"Diff:\n{_diff_text}"
+    return result
+
+
 def history_to_langchain_messages(
     history: list[dict], current_mode: str | None = None
 ) -> list[BaseMessage]:
@@ -1015,6 +1218,27 @@ def history_to_langchain_messages(
     # (مثلاً «1»). دو ToolMessage با یک tool_call_id خطای provider
     # «Duplicate function_call_output for call_id» را می‌سازد.
     used_ids: set[str] = set()
+    # Total-budget pre-pass (newest-first): decide which past-turn results
+    # stay verbatim; the rest become stubs below. Bounds the request base
+    # deterministically, independent of model behaviour. Cost is the
+    # per-result-capped size, so one huge recent result still renders its
+    # 4K head instead of being stubbed outright.
+    _flat_cache: dict[tuple[int, int], str] = {}
+    _keep_full: set[tuple[int, int]] = set()
+    _budget_left = _HISTORY_TOOL_RESULTS_BUDGET_CHARS
+    for _ti in range(len(history or []) - 1, -1, -1):
+        _turn0 = (history or [])[_ti]
+        if not (isinstance(_turn0, dict) and _turn0.get("role") == "assistant"):
+            continue
+        for _ai, _ta in enumerate(_turn0.get("toolActivity") or []):
+            if not isinstance(_ta, dict):
+                continue
+            _flat = _flatten_history_tool_result(_ta)
+            _flat_cache[(_ti, _ai)] = _flat
+            _cost = min(len(_flat), _HISTORY_TOOL_RESULT_MAX_CHARS)
+            if _cost <= _budget_left:
+                _keep_full.add((_ti, _ai))
+                _budget_left -= _cost
     # Progress attaches ONLY to the latest plan-carrying turn: every historic
     # turn re-injecting its own full checklist multiplied tokens per message.
     _latest_plan_idx = -1
@@ -1060,7 +1284,7 @@ def history_to_langchain_messages(
         if role == "assistant" and tool_activity:
             tool_calls: list[dict] = []
             tool_msgs: list[BaseMessage] = []
-            for ta in tool_activity:
+            for _ta_idx, ta in enumerate(tool_activity):
                 if not isinstance(ta, dict):
                     continue
                 base_id = str(ta.get("callId") or f"ta-{len(tool_calls)}")
@@ -1077,69 +1301,31 @@ def history_to_langchain_messages(
                         "id": tc_id,
                     }
                 )
-                # Prefer the full tool result (items, or the `results` alias the
-                # backend emits on tool_result events); fall back to the summary.
-                # Either may be a plain string (e.g. "MATCHES for 'foo'") OR a
-                # list of dicts — flatten either into readable text so the model
-                # sees the real result and does NOT re-execute the tool on
-                # reconnect (which would waste context).
-                raw_items = ta.get("items")
-                if raw_items is None:
-                    raw_items = ta.get("results")
-                if isinstance(raw_items, str):
-                    result = raw_items
-                elif isinstance(raw_items, list) and raw_items:
-                    parts = []
-                    for _it in raw_items:
-                        if isinstance(_it, dict):
-                            # Keep the identifying fields, not just the snippet
-                            # text, so the model can act without re-running:
-                            # grep -> file:line:text, glob -> path,
-                            # web_search -> title (url): snippet,
-                            # read/terminal/task -> path: content.
-                            _path = _it.get("path") or _it.get("file") or ""
-                            _line_no = _it.get("line")
-                            _title = _it.get("title") or ""
-                            _url = _it.get("url") or ""
-                            _body = (
-                                _it.get("snippet")
-                                or _it.get("content")
-                                or _it.get("text")
-                                or _it.get("result")
-                                or _it.get("output")
-                                or ""
-                            )
-                            if _path and _line_no is not None and _body:
-                                parts.append(f"{_path}:{_line_no}:{_body}")
-                            elif _path and _body:
-                                parts.append(f"{_path}: {_body}")
-                            elif _path and not _body:
-                                parts.append(str(_path))
-                            elif _title and _url and _body:
-                                parts.append(f"{_title} ({_url}): {_body}")
-                            elif _title and _body:
-                                parts.append(f"{_title}: {_body}")
-                            elif _body:
-                                parts.append(str(_body))
-                            else:
-                                parts.append(str(_it))
-                        else:
-                            parts.append(str(_it))
-                    result = "\n".join(parts)
-                else:
-                    result = ta.get("summary") or ""
-                # write_file/edit_file store the unified diff on the activity
-                # (not in items) — carry it so the next turn sees what changed
-                # without re-reading the file.
-                _diff = ta.get("diff")
-                if isinstance(_diff, str) and _diff.strip():
-                    _diff_text = _diff.strip()
-                    if len(_diff_text) > 8000:
-                        _diff_text = _diff_text[:8000] + "\n...(diff truncated)"
-                    if result:
-                        result = f"{result}\nDiff:\n{_diff_text}"
-                    else:
-                        result = f"Diff:\n{_diff_text}"
+                # Flattened once in the budget pre-pass; the cache always
+                # hits (same history, same indices) — the fallback only
+                # guards a future refactor diverging the two loops.
+                result = _flat_cache.get((_turn_idx, _ta_idx))
+                if result is None:
+                    result = _flatten_history_tool_result(ta)
+                if (_turn_idx, _ta_idx) not in _keep_full:
+                    # Beyond the total budget: a short stub with a re-run
+                    # pointer keeps the request base bounded no matter how
+                    # many tools ran in earlier turns.
+                    result = (
+                        "[older tool result omitted to save context "
+                        f"({len(result)} chars); re-run the tool for the "
+                        "full output]"
+                    )
+                elif len(result) > _HISTORY_TOOL_RESULT_MAX_CHARS:
+                    # Cap PAST-turn results deterministically (see the
+                    # constant above): the full output already lived in ITS
+                    # turn; later turns only need enough to know what was
+                    # done.
+                    result = (
+                        result[:_HISTORY_TOOL_RESULT_MAX_CHARS]
+                        + f"\n...(truncated history tool result, {len(result)}"
+                        " chars total; re-run the tool for the full output)"
+                    )
                 tool_msgs.append(ToolMessage(content=str(result), tool_call_id=tc_id))
             if tool_calls:
                 _ai_content = content
@@ -1192,13 +1378,15 @@ def history_to_langchain_messages(
 def filter_tools_for_mode(
     mode: str,
     tools: dict[str, Callable],
-    cap: dict | None,
-    allow_create: bool,
-    allow_outside: bool,
+    cap: dict | None = None,
+    allow_create: bool = True,
+    allow_outside: bool = False,
+    *extra: Any,
     prompt: str = "",
     root: str = "",
     allow_computer: bool = False,
     history: list | None = None,
+    **kwargs: Any,
 ) -> dict[str, Callable]:
     """Return the mode-appropriate subset of ``tools``.
 
@@ -1207,6 +1395,45 @@ def filter_tools_for_mode(
     plan-mode persistence (handled by the plan_build node, not a tool), ask-mode drops (read/memory/trivial-prompt schemas),
     ``allow_create`` gating of skill/MCP creation, and file-scope stripping.
     """
+    # Backward compatibility with the legacy 10-argument call form
+    # (mode, tools, cap, allowed, allow_create, allow_outside, prompt,
+    # root, allow_computer, history) still used by pinned tests: a set-like
+    # 4th argument is the legacy allowed-tools set, so shift the rest.
+    _tools_original = dict(tools)
+    if isinstance(allow_create, (set, frozenset, list, tuple)):
+        _legacy = [allow_create, allow_outside] + list(extra)
+        _legacy_allowed = set(_legacy[0] or ())
+        allow_create = _legacy[1] if len(_legacy) > 1 and isinstance(_legacy[1], bool) else True
+        allow_outside = _legacy[2] if len(_legacy) > 2 and isinstance(_legacy[2], bool) else False
+        # prompt/root/allow_computer/history are keyword-only, so an explicit
+        # keyword already bound above; only overwrite from the legacy
+        # positional tail when that position exists.
+        if len(_legacy) > 3 and isinstance(_legacy[3], str):
+            prompt = _legacy[3]
+        elif not isinstance(prompt, str):
+            prompt = ""
+        if len(_legacy) > 4 and isinstance(_legacy[4], str):
+            root = _legacy[4]
+        elif not isinstance(root, str):
+            root = ""
+        if len(_legacy) > 5 and isinstance(_legacy[5], bool):
+            allow_computer = _legacy[5]
+        if len(_legacy) > 6 and isinstance(_legacy[6], list):
+            history = _legacy[6]
+    else:
+        _legacy_allowed = set(kwargs.pop("allowed", kwargs.pop("allowed_tools", None)) or ())
+        # Safety net: a new-style caller passing prompt/root positionally
+        # lands in *extra (they are keyword-only); map them in order.
+        if extra:
+            _rest = list(extra)
+            if (not prompt or not isinstance(prompt, str)) and _rest and isinstance(_rest[0], str):
+                prompt = _rest.pop(0)
+            if (not root or not isinstance(root, str)) and _rest and isinstance(_rest[0], str):
+                root = _rest.pop(0)
+            if _rest and isinstance(_rest[0], bool):
+                allow_computer = _rest.pop(0)
+            if _rest and isinstance(_rest[0], list):
+                history = _rest.pop(0)
     cap = cap or {}
     _WEB = {"web_search", "fetch_url", "search_console"}
     has_cap = any(
@@ -1308,6 +1535,10 @@ def filter_tools_for_mode(
     # schema prefix every turn and force full-price reprocessing. Build in
     # particular must keep the same toolset across turns, so sort by name to
     # keep the bound schema prefix byte-identical (same set, deterministic order).
+    if _legacy_allowed:
+        for _name in _legacy_allowed:
+            if _name != "computer" and _name in _tools_original and _name not in tools:
+                tools[_name] = _tools_original[_name]
     tools = dict(sorted(tools.items(), key=lambda kv: kv[0]))
     # Record the PARENT's actual (mode-filtered) toolset so a sub-agent spawned
     # via `task` inherits exactly these tools — not the full registry. This is
@@ -1941,7 +2172,81 @@ def _parse_skill_route(raw: str, rows: list[dict], max_n: int) -> list[str] | No
     return out[:max_n]
 
 
+# Per-turn routing memo. A turn that reconnects or auto-retries mid-run rebuilds
+# the turn context and calls the router again with the SAME chat + prompt. The
+# embedding prefilter (wakes the ~1.1 GB e5 model) and the decision model must
+# run only at the START of a turn, so the first outcome (picks, [] or None) is
+# remembered and replayed for the same (chat, prompt, skill set). The lookup
+# happens BEFORE any embedding / model work.
+_SKILL_TURN_CACHE: dict[str, tuple[float, list[str] | None]] = {}
+_SKILL_TURN_CACHE_MAX = 128
+_SKILL_TURN_CACHE_TTL = 3 * 3600.0  # long turns (30+ min) with reconnects stay covered
+# Stop -> "continue" resume: the frontend sends a short message ("ادامه بده")
+# with an appended `[SYSTEM: a task was interrupted mid-way in this chat ...]`
+# note. That prompt differs from the original task's, so the per-prompt memo
+# above misses, yet the task (and its skills) are the same. Such a continuation
+# reuses the chat's last routed skills instead of waking the embedder and the
+# decision model again.
+_SKILL_CONTINUE_RE = re.compile(r"a task was interrupted mid-way in this chat", re.I)
+_SKILL_LAST_BY_CHAT: dict[str, tuple[float, list[str]]] = {}
+
+
+def _skill_turn_key(prompt: str, skills: list[dict], chat_id: str) -> str:
+    sig = "\n".join(
+        f"{s.get('name')}|{s.get('description')}|"
+        + ",".join(str(k) for k in (s.get("fa_keywords") or []))
+        for s in skills or []
+        if str(s.get("name") or "").strip()
+    )
+    raw = f"{chat_id}\x00{(prompt or '').strip()[:1500]}\x00{sig}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 async def _route_skills(
+    prompt: str,
+    skills: list[dict],
+    model: Any,
+    chat_id: str = "",
+    emit: Callable[[dict], None] | None = None,
+) -> list[str] | None:
+    """Route skills ONCE per turn: replay the first outcome on reconnect/retry.
+
+    Same chat + prompt + skill set within the TTL returns the remembered
+    result without touching the embedder or the decision model. Exceptions
+    (including cancellation) are never memoized.
+    """
+    key = ""
+    if chat_id:
+        try:
+            key = _skill_turn_key(prompt, skills, str(chat_id))
+        except Exception:  # noqa: BLE001 - memo is best-effort
+            key = ""
+    now = time.monotonic()
+    chat_key = str(chat_id or "")
+    is_continue = bool(chat_key) and bool(_SKILL_CONTINUE_RE.search(prompt or ""))
+    if key:
+        hit = _SKILL_TURN_CACHE.get(key)
+        if hit is not None and now - hit[0] < _SKILL_TURN_CACHE_TTL:
+            return None if hit[1] is None else list(hit[1])
+    if is_continue:
+        last = _SKILL_LAST_BY_CHAT.get(chat_key)
+        if last is not None and now - last[0] < _SKILL_TURN_CACHE_TTL:
+            return list(last[1])
+    result = await _route_skills_uncached(
+        prompt, skills, model, chat_id=chat_id, emit=emit
+    )
+    if key:
+        _SKILL_TURN_CACHE[key] = (now, None if result is None else list(result))
+        while len(_SKILL_TURN_CACHE) > _SKILL_TURN_CACHE_MAX:
+            _SKILL_TURN_CACHE.pop(next(iter(_SKILL_TURN_CACHE)))
+    if chat_key and result is not None:
+        _SKILL_LAST_BY_CHAT[chat_key] = (now, list(result))
+        while len(_SKILL_LAST_BY_CHAT) > _SKILL_TURN_CACHE_MAX:
+            _SKILL_LAST_BY_CHAT.pop(next(iter(_SKILL_LAST_BY_CHAT)))
+    return result
+
+
+async def _route_skills_uncached(
     prompt: str,
     skills: list[dict],
     model: Any,
@@ -1960,12 +2265,9 @@ async def _route_skills(
     """
     text = (prompt or "").strip()
     rows = [s for s in skills or [] if str(s.get("name") or "").strip()]
-    try:
-        from skill_prefilter import prefilter_skills as _prefilter_skills
-
-        rows = _prefilter_skills(text, rows)
-    except Exception as exc:  # noqa: BLE001 — prefilter is best-effort
-        logger.debug("[skills] prefilter failed: %s", exc)
+    # NOTE: the embedding prefilter runs only AFTER the cheap early-outs below
+    # (no model, paused router, skill-meta request) so those paths never wake
+    # the ~1.1 GB embedder.
     try:
         max_n = int(getattr(_agents, "_SKILL_AUTO_MAX", 2))
     except Exception:  # noqa: BLE001
@@ -1977,6 +2279,14 @@ async def _route_skills(
             return []  # a request about making/editing skills loads none
     now = time.monotonic()
     if _skill_route_state["paused_until"] > now:
+        return None
+    try:
+        from skill_prefilter import prefilter_skills as _prefilter_skills
+
+        rows = _prefilter_skills(text, rows)
+    except Exception as exc:  # noqa: BLE001 — prefilter is best-effort
+        logger.debug("[skills] prefilter failed: %s", exc)
+    if not rows:
         return None
     lines = []
     for s in rows:
@@ -2692,6 +3002,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         permit=_shared_permit(state, allow_outside),
         chat_id=chat_id,
         history=state.get("history") or [],
+        permission_gate_chat=state.get("permission_gate_chat"),
+        ask_gate_chat=state.get("ask_gate_chat"),
     )
 
     filtered = filter_tools_for_mode(
@@ -4623,13 +4935,9 @@ async def _run_mode_turn(
     # is undesirable. Transient throttles are retried below without any such
     # injection.
 
-    # No user-configurable step budget: the old 12-50 auto cap cut real
-    # tasks in half ("step limit reached" mid-task). A single high internal
-    # safety ceiling remains so a model that never stops calling tools (fresh
-    # args every step — invisible to the repetition guard) cannot burn
-    # unbounded tokens. Real tasks finish in single-digit steps; 200 is a
-    # runaway guard, never a task budget.
-    MAX_STEPS = 200
+    # No step budget at all: the old 12-50 auto cap and the later 200
+    # runaway ceiling are both removed. The loop runs until the model
+    # returns a text reply or a repetition/doom-loop guard stops it.
     async def _execute_tool(name: str, args: dict, call_id: str = "", step: int = 0) -> str:
         import inspect
 
@@ -4747,7 +5055,7 @@ async def _run_mode_turn(
                                 # A budget refusal is not a result: replaying it
                                 # would keep refusing after an edit re-arms the
                                 # budget.
-                                if _is_search_refusal(mm.content):
+                                if _is_search_refusal(mm.content) or _is_readonly_refusal(mm.content):
                                     break
                                 return mm.content
         return None
@@ -4904,18 +5212,15 @@ async def _run_mode_turn(
         # Per-turn search guard (build only): counts steps that call grep/glob/read
         # without an intervening edit; see _search_gate_text.
         _search_batches = 0
-        while steps < MAX_STEPS:
+        # Consecutive exploration-only steps (read/grep/glob/lsp) with no action
+        # in between; see _readonly_gate_text.
+        _readonly_streak = 0
+        while True:
             steps += 1
             _step_t0 = time.monotonic()
             _llm_wait_s = 0.0
             _tool_exec_s = 0.0
             _ckpt_save_s = 0.0
-            # Runaway guard (opencode's isLastStep -> MAX_STEPS_PROMPT): on the
-            # final allowed step, force the model to stop tool-calling and
-            # summarize instead of burning more reads/searches. Without this the
-            # loop just breaks at the ceiling and returns an empty reply.
-            if steps >= MAX_STEPS:
-                msgs.append(AIMessage(content=_agents._MAX_STEPS_PROMPT))
             # Deliver any background sub-agent report that finished since the
             # previous step so the main agent reads it before its next call.
             await _drain_subagent_reports(msgs, chat_id, queue)
@@ -5068,7 +5373,9 @@ async def _run_mode_turn(
                     _transient_msgs.clear()
                 _llm_t0 = time.monotonic()
                 _first_chunk_t = 0.0
-                async for chunk in bound.astream(request_messages):
+                async for chunk in _stream_with_first_chunk_timeout(
+                    bound.astream(request_messages), _FIRST_CHUNK_TIMEOUT_S
+                ):
                     if not _first_chunk_t:
                         _first_chunk_t = time.monotonic() - _llm_t0
                     # Check for cancellation at each chunk so the Stop button
@@ -5385,7 +5692,7 @@ async def _run_mode_turn(
                 # socket): the pooled sockets are poisoned and every retry on the
                 # same pool fails identically until the app restarts. Rebuild the
                 # model on a fresh HTTP pool; the retry wrapper then re-runs it.
-                if _is_connection_dropped(exc):
+                if _is_connection_dropped(exc) or isinstance(exc, _FirstChunkTimeout):
                     try:
                         model = rebuild_model_fresh(model)
                         logger.warning(
@@ -5752,6 +6059,32 @@ async def _run_mode_turn(
                     else:
                         _kept_calls.append(_tc)
                 _pending = _kept_calls
+            # Read-only streak guard (build only): refuse an unbatched
+            # exploration step past the streak budget; batched steps pass and
+            # give part of the budget back; any other tool resets it. Counted
+            # on the calls that survived the search gate above.
+            _ro_names = [(tc.get("name") or "") for tc in _pending]
+            if (mode or "") == "build" and _ro_names:
+                if all(n in _READONLY_EXPLORE_TOOLS for n in _ro_names):
+                    _is_step_batched = len(_pending) >= 2 or any(
+                        _is_batch_call(tc.get("name", ""), tc.get("args") or {})
+                        for tc in _pending
+                    )
+                    _ro_text = _readonly_gate_text(mode, _readonly_streak, _pending)
+                    if _ro_text:
+                        queue.put_nowait({"kind": "warn", "content": _ro_text})
+                        for _tc in _pending:
+                            append_tool_result(msgs, _ro_text, _tc.get("id", ""))
+                        _pending = []
+                    elif _is_step_batched:
+                        _readonly_streak = max(
+                            0,
+                            _MAX_READONLY_STEPS_WITHOUT_ACTION - _READONLY_BATCH_REARM,
+                        )
+                    else:
+                        _readonly_streak += 1
+                else:
+                    _readonly_streak = 0
             # NOTE: Each tool function (via make_tool_callbacks) emits its own
             # {"kind": "tool"} event internally. We do NOT emit here to avoid
             # duplicate UI cards — previously this pre-execution emit AND the
@@ -7199,6 +7532,8 @@ def _make_explore_tools(state: AgentState, queue: asyncio.Queue) -> dict:
         permit=_shared_permit(state, bool(state.get("allow_outside"))),
         chat_id=state.get("chat_id", ""),
         history=state.get("history") or [],
+        permission_gate_chat=state.get("permission_gate_chat"),
+        ask_gate_chat=state.get("ask_gate_chat"),
     )
     return tools
 

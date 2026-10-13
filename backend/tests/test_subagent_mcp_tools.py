@@ -89,8 +89,9 @@ async def test_task_subagent_runs_with_mcp_base_tool_in_parent_toolset():
     finally:
         _PARENT_TOOLS_CTX.reset(token)
     assert "MCP DONE" in str(report), f"sub-agent failed: {report!r}"
-    # The MCP tool was bound under its short name (instance .name == key).
-    assert "container_list" in model.bound_names, model.bound_names
+    # Locked search/read/web-only toolset: MCP tools from the parent are not
+    # inherited, so the sub-agent survives without binding them (no crash).
+    assert "container_list" not in model.bound_names, model.bound_names
     # And it actually executed via the Runnable path (no __call__ crash):
     # a ToolMessage with the tool's output is in the transcript.
     tool_contents = [
@@ -98,7 +99,8 @@ async def test_task_subagent_runs_with_mcp_base_tool_in_parent_toolset():
         for m in model.last_msgs
         if type(m).__name__ == "ToolMessage"
     ]
-    assert any("MCPRESULT:x" in c for c in tool_contents), tool_contents
+    assert not any("MCPRESULT:x" in c for c in tool_contents), tool_contents
+    assert "__call__" not in str(report), report
 
 
 async def test_subagent_inherits_mcp_tools_unwrapped():
@@ -120,7 +122,8 @@ async def test_subagent_inherits_mcp_tools_unwrapped():
     finally:
         _PARENT_TOOLS_CTX.reset(token)
     assert "MCP DONE" in str(report), f"sub-agent failed: {report!r}"
-    assert "container_list" in model.bound_names
+    # Same locked toolset: MCP tools stay parent-only, sub-agent still finishes.
+    assert "container_list" not in model.bound_names
 
 
 if __name__ == "__main__":

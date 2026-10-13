@@ -88,28 +88,41 @@ def test_chats_title_missing_text_400():
     assert r.status_code == 400
 
 
-def test_chats_title_build_failure_returns_null(monkeypatch):
+def test_chats_title_build_failure_falls_back_to_heuristic(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("no model")
 
     monkeypatch.setattr(server, "build_chat_model", boom)
     r = _client().post("/chats/title", json=_base_payload())
     assert r.status_code == 200
-    assert r.json()["title"] is None
+    data = r.json()
+    assert data["title"] == "how do I bake"
+    assert data["usage"] is None
 
 
-def test_chats_title_llm_failure_returns_null(monkeypatch):
+def test_chats_title_llm_failure_falls_back_to_heuristic(monkeypatch):
     _stub_model(monkeypatch, RuntimeError("provider down"))
     r = _client().post("/chats/title", json=_base_payload())
     assert r.status_code == 200
-    assert r.json()["title"] is None
+    data = r.json()
+    assert data["title"] == "how do I bake"
+    assert data["usage"] is None
 
 
-def test_chats_title_empty_reply_returns_null(monkeypatch):
+def test_chats_title_empty_reply_falls_back_to_heuristic(monkeypatch):
     _stub_model(monkeypatch, "   ")
     r = _client().post("/chats/title", json=_base_payload())
     assert r.status_code == 200
-    assert r.json()["title"] is None
+    data = r.json()
+    assert data["title"] == "how do I bake"
+    assert data["usage"] is None
+
+
+def test_chats_title_heuristic_fallback_caps_at_four_words(monkeypatch):
+    _stub_model(monkeypatch, "   ")
+    r = _client().post("/chats/title", json=_base_payload(text="word " * 100))
+    assert r.status_code == 200
+    assert r.json()["title"] == "word word word word"
 
 
 def test_chats_title_prefers_title_slot_over_compact(monkeypatch):
@@ -158,7 +171,8 @@ def test_chats_title_input_capped_at_500_chars(monkeypatch):
     _, called = _stub_model(monkeypatch, "Ok")
     r = _client().post("/chats/title", json=_base_payload(text="x" * 5000))
     assert r.status_code == 200
-    assert len(called["user"]) == 500
+    # The message body is capped at 500 chars inside the Message/Title wrapper.
+    assert called["user"].count("x") == 500
 
 
 def test_chats_title_falls_back_when_title_slot_fails(monkeypatch):
@@ -218,3 +232,46 @@ def test_chats_title_forwards_chat_id_for_trace(monkeypatch):
     r = _client().post("/chats/title", json=_base_payload(chat_id="chat-123"))
     assert r.status_code == 200
     assert called.get("chat_id") == "chat-123"
+
+
+def test_chats_title_prompt_forbids_answering(monkeypatch):
+    """The model is told to name the chat, not to answer the message."""
+    _, called = _stub_model(monkeypatch, "Ok")
+    r = _client().post("/chats/title", json=_base_payload())
+    assert r.status_code == 200
+    system = called.get("system") or ""
+    assert "Do NOT answer" in system
+    assert "4 words" in system
+    user = called.get("user") or ""
+    assert "sourdough" in user
+
+
+def test_chats_title_apology_reply_falls_back_to_heuristic(monkeypatch):
+    """A model that answers instead of titling is rejected like an empty reply."""
+    _stub_model(monkeypatch, "متأسفانه الان ابزارها در دسترس نیستند")
+    r = _client().post(
+        "/chats/title", json=_base_payload(text="خطاهای تست هارو رفع کن")
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["title"] == "خطاهای تست هارو رفع"
+    assert data["usage"] is None
+
+
+def test_chats_title_apology_reply_tries_next_candidate(monkeypatch):
+    """An apology from the title slot falls through to the next candidate."""
+    calls = []
+
+    async def fake_complete(mo, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return "Sorry, I cannot help with that", None
+        return "Test Error Fixes", None
+
+    monkeypatch.setattr(server, "build_chat_model", lambda *a, **k: object())
+    monkeypatch.setattr(server, "llm_complete", fake_complete)
+    r = _client().post(
+        "/chats/title", json=_base_payload(subagent_models={"title": "t-model"})
+    )
+    assert r.status_code == 200
+    assert r.json()["title"] == "Test Error Fixes"

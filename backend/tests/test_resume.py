@@ -128,7 +128,8 @@ async def test_checkpoint_snapshot_patches_unanswered_sequential_calls():
             ToolMessage(content="MATCHES a", tool_call_id="p1"),
         ]
         await _save_turn_checkpoint_valid(
-            tid, msgs, [{"name": "edit_file", "args": {"path": "x"}, "id": "s1"}]
+            tid, msgs, [{"name": "edit_file", "args": {"path": "x"}, "id": "s1"}],
+            force=True,
         )
         loaded = await _load_turn_checkpoint(tid)
         assert loaded is not None, "چک‌پوینت valid باید ذخیره/بارگذاری شود"

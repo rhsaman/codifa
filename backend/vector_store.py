@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 import numpy as np
 import sqlite_vec
 
-from embeddings import embed_passages, embed_queries
+from embeddings import embed_dim, embed_passages, embed_queries
 
 KIND_MEMORY = "memory"
 KIND_WEB = "web"

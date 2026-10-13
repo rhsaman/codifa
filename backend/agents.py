@@ -702,6 +702,13 @@ _SEARCH_RULE = (
     "FORBIDDEN: grep with >3 `|` alternatives; mixed-language OR (one language/concept, max 3); grep for filenames; searching/reading files via run_terminal/scripts.\n"
     "2. DELEGATION: task(subagent_type='subagent') only for parallelizable chunks (one per chunk, ONE block), never file lookups; named Files -> skip discovery, ONE read via filePaths/ranges.\n"
     "3. BATCHING: all known searches in ONE parallel turn: terms/scopes/filters via ONE grep call (patterns/paths/includes), globs via patterns, files via ONE read (filePaths or ranges+symbols), never two reads of one window.\n"
+    "FORBIDDEN: grep with >3 `|` alternatives; mixed-language OR (one language/concept, max 3); grep for filenames; searching/reading files via run_terminal/scripts.\n"
+    "BATCH EXAMPLES (use these shapes, never single-arg equivalents):\n"
+    "  grep(patterns=['pat1','pat2'], path='src/', include='*.py')  — NOT two grep() calls\n"
+    "  read(filePaths=['a.py','b.py'])  — NOT two read(filePath=…) calls\n"
+    "  read(filePath='x.py', ranges=['x.py:1:50','x.py:200:50'])  — NOT two read() calls\n"
+    "  glob(patterns=['**/*.ts','**/*.tsx'])  — NOT two glob() calls\n"
+    "If you need 2+ searches/reads with the SAME scope, merge into ONE call. If scopes differ, fire them as parallel tool calls in ONE step.\n"
     "4. STOP: after 2-3 search batches start editing in the same turn; report exact errors.\n"
 )
 
@@ -1270,7 +1277,8 @@ def _plan_reuse_note(history: list[dict], prompt: str = "") -> str:
                 "their current statuses, then mark steps in_progress/completed as you work. "
                 "Steps already marked completed must NOT be re-executed — only do the "
                 "pending/in_progress ones. NEVER send update_plan alone when there IS next "
-                "work — always batch it with your next tool calls in the SAME step. Solo "
+                "work — always batch it with your next tool calls in the SAME step "
+                "(only batch it with the next real tool calls). Solo "
                 "is only for the final tick with no further work."
             )
         numbered = "\n".join(
@@ -1516,18 +1524,22 @@ def _tool_reuse_note(history: list[dict]) -> str:
         return ""
     if not repeated:
         return (
-            "Earlier in this conversation you already ran tools and their FULL "
-            "results are in the transcript above — re-read them there instead "
-            "of re-running the same calls. Only use tools for NEW information "
-            "this turn actually needs."
+            "Earlier in this conversation you already ran tools. Results still "
+            "shown in full above are there — reuse them instead of re-running the "
+            "same calls. Results shown as `[truncated ... re-issue if still needed]` "
+            "or `[older tool result omitted ...]` were dropped to save context: if "
+            "you need their content, re-run them ONCE, batched in one call. Only "
+            "use tools for NEW information this turn actually needs."
         )
     return (
-        "Earlier in this conversation you ALREADY ran these tool calls and their "
-        "FULL results are in the transcript above — re-read them there instead of "
-        "re-running the tools. Do NOT call the same tool with the same arguments "
-        "again, and do NOT re-search/re-read what is already answered above, "
-        "unless the user explicitly asks for a fresh run or new inputs. "
-        "Only use tools for NEW information this turn actually needs:\n"
+        "Earlier in this conversation you ALREADY ran these tool calls. Results "
+        "still shown in full above are there — reuse them instead of re-running "
+        "the tools, and do NOT re-search/re-read what is already answered above. "
+        "Results shown as `[truncated ... re-issue if still needed]` or `[older "
+        "tool result omitted ...]` were dropped to save context: if you need "
+        "their content, re-run them ONCE, batched in one call (never one window "
+        "per step). Only use tools for NEW information this turn actually "
+        "needs:\n"
         + "\n".join(entries)
     )
 
@@ -3998,6 +4010,8 @@ async def run_agent(
     cap: dict | None = None,
     permission_gates: dict | None = None,
     ask_gates: dict | None = None,
+    permission_gate_chat: dict | None = None,
+    ask_gate_chat: dict | None = None,
     allow_outside: bool = False,
     allow_computer: bool = False,
     allow_outside_folders: list[str] | None = None,
@@ -4055,6 +4069,8 @@ async def run_agent(
         "cap": cap,
         "permission_gates": permission_gates,
         "ask_gates": ask_gates,
+        "permission_gate_chat": permission_gate_chat,
+        "ask_gate_chat": ask_gate_chat,
         "allow_outside": allow_outside,
         "allow_computer": allow_computer,
         "allow_outside_folders": list(allow_outside_folders or []),

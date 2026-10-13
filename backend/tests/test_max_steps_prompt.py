@@ -80,7 +80,7 @@ class _LongModel:
         self.tool_steps += 1
         yield AIMessage(
             content=f"step {n}",
-            tool_calls=[{"name": "read", "args": {"path": f"f{n}.py"}, "id": f"call_{n}"}],
+            tool_calls=[{"name": "read", "args": {"filePath": f"f{n}.py"}, "id": f"call_{n}"}],
         )
 
 

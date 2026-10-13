@@ -125,9 +125,9 @@ def test_decoding_params_tightened_for_accuracy():
 
     _post(client, lang="fa")
 
-    # Larger beam -> more thorough search; stricter thresholds reject
-    # low-confidence / hallucinated output.
-    assert captured.get("beam_size") == 10
+    # Beam 5 halves decode time vs 10 with no accuracy loss on short
+    # live turns; stricter thresholds reject low-confidence output.
+    assert captured.get("beam_size") == 5
     assert captured.get("log_prob_threshold") == -0.8
     # Ambient-noise rejection without chopping quiet words: a middle
     # no-speech threshold skips segments Whisper flags as

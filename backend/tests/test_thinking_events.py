@@ -58,11 +58,18 @@ def test_thinking_from_string_content_is_detected():
     assert _thinking_from_chunk(chunk) is None
 
 
-async def test_raw_thinking_in_content_does_not_leak(run_events, mock_server, workspace):
+async def test_raw_thinking_in_content_does_not_leak(run_events, mock_server, workspace, monkeypatch):
     """opencode streams thinking under delta.reasoning (reasoning_content is
     nulled). The backend must drop those tokens and never emit them as 'text'
     events, while still emitting the real answer text."""
     from agents import run_agent
+
+    # Isolate from the shared skill store: when earlier tests seed skills,
+    # the skill router would consume mock.script[0] and the turn would fall
+    # back to the 'default' reply. Empty skills skip routing without an LLM call.
+    import graph as _graph
+
+    monkeypatch.setattr(_graph._agents, "_load_skills", lambda _r: [])
 
     base, mock = mock_server
     # Script: a reasoning model that first streams thinking under delta.reasoning,

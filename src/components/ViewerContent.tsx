@@ -16,7 +16,17 @@ function PanelPane() {
   return (
     <div
       className="panel-pane"
-      style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}
+      style={{
+        flex: "1 1 0",
+        display: "block",
+        boxSizing: "border-box",
+        height: "100%",
+        maxHeight: "100%",
+        minHeight: 0,
+        minWidth: 0,
+        overflowY: "auto",
+        overscrollBehavior: "contain",
+      }}
     >
       <ScheduleSection />
       <SubagentsSection />

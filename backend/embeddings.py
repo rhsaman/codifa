@@ -54,7 +54,20 @@ def _preferred_root() -> str:
 _QUERY_PREFIX = "query: "
 _PASSAGE_PREFIX = "passage: "
 
-_BATCH = 32
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name) or default)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+_BATCH = _env_int("EMBED_BATCH", 4)
+
+# Max texts embedded in one call window. Large index runs can queue tens of
+# thousands of chunks; holding all batch outputs + concat + result (3x) plus
+# the Python float list (7x vs float32) spikes RSS to many GB. Windowing
+# keeps peak near one window plus the final array.
 
 # e5-style position embeddings top out at 512; longer inputs make ONNX raise
 # "indices element out of data bounds" on the position-embeddings Gather, so
@@ -70,7 +83,10 @@ _LOCK = threading.RLock()
 # so keeping it resident forever in a long-lived sidecar dominates the app's
 # RAM. After this many seconds without an embed call the model is dropped;
 # the next call simply reloads it lazily (a few seconds, same vectors).
-_IDLE_EVICT_S = 15 * 60
+try:
+    _IDLE_EVICT_S = float(os.environ.get("EMBED_IDLE_EVICT_S") or 30)
+except (TypeError, ValueError):
+    _IDLE_EVICT_S = float(30)
 _last_used = 0.0
 _active_embeds = 0
 _evict_timer: threading.Timer | None = None
@@ -94,6 +110,7 @@ def _evict_if_idle() -> None:
     mid-inference); a busy model re-arms the timer for another window. A model
     used within the window is left alone — a concurrent ``_touch`` already
     re-armed the timer, so touching here would wrongly restart the idle clock.
+    Also drops the passage vector cache so peak RAM falls immediately.
     """
     with _LOCK:
         if not _CACHE:
@@ -104,7 +121,39 @@ def _evict_if_idle() -> None:
             _touch()
             return
         _CACHE.clear()
+    with _PASSAGE_VEC_LOCK:
+        _PASSAGE_VEC_CACHE.clear()
+        _PASSAGE_VEC_ORDER.clear()
     gc.collect()
+
+
+def unload() -> bool:
+    """Drop the cached embedding model immediately, freeing ~1.1 GB RAM.
+
+    Returns True when a loaded model was dropped. Safe to call anytime;
+    the next embed call reloads lazily. Used by the manual free-memory
+    endpoint so idle RAM can be reclaimed without waiting for the timer.
+    Also clears the passage vector cache.
+    """
+    global _evict_timer
+    with _LOCK:
+        had_model = bool(_CACHE)
+        if _active_embeds > 0:
+            return False
+        _CACHE.clear()
+        if _evict_timer is not None:
+            try:
+                _evict_timer.cancel()
+            except Exception:  # noqa: BLE001, S110 -- timer cancel never fails
+                pass
+            _evict_timer = None
+    with _PASSAGE_VEC_LOCK:
+        had_cache = bool(_PASSAGE_VEC_CACHE)
+        _PASSAGE_VEC_CACHE.clear()
+        _PASSAGE_VEC_ORDER.clear()
+    if had_model or had_cache:
+        gc.collect()
+    return had_model
 
 # Passage vector cache: exact description text -> L2-normalized vector.
 # The rerank step re-embeds the same file descriptions on every turn while
@@ -116,7 +165,7 @@ def _evict_if_idle() -> None:
 _PASSAGE_VEC_CACHE: dict[str, object] = {}
 _PASSAGE_VEC_ORDER: list[str] = []
 _PASSAGE_VEC_LOCK = threading.Lock()
-_PASSAGE_VEC_MAX = 5000
+_PASSAGE_VEC_MAX = _env_int("EMBED_CACHE_MAX", 200)
 
 
 class EmbedderUnavailableError(RuntimeError):
@@ -259,6 +308,12 @@ def _load() -> None:
                 _sess_opts.add_session_config_entry(
                     "arena_extend_strategy", "kSameAsRequested"
                 )
+            # Bound native thread arenas: default uses all cores and each
+            # thread reserves its own arena, multiplying peak past weights.
+            with contextlib.suppress(Exception):
+                _sess_opts.intra_op_num_threads = min(2, os.cpu_count() or 1)
+            with contextlib.suppress(Exception):
+                _sess_opts.inter_op_num_threads = 1
             _CACHE["session"] = onnxruntime.InferenceSession(
                 onnx_path,
                 sess_options=_sess_opts,
@@ -322,6 +377,8 @@ def _embed_batch(texts: Sequence[str], prefix: str) -> np.ndarray:
     similar row length instead of the single longest row. Per-row results are
     independent (padding is masked), so restoring the original order yields
     the same vectors as naive chunking — only with less wasted matmul.
+    Large lists are processed window by window directly into the final array
+    so peak stays near one window instead of 3x the whole list.
     """
     lst = list(texts)
     n = len(lst)
@@ -329,13 +386,28 @@ def _embed_batch(texts: Sequence[str], prefix: str) -> np.ndarray:
         return _embed(lst, prefix)
     order = sorted(range(n), key=lambda i: len(lst[i]))
     sorted_texts = [lst[i] for i in order]
-    rows: list[np.ndarray] = []
-    for i in range(0, n, _BATCH):
-        rows.append(_embed(sorted_texts[i : i + _BATCH], prefix))
-    concat = np.concatenate(rows, axis=0)
+    window = _env_int("EMBED_WINDOW", 128)
+    # First window determines the vector width for preallocation.
+    first = sorted_texts[:window]
+    first_rows: list[np.ndarray] = []
+    for i in range(0, len(first), _BATCH):
+        first_rows.append(_embed(first[i : i + _BATCH], prefix))
+    first_concat = np.concatenate(first_rows, axis=0)
+    dim = int(first_concat.shape[1])
+    concat = np.empty((n, dim), dtype=first_concat.dtype)
+    concat[: len(first)] = first_concat
+    del first_rows, first_concat
+    for start in range(window, n, window):
+        chunk = sorted_texts[start : start + window]
+        chunk_rows: list[np.ndarray] = []
+        for i in range(0, len(chunk), _BATCH):
+            chunk_rows.append(_embed(chunk[i : i + _BATCH], prefix))
+        concat[start : start + len(chunk)] = np.concatenate(chunk_rows, axis=0)
+        del chunk_rows
     result = np.empty_like(concat)
     for sorted_pos, orig_idx in enumerate(order):
         result[orig_idx] = concat[sorted_pos]
+    del concat
     return result
 
 
@@ -354,15 +426,11 @@ def _embed_passages_cached(texts: Sequence[str]) -> np.ndarray:
     missing_idx = [i for i, v in enumerate(cached) if v is None]
     if missing_idx:
         missing_texts = [lst[i] for i in missing_idx]
-        order = sorted(range(len(missing_texts)), key=lambda j: len(missing_texts[j]))
-        sorted_miss = [missing_texts[j] for j in order]
-        rows: list[np.ndarray] = []
-        for i in range(0, len(sorted_miss), _BATCH):
-            rows.append(_embed(sorted_miss[i : i + _BATCH], _PASSAGE_PREFIX))
-        concat = np.concatenate(rows, axis=0)
-        miss_vecs = [None] * len(missing_texts)
-        for sorted_pos, j in enumerate(order):
-            miss_vecs[j] = concat[sorted_pos]
+        # Reuse the windowed batcher so a cold index of thousands of texts
+        # never holds 3x the whole list plus the Python float list at once.
+        miss_mat = _embed_batch(missing_texts, _PASSAGE_PREFIX)
+        miss_vecs = [miss_mat[j] for j in range(len(missing_texts))]
+        del miss_mat
         with _PASSAGE_VEC_LOCK:
             for j, i in enumerate(missing_idx):
                 vec = np.array(miss_vecs[j], dtype=np.float32, copy=True)

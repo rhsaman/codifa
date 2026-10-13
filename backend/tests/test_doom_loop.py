@@ -316,9 +316,10 @@ def test_normalized_call_sig_collapses_windowing_args():
 def test_near_miss_paging_loop_stops_early():
     """A model paging ONE file window after window (same path, different
     offset each step) is the near-miss loop the exact-args guard missed.
-    The normalized signature must count it: the second identical step gets
-    the repeat short-circuit (no tool re-execution), the third breaks the
-    loop with the steering message.
+    The normalized signature counts it with paging grace: each window
+    still executes (served in full, revisit nudge is advisory), and the
+    5th consecutive same-file step breaks the loop with the steering
+    message instead of burning the whole step budget.
     """
 
     class _PagingModel:
@@ -368,12 +369,14 @@ def test_near_miss_paging_loop_stops_early():
             emit=None,
         )
     )
-    # The 3rd identical (normalized) step breaks the loop; the 2nd was
-    # short-circuited, so the tool only really executed ONCE.
-    assert model.executions == 1, (
-        f"repeat short-circuit failed: tool ran {model.executions} times"
+    # The 5th consecutive same-file (normalized) step breaks the loop with
+    # the steering message; steps 1-4 each executed (no short-circuit for
+    # paging — every window is served in full).
+    assert model.executions == 4, (
+        f"paging guard failed: tool ran {model.executions} times (want 4)"
     )
-    assert isinstance(result, str)
+    assert model._i == 5, f"loop must break at the 5th paging step, got {model._i}"
+    assert result == "", f"steering break must return empty, got {result!r}"
 
 
 if __name__ == "__main__":

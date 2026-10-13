@@ -66,6 +66,7 @@ import {
   steerChat,
   streamChat,
   fetchCredits,
+  preloadLocalModel,
   transcribeAudio,
   respondPermission,
   respondAsk,
@@ -3283,10 +3284,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const WATCHDOG_MAX_RETRIES = 5;
     const WATCHDOG_BASE_BACKOFF_MS = 30_000;
     const STALL_CHECK_INTERVAL_MS = 10_000;
-    // No limit on silence of real content while the socket is alive via
-    // keepalives: a thinking model must never be aborted/resent for thinking
-    // too long. Dead sockets are still caught by the keepalive clock (`limit`).
-    const CONTENT_STALL_LIMIT_MS = Number.POSITIVE_INFINITY;
     const stallTimer = setInterval(() => {
       // An explicit Stop cancels all auto-retry: never re-arm the retry banner
       // or schedule a resend after the user stopped this chat. Without this, a
@@ -3303,12 +3300,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // A tool that's still running gets a much longer leash — it's doing real
       // work, not stalled on the provider.
       const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
-      // Silent-thinking models can legitimately emit no content for a long time
-      // while keepalives keep the socket alive. The dead-socket limit above stays
-      // short; the content-stall limit is unbounded for thinking.
+      // Content stall while the socket stays alive via keepalives: a wedged
+      // provider stream would otherwise show "waiting for model" forever.
+      // Thinking models are exempt — reasoning silence is legitimate no matter
+      // how long it runs. Permission/ask pauses return early above.
+      const thinkingNowEarly =
+        useStore
+          .getState()
+          .chats.find((c) => c.id === chat.id)
+          ?.messages.find((m) => m.id === assistantMsg.id)
+          ?.thinkingActive === true;
       const contentLimit = isToolRunning(toolRunning)
         ? 900_000
-        : CONTENT_STALL_LIMIT_MS;
+        : 300_000;
       const elapsed = Date.now() - lastEventAtMs;
       const contentElapsed = Date.now() - lastContentAtMs;
       // Content-stall recovery: keepalives keep the socket clock fresh, so a
@@ -3316,11 +3320,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // socket path below. Once content has been stale past the limit while the
       // socket is still "alive", treat it as stalled and fall through to the
       // auto-retry path instead of showing the pill forever.
-      const contentStalled = shouldRecoverContentStall(
-        contentElapsed,
-        elapsed,
-        contentLimit,
-      );
+      const contentStalled = thinkingNowEarly
+        ? false
+        : shouldRecoverContentStall(
+            contentElapsed,
+            elapsed,
+            contentLimit,
+          );
       // Active thinking is legitimate silence, however long the reasoning
       // pass runs: while the thinking window is open the per-message thinking
       // indicator already explains the wait, so the watchdog must not consider
@@ -3793,11 +3799,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "diff") {
         clearTransientRetry();
         const current = findMsg()?.toolActivity ?? [];
-        // تطبیق ایونت diff با کارت ابزار: وقتی دو edit_file/write_file همزمان
-        // running هستند، تطبیقِ فقط بر اساس نام ابزار، دیف را به هر دو کارت
-        // می‌چسباند. بک‌اند path را می‌فرستد؛ پس اول بر اساس path مچ می‌کنیم و
-        // اگر هیچ کارتی مچ نشد (مثلاً استریم mid-turn ریکانکت شده)، به تطبیق
-        // قدیمیِ tool+running برمی‌گردیم.
+        // Match a diff event to its tool card: when two edit_file/write_file
+        // calls run concurrently, matching on tool name alone attaches the
+        // diff to both cards. The backend sends path, so match on path first
+        // and fall back to the legacy tool+running match when no card matches
+        // (e.g. mid-turn reconnected stream).
         const pathOf = (a: ToolActivity) =>
           String(a.args?.path ?? a.args?.filePath ?? "");
         const hasPath = typeof event.path === "string" && event.path !== "";
@@ -3906,8 +3912,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           plan: incoming,
           retry: null,
         });
-        // پنل راست هرگز خودکار باز نمی‌شود — حتی با ساخت تودوی تازه؛
-        // فقط کاربر با دکمه/میان‌بر آن را باز می‌کند.
+        // The right panel never opens automatically, even with a fresh todo;
+        // only the user opens it via button/shortcut.
       } else if (event.kind === "plan_card") {
         // Plan mode finished: collapse the streamed plan into a Plan card.
         // The bubble is sealed — the next streamed text (planner revision or
@@ -3963,8 +3969,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "ask") {
         setAskFreeText("");
         setPlanApprovalSel(0);
-        // آیتم‌های options ممکنه از سمت backend غیررشته باشن (object/array/null).
-        // همه رو به string coerce می‌کنیم تا prepareContent کرش نکنه.
+        // Backend options may be non-strings (object/array/null). Coerce all
+        // to string so prepareContent never crashes.
         const rawOpts: unknown[] = Array.isArray(event.options)
           ? event.options
           : [];
@@ -5596,6 +5602,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     stopTts(LIVE_TTS_OWNER);
     clearLiveError();
     setLiveState('connecting');
+    // Warm local weights in parallel with the user speaking: the sidecar
+    // loads Whisper/G2P/pocket in the background while the mic opens, so
+    // the first turn never pays the cold-load cost inside its timeout.
+    // No RAM is pinned at boot — this only runs on explicit live start,
+    // and idle-eviction still frees the weights after the idle window.
+    preloadLocalModel('whisper');
+    preloadLocalModel('tts');
     try {
       const transcribeChunk = async (blob: Blob, lang?: string): Promise<string> => {
         const { lang: chainLang, chains } = resolveSttChain();

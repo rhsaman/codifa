@@ -58,7 +58,7 @@ async def test_subagent_system_batches_searches_and_bans_chunk_walking():
     assert "when in doubt, re-read" in text, (
         "باید بگوید در صورت تردید دوباره بخواند"
     )
-    assert "Finish ALL Glob/Grep discovery FIRST" in text, (
+    assert "Finish ALL Glob/Grep lookups FIRST" in text, (
         "باید ترتیب اکتشاف-اول-بعد-خوانش را صریح بگوید"
     )
 

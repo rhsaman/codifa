@@ -41,6 +41,9 @@ from vector_store import KIND_FILE, VectorStore
 INDEX_MAX_FILE_BYTES = 2_000_000  # per-file cap: don't embed giant files
 INDEX_CHUNK_CHARS = 1_200  # target chars per embedded chunk
 INDEX_CHUNK_OVERLAP = 120  # overlap so symbol boundaries don't split meaning
+# Max chunks embedded per file: one huge doc must not queue thousands of
+# vectors in a single run and spike RSS to many GB.
+INDEX_MAX_CHUNKS_PER_FILE = 60
 
 # Language label per extension (best effort; used for display + retrieval).
 _LANGUAGE_BY_EXT = {
@@ -310,8 +313,9 @@ def index_file(store: VectorStore, root: str, info: dict) -> int:
             meta["end_line"] = syms[0]["end"]
     else:
         # Docs/configs: keep content chunks (useful for RAG; content_hash
-        # handles changes).
-        chunks = _chunk_text(text)
+        # handles changes). Capped per file so a single huge doc cannot
+        # queue thousands of embeddings in one run.
+        chunks = _chunk_text(text)[:INDEX_MAX_CHUNKS_PER_FILE]
     if not chunks:
         return 0
     try:

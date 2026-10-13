@@ -22,7 +22,7 @@ def test_update_plan_description_bans_solo_prefers_batching(tmp_path):
     cbs = _cbs(str(tmp_path))
     doc = cbs["update_plan"].__doc__ or ""
     assert "NEVER send update_plan alone" in doc
-    assert "always batch it with your next tool calls" in doc
+    assert "only batch it with the next real tool calls" in doc
     assert "a solo update_plan is fine" not in doc
 
 
@@ -38,7 +38,7 @@ def test_checklist_continuation_rule_prefers_batching():
     note = _plan_reuse_note(history)
     assert "EXISTING CHECKLIST" in note, note
     assert "NEVER send update_plan alone" in note, note
-    assert "always batch it with your next tool calls" in note, note
+    assert "only batch it with the next real tool calls" in note, note
 
 
 async def test_repeat_read_reserves_full_content(tmp_path):

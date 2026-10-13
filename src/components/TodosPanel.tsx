@@ -480,10 +480,12 @@ function RightPanelContent() {
       aria-label="Right panel"
       style={{
         width,
+        flex: "0 0 auto",
+        alignSelf: "stretch",
         display: "flex",
         flexDirection: "column",
-        height: "100%",
         minHeight: 0,
+        maxHeight: "100%",
         overflow: "hidden",
       }}
     >
@@ -494,7 +496,13 @@ function RightPanelContent() {
       />
       <div
         className="right-panel-body"
-        style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto" }}
+        style={{
+          flex: "1 1 auto",
+          minHeight: 0,
+          minWidth: 0,
+          overflowY: "auto",
+          overscrollBehavior: "contain",
+        }}
       >
         <ScheduleSection />
         <SubagentsSection />

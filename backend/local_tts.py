@@ -266,6 +266,34 @@ def _evict_tts_if_idle() -> None:
     gc.collect()
 
 
+def unload() -> bool:
+    """Drop cached TTS models immediately, freeing RAM.
+
+    Returns True when a cached model was dropped. Safe to call anytime;
+    the next synthesis reloads lazily. Used by the manual free-memory
+    endpoint so idle RAM can be reclaimed without waiting for the timer.
+    """
+    global _POCKET_MODEL, _POCKET_VOICE_STATE, _POCKET_VOICE_KEY, _G2P_TOK, _G2P_MODEL, _tts_evict_timer
+    with _LOCK:
+        had_model = _POCKET_MODEL is not None or _G2P_MODEL is not None
+        _POCKET_MODEL = None
+        _POCKET_VOICE_STATE = None
+        _POCKET_VOICE_KEY = ""
+        _G2P_TOK = None
+        _G2P_MODEL = None
+        if _tts_evict_timer is not None:
+            try:
+                _tts_evict_timer.cancel()
+            except Exception:  # noqa: BLE001, S110 -- timer cancel never fails
+                pass
+            _tts_evict_timer = None
+    if had_model:
+        import gc
+
+        gc.collect()
+    return had_model
+
+
 def active_provider_id() -> str:
     """Return the active local TTS provider id."""
     return ACTIVE_LOCAL_TTS_ID

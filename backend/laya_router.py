@@ -72,9 +72,9 @@ _load_error = ""
 # sidecar's RAM for the rest of the session. After this many seconds without
 # a predict call the agent is dropped; the next call reloads it lazily.
 try:
-    _LAYA_IDLE_EVICT_S = float(os.environ.get("LAYA_IDLE_EVICT_S") or 5 * 60)
+    _LAYA_IDLE_EVICT_S = float(os.environ.get("LAYA_IDLE_EVICT_S") or 60)
 except (TypeError, ValueError):
-    _LAYA_IDLE_EVICT_S = float(5 * 60)
+    _LAYA_IDLE_EVICT_S = float(60)
 _laya_last_used = 0.0
 _laya_evict_timer: threading.Timer | None = None
 
@@ -112,6 +112,36 @@ def _evict_laya_if_idle() -> None:
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001, S110 - cache clear is best-effort
         pass
+
+
+def unload() -> bool:
+    """Drop the cached Laya agent immediately, freeing RAM.
+
+    Returns True when a loaded agent was dropped. Safe anytime; the next
+    predict call reloads lazily. Used by the manual free-memory endpoint.
+    """
+    global _agent, _agent_dir, _load_error, _laya_evict_timer
+    with _lock:
+        had_model = _agent is not None
+        _agent = None
+        _agent_dir = ""
+        _load_error = ""
+        if _laya_evict_timer is not None:
+            try:
+                _laya_evict_timer.cancel()
+            except Exception:  # noqa: BLE001, S110 -- timer cancel never fails
+                pass
+            _laya_evict_timer = None
+    if had_model:
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001, S110 - cache clear is best-effort
+            pass
+    return had_model
 
 
 def is_laya_entry(entry: object) -> bool:

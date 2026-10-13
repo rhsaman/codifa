@@ -41,8 +41,11 @@ def test_cheap_truncation_placeholder_names_tool_and_args():
     truncated = [m for m in msgs if isinstance(m, ToolMessage) and str(m.content).startswith("[truncated ")]
     assert truncated, "expected meaningful placeholders"
     assert any("read" in str(m.content) and "f0.py" in str(m.content) for m in truncated)
-    # Recent steps stay verbatim.
-    assert any(isinstance(m, ToolMessage) and m.content == "x" * 60_000 for m in msgs)
+    # Recent steps stay usable: kept results are capped at 8k (never fully
+    # verbatim past the keep cap), old steps become named placeholders.
+    kept = [m for m in msgs if isinstance(m, ToolMessage) and len(str(m.content)) >= 8000]
+    assert kept, "expected recent tool results to be kept (capped, not dropped)"
+    assert all(len(str(m.content)) <= 9000 for m in kept)
 
 
 def test_cheap_truncation_skips_rerun_until_regrow():

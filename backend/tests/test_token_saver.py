@@ -92,7 +92,7 @@ def test_mcp_note_full_first_then_short():
     assert "MCP CONNECTORS" in full
     short = graph._mcp_note_for_turn(tools, True, "chat-1")
     assert "MCP CONNECTORS" not in short
-    assert "web_search is DISABLED" in short, "behavioral rule must survive"
+    assert "browser_navigate" in short, "behavioral rule must survive"
     # Server change re-sends the full note.
     tools2 = tools + [_mcp_tool("mcp__files__read")]
     full2 = graph._mcp_note_for_turn(tools2, True, "chat-1")
@@ -252,4 +252,4 @@ def test_update_plan_accepts_text_title_aliases(tmp_path):
         )
     )
     assert not out.startswith("ERROR"), out
-    assert "2 steps" in out, out
+    assert "0/2" in out, out

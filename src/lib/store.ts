@@ -3473,8 +3473,15 @@ export const useStore = create<State>((set, get) => ({
       message.content.trim() !== ''
     ) {
       // First user message but the trigger guard blocked (title already left
-      // 'New chat'): log once so a silent no-title is diagnosable.
-      console.info('[title] trigger skipped — current title:', prev.title)
+      // 'New chat'). When the current title is just this message's own auto
+      // slice (resend/retry path), there is nothing to diagnose — keep it at
+      // debug so the console stays quiet; a genuinely different title (manual
+      // rename, fork) is still logged at info with the chat id.
+      if (prev.title !== autoTitle) {
+        console.info('[title] trigger skipped — current title:', prev.title, chatId.slice(-6))
+      } else {
+        console.debug('[title] trigger skipped — title already matches first message', chatId.slice(-6))
+      }
     }
     return full
   },

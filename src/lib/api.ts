@@ -425,6 +425,29 @@ export async function transcribeAudio(
   }
 }
 
+/**
+ * Fire-and-forget warm of a local model (whisper / local TTS) in the
+ * sidecar. Called when live voice starts so weights load in parallel with
+ * the user speaking instead of inside the first request timeout. Never
+ * blocks: failures are swallowed (the real request loads lazily anyway).
+ */
+export function preloadLocalModel(kind: 'whisper' | 'tts'): void {
+  void (async () => {
+    try {
+      const url = await ensureSidecar()
+      if (!url) return
+      await fetch(`${url}/models/preload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => null)
+    } catch {
+      // Preload is best-effort only.
+    }
+  })()
+}
+
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
   const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')

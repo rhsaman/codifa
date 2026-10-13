@@ -24,13 +24,13 @@ Design notes
   lock) are reaped before every fresh connect and again on shutdown.
 * A per-server lock serialises connects so two concurrent turns never
   double-spawn the same server.
-* وقتی فراخوانی یک ابزار به‌خاطر بسته‌شدن مرورگر/اتصال شکست می‌خورد (کاربر
-  تب را بسته یا مرورگر بین دو turn کرش کرده)، سشن شفاف دوباره وصل
-  (reconnect) می‌شود و فراخوانی یک‌بار دیگر تکرار می‌گردد — مدل هرگز
-  شکستِ ساختگی را نمی‌بیند.
-* تعریف ابزارها قبل از رسیدن به مدل فشرده می‌شود: توضیحات به جمله(های)
-  اول بریده و description فیلدهای schema سقف می‌خورند تا سرورهای پرحرف
-  (مثل Playwright) با هر turn پاراگراف‌ها را دوباره نفرستند.
+* When a tool call fails because the browser/connection closed (user closed
+  the tab or the browser crashed between turns), the session transparently
+  reconnects and the call is retried once — the model never sees the synthetic
+  failure.
+* Tool definitions are compacted before reaching the model: descriptions are
+  cut to the first sentence(s) and schema field descriptions are capped, so
+  verbose servers (e.g. Playwright) do not resend paragraphs every turn.
 """
 
 from __future__ import annotations

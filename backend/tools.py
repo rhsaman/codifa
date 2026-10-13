@@ -71,6 +71,7 @@ _SUBAGENT_STRIPPED_TOOLS = frozenset({
     "confirm_action",
     "git_commit",
     "run_terminal",
+    "run_tests",
     "terminal_stop",
     "terminal_logs",
     "create_skill",
@@ -7328,6 +7329,31 @@ Returns each match with ±3 lines of surrounding code (the matching line marked 
             pass
         return raw
 
+    async def run_tests_tool(
+        path: str = "", test: str = "", related: bool = False
+    ) -> str:
+        """Run ONLY the tests related to your current change — never the whole
+        suite. Pass `path` (a test file, any language), optionally `test` (a
+        single test name) for a `file::test` scoped run, or `related=true`
+        with a source file path to run the tests vitest derives from it. The
+        command is derived from the project's own runner (pytest, vitest,
+        jest, playwright, cypress, cargo, go, maven, gradle, dotnet, flutter,
+        rspec, phpunit, mix, ctest) — no hard-coded stack. Use this instead of
+        run_terminal for every test iteration step; fall back to run_terminal
+        with the project's own scoped command only when this returns an error
+        about an undetected runner."""
+        from graph import scoped_test_command  # lazy: avoid import cycle
+
+        cmd = scoped_test_command(root, path=path, test=test, related=related)
+        if not cmd:
+            return (
+                "ERROR: no test runner detected in this project (no known "
+                "manifest or test config). Find the project's own test "
+                "command from its manifest and run it via run_terminal, "
+                "scoped to the single file/test you touched."
+            )
+        return await terminal_tool(cmd, timeout=TERMINAL_TIMEOUT_MAX)
+
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations. NEVER use it to create, edit or delete files — use write_file for brand-new files and edit_file for changes to existing files (sed -i, patch, tee, redirects and python heredocs that write files are NOT acceptable substitutes). Runs on the MAIN model — raw output is returned directly (capped to `terminal_out_chars`) so the agent can read it itself. BATCH: chain independent commands in ONE call with `;` or `&&` (e.g. lint then tests: `ruff check x.py; pytest -q`) — NEVER one call per command, and never re-run a command just to see it with a different `| head`/`| tail`; test/build commands (npm test, pytest, vitest, tsc, ...) already get the maximum timeout by default. LONG-LIVED SERVERS (any stack): prefix the project's own start command (found in its manifest, never assumed) with `bg:` (e.g. `bg: <project launch command>`) — it starts detached and returns immediately with a job_id; logs go to the OS temp dir; read output with `terminal_logs <job_id>` and stop it with `terminal_stop <job_id>`. If a dependency is missing, do NOT report 'not installed' and stop — ask permission with request_permission (explain why), WAIT, then retry the install and the original command."""
         _main_name = str(getattr(main_model, "model_name", "") or "")
@@ -11657,6 +11683,7 @@ When you need to read several files, read multiple independent files in parallel
         "search_console": search_console_tool,
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,
+        "run_tests": run_tests_tool,
         "current_time": current_time_tool,
         "computer": computer_tool,
         "git_status": git_status_tool,

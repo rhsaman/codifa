@@ -665,6 +665,48 @@ _TEST_STYLE_RULE = (
     "Keep test suites FAST -- every test you add is re-run on later turns. Prefer unit tests over full-pipeline integration tests; a new test should finish in well under a few seconds. NEVER synchronize tests with real time: no fixed time.sleep / asyncio.sleep, no polling loops with generous timeouts -- inject fake clocks, monkeypatch delay/TTL constants to tiny values, or wait on events/conditions. Use table-driven tests (parametrize) for near-duplicate cases and extend the existing test file instead of creating new ones. Clean up every temp dir/file a test creates. Tests must not hang: give every wait a small, bounded timeout."
 )
 
+# What tests must MEASURE and where fakes are allowed. Language-agnostic:
+# applies to every stack the agent works in (pytest, vitest, jest, go test,
+# cargo test, mvn, dotnet, flutter test, ...). Appended to the plan and
+# build prompts (graph.py).
+_TEST_DISCIPLINE_RULE = (
+    "\n\nTEST DISCIPLINE RULE (plan & build):\n"
+    "Tests must verify BEHAVIOR, not implementation: drive the public "
+    "interface and assert observable outcomes (return values, emitted "
+    "events, rendered UI, written files/DB rows) -- never private internals "
+    "or call counts that a refactor would break. Fake ONLY the outer "
+    "boundary (network, disk, clock, third-party services) with the "
+    "project's own mocking pattern; the code under test must be the real "
+    "code. Reproduce every bug FIRST with a failing test that fails for "
+    "the reported reason, then fix until it passes -- a fix without a "
+    "reproducing test is unverifiable."
+)
+
+# The mandatory write -> run -> read -> fix -> rerun loop for build mode.
+# Language-agnostic: the project's own manifest and existing tests define
+# the commands and the style, so the loop works in any project. Appended
+# to the build prompt only (graph.py).
+_TEST_EXECUTION_RULE = (
+    "\n\nTEST EXECUTION RULE (build only):\n"
+    "NEVER deliver a test you have not run. The loop is mandatory: write -> "
+    "run -> read the failure -> fix -> run again, until green.\n"
+    "1. BEFORE writing any test, learn the project's own setup: read its "
+    "manifest (package.json, pyproject.toml, Cargo.toml, go.mod, pom.xml, "
+    "build.gradle, pubspec.yaml, Makefile, CMakeLists.txt, ...) and COPY "
+    "the closest existing test file's style (runner, assertions, fixtures, "
+    "naming) -- a test that ignores the project's pattern will not even "
+    "run.\n"
+    "2. Write ONE test first, run it, then write the rest -- never a batch "
+    "of ten untested tests in a row.\n"
+    "3. Run ONLY the tests related to your change: use the run_tests tool "
+    "(or the project's own scoped form -- pytest file::test, vitest "
+    "related, jest -t, go test -run, cargo test name, mvn -Dtest=Class). "
+    "Running the whole suite on every step is too slow.\n"
+    "4. Read the real output (exit code, failing assertion, traceback), "
+    "fix the code or the test, and re-run until it passes. Do NOT finish "
+    "with red tests."
+)
+
 # Doing-tasks guidance (mirrors opencode's "Doing tasks" section): how to use the
 # search tools, verify work, and what NOT to do. Appended to every mode's prompt
 # via graph.py so the agent behaves consistently across ask/build/plan.

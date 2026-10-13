@@ -382,3 +382,19 @@ async def test_live_test_injects_live_rule_not_unit_tests(run_events, mock_serve
     assert "browser evidence comes first" in joined
     assert "OS temp dir (log files) is always readable" in joined
     assert "TEST VERIFICATION RULE: this is code-changing work" not in joined
+
+
+async def test_build_test_rule_introduces_run_tests_tool(run_events, mock_server):
+    """The Build mode's test-verification message must introduce the
+    run_tests tool so the agent runs only the related tests (any language)
+    instead of the whole suite on every step."""
+    _base, mock = mock_server
+    mock.script = [text_reply("done")]
+    await run_events("یک کامپوننت بنویس", mode="build")
+    all_messages = [m for body in mock.captured for m in body.get("messages", [])]
+    joined = json.dumps(all_messages, ensure_ascii=False)
+    assert "TEST VERIFICATION RULE" in joined
+    assert "run_tests" in joined, (
+        "build must introduce the run_tests tool for scoped test runs; "
+        f"messages did not contain it: {joined[:500]}"
+    )

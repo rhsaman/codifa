@@ -74,6 +74,7 @@ const TOOL_LABEL: Record<string, string> = {
   glob: "Search Files",
   web_search: "Web Search",
   run_terminal: "Ran a command",
+  run_tests: "Ran related tests",
   search_memory: "Search Memory",
   memory: "Memory",
   ask_user: "Ask User",
@@ -97,6 +98,7 @@ const TOOL_LABEL: Record<string, string> = {
  *  label (mirrors Claude-app's trace icons). */
 const TOOL_ICON: Record<string, string> = {
   run_terminal: "❯",
+  run_tests: "🧪",
   list_files: "📁",
   read: "📄",
   grep: "🔍",
@@ -128,6 +130,7 @@ function toolIcon(tool: string): string {
  *  instead of a raw tool-name tally. */
 const TOOL_NOUN: Record<string, [string, string]> = {
   run_terminal: ["command", "commands"],
+  run_tests: ["test run", "test runs"],
   list_files: ["file listing", "file listings"],
   read: ["file read", "file reads"],
   grep: ["search", "searches"],

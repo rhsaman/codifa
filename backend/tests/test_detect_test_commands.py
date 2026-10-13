@@ -4,7 +4,11 @@ per language, and never fabricates a passing test for C/C++ without a runner.
 
 import os
 
-from graph import detect_frontend_stack, detect_test_commands
+from graph import (
+    detect_frontend_stack,
+    detect_test_commands,
+    scoped_test_command,
+)
 
 
 def _mk(root, name, body=""):
@@ -45,6 +49,71 @@ def test_c_cpp_without_runner_returns_no_commands(tmp_path):
 def test_python_uses_uv_run_pytest(tmp_path):
     _mk(str(tmp_path), "pyproject.toml", "[project]\nname = 'demo'\n")
     assert detect_test_commands(str(tmp_path)) == ["uv run pytest"]
+
+
+def test_scoped_pytest_file_and_single_test(tmp_path):
+    _mk(str(tmp_path), "pyproject.toml", "[project]\nname = 'demo'\n")
+    root = str(tmp_path)
+    # File scope: the project's own runner with the file appended.
+    assert scoped_test_command(root, "backend/tests/test_x.py") == (
+        "uv run pytest backend/tests/test_x.py"
+    )
+    # Single-test scope: pytest's native file::test form.
+    assert scoped_test_command(root, "backend/tests/test_x.py", test="test_ok") == (
+        "uv run pytest backend/tests/test_x.py::test_ok"
+    )
+
+
+def test_scoped_vitest_uses_related(tmp_path):
+    _mk(
+        str(tmp_path),
+        "package.json",
+        '{"scripts": {"test": "vitest"}, "devDependencies": {"vitest": "^3"}}',
+    )
+    root = str(tmp_path)
+    assert scoped_test_command(root, "src/app.test.ts") == (
+        "npx vitest run src/app.test.ts"
+    )
+    # related=True: vitest's related mode (tests touching the changed files);
+    # --run keeps it out of watch mode.
+    assert scoped_test_command(root, "src/app.ts", related=True) == (
+        "npx vitest related src/app.ts --run"
+    )
+
+
+def test_scoped_jest_uses_dash_t(tmp_path):
+    _mk(
+        str(tmp_path),
+        "package.json",
+        '{"scripts": {"test": "jest"}, "devDependencies": {"jest": "^29"}}',
+    )
+    assert scoped_test_command(
+        str(tmp_path), "src/app.test.js", test="renders the button"
+    ) == 'npx jest src/app.test.js -t "renders the button"'
+
+
+def test_scoped_go_uses_run_flag(tmp_path):
+    _mk(str(tmp_path), "go.mod", "module demo\n")
+    root = str(tmp_path)
+    assert scoped_test_command(root, "pkg/thing_test.go") == (
+        "go test ./pkg"
+    )
+    assert scoped_test_command(root, "pkg/thing_test.go", test="TestThing") == (
+        'go test ./pkg -run "TestThing"'
+    )
+
+
+def test_scoped_cargo_uses_test_filter(tmp_path):
+    _mk(str(tmp_path), "Cargo.toml", "[package]\nname = 'demo'\n")
+    assert scoped_test_command(
+        str(tmp_path), "src/lib.rs", test="adds_numbers"
+    ) == "cargo test adds_numbers"
+
+
+def test_scoped_without_runner_returns_none(tmp_path):
+    # No manifest -> no fabricated command; the caller falls back to guidance.
+    _mk(str(tmp_path), "main.c", "int main(){return 0;}\n")
+    assert not scoped_test_command(str(tmp_path), "main.c")
 
 
 def test_javascript_uses_npx_test_runner(tmp_path):

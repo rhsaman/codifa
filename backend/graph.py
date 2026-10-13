@@ -219,6 +219,7 @@ _SEQUENTIAL_TOOLS = {
     "edit_file",
     "write_document",
     "run_terminal",
+    "run_tests",
     "confirm_action",
     "memory",
     "create_skill",
@@ -1449,7 +1450,7 @@ def filter_tools_for_mode(
             "git_commit",
             "write_document",
         }
-        _TERM = {"run_terminal"}
+        _TERM = {"run_terminal", "run_tests"}
         denied: set[str] = set()
         if not cap.get("readFiles", False):
             denied |= _READ
@@ -1476,6 +1477,7 @@ def filter_tools_for_mode(
                     "write_file",
                     "edit_file",
                     "run_terminal",
+                    "run_tests",
                     "confirm_action",
                     "git_commit",
                     "write_document",
@@ -3157,6 +3159,8 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
         + (_agents._LENGTH_RULE if mode in ("plan", "build") else "")
         + (_agents._TEST_DIR_RULE if mode in ("plan", "build") else "")
         + (_agents._TEST_STYLE_RULE if mode in ("plan", "build") else "")
+        + (_agents._TEST_DISCIPLINE_RULE if mode in ("plan", "build") else "")
+        + (_agents._TEST_EXECUTION_RULE if mode == "build" else "")
     )
     # Language directive depends on the CURRENT prompt (Persian/English
     # detection), so it must NOT live in the system prompt — otherwise the cache
@@ -3473,7 +3477,9 @@ async def build_turn_context(state: AgentState, queue: asyncio.Queue) -> dict:
                         "If a relevant test file already exists, ADD test cases there "
                         "— do NOT create a new file. "
                         "Run ONLY the test file(s) you wrote or touched, never the "
-                        "whole suite while iterating "
+                        "whole suite while iterating — prefer the run_tests tool "
+                        "(it scopes to one file or one test in the project's own "
+                        "runner, any language) or the project's own scoped form "
                         "(uv run pytest tests/test_x.py / npx vitest run "
                         "path/to/file.test.ts / cargo test / go test / ..."
                         + fw_note
@@ -6723,6 +6729,237 @@ def detect_test_commands(root: str) -> list[str]:
     # empty so the Build is told there are no project tests to run.
 
     return cmds
+
+
+def scoped_test_command(
+    root: str, path: str = "", test: str = "", related: bool = False
+) -> str:
+    """Build the narrowest command that runs ONLY one file's / one named test.
+
+    Language-agnostic companion to ``detect_test_commands``: the runner is
+    derived from the project's own markers, and when ``path`` is given its
+    extension picks the right language in multi-language workspaces. The
+    path/test pair is mapped to THAT runner's scoping syntax (pytest
+    ``file::test``, vitest ``related``/``-t``, jest ``-t``, playwright
+    ``--grep``, cypress ``--spec``, ``cargo test <name>``, go ``-run``, maven
+    ``-Dtest=``, gradle ``--tests``, dotnet ``--filter``, flutter/dart
+    ``--plain-name``, rspec, phpunit ``--filter``, mix, ctest ``-R``).
+    ``related`` (tests affected by a source file) is vitest-only and ignored
+    elsewhere. Returns "" when no runner is detected so the caller can fall
+    back to the project's own full command.
+    """
+    import os
+
+    path = str(path or "").strip()
+    test = str(test or "").strip()
+    related = bool(related)
+
+    # Runners want workspace-relative paths; rebase absolute ones.
+    if path:
+        _abs = os.path.normpath(
+            path if os.path.isabs(path) else os.path.join(root, path)
+        )
+        try:
+            _rel = os.path.relpath(_abs, root)
+        except ValueError:
+            _rel = _abs
+        path = _abs if _rel.startswith("..") else _rel
+    ext = os.path.splitext(path)[1].lower() if path else ""
+    stem = os.path.splitext(os.path.basename(path))[0] if path else ""
+
+    def _q(value: str) -> str:
+        # One place to quote a test-name filter for every OS shell.
+        return f'"{value}"'
+
+    # --- Python ---
+    _py = os.path.isfile(os.path.join(root, "uv.lock")) or os.path.isfile(
+        os.path.join(root, "pyproject.toml")
+    )
+    _py_legacy = os.path.isfile(os.path.join(root, "pytest.ini")) or os.path.isfile(
+        os.path.join(root, "setup.py")
+    )
+    if (not ext or ext == ".py") and (_py or _py_legacy):
+        base = "uv run pytest" if _py else "python -m pytest"
+        if path and test:
+            return f"{base} {path}::{test}"
+        if path:
+            return f"{base} {path}"
+        if test:
+            return f"{base} -k {test}"
+        return base
+
+    # --- Node / JS / TS ---
+    _JS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"}
+    pkg = os.path.join(root, "package.json")
+    if (not ext or ext in _JS_EXTS) and os.path.isfile(pkg):
+        try:
+            with open(pkg, encoding="utf-8") as _f:
+                data = json.loads(_f.read())
+        except Exception:  # noqa: BLE001
+            data = {}
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        scripts = scripts if isinstance(scripts, dict) else {}
+        deps = (
+            {
+                **(data.get("dependencies") or {}),
+                **(data.get("devDependencies") or {}),
+            }
+            if isinstance(data, dict)
+            else {}
+        )
+        if "vitest" in deps:
+            if related and path:
+                return f"npx vitest related {path} --run"
+            cmd = f"npx vitest run {path}".rstrip()
+            if test:
+                cmd += f" -t {_q(test)}"
+            return cmd
+        if "jest" in deps or "react-scripts" in deps:
+            cmd = f"npx jest {path}".rstrip()
+            if test:
+                cmd += f" -t {_q(test)}"
+            return cmd
+        if "@playwright/test" in deps:
+            cmd = f"npx playwright test {path}".rstrip()
+            if test:
+                cmd += f" --grep {_q(test)}"
+            return cmd
+        if "cypress" in deps:
+            cmd = "npx cypress run"
+            if path:
+                cmd += f" --spec {path}"
+            return cmd
+        if scripts.get("test"):
+            # Generic `npm test` script: most runners accept a path after --.
+            cmd = "npm test"
+            if path:
+                cmd += f" -- {path}"
+            return cmd
+
+    # --- Rust ---
+    if (not ext or ext == ".rs") and os.path.isfile(
+        os.path.join(root, "Cargo.toml")
+    ):
+        if test:
+            return f"cargo test {test}"
+        if path and stem and path.replace("\\", "/").startswith("tests/"):
+            # tests/foo.rs is its own integration target: --test foo.
+            return f"cargo test --test {stem}"
+        return "cargo test"
+
+    # --- Go ---
+    if (not ext or ext == ".go") and os.path.isfile(os.path.join(root, "go.mod")):
+        if path:
+            _target = (
+                path
+                if os.path.isdir(os.path.join(root, path))
+                else (os.path.dirname(path) or ".")
+            )
+            if not _target.startswith((".", "/", "\\")):
+                _target = "./" + _target
+        else:
+            _target = "./..."
+        cmd = f"go test {_target}"
+        if test:
+            cmd += f" -run {_q(test)}"
+        return cmd
+
+    # --- Java (Maven / Gradle) ---
+    _JVM_EXTS = {".java", ".kt", ".scala"}
+    if (not ext or ext in _JVM_EXTS) and os.path.isfile(
+        os.path.join(root, "pom.xml")
+    ):
+        cmd = "mvn -q test"
+        if test:
+            cmd += f" -Dtest={test}"
+        elif stem:
+            cmd += f" -Dtest={stem}"
+        return cmd
+    if (not ext or ext in _JVM_EXTS) and (
+        os.path.isfile(os.path.join(root, "build.gradle"))
+        or os.path.isfile(os.path.join(root, "build.gradle.kts"))
+    ):
+        cmd = "./gradlew test"
+        if test:
+            cmd += f" --tests {_q(test)}"
+        elif stem:
+            cmd += f" --tests {_q(stem)}"
+        return cmd
+
+    # --- .NET ---
+    try:
+        _dotnet = any(f.endswith((".csproj", ".sln")) for f in os.listdir(root))
+    except OSError:
+        _dotnet = False
+    if (not ext or ext in {".cs", ".fs"}) and _dotnet:
+        cmd = "dotnet test"
+        if path and path.endswith((".csproj", ".fsproj", ".sln")):
+            cmd += f" {path}"
+        if test:
+            cmd += f" --filter {_q('FullyQualifiedName~' + test)}"
+        return cmd
+
+    # --- Ruby ---
+    if (not ext or ext == ".rb") and os.path.isfile(os.path.join(root, "Gemfile")):
+        cmd = "bundle exec rspec"
+        if path:
+            cmd += f" {path}"
+        if test:
+            cmd += f" -e {_q(test)}"
+        return cmd
+
+    # --- PHP ---
+    if (not ext or ext == ".php") and os.path.isfile(
+        os.path.join(root, "composer.json")
+    ):
+        cmd = "vendor/bin/phpunit"
+        if path:
+            cmd += f" {path}"
+        if test:
+            cmd += f" --filter {test}"
+        return cmd
+
+    # --- Elixir ---
+    if (not ext or ext in {".ex", ".exs"}) and os.path.isfile(
+        os.path.join(root, "mix.exs")
+    ):
+        cmd = "mix test"
+        if path:
+            cmd += f" {path}"
+        return cmd
+
+    # --- Dart / Flutter ---
+    if (not ext or ext == ".dart") and os.path.isfile(
+        os.path.join(root, "pubspec.yaml")
+    ):
+        try:
+            with open(os.path.join(root, "pubspec.yaml"), encoding="utf-8") as _f:
+                _pub = _f.read()
+            _is_flutter = "flutter:" in _pub or "sdk: flutter" in _pub
+        except OSError:
+            _is_flutter = False
+        cmd = "flutter test" if _is_flutter else "dart test"
+        if path:
+            cmd += f" {path}"
+        if test:
+            cmd += f" --plain-name {_q(test)}"
+        return cmd
+
+    # --- C / C++ ---
+    _C_EXTS = {".c", ".cc", ".cpp", ".h", ".hpp"}
+    if (not ext or ext in _C_EXTS) and os.path.isfile(
+        os.path.join(root, "CMakeLists.txt")
+    ):
+        cmd = "ctest --output-on-failure"
+        if test:
+            cmd += f" -R {_q(test)}"
+        return cmd
+    if (not ext or ext in _C_EXTS) and os.path.isfile(
+        os.path.join(root, "Makefile")
+    ):
+        return "make test"
+
+    return ""
 
 
 def detect_frontend_stack(root: str) -> str:

@@ -713,6 +713,28 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 .unwrap_or_default();
             Ok(json!({ "unix_ms": now.as_millis() as u64 }).to_string())
         }
+        // LSP-backed tools (phase 3-3 parity with tools.py) — served by the
+        // native stdio JSON-RPC client in lsp.rs.
+        "lsp_definition" => crate::lsp::definition(
+            root,
+            &s("filePath"),
+            args["line"].as_i64().unwrap_or(1),
+            args["character"].as_i64().unwrap_or(0),
+        ),
+        "lsp_references" => crate::lsp::references(
+            root,
+            &s("filePath"),
+            args["line"].as_i64().unwrap_or(1),
+            args["character"].as_i64().unwrap_or(0),
+        ),
+        "lsp_hover" => crate::lsp::hover(
+            root,
+            &s("filePath"),
+            args["line"].as_i64().unwrap_or(1),
+            args["character"].as_i64().unwrap_or(0),
+        ),
+        "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query")),
+        "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath")),
         _ => Err(format!("tool {name:?} is not available natively (proxied to the sidecar)")),
     }
 }

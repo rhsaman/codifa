@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod lsp;
 mod backend_light;
 mod commands;
 mod compact;

@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::compact;
 use crate::git;
 use crate::llm::{self, LlmConfig};
@@ -283,6 +284,34 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     }
 }
 
+// ---------- native /chat/stream (phase 3-2) ----------
+
+async fn chat_stream(Json(body): Json<Value>) -> Response<Body> {
+    let Ok(req) = serde_json::from_value::<agent::AgentRequest>(body) else {
+        return bad_request("invalid agent request");
+    };
+    // Unbounded channel: the event callback is a sync FnMut called from
+    // inside the tokio runtime, so blocking_send would panic; unbounded
+    // send is non-blocking and the SSE consumer drains it as fast as the
+    // client reads.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+    tokio::spawn(async move {
+        let tx = tx;
+        let _ = agent::run_turn(&req, &|ev: &agent::AgentEvent| {
+            let line = format!("data: {}\n\n", ev.to_json());
+            let _ = tx.send(Ok(line.into_bytes()));
+        })
+        .await;
+    });
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
+}
+
 // ---------- proxy plumbing ----------
 
 async fn sidecar_base() -> Option<String> {
@@ -364,6 +393,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
+        .route("/chat/stream", post(chat_stream))
         .fallback(proxy_fallback)
         .with_state(state)
 }

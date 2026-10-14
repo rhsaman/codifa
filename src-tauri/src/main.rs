@@ -5,17 +5,19 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
- mod backend_light;
- mod commands;
- mod compact;
- mod git;
- mod llm;
- mod pty;
+mod agent;
+mod backend_light;
+mod commands;
+mod compact;
+mod git;
+mod llm;
+mod pty;
 mod secrets;
 mod sidecar;
 mod skills;
 mod state;
 mod store;
+mod tools;
 
 use std::time::Duration;
 

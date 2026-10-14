@@ -32,6 +32,10 @@ libc = "0.2"
 axum = { version = "0.7", features = ["http1"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Phase 3-2: native agent tools (read/grep/glob/write/edit/terminal)
+regex = "1"
+walkdir = "2"
+tokio-stream = "0.1"
 
 [profile.release]
 codegen-units = 1

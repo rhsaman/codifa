@@ -174,11 +174,17 @@ pub struct StreamAcc {
 }
 
 /// Callback fired for every text delta (the agent loop forwards these live).
-pub type DeltaSink<'a> = &'a mut (dyn FnMut(&str) + 'a);
+pub type DeltaSink<'a> = &'a mut (dyn FnMut(&str) + Send + 'a);
 
-/// Parse one SSE `data:` payload into accumulator updates. Returns true when
-/// the payload was a terminal `[DONE]` marker.
-fn apply_sse_payload(provider: &str, payload: &str, acc: &mut StreamAcc) -> bool {
+/// Parse one SSE `data:` payload into accumulator updates, forwarding text
+/// deltas to `on_delta` as they arrive. Returns true when the payload was a
+/// terminal `[DONE]` marker.
+fn apply_sse_payload(
+    provider: &str,
+    payload: &str,
+    acc: &mut StreamAcc,
+    on_delta: &mut dyn FnMut(&str),
+) -> bool {
     let payload = payload.trim();
     if payload == "[DONE]" {
         return true;
@@ -192,6 +198,7 @@ fn apply_sse_payload(provider: &str, payload: &str, acc: &mut StreamAcc) -> bool
                 Some("content_block_delta") => {
                     if let Some(t) = v["delta"]["text"].as_str() {
                         acc.text.push_str(t);
+                        on_delta(t);
                     }
                 }
                 Some("message_delta") => {
@@ -224,6 +231,7 @@ fn apply_sse_payload(provider: &str, payload: &str, acc: &mut StreamAcc) -> bool
         "google" => {
             if let Some(t) = v["candidates"][0]["content"]["parts"][0]["text"].as_str() {
                 acc.text.push_str(t);
+                on_delta(t);
             }
             if v["usageMetadata"].is_object() {
                 acc.usage = Some(v["usageMetadata"].clone());
@@ -239,6 +247,7 @@ fn apply_sse_payload(provider: &str, payload: &str, acc: &mut StreamAcc) -> bool
             let choice = &v["choices"][0];
             if let Some(t) = choice["delta"]["content"].as_str() {
                 acc.text.push_str(t);
+                on_delta(t);
             }
             if let Some(tcs) = choice["delta"]["tool_calls"].as_array() {
                 for tc in tcs {
@@ -381,9 +390,7 @@ async fn stream_with_key(
             let frame: String = buf.drain(..pos + 2).collect();
             for line in frame.lines() {
                 if let Some(payload) = line.strip_prefix("data: ") {
-                    let mut sink = |t: &str| on_delta(t);
-                    let _ = &mut sink;
-                    if apply_sse_payload(&cfg.provider, payload, &mut acc) {
+                    if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut *on_delta) {
                         return Ok(acc);
                     }
                 }
@@ -488,58 +495,73 @@ mod tests {
     #[test]
     fn sse_payloads_accumulate_openai_deltas() {
         let mut acc = StreamAcc::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut sink = |d: &str| deltas.push(d.to_string());
         assert!(!apply_sse_payload(
             "custom",
             r#"{"choices":[{"delta":{"content":"he"}}]}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "custom",
             r#"{"choices":[{"delta":{"content":"llo"}}]}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "custom",
             r#"{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "read", "arguments": "{\"file"}}]}}]}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "custom",
             r#"{"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "Path\":\"a\"}"}}]}}]}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "custom",
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"input_tokens":2}}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert_eq!(acc.text, "hello");
+        assert_eq!(deltas, vec!["he".to_string(), "llo".to_string()]);
         assert_eq!(acc.finish_reason, "tool_calls");
         assert_eq!(acc.tool_calls.len(), 1);
         assert_eq!(acc.tool_calls[0]["function"]["name"], "read");
         assert_eq!(acc.tool_calls[0]["function"]["arguments"].as_str().unwrap(), r#"{"filePath":"a"}"#);
         assert_eq!(acc.usage.clone().unwrap()["input_tokens"], 2);
         // Terminal marker.
-        assert!(apply_sse_payload("custom", "[DONE]", &mut acc));
+        {
+            let mut sink = |_: &str| {};
+            assert!(apply_sse_payload("custom", "[DONE]", &mut acc, &mut sink));
+        }
     }
 
     #[test]
     fn sse_payloads_accumulate_anthropic_deltas() {
         let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
         assert!(!apply_sse_payload(
             "anthropic",
             r#"{"type":"message_start","message":{"usage":{"input_tokens":7}}}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "anthropic",
             r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert!(!apply_sse_payload(
             "anthropic",
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
-            &mut acc
+            &mut acc,
+            &mut sink
         ));
         assert_eq!(acc.text, "hi");
         assert_eq!(acc.finish_reason, "end_turn");

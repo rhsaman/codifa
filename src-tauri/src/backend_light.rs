@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::compact;
 use crate::git;
 use crate::llm::{self, LlmConfig};
@@ -21,6 +22,7 @@ use crate::sidecar;
 use crate::skills;
 use crate::state::get_data_root;
 use std::path::PathBuf;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// The public router's URL, mirrored into a global so `sidecar_url` (which
 /// runs on arbitrary threads) can hand it to the renderer.
@@ -285,10 +287,62 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
 }
 
 // ---------- /chat/stream ----------
-// Served by the Python sidecar through the catch-all proxy below. The native
-// Rust agent loop (agent.rs) has not reached feature parity yet (LangGraph
-// checkpoints, MCP, sub-agents), and intercepting this route broke live
-// chats. Re-enable a native handler only once agent.rs reaches parity.
+// Default: proxied to the Python sidecar, which has full parity (LangGraph
+// checkpoints, MCP, sub-agents). The native Rust loop (agent.rs) is opt-in
+// via CODIFA_NATIVE_AGENT=1 for live testing until it reaches parity.
+
+async fn chat_stream_entry(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    let native = std::env::var("CODIFA_NATIVE_AGENT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if native {
+        chat_stream_native(body).await
+    } else {
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/chat/stream")
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .expect("fixed request builder");
+        proxy_all(st, req, "/chat/stream").await
+    }
+}
+
+/// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
+/// the same event protocol the Python sidecar emits.
+async fn chat_stream_native(body: Value) -> Response<Body> {
+    let req = match serde_json::from_value::<agent::AgentRequest>(body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(&format!("invalid agent request: {e}")),
+    };
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
+    tokio::spawn(async move {
+        let tx_err = tx.clone();
+        let emit = move |ev: &agent::AgentEvent| {
+            let line = format!("data: {}\n\n", ev.to_json());
+            let _ = tx.send(Ok(axum::body::Bytes::from(line)));
+        };
+        if let Err(e) = agent::run_turn(&req, emit).await {
+            let payload = serde_json::json!({"kind": "error", "content": e});
+            let _ = tx_err.send(Ok(axum::body::Bytes::from(format!(
+                "data: {payload}\n\n"
+            ))));
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response()
+        })
+}
 
 // ---------- proxy plumbing ----------
 
@@ -415,6 +469,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
+        .route("/chat/stream", post(chat_stream_entry))
         .fallback(proxy_fallback)
         .layer(middleware::from_fn(cors))
         .with_state(state)
@@ -513,6 +568,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_defaults_to_sidecar_proxy() {
+        // Without CODIFA_NATIVE_AGENT the route must flow to the sidecar
+        // (503 here because no sidecar runs in tests) — never a native 200.
+        let app = router(new_state(std::env::temp_dir()));
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
     }
 
     #[tokio::test]

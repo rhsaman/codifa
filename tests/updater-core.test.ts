@@ -1,6 +1,6 @@
 // Cross-platform updater asset-picking tests.
 // Run: node test/updater-core.test.ts  (Node ≥23 strips TS types natively)
-import { pickAsset, isNewer, parseVersion } from '../electron/updater-core.ts'
+import { pickAsset, isNewer, parseVersion } from '../src/lib/updater-core.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {

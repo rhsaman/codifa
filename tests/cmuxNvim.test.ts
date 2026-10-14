@@ -6,7 +6,7 @@ import {
   buildNvimKeystrokeArgs,
   isSocketDeniedOutput,
   shellQuote,
-} from "../electron/cmuxNvim.ts";
+} from "../src/lib/cmuxNvim.ts";
 
 let failed = 0;
 function check(name: string, cond: boolean, extra?: unknown) {

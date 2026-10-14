@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { UpdateInfo, UpdateProgress } from '../../electron/preload'
+import type { UpdateInfo, UpdateProgress } from '../types/coderApi'
 
 type Phase = 'hidden' | 'available' | 'downloading' | 'installing' | 'done' | 'error'
 

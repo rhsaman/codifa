@@ -3310,48 +3310,6 @@ textarea {
   position: relative;
 }
 
-.chat-root-preview {
-  position: absolute;
-  z-index: 60;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
-  background: transparent;
-  border: none;
-  border-radius: 8px;
-  pointer-events: none;
-  padding: 6px;
-  box-sizing: border-box;
-}
-
-.chat-root-preview.preview-left {
-  top: 0;
-  bottom: 0;
-  left: 0;
-  right: 50%;
-}
-
-.chat-root-preview.preview-right {
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  right: 0;
-}
-
-.chat-root-preview.preview-top {
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 50%;
-}
-
-.chat-root-preview.preview-bottom {
-  bottom: 0;
-  left: 0;
-  right: 0;
-  top: 50%;
-}
-
 .chat-window-body {
   flex: 1 1 auto;
   display: flex;
@@ -3555,14 +3513,8 @@ textarea {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
-.chat-windows.tree .chat-window.drop-active {
-  border-color: var(--accent);
-}
-
-/* The pane being moved never shows a landing preview on itself. */
-.chat-windows.tree .chat-window.drag-source.drop-active {
-  border-color: var(--border);
-}
+/* The unified overlay is the drop highlight (dashed page inside it); the
+   pane's own drop-active border would paint a second outline on top. */
 
 .chat-windows.tree .chat-window.drag-source .chat-drop-preview {
   display: none;
@@ -3857,7 +3809,11 @@ textarea {
   white-space: nowrap;
 }
 
-.chat-drop-preview {
+/* Unified drop overlay: one persistent element for the whole stack. It is
+   positioned in px over the target pane/strip every frame, so moving between
+   panes or zones animates as a real transition (per-pane overlays mount and
+   unmount, which can never animate). */
+.chat-drop-overlay {
   position: absolute;
   z-index: 60;
   display: flex;
@@ -3869,38 +3825,23 @@ textarea {
   pointer-events: none;
   padding: 6px;
   box-sizing: border-box;
+  opacity: 0;
+  transition:
+    top 140ms ease,
+    left 140ms ease,
+    width 140ms ease,
+    height 140ms ease,
+    opacity 120ms ease;
 }
 
-.chat-drop-preview.preview-left {
-  top: 0;
-  bottom: 0;
-  left: 0;
-  right: 50%;
-}
+@keyframes chat-drop-fade {
+  from {
+    opacity: 0;
+  }
 
-.chat-drop-preview.preview-right {
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  right: 0;
-}
-
-.chat-drop-preview.preview-top {
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 50%;
-}
-
-.chat-drop-preview.preview-bottom {
-  bottom: 0;
-  left: 0;
-  right: 0;
-  top: 50%;
-}
-
-.chat-drop-preview.preview-center {
-  inset: 0;
+  to {
+    opacity: 1;
+  }
 }
 
 .chat-drop-hint {
@@ -3921,6 +3862,22 @@ textarea {
   min-height: 0;
   min-width: 0;
   pointer-events: none;
+}
+
+/* The unified overlay draws the landing visual by gliding onto the ghost
+   slot's rect, so the ghost's own page stays invisible — a visible ghost
+   under a gliding overlay would read as a double preview. */
+.chat-drop-ghost .chat-drop-ghost-page {
+  visibility: hidden;
+}
+
+/* Smooth the layout shift when the ghost mounts or a pane vacates mid-drag:
+   flex-grow is animatable, so panes glide to their new sizes instead of
+   snapping the whole split under the cursor. Scoped to the dragging state so
+   normal pane resizing stays instant. NOTE: the class is removed BEFORE the
+   drop event dispatches, so the final post-drop relayout is instant. */
+body.coder-dragging .chat-split-child {
+  transition: flex-grow 150ms ease;
 }
 
 .chat-drop-ghost-page {
@@ -4957,7 +4914,9 @@ textarea {
 .chat-panel.file-dragover .chat-scroll {
   opacity: 0.55;
 }
-.chat-drop-overlay {
+/* Distinct class name: the unified window-drop overlay below shares this
+   file, and a same-name later rule would paint its dashed border on it. */
+.chat-file-drop-overlay {
   position: absolute;
   inset: 0;
   z-index: 60;

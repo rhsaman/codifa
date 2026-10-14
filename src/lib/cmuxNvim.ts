@@ -1,8 +1,8 @@
 // Pure helpers for opening a file in nvim hosted inside cmux.
 // No electron/node imports here so the renderer test runner can import this.
- // Detects the cmux socket refusing an outside process. The cmux CLI exits 0
- // even on refusal ("Access denied" on stdout), so the output text — not the
- // exit code — is the only success signal for socket-backed commands.
+// Detects the cmux socket refusing an outside process. The cmux CLI exits 0
+// even on refusal ("Access denied" on stdout), so the output text — not the
+// exit code — is the only success signal for socket-backed commands.
 export function isSocketDeniedOutput(output: string): boolean {
   return /access denied|broken pipe|only processes started inside cmux/i.test(output)
 }
@@ -26,7 +26,7 @@ export function appleScriptEscape(s: string): string {
 // Best-effort UI-scripting fallback for when the cmux socket refuses outside
 // processes; needs Accessibility permission and may fail silently.
 export function buildNvimKeystrokeArgs(cmd: string): string[] {
-  const escaped = appleScriptEscape(cmd);
+  const escaped = appleScriptEscape(cmd)
   return [
     '-e',
     'set oldClip to the clipboard',
@@ -46,5 +46,5 @@ export function buildNvimKeystrokeArgs(cmd: string): string[] {
     'delay 0.5',
     '-e',
     'set the clipboard to oldClip',
-  ];
+  ]
 }

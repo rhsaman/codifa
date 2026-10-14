@@ -10,7 +10,6 @@
   "keywords": [
     "ai",
     "coding-assistant",
-    "electron",
     "offline-first",
     "local-llm",
     "rag",
@@ -28,11 +27,9 @@
     "url": "git+https://github.com/rhsaman/codifa.git"
   },
   "homepage": "https://github.com/rhsaman/codifa",
-  "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {
     "setup": "uv sync --project backend",
-    "postinstall": "node scripts/fix-native-deps.mjs",
     "dev": "vite",
     "dev:web": "vite --mode webonly",
     "dev:agent": "vite --mode webonly --port 5174 --strictPort",
@@ -42,19 +39,20 @@
     "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:frontend": "bash tests/run-frontend.sh",
     "clean": "node -e \"import('fs').then(f=>f.rmSync('release',{recursive:true,force:true}))\"",
-    "dist": "npm run build && npm run setup && npm run clean && node scripts/run-electron-builder.mjs",
-    "dist:mac": "npm run build && npm run setup && npm run clean && node scripts/run-electron-builder.mjs --mac",
-    "dist:win": "npm run build && npm run setup && npm run clean && node scripts/run-electron-builder.mjs --win",
-    "dist:linux": "npm run build && npm run setup && npm run clean && node scripts/run-electron-builder.mjs --linux"
+    "dist": "npm run build && npm run tauri build",
+    "dist:mac": "npm run build && npm run tauri build -- --target aarch64-apple-darwin",
+    "dist:win": "npm run build && npm run tauri build -- --target x86_64-pc-windows-msvc",
+    "dist:linux": "npm run build && npm run tauri build",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
+    "@tauri-apps/api": "^2.12.3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
     "mermaid": "^11.17.0",
     "monaco-editor": "^0.52.2",
-    "node-pty": "^1.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-markdown": "^9.0.1",
@@ -63,79 +61,16 @@
     "zustand": "^4.5.5"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.2.0",
+    "@tauri-apps/cli": "^2.12.2",
     "@types/node": "^22.7.4",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^4.3.1",
     "concurrently": "^9.0.1",
-    "electron": "^31.4.0",
-    "electron-builder": "^25.1.8",
     "esbuild": "^0.28.2",
     "highlight.js": "^11.10.0",
     "typescript": "^5.6.2",
-    "vite": "^5.4.8",
-    "vite-plugin-electron": "^0.28.8",
-    "vite-plugin-electron-renderer": "^0.14.6"
-  },
-  "build": {
-    "appId": "com.codifa.app",
-    "productName": "Codifa",
-    "electronDist": "node_modules/electron/dist",
-    "icon": "build/icon.png",
-    "afterSign": "scripts/ad-hoc-sign.mjs",
-    "afterPack": "scripts/after-pack.mjs",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**/*",
-      "dist-electron/**/*",
-      "build/icon.png"
-    ],
-    "asarUnpack": [
-      "node_modules/node-pty/**"
-    ],
-    "extraResources": [
-      {
-        "from": "backend",
-        "to": "backend",
-        "filter": [
-          "**/*",
-          "!**/__pycache__/**",
-          "!**/.venv/**",
-          "!**/whisper/**",
-          "!**/models--*/**",
-          "!**/tests/**",
-          "!**/pytest-of-*/**",
-          "!**/coder-test-*/**"
-        ]
-      }
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "identity": null,
-      "target": [
-        "dmg",
-        "zip"
-      ]
-    },
-    "win": {
-      "target": [
-        "nsis"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
-    },
-    "linux": {
-      "target": [
-        "AppImage",
-        "deb"
-      ],
-      "category": "Development"
-    }
+    "vite": "^5.4.8"
   },
   "allowScripts": {
     "electron@31.7.7": true,

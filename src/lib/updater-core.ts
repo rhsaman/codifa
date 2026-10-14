@@ -1,7 +1,7 @@
 /**
  * Pure, platform-agnostic helpers for the GitHub-releases updater.
- * No `electron` imports here so the logic can be unit-tested in plain Node
- * (see test/updater-core.test.ts).
+ * No platform imports here so the logic can be unit-tested in plain Node
+ * (see tests/updater-core.test.ts).
  */
 
 export interface ReleaseAsset {
@@ -36,15 +36,14 @@ export function isNewer(latest: string, current: string): boolean {
  * Ordering matters:
  *  - macOS: exact-arch .dmg → universal .dmg → exact-arch -mac.zip →
  *    universal .zip → any .dmg → any -mac.zip (last resorts for hand-made
- *    releases that don't follow electron-builder naming). An arm64 .dmg is
- *    never picked for an x64 Mac (it would mount but the app inside can't run).
- *  - Windows: NSIS "Setup" .exe first (electron-builder's default), then any
- *    .exe (portable builds).
+ *    releases that don't follow builder naming). An arm64 .dmg is never picked
+ *    for an x64 Mac (it would mount but the app inside can't run).
+ *  - Windows: NSIS "Setup" .exe first, then any .exe (portable builds).
  *  - Linux: AppImage (runs without sudo; a .deb would need root to install).
  */
 export function pickAsset(
   assets: ReleaseAsset[],
-  platform: NodeJS.Platform,
+  platform: string,
   arch: string,
 ): ReleaseAsset | null {
   const name = (a: ReleaseAsset): string => a.name.toLowerCase()

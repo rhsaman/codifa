@@ -8635,7 +8635,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         </button>
       )}
       {dragOver && (
-        <div className="chat-drop-overlay" aria-hidden="true">
+        <div className="chat-file-drop-overlay" aria-hidden="true">
           <span>Drop to attach to input</span>
         </div>
       )}

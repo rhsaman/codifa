@@ -507,19 +507,100 @@ const LeafView = memo(function LeafView({
       }}>
         <MemoChatPanel chatId={chatId} dimmed={multi && !focused} />
       </div>
-      {dropPos && (
-        <div className={`chat-drop-preview preview-${dropPos}`} aria-hidden="true">
-          <div className="chat-drop-empty-page">
-            <span className="chat-drop-empty-title">{drag.dragId ? chatTitleOf(drag.dragId) : "Chat"}</span>
-            <span className="chat-drop-hint">
-              {dropPos === "center" ? (drag.dragId ? "Release to swap" : "Release to replace") : "Release to open here"}
-            </span>
-          </div>
-        </div>
-      )}
     </section>
   );
 }, leafDragEqual);
+
+/** Unified drop overlay: one persistent element for the whole stack that
+ *  glides between target rects (leaf panes, root strips) via CSS transitions.
+ *  Per-pane overlays cannot animate — they mount/unmount on every target
+ *  change, and a freshly mounted element has no previous geometry to
+ *  transition from. The target rect is re-measured every frame while the
+ *  overlay is visible because ghost insertion and the vacated source shift
+ *  the layout under a steady cursor. */
+function ChatDropOverlay({ mark, title, dragging, ghost }: { mark: DropMark | null; title: string; dragging: boolean; ghost?: boolean }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  // Tracks whether the overlay is currently visible, so the first frame after
+  // (re)appearing can place the geometry instantly (no slide from stale
+  // coordinates) and only then fade in.
+  const visibleRef = useRef(false);
+  const active = !!mark;
+  // Callers render with a non-null mark while active; the fallback keeps types strict.
+  const { id, pos } = mark ?? { id: CHAT_ROOT_DROP_ID, pos: "center" as ChatDropPos };
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !active) {
+      // Hide via opacity only: the element stays mounted for the whole drag
+      // session, so it never remounts (a remount is what reads as a jump).
+      if (el) {
+        el.style.opacity = "0";
+        visibleRef.current = false;
+      }
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const stack = (el.parentElement ?? null) as HTMLElement | null;
+      const target = !stack
+        ? null
+        : ghost
+          ? (stack.querySelector(".chat-drop-ghost") as HTMLElement | null)
+          : id === CHAT_ROOT_DROP_ID
+            ? stack
+            : (stack.querySelector(`[data-chat-window="${CSS.escape(id)}"]`) as HTMLElement | null);
+      const r = target?.getBoundingClientRect();
+      if (stack && r && r.width > 0 && r.height > 0) {
+        const s = stack.getBoundingClientRect();
+        let left = r.left - s.left;
+        let top = r.top - s.top;
+        let width = r.width;
+        let height = r.height;
+        if (!ghost) {
+          if (pos === "left") width /= 2;
+          else if (pos === "right") { left += width / 2; width /= 2; }
+          else if (pos === "top") height /= 2;
+          else if (pos === "bottom") { top += height / 2; height /= 2; }
+        }
+        const st = el.style;
+        if (!visibleRef.current) {
+          // First frame after appearing: jump to the new rect with transitions
+          // disabled, then fade in — gliding from an old hidden rect would
+          // read as a jump from the wrong place.
+          st.transition = "none";
+          st.left = `${left}px`;
+          st.top = `${top}px`;
+          st.width = `${width}px`;
+          st.height = `${height}px`;
+          void el.offsetWidth;
+          st.transition = "";
+          st.opacity = "1";
+          visibleRef.current = true;
+        } else {
+          st.left = `${left}px`;
+          st.top = `${top}px`;
+          st.width = `${width}px`;
+          st.height = `${height}px`;
+        }
+      } else if (visibleRef.current) {
+        el.style.opacity = "0";
+        visibleRef.current = false;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [active, id, pos, ghost]);
+  return (
+    <div ref={ref} className="chat-drop-overlay" aria-hidden="true">
+      <div className="chat-drop-empty-page">
+        <span className="chat-drop-empty-title">{title}</span>
+        <span className="chat-drop-hint">
+          {id !== CHAT_ROOT_DROP_ID && pos === "center" ? (dragging ? "Release to swap" : "Release to replace") : "Release to open here"}
+        </span>
+      </div>
+    </div>
+  );
+}
 
 /** Recursive split node: row = side-by-side, col = stacked. */
 function SplitView({
@@ -1020,14 +1101,26 @@ export function ChatWindows() {
   // A drop target implies an active drag (cleared on dragend/drop), so the
   // root preview also covers external tab/sidebar drags (dragId stays null).
   const rootDropPos = drop?.id === CHAT_ROOT_DROP_ID ? drop.pos : null;
-  const rootPreview = rootDropPos ? (
-    <div className={`chat-root-preview preview-${rootDropPos}`} aria-hidden="true">
-      <div className="chat-drop-empty-page">
-        <span className="chat-drop-empty-title">{dragId ? chatTitleOf(dragId) : "Chat"}</span>
-        <span className="chat-drop-hint">Release to open here</span>
-      </div>
-    </div>
-  ) : null;
+  // Ghost layout preview (sibling/nested slot) for edge drops: when it renders
+  // it already shows the landing zone, so the unified overlay stays hidden
+  // (both at once would read as an extra window).
+  const ghostTargetIdx = visibleChatIds.findIndex((id) => !!drop && drop.id === id && drop.pos !== "center");
+  const ghostTargetPos = ghostTargetIdx >= 0 ? drop!.pos : null;
+  const ghostParentDir = horizontal ? "row" : "col";
+  const showSiblingGhost = ghostTargetIdx >= 0 && ghostTargetPos !== null && !fullscreenId && shouldShowSiblingGhost(ghostParentDir, ghostTargetPos, true);
+  const showNestedGhost = ghostTargetIdx >= 0 && ghostTargetPos !== null && !fullscreenId && shouldShowNestedGhost(ghostParentDir, ghostTargetPos, true);
+  // The overlay element stays mounted for the whole drag session; hiding is
+  // opacity-only, so reappearing never remounts and never jumps. While a
+  // ghost slot represents the landing zone, the overlay glides onto the
+  // ghost's rect instead of hiding (hide-here + show-there read as a jump).
+  const rootPreview = (
+    <ChatDropOverlay
+      mark={drop}
+      ghost={showSiblingGhost || showNestedGhost}
+      title={dragId ? chatTitleOf(dragId) : "Chat"}
+      dragging={!!dragId}
+    />
+  );
   // Tree path: recursive splits with edge highlights.
   if (chatTree && treeLeaves > 0) {
     const single = treeLeaves <= 1;
@@ -1091,11 +1184,10 @@ export function ChatWindows() {
         // along the stack axis inserts a real flex sibling ghost with equal
         // size, so 2 windows preview as 2 equal (not 3) and dragging the 3rd
         // previews 3 equal. External tab/sidebar drags keep dragId null.
-        const targetIdx = visibleChatIds.findIndex((id) => !!drag.drop && drag.drop.id === id && drag.drop.pos !== "center");
-        const targetPos = targetIdx >= 0 ? drag.drop!.pos : null;
-        const parentDir = horizontal ? "row" : "col";
-        const showGhost = targetIdx >= 0 && targetPos !== null && !fullscreenId && shouldShowSiblingGhost(parentDir, targetPos, true);
-        const showNestedGhost = targetIdx >= 0 && targetPos !== null && !fullscreenId && shouldShowNestedGhost(parentDir, targetPos, true);
+        // Ghost geometry is hoisted above (shared with overlay suppression).
+        const targetIdx = ghostTargetIdx;
+        const targetPos = ghostTargetPos;
+        const showGhost = showSiblingGhost;
         const ghostAt = showGhost ? ghostInsertIndex(targetIdx, targetPos!) : -1;
         const ghostTitle = drag.dragId ? chatTitleOf(drag.dragId) : "Chat";
         const ghostSlot = showGhost ? (

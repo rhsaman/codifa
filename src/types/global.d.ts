@@ -1,4 +1,4 @@
-import type { CoderApi } from '../../electron/preload'
+import type { CoderApi } from './coderApi'
 
 declare global {
   interface Window {

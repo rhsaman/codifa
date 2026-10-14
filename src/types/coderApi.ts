@@ -1,0 +1,121 @@
+/**
+ * Shared renderer-side types for the window.coder bridge API.
+ *
+ * This is the single source of truth for the bridge surface; both the Tauri
+ * bridge (src/lib/tauriBridge.ts) and the web test harness stub conform to it.
+ */
+
+export interface RegionRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface FileEntry {
+  name: string
+  kind: 'file' | 'dir' | 'link'
+  path: string
+}
+
+export interface SearchMatch {
+  file: string
+  line: number
+  text: string
+}
+
+/** A live pty session (in-app terminal panel). */
+export interface TerminalSessionInfo {
+  id: string
+  /** Shell binary basename (zsh, bash, …) shown in the terminal tab. */
+  shell: string
+  /** Directory the shell was spawned in. */
+  cwd: string
+}
+
+export interface UpdateInfo {
+  available: boolean
+  currentVersion: string
+  latestVersion: string
+  notes: string
+  assetName: string | null
+  assetUrl: string | null
+  releaseUrl: string
+}
+
+export interface UpdateProgress {
+  phase: 'downloading' | 'installing'
+  percent: number
+}
+
+export interface OpResult {
+  ok: boolean
+  error?: string
+}
+
+export interface GoogleSignInResult {
+  refreshToken: string
+  accessToken: string
+  expiresIn: number
+}
+
+export interface CoderApi {
+  getSidecarUrl(): Promise<string | null>
+  probeSidecar(): Promise<boolean>
+  secretsGetKey(): Promise<string>
+  getEnv(key: string): Promise<string | null>
+  googleSignIn(
+    clientId: string,
+    clientSecret: string,
+    scope?: string,
+  ): Promise<GoogleSignInResult>
+  selectFolder(): Promise<string | null>
+  selectFile(): Promise<string[] | null>
+  importFile(absPath: string): Promise<string | null>
+  fsList(root: string, rel: string): Promise<FileEntry[]>
+  fsWalk(root: string): Promise<{ rel: string; name: string }[]>
+  fsRead(root: string, rel: string): Promise<{ content: string }>
+  fsWrite(root: string, rel: string, content: string): Promise<boolean>
+  fsDelete(root: string, rel: string): Promise<boolean>
+  coderList(rel: string): Promise<FileEntry[]>
+  coderRead(rel: string): Promise<{ content: string }>
+  coderWrite(rel: string, content: string): Promise<boolean>
+  coderDelete(rel: string): Promise<boolean>
+  copyText(text: string): Promise<boolean>
+  searchContent(root: string, query: string): Promise<SearchMatch[]>
+  readImage(absPath: string): Promise<string | null>
+  normalizeImage(absPath: string): Promise<{ path: string; dataUrl: string } | null>
+  captureScreen(): Promise<{ path: string; dataUrl: string } | null>
+  captureRegion(): Promise<{ path: string; dataUrl: string } | null>
+  selectRegion(rect: RegionRect): void
+  cancelRegion(): void
+  getPathForFile(file: File): string
+  storeGet<T>(key: string): Promise<T | null>
+  storeSet(key: string, value: unknown): Promise<boolean>
+  getDataPath(): Promise<string>
+  hasSettingsFile(): Promise<boolean>
+  openExternal(url: string): Promise<void>
+  openExternalChrome(url: string): Promise<void>
+  openFileExternal(
+    absPath: string,
+    editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp' | 'default',
+  ): Promise<OpResult>
+  openWorkspaceFolder(dir: string): Promise<OpResult>
+  openWorkspaceTerminal(dir: string): Promise<OpResult>
+  terminalCreate(cwd: string): Promise<TerminalSessionInfo>
+  terminalList(): Promise<TerminalSessionInfo[]>
+  terminalWrite(id: string, data: string): Promise<boolean>
+  terminalResize(id: string, cols: number, rows: number): Promise<boolean>
+  terminalKill(id: string): Promise<boolean>
+  onTerminalData(cb: (id: string, data: string) => void): () => void
+  onTerminalExit(cb: (id: string, exitCode: number) => void): () => void
+  moveDataPath(p: string): Promise<string>
+  onSidecarChanged(cb: () => void): () => void
+  onSidecarDead(cb: () => void): () => void
+  onFlushPersist(cb: () => void): () => void
+  flushPersistDone(): void
+  onMigrateProgress(cb: (evt: { label: string; pct: number }) => void): () => void
+  checkForUpdates(): Promise<UpdateInfo>
+  startUpdate(): Promise<OpResult>
+  onUpdateProgress(cb: (p: UpdateProgress) => void): () => void
+}

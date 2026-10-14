@@ -1,6 +1,7 @@
 # ============================================================
 # Node.js / npm / yarn / pnpm / bun
 # ============================================================
+src-tauri/
 .zcode/
 .zcodeignore
 node_modules/
@@ -32,6 +33,7 @@ MEMORY.md
 dist/
 dist-electron/
 release/
+.tauri-backend/
 out/
 .vite/
 *.asar

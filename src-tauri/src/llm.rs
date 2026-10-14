@@ -289,6 +289,7 @@ pub async fn stream_chat(
     client: &Client,
     cfg: &LlmConfig,
     messages: &[Value],
+    tools: Option<&[Value]>,
     on_delta: DeltaSink<'_>,
 ) -> Result<StreamAcc, (u16, String)> {
     if cfg.api_keys.is_empty() {
@@ -296,7 +297,7 @@ pub async fn stream_chat(
     }
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match stream_with_key(client, cfg, key, messages, on_delta).await {
+        match stream_with_key(client, cfg, key, messages, tools, on_delta).await {
             Ok(acc) => return Ok(acc),
             Err((status, body)) if is_key_error(status, &body) => {
                 last_err = format!("key rejected ({status}): {body}");
@@ -313,6 +314,7 @@ async fn stream_with_key(
     cfg: &LlmConfig,
     key: &str,
     messages: &[Value],
+    tools: Option<&[Value]>,
     on_delta: DeltaSink<'_>,
 ) -> Result<StreamAcc, (u16, String)> {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
@@ -363,6 +365,9 @@ async fn stream_with_key(
             }
             if let Some(mt) = cfg.max_tokens {
                 body["max_tokens"] = json!(mt);
+            }
+            if let Some(t) = tools {
+                body["tools"] = json!(t);
             }
         }
     }

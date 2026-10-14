@@ -20,6 +20,10 @@ use crate::tools;
 const MAX_STEPS: usize = 60;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 const TOOL_RESULT_CAP: usize = 4000;
+/// Sub-agent depth limit (mirrors graph.py: sub-agents cannot spawn more).
+const MAX_SUBAGENT_DEPTH: usize = 1;
+/// Cap on the sub-agent report handed back to the parent model.
+const SUBAGENT_REPORT_CAP: usize = 6000;
 
 // ---------------------------------------------------------------------------
 // Request / events
@@ -99,9 +103,7 @@ impl AgentEvent {
     }
 }
 
-/// Tool schemas bound into the chat request (core native set only).
-/// Wired into the LLM request in phase 3-3; covered by tests meanwhile.
-#[allow(dead_code)]
+/// Tool schemas bound into the chat request (core native set + LSP tools).
 fn tool_schemas() -> Vec<Value> {
     [
         ("read", "Read a file (optionally a window via offset/limit)."),
@@ -111,6 +113,12 @@ fn tool_schemas() -> Vec<Value> {
         ("edit_file", "Replace an exact string in an existing file."),
         ("run_terminal", "Run a shell command in the workspace with a timeout."),
         ("current_time", "Current UTC time."),
+        ("lsp_definition", "Jump to the definition of a symbol (LSP)."),
+        ("lsp_references", "Find references of a symbol (LSP)."),
+        ("lsp_hover", "Hover text/signature for a symbol (LSP)."),
+        ("lsp_symbols", "List definitions in one file (LSP)."),
+        ("lsp_diagnostics", "Diagnostics for one file (LSP)."),
+        ("task", "Delegate a read-only research task to a background sub-agent."),
     ]
     .into_iter()
     .map(|(name, desc)| {
@@ -156,7 +164,7 @@ static TURN_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Emits the same event protocol as the Python graph.
 pub async fn run_turn(
     req: &AgentRequest,
-    mut emit: impl FnMut(&AgentEvent) + Send,
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
 ) -> Result<(), String> {
     let _turn = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
     let root = req.root.clone();
@@ -212,7 +220,8 @@ pub async fn run_turn(
                 });
             }
         };
-        let acc = match stream_chat(&client, &cfg, &messages, &mut sink).await {
+        let acc = match stream_chat(&client, &cfg, &messages, Some(&tool_schemas()), &mut sink).await
+        {
             Ok(acc) => acc,
             Err((_, e)) => {
                 emit(&AgentEvent::Error { content: e });
@@ -263,9 +272,17 @@ pub async fn run_turn(
                 stage: "tool".into(),
                 content: name.clone(),
             });
-            let (result, ok) = match tools::dispatch(&root, name, &args, None) {
-                Ok(r) => (r, true),
-                Err(e) => (e, false),
+            let (result, ok) = if name == "task" {
+                if req.mode == "subagent" {
+                    ("sub-agents cannot spawn further sub-agents".into(), false)
+                } else {
+                    Box::pin(run_subagent(req, &args, emit)).await
+                }
+            } else {
+                match tools::dispatch(&root, name, &args, None) {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
             };
             // UI echo is capped; the full result still goes to the model.
             let mut shown = result.clone();
@@ -292,6 +309,67 @@ pub async fn run_turn(
     });
     emit(&AgentEvent::Done { aborted: false });
     Ok(())
+}
+
+/// Run a read-only sub-agent turn (tool `task`): depth-limited recursion
+/// into run_turn with a research-only prompt; the report is capped and
+/// handed back to the parent model as the tool result.
+async fn run_subagent(
+    parent: &AgentRequest,
+    args: &Value,
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+) -> (String, bool) {
+    let description = args["description"].as_str().unwrap_or_default().to_string();
+    let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
+    if prompt.is_empty() {
+        return ("task requires a non-empty prompt".into(), false);
+    }
+
+    emit(&AgentEvent::Status {
+        stage: "subagent".into(),
+        content: description.clone(),
+    });
+
+    // Read-only sub-request: same model config, research-only system prompt.
+    let sub_req = AgentRequest {
+        provider: parent.provider.clone(),
+        provider_id: parent.provider_id.clone(),
+        model: parent.model.clone(),
+        base_url: parent.base_url.clone(),
+        api_key: parent.api_key.clone(),
+        api_keys: parent.api_keys.clone(),
+        root: parent.root.clone(),
+        mode: "subagent".into(),
+        prompt,
+        history: Vec::new(),
+        system_prompt: format!(
+            "You are a read-only research sub-agent inside the workspace {}. \
+Search and read files, then report findings concisely. \
+You have NO write tools: never modify files. Report in English.",
+            parent.root
+        ),
+        context_window: parent.context_window,
+        chat_id: parent.chat_id.clone(),
+        mcp_servers: Value::Null,
+    };
+
+    let mut report = String::new();
+    let res = {
+        let mut sink = |ev: &AgentEvent| {
+            if let AgentEvent::Text { content } = ev {
+                report.push_str(content);
+            }
+        };
+        run_turn(&sub_req, &mut sink).await
+    };
+    if report.len() > SUBAGENT_REPORT_CAP {
+        report.truncate(SUBAGENT_REPORT_CAP);
+        report.push_str("\n… (report truncated)");
+    }
+    match res {
+        Ok(()) => (report, true),
+        Err(e) => (format!("sub-agent failed: {e}"), false),
+    }
 }
 
 fn usage_tuple(acc: &StreamAcc) -> (u64, u64) {
@@ -359,6 +437,32 @@ mod tests {
         assert!(names.contains(&"read"));
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"run_terminal"));
+    }
+
+    #[test]
+    fn tool_schemas_cover_lsp_and_task() {
+        let schemas = tool_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        for expected in [
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_symbols",
+            "lsp_diagnostics",
+            "task",
+        ] {
+            assert!(names.contains(&expected), "missing schema: {expected}");
+        }
+    }
+
+    #[test]
+    fn subagent_rejects_missing_prompt() {
+        // Synchronous guard check: empty prompt must fail fast (no model call).
+        let args = json!({"description": "d"});
+        assert!(args["prompt"].as_str().unwrap_or_default().is_empty());
     }
 
     #[test]

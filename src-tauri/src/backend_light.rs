@@ -323,11 +323,11 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
         tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
     tokio::spawn(async move {
         let tx_err = tx.clone();
-        let emit = move |ev: &agent::AgentEvent| {
+        let mut emit = move |ev: &agent::AgentEvent| {
             let line = format!("data: {}\n\n", ev.to_json());
             let _ = tx.send(Ok(axum::body::Bytes::from(line)));
         };
-        if let Err(e) = agent::run_turn(&req, emit).await {
+        if let Err(e) = agent::run_turn(&req, &mut emit).await {
             let payload = serde_json::json!({"kind": "error", "content": e});
             let _ = tx_err.send(Ok(axum::body::Bytes::from(format!(
                 "data: {payload}\n\n"

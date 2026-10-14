@@ -13,7 +13,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::agent;
 use crate::compact;
 use crate::git;
 use crate::llm::{self, LlmConfig};

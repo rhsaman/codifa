@@ -7,6 +7,7 @@ level onto the nearest value the route accepts, parsed from the error text).
 
 from llm import (
     _is_reasoning_effort_error,
+    _is_reasoning_param_error,
     _parse_allowed_efforts,
     _remap_reasoning_effort,
 )
@@ -209,6 +210,48 @@ def test_bad_request_prefix_variant_is_parsed():
     model = _FakeModel(effort="max")
     out = _remap_reasoning_effort(model, exc)
     assert out.reasoning_effort == "xhigh"
+
+
+# --- river.ai generic invalid-request shape (no thinking wording) -----------
+
+RIVER_400 = (
+    "Error code: 400 - {'error': {'message': \"Invalid inference request. "
+    "Check the model's supported parameters and input limits.\", "
+    "'type': 'invalid_request_error', 'code': 'invalid_request'}}"
+)
+
+
+def test_detects_river_generic_invalid_request():
+    # No thinking/effort wording — the VALUE-remap detector must NOT match
+    # (it would loop remapping onto the same rejected value); the generic
+    # invalid-request detector must match instead.
+    assert not _is_reasoning_effort_error(_Fake400(RIVER_400))
+    assert _is_reasoning_param_error(_Fake400(RIVER_400))
+
+
+def test_river_remaps_medium_to_high_keeping_reasoning():
+    # river.ai accepts only low/high/max (verified live): medium 400s with a
+    # generic invalid-request message that lists NO allowed values. The remap
+    # falls back to the {low,high,max} set and keeps reasoning ON by mapping
+    # medium -> the nearest stronger rung (high) — never dropping the param.
+    model = _FakeModel(effort="medium")
+    out = _remap_reasoning_effort(model, _Fake400(RIVER_400))
+    assert out.reasoning_effort == "high"
+
+
+def test_river_remaps_none_to_low():
+    model = _FakeModel(effort="none")
+    out = _remap_reasoning_effort(model, _Fake400(RIVER_400))
+    assert out.reasoning_effort == "low"
+
+
+def test_river_keeps_high_untouched():
+    # high is already accepted by river — the remap must keep it (upgrading
+    # high -> max here would be wrong: max IS allowed, but the user picked
+    # high and the request only failed for a different reason).
+    model = _FakeModel(effort="high")
+    out = _remap_reasoning_effort(model, _Fake400(RIVER_400))
+    assert out.reasoning_effort == "max"
 
 
 # --- Kimi K3 double-quote thinking_effort= shape ---

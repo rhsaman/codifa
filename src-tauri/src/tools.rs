@@ -3,6 +3,10 @@
 // LSP-backed features (symbols=, symbol fast paths) stay on the Python
 // sidecar until phase 4; the agent loop falls back to grep for names.
 
+// Phase 3-2 WIP: native core tools are only called from agent.rs, which is
+// not wired to a route yet. Silence dead-code until the route lands.
+#![allow(dead_code)]
+
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 use std::fs;

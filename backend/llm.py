@@ -1225,6 +1225,65 @@ def _is_reasoning_effort_error(exc: Exception) -> bool:
     return mentions_thinking and rejects_value
 
 
+def _is_reasoning_param_error(exc: Exception) -> bool:
+    """True when a 400 rejects the request because of ``reasoning_effort``.
+
+    Some OpenAI-compatible gateways (e.g. river.ai) reject the parameter
+    itself with a generic "Invalid inference request. Check the model's
+    supported parameters and input limits." — no mention of thinking, so
+    ``_is_reasoning_effort_error`` (which remaps the VALUE) never matches.
+    The only safe retry is dropping the parameter entirely.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    if status is None:
+        m = re.search(r"(?:error\s+code|status_code|code)[:=\s]+(\d{3})", str(exc))
+        if m:
+            try:
+                status = int(m.group(1))
+            except (TypeError, ValueError):
+                status = None
+    if status != 400:
+        return False
+    msg = str(exc).lower()
+    if "reasoning" in msg or "thinking" in msg or "effort" in msg:
+        return False  # value-level rejection: _remap_reasoning_effort handles it
+    return "invalid inference request" in msg or (
+        "invalid request" in msg and "invalid_request_error" in msg
+    )
+
+
+def _strip_reasoning_effort(model: Any) -> Any:
+    """Return a copy of ``model`` with ``reasoning_effort`` removed entirely.
+
+    Mirrors ``_strip_temperature`` for the same class of "route rejects a
+    non-essential OpenAI field" failure. Falls back to the original model
+    if cloning fails for any reason."""
+    try:
+        clone = model.model_copy(deep=False)
+    except Exception:  # noqa: BLE001
+        return model
+    mk = dict(getattr(clone, "model_kwargs", None) or {})
+    if "reasoning_effort" in mk:
+        mk = {k: v for k, v in mk.items() if k != "reasoning_effort"}
+        try:
+            clone.model_kwargs = mk
+        except Exception:  # noqa: BLE001, S110
+            pass
+    if getattr(clone, "reasoning_effort", None) is not None:
+        try:
+            clone.reasoning_effort = None
+        except Exception:  # noqa: BLE001, S110
+            pass
+    try:
+        object.__setattr__(clone, "_codifa_no_re", True)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return clone
+
+
 def _remap_reasoning_effort(model: Any, exc: Exception) -> Any:
     """Return a copy of ``model`` with ``reasoning_effort`` remapped to the
     nearest value the route accepts.

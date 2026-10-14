@@ -163,6 +163,7 @@ from llm import (
     _is_parallel_calls_error,
     _is_plan_only_step,
     _is_reasoning_effort_error,
+    _is_reasoning_param_error,
     _is_stream_options_error,
     _is_temperature_error,
     _normalized_call_sig,
@@ -171,6 +172,7 @@ from llm import (
     _RevisitStreakTracker,
     rebuild_model_fresh,
     _strip_parallel_calls,
+    _strip_reasoning_effort,
     _strip_stream_options,
     _strip_temperature,
     append_tool_result,
@@ -5152,6 +5154,7 @@ async def _run_mode_turn(
         _no_pc = False
         _no_temp = False
         _no_re = 0
+        _no_re_strip = False
         # --- Interrupted-turn resume (durable, step-by-step) -----------------
         # Every completed tool result is persisted to LangGraph's checkpointer
         # (see _save_turn_checkpoint) so a mid-turn disconnect/reconnect can replay
@@ -5729,7 +5732,29 @@ async def _run_mode_turn(
                 # turn survives instead of dying on a thinking-mode mismatch.
                 # Up to 3 remaps: providers disagree on the top rung ('max' vs
                 # 'xhigh'), so one hop may lead to another (high -> max -> xhigh).
-                if _no_re < 3 and _is_reasoning_effort_error(exc):
+                # Only steer reasoning params when we actually sent one — a
+                # generic invalid-request 400 from a model without an effort
+                # set is a different failure (input limits, bad model, ...).
+                _has_re = (
+                    getattr(model, "reasoning_effort", None) is not None
+                    or (getattr(model, "model_kwargs", None) or {}).get(
+                        "reasoning_effort"
+                    )
+                    is not None
+                )
+                if (
+                    _has_re
+                    and _no_re < 3
+                    and (
+                        _is_reasoning_effort_error(exc)
+                        or _is_reasoning_param_error(exc)
+                    )
+                ):
+                    # Value-level rejections remap to the nearest allowed
+                    # effort (keeps reasoning ON); generic invalid-request
+                    # gateways (e.g. river.ai accepts only low/high/max and
+                    # 400s medium/xhigh) fall back to the {low,high,max} set
+                    # inside _remap_reasoning_effort — medium -> high.
                     _remapped = _remap_reasoning_effort(model, exc)
                     if _remapped is not model and getattr(
                         _remapped, "reasoning_effort", None
@@ -5737,6 +5762,14 @@ async def _run_mode_turn(
                         _no_re += 1
                         model = _remapped
                         continue
+                # Last resort: gateways that reject the reasoning_effort
+                # PARAMETER itself (remap exhausted or stuck on the same
+                # value) — drop the field and retry once so the turn
+                # survives instead of burning the whole retry budget.
+                if _has_re and not _no_re_strip and _is_reasoning_param_error(exc):
+                    _no_re_strip = True
+                    model = _strip_reasoning_effort(model)
+                    continue
                 # Surface the most common per-step failures as readable SSE
                 # events instead of letting them bubble up to _drive as raw
                 # tracebacks (the old behavior looked like a silent

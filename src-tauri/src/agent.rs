@@ -4,6 +4,11 @@
 //! LSP-backed tools, MCP and subagents stay on the Python sidecar until their
 //! phases land (dispatch returns a clear error for those names).
 
+// Phase 3-2 WIP: the native agent loop is not wired to a route yet
+// (/chat/stream stays on the Python sidecar until parity). Keep the code
+// compiled and tested; silence dead-code until the route lands.
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};

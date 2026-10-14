@@ -3,6 +3,10 @@
 // (/chat/compact). Streaming chat stays on the Python sidecar until the
 // agent loop (phase 3-2) moves over.
 
+// Phase 3-2 WIP: streaming path is only called from agent.rs (not wired to a
+// route yet). Silence dead-code on the streaming half until the route lands.
+#![allow(dead_code)]
+
 use reqwest::Client;
 use serde_json::{json, Value};
 

@@ -8,6 +8,7 @@
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{Request, Response, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -350,6 +351,45 @@ async fn convert_response(res: reqwest::Response) -> Response<Body> {
         })
 }
 
+/// Permissive CORS for the webview: the renderer origin (vite dev server or
+/// tauri://localhost) is cross-origin to this loopback port and WKWebView
+/// enforces CORS strictly — without these headers every renderer fetch fails
+/// even though the proxy itself works (curl never notices the difference).
+/// The Python sidecar used to send them directly (allow_origins=["*"]); the
+/// proxy must behave the same now that all traffic flows through it.
+async fn cors(req: Request<Body>, next: Next) -> Response<Body> {
+    // Answer preflight here: the browser sends OPTIONS before any JSON POST
+    // and must get the allow headers without a round trip to the sidecar.
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut res = StatusCode::NO_CONTENT.into_response();
+        add_cors_headers(&mut res);
+        return res;
+    }
+    let mut res = next.run(req).await;
+    add_cors_headers(&mut res);
+    res
+}
+
+fn add_cors_headers(res: &mut Response<Body>) {
+    let h = res.headers_mut();
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        axum::http::HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+    );
+    h.insert(
+        axum::http::header::ACCESS_CONTROL_MAX_AGE,
+        axum::http::HeaderValue::from_static("86400"),
+    );
+}
+
 /// Catch-all: every non-native path is proxied to the Python sidecar.
 async fn proxy_fallback(st: State<AppState>, req: Request<Body>) -> Response<Body> {
     let uri: &Uri = req.uri();
@@ -376,6 +416,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
         .fallback(proxy_fallback)
+        .layer(middleware::from_fn(cors))
         .with_state(state)
 }
 
@@ -432,6 +473,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn cors_headers_on_every_response_and_preflight() {
+        let app = router(new_state(std::env::temp_dir()));
+
+        // Preflight: OPTIONS must be answered here with the allow headers —
+        // the webview sends it before any JSON POST.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/chat/stream")
+                    .header("origin", "tauri://localhost")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 204);
+        assert_eq!(
+            res.headers()["access-control-allow-origin"],
+            "*"
+        );
+
+        // Native route responses carry the headers too (the webview origin is
+        // cross-origin to this port).
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/skills")
+                    .header("origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.headers()["access-control-allow-origin"], "*");
     }
 
     #[tokio::test]

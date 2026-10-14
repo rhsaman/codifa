@@ -735,6 +735,22 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
         ),
         "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query")),
         "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath")),
+        // Native memory store (JSONL layer of memory_manager.py).
+        "save_memory" => {
+            let t = s("memory_type");
+            let mtype: &str = if t.is_empty() { "long_term" } else { &t };
+            let rec = crate::memory::add(&s("content"), mtype, root);
+            Ok(rec.to_string())
+        }
+        "search_memory" => {
+            let limit = args["max_results"].as_u64().unwrap_or(15) as usize;
+            let hits = crate::memory::search(&s("query"), root, limit);
+            if hits.is_empty() {
+                Ok("no matching memories".into())
+            } else {
+                Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
+            }
+        }
         _ => Err(format!("tool {name:?} is not available natively (proxied to the sidecar)")),
     }
 }

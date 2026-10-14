@@ -7,6 +7,7 @@
 
 mod agent;
 mod lsp;
+mod memory;
 mod backend_light;
 mod commands;
 mod compact;

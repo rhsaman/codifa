@@ -119,6 +119,8 @@ fn tool_schemas() -> Vec<Value> {
         ("lsp_symbols", "List definitions in one file (LSP)."),
         ("lsp_diagnostics", "Diagnostics for one file (LSP)."),
         ("task", "Delegate a read-only research task to a background sub-agent."),
+        ("save_memory", "Persist a durable note about the project for future sessions."),
+        ("search_memory", "Search previously saved project notes."),
     ]
     .into_iter()
     .map(|(name, desc)| {

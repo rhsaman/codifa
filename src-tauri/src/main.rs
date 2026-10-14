@@ -5,10 +5,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod backend_light;
-mod commands;
-mod git;
-mod pty;
+ mod backend_light;
+ mod commands;
+ mod compact;
+ mod git;
+ mod llm;
+ mod pty;
 mod secrets;
 mod sidecar;
 mod skills;

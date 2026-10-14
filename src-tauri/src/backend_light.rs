@@ -11,9 +11,11 @@ use axum::http::{Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::compact;
 use crate::git;
+use crate::llm::{self, LlmConfig};
 use crate::sidecar;
 use crate::skills;
 use crate::state::get_data_root;
@@ -206,6 +208,81 @@ async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
     }
 }
 
+// ---------- native /chat/compact (phase 3-1) ----------
+
+#[derive(serde::Deserialize)]
+struct CompactBody {
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    api_keys: Vec<String>,
+    #[serde(default)]
+    fallback_provider: String,
+    #[serde(default)]
+    fallback_model: String,
+    #[serde(default)]
+    fallback_base_url: String,
+    #[serde(default)]
+    fallback_api_key: String,
+    #[serde(default)]
+    history: Vec<Value>,
+    #[serde(default)]
+    context_window: usize,
+    #[serde(default)]
+    max_output: usize,
+}
+
+fn default_provider() -> String {
+    "custom".into()
+}
+
+async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
+    if body.history.is_empty() {
+        return Json(json!({ "summary": Value::Null, "keep": 0, "error": "no messages to compact" }))
+            .into_response();
+    }
+    let client = llm::http_client();
+    let model = LlmConfig {
+        provider: body.provider.clone(),
+        model: body.model.clone(),
+        base_url: body.base_url.clone(),
+        api_keys: {
+            let mut k = body.api_keys.clone();
+            if k.is_empty() && !body.api_key.is_empty() {
+                k.push(body.api_key.clone());
+            }
+            k
+        },
+        temperature: Some(0.2),
+        max_tokens: Some(4096),
+        timeout_secs: 300,
+    };
+    let fallback = if body.fallback_model.is_empty() {
+        None
+    } else {
+        Some(LlmConfig {
+            provider: if body.fallback_provider.is_empty() { body.provider.clone() } else { body.fallback_provider.clone() },
+            model: body.fallback_model.clone(),
+            base_url: if body.fallback_base_url.is_empty() { body.base_url.clone() } else { body.fallback_base_url.clone() },
+            api_keys: if body.fallback_api_key.is_empty() { model.api_keys.clone() } else { vec![body.fallback_api_key.clone()] },
+            temperature: Some(0.2),
+            max_tokens: Some(4096),
+            timeout_secs: 300,
+        })
+    };
+    match compact::compact_history(&client, &model, fallback.as_ref(), &body.history, body.context_window, body.max_output, true).await {
+        Ok(Some(out)) => Json(json!({ "summary": out.summary, "keep": out.keep, "usage": out.usage })).into_response(),
+        Ok(None) => Json(json!({ "summary": Value::Null, "keep": 0, "error": "nothing to compact" })).into_response(),
+        Err(e) => Json(json!({ "summary": Value::Null, "keep": 0, "error": e })).into_response(),
+    }
+}
+
 // ---------- proxy plumbing ----------
 
 async fn sidecar_base() -> Option<String> {
@@ -286,6 +363,7 @@ pub fn router(state: AppState) -> Router {
         .route("/skills/sync", post(skills_sync))
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
+        .route("/chat/compact", post(chat_compact))
         .fallback(proxy_fallback)
         .with_state(state)
 }

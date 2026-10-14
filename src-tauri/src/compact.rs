@@ -279,6 +279,7 @@ pub async fn compact_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn msg(role: &str, content: &str) -> Value {
         json!({ "role": role, "content": content })

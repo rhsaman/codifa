@@ -284,33 +284,11 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     }
 }
 
-// ---------- native /chat/stream (phase 3-2) ----------
-
-async fn chat_stream(Json(body): Json<Value>) -> Response<Body> {
-    let Ok(req) = serde_json::from_value::<agent::AgentRequest>(body) else {
-        return bad_request("invalid agent request");
-    };
-    // Unbounded channel: the event callback is a sync FnMut called from
-    // inside the tokio runtime, so blocking_send would panic; unbounded
-    // send is non-blocking and the SSE consumer drains it as fast as the
-    // client reads.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
-    tokio::spawn(async move {
-        let tx = tx;
-        let _ = agent::run_turn(&req, &|ev: &agent::AgentEvent| {
-            let line = format!("data: {}\n\n", ev.to_json());
-            let _ = tx.send(Ok(line.into_bytes()));
-        })
-        .await;
-    });
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
-}
+// ---------- /chat/stream ----------
+// Served by the Python sidecar through the catch-all proxy below. The native
+// Rust agent loop (agent.rs) has not reached feature parity yet (LangGraph
+// checkpoints, MCP, sub-agents), and intercepting this route broke live
+// chats. Re-enable a native handler only once agent.rs reaches parity.
 
 // ---------- proxy plumbing ----------
 
@@ -356,16 +334,21 @@ async fn proxy_all(st: AppState, req: Request<Body>, path: &str) -> Response<Bod
 async fn convert_response(res: reqwest::Response) -> Response<Body> {
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let headers = res.headers().clone();
-    let bytes = res.bytes().await.unwrap_or_default();
     let mut builder = Response::builder().status(status);
     for (k, v) in headers.iter() {
         if matches!(k.as_str(), "content-type" | "content-disposition" | "cache-control") {
             builder = builder.header(k, v);
         }
     }
-    builder.body(Body::from(bytes)).unwrap_or_else(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response()
-    })
+    // Stream the sidecar body through instead of buffering it: SSE endpoints
+    // (/chat/stream) must deliver deltas incrementally — buffering holds every
+    // event until the whole turn finishes, the frontend watchdog sees a silent
+    // stream and reconnects ("Connection lost").
+    builder
+        .body(Body::from_stream(res.bytes_stream()))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response()
+        })
 }
 
 /// Catch-all: every non-native path is proxied to the Python sidecar.
@@ -393,7 +376,6 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
-        .route("/chat/stream", post(chat_stream))
         .fallback(proxy_fallback)
         .with_state(state)
 }

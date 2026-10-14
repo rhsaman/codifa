@@ -304,6 +304,13 @@ def _load() -> None:
             # only reserves what each run asks for. Numerics (and ranking
             # quality) are unaffected — allocator choice only, not math.
             _sess_opts = onnxruntime.SessionOptions()
+            # Disable the CPU memory arena entirely: with kSameAsRequested the
+            # arena still grows to the largest single batch and is never
+            # returned to the OS. Disabling it makes every allocation go
+            # through the system allocator, which actually frees — peak RSS
+            # stays near the 1.1 GB weights instead of weights + arena.
+            with contextlib.suppress(Exception):
+                _sess_opts.enable_cpu_mem_arena = False
             with contextlib.suppress(Exception):
                 _sess_opts.add_session_config_entry(
                     "arena_extend_strategy", "kSameAsRequested"

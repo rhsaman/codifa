@@ -500,12 +500,12 @@ mod tests {
         ));
         assert!(!apply_sse_payload(
             "custom",
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"file"}]}}]}]}"#,
+            r#"{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "read", "arguments": "{\"file"}}]}}]}"#,
             &mut acc
         ));
         assert!(!apply_sse_payload(
             "custom",
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"filePath\":\"a\"}"}}]}}]}"#,
+            r#"{"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "Path\":\"a\"}"}}]}}]}"#,
             &mut acc
         ));
         assert!(!apply_sse_payload(

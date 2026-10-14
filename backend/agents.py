@@ -970,6 +970,20 @@ def _is_retryable(exc: BaseException) -> bool:
     )
     if any(p in _low for p in _validation_patterns):
         return False
+    # ── Hard-fail: permanent invalid-request rejections ────────────────
+    # 400 "Invalid inference request. Check the model's supported parameters
+    # and input limits." (and similar wordings) is a *permanent* rejection of
+    # the payload itself — retrying the identical request burns the full
+    # retry budget (~5 min) and then still fails with the same 400.
+    _invalid_request_patterns = (
+        "invalid inference request",
+        "invalid request",
+        "unsupported parameter",
+        "not a valid parameter",
+        "invalid parameter",
+    )
+    if any(p in _low for p in _invalid_request_patterns):
+        return False
     # ── Hard-fail: context overflow ───────────────────────────────────
     # 400 "exceeds the available context size" / "context_length_exceeded"
     # means the *entire request* is too big — retrying the same oversized

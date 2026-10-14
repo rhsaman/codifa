@@ -413,6 +413,26 @@ def test_400_duplicate_function_call_output_is_not_retryable():
     assert agents._is_retryable(exc) is False
 
 
+def test_400_invalid_inference_request_is_not_retryable():
+    """400 "Invalid inference request … input limits" is a permanent rejection
+    of the payload itself (bad parameter / input over the model's limits).
+    Retrying the identical request burns the full retry budget and then fails
+    with the same 400 — must fail fast like the validation errors."""
+    exc = RuntimeError(
+        "Error code: 400 - {'error': {'message': \"Invalid inference request. "
+        "Check the model's supported parameters and input limits.\", "
+        "'type': 'invalid_request_error', 'code': 'invalid_request'}}"
+    )
+    assert agents._is_retryable(exc) is False
+
+    # Generic "invalid request" wording without the inference prefix
+    exc2 = RuntimeError(
+        'Error code: 400 - {"error": {"message": "Invalid request: '
+        'unsupported parameter: reasoning_effort"}}'
+    )
+    assert agents._is_retryable(exc2) is False
+
+
 def test_hard_quota_exhausted_still_detected():
     """A genuine usage-quota cap (no transient phrase) is still detected as
     exhausted and skips the retry loop."""

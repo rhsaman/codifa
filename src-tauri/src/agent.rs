@@ -22,8 +22,6 @@ const MAX_STEPS: usize = 60;
 const TOOL_RESULT_CAP: usize = 4000;
 /// Sub-agent depth limit (mirrors graph.py: sub-agents cannot spawn more).
 const MAX_SUBAGENT_DEPTH: usize = 1;
-/// Cap on the sub-agent report handed back to the parent model.
-const SUBAGENT_REPORT_CAP: usize = 6000;
 
 // ---------------------------------------------------------------------------
 // Request / events
@@ -103,24 +101,17 @@ impl AgentEvent {
     }
 }
 
-/// Tool schemas bound into the chat request (core native set + LSP tools).
+/// Tool schemas for the MAIN agent: no search/read tools — the main agent
+/// delegates all research to the `explore` sub-agent and works only with the
+/// data the sub-agent returns (user request: main agent must not search).
 fn tool_schemas() -> Vec<Value> {
     [
-        ("read", "Read a file (optionally a window via offset/limit)."),
-        ("grep", "Regex content search under a path."),
-        ("glob", "Find files by glob pattern (path-scoped)."),
         ("write_file", "Create or overwrite a file."),
         ("edit_file", "Replace an exact string in an existing file."),
         ("run_terminal", "Run a shell command in the workspace with a timeout."),
         ("current_time", "Current UTC time."),
-        ("lsp_definition", "Jump to the definition of a symbol (LSP)."),
-        ("lsp_references", "Find references of a symbol (LSP)."),
-        ("lsp_hover", "Hover text/signature for a symbol (LSP)."),
-        ("lsp_symbols", "List definitions in one file (LSP)."),
-        ("lsp_diagnostics", "Diagnostics for one file (LSP)."),
-        ("task", "Delegate a read-only research task to a background sub-agent."),
+        ("explore", "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need."),
         ("save_memory", "Persist a durable note about the project for future sessions."),
-        ("search_memory", "Search previously saved project notes."),
     ]
     .into_iter()
     .map(|(name, desc)| {
@@ -147,6 +138,50 @@ fn tool_schemas() -> Vec<Value> {
                         "offset": {"type": "integer"},
                         "limit": {"type": "integer"},
                         "max_results": {"type": "integer"},
+                    },
+                },
+            },
+        })
+    })
+    .collect()
+}
+
+/// Tool schemas for the explore SUB-AGENT: the full read/search set the main
+/// agent no longer has (read/grep/glob/LSP) plus memory search.
+fn research_schemas() -> Vec<Value> {
+    [
+        ("read", "Read a file (optionally a window via offset/limit)."),
+        ("grep", "Regex content search under a path."),
+        ("glob", "Find files by glob pattern (path-scoped)."),
+        ("lsp_definition", "Jump to the definition of a symbol (LSP)."),
+        ("lsp_references", "Find references of a symbol (LSP)."),
+        ("lsp_hover", "Hover text/signature for a symbol (LSP)."),
+        ("lsp_symbols", "List definitions in one file (LSP)."),
+        ("lsp_diagnostics", "Diagnostics for one file (LSP)."),
+        ("search_memory", "Search previously saved project notes."),
+    ]
+    .into_iter()
+    .map(|(name, desc)| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filePath": {"type": "string"},
+                        "path": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "patterns": {"type": "array", "items": {"type": "string"}},
+                        "include": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                        "max_results": {"type": "integer"},
+                        "query": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "character": {"type": "integer"},
+                        "line": {"type": "integer"},
                     },
                 },
             },
@@ -212,6 +247,14 @@ pub async fn run_turn(
         content: "Contacting model".into(),
     });
 
+    // The explore sub-agent gets the full read/search set; the main agent
+    // deliberately has NO search tools and must delegate via `explore`.
+    let schemas = if req.mode == "subagent" {
+        research_schemas()
+    } else {
+        tool_schemas()
+    };
+
     for _step in 0..MAX_STEPS {
         // stream_chat accumulates text/tool_calls itself; the sink only
         // forwards live text deltas to the SSE stream.
@@ -222,7 +265,7 @@ pub async fn run_turn(
                 });
             }
         };
-        let acc = match stream_chat(&client, &cfg, &messages, Some(&tool_schemas()), &mut sink).await
+        let acc = match stream_chat(&client, &cfg, &messages, Some(&schemas), &mut sink).await
         {
             Ok(acc) => acc,
             Err((_, e)) => {
@@ -274,7 +317,7 @@ pub async fn run_turn(
                 stage: "tool".into(),
                 content: name.clone(),
             });
-            let (result, ok) = if name == "task" {
+            let (result, ok) = if name == "explore" || name == "task" {
                 if req.mode == "subagent" {
                     ("sub-agents cannot spawn further sub-agents".into(), false)
                 } else {
@@ -313,9 +356,11 @@ pub async fn run_turn(
     Ok(())
 }
 
-/// Run a read-only sub-agent turn (tool `task`): depth-limited recursion
-/// into run_turn with a research-only prompt; the report is capped and
-/// handed back to the parent model as the tool result.
+/// Run the explore sub-agent (tools `explore`/`task`): depth-limited
+/// recursion into run_turn with a research-only prompt and the FULL
+/// read/search tool set. The report is returned UNCAPPED — the main agent
+/// has no search tools of its own, so this report is its only source of
+/// data (UI echo is still capped by the caller).
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
@@ -324,7 +369,7 @@ async fn run_subagent(
     let description = args["description"].as_str().unwrap_or_default().to_string();
     let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
     if prompt.is_empty() {
-        return ("task requires a non-empty prompt".into(), false);
+        return ("explore requires a non-empty prompt".into(), false);
     }
 
     emit(&AgentEvent::Status {
@@ -345,9 +390,12 @@ async fn run_subagent(
         prompt,
         history: Vec::new(),
         system_prompt: format!(
-            "You are a read-only research sub-agent inside the workspace {}. \
-Search and read files, then report findings concisely. \
-You have NO write tools: never modify files. Report in English.",
+            "You are the explore sub-agent inside the workspace {}. \
+Search and read files (read/grep/glob/LSP tools) and report the FULL \
+findings — the main agent cannot search itself and relies entirely on \
+your report, so include exact file paths, line numbers, symbol names \
+and relevant code excerpts. You have NO write tools: never modify files. \
+Report in English.",
             parent.root
         ),
         context_window: parent.context_window,
@@ -364,10 +412,6 @@ You have NO write tools: never modify files. Report in English.",
         };
         run_turn(&sub_req, &mut sink).await
     };
-    if report.len() > SUBAGENT_REPORT_CAP {
-        report.truncate(SUBAGENT_REPORT_CAP);
-        report.push_str("\n… (report truncated)");
-    }
     match res {
         Ok(()) => (report, true),
         Err(e) => (format!("sub-agent failed: {e}"), false),
@@ -393,8 +437,10 @@ fn default_system_prompt(mode: &str, root: &str) -> String {
     format!(
         "You are Codifa, a coding agent inside the user's desktop IDE. \
 Workspace root: {root}. Mode: {mode}. \
-Use the provided tools (read/grep/glob/write_file/edit_file/run_terminal) to \
-work inside the workspace. Reply in the user's language. \
+You have NO search/read tools: delegate ALL file reading, searching and \
+LSP lookups to the `explore` sub-agent and work from its full report. \
+Use write_file/edit_file/run_terminal to make changes. \
+Reply in the user's language. \
 Docstrings and comments in code must be English."
     )
 }
@@ -430,34 +476,44 @@ mod tests {
     }
 
     #[test]
-    fn tool_schemas_cover_core_set() {
+    fn tool_schemas_main_agent_has_no_search_tools() {
         let schemas = tool_schemas();
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        assert!(names.contains(&"read"));
+        // Main agent must NOT have search/read tools — research is delegated.
+        for banned in ["read", "grep", "glob", "lsp_definition", "lsp_symbols"] {
+            assert!(!names.contains(&banned), "main agent must not have {banned}");
+        }
+        assert!(names.contains(&"explore"));
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"run_terminal"));
     }
 
     #[test]
-    fn tool_schemas_cover_lsp_and_task() {
-        let schemas = tool_schemas();
+    fn research_schemas_cover_search_set() {
+        let schemas = research_schemas();
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
         for expected in [
+            "read",
+            "grep",
+            "glob",
             "lsp_definition",
             "lsp_references",
             "lsp_hover",
             "lsp_symbols",
             "lsp_diagnostics",
-            "task",
+            "search_memory",
         ] {
             assert!(names.contains(&expected), "missing schema: {expected}");
         }
+        // The sub-agent must not be able to write or spawn agents.
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"explore"));
     }
 
     #[test]

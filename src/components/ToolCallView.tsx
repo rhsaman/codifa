@@ -80,6 +80,7 @@ const TOOL_LABEL: Record<string, string> = {
   ask_user: "Ask User",
   fetch_url: "Fetch URL",
   task: "Task",
+  explore: "Explore",
   vision: "Vision",
   create_skill: "Create Skill",
   create_mcp: "Create MCP",
@@ -109,6 +110,7 @@ const TOOL_ICON: Record<string, string> = {
   memory: "🧠",
   ask_user: "❓",
   task: "🧩",
+  explore: "🔍",
   vision: "🖼",
   create_skill: "⚙",
   create_mcp: "🔌",
@@ -141,6 +143,7 @@ const TOOL_NOUN: Record<string, [string, string]> = {
   memory: ["note", "notes"],
   ask_user: ["question", "questions"],
   task: ["sub-agent call", "sub-agent calls"],
+  explore: ["explore run", "explore runs"],
   vision: ["image lookup", "image lookups"],
   create_skill: ["skill saved", "skills saved"],
   create_mcp: ["connector added", "connectors added"],
@@ -165,12 +168,14 @@ function groupSummary(activities: ToolActivity[]): string {
 }
 
 /** A task card running the background sub-agent (opencode-style subagent;
- *  "explore"/"general" are legacy pre-rename types the backend still accepts). */
+ *  "explore" is the native Rust research sub-agent; "general" is a legacy
+ *  pre-rename type the backend still accepts). */
 export const isSubagentCard = (a: ToolActivity) =>
-  a.tool === "task" &&
+  (a.tool === "task" || a.tool === "explore") &&
   (a.args?.subagent_type === "subagent" ||
     a.args?.subagent_type === "explore" ||
-    a.args?.subagent_type === "general");
+    a.args?.subagent_type === "general" ||
+    a.tool === "explore");
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;

@@ -159,9 +159,242 @@ async fn complete_with_key(
     extract_completion(&cfg.provider, &v)
 }
 
-/// Pull (text, usage) out of a provider response.
-fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, String)> {
+// ---------------------------------------------------------------------------
+// Streaming (SSE) — phase 3-2: the agent loop consumes deltas + tool_calls.
+// ---------------------------------------------------------------------------
+
+/// One streamed step's accumulated output.
+#[derive(Debug, Default, Clone)]
+pub struct StreamAcc {
+    pub text: String,
+    /// OpenAI-style tool calls accumulated across deltas: {id, name, arguments}.
+    pub tool_calls: Vec<Value>,
+    pub finish_reason: String,
+    pub usage: Option<Value>,
+}
+
+/// Callback fired for every text delta (the agent loop forwards these live).
+pub type DeltaSink<'a> = &'a mut (dyn FnMut(&str) + 'a);
+
+/// Parse one SSE `data:` payload into accumulator updates. Returns true when
+/// the payload was a terminal `[DONE]` marker.
+fn apply_sse_payload(provider: &str, payload: &str, acc: &mut StreamAcc) -> bool {
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        return true;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
     match provider {
+        "anthropic" => {
+            match v["type"].as_str() {
+                Some("content_block_delta") => {
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        acc.text.push_str(t);
+                    }
+                }
+                Some("message_delta") => {
+                    acc.finish_reason = v["delta"]["stop_reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    if v["usage"].is_object() {
+                        let merged = match acc.usage.take() {
+                            Some(u) => {
+                                let mut m = u;
+                                for (k, val) in v["usage"].as_object().unwrap() {
+                                    m[k] = val.clone();
+                                }
+                                m
+                            }
+                            None => v["usage"].clone(),
+                        };
+                        acc.usage = Some(merged);
+                    }
+                }
+                Some("message_start") => {
+                    if v["message"]["usage"].is_object() {
+                        acc.usage = Some(v["message"]["usage"].clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        "google" => {
+            if let Some(t) = v["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                acc.text.push_str(t);
+            }
+            if v["usageMetadata"].is_object() {
+                acc.usage = Some(v["usageMetadata"].clone());
+            }
+            if v["candidates"][0]["finishReason"].is_string() {
+                acc.finish_reason = v["candidates"][0]["finishReason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+        _ => {
+            let choice = &v["choices"][0];
+            if let Some(t) = choice["delta"]["content"].as_str() {
+                acc.text.push_str(t);
+            }
+            if let Some(tcs) = choice["delta"]["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    if acc.tool_calls.len() <= idx {
+                        acc.tool_calls.resize_with(idx + 1, || json!({}));
+                    }
+                    let slot = &mut acc.tool_calls[idx];
+                    if let Some(id) = tc["id"].as_str() {
+                        slot["id"] = json!(id);
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        slot["function"]["name"] = json!(name);
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        let cur = slot["function"]["arguments"].as_str().unwrap_or_default();
+                        slot["function"]["arguments"] = json!(format!("{cur}{args}"));
+                    }
+                }
+            }
+            if let Some(fr) = choice["finish_reason"].as_str() {
+                acc.finish_reason = fr.to_string();
+            }
+            if v["usage"].is_object() {
+                acc.usage = Some(v["usage"].clone());
+            }
+        }
+    }
+    false
+}
+
+/// Stream one chat completion, invoking `on_delta` for every text chunk.
+/// Returns the accumulated result (text, tool_calls, finish_reason, usage).
+pub async fn stream_chat(
+    client: &Client,
+    cfg: &LlmConfig,
+    messages: &[Value],
+    on_delta: DeltaSink<'_>,
+) -> Result<StreamAcc, (u16, String)> {
+    if cfg.api_keys.is_empty() {
+        return Err((0, "no api key configured".into()));
+    }
+    let mut last_err = String::new();
+    for key in &cfg.api_keys {
+        match stream_with_key(client, cfg, key, messages, on_delta).await {
+            Ok(acc) => return Ok(acc),
+            Err((status, body)) if is_key_error(status, &body) => {
+                last_err = format!("key rejected ({status}): {body}");
+                continue;
+            }
+            Err((_, body)) => return Err((0, body)),
+        }
+    }
+    Err((0, last_err))
+}
+
+async fn stream_with_key(
+    client: &Client,
+    cfg: &LlmConfig,
+    key: &str,
+    messages: &[Value],
+    on_delta: DeltaSink<'_>,
+) -> Result<StreamAcc, (u16, String)> {
+    let base = normalize_base(&cfg.provider, &cfg.base_url);
+    let (url, header_name, header_value) = match cfg.provider.as_str() {
+        "anthropic" => (format!("{base}/v1/messages"), "x-api-key", key.to_string()),
+        "google" => (
+            format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse", model = cfg.model),
+            "x-goog-api-key",
+            key.to_string(),
+        ),
+        _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
+    };
+
+    let mut body = json!({});
+    match cfg.provider.as_str() {
+        "anthropic" => {
+            let system: Vec<&str> = messages
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .filter_map(|m| m["content"].as_str())
+                .collect();
+            body["model"] = json!(cfg.model);
+            body["max_tokens"] = json!(cfg.max_tokens.unwrap_or(4096));
+            if !system.is_empty() {
+                body["system"] = json!(system.join("\n\n"));
+            }
+            body["messages"] = json!(messages
+                .iter()
+                .filter(|m| m["role"] != "system")
+                .collect::<Vec<_>>());
+            body["stream"] = json!(true);
+        }
+        "google" => {
+            if let Some(sys) = messages.iter().find(|m| m["role"] == "system") {
+                body["systemInstruction"] = json!({ "parts": [{ "text": sys["content"] }] });
+            }
+            body["contents"] = json!(messages
+                .iter()
+                .filter(|m| m["role"] != "system")
+                .collect::<Vec<_>>());
+        }
+        _ => {
+            body["model"] = json!(cfg.model);
+            body["stream"] = json!(true);
+            body["messages"] = json!(messages);
+            if let Some(t) = cfg.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(mt) = cfg.max_tokens {
+                body["max_tokens"] = json!(mt);
+            }
+        }
+    }
+
+    let mut req = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
+        .header(header_name, header_value)
+        .json(&body);
+    if cfg.provider == "anthropic" {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err((status, text));
+    }
+
+    let mut acc = StreamAcc::default();
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| (0u16, e.to_string()))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE frames are separated by a blank line.
+        while let Some(pos) = buf.find("\n\n") {
+            let frame: String = buf.drain(..pos + 2).collect();
+            for line in frame.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    let mut sink = |t: &str| on_delta(t);
+                    let _ = &mut sink;
+                    if apply_sse_payload(&cfg.provider, payload, &mut acc) {
+                        return Ok(acc);
+                    }
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
+
+/// Pull (text, usage) out of a provider response.
+fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, String)> {    match provider {
         "anthropic" => {
             let text: String = v["content"]
                 .as_array()
@@ -250,6 +483,69 @@ mod tests {
         let c = http_client();
         let c0 = cfg("custom", "http://127.0.0.1:1", &[]);
         assert!(tokio_test_block(&c, &c0).contains("no api key"));
+    }
+
+    #[test]
+    fn sse_payloads_accumulate_openai_deltas() {
+        let mut acc = StreamAcc::default();
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"content":"he"}}]}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"content":"llo"}}]}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"file"}]}}]}]}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"filePath\":\"a\"}"}}]}}]}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"input_tokens":2}}"#,
+            &mut acc
+        ));
+        assert_eq!(acc.text, "hello");
+        assert_eq!(acc.finish_reason, "tool_calls");
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0]["function"]["name"], "read");
+        assert_eq!(acc.tool_calls[0]["function"]["arguments"].as_str().unwrap(), r#"{"filePath":"a"}"#);
+        assert_eq!(acc.usage.clone().unwrap()["input_tokens"], 2);
+        // Terminal marker.
+        assert!(apply_sse_payload("custom", "[DONE]", &mut acc));
+    }
+
+    #[test]
+    fn sse_payloads_accumulate_anthropic_deltas() {
+        let mut acc = StreamAcc::default();
+        assert!(!apply_sse_payload(
+            "anthropic",
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7}}}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "anthropic",
+            r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#,
+            &mut acc
+        ));
+        assert!(!apply_sse_payload(
+            "anthropic",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            &mut acc
+        ));
+        assert_eq!(acc.text, "hi");
+        assert_eq!(acc.finish_reason, "end_turn");
+        let usage = acc.usage.unwrap();
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
     }
 
     fn tokio_test_block(client: &Client, c: &LlmConfig) -> String {

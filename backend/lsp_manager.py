@@ -49,9 +49,11 @@ _LSP_MAX_BYTES = 1_000_000
 # no extra tokens). TTL keeps stale file signatures from serving forever.
 _LSP_RESULT_TTL = 300.0
 _LSP_RESULT_CACHE_MAX = 512
-# Background update throttle (at most once a week per language).
+# Background update throttle (at most once a week per language). Stamps are
+# persisted in the user data root so an app restart does not re-run updates.
 _UPDATE_INTERVAL = 7 * 24 * 3600.0
 _UPDATE_STAMPS: dict[str, float] = {}
+_UPDATE_STAMPS_LOADED = False
 
 # Registry: language -> server command (opencode-style built-ins).
 # Bare binary names only; resolved through PATH via shutil.which so no
@@ -322,25 +324,14 @@ _INSTALL_EVENTS: dict[str, threading.Event] = {}
 _STARTING: dict[tuple[str, str], threading.Event] = {}
 _STARTING_LOCK = threading.Lock()
 
-# One-time user consent for global installs (pip/npm/brew/go/gem/cargo/rustup
-# all write outside the workspace). A global auto-install runs only after an
-# explicit approval once per language per process; without approval the binary
-# stays missing and callers show the install hint instead. Pre-approve with
-# CODIFA_LSP_INSTALL_CONSENT=1 (CI); opt out entirely with
-# CODIFA_LSP_AUTOINSTALL=0. Every stage is logged (logger) and fanned out via
-# _notify_progress so the progress log is preserved.
+# Global installs (pip/npm/brew/go/gem/cargo/rustup all write outside the
+# workspace) run automatically without asking: a missing server is installed
+# on first use and an installed one is refreshed weekly. Opt out entirely
+# with CODIFA_LSP_AUTOINSTALL=0. Every stage is logged (logger) and fanned
+# out via _notify_progress so the progress log is preserved.
 _LSP_INSTALL_CONSENT_ENV = "CODIFA_LSP_INSTALL_CONSENT"
 _INSTALL_CONFIRMED: set[str] = set()
 _INSTALL_CONFIRMED_LOCK = threading.Lock()
-
-
-def _is_global_command(cmd: list[str] | None) -> bool:
-    """True when an install command writes outside the workspace."""
-    if not cmd:
-        return False
-    lowered = " ".join(cmd).lower()
-    markers = ("pip", "npm", "gem", "cargo", "brew", "rustup", "-g", "install")
-    return any(m in lowered for m in markers)
 
 
 def has_install_consent(lang: str) -> bool:
@@ -478,6 +469,44 @@ _UPDATE_COMMANDS: dict[str, list[str]] = {
 
 _UPDATE_ATTEMPTED: set[str] = set()
 _UPDATE_ATTEMPTED_LOCK = threading.Lock()
+
+
+def _update_stamps_path() -> str:
+    """Weekly-update stamps persist in the user data root (survive restarts)."""
+    try:
+        from state_db import data_root
+
+        return os.path.join(data_root(), "lsp-update-stamps.json")
+    except Exception:  # noqa: BLE001 - state_db unavailable (standalone use)
+        root = os.environ.get("CODER_DATA_DIR") or os.path.expanduser("~/.codifa")
+        return os.path.join(root, "lsp-update-stamps.json")
+
+
+def _load_update_stamps_once() -> None:
+    """Load persisted stamps the first time an update check runs."""
+    global _UPDATE_STAMPS_LOADED
+    with _UPDATE_ATTEMPTED_LOCK:
+        if _UPDATE_STAMPS_LOADED:
+            return
+        _UPDATE_STAMPS_LOADED = True
+    try:
+        with open(_update_stamps_path(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            for key, val in raw.items():
+                _UPDATE_STAMPS[str(key)] = float(val)
+    except Exception:  # noqa: BLE001, S110 - no stamps file yet is normal
+        pass
+
+
+def _mark_updated(lang: str) -> None:
+    """Record now as the last install/update time for lang (memory + disk)."""
+    _UPDATE_STAMPS[str(lang)] = time.time()
+    try:
+        with open(_update_stamps_path(), "w", encoding="utf-8") as fh:
+            json.dump(_UPDATE_STAMPS, fh)
+    except Exception:  # noqa: BLE001, S110 - persistence is best-effort
+        pass
 
 # Global lsp config overrides (opencode-style lsp section). Shape:
 # {"python": {"disabled": bool, "command": [...], "extensions": [...],
@@ -1442,14 +1471,6 @@ class LspManager:
             return
         def _run_install() -> None:
             cmd = _INSTALL_COMMANDS.get(lang)
-            if _is_global_command(cmd) and not has_install_consent(lang):
-                logger.warning("lsp auto-install needs one-time confirmation lang=%s", lang)
-                _notify_progress(lang, "confirm_needed", f"global install needs one-time confirmation for {lang}")
-                try:
-                    event.set()
-                except Exception:  # noqa: BLE001 - set never fails
-                    pass
-                return
             announced = False
             succeeded = False
             try:
@@ -1460,6 +1481,9 @@ class LspManager:
                     proc = subprocess.run(cmd, capture_output=True, timeout=180)
                     if proc.returncode == 0:
                         succeeded = True
+                        # A fresh install counts as up to date: skip the
+                        # weekly update for this language.
+                        _mark_updated(lang)
                         logger.warning("lsp auto-install ok lang=%s", lang)
                     else:
                         logger.warning(
@@ -1503,14 +1527,14 @@ class LspManager:
                 return
         except Exception:  # noqa: BLE001 - env check never fails
             return
+        _load_update_stamps_once()
         with _UPDATE_ATTEMPTED_LOCK:
-            now = time.monotonic()
+            now = time.time()
             if lang in _UPDATE_ATTEMPTED:
                 return
             if now - _UPDATE_STAMPS.get(lang, 0.0) < _UPDATE_INTERVAL:
                 return
             _UPDATE_ATTEMPTED.add(lang)
-            _UPDATE_STAMPS[lang] = now
         cmd = _UPDATE_COMMANDS.get(lang)
         if not cmd:
             return
@@ -1518,8 +1542,10 @@ class LspManager:
             try:
                 logger.warning("lsp auto-update start lang=%s", lang)
                 _notify_progress(lang, "updating", f"updating language server for {lang}...")
-                subprocess.run(cmd, capture_output=True, timeout=180)
-                logger.warning("lsp auto-update done lang=%s", lang)
+                proc = subprocess.run(cmd, capture_output=True, timeout=180)
+                if proc.returncode == 0:
+                    _mark_updated(lang)
+                logger.warning("lsp auto-update done lang=%s rc=%s", lang, proc.returncode)
                 _notify_progress(lang, "updated", f"language server for {lang} updated")
             except Exception as exc:  # noqa: BLE001 - update is best-effort
                 logger.warning("lsp auto-update error lang=%s: %s", lang, exc)

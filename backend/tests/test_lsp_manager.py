@@ -559,6 +559,49 @@ def test_install_retry_after_consent():
             mgr.shutdown()
 
 
+def test_update_stamp_persists_and_blocks_weekly_refresh(tmp_path, monkeypatch):
+    """_mark_updated persists a stamp; a fresh process skips the weekly update."""
+    import json as _json
+    import time as _time
+
+    import lsp_manager as _lm
+
+    stamps_file = tmp_path / "lsp-update-stamps.json"
+    monkeypatch.setattr(_lm, "_update_stamps_path", lambda: str(stamps_file))
+    lang = "stamp-lang"
+
+    # Process 1: mark updated -> stamp written to disk.
+    _lm._UPDATE_STAMPS.pop(lang, None)
+    _lm._mark_updated(lang)
+    saved = _json.loads(stamps_file.read_text(encoding="utf-8"))
+    assert lang in saved
+
+    # Process 2: empty in-memory state, stamps loaded from disk -> within the
+    # weekly interval, so no update is attempted.
+    monkeypatch.setattr(_lm, "_UPDATE_STAMPS", {})
+    monkeypatch.setattr(_lm, "_UPDATE_STAMPS_LOADED", False)
+    monkeypatch.setattr(_lm, "_UPDATE_ATTEMPTED", set())
+    monkeypatch.setattr(_lm, "_UPDATE_COMMANDS", {lang: ["true"]})
+    ran: list[str] = []
+
+    class _T:
+        def start(self):
+            ran.append(lang)
+
+    monkeypatch.setattr(_lm.threading, "Thread", lambda **k: _T())
+    _lm.LspManager._maybe_auto_update(_lm, lang)
+    assert ran == []
+    assert lang in _lm._UPDATE_STAMPS  # loaded from disk
+
+    # Past the interval -> update is scheduled once (thread spawned; the
+    # real _run re-stamps on success, covered by _mark_updated above).
+    _lm._UPDATE_STAMPS[lang] = _time.time() - _lm._UPDATE_INTERVAL - 1
+    _lm.LspManager._maybe_auto_update(_lm, lang)
+    assert ran == [lang]
+    with _lm._UPDATE_ATTEMPTED_LOCK:
+        assert lang in _lm._UPDATE_ATTEMPTED
+
+
 def test_wait_for_server_blocks_until_start_finishes():
     """wait_for_server absorbs the lazy-start latency: it blocks on the
     in-progress start event and returns True once the client is live."""

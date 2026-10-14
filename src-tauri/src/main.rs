@@ -11,6 +11,7 @@ mod git;
 mod pty;
 mod secrets;
 mod sidecar;
+mod skills;
 mod state;
 mod store;
 

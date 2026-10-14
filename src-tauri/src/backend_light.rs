@@ -15,6 +15,9 @@ use serde_json::Value;
 
 use crate::git;
 use crate::sidecar;
+use crate::skills;
+use crate::state::get_data_root;
+use std::path::PathBuf;
 
 /// The public router's URL, mirrored into a global so `sidecar_url` (which
 /// runs on arbitrary threads) can hand it to the renderer.
@@ -26,7 +29,8 @@ pub fn public_url() -> Option<String> {
 }
 
 /// Bind the public router port and serve until the process exits.
-pub fn serve(_app: tauri::AppHandle) -> Result<(), String> {
+pub fn serve(app: tauri::AppHandle) -> Result<(), String> {
+    let data_root = get_data_root(&app);
     // Bind inside the tokio runtime: registering a blocking std listener
     // with tokio panics (tokio#7172).
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -42,7 +46,7 @@ pub fn serve(_app: tauri::AppHandle) -> Result<(), String> {
         let url = format!("http://127.0.0.1:{port}");
         *PUBLIC_URL.lock().unwrap() = Some(url.clone());
         eprintln!("[router] public endpoint: {url}");
-        axum::serve(listener, router(new_state()))
+        axum::serve(listener, router(new_state(data_root)))
             .await
             .map_err(|e| e.to_string())
     })
@@ -52,14 +56,17 @@ pub fn serve(_app: tauri::AppHandle) -> Result<(), String> {
 pub struct AppState {
     /// Reqwest client for proxying to the Python sidecar.
     http: reqwest::Client,
+    /// Resolved data root (~/.codifa) for the native file-backed endpoints.
+    data_root: PathBuf,
 }
 
-pub fn new_state() -> AppState {
+pub fn new_state(data_root: PathBuf) -> AppState {
     AppState {
         http: reqwest::Client::builder()
             .no_proxy()
             .build()
             .expect("reqwest client"),
+        data_root,
     }
 }
 
@@ -151,14 +158,14 @@ async fn git_push(Json(body): Json<git::PushBody>) -> Response<Body> {
     git_response(git::push(&body.root, &body.remote, &body.branch, body.set_upstream))
 }
 
-// ---------- skills / mcp / system-prompts (proxied until ported) ----------
+// ---------- skills / mcp (native) + system-prompts (proxied) ----------
 
 async fn system_prompts(State(st): State<AppState>) -> Response<Body> {
     proxy_get(&st, "/system-prompts").await
 }
 
 async fn skills_list(State(st): State<AppState>) -> Response<Body> {
-    proxy_get(&st, "/skills").await
+    Json(skills::list_skills(&st.data_root)).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -168,43 +175,38 @@ struct SkillFileQuery {
 }
 
 async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>) -> Response<Body> {
-    let url = format!(
-        "/skills/file?name={}&file={}",
-        percent_encoding(&q.name),
-        percent_encoding(&q.file)
-    );
-    proxy_get(&st, &url).await
+    match skills::read_skill_file(&st.data_root, &q.name, &q.file) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+    }
 }
 
-async fn skills_sync(st: State<AppState>, req: Request<Body>) -> Response<Body> {
-    proxy_all(st.0, req, "/skills/sync").await
+async fn skills_sync(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match skills::sync_skill(&st.data_root, &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
 }
 
 async fn mcp_list(State(st): State<AppState>) -> Response<Body> {
-    proxy_get(&st, "/mcp").await
+    Json(skills::list_mcp(&st.data_root)).into_response()
 }
 
-async fn mcp_save(st: State<AppState>, req: Request<Body>) -> Response<Body> {
-    proxy_all(st.0, req, "/mcp").await
+async fn mcp_save(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match skills::save_mcp(&st.data_root, &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
 }
 
-async fn mcp_delete(st: State<AppState>, req: Request<Body>) -> Response<Body> {
-    proxy_all(st.0, req, "/mcp/delete").await
+async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match skills::delete_mcp(&st.data_root, &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
 }
 
 // ---------- proxy plumbing ----------
-
-fn percent_encoding(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
 
 async fn sidecar_base() -> Option<String> {
     // The sidecar state lives in Tauri's managed state; the router runs on a
@@ -295,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_status_serves_natively_and_fallback_proxies() {
-        let app = router(new_state());
+        let app = router(new_state(std::env::temp_dir()));
         let root = env!("CARGO_MANIFEST_DIR");
 
         // Native route: /git/status against this repo (a real git checkout).
@@ -329,8 +331,36 @@ mod tests {
         assert_eq!(res.status(), 400);
 
         // Fallback proxy: sidecar is not running in tests -> 503, proving the
-        // fallback path exists and does not 404.
+        // fallback path exists and does not 404. /system-prompts is still
+        // proxied (prompts live in the Python agent engine).
         let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/system-prompts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn skills_and_mcp_serve_natively() {
+        // Isolated data root so the test never touches the real ~/.codifa.
+        let tmp = std::env::temp_dir().join(format!("codifa-test-{}", std::process::id()));
+        let skills_dir = tmp.join("skills").join("learn-from-docs");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("skill.md"),
+            "---\nname: Learn from Docs\ndescription: d\n---\n\n# Learn from Docs\nbody",
+        )
+        .unwrap();
+        let app = router(new_state(tmp.clone()));
+
+        // Native skills list.
+        let res = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/skills")
@@ -339,6 +369,59 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), 503);
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["skills"][0]["name"], "Learn from Docs");
+        // Frontmatter is stripped; the markdown body (incl. heading) remains.
+        assert_eq!(
+            body["skills"][0]["content"].as_str().unwrap().trim(),
+            "# Learn from Docs\nbody"
+        );
+
+        // Native MCP save + list + delete round-trip.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"docker","cfg":{"command":"docker"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["mcpServers"]["docker"]["command"], "docker");
+
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"docker"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(tmp.join("mcp").read_dir().unwrap().next().is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

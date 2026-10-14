@@ -1,7 +1,10 @@
 # ============================================================
 # Node.js / npm / yarn / pnpm / bun
 # ============================================================
-src-tauri/
+# Tauri shell IS tracked (Rust sources, config, icons) — only its build
+# output and generated artifacts are ignored below.
+src-tauri/target/
+src-tauri/gen/schemas/
 .zcode/
 .zcodeignore
 node_modules/

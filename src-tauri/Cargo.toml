@@ -1,0 +1,51 @@
+[package]
+name = "codifa"
+version = "1.8.3"
+description = "Offline-first AI coding assistant"
+authors = ["rhsaman"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
+futures-util = "0.3"
+open = "5"
+portable-pty = "0.8"
+arboard = "3"
+screenshots = "0.8"
+image = "0.25"
+rand = "0.8"
+base64 = "0.22"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+percent-encoding = "2"
+libc = "0.2"
+# Phase 2: native HTTP router (light endpoints) + proxy to the Python sidecar
+axum = { version = "0.7", features = ["http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# `tauri dev` runs a DEBUG build: without this the store/JSON/PTY hot paths
+# run unoptimized and the whole app feels far slower than the Electron release
+# build. Optimizing dependencies (not our crate) keeps incremental builds fast
+# while making dev runtime close to release.
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+tower = "0.5.3"

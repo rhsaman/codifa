@@ -1,4 +1,4 @@
-import type { DiffStats, SidecarEvent, ToolActivity } from "../types";
+import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
 
 /** شمارش +N -M را از رشته‌ی unified diff استخراج می‌کند (خطوط +++/--- نادیده گرفته می‌شوند). */
 export function diffStatsFromUnified(diff: string): DiffStats {
@@ -246,7 +246,12 @@ export function resolveToolResult(
               : "done",
         summary: event.summary,
         engine: event.engine,
-        items: event.results,
+        items:
+          event.results ??
+          (typeof event.result === "string"
+            ? (filesFromNativeResult(act.tool, event.result, act.args) as
+                unknown as SearchResultItem[] | undefined)
+            : undefined),
         model: event.model || act.model,
         elapsedMs: now - (act.startedAt ?? now),
       };
@@ -261,6 +266,42 @@ export function resolveToolResult(
   };
 
   return activities.map((a) => resolved(a, true));
+}
+
+/** Extract file rows from a native (Rust) tool's plain-text result so the UI
+ *  renders clickable file chips (icon + basename) instead of a raw text dump.
+ *  File-targeting tools take the path from their args (read's result IS the
+ *  file content); grep/glob/LSP outputs are scanned for path-like tokens. */
+export function filesFromNativeResult(
+  tool: string,
+  result: string,
+  args?: Record<string, unknown>,
+): Array<Record<string, unknown>> | null {
+  if (!result) return null;
+  const argPath = String(args?.filePath ?? args?.path ?? "");
+  if (tool === "read" || tool === "write_file" || tool === "edit_file") {
+    return argPath ? [{ file: argPath }] : null;
+  }
+  // Textual tools whose result is not a file listing.
+  if (tool === "run_terminal" || tool === "explore" || tool === "task") return null;
+  const re = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,10})(?::(\d+))?/g;
+  const seen = new Set<string>();
+  const out: Array<Record<string, unknown>> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(result)) !== null && out.length < 50) {
+    const file = m[1];
+    // Skip prose fragments like "e.g" — require a known code extension or a
+    // directory component so only real paths become chips.
+    if (
+      !file.includes("/") &&
+      !/\.(ts|tsx|js|jsx|mjs|cjs|py|rs|json|toml|md|css|scss|html|yaml|yml|txt|sh|go|java|rb|php|c|cpp|h|hpp|sql|lock|svg|png|jpg)$/i.test(file)
+    )
+      continue;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    out.push({ file, line: m[2] ? Number(m[2]) : undefined });
+  }
+  return out.length > 0 ? out : null;
 }
 
 /** Extract plain terminal text from tool result rows (`results`/`items`).

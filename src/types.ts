@@ -621,6 +621,10 @@ export interface SidecarEvent {
   ids?: string[]
   /** Structured tool results (web_search hits) shown in the tool card. */
   results?: SearchResultItem[]
+  /** Plain-text tool result from the native (Rust) tool loop — the UI
+   *  extracts file paths from it and renders clickable file chips instead
+   *  of dumping the raw text. */
+  result?: string
   /** Which web-search provider produced the results (e.g. 'tavily'). */
   engine?: string
   /** True for events emitted by a sub-agent (explore's internal read/grep/glob)

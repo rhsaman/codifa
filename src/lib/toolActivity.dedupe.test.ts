@@ -211,6 +211,66 @@ console.log('۹) sub-event duplicate: فقط یک child:')
   check('یک child باقی مانده', (out3[0].children?.length ?? 0) === 1, out3[0].children)
 }
 
+console.log('۱۰) tool_result بومی با result متنی: فایل‌ها به آیتم تبدیل می‌شوند:')
+{
+  const ev1: SidecarEvent = {
+    kind: "tool",
+    tool: "glob",
+    args: { pattern: "*", path: "/w" },
+    id: "g1",
+  } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "glob",
+    id: "g1",
+    result: "src/main.tsx\nsrc/lib/store.ts\nREADME.md\nno prose here",
+  } as any
+  const out1 = applyToolEvent([], ev1)
+  const out2 = resolveToolResult(out1, ev2)
+  const items = (out2[0].items ?? []) as unknown as Array<Record<string, unknown>>
+  check('سه فایل استخراج شد', items.length === 3, items)
+  check('مسیر اول درست است', String(items[0]?.file) === "src/main.tsx", items[0])
+}
+
+console.log('۱۱) read بومی: فایل از args استخراج می‌شود (نه از متن نتیجه):')
+{
+  const ev1: SidecarEvent = {
+    kind: "tool",
+    tool: "read",
+    args: { filePath: "/w/src/App.tsx" },
+    id: "r1",
+  } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "read",
+    id: "r1",
+    result: "import React from 'react'\n...",
+  } as any
+  const out1 = applyToolEvent([], ev1)
+  const out2 = resolveToolResult(out1, ev2)
+  const items = (out2[0].items ?? []) as unknown as Array<Record<string, unknown>>
+  check('فایل از args آمد', String(items[0]?.file) === "/w/src/App.tsx", items)
+}
+
+console.log('۱۲) run_terminal/explore: result متنی به فایل تبدیل نمی‌شود:')
+{
+  const ev1: SidecarEvent = {
+    kind: "tool",
+    tool: "run_terminal",
+    args: { command: "ls" },
+    id: "t1",
+  } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "run_terminal",
+    id: "t1",
+    result: "src/main.tsx\nREADME.md",
+  } as any
+  const out1 = applyToolEvent([], ev1)
+  const out2 = resolveToolResult(out1, ev2)
+  check('terminal بدون آیتم فایل', !out2[0].items || out2[0].items.length === 0, out2[0].items)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد.`)
   process.exit(1)

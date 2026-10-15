@@ -18,6 +18,7 @@ import { useViewerTabs } from "../lib/viewerTabs";
 import { api } from "../lib/fs";
 import { restoreCheckpoint } from "../lib/api";
 import { fixZwsp, prepareContent } from "../lib/bidi";
+import { fileBasename } from "../lib/fileTypes";
 import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
@@ -599,7 +600,8 @@ export const FileResultLinks = memo(function FileResultLinks({
             <FileChip
               path={file}
               line={line ? Number(line) : undefined}
-              display={`${file}${line ? `:${line}` : ""}`}
+              // Basename only in the UI — the full path stays in the tooltip.
+              display={`${fileBasename(file)}${line ? `:${line}` : ""}`}
             />
             {text && <span className="file-result-text">{text}</span>}
           </li>
@@ -1451,7 +1453,9 @@ function subArgSummary(activity: ToolActivity): string {
     ) {
       p += `:1–${lm}`;
     }
-    parts.push(p);
+    // Basename only — the full path must not clutter the row head.
+    const slash = p.lastIndexOf("/");
+    parts.push(slash >= 0 ? p.slice(slash + 1) : p);
   }
 
   // grep/glob/web_search: pattern or query — capped: the sub-agent merges
@@ -2112,7 +2116,7 @@ function ToolPathSpan({ path }: { path: string }) {
       }}
     >
       <FileIcon path={path} size={20} />
-      {path}
+      {fileBasename(path)}
     </span>
   );
 }

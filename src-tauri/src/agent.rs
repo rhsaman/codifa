@@ -266,7 +266,7 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "glob",
-            "Find files by glob pattern. ALWAYS pass path scoped to the likely directory — never glob the whole tree.",
+            "Find FILES (never directories) by glob. The pattern is matched against the path relative to `path`; `**/` matches zero or more directories and `*` never crosses `/`. ALWAYS pass path scoped to a real directory from the project layout. A 'no matches' answer is final — do not retry variations; use grep, or read a directory path to list it.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
@@ -276,22 +276,37 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "lsp_definition",
-            "Jump to the definition of a symbol (LSP).",
-            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+            "Jump to the DEFINITION of a symbol and show its body (LSP) — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. No need to know line/character.",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol (a usage or the declaration)"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
         ),
         (
             "lsp_references",
-            "Find references of a symbol (LSP).",
-            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+            "Find ALL references/usages of a symbol across the workspace (LSP). Pass filePath + symbol (same as lsp_definition).",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
         ),
         (
             "lsp_hover",
-            "Hover text/signature for a symbol (LSP).",
-            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+            "Type/signature/docs of a symbol (LSP). Pass filePath + symbol (same as lsp_definition).",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
         ),
         (
             "lsp_symbols",
-            "List definitions in one file (LSP).",
+            "List the functions/classes/structs of ONE file with their line ranges (query filters by name). Use it instead of reading a large file just to find where something lives, then read only that window.",
             json!({"filePath": {"type": "string"}, "query": {"type": "string"}}),
         ),
         (
@@ -593,8 +608,8 @@ pub async fn run_turn(
             matches!(
                 name,
                 "read" | "grep" | "glob" | "current_time" | "system_stats"
-                    | "search_memory" | "lsp_definition" | "lsp_hover"
-                    | "lsp_symbols" | "lsp_diagnostics"
+                    | "search_memory" | "lsp_definition" | "lsp_references"
+                    | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
             )
         };
         let mut batch: Vec<(String, String, Value)> = Vec::new();
@@ -947,6 +962,40 @@ fn is_file_search_command(cmd: &str) -> bool {
         })
 }
 
+/// System prompt of the explore sub-agent: the research strategy plus a compact
+/// project layout, so it starts from REAL paths instead of guessing with glob
+/// (a traced run burned ~20 calls hunting for `backend/`), and explicit LSP
+/// guidance (the old prompt never mentioned LSP, so the model never used it).
+fn explore_system_prompt(root: &str) -> String {
+    let layout = tools::layout_snapshot(root, 3500);
+    format!(
+        "You are the explore sub-agent inside the workspace {root}. \
+The main agent waits on you and cannot search itself, so be fast and precise: \
+aim for at most ~10 tool calls, then report.\n\n\
+How to search:\n\
+1. PROJECT LAYOUT (below) lists real paths. Start from it; never glob to discover \
+directories or file names you can already see there.\n\
+2. To find where a symbol is defined or used: ONE grep for the bare identifier \
+scoped with path/include, then lsp_definition / lsp_references with filePath + \
+symbol (no line/character needed). To locate things inside a big file use \
+lsp_symbols (names + line ranges), then read only that window.\n\
+3. glob lists FILES only (never directories) and matches the pattern against the \
+path relative to `path`; `**/` matches zero or more directories. To list a \
+directory, read its path. A 'no matches' answer is final: do NOT retry it with \
+variations — switch tool, or re-read the layout.\n\
+4. If an lsp_* tool says the language server is unavailable, stop using LSP for \
+that language and use grep + read.\n\
+5. Put independent calls in the SAME step (they run in parallel). Read only the \
+line ranges you need (offset/limit), never whole large files. Never repeat a \
+search with the same pattern.\n\n\
+Report: exact file paths, line numbers, symbol names and short code excerpts. \
+You have NO write tools: never modify files. When you learn a durable key point \
+(decision, preference, gotcha), save it with save_memory — concise, under ~500 \
+chars, never whole files or outputs. Report in English.\n\n\
+PROJECT LAYOUT (dir: entries; hidden dirs and build output omitted):\n{layout}"
+    )
+}
+
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
@@ -979,22 +1028,7 @@ async fn run_subagent(
         mode: "subagent".into(),
         prompt,
         history: Vec::new(),
-        system_prompt: format!(
-            "You are the explore sub-agent inside the workspace {}. \
-Search TARGETED, not exhaustively — the main agent waits on you, so \
-every extra call wastes its time. Strategy: (1) start from manifest/config \
-files the task points at; (2) grep with NARROW patterns scoped to likely \
-directories (always pass path/include); (3) read only the line ranges you \
-need (offset/limit), never whole large files; (4) never glob the whole \
-tree or repeat a search with the same pattern. Aim for at most ~10 tool \
-calls, then report. Include exact file paths, line numbers, symbol names \
-and short code excerpts — the main agent cannot search itself and relies \
-entirely on your report. You have NO write tools: never modify files. \
-When you learn a durable key point (decision, preference, gotcha), save it \
-with save_memory — concise, under ~500 chars, never whole files or outputs. \
-Report in English.",
-            parent.root
-        ),
+        system_prompt: explore_system_prompt(&parent.root),
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
@@ -1228,6 +1262,23 @@ mod tests {
         // The sub-agent must not be able to write or spawn agents.
         assert!(!names.contains(&"write_file"));
         assert!(!names.contains(&"explore"));
+    }
+
+    #[test]
+    fn explore_prompt_carries_layout_and_lsp_guidance() {
+        let dir = std::env::temp_dir().join(format!("codifa-explore-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backend")).unwrap();
+        std::fs::write(dir.join("backend/server.py"), "").unwrap();
+        let p = explore_system_prompt(dir.to_str().unwrap());
+        // Real paths up front, so the model never has to glob for them.
+        assert!(p.contains("backend/: server.py"), "{p}");
+        // LSP + glob semantics are spelled out (the old prompt never named LSP).
+        assert!(p.contains("lsp_definition") && p.contains("lsp_references") && p.contains("lsp_symbols"));
+        assert!(p.contains("FILES only") && p.contains("no matches"));
+        // Still read-only and English-reporting.
+        assert!(p.contains("NO write tools") && p.contains("Report in English"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

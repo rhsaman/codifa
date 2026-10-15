@@ -297,6 +297,64 @@ fn collect_files(scope: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Compact project layout for the explore sub-agent's system prompt: a
+/// breadth-first listing ("dir/: entries") of the workspace, hidden entries and
+/// SKIP_DIRS pruned, capped per directory and by `budget` bytes (whole lines
+/// only, so Persian names never get sliced). It hands the model REAL paths up
+/// front instead of letting it guess with glob.
+pub fn layout_snapshot(root: &str, budget: usize) -> String {
+    const MAX_NAMES_PER_DIR: usize = 60;
+    const MAX_DEPTH: usize = 3;
+    let root_path = Path::new(root);
+    let mut out = String::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root_path.to_path_buf(), 0));
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let mut names: Vec<(String, bool)> = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.path().is_dir();
+            if is_dir && SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            names.push((name, is_dir));
+        }
+        names.sort();
+        let rel = dir.strip_prefix(root_path).unwrap_or(&dir).to_string_lossy().to_string();
+        let label = if rel.is_empty() { "./".to_string() } else { format!("{rel}/") };
+        let total = names.len();
+        let shown: Vec<String> = names
+            .iter()
+            .take(MAX_NAMES_PER_DIR)
+            .map(|(n, d)| {
+                let n: String = n.chars().take(60).collect();
+                if *d { format!("{n}/") } else { n }
+            })
+            .collect();
+        let mut line = format!("{label}: {}", shown.join(", "));
+        if total > MAX_NAMES_PER_DIR {
+            line.push_str(&format!(", … (+{} more)", total - MAX_NAMES_PER_DIR));
+        }
+        line.push('\n');
+        if out.len() + line.len() > budget {
+            break;
+        }
+        out.push_str(&line);
+        if depth + 1 < MAX_DEPTH {
+            for (n, d) in &names {
+                if *d {
+                    queue.push_back((dir.join(n), depth + 1));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Locate the rg binary. The packaged macOS app inherits a minimal PATH
 /// (no /opt/homebrew/bin), so probe the common install locations before
 /// giving up — the agent's grep tool depends on ripgrep.
@@ -451,25 +509,40 @@ pub fn grep_scope(
     Ok(out)
 }
 
-/// Translate a glob like `*.{ts,tsx}` or `*.test.py` into a regex.
+/// Translate a glob like `*.{ts,tsx}`, `**/*.test.py` or `src/**/mod.rs` into
+/// a regex. `**/` matches ZERO or more directories (so `**/server.py` also
+/// matches a root-level `server.py` — it used to demand at least one parent
+/// dir and silently missed top-level files), `*` never crosses a `/`.
 fn glob_to_regex(glob: &str) -> regex::Regex {
     let mut pat = String::from("^");
     let mut chars = glob.chars().peekable();
+    let mut brace_depth = 0usize;
     while let Some(c) = chars.next() {
         match c {
             '*' => {
                 if chars.peek() == Some(&'*') {
                     chars.next();
-                    pat.push_str(".*");
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        pat.push_str("(?:.*/)?");
+                    } else {
+                        pat.push_str(".*");
+                    }
                 } else {
                     pat.push_str("[^/]*");
                 }
             }
-            '?' => pat.push('.'),
-            '{' => pat.push_str("(?:"),
-            '}' => pat.push(')'),
-            ',' => pat.push('|'),
-            '.' | '(' | ')' | '[' | ']' | '^' | '$' | '+' | '|' | '\\' => {
+            '?' => pat.push_str("[^/]"),
+            '{' => {
+                brace_depth += 1;
+                pat.push_str("(?:");
+            }
+            '}' if brace_depth > 0 => {
+                brace_depth -= 1;
+                pat.push(')');
+            }
+            ',' if brace_depth > 0 => pat.push('|'),
+            '.' | '(' | ')' | '[' | ']' | '^' | '$' | '+' | '|' | '\\' | '}' => {
                 pat.push('\\');
                 pat.push(c);
             }
@@ -478,6 +551,14 @@ fn glob_to_regex(glob: &str) -> regex::Regex {
     }
     pat.push('$');
     regex::Regex::new(&pat).unwrap_or_else(|_| regex::Regex::new("^$").unwrap())
+}
+
+/// A file matches when the glob hits its path relative to the glob SCOPE (what
+/// the model naturally writes for `path=src-tauri, pattern=src/*`), its path
+/// relative to the workspace root, or its bare file name (`*.ts` finds nested
+/// files the way `**/*.ts` users expect).
+fn glob_matches(re: &regex::Regex, rel_scope: &str, rel_root: &str, name: &str) -> bool {
+    re.is_match(rel_scope) || re.is_match(rel_root) || re.is_match(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,16 +573,25 @@ pub fn glob_scope(root: &Path, scope: &str, pattern: &str, max_results: usize) -
     } else {
         resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
     };
+    // A missing scope used to fall through to an empty walk and answer a
+    // plain "no matches" — the model then burned calls guessing path spellings.
+    if !scope_abs.exists() {
+        return Err(format!(
+            "path does not exist: {scope} — use a real directory from the project layout in your prompt"
+        ));
+    }
+    if scope_abs.is_file() {
+        return Err(format!("path is a file, not a directory: {scope}"));
+    }
     let re = glob_to_regex(pattern);
     let mut files = Vec::new();
     collect_files(&scope_abs, &mut files);
     let mut out = Vec::new();
     for file in files {
         let rel = file.strip_prefix(&root_real).unwrap_or(&file).to_string_lossy().to_string();
-        // Match the relative path AND the bare file name (so `*.ts` also hits
-        // nested files the way `**/*.ts` users expect).
+        let rel_scope = file.strip_prefix(&scope_abs).unwrap_or(&file).to_string_lossy().to_string();
         let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
-        if re.is_match(&rel) || re.is_match(&name) {
+        if glob_matches(&re, &rel_scope, &rel, &name) {
             out.push(rel);
             if out.len() >= max_results.min(MAX_SEARCH_RESULTS) {
                 break;
@@ -741,7 +831,9 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             let max = args["max_results"].as_u64().unwrap_or(100) as usize;
             let hits = glob_scope(Path::new(root), &scope, &pattern, max)?;
             if hits.is_empty() {
-                Ok("no matches".into())
+                Ok(format!(
+                    "no matches for {pattern:?} under {scope:?}. glob lists FILES only (never directories), skips hidden dirs and node_modules/target/dist/build, and `**/` matches zero or more directories. This answer is final — do not retry variations: use grep, or read a directory path to list its entries."
+                ))
             } else {
                 Ok(hits.join("\n"))
             }
@@ -814,24 +906,26 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
         "system_stats" => system_stats(&s("filter"), args["top"].as_u64().unwrap_or(15) as usize),
         // LSP-backed tools (phase 3-3 parity with tools.py) — served by the
         // native stdio JSON-RPC client in lsp.rs.
-        "lsp_definition" => crate::lsp::definition(
-            root,
-            &s("filePath"),
-            args["line"].as_i64().unwrap_or(1),
-            args["character"].as_i64().unwrap_or(0),
-        ),
-        "lsp_references" => crate::lsp::references(
-            root,
-            &s("filePath"),
-            args["line"].as_i64().unwrap_or(1),
-            args["character"].as_i64().unwrap_or(0),
-        ),
-        "lsp_hover" => crate::lsp::hover(
-            root,
-            &s("filePath"),
-            args["line"].as_i64().unwrap_or(1),
-            args["character"].as_i64().unwrap_or(0),
-        ),
+        // The schemas advertise `symbol=` (the model rarely knows line/column);
+        // it used to be ignored, so position defaulted to 1:0 and every call
+        // answered "No definition found". Resolve the symbol to a real position;
+        // an explicit `line` is kept as a disambiguation hint.
+        "lsp_definition" | "lsp_references" | "lsp_hover" => {
+            let file = s("filePath");
+            let symbol = s("symbol");
+            let (line, character) = if !symbol.trim().is_empty() {
+                crate::lsp::locate_symbol(root, &file, symbol.trim(), args["line"].as_i64())?
+            } else if let Some(line) = args["line"].as_i64() {
+                (line, args["character"].as_i64().unwrap_or(0))
+            } else {
+                return Err("pass filePath + symbol=<identifier> (preferred), or filePath + line + character".into());
+            };
+            match name {
+                "lsp_definition" => crate::lsp::definition(root, &file, line, character),
+                "lsp_references" => crate::lsp::references(root, &file, line, character),
+                _ => crate::lsp::hover(root, &file, line, character),
+            }
+        }
         "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query")),
         "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath")),
         // Native memory store (JSONL layer of memory_manager.py).
@@ -1018,6 +1112,61 @@ mod tests {
         assert_eq!(hits, vec!["deep/nest/x.test.ts".to_string()]);
         let hits = glob_scope(&tmp, "", "*.py", 10).unwrap();
         assert_eq!(hits, vec!["top.py".to_string()]);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn glob_double_star_matches_root_level_and_scope_relative() {
+        let tmp = std::env::temp_dir().join("codifa-glob-root-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("backend")).unwrap();
+        fs::create_dir_all(tmp.join("src-tauri/src")).unwrap();
+        fs::write(tmp.join("backend/server.py"), "").unwrap();
+        fs::write(tmp.join("src-tauri/src/agent.rs"), "").unwrap();
+        // Regression: `**/` demanded a parent dir, so root-level paths never matched.
+        let hits = glob_scope(&tmp, "", "**/backend/server.py", 10).unwrap();
+        assert_eq!(hits, vec!["backend/server.py".to_string()]);
+        // Pattern relative to the scope (path=src-tauri, pattern=src/*).
+        let hits = glob_scope(&tmp, "src-tauri", "src/*", 10).unwrap();
+        assert_eq!(hits, vec!["src-tauri/src/agent.rs".to_string()]);
+        // A missing scope is an error, not a silent "no matches".
+        let err = glob_scope(&tmp, "nope", "*.rs", 10).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn layout_snapshot_lists_real_paths_and_skips_noise() {
+        let tmp = std::env::temp_dir().join("codifa-layout-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("backend/tests")).unwrap();
+        fs::create_dir_all(tmp.join("node_modules/x")).unwrap();
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        fs::write(tmp.join("backend/server.py"), "").unwrap();
+        fs::write(tmp.join("backend/tests/t.py"), "").unwrap();
+        fs::write(tmp.join("package.json"), "").unwrap();
+        let snap = layout_snapshot(tmp.to_str().unwrap(), 4000);
+        assert!(snap.contains("./: backend/, package.json"), "{snap}");
+        assert!(snap.contains("backend/: server.py, tests/"), "{snap}");
+        assert!(snap.contains("backend/tests/: t.py"), "{snap}");
+        assert!(!snap.contains("node_modules") && !snap.contains(".git"), "{snap}");
+        assert!(layout_snapshot(tmp.to_str().unwrap(), 40).len() <= 40);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn lsp_tools_resolve_symbol_or_fail_fast_without_spawning_a_server() {
+        let tmp = std::env::temp_dir().join("codifa-lsp-dispatch-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.rs"), "fn alpha() {}\n").unwrap();
+        let root = tmp.to_str().unwrap();
+        // Neither symbol nor line: clear error instead of a bogus 1:0 lookup.
+        let err = dispatch(root, "lsp_definition", &json!({ "filePath": "a.rs" }), None).unwrap_err();
+        assert!(err.contains("symbol"), "{err}");
+        // Unknown symbol: reported before any language server is started.
+        let err = dispatch(root, "lsp_hover", &json!({ "filePath": "a.rs", "symbol": "missing_fn" }), None).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
         fs::remove_dir_all(&tmp).ok();
     }
 

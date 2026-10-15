@@ -172,6 +172,50 @@ fn write_message(stdin: &mut ChildStdin, msg: &Value) -> Result<(), String> {
 
 // --- per-root manager ---------------------------------------------------------
 
+/// PATH for language servers. A GUI-launched macOS app inherits a minimal PATH
+/// (no Homebrew, ~/.cargo/bin or nvm node), so `rust-analyzer` — or a node-based
+/// `typescript-language-server`, which needs `node` on PATH — was never found
+/// and every lsp_* call failed; the sub-agent then gave up on LSP entirely.
+fn augmented_path() -> std::ffi::OsString {
+    let mut dirs_vec: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut extra: Vec<PathBuf> = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = dirs::home_dir() {
+        for rel in [".cargo/bin", ".local/bin", "go/bin", ".volta/bin", ".bun/bin", ".pyenv/shims"] {
+            extra.push(home.join(rel));
+        }
+        if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            for e in rd.flatten() {
+                extra.push(e.path().join("bin"));
+            }
+        }
+    }
+    for d in extra {
+        if d.is_dir() && !dirs_vec.contains(&d) {
+            dirs_vec.push(d);
+        }
+    }
+    std::env::join_paths(dirs_vec).unwrap_or_default()
+}
+
+/// Resolve a bare server command against `path_env` (explicit paths pass through).
+fn resolve_binary(cmd0: &str, path_env: &std::ffi::OsStr) -> PathBuf {
+    if cmd0.contains('/') {
+        return PathBuf::from(cmd0);
+    }
+    for dir in std::env::split_paths(path_env) {
+        let cand = dir.join(cmd0);
+        if cand.is_file() {
+            return cand;
+        }
+    }
+    PathBuf::from(cmd0)
+}
+
 struct Server {
     child: Child,
     stdin: ChildStdin,
@@ -185,14 +229,22 @@ impl Server {
     fn spawn(root: &Path, language: &str) -> Result<Server, String> {
         let cmd = server_command(language)
             .ok_or_else(|| format!("no language server registered for {language}"))?;
-        let mut process = Command::new(&cmd[0])
+        let path_env = augmented_path();
+        let program = resolve_binary(&cmd[0], &path_env);
+        let mut process = Command::new(&program)
             .args(&cmd[1..])
+            .env("PATH", &path_env)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("failed to start {}: {e}", cmd[0]))?;
+            .map_err(|e| {
+                format!(
+                    "LSP unavailable: could not start {} ({e}) — the language server is not installed or not on PATH. Use grep + read for {language} files instead of retrying.",
+                    cmd[0]
+                )
+            })?;
         let stdin = process.stdin.take().ok_or("no stdin")?;
         let stdout = process.stdout.take().ok_or("no stdout")?;
         Ok(Server {
@@ -212,7 +264,13 @@ impl Server {
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
-            "capabilities": {},
+            // Without hierarchicalDocumentSymbolSupport servers answer
+            // documentSymbol with flat SymbolInformation (handled in `symbols`).
+            "capabilities": {
+                "textDocument": {
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
+                }
+            },
         });
         write_message(&mut self.stdin, &json!({"jsonrpc": "2.0", "id": next_id(), "method": "initialize", "params": params}))?;
         // Drain responses until the matching initialize result arrives.
@@ -222,7 +280,9 @@ impl Server {
                 return Err("initialize timed out".into());
             }
             let msg = read_message(&mut self.stdout)?;
-            if msg.get("id").is_some() {
+            // A server->client request also carries an `id` (and a `method`);
+            // only a method-less message is the initialize response.
+            if msg.get("id").is_some() && msg.get("method").is_none() {
                 break;
             }
         }
@@ -273,7 +333,10 @@ impl Server {
                 return Err(format!("{method} timed out"));
             }
             let msg = read_message(&mut self.stdout)?;
-            if msg.get("id").and_then(Value::as_u64) == Some(id) {
+            // Server->client requests (workDoneProgress/create, registerCapability)
+            // use their own id counter and can collide with ours: require a
+            // method-less message so one is never mistaken for our response.
+            if msg.get("id").and_then(Value::as_u64) == Some(id) && msg.get("method").is_none() {
                 if let Some(err) = msg.get("error") {
                     return Err(format!("server error: {err}"));
                 }
@@ -369,6 +432,68 @@ fn read_excerpt(path: &Path, start_line: u32, max_lines: usize) -> String {
 }
 
 // --- the five tools ------------------------------------------------------------
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_comment_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("//") || t.starts_with('#') || t.starts_with('*') || t.starts_with("/*")
+}
+
+/// Locate `symbol` in `text` as a whole word. Returns (1-based line, UTF-16
+/// character offset — the unit LSP positions use, so text before the symbol
+/// may be Persian/emoji). When `hint_line` (1-based) contains the symbol that
+/// occurrence wins; otherwise the first non-comment occurrence, then the first
+/// occurrence anywhere.
+pub fn find_symbol_position(text: &str, symbol: &str, hint_line: Option<i64>) -> Option<(i64, i64)> {
+    if symbol.is_empty() {
+        return None;
+    }
+    let occurrence = |line: &str| -> Option<i64> {
+        for (idx, _) in line.match_indices(symbol) {
+            let before = line[..idx].chars().next_back();
+            let after = line[idx + symbol.len()..].chars().next();
+            if before.map_or(true, |c| !is_ident_char(c)) && after.map_or(true, |c| !is_ident_char(c)) {
+                return Some(line[..idx].encode_utf16().count() as i64);
+            }
+        }
+        None
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(h) = hint_line {
+        if h >= 1 {
+            if let Some(line) = lines.get((h - 1) as usize) {
+                if let Some(col) = occurrence(line) {
+                    return Some((h, col));
+                }
+            }
+        }
+    }
+    let mut fallback: Option<(i64, i64)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(col) = occurrence(line) {
+            if !is_comment_line(line) {
+                return Some((i as i64 + 1, col));
+            }
+            if fallback.is_none() {
+                fallback = Some((i as i64 + 1, col));
+            }
+        }
+    }
+    fallback
+}
+
+/// Resolve `symbol=` (what the model actually knows) to a (line, character)
+/// position inside `file_path` for definition/references/hover.
+pub fn locate_symbol(root: &str, file_path: &str, symbol: &str, hint_line: Option<i64>) -> Result<(i64, i64), String> {
+    let abs = resolve_safe(root, file_path, true, None)?;
+    let text = std::fs::read_to_string(&abs).map_err(|e| format!("cannot read {file_path}: {e}"))?;
+    find_symbol_position(&text, symbol, hint_line).ok_or_else(|| {
+        format!("symbol {symbol:?} not found in {file_path} — check the spelling, or grep for it first")
+    })
+}
 
 /// lsp_definition: `path:line:character` hits; inline body for <= 3 hits.
 pub fn definition(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
@@ -499,8 +624,12 @@ pub fn symbols(root: &str, file_path: &str, query: &str) -> Result<String, Strin
                 .and_then(Value::as_u64)
                 .map(symbol_kind_name)
                 .unwrap_or_else(|| "?".into());
-            let start = n.pointer("/range/start/line").and_then(Value::as_u64).unwrap_or(0) + 1;
-            let end = n.pointer("/range/end/line").and_then(Value::as_u64).unwrap_or(0) + 1;
+            // DocumentSymbol carries `range`; flat SymbolInformation (pylsp, or
+            // any server without hierarchical support) nests it under
+            // `location.range` — reading only `range` made every symbol L1-L1.
+            let range = n.get("range").or_else(|| n.pointer("/location/range"));
+            let start = range.and_then(|r| r.pointer("/start/line")).and_then(Value::as_u64).unwrap_or(0) + 1;
+            let end = range.and_then(|r| r.pointer("/end/line")).and_then(Value::as_u64).unwrap_or(0) + 1;
             out.push((start, end, kind, name));
             if let Some(children) = n.get("children").and_then(Value::as_array) {
                 walk(children, out);
@@ -645,6 +774,37 @@ mod tests {
         assert_eq!(symbol_kind_name(5), "class");
         assert_eq!(symbol_kind_name(12), "function");
         assert_eq!(symbol_kind_name(6), "method");
+    }
+
+    #[test]
+    fn symbol_position_prefers_hint_line_then_code_over_comments() {
+        let text = "// compact_history is great\nfn other() {}\npub async fn compact_history(a: u8) {}\nlet x = compact_history(1);\n";
+        // No hint: skips the comment and lands on the declaration (line 3).
+        assert_eq!(find_symbol_position(text, "compact_history", None), Some((3, 13)));
+        // The hint line wins even when the model got the column wrong.
+        assert_eq!(find_symbol_position(text, "compact_history", Some(4)), Some((4, 8)));
+        // A hint line without the symbol falls back to the global search.
+        assert_eq!(find_symbol_position(text, "compact_history", Some(2)), Some((3, 13)));
+        // Whole-word only; comment-only occurrences still resolve as a fallback.
+        assert_eq!(find_symbol_position("fn compact_history_x() {}", "compact_history", None), None);
+        assert_eq!(find_symbol_position("// foo bar\n", "foo", None), Some((1, 3)));
+    }
+
+    #[test]
+    fn symbol_position_is_utf16_after_persian_text() {
+        // "سلام " is 5 UTF-16 units before the symbol; an emoji takes 2.
+        assert_eq!(find_symbol_position("سلام foo()\n", "foo", None), Some((1, 5)));
+        assert_eq!(find_symbol_position("😀 foo()\n", "foo", None), Some((1, 3)));
+    }
+
+    #[test]
+    fn resolve_binary_passes_explicit_paths_and_falls_back_to_bare_name() {
+        let p = augmented_path();
+        assert_eq!(resolve_binary("/x/y", &p), PathBuf::from("/x/y"));
+        assert_eq!(
+            resolve_binary("definitely-not-installed-xyz", &p),
+            PathBuf::from("definitely-not-installed-xyz")
+        );
     }
 
     #[test]

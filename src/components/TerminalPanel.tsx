@@ -213,6 +213,16 @@ export function TerminalPanel() {
     }
   }, [supported])
 
+  // Full unmount (HMR, app teardown): dispose every xterm so no stale onData
+  // handler keeps writing to live ptys after a remount adopts the sessions.
+  useEffect(() => {
+    return () => {
+      for (const entry of entries.current.values()) entry.term.dispose()
+      entries.current.clear()
+      screens.current.clear()
+    }
+  }, [])
+
   // Re-paint the xterm palette when the app theme changes.
   useEffect(() => {
     const t = xtermTheme()
@@ -331,7 +341,17 @@ export function TerminalPanel() {
     (tab: TerminalTab, el: HTMLDivElement | null) => {
       screens.current.set(tab.id, el)
       if (!el) return
-      if (entries.current.has(tab.id)) return
+      const existing = entries.current.get(tab.id)
+      if (existing) {
+        if (existing.el === el) return
+        // The screen div was remounted (StrictMode double-mount, HMR, layout
+        // switch): the old xterm is bound to a detached element but its onData
+        // handler is still live — two handlers would write every keystroke to
+        // the pty twice (duplicated typing). Dispose the stale instance and
+        // rebuild on the new element.
+        existing.term.dispose()
+        entries.current.delete(tab.id)
+      }
       if (!hasTerminalApi()) return
       const term = new Terminal({
         fontSize: 12.5,

@@ -412,15 +412,18 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
     // sender count hits zero (all clones dropped), flip the cancel flag so
     // the agent loop bails instead of burning provider tokens.
     let cancel_watcher = std::sync::Arc::clone(&cancel);
-    let watch_tx = tx.clone();
+    // Weak handle: the watcher must NOT keep the channel alive — a strong
+    // clone here meant the sender count never reached zero after run_turn
+    // finished, so the SSE stream stayed open after `done` (curl/fetch hung
+    // until its own timeout).
+    let watch_tx = tx.downgrade();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             // When the client disconnects (Stop button aborts the fetch), the
             // response body — and with it the channel receiver — is dropped,
-            // which flips the sender's is_closed(). strong_count never reaches
-            // zero here because the agent task holds its own sender clone.
-            if watch_tx.is_closed() {
+            // which flips the sender's is_closed().
+            if watch_tx.strong_count() == 0 {
                 cancel_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }

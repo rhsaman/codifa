@@ -665,7 +665,10 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 if p.is_empty() { s("path") } else { p }
             };
             let offset = args["offset"].as_u64().unwrap_or(1) as usize;
-            let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
+            // Windowed-read discipline: a whole-file read floods the context
+            // and slows the agent down. Cap the default window; larger reads
+            // must be explicit (offset/limit).
+            let limit = args["limit"].as_u64().unwrap_or(400) as usize;
             let abs = resolve_safe(root, &path, true, permit)?;
             read_window(&abs, offset, limit)
         }

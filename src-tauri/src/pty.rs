@@ -105,17 +105,47 @@ pub fn terminal_create(app: AppHandle, cwd: &str) -> Result<TerminalSessionInfo,
         cwd: cwd.to_string_lossy().into_owned(),
     };
 
-    // Reader thread: pty output -> terminal:data events.
+    // Reader thread: pty output -> terminal:data events. The buffer is a
+    // growing UTF-8 accumulator: a multi-byte char split across two reads must
+    // not be emitted as replacement chars (they corrupted the xterm input
+    // echo — typing one letter could paint extra garbage characters).
     let reader_app = app.clone();
     let reader_id = id.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut pending: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = reader_app.emit("terminal:data", (reader_id.clone(), data));
+                    pending.extend_from_slice(&buf[..n]);
+                    // Emit only up to the last complete UTF-8 char boundary.
+                    let mut emit_len = pending.len();
+                    while emit_len > 0 {
+                        match std::str::from_utf8(&pending[..emit_len]) {
+                            Ok(_) => break,
+                            Err(e) if e.error_len().is_none() => {
+                                // Incomplete tail char: try a shorter prefix.
+                                emit_len = e.valid_up_to();
+                                if emit_len > 0 {
+                                    break;
+                                }
+                                // No complete char yet — wait for more bytes.
+                                emit_len = 0;
+                                break;
+                            }
+                            Err(_) => {
+                                // Invalid bytes: drop the leading bad byte.
+                                pending.drain(..1);
+                                emit_len = pending.len();
+                            }
+                        }
+                    }
+                    if emit_len > 0 {
+                        let data = String::from_utf8_lossy(&pending[..emit_len]).into_owned();
+                        pending.drain(..emit_len);
+                        let _ = reader_app.emit("terminal:data", (reader_id.clone(), data));
+                    }
                 }
             }
         }

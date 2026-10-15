@@ -278,8 +278,17 @@ export function filesFromNativeResult(
   args?: Record<string, unknown>,
 ): Array<Record<string, unknown>> | null {
   if (!result) return null;
-  const argPath = String(args?.filePath ?? args?.path ?? "");
+  // read accepts BOTH shapes: a single filePath string and a filePaths
+  // array (the batch form the model actually sends — see the Read File
+  // cards). Only the string was read before, so batch reads produced no
+  // argPath and the chip fell back to a bare filename from the result
+  // text, which the viewer could not resolve ("No file exists").
+  const argList: string[] = Array.isArray(args?.filePaths)
+    ? (args?.filePaths as unknown[]).map(String)
+    : [];
+  const argPath = String(args?.filePath ?? args?.path ?? argList[0] ?? "");
   if (tool === "read" || tool === "write_file" || tool === "edit_file") {
+    if (argList.length > 1) return argList.map((f) => ({ file: f }));
     return argPath ? [{ file: argPath }] : null;
   }
   // Textual tools whose result is not a file listing. Memory results are

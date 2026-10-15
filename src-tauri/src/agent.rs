@@ -676,19 +676,39 @@ pub async fn run_turn(
             // Concurrent explores polled in THIS task via join_all — no
             // tokio::spawn, so no Send bound and the turn still blocks until
             // every report is back (explore stays synchronous by design).
+            // Structural events (tool cards/status/usage) flow through a
+            // channel to the parent stream so parallel explores stay VISIBLE
+            // in the chat while they work; Text/Error stay inside each
+            // sub-agent's own report (never surfaced in the chat).
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             let futures: Vec<_> = explore_batch
                 .iter()
                 .map(|(_id, _name, args)| {
                     let req_c = req.clone();
                     let args_c = args.clone();
                     let cancel_c = std::sync::Arc::clone(cancel);
+                    let tx = tx.clone();
                     Box::pin(async move {
-                        let mut sink = |_ev: &AgentEvent| {};
+                        let mut sink = move |ev: &AgentEvent| {
+                            let _ = tx.send(ev.clone());
+                        };
                         run_subagent(&req_c, &args_c, &mut sink, &cancel_c).await
                     })
                 })
                 .collect();
-            let results = futures_util::future::join_all(futures).await;
+            // Drop our sender so rx.recv() returns None once every explore
+            // has finished and the forward loop can end.
+            drop(tx);
+            let sub_all = futures_util::future::join_all(futures);
+            let forward = async {
+                while let Some(ev) = rx.recv().await {
+                    match ev {
+                        AgentEvent::Text { .. } | AgentEvent::Error { .. } => {}
+                        _ => emit(&ev),
+                    }
+                }
+            };
+            let (results, _) = tokio::join!(sub_all, forward);
             for ((id, name, args), (result, ok)) in explore_batch.into_iter().zip(results) {
                 finish_tool(
                     &mut messages,
@@ -721,9 +741,19 @@ pub async fn run_turn(
                 name: name.clone(),
                 args: args.clone(),
             });
-            let (result, ok) = match tools::dispatch(&root, name, &args, None) {
-                Ok(r) => (r, true),
-                Err(e) => (e, false),
+            let (result, ok) = if name == "run_terminal"
+                && req.mode != "subagent"
+                && is_file_search_command(args["command"].as_str().unwrap_or_default())
+            {
+                (
+                    "blocked: the main agent must not locate files via the terminal — delegate file discovery to the `explore` sub-agent".into(),
+                    false,
+                )
+            } else {
+                match tools::dispatch(&root, name, &args, None) {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
             };
             finish_tool(
                 &mut messages,
@@ -895,6 +925,22 @@ fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
 /// flag (Stop button) aborts every concurrent explore too.
 type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
+/// True when a shell command tries to LOCATE files (find/grep/rg/ls/…).
+/// The main agent has no search tools by design — file discovery must go
+/// through the explore sub-agent, not terminal one-liners (user request).
+fn is_file_search_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    // Check every pipeline/chain segment, not just the first token.
+    lower
+        .split([';', '|', '&', '\n'])
+        .any(|seg| {
+            let t = seg.trim();
+            ["find", "grep", "rg", "ls", "fd", "locate", "tree", "glob"]
+                .iter()
+                .any(|p| t == *p || t.starts_with(&format!("{p} ")))
+        })
+}
+
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
@@ -1015,6 +1061,9 @@ fn default_system_prompt(mode: &str, root: &str) -> String {
 Workspace root: {root}. Mode: {mode}. \
 You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
+NEVER use run_terminal to find or inspect files (find/grep/rg/ls) — file \
+discovery goes through `explore` only; run_terminal is for builds, tests \
+and git. \
 Use write_file/edit_file/run_terminal to make changes. \
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \

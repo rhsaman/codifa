@@ -6464,7 +6464,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (dirSel) useStore.getState().createWorkspace(dirSel);
     };
     return (
-      <div className="chat-panel" ref={panelRef}>
+      <div className="chat-panel">
         <div
           className="empty-state"
           style={{ display: "flex", height: "100%", alignItems: "center" }}
@@ -6516,6 +6516,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   return (
     <div
       className={"chat-panel" + (dimmed ? " chat-window-dimmed" : "") + (dragOver ? " file-dragover" : "")}
+      ref={panelRef}
       data-chat-id={chat?.id ?? activeChatId}
       data-focused={isFocused ? "true" : "false"}
       onPointerDown={() => {
@@ -8725,7 +8726,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
             </svg>
           </div>
-          <span>Drop files here</span>
+                    <span>Drop files here</span>
         </div>
       )}
     </div>

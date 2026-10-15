@@ -1,8 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, suggestSimilarFiles, type WorkspaceFile } from "../lib/fs";
+import { api, normPath, resolveWorkspacePath, suggestSimilarFiles, workspaceFiles, type WorkspaceFile } from "../lib/fs";
 import { readDocumentText } from "../lib/api";
 import { commentFileSelection } from "../lib/fileComments";
+import { selectionBarPos } from "../lib/selectionBar";
 import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
@@ -226,10 +227,13 @@ export function FileViewerPanel({
   );
   const root = fileRoot || storeRoot;
   // Absolute path for external editors / image reads (plain string join — the
-  // renderer has no node:path).
-  const absPath = filePath.startsWith("/")
-    ? filePath
-    : `${(root || "").replace(/\/+$/, "")}/${filePath}`;
+  // renderer has no node:path). Invisible bidi marks are stripped first: model
+  // output and tool results carry them inside paths, and they made fs_read
+  // miss files that exist.
+  const cleanFilePath = normPath(filePath);
+  const absPath = cleanFilePath.startsWith("/")
+    ? cleanFilePath
+    : `${(root || "").replace(/\/+$/, "")}/${cleanFilePath}`;
   const ext = extOf(filePath);
   const isImage = IMAGE_EXTS.has(ext);
   // Office documents (Word/Excel/PDF) open in the system default app
@@ -313,6 +317,7 @@ export function FileViewerPanel({
     setCommentText("");
     setCommentOpen(false);
     setAnchorPos(null);
+    setSelBar(null);
     savedRangeRef.current = null;
   }, [absPath]);
   // Highlighted text for the "Add comment" action (-> owning chat's queue).
@@ -325,6 +330,9 @@ export function FileViewerPanel({
   // fixed-position textarea (no buttons, no chrome). The highlight text is
   // frozen so the open box never depends on live window selection.
   const [anchorPos, setAnchorPos] = useState<{ x: number; y: number } | null>(null);
+  // Copy/Reply toolbar armed by a highlight. The comment editor opens only
+  // after Reply, so selecting text never yanks focus into a textarea.
+  const [selBar, setSelBar] = useState<{ x: number; y: number } | null>(null);
   const [commentOpen, setCommentOpen] = useState(false);
   const [commentQuote, setCommentQuote] = useState("");
   const [commentLoc, setCommentLoc] = useState("");
@@ -421,27 +429,29 @@ export function FileViewerPanel({
       savedRangeRef.current = null;
     }
     setSelection(text);
-    try {
-      const rect = savedRect;
-      if (rect && (rect.width > 0 || rect.height > 0) && typeof window !== "undefined") {
-        const vw = window.innerWidth || 800;
-        const vh = window.innerHeight || 600;
-        const boxW = 280;
-        const boxH = 90;
-        setAnchorPos({
-          x: Math.min(Math.max(rect.left, 8), Math.max(vw - boxW - 8, 8)),
-          y: Math.max(8, Math.min(rect.bottom + 8, Math.max(vh - boxH - 8, 8))),
-        });
-      } else {
-        setAnchorPos((prev) => prev ?? { x: 16, y: 96 });
-      }
-    } catch {
-      setAnchorPos((prev) => prev ?? { x: 16, y: 96 });
-    }
     const loc = locateSelection(sel);
     setCommentLoc(loc);
     // Frozen quote: set once on open, never rewritten while open (see guard).
     setCommentQuote(text);
+    // Arm the Copy/Reply toolbar at the highlight instead of opening the
+    // editor: a textarea that grabs focus mid-drag interrupts the selection.
+    try {
+      const rect = savedRect;
+      if (rect && (rect.width > 0 || rect.height > 0) && typeof window !== "undefined") {
+        setSelBar(
+          selectionBarPos(rect, window.innerWidth, window.innerHeight),
+        );
+      } else {
+        setSelBar((prev) => prev ?? { x: 16, y: 96 });
+      }
+    } catch {
+      setSelBar((prev) => prev ?? { x: 16, y: 96 });
+    }
+  };
+  /** Reply: open the comment editor at the armed toolbar position. */
+  const openCommentBox = () => {
+    setAnchorPos(selBar ?? { x: 16, y: 96 });
+    setSelBar(null);
     setCommentOpen(true);
     // Keep the document scroll stable: focusing without preventScroll yanks
     // the viewer and makes the highlight look like it jumps. Focus never
@@ -454,6 +464,20 @@ export function FileViewerPanel({
         commentInputRef.current?.focus?.();
       }
     });
+  };
+  /** Copy: put the highlighted text on the clipboard and dismiss the toolbar.
+   *  The LIVE selection wins over the frozen quote — the user may have
+   *  re-selected since the toolbar appeared, and only what is selected now
+   *  must land on the clipboard. */
+  const copySelection = () => {
+    let live = "";
+    try {
+      live = window.getSelection()?.toString().trim() ?? "";
+    } catch {
+      live = "";
+    }
+    void copyToClipboard(live || commentQuote || selection);
+    cancelComment();
   };
   // A highlight may end outside the panel, so listen on document. Reads are
   // deferred two frames so single-word/double-click selections commit first.
@@ -535,22 +559,23 @@ export function FileViewerPanel({
     setCommentText("");
     setCommentOpen(false);
     setAnchorPos(null);
+    setSelBar(null);
     if (typeof window !== "undefined") window.getSelection()?.removeAllRanges();
   };
   // Clicking anywhere outside the comment box dismisses it like Esc (no send).
   // No in-panel exemption: a click on code/gutter/head while the box is open
   // closes it (refreshSelection is frozen while open, so it never reopens).
   useEffect(() => {
-    if (!commentOpen) return;
+    if (!commentOpen && !selBar) return;
     const onDown = (e: PointerEvent) => {
       const t = e.target as HTMLElement | null;
-      if (t && typeof t.closest === "function" && t.closest(".fv-comment-float")) return;
+      if (t && typeof t.closest === "function" && t.closest(".fv-comment-float, .fv-sel-bar")) return;
       cancelComment();
     };
     document.addEventListener("pointerdown", onDown);
     return () => document.removeEventListener("pointerdown", onDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [commentOpen]);
+  }, [commentOpen, selBar]);
   // Ctrl+F opens the in-viewer search; Escape closes it.
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
@@ -622,23 +647,33 @@ export function FileViewerPanel({
         }
         // fs:read resolves (root, rel) and refuses to escape the root, so an
         // absolute path is read as (dir, basename) — its own containment.
-        // A trailing ":42" line suffix inside the path would miss the file —
-        // strip it (the line reaches the viewer via its own prop).
-        const cleanPath = filePath.replace(/:\d+$/, "");
-        const res = cleanPath.startsWith("/")
-          ? await api.fsRead(
-              cleanPath.slice(0, cleanPath.lastIndexOf("/")) || "/",
-              cleanPath.slice(cleanPath.lastIndexOf("/") + 1),
-            )
-          : await api.fsRead(root, cleanPath);
+        // A trailing ":42" / ":42-45" line suffix inside the path would miss
+        // the file — strip it (the line reaches the viewer via its own prop).
+        const cleanPath = normPath(filePath.replace(/:\d+(?:-\d+)?$/, ""));
+        const readPath = (rel: string) =>
+          cleanPath.startsWith("/")
+            ? api.fsRead(
+                cleanPath.slice(0, cleanPath.lastIndexOf("/")) || "/",
+                cleanPath.slice(cleanPath.lastIndexOf("/") + 1),
+              )
+            : api.fsRead(root, rel);
+        let res = await readPath(cleanPath);
+        if (res?.content == null) {
+          // The chip may carry a bare or stale path (a scoped grep returns
+          // "toolNesting.test.ts", a moved file keeps its name). Resolve it
+          // against the workspace index before declaring it missing.
+          const hit = resolveWorkspacePath(cleanPath, await workspaceFiles(root));
+          if (hit) res = await api.fsRead(root, hit.rel);
+        }
         if (!alive) return;
         setState(
           res?.content != null
             ? { loading: false, content: res.content }
             : {
                 loading: false,
-                error:
-                  "No file exists at this path — it may be planned but never created, or it has moved.",
+                // Name the attempted path and root: a bare "not found" made
+                // this undebuggable when the chip carried a stale path.
+                error: `No file exists at this path: ${cleanPath}${root ? ` (workspace: ${root})` : ""} — it may be planned but never created, or it has moved.`,
               },
         );
       } catch (err) {
@@ -1015,7 +1050,37 @@ export function FileViewerPanel({
           </span>
         </form>
       )}
-      {/* no trigger button: a finished highlight opens the box directly */}
+      {/* no trigger button: a finished highlight arms the Copy/Reply toolbar */}
+      {selBar && !commentOpen && (commentQuote || selection) && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="fv-sel-bar"
+              style={{ position: "fixed", top: selBar.y, left: selBar.x, zIndex: 9999 }}
+              onMouseUp={(e) => e.stopPropagation()}
+              onKeyUp={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="fv-sel-btn"
+                title="Copy"
+                aria-label="Copy selection"
+                onClick={copySelection}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              </button>
+              <button
+                type="button"
+                className="fv-sel-btn"
+                title="Reply"
+                aria-label="Reply to selection"
+                onClick={openCommentBox}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
       {commentOpen && (commentQuote || selection) && typeof document !== "undefined"
         ? createPortal(
             <div

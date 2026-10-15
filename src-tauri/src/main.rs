@@ -22,6 +22,7 @@ mod pty;
 mod secrets;
 mod sidecar;
 mod skills;
+mod skill_router;
 mod state;
 mod store;
 mod tools;

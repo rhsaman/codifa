@@ -215,7 +215,25 @@ const params = new URLSearchParams(window.location.search);
 };
 
 const root = createRoot(document.getElementById("root")!);
-if (params.get("scenario") === "terminal") {
+if (params.get("scenario") === "diff") {
+  // DiffView alone: lets a browser driver select diff text and assert the
+  // Copy/Reply toolbar appears instead of the comment editor opening directly.
+  const { DiffView } = await import("../../src/components/ToolCallView");
+  const sample = [
+    "--- a/x.ts",
+    "+++ b/x.ts",
+    "@@ -1,3 +1,3 @@",
+    " const a = 1",
+    "-const b = 2",
+    "+const b = 3",
+    " const c = 4",
+  ].join("\n");
+  root.render(
+    <div style={{ padding: 24, background: "var(--bg, #0b0e14)" }}>
+      <DiffView diff={sample} path="x.ts" layout="unified" />
+    </div>,
+  );
+} else if (params.get("scenario") === "terminal") {
   // Stub the pty bridge: one live session, and a counter of every resize the
   // panel pushes (the oscillation signal). Data is echoed back so the screen
   // renders something.
@@ -249,6 +267,19 @@ if (params.get("scenario") === "terminal") {
   (window as any).__term = { resizes, writes };
   const { TerminalPanel } = await import("../../src/components/TerminalPanel");
   root.render(<TerminalPanel />);
+} else if (params.get("scenario") === "diff") {
+  // Diff panel (git/review) for the highlight -> Copy/Reply flow: a selection
+  // must arm the toolbar, and the reply must state the path + line ONCE (the
+  // `[path line N]` marker the diff embeds is stripped by formatFileComment).
+  const { DiffView } = await import("../../src/components/ToolCallView");
+  root.render(
+    <div style={{ padding: 20, background: "var(--bg, #0b0e14)", color: "#ddd" }}>
+      <DiffView
+        diff={"@@ -1,4 +1,5 @@\n context line\n-removed line\n+added line\n+another added\n"}
+        path="backend/tests/test_test_execution_rule.py"
+      />
+    </div>,
+  );
 } else if (params.get("scenario") === "plan-panel") {
   // Standalone docked Plan panel (the App viewer group isn't mounted here).
   root.render(

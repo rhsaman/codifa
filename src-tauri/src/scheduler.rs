@@ -427,6 +427,7 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         prompt,
         history: vec![],
         system_prompt: String::new(),
+        skills: vec![],
         context_window: 0,
         chat_id: format!("schedule-{sid}"),
         mcp_servers: Value::Null,

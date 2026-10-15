@@ -177,6 +177,35 @@ async function fallbackWalk(root: string): Promise<WorkspaceFile[]> {
   return out
 }
 
+/** Strip invisible bidi/zero-width marks and normalize separators. Model
+ *  output and tool results routinely carry RTL marks inside paths, which made
+ *  `fs_read` miss a file that exists while the suggestion list (which already
+ *  normalized) found it. */
+export function normPath(p: string): string {
+  return p
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .trim()
+}
+
+/** Resolve a chip path that failed to open directly against the workspace
+ *  index. A scoped grep returns bare names ("toolNesting.test.ts" for
+ *  path=tests) and a moved file keeps its name, so an exact basename match
+ *  wins; otherwise the closest suggestion is used. Returns null when nothing
+ *  matches — the caller then reports the path as missing. */
+export function resolveWorkspacePath(
+  target: string,
+  files: WorkspaceFile[],
+): WorkspaceFile | null {
+  const clean = normPath(target)
+  const base = clean.split('/').pop() ?? clean
+  if (!base) return null
+  const exact = files.find((f) => f.name === base)
+  if (exact) return exact
+  return suggestSimilarFiles(clean, files, 1)[0] ?? null
+}
+
 /** Rank workspace files that look like the closest match for a path that
  *  failed to open — model output (plans, summaries) is full of paths that were
  *  never created or have moved, and a bare "not found" is a dead end. Order:
@@ -188,12 +217,7 @@ export function suggestSimilarFiles(
   files: WorkspaceFile[],
   limit = 8,
 ): WorkspaceFile[] {
-  const norm = (p: string) =>
-    p
-      .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
-      .replace(/\\/g, '/')
-      .replace(/^\.\/+/, '')
-      .trim()
+  const norm = normPath
   const target = norm(targetRel)
   if (!target) return []
   const base = target.split('/').pop() ?? target

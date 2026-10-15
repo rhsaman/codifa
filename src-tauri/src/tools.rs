@@ -944,6 +944,60 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
             }
         }
+        // Load one stored skill's body on demand (the auto-matcher inlines the
+        // obvious picks; anything else costs one tool call instead of a
+        // prompt-sized body). `file` reads an extra file of that skill.
+        "load_skill" => {
+            let name = s("name");
+            if name.trim().is_empty() {
+                return Err("load_skill requires name".into());
+            }
+            let file = s("file");
+            if !file.trim().is_empty() {
+                let v = crate::skills::read_skill_file(std::path::Path::new(root), &name, &file)?;
+                return Ok(v["content"].as_str().unwrap_or_default().to_string());
+            }
+            let all = crate::skills::list_skills(std::path::Path::new(root));
+            let wanted = name.trim().to_lowercase();
+            let hit = all["skills"].as_array().and_then(|list| {
+                list.iter().find(|sk| {
+                    let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
+                    let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
+                    n == wanted || slug == wanted
+                })
+            });
+            match hit {
+                Some(sk) => {
+                    let files: Vec<&str> = sk["files"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let mut out = format!(
+                        "===== SKILL: {} =====\nDescription: {}\n",
+                        sk["name"].as_str().unwrap_or_default(),
+                        sk["description"].as_str().unwrap_or_default()
+                    );
+                    if !files.is_empty() {
+                        out.push_str(&format!(
+                            "Extra files: {} — load a specific file with load_skill(file=<name>) only when needed.\n",
+                            files.join(", ")
+                        ));
+                    }
+                    out.push_str(&format!("\n{}\n", sk["content"].as_str().unwrap_or_default()));
+                    Ok(out)
+                }
+                None => {
+                    let names: Vec<&str> = all["skills"]
+                        .as_array()
+                        .map(|l| l.iter().filter_map(|sk| sk["name"].as_str()).collect())
+                        .unwrap_or_default();
+                    Err(format!(
+                        "skill not found: {name}. Available: {}",
+                        if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                    ))
+                }
+            }
+        }
         _ => Err(format!("tool {name:?} is not available natively (proxied to the sidecar)")),
     }
 }

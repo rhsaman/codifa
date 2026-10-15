@@ -6494,6 +6494,21 @@ body.coder-dragging .chat-split-child {
   padding-left: 10px;
 }
 
+/* Prose result of a text-output tool (LSP lookups, memory search) — those
+   results carry no file rows, so the raw text is the only output. */
+.tool-sub-result {
+  margin: 0;
+  padding: 4px 10px 8px 26px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
 .tool-sub-list .tool-card {
   background: linear-gradient(to bottom,
       color-mix(in srgb, var(--bg-hover) 80%, var(--tool-color) 20%),
@@ -21829,6 +21844,38 @@ tr[data-search-current] .fv-mark,
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
+/* Copy/Reply toolbar armed by a highlight. The comment editor opens only after
+   Reply, so selecting text never yanks focus into a textarea mid-drag. */
+.fv-sel-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 97%, transparent);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 40%);
+  backdrop-filter: blur(16px) saturate(1.2);
+}
+
+.fv-sel-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.fv-sel-btn:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 /* Floating highlight comment: */
 .fv-comment-float {
   position: fixed;
@@ -21853,7 +21900,8 @@ tr[data-search-current] .fv-mark,
    JS-anchored position; only small screens force docking. */
 @media (max-width: 760px) {
   .fv-comment-pop,
-  .fv-comment-float {
+  .fv-comment-float,
+  .fv-sel-bar {
     left: auto !important;
     right: 8px !important;
   }
@@ -22602,30 +22650,17 @@ tr[data-search-current] .fv-mark,
   height: 100%;
 }
 
-/* The horizontal scrollbar painted a dark strip along the panel's bottom
-   (read as a "black line") and its appear/disappear oscillated the fit size.
-   xterm cols already match the container width, so horizontal overflow never
-   carries content — hide it. */
+/* Wide output never scrolls the panel horizontally — lines wrap instead
+   (VSCode behaviour). xterm draws its OWN VS Code-style scrollbar element
+   (.xterm-scrollable-element > .scrollbar.horizontal), so hiding the native
+   viewport overflow is not enough: that custom horizontal bar was the dark
+   strip along the panel's bottom. */
 .terminal-screen .xterm-viewport {
   overflow-x: hidden;
 }
 
-.terminal-screen .xterm-viewport::-webkit-scrollbar:horizontal {
-  display: none;
-}
-
-/* Wide output never scrolls the panel horizontally — the horizontal
-   scrollbar read as a stray dark strip at the bottom of the terminal.
-   Lines wrap instead (same as VSCode). */
-.terminal-screen .xterm-viewport {
-  overflow-x: hidden;
-}
-
-/* xterm paints a horizontal scrollbar when a line overflows the viewport —
-   it read as a stray dark strip along the bottom of the panel. Lines wrap
-   instead (VSCode behaviour). */
-.terminal-screen .xterm-viewport {
-  overflow-x: hidden !important;
+.terminal-screen .xterm .xterm-scrollable-element > .scrollbar.horizontal {
+  display: none !important;
 }
 
 .terminal-screen .xterm-viewport::-webkit-scrollbar {

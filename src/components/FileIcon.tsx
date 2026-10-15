@@ -1,5 +1,6 @@
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
+import { normPath } from "../lib/fs";
 import { useViewerTabs } from "../lib/viewerTabs";
 import {
   AUDIO_EXTS,
@@ -542,13 +543,17 @@ export function FileIcon({
  *  dispatches the historical `coder:open-file` CustomEvent so future
  *  listeners (e.g. an external editor hook) keep working. */
 export function openWorkspaceFile(path: string, line?: number): void {
-  let clean = path.trim();
+  // Invisible bidi/zero-width marks ride along inside paths copied from model
+  // output and tool results; they make the viewer miss a file that exists.
+  let clean = normPath(path);
   if (!clean) return;
   // Message-text chips often carry the line inside the path ("store.ts:42")
   // — split it off so the viewer resolves the real file instead of missing
   // it with "No file exists at this path".
   if (line === undefined) {
-    const m = clean.match(/^(.+\.[A-Za-z0-9]+):(\d+)$/);
+    // ":42" and ":42-45" both ride inside the path — split the line off so the
+    // viewer resolves the real file instead of missing it.
+    const m = clean.match(/^(.+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$/);
     if (m) {
       clean = m[1];
       line = Number(m[2]);

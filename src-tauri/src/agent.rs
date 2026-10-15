@@ -57,6 +57,11 @@ pub struct AgentRequest {
     pub history: Vec<Value>,
     #[serde(default)]
     pub system_prompt: String,
+    /// Skill names the user attached to this turn (@mention). Their full
+    /// bodies are inlined into the system prompt, exactly like the Python
+    /// sidecar's ATTACHED SKILLS section.
+    #[serde(default)]
+    pub skills: Vec<String>,
     #[serde(default)]
     #[allow(dead_code)]
     pub context_window: u64,
@@ -142,6 +147,9 @@ pub enum AgentEvent {
     /// body) — the frontend renders it as the Plan card and the docked
     /// Plan viewer tab.
     PlanCard { title: String, body: String },
+    /// Auto-matched / attached skills for this turn (the frontend renders
+    /// them as ⚡ chips on the assistant message).
+    Skills { skills: Vec<String>, manual: bool, note: Option<String> },
     Done { aborted: bool },
     Error { content: String },
 }
@@ -170,6 +178,13 @@ impl AgentEvent {
             AgentEvent::Done { aborted } => json!({"kind": "done", "aborted": aborted}),
             AgentEvent::PlanCard { title, body } => {
                 json!({"kind": "plan_card", "title": title, "body": body})
+            }
+            AgentEvent::Skills { skills, manual, note } => {
+                let mut v = json!({"kind": "skill", "skills": skills, "manual": manual});
+                if let Some(n) = note {
+                    v["note"] = json!(n);
+                }
+                v
             }
             AgentEvent::Error { content } => json!({"kind": "error", "content": content}),
         }
@@ -215,8 +230,16 @@ fn tool_schemas() -> Vec<Value> {
             }),
         ),
         (
+            "load_skill",
+            "Load the FULL body of one stored skill by name (or one of its extra files via `file`). Skills that obviously match the request are already inlined in your prompt — call this only for a skill you need but were not given.",
+            json!({
+                "name": {"type": "string", "description": "Skill name or slug"},
+                "file": {"type": "string", "description": "Optional extra file of that skill"}
+            }),
+        ),
+        (
             "explore",
-            "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
+            "Delegate ONE research question to the explore sub-agent (it reads files, greps, globs, runs LSP lookups and returns the FULL findings — you cannot search yourself). IMPORTANT: when a task spans several independent areas, call explore SEVERAL TIMES IN THE SAME STEP — parallel calls run CONCURRENTLY and cost one round-trip, while one giant explore is slow and returns a shallow report. Prefer 2-4 focused explores (one per area/file group) over a single broad one. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
             json!({
                 "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
@@ -325,6 +348,14 @@ fn research_schemas() -> Vec<Value> {
             json!({
                 "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
                 "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
+            }),
+        ),
+        (
+            "load_skill",
+            "Load the FULL body of one stored skill by name (or one of its extra files via `file`). Skills that obviously match the request are already inlined in your prompt — call this only for a skill you need but were not given.",
+            json!({
+                "name": {"type": "string", "description": "Skill name or slug"},
+                "file": {"type": "string", "description": "Optional extra file of that skill"}
             }),
         ),
     ];
@@ -451,11 +482,34 @@ pub async fn run_turn(
 
     // Assemble the message list: system + history + current user prompt.
     let mut messages: Vec<Value> = Vec::new();
-    let system = if req.system_prompt.is_empty() {
+    let mut system = if req.system_prompt.is_empty() {
         default_system_prompt(&req.mode, &root)
     } else {
         req.system_prompt.clone()
     };
+    // Skills: the user's @mentions plus the in-code auto-match are inlined as
+    // full bodies (mirror of graph.py's SKILLS section). No picks = no tokens.
+    let skill_section = crate::skill_router::build_section(&root, &req.prompt, &req.skills);
+    if !skill_section.text.is_empty() {
+        system.push_str(&skill_section.text);
+    }
+    if !skill_section.auto.is_empty() {
+        emit(&AgentEvent::Skills {
+            skills: skill_section.auto.clone(),
+            manual: false,
+            note: None,
+        });
+    }
+    if !skill_section.missing.is_empty() {
+        emit(&AgentEvent::Skills {
+            skills: Vec::new(),
+            manual: true,
+            note: Some(format!(
+                "Attached skills not found — they may have been deleted or renamed: {}. The turn runs without them.",
+                skill_section.missing.join(", ")
+            )),
+        });
+    }
     messages.push(json!({"role": "system", "content": system}));
     for m in &req.history {
         if let (Some(role), Some(content)) = (
@@ -616,7 +670,7 @@ pub async fn run_turn(
             matches!(
                 name,
                 "read" | "grep" | "glob" | "current_time" | "system_stats"
-                    | "search_memory" | "lsp_definition" | "lsp_references"
+                    | "search_memory" | "load_skill" | "lsp_definition" | "lsp_references"
                     | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
             )
         };
@@ -1066,6 +1120,7 @@ async fn run_subagent(
         prompt,
         history: Vec::new(),
         system_prompt: explore_system_prompt(&parent.root),
+        skills: Vec::new(),
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
@@ -1132,6 +1187,9 @@ fn default_system_prompt(mode: &str, root: &str) -> String {
 Workspace root: {root}. Mode: {mode}. \
 You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
+When a task spans several independent areas, fire SEVERAL `explore` calls \
+IN THE SAME STEP (they run concurrently, one round-trip) — one focused \
+explore per area/file group, never a single broad one. \
 NEVER use run_terminal to find or inspect files (find/grep/rg/ls) — file \
 discovery goes through `explore` only; run_terminal is for builds, tests \
 and git. \
@@ -1270,6 +1328,20 @@ mod tests {
     }
 
     #[test]
+    fn explore_schema_asks_for_parallel_calls() {
+        // The model only parallelizes when the tool description says so: one
+        // broad explore used to be the default and made turns slow/shallow.
+        let schemas = tool_schemas();
+        let desc = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "explore")
+            .and_then(|s| s["function"]["description"].as_str())
+            .unwrap();
+        assert!(desc.contains("SEVERAL TIMES IN THE SAME STEP"), "{desc}");
+        assert!(desc.contains("CONCURRENTLY"), "{desc}");
+    }
+
+    #[test]
     fn research_schemas_cover_search_set() {
         let schemas = research_schemas();
         let names: Vec<&str> = schemas
@@ -1366,6 +1438,34 @@ mod tests {
     }
 
     #[test]
+    fn load_skill_returns_body_and_lists_names_when_missing() {
+        use crate::tools::dispatch;
+        let dir = std::env::temp_dir().join(format!("codifa-load-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sdir = dir.join("skills").join("movie-finder");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("skill.md"),
+            "---\nname: Movie Finder\ndescription: find movies\n---\nBODY HERE\n",
+        )
+        .unwrap();
+        std::fs::write(sdir.join("extra.md"), "EXTRA BODY").unwrap();
+        let root = dir.to_str().unwrap();
+
+        let body = dispatch(root, "load_skill", &json!({"name": "Movie Finder"}), None).unwrap();
+        assert!(body.contains("BODY HERE"), "{body}");
+        assert!(body.contains("Extra files: extra.md"), "{body}");
+        // Slug works too, and an extra file is readable on demand.
+        let extra = dispatch(root, "load_skill", &json!({"name": "movie-finder", "file": "extra.md"}), None).unwrap();
+        assert_eq!(extra, "EXTRA BODY");
+        // A miss names the available skills instead of a bare error.
+        let err = dispatch(root, "load_skill", &json!({"name": "Ghost"}), None).unwrap_err();
+        assert!(err.contains("Movie Finder"), "{err}");
+        assert!(dispatch(root, "load_skill", &json!({}), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dispatch_via_tools_roundtrip() {
         let dir = std::env::temp_dir().join(format!("codifa-agent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1410,6 +1510,7 @@ mod tests {
             prompt: "hi".into(),
             history: Vec::new(),
             system_prompt: String::new(),
+            skills: Vec::new(),
             context_window: 0,
             chat_id: String::new(),
             mcp_servers: Value::Null,

@@ -96,6 +96,29 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
     acts[0]?.status === 'done' && acts[0] === before, acts[0]?.status)
 }
 
+// 7) Text-output tools (LSP lookups, memory search) keep their prose result so
+//    the card can render it. Their result carries no file paths, so `items`
+//    stays empty and the text used to be dropped entirely (empty card).
+{
+  let acts = resolveToolResult(
+    applyToolEvent([], toolEvent({ tool: 'lsp_symbols', call_id: 7 })),
+    resultEvent({ tool: 'lsp_symbols', call_id: 7, status: 'done', result: '- function foo (L1-L3)' }),
+  )
+  check('lsp_symbols keeps its text result', acts[0]?.resultText === '- function foo (L1-L3)', acts[0]?.resultText)
+  check('lsp_symbols has no file items', !acts[0]?.items, acts[0]?.items)
+}
+
+// 8) A file-listing tool's result must NOT be duplicated into resultText — it
+//    already renders as clickable file chips.
+{
+  const acts = resolveToolResult(
+    applyToolEvent([], toolEvent({ tool: 'grep', call_id: 8, args: { path: 'src' } })),
+    resultEvent({ tool: 'grep', call_id: 8, status: 'done', result: 'src/a.ts:1:hit' }),
+  )
+  check('grep result becomes file chips, not resultText',
+    acts[0]?.resultText === undefined && (acts[0]?.items?.length ?? 0) === 1, acts[0])
+}
+
 if (failed > 0) {
   console.error(`\n${failed} toolNesting check(s) FAILED`)
   process.exit(1)

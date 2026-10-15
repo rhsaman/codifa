@@ -309,6 +309,10 @@ export interface ToolActivity {
   results?: SearchResultItem[]
   /** Which web-search provider produced these results (e.g. 'tavily'). */
   engine?: string
+  /** Verbatim plain-text result of a text-output tool (LSP lookups, memory
+   *  search). Those results carry no file paths, so `items` stays empty and
+   *  the text is rendered as-is instead of being dropped. */
+  resultText?: string
 }
 
 export interface TokenUsage {

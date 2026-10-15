@@ -53,11 +53,20 @@ fn resolve_safe(root: &Path, rel: &str) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|e| format!("root missing: {e}"))?;
     let rel = rel.replace('\\', "/");
-    let rel = rel.trim().trim_start_matches('/');
-    if rel.is_empty() {
+    let rel = rel.trim();
+    if rel.is_empty() || rel == "/" {
         return Ok(root_real);
     }
-    let candidate = root_real.join(rel);
+    // An absolute path is taken as-is: the file viewer sends dir + basename for
+    // absolute chips, and stripping the leading "/" made it root-relative
+    // ("/Users/x/y.ts" -> "<root>/Users/x/y.ts") so every absolute chip failed
+    // with "No file exists at this path". Containment is still enforced by the
+    // canonicalized-anchor check below.
+    let candidate = if rel.starts_with('/') {
+        PathBuf::from(rel)
+    } else {
+        root_real.join(rel)
+    };
     // Walk up to the nearest EXISTING ancestor and resolve THAT, so a
     // brand-new nested path can still be created inside the root.
     let mut anchor = candidate.clone();
@@ -76,7 +85,75 @@ fn resolve_safe(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if anchor_real != root_real && !anchor_real.starts_with(&root_real) {
         return Err("path escapes project root".into());
     }
-    Ok(anchor_real.join(candidate.strip_prefix(&anchor).unwrap_or(&candidate)))
+    // `join("")` appends a trailing separator, and `exists()` on "file/" is
+    // false on Unix (ENOTDIR) — that made fs_read report EVERY existing file as
+    // missing ("No file exists at this path"). Return the anchor itself when
+    // there is no tail to append.
+    let tail = candidate.strip_prefix(&anchor).unwrap_or(&candidate);
+    Ok(if tail.as_os_str().is_empty() {
+        anchor_real
+    } else {
+        anchor_real.join(tail)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("codifa-rs-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_safe_accepts_absolute_path_inside_root() {
+        let root = temp_root("abs-in");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let file = root.join("sub/a.ts");
+        std::fs::write(&file, "x").unwrap();
+        let got = resolve_safe(&root, &file.to_string_lossy()).unwrap();
+        assert_eq!(got, file.canonicalize().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_safe_rejects_absolute_path_outside_root() {
+        let root = temp_root("abs-out");
+        let outside = std::env::temp_dir().join(format!("codifa-rs-outside-{}.txt", std::process::id()));
+        std::fs::write(&outside, "x").unwrap();
+        let err = resolve_safe(&root, &outside.to_string_lossy()).unwrap_err();
+        assert!(err.contains("escapes"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[test]
+    fn resolve_safe_keeps_relative_paths_root_scoped() {
+        let root = temp_root("rel");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "x").unwrap();
+        let got = resolve_safe(&root, "src/a.ts").unwrap();
+        assert_eq!(got, root.join("src/a.ts").canonicalize().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fs_read_serves_relative_and_absolute_paths() {
+        let root = temp_root("read");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/a.ts");
+        std::fs::write(&file, "hello").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let rel = fs_read(root_s.clone(), "src/a.ts".into()).unwrap().unwrap();
+        assert_eq!(rel["content"].as_str(), Some("hello"));
+        let abs = fs_read(root_s, file.to_string_lossy().into_owned())
+            .unwrap()
+            .unwrap();
+        assert_eq!(abs["content"].as_str(), Some("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 fn resolve_coder_safe(app: &AppHandle, rel: &str) -> Result<PathBuf, String> {

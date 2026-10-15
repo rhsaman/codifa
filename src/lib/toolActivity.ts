@@ -258,6 +258,13 @@ export function resolveToolResult(
             : undefined) ?? event.results,
         model: event.model || act.model,
         elapsedMs: now - (act.startedAt ?? now),
+        // Text-output tools (LSP lookups, memory search) return prose with no
+        // file paths, so `items` above stays empty — keep the raw text so the
+        // card can render it instead of showing nothing.
+        resultText:
+          typeof event.result === "string" && TEXT_RESULT_TOOLS.has(act.tool)
+            ? event.result
+            : act.resultText,
       };
     }
     if (act.children && act.children.length > 0) {
@@ -271,6 +278,20 @@ export function resolveToolResult(
 
   return activities.map((a) => resolved(a, true));
 }
+
+/** Tools whose native result is plain prose with no file paths (LSP lookups,
+ *  memory search). `filesFromNativeResult` returns null for them, so their text
+ *  is kept verbatim in `ToolActivity.resultText` and rendered as-is — without
+ *  this the whole result was dropped and the card showed no output at all. */
+export const TEXT_RESULT_TOOLS = new Set([
+  "lsp_symbols",
+  "lsp_hover",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_diagnostics",
+  "search_memory",
+  "save_memory",
+]);
 
 /** Extract file rows from a native (Rust) tool's plain-text result so the UI
  *  renders clickable file chips (icon + basename) instead of a raw text dump.

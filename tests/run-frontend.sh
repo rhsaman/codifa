@@ -151,6 +151,9 @@ fileSuggest|tests/fileSuggest.test.ts|--packages=external --external:electron
 textViewer|tests/textViewer.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 composerLayout|tests/composerLayout.test.ts|-
 chatQuote|src/lib/chatQuote.test.ts|
+fileComment|tests/fileComment.test.ts|
+selectionBar|tests/selectionBar.test.ts|
+workspacePath|tests/workspacePath.test.ts|
 cmuxNvim|tests/cmuxNvim.test.ts|-
 historySubmit|tests/historySubmit.test.ts|-
 EOF

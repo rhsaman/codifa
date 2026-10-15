@@ -24,6 +24,7 @@ import { useDragScroll } from "../lib/useDragScroll";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { createPortal } from "react-dom";
 import { commentFileSelection } from "../lib/fileComments";
+import { selectionBarPos } from "../lib/selectionBar";
 
 /** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
  *  dozens of tool rows; one interval driving every live clock keeps CPU and
@@ -913,6 +914,10 @@ export function DiffView({
   }, [activeHit, query, diff]);
   const chatId = useStore((s) => s.activeChatId);
   const [box, setBox] = useState<{ base: string; x: number; y: number } | null>(null);
+  // Copy/Reply toolbar armed by a highlight — same two-step flow as the file
+  // viewer: a selection never yanks focus into the textarea, the editor opens
+  // only after Reply.
+  const [selBar, setSelBar] = useState<{ base: string; x: number; y: number } | null>(null);
   const [note, setNote] = useState("");
   const commentInputRef = useRef<HTMLTextAreaElement | null>(null);
   // Focus without scrolling so the diff highlight stays put (same as FileViewerPanel).
@@ -929,13 +934,14 @@ export function DiffView({
   }, [box]);
   // Outside press dismisses like Esc (no send); presses inside the diff only move the box.
   useEffect(() => {
-    if (!box) return;
+    if (!box && !selBar) return;
     const onDown = (e: PointerEvent) => {
       const t = e.target as HTMLElement | null;
-      if (t && typeof t.closest === "function" && t.closest(".fv-comment-float")) return;
+      if (t && typeof t.closest === "function" && t.closest(".fv-comment-float, .fv-sel-bar")) return;
       const container = measureRef.current;
       if (container && t instanceof Element && container.contains(t)) return;
       setBox(null);
+      setSelBar(null);
       setNote("");
       try {
         window.getSelection()?.removeAllRanges();
@@ -945,11 +951,41 @@ export function DiffView({
     };
     document.addEventListener("pointerdown", onDown);
     return () => document.removeEventListener("pointerdown", onDown);
-  }, [box]);
+  }, [box, selBar]);
   if (rows.length === 0) return null;
   const closeBox = () => {
     setBox(null);
     setNote("");
+  };
+  const closeSelBar = () => {
+    setSelBar(null);
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      /* ignore */
+    }
+  };
+  /** Reply: open the comment editor at the armed toolbar position. */
+  const openBox = () => {
+    if (!selBar) return;
+    setBox({ base: selBar.base, x: selBar.x, y: selBar.y });
+    setSelBar(null);
+    setNote("");
+  };
+  /** Copy: put the highlighted text on the clipboard and dismiss the toolbar.
+   *  The LIVE selection wins over the frozen diff quote — the quote carries a
+   *  "[path line N]" header for the agent, which must never reach the
+   *  clipboard when the user only asked to copy the highlighted text. */
+  const copySelection = () => {
+    if (!selBar) return;
+    let live = "";
+    try {
+      live = window.getSelection()?.toString().trim() ?? "";
+    } catch {
+      live = "";
+    }
+    void copyToClipboard(live || selBar.base);
+    closeSelBar();
   };
   const sendBox = (queued?: boolean) => {
     if (!box || !chatId) {
@@ -973,17 +1009,20 @@ export function DiffView({
   };
   const refreshHighlight = () => {
     if (!commentable) return;
+    // Freeze while the editor is open: focusing its textarea must not rewrite
+    // the frozen quote (a new highlight requires closing first).
+    if (box) return;
     const container = measureRef.current;
     if (!container) return;
     const sel = typeof window !== "undefined" ? window.getSelection() : null;
     if (!sel || !container.contains(sel.anchorNode)) return;
     if (sel.isCollapsed) {
-      if (box) closeBox();
+      if (selBar) setSelBar(null);
       return;
     }
     const text = sel.toString().trim();
     if (!text) {
-      if (box) closeBox();
+      if (selBar) setSelBar(null);
       return;
     }
     const filePath = path ?? "diff";
@@ -992,23 +1031,16 @@ export function DiffView({
       const range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
       const rect = range?.getBoundingClientRect();
       if (rect && typeof window !== "undefined") {
-        const vw = window.innerWidth || 800;
-        const vh = window.innerHeight || 600;
-        const w = 320;
-        const h = 120;
-        setBox({
+        setSelBar({
           base,
-          x: Math.min(Math.max(rect.left, 8), Math.max(vw - w - 8, 8)),
-          y: Math.min(Math.max(rect.bottom + 8, 8), Math.max(vh - h - 8, 8)),
+          ...selectionBarPos(rect, window.innerWidth, window.innerHeight),
         });
-        setNote("");
         return;
       }
     } catch {
       /* fall through to default position */
     }
-    setBox({ base, x: 16, y: 96 });
-    setNote("");
+    setSelBar({ base, x: 16, y: 96 });
   };
   // شمارنده‌ی ترتیبی رخدادها در ترتیب رندر خط‌ها.
   let hitCursor = 0;
@@ -1171,6 +1203,36 @@ export function DiffView({
       onKeyUp={refreshHighlight}
     >
       {showSide ? renderSide() : renderUnified()}
+      {commentable && selBar && !box && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="fv-sel-bar"
+              style={{ position: "fixed", top: selBar.y, left: selBar.x, zIndex: 9999 }}
+              onMouseUp={(e) => e.stopPropagation()}
+              onKeyUp={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="fv-sel-btn"
+                title="Copy"
+                aria-label="Copy selection"
+                onClick={copySelection}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              </button>
+              <button
+                type="button"
+                className="fv-sel-btn"
+                title="Reply"
+                aria-label="Reply to selection"
+                onClick={openBox}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
       {commentable && box && typeof document !== "undefined"
         ? createPortal(
             <div
@@ -1559,21 +1621,30 @@ export const ToolSubRow = memo(function ToolSubRow({
       : activity.elapsedMs;
   const subSummary = subArgSummary(activity);
   return (
-    <div
-      className={`tool-sub-row ${activity.status}${running ? " running" : ""}`}
-    >
-      <StatusIcon status={activity.status} />
-      <span className="tool-sub-name">
-        {TOOL_LABEL[activity.tool] ?? activity.tool}
-      </span>
-      <span className="tool-sub-args" title={subSummary}>
-        {subSummary}
-      </span>
-      {activity.summary && (
-        <span className="tool-sub-summary">{activity.summary}</span>
+    <>
+      <div
+        className={`tool-sub-row ${activity.status}${running ? " running" : ""}`}
+      >
+        <StatusIcon status={activity.status} />
+        <span className="tool-sub-name">
+          {TOOL_LABEL[activity.tool] ?? activity.tool}
+        </span>
+        <span className="tool-sub-args" title={subSummary}>
+          {subSummary}
+        </span>
+        {activity.summary && (
+          <span className="tool-sub-summary">{activity.summary}</span>
+        )}
+        <span className="tool-ms">{fmtTime(ms)}</span>
+      </div>
+      {/* Text-output tools (LSP lookups, memory search) have no file rows, so
+          their prose result is the only output — show it under the row. */}
+      {activity.resultText && (
+        <pre className="tool-sub-result" dir="auto">
+          {activity.resultText}
+        </pre>
       )}
-      <span className="tool-ms">{fmtTime(ms)}</span>
-    </div>
+    </>
   );
 });
 
@@ -1620,6 +1691,10 @@ function traceRowOutputText(activity: ToolActivity, argsText: string): string {
       const f = fenceFor(out);
       parts.push(`**Output**\n\n${f}\n${out}\n${f}`);
     }
+  }
+  if (activity.resultText) {
+    const f = fenceFor(activity.resultText);
+    parts.push(`**Result**\n\n${f}\n${activity.resultText}\n${f}`);
   }
   return parts.join("\n\n");
 }
@@ -1739,6 +1814,17 @@ const TraceRow = memo(function TraceRow({
                 dir="auto"
               >
                 {activity.diff}
+              </pre>
+            </div>
+          )}
+          {activity.resultText && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Result</span>
+              <pre
+                className="trace-expand-val trace-expand-pre"
+                dir="auto"
+              >
+                {activity.resultText}
               </pre>
             </div>
           )}
@@ -2060,6 +2146,17 @@ export const ToolSingleRow = memo(function ToolSingleRow({
                 dir="auto"
               >
                 {activity.diff}
+              </pre>
+            </div>
+          )}
+          {activity.resultText && (
+            <div className="trace-expand-section">
+              <span className="trace-expand-key">Result</span>
+              <pre
+                className="trace-expand-val trace-expand-pre"
+                dir="auto"
+              >
+                {activity.resultText}
               </pre>
             </div>
           )}

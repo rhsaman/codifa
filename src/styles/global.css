@@ -4914,40 +4914,32 @@ body.coder-dragging .chat-split-child {
 .chat-panel.file-dragover .chat-scroll {
   opacity: 0.55;
 }
-/* Claude-Code-style drop overlay: dashed frame + centered hint while a file
-   drag hovers over the chat panel (pure CSS — no extra JSX state). */
-.chat-panel.file-dragover::after {
-  content: "Drop files here";
-  position: absolute;
-  inset: 14px;
-  border: 2px dashed var(--accent, #4c8dff);
-  border-radius: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--accent, #4c8dff);
-  background: color-mix(in srgb, var(--accent, #4c8dff) 8%, transparent);
-  pointer-events: none;
-  z-index: 40;
-}
+/* Claude-Code-style drop overlay lives in JSX (.chat-file-drop-overlay below:
+   dashed frame + image/file/folder icons + centered hint). */
 /* Distinct class name: the unified window-drop overlay below shares this
    file, and a same-name later rule would paint its dashed border on it. */
 .chat-file-drop-overlay {
   position: absolute;
-  inset: 0;
+  inset: 14px;
   z-index: 60;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  border-radius: 12px;
-  font-size: 14px;
+  gap: 14px;
+  border-radius: 14px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--accent);
-  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
   border: 2px dashed var(--accent);
   pointer-events: none;
+}
+.chat-file-drop-icons {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  opacity: 0.9;
 }
 
 .composer-inner {

@@ -7616,9 +7616,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           }}
         />
         <div className="composer-inner">
-          {dragOver && (
-            <div className="drop-overlay">Drop files or images to attach</div>
-          )}
           <div className="composer-input-wrap">
             {historyOpen && (
               // Terminal-style history: oldest on top, newest just above the
@@ -8692,7 +8689,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       )}
       {dragOver && (
         <div className="chat-file-drop-overlay" aria-hidden="true">
-          <span>Drop to attach to input</span>
+          <div className="chat-file-drop-icons">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <circle cx="8.5" cy="8.5" r="1.5" />
+              <path d="M21 15l-5-5L5 21" />
+            </svg>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+              <path d="M14 2v6h6" />
+            </svg>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+            </svg>
+          </div>
+          <span>Drop files here</span>
         </div>
       )}
     </div>

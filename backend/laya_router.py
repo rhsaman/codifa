@@ -395,19 +395,4 @@ def predict(
     except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
         logger.warning("[skills] laya local failed: %s", exc)
         return None
-    try:
-        import trace_store
-
-        trace_store.append(
-            str(chat_id or ""),
-            "llm",
-            f"laya · {', '.join(names) or '-'}",
-            detail={"provider": "local", "provider_id": "local",
-                    "sub": True, "local": True},
-            model="laya",
-            prompt=text[:_PROMPT_MAX_CHARS],
-            result=", ".join(names),
-        )
-    except Exception:  # noqa: BLE001, S110 — trace never breaks routing
-        pass
     return names

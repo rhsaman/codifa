@@ -1928,6 +1928,23 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _is_read_timeout(exc: BaseException) -> bool:
+    """True when ``exc`` (or its ``__cause__`` chain) is a read timeout.
+
+    The provider sent no data for the whole read window (httpx.ReadTimeout /
+    httpcore.ReadTimeout). Used to show the "tap Retry" hint instead of the
+    generic "just wait" message.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if "ReadTimeout" in type(cur).__name__:
+            return True
+        cur = cur.__cause__
+    return False
+
+
 def _friendly_error(exc: Exception, model: str, base_url: str = "") -> str:
     text = str(exc)
     # httpx.ReadTimeout / httpcore.ReadTimeout: the provider sent no data for
@@ -2514,22 +2531,6 @@ def _open_store(root: str, vector_db_path: str):
     if store is None:
         raise HTTPException(status_code=503, detail="vector store unavailable")
     return store
-
-
-@app.get("/lsp/status")
-async def lsp_status(
-    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
-) -> dict:
-    """Return lazy LSP manager status (opencode-style, started on demand)."""
-    try:
-        from lsp_manager import get_status as _lsp_status
-    except Exception:  # noqa: BLE001 - LSP optional, status degrades gracefully
-        return {"available": False, "servers": {}}
-    try:
-        return await asyncio.to_thread(_lsp_status, root)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("lsp status failed for %s: %s", root, exc)
-        return {"available": False, "error": str(exc)}
 
 
 @app.get("/index/status")

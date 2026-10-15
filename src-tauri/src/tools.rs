@@ -73,8 +73,15 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
                 }
             }
         }
-        // OS temp dir is always accessible (background terminal logs).
-        if let Ok(tmp) = std::env::temp_dir().canonicalize() {
+        // OS temp dirs are always accessible (background terminal logs,
+        // throwaway test files). env::temp_dir() is the per-user tree on
+        // macOS (/var/folders/.../T); /tmp and /private/tmp are separate
+        // roots a user or tool may legitimately target, so allow them too.
+        let mut tmp_roots: Vec<PathBuf> = vec![std::env::temp_dir()];
+        tmp_roots.push(PathBuf::from("/tmp"));
+        tmp_roots.push(PathBuf::from("/private/tmp"));
+        for tmp in tmp_roots {
+            let Ok(tmp) = tmp.canonicalize() else { continue };
             if target_canon == tmp || target_canon.starts_with(&tmp) {
                 return Ok(target);
             }
@@ -815,6 +822,13 @@ mod tests {
         // Temp dir is always allowed.
         let t = std::env::temp_dir().join("codifa-allowed.txt");
         assert!(resolve_safe(root, &t.to_string_lossy(), false, None).is_ok());
+        // The shared /tmp root is allowed too (Unix; skipped where absent).
+        #[cfg(unix)]
+        {
+            fs::write("/tmp/codifa-tmp-allowed.txt", "x").unwrap();
+            assert!(resolve_safe(root, "/tmp/codifa-tmp-allowed.txt", false, None).is_ok());
+            let _ = fs::remove_file("/tmp/codifa-tmp-allowed.txt");
+        }
         // permit folders grant only their subtree.
         let permit = json!({ "folders": [tmp.parent().unwrap().to_str().unwrap()] });
         assert!(resolve_safe(root, "/etc/passwd", false, Some(&permit)).is_err());

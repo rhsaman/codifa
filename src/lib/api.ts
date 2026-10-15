@@ -1195,63 +1195,6 @@ export interface SubagentJob {
   events: SubagentEvent[]
 }
 
-/** List this chat's background sub-agent jobs (running + finished), newest first. */
-export async function listSubagents(chatId: string): Promise<SubagentJob[]> {
-  const url = await ensureSidecar()
-  if (!url || !chatId) return []
-  try {
-    const res = await fetch(
-      `${url}/chats/${encodeURIComponent(chatId)}/subagents`,
-    )
-    if (!res.ok) return []
-    const body = (await res.json().catch(() => ({}))) as {
-      jobs?: SubagentJob[]
-    }
-    return Array.isArray(body.jobs) ? body.jobs : []
-  } catch {
-    return []
-  }
-}
-
-/** Stop one background sub-agent of a chat. */
-export async function stopSubagent(
-  chatId: string,
-  taskId: string,
-): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  try {
-    await fetch(
-      `${url}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(taskId)}/stop`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' } },
-    )
-  } catch {
-    /* best effort */
-  }
-}
-
-/** Send a follow-up message to one running background sub-agent. */
-export async function steerSubagent(
-  chatId: string,
-  taskId: string,
-  message: string,
-): Promise<boolean> {
-  const url = await ensureSidecar()
-  if (!url) return false
-  try {
-    const res = await fetch(
-      `${url}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(taskId)}/steer`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-      },
-    )
-    return res.ok
-  } catch {
-    return false
-  }
-}
 
 /** Answer a pending outside-workspace permission / confirm_action request from the agent. */
 export async function respondPermission(

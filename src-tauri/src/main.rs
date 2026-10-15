@@ -16,6 +16,7 @@ mod compact;
 mod git;
 mod llm;
 mod plans;
+mod appstate;
 mod pty;
 mod secrets;
 mod sidecar;

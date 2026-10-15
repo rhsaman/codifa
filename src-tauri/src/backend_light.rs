@@ -62,7 +62,7 @@ pub struct AppState {
     /// Reqwest client for proxying to the Python sidecar.
     http: reqwest::Client,
     /// Resolved data root (~/.codifa) for the native file-backed endpoints.
-    data_root: PathBuf,
+    pub data_root: PathBuf,
 }
 
 pub fn new_state(data_root: PathBuf) -> AppState {
@@ -163,11 +163,7 @@ async fn git_push(Json(body): Json<git::PushBody>) -> Response<Body> {
     git_response(git::push(&body.root, &body.remote, &body.branch, body.set_upstream))
 }
 
-// ---------- skills / mcp (native) + system-prompts (proxied) ----------
-
-async fn system_prompts(State(st): State<AppState>) -> Response<Body> {
-    proxy_get(&st, "/system-prompts").await
-}
+// ---------- skills / mcp (native) + system-prompts (native appstate) ----------
 
 async fn skills_list(State(st): State<AppState>) -> Response<Body> {
     Json(skills::list_skills(&st.data_root)).into_response()
@@ -255,7 +251,7 @@ fn default_provider() -> String {
 /// Resolve a Tool Models slot entry ("providerId/model" | bare model | "")
 /// to (model, base_url, api_keys) — shared by the compact and sub-agent
 /// slots; mirrors graph.py resolve_subagent_model.
-fn resolve_slot_target(
+pub fn resolve_slot_target(
     entry: &str,
     parent_model: &str,
     parent_base: &str,
@@ -561,16 +557,6 @@ async fn sidecar_base() -> Option<String> {
     sidecar::current_url().map(|u| u.trim_end_matches('/').to_string())
 }
 
-async fn proxy_get(st: &AppState, path: &str) -> Response<Body> {
-    let Some(base) = sidecar_base().await else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "sidecar not ready").into_response();
-    };
-    match st.http.get(format!("{base}{path}")).send().await {
-        Ok(res) => convert_response(res).await,
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response(),
-    }
-}
-
 async fn proxy_all(st: AppState, req: Request<Body>, path: &str) -> Response<Body> {
     let Some(base) = sidecar_base().await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "sidecar not ready").into_response();
@@ -671,7 +657,7 @@ pub fn router(state: AppState) -> Router {
         .route("/git/branches", get(git_branches))
         .route("/git/checkout", post(git_checkout))
         .route("/git/push", post(git_push))
-        .route("/system-prompts", get(system_prompts))
+        .route("/system-prompts", get(crate::appstate::system_prompts_get))
         .route("/skills", get(skills_list))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
@@ -686,6 +672,19 @@ pub fn router(state: AppState) -> Router {
         .route("/plan", delete(plan_delete))
         .route("/plan/checklist", get(plan_checklist_get))
         .route("/plan/checklist", post(plan_checklist_save))
+        .route("/app/state", get(crate::appstate::app_state_get))
+        .route("/app/state", post(crate::appstate::app_state_post))
+        .route("/checkpoints/:chat_id", get(crate::appstate::checkpoints_list))
+        .route("/checkpoints/:chat_id/:seq/restore", post(crate::appstate::checkpoints_restore))
+        .route("/schedules", get(crate::appstate::schedules_list))
+        .route("/schedules", post(crate::appstate::schedules_upsert))
+        .route("/schedules/:id", delete(crate::appstate::schedules_delete))
+        .route("/schedules/:id/runs", get(crate::appstate::schedule_runs_list))
+        .route("/schedules/:id/runs", delete(crate::appstate::schedule_runs_clear))
+        .route("/schedule-runs", get(crate::appstate::all_schedule_runs))
+        .route("/schedule-runs/orphans", delete(crate::appstate::orphan_schedule_runs_clear))
+        .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
+        .route("/chats/title", post(crate::appstate::chat_title))
         .fallback(proxy_fallback)
         // The default axum body cap is 2 MB — the compact request carries the
         // FULL chat history (tool outputs included) and /chat/stream carries
@@ -736,9 +735,8 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), 400);
 
-        // Fallback proxy: sidecar is not running in tests -> 503, proving the
-        // fallback path exists and does not 404. /system-prompts is still
-        // proxied (prompts live in the Python agent engine).
+        // /system-prompts is now NATIVE (appstate::system_prompts_get) — it
+        // must return 200 with the canonical prompt keys.
         let res = app
             .oneshot(
                 axum::http::Request::builder()
@@ -748,7 +746,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), 503);
+        assert_eq!(res.status(), 200);
     }
 
     #[tokio::test]

@@ -166,14 +166,6 @@ fn tool_schemas() -> Vec<Value> {
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
             }),
         ),
-        (
-            "save_memory",
-            "Persist a durable note about the project for future sessions. Save ONLY key points: decisions, user preferences, gotchas, and facts worth remembering — never dump whole files, tool outputs or conversation text. Keep each note under ~500 chars.",
-            json!({
-                "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
-                "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
-            }),
-        ),
     ];
     schemas
         .iter()
@@ -254,6 +246,14 @@ fn research_schemas() -> Vec<Value> {
             "search_memory",
             "Search previously saved project notes.",
             json!({"query": {"type": "string"}}),
+        ),
+        (
+            "save_memory",
+            "Persist a durable note about the project for future sessions. Save ONLY key points: decisions, user preferences, gotchas, and facts worth remembering — never dump whole files, tool outputs or conversation text. Keep each note under ~500 chars.",
+            json!({
+                "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
+                "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
+            }),
         ),
     ];
     schemas
@@ -663,6 +663,8 @@ tree or repeat a search with the same pattern. Aim for at most ~10 tool \
 calls, then report. Include exact file paths, line numbers, symbol names \
 and short code excerpts — the main agent cannot search itself and relies \
 entirely on your report. You have NO write tools: never modify files. \
+When you learn a durable key point (decision, preference, gotcha), save it \
+with save_memory — concise, under ~500 chars, never whole files or outputs. \
 Report in English.",
             parent.root
         ),
@@ -739,8 +741,8 @@ Workspace root: {root}. Mode: {mode}. \
 You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
 Use write_file/edit_file/run_terminal to make changes. \
-When using save_memory, store ONLY concise key points (decisions, \
-preferences, gotchas) — never whole files or tool outputs. \
+Only run `git commit` when the user EXPLICITLY asks for it — never commit \
+on your own initiative. \
 Reply in the user's language. \
 Docstrings and comments in code must be English."
     )
@@ -863,7 +865,8 @@ mod tests {
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
         // Main agent must NOT have search/read tools — research is delegated.
-        for banned in ["read", "grep", "glob", "lsp_definition", "lsp_symbols"] {
+        // Memory tools live on the explore sub-agent too (user request).
+        for banned in ["read", "grep", "glob", "lsp_definition", "lsp_symbols", "save_memory", "search_memory"] {
             assert!(!names.contains(&banned), "main agent must not have {banned}");
         }
         assert!(names.contains(&"explore"));
@@ -888,6 +891,7 @@ mod tests {
             "lsp_symbols",
             "lsp_diagnostics",
             "search_memory",
+            "save_memory",
         ] {
             assert!(names.contains(&expected), "missing schema: {expected}");
         }

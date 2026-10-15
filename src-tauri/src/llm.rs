@@ -153,7 +153,22 @@ async fn complete_with_key(
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
+    // Header timeout (same rationale as stream_with_key below).
+    const HEADER_TIMEOUT_SECS: u64 = 60;
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(HEADER_TIMEOUT_SECS),
+        req.send(),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| (0u16, e.to_string()))?,
+        Err(_) => {
+            return Err((
+                0u16,
+                format!("provider did not respond (no headers for {HEADER_TIMEOUT_SECS}s)"),
+            ))
+        }
+    };
     let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| (status, e.to_string()))?;
     if !(200..300).contains(&status) {
@@ -380,7 +395,24 @@ async fn stream_with_key(
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
+    // Header timeout: if the provider never answers (connection accepted
+    // but no response headers), abort with a clear error instead of
+    // hanging the turn until the request-wide 600s cap.
+    const HEADER_TIMEOUT_SECS: u64 = 60;
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(HEADER_TIMEOUT_SECS),
+        req.send(),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| (0u16, e.to_string()))?,
+        Err(_) => {
+            return Err((
+                0u16,
+                format!("provider did not respond (no headers for {HEADER_TIMEOUT_SECS}s)"),
+            ))
+        }
+    };
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();

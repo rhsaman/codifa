@@ -6674,16 +6674,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         m.toolActivity &&
                         m.toolActivity.length > 0 && (
                           <div className="tool-timeline">
-                            {m.toolActivity.map((act, i) => (
-                              <ToolCallView
-                                key={i}
-                                activity={act}
-                                chatId={chat.id}
-                                onReverted={() =>
-                                  useStore.getState().markToolReverted(m.id, i)
-                                }
-                              />
-                            ))}
+                            {/* Explore parent cards are hidden in chat (the
+                              sub-agent tool group represents them); keep the
+                              original index for markToolReverted. */}
+                            {m.toolActivity
+                              .map((act, i) => ({ act, i }))
+                              .filter(({ act }) => act.tool !== "explore")
+                              .map(({ act, i }) => (
+                                <ToolCallView
+                                  key={i}
+                                  activity={act}
+                                  chatId={chat.id}
+                                  onReverted={() =>
+                                    useStore.getState().markToolReverted(m.id, i)
+                                  }
+                                />
+                              ))}
                           </div>
                         )}
                     </Fragment>

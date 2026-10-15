@@ -2002,6 +2002,10 @@ export function renderSegments(
       pendingEdit.push({ activity, index: seg.index });
       return;
     }
+    // The explore parent card is intentionally NOT rendered in chat: its
+    // head row duplicates the sub-agent tool group that follows it. The
+    // forwarded sub-agent calls still render as their own tool group.
+    if (activity.tool === "explore") return;
     if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isSubagentCard(activity)) {
       flush();
       wrapTrace();

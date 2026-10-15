@@ -817,6 +817,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   }, []);
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
+  // Tauri native drag events are enabled (dragDropEnabled: true) — WKWebView
+  // swallows HTML5 drops of OS files, so the shell forwards the real paths
+  // via this custom event (see main.tsx onDragDropEvent).
+  useEffect(() => {
+    const onNativeDrop = (e: Event) => {
+      const paths = (e as CustomEvent<string[]>).detail ?? [];
+      setDragOver(false);
+      dragDepth.current = 0;
+      for (const p of paths) addDroppedFile(p, p.split("/").pop() ?? p);
+    };
+    window.addEventListener("codifa:file-drop", onNativeDrop);
+    return () => window.removeEventListener("codifa:file-drop", onNativeDrop);
+  }, []);
   // "+" action menu (files / screenshot / skills / MCP) — the single entry
   // point that keeps the bottom toolbar minimal.
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);

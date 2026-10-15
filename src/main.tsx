@@ -28,11 +28,17 @@ if (tauri) {
   void import('@tauri-apps/api/webview').then(({ getCurrentWebview }) =>
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === 'drop') {
+        const paths = event.payload.paths
         recordDroppedPaths(
-          event.payload.paths.map((p) => ({
+          paths.map((p) => ({
             name: p.split('/').pop() ?? p,
             path: p,
           })),
+        )
+        // WKWebView swallows HTML5 drops of OS files, so the active chat
+        // panel listens for this custom event and attaches by real path.
+        window.dispatchEvent(
+          new CustomEvent('codifa:file-drop', { detail: paths }),
         )
       }
     }),

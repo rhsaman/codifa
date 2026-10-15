@@ -25,6 +25,7 @@ import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { createPortal } from "react-dom";
 import { commentFileSelection } from "../lib/fileComments";
 import { selectionBarPos } from "../lib/selectionBar";
+import { bareToolName, mcpServerOf } from "../lib/mcpTools";
 
 /** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
  *  dozens of tool rows; one interval driving every live clock keeps CPU and
@@ -132,13 +133,11 @@ function toolIcon(tool: string): string {
 }
 
 /** MCP tools arrive as `mcp__<server>__<tool>`: show the bare tool name with
- *  the connector as a suffix so the card stays readable. */
+ *  the connector as a suffix so the card stays readable. A tool whose name is
+ *  unique across the enabled connectors arrives BARE already. */
 export function toolLabel(tool: string): string {
-  if (tool.startsWith("mcp__")) {
-    const rest = tool.slice(5);
-    const i = rest.indexOf("__");
-    if (i > 0) return `${rest.slice(i + 2)} · ${rest.slice(0, i)}`;
-  }
+  const server = mcpServerOf(tool);
+  if (server) return `${bareToolName(tool)} · ${server}`;
   return TOOL_LABEL[tool] ?? tool;
 }
 

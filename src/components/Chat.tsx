@@ -82,6 +82,7 @@ import {
   type StreamParams,
 } from "../lib/api";
 import { playAlarm } from "../lib/alarm";
+import { isBrowserTool } from "../lib/mcpTools";
 
 import type { SkillRow, TranscribeProviderOpts } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
@@ -3697,7 +3698,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         if (event.tool === "create_mcp") mcpChanged = true;
         // Codex-style: the first browser tool call of a turn docks the Browser
         // viewer tab on the right so the user watches the shared session live.
-        if ((event.tool ?? "").startsWith("browser_")) {
+        // MCP tools arrive either bare (`browser_navigate`) or qualified
+        // (`mcp__playwright__browser_navigate`) — both must dock the panel,
+        // otherwise the agent's browser work stays invisible in the app.
+        if (isBrowserTool(event.tool ?? "")) {
           const browserVt = useViewerTabs.getState();
           if (!browserVt.tabs.some((t) => t.kind === "browser" && t.chatId === chat.id))
             browserVt.openBrowser(chat.id);

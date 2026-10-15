@@ -84,6 +84,10 @@ pub struct AgentRequest {
     /// and silently disabled both auto-match and the decision model.
     #[serde(default)]
     pub data_root: String,
+    /// The composer's Computer Use switch. When false the `computer` tool is
+    /// never bound, so the agent cannot touch the desktop at all.
+    #[serde(default)]
+    pub allow_computer: bool,
 }
 
 fn default_mode() -> String {
@@ -601,11 +605,26 @@ pub async fn run_turn(
     // tools/list. A connector that fails to start contributes no tools — but
     // the reason is surfaced as a warning, so "the agent has no browser tool"
     // is never a silent mystery again.
-    let (mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers);
+    let (mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers, &req.chat_id);
     for failure in mcp_failures {
         emit(&AgentEvent::Warn { content: failure });
     }
+    // The exact names the model will call. A connector tool whose name is
+    // unique across the enabled servers is advertised BARE (`browser_navigate`)
+    // so the model sees short readable names; dispatch therefore cannot rely on
+    // the `mcp__` prefix alone. Without this set a bare call fell through to
+    // the native dispatcher and failed with "not available natively" — the
+    // browser tool looked broken even though the connector was running.
+    let mcp_names: std::collections::HashSet<String> = mcp_schemas
+        .iter()
+        .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+        .collect();
     schemas.extend(mcp_schemas);
+    // Desktop control is a hard on/off switch (composer → Computer Use): when
+    // it is off the tool is never bound, so the model cannot even try.
+    if req.allow_computer && req.mode != "subagent" {
+        schemas.push(crate::computer::schema());
+    }
 
     let max_steps = if req.mode == "subagent" {
         SUBAGENT_MAX_STEPS
@@ -723,12 +742,16 @@ pub async fn run_turn(
         // wall time is dominated by these. Mutating tools and sub-agents
         // stay sequential (ordering + cancel semantics).
         let is_readonly = |name: &str| {
-            matches!(
-                name,
-                "read" | "grep" | "glob" | "current_time" | "system_stats"
-                    | "search_memory" | "load_skill" | "lsp_definition" | "lsp_references"
-                    | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
-            )
+            // An MCP tool is never batched as read-only: it may mutate remote
+            // state, and a bare connector name could otherwise shadow a native
+            // tool of the same name.
+            !mcp_names.contains(name)
+                && matches!(
+                    name,
+                    "read" | "grep" | "glob" | "current_time" | "system_stats"
+                        | "search_memory" | "load_skill" | "lsp_definition" | "lsp_references"
+                        | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
+                )
         };
         let mut batch: Vec<(String, String, Value)> = Vec::new();
         let mut sequential: Vec<(String, String, String)> = Vec::new();
@@ -888,8 +911,15 @@ pub async fn run_turn(
                     "blocked: the main agent must not locate files via the terminal — delegate file discovery to the `explore` sub-agent".into(),
                     false,
                 )
-            } else if name.starts_with(crate::mcp::TOOL_PREFIX) {
-                match crate::mcp::call_tool(&req.mcp_servers, name, &args) {
+            } else if name == "computer" {
+                // Bound only when the user enabled Computer Use; the schema is
+                // withheld otherwise, so reaching here means it is allowed.
+                match crate::computer::run(&args) {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
+            } else if mcp_names.contains(name) || name.starts_with(crate::mcp::TOOL_PREFIX) {
+                match crate::mcp::call_tool(&req.mcp_servers, name, &args, &req.chat_id) {
                     Ok(r) => (r, true),
                     Err(e) => (e, false),
                 }
@@ -1188,6 +1218,8 @@ async fn run_subagent(
         subagent_models: std::collections::HashMap::new(),
         providers: parent.providers.clone(),
         data_root: parent.data_root.clone(),
+        // Sub-agents are research-only: desktop control is never delegated.
+        allow_computer: false,
     };
 
     let mut report = String::new();
@@ -1589,6 +1621,7 @@ mod tests {
             subagent_models: std::collections::HashMap::new(),
             providers: std::collections::HashMap::new(),
             data_root: String::new(),
+            allow_computer: false,
         }
     }
 

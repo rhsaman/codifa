@@ -434,6 +434,8 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         subagent_models: std::collections::HashMap::new(),
         providers: std::collections::HashMap::new(),
         data_root: String::new(),
+        // Headless scheduled runs never touch the desktop.
+        allow_computer: false,
     };
 
     let mut final_text = String::new();

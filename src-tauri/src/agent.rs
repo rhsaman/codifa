@@ -151,6 +151,14 @@ fn tool_schemas() -> Vec<Value> {
         ),
         ("current_time", "Current UTC time.", json!({})),
         (
+            "system_stats",
+            "Read the OS process list (Activity Monitor): per-process RSS memory and CPU usage. Use it to diagnose memory/CPU issues. Args: filter (substring, optional) and top (how many rows, default 15).",
+            json!({
+                "filter": {"type": "string", "description": "Only processes whose command contains this substring (optional)"},
+                "top": {"type": "integer", "description": "Max rows to return (default 15)"}
+            }),
+        ),
+        (
             "explore",
             "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
             json!({
@@ -314,6 +322,12 @@ pub async fn run_turn(
     }
     if !req.prompt.is_empty() {
         messages.push(json!({"role": "user", "content": req.prompt}));
+    }
+    // Separate context/autocompact for the explore sub-agent (user request):
+    // its message list is compacted against its OWN budget — never the main
+    // agent's history or window.
+    if req.mode == "subagent" {
+        compact_subagent_messages(&mut messages, req.context_window as usize);
     }
 
     let client = http_client();
@@ -553,6 +567,41 @@ fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>) 
             req.api_keys.clone(),
         ),
     }
+}
+
+/// Compact the explore sub-agent's message list independently of the main
+/// agent's history (user request: explore context/autocompact must be
+/// separate). Mirrors compact.rs but with a smaller budget: the sub-agent
+/// only needs its recent tool results + the report it is building.
+fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
+    // Rough token estimate: ~4 chars per token (same heuristic as compact.rs).
+    let est = |m: &Value| -> usize { m["content"].as_str().map(|c| c.len().div_ceil(4)).unwrap_or(0) };
+    let total: usize = messages.iter().map(&est).sum();
+    // Keep ~60% of the context window usable; compact when over.
+    let budget = ctx.saturating_sub(2048).max(4096) * 60 / 100;
+    if total <= budget {
+        return;
+    }
+    // Keep the system prompt (index 0) and the last few messages verbatim;
+    // summarize the middle into one user message.
+    let keep_tail = 4.min(messages.len().saturating_sub(1));
+    let head = messages[0].clone();
+    let mid: Vec<Value> = messages[1..messages.len() - keep_tail].to_vec();
+    let tail: Vec<Value> = messages[messages.len() - keep_tail..].to_vec();
+    let mut summary = String::from("[Earlier research compacted] Key findings so far:\n");
+    for m in &mid {
+        let c = m["content"].as_str().unwrap_or_default();
+        if c.len() > 400 {
+            summary.push_str(&format!("- {}…\n", &c[..400]));
+        } else if !c.is_empty() {
+            summary.push_str(&format!("- {c}\n"));
+        }
+    }
+    *messages = vec![
+        head,
+        json!({"role": "user", "content": summary}),
+    ];
+    messages.extend(tail);
 }
 
 async fn run_subagent(

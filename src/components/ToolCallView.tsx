@@ -91,6 +91,7 @@ const TOOL_LABEL: Record<string, string> = {
   git_commit: "Git Commit",
   git_log: "Git Log",
   current_time: "Current Time",
+  system_stats: "System Stats",
   computer: "Computer",
   search_console: "Search Console",
 };
@@ -121,6 +122,7 @@ const TOOL_ICON: Record<string, string> = {
   git_commit: "✅",
   git_log: "🕘",
   current_time: "🕒",
+  system_stats: "📊",
   computer: "🖥",
   search_console: "🔎",
 };

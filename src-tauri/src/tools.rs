@@ -775,6 +775,9 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 .unwrap_or_default();
             Ok(json!({ "unix_ms": now.as_millis() as u64 }).to_string())
         }
+        // Activity Monitor for the agent: per-process RSS/CPU so it can
+        // diagnose memory/CPU issues itself (read-only, all modes).
+        "system_stats" => system_stats(&s("filter"), args["top"].as_u64().unwrap_or(15) as usize),
         // LSP-backed tools (phase 3-3 parity with tools.py) — served by the
         // native stdio JSON-RPC client in lsp.rs.
         "lsp_definition" => crate::lsp::definition(
@@ -817,6 +820,39 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
     }
 }
 
+/// Activity Monitor for the agent: per-process RSS/CPU via `ps` (read-only,
+/// available in every mode so the agent can diagnose memory/CPU issues).
+fn system_stats(filter: &str, top: usize) -> Result<String, String> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "rss,pcpu,comm"])
+        .output()
+        .map_err(|e| format!("ps failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ps exited with {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows: Vec<(f64, f64, String)> = Vec::new();
+    for line in text.lines().skip(1) {
+        let mut it = line.split_whitespace();
+        let (Some(rss), Some(cpu)) = (it.next(), it.next()) else { continue };
+        let comm = it.collect::<Vec<_>>().join(" ");
+        let rss_mb: f64 = rss.parse().unwrap_or(0.0);
+        let cpu: f64 = cpu.parse().unwrap_or(0.0);
+        let f = filter.to_lowercase();
+        if !f.is_empty() && !comm.to_lowercase().contains(&f) {
+            continue;
+        }
+        rows.push((rss_mb / 1024.0, cpu, comm));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total: f64 = rows.iter().map(|r| r.0).sum();
+    let mut s = format!("total RSS of listed processes: {total:.0} MB\n");
+    for (rss, cpu, comm) in rows.iter().take(top.max(1)) {
+        s.push_str(&format!("{rss:8.0} MB  {cpu:5.1}%  {comm}\n"));
+    }
+    Ok(s)
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -824,6 +860,24 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_stats_lists_processes() {
+        let out = system_stats("", 5).expect("system_stats should work");
+        assert!(out.contains("total RSS"), "missing header: {out}");
+        assert!(out.lines().count() > 1, "no rows: {out}");
+    }
+
+    #[test]
+    fn system_stats_filters_by_name() {
+        let out = system_stats("codifa", 10).expect("system_stats should work");
+        for line in out.lines().skip(1) {
+            assert!(
+                line.to_lowercase().contains("codifa") || line.trim().is_empty(),
+                "non-matching row leaked: {line}"
+            );
+        }
+    }
 
     #[test]
     fn resolve_safe_rejects_escapes() {

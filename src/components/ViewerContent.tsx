@@ -8,7 +8,7 @@ import { BrowserPanel } from "./BrowserPanel";
 import { FileViewerPanel } from "./FileViewerPanel";
 import { TextViewerPanel } from "./TextViewerPanel";
 import { ScheduleSection } from "./SchedulePanel";
-import { SubagentsSection, TodosSection } from "./TodosPanel";
+import { TodosSection } from "./TodosPanel";
 
 /** Panel mode body: the docked right-panel sections (schedules, background
  *  sub-agents, todos) rendered in place of viewer tab content. */
@@ -29,7 +29,6 @@ function PanelPane() {
       }}
     >
       <ScheduleSection />
-      <SubagentsSection />
       <TodosSection />
     </div>
   );

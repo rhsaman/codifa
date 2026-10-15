@@ -168,14 +168,14 @@ function groupSummary(activities: ToolActivity[]): string {
 }
 
 /** A task card running the background sub-agent (opencode-style subagent;
- *  "explore" is the native Rust research sub-agent; "general" is a legacy
- *  pre-rename type the backend still accepts). */
+ *  "general" is a legacy pre-rename type the backend still accepts).
+ *  NOTE: "explore" is deliberately NOT a subagent card — the user asked for
+ *  it to render like every other tool call row (same color), not as a big
+ *  task card. */
 export const isSubagentCard = (a: ToolActivity) =>
-  (a.tool === "task" || a.tool === "explore") &&
+  a.tool === "task" &&
   (a.args?.subagent_type === "subagent" ||
-    a.args?.subagent_type === "explore" ||
-    a.args?.subagent_type === "general" ||
-    a.tool === "explore");
+    a.args?.subagent_type === "general");
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;

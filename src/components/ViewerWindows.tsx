@@ -12,7 +12,7 @@ import { BrowserPanel } from "./BrowserPanel";
 import { FileViewerPanel } from "./FileViewerPanel";
 import { TextViewerPanel } from "./TextViewerPanel";
 import { ScheduleSection } from "./SchedulePanel";
-import { SubagentsSection, TodosSection } from "./TodosPanel";
+import { TodosSection } from "./TodosPanel";
 import { ViewerContent } from "./ViewerContent";
 
 /** MIME type for dragging a viewer tab id onto panes to split. */
@@ -450,7 +450,6 @@ export function ViewerWindows() {
         }}
       >
         <ScheduleSection />
-        <SubagentsSection />
         <TodosSection />
       </div>
     );

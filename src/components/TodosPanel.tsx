@@ -3,7 +3,6 @@ import { useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
 import { ScheduleSection } from "./SchedulePanel";
-import { listSubagents, stopSubagent, type SubagentJob } from "../lib/api";
 import type { ChatMessage } from "../types";
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -247,160 +246,6 @@ export function TodosPanel() {
   return null;
 }
 
-/** عمر یک job ساب‌ایجنت به شکل m:ss — خالص تا تست مستقیم صدا بزند. */
-export function subagentAge(
-  createdAt: number,
-  now: number = Date.now() / 1000,
-): string {
-  const s = Math.max(0, Math.round(now - createdAt));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}
-
-/** برچسب وضعیت ساب‌ایجنت برای title/dot — خالص تا تست مستقیم صدا بزند. */
-export function subagentStatusLabel(status: string): string {
-  if (status === "running") return "running";
-  if (status === "completed") return "done";
-  if (status === "failed") return "failed";
-  if (status === "stopped") return "stopped";
-  return status || "unknown";
-}
-
-/** بخش ساب‌ایجنت‌های پس‌زمینه در پنل راست: job های per-chat همین چت
- *  (poll هر ۳ ثانیه؛ فقط وقتی job هست رندر می‌شود) با دکمهٔ stop برای
- *  job های در حال اجرا — همان مسیری که task_stop ابزارِ ایجنت اصلی است. */
-export function SubagentsSection() {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const dir = useStore((s) => s.dir);
-  const [jobs, setJobs] = useState<SubagentJob[]>([]);
-  const [collapsed, setCollapsed] = useState(false);
-  const [stopping, setStopping] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!activeChatId) return;
-    let alive = true;
-    const tick = async () => {
-      const js = await listSubagents(activeChatId);
-      if (alive) setJobs(js);
-    };
-    void tick();
-    const t = setInterval(tick, 3000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [activeChatId]);
-
-  if (!activeChatId || jobs.length === 0) return null;
-  const runningCount = jobs.filter((j) => j.status === "running").length;
-
-  const onStop = async (taskId: string) => {
-    setStopping(taskId);
-    try {
-      await stopSubagent(activeChatId, taskId);
-      setJobs(await listSubagents(activeChatId));
-    } finally {
-      setStopping(null);
-    }
-  };
-
-  const openTrace = (j: SubagentJob) => {
-    useViewerTabs
-      .getState()
-      .openTraces(activeChatId, "all", j.task_id, j.description || j.task_id);
-  };
-
-  return (
-    <div
-      className={`sidebar-panel subagents-docked${collapsed ? " collapsed" : ""}`}
-      dir={dir}
-    >
-      <div
-        className="sidebar-panel-head"
-        role="button"
-        tabIndex={0}
-        title="Click to collapse"
-        onClick={() => setCollapsed((v) => !v)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setCollapsed((v) => !v);
-          }
-        }}
-      >
-        <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
-        <span className="sidebar-panel-title">Sub-agents</span>
-        {runningCount > 0 ? (
-          <span className="sidebar-panel-count live">{runningCount} running</span>
-        ) : (
-          <span className="sidebar-panel-count">{jobs.length}</span>
-        )}
-      </div>
-      {!collapsed && (
-        <ul className="sidebar-subagents-list">
-          {jobs.map((j) => {
-            const statusLabel = subagentStatusLabel(j.status);
-            return (
-              <li
-                key={j.task_id}
-                className={`sidebar-subagent-item status-${j.status}`}
-              >
-                <span
-                  className="sidebar-subagent-mark"
-                  title={statusLabel}
-                  aria-label={statusLabel}
-                >
-                  {j.status === "completed"
-                    ? "✓"
-                    : j.status === "failed"
-                      ? "✕"
-                      : j.status === "stopped"
-                        ? "⏹"
-                        : ""}
-                </span>
-                <button
-                  type="button"
-                  className="sidebar-subagent-main"
-                  title={`Open sub-agent trace — ${j.task_id}`}
-                  aria-label={`Open trace of ${j.description || j.task_id}`}
-                  onClick={() => openTrace(j)}
-                >
-                  <span className="sidebar-subagent-desc">
-                    {prepareContent(j.description || j.task_id, dir)}
-                  </span>
-                  {j.status === "running" && (
-                    <span className="sidebar-subagent-meta">
-                      {subagentAge(j.created_at)}
-                      {j.steering ? " · steered" : ""}
-                    </span>
-                  )}
-                </button>
-                {j.status === "running" ? (
-                  <button
-                    className="sidebar-subagent-stop"
-                    title={`Stop ${j.task_id}`}
-                    aria-label={`Stop ${j.description || j.task_id}`}
-                    disabled={stopping === j.task_id}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void onStop(j.task_id);
-                    }}
-                  >
-                    {stopping === j.task_id ? "…" : "✕"}
-                  </button>
-                ) : (
-                  <span className="sidebar-subagent-open" aria-hidden="true">
-                    ›
-                  </span>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </div>
-  );
-}
-
 /** پنل راست داک‌شده به سبک کلود — میزبان تودوها و بخش‌های آینده.
  *  عرض با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و ذخیرهٔ محلی
  *  مثل سایدبار تا بین بازشدن‌ها حفظ شود. */
@@ -505,7 +350,6 @@ function RightPanelContent() {
         }}
       >
         <ScheduleSection />
-        <SubagentsSection />
         <TodosSection />
       </div>
     </aside>

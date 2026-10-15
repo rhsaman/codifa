@@ -87,7 +87,7 @@ impl AgentEvent {
             AgentEvent::Text { content } => json!({"kind": "text", "content": content}),
             AgentEvent::Thinking { active } => json!({"kind": "thinking", "active": active}),
             AgentEvent::Tool { name, args, result, ok } => json!({
-                "kind": "tool", "name": name, "args": args,
+                "kind": "tool", "name": name, "tool": name, "args": args,
                 "result": result, "ok": ok,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),

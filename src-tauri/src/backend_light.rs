@@ -287,29 +287,12 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
 }
 
 // ---------- /chat/stream ----------
-// Default: proxied to the Python sidecar, which has full parity (LangGraph
-// checkpoints, MCP, sub-agents). The native Rust loop (agent.rs) is opt-in
-// via CODIFA_NATIVE_AGENT=1 for live testing until it reaches parity.
+// Always the native Rust agent loop (agent.rs) — no Python fallback.
 
 async fn chat_stream_entry(
-    State(st): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    let native = std::env::var("CODIFA_NATIVE_AGENT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if native {
-        chat_stream_native(body).await
-    } else {
-        let bytes = serde_json::to_vec(&body).unwrap_or_default();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/chat/stream")
-            .header("content-type", "application/json")
-            .body(Body::from(bytes))
-            .expect("fixed request builder");
-        proxy_all(st, req, "/chat/stream").await
-    }
+    chat_stream_native(body).await
 }
 
 /// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
@@ -571,9 +554,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_defaults_to_sidecar_proxy() {
-        // Without CODIFA_NATIVE_AGENT the route must flow to the sidecar
-        // (503 here because no sidecar runs in tests) — never a native 200.
+    async fn chat_stream_is_always_native() {
+        // No Python fallback: an empty body fails native deserialization
+        // with a 400 — never a sidecar 503.
         let app = router(new_state(std::env::temp_dir()));
         let res = app
             .oneshot(
@@ -586,7 +569,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), 503);
+        assert_eq!(res.status(), 400);
     }
 
     #[tokio::test]

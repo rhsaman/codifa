@@ -546,10 +546,15 @@ Report in English.",
     };
 
     let mut report = String::new();
+    let mut sub_error = String::new();
     let res = {
         let mut sink = |ev: &AgentEvent| {
-            if let AgentEvent::Text { content } = ev {
-                report.push_str(content);
+            match ev {
+                AgentEvent::Text { content } => report.push_str(content),
+                // Capture the sub-agent's error so an empty report can say WHY
+                // it is empty (provider 400/401, tool failure, …).
+                AgentEvent::Error { content } => sub_error.push_str(content),
+                _ => {}
             }
             // Forward sub-agent events to the parent stream so its tool
             // calls are visible in the chat while explore works.
@@ -558,7 +563,22 @@ Report in English.",
         run_turn(&sub_req, &mut sink, cancel).await
     };
     match res {
-        Ok(()) => (report, true),
+        Ok(()) => {
+            if report.trim().is_empty() {
+                // The turn "succeeded" but produced no text — the parent must
+                // not treat an empty report as data. Surface the captured
+                // sub-agent error (or a generic message) so it can retry or
+                // fall back to its own tools.
+                let why = if sub_error.trim().is_empty() {
+                    "the sub-agent produced no output (empty model response)".to_string()
+                } else {
+                    sub_error
+                };
+                (format!("explore returned no findings: {why}"), false)
+            } else {
+                (report, true)
+            }
+        }
         Err(e) => (format!("sub-agent failed: {e}"), false),
     }
 }

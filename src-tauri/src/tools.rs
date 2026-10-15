@@ -7,7 +7,6 @@
 // not wired to a route yet. Silence dead-code until the route lands.
 #![allow(dead_code)]
 
-use regex::RegexBuilder;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -291,8 +290,12 @@ fn collect_files(scope: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Grep file contents: combined case-insensitive regex over a scope with an
-/// optional include glob; returns matches with ±3 context lines, `>` marker.
+/// Grep file contents via the ripgrep binary (rg) — parallel search,
+/// .gitignore-aware, far faster than the in-process walker below.
+/// No fallback (per user request): rg must be on PATH; a missing binary
+/// surfaces as a clear error instead of silently degrading to the walker.
+/// Output mirrors the walker's format: `rel:\n` headers, `>` marker on
+/// the match line, ±3 context lines, long lines truncated.
 pub fn grep_scope(
     root: &Path,
     scope: &str,
@@ -311,74 +314,94 @@ pub fn grep_scope(
             count_grep_alternatives(pattern)
         ));
     }
-    // macOS temp dirs resolve through /private/var — canonicalize so the
-    // strip_prefix calls below produce workspace-relative paths.
     let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let scope_abs = if scope.is_empty() {
         root_real.clone()
     } else {
         resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
     };
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .build()
-        .map_err(|e| format!("invalid pattern: {e}"))?;
-    let include_re = if include.is_empty() {
-        None
-    } else {
-        Some(glob_to_regex(include))
-    };
 
-    let mut files = Vec::new();
-    collect_files(&scope_abs, &mut files);
-    files.sort();
+    let cap = max_results.min(MAX_SEARCH_RESULTS);
+    let mut cmd = std::process::Command::new("rg");
+    cmd.current_dir(&scope_abs)
+        .arg("--json")
+        .arg("--line-number")
+        .arg("--max-count")
+        .arg(cap.to_string())
+        .arg("--context")
+        .arg("3")
+        .arg("--ignore-case")
+        .arg("--no-messages");
+    if !include.is_empty() {
+        cmd.arg("--glob").arg(include);
+    }
+    cmd.arg("--").arg(pattern).arg(".");
 
+    let raw = cmd
+        .output()
+        .map_err(|e| format!("ripgrep (rg) is required but could not be run: {e}"))?;
+    if raw.status.code() == Some(2) {
+        return Err(String::from_utf8_lossy(&raw.stderr).trim().to_string());
+    }
+
+    // Parse rg --json events and rebuild the walker's header+marker format.
     let mut out = String::new();
     let mut hits = 0usize;
-    let cap = max_results.min(MAX_SEARCH_RESULTS);
-    'files: for file in &files {
-        if let Some(inc) = &include_re {
-            let rel = file.strip_prefix(&root_real).unwrap_or(file).to_string_lossy();
-            if !inc.is_match(&rel) {
-                continue;
-            }
-        }
-        let Ok(content) = fs::read(file) else { continue };
-        // Skip binary-looking files (NUL byte in the first 8KB).
-        if content.iter().take(8192).any(|&b| b == 0) {
-            continue;
-        }
-        let Ok(text) = String::from_utf8(content) else { continue };
-        let lines: Vec<&str> = text.lines().collect();
-        let mut file_header_written = false;
-        for (i, line) in lines.iter().enumerate() {
-            if re.is_match(line) {
+    let mut current_file = String::new();
+    let mut pending: Vec<(bool, u64, String)> = Vec::new(); // (is_match, line_no, text)
+    for line in String::from_utf8_lossy(&raw.stdout).lines() {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+        let kind = ev["type"].as_str().unwrap_or_default();
+        if kind == "begin" {
+            let path = ev["data"]["path"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let abs = scope_abs.join(&path);
+            let abs = abs.components().collect::<std::path::PathBuf>();
+            current_file = abs
+                .strip_prefix(&root_real)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+        } else if kind == "match" || kind == "context" {
+            let text = ev["data"]["lines"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .trim_end_matches('\n')
+                .to_string();
+            let line_no = ev["data"]["line_number"].as_u64().unwrap_or(0);
+            if kind == "match" {
                 if hits >= cap {
-                    out.push_str(&format!(
-                        "\n[truncated — {hits}+ matches; read the shown files instead of re-grepping]\n"
-                    ));
-                    break 'files;
+                    continue;
                 }
-                if !file_header_written {
-                    let rel = file.strip_prefix(&root_real).unwrap_or(file).to_string_lossy();
-                    out.push_str(&format!("{rel}:\n"));
-                    file_header_written = true;
-                }
-                let from = i.saturating_sub(3);
-                let to = (i + 4).min(lines.len());
-                for j in from..to {
-                    let marker = if j == i { ">" } else { " " };
-                    let body = if lines[j].len() > MAX_LINE_LENGTH {
-                        format!("{} …[truncated]", &lines[j][..MAX_LINE_LENGTH])
-                    } else {
-                        lines[j].to_string()
-                    };
-                    out.push_str(&format!("{marker}{}: {body}\n", j + 1));
-                }
-                out.push('\n');
                 hits += 1;
             }
+            pending.push((kind == "match", line_no, text));
+        } else if kind == "end" {
+            if !pending.is_empty() && !current_file.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&current_file);
+                out.push_str(":\n");
+                for (is_match, line_no, text) in &pending {
+                    let marker = if *is_match { ">" } else { " " };
+                    let body = if text.len() > MAX_LINE_LENGTH {
+                        format!("{} …[truncated]", &text[..MAX_LINE_LENGTH])
+                    } else {
+                        text.clone()
+                    };
+                    out.push_str(&format!("{marker}{line_no}: {body}\n"));
+                }
+                pending.clear();
+            }
         }
+    }
+    if hits >= cap {
+        out.push_str(&format!(
+            "\n[truncated — {hits}+ matches; read the shown files instead of re-grepping]\n"
+        ));
     }
     if hits == 0 {
         return Ok("no matches".into());

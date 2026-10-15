@@ -83,7 +83,7 @@ fn find_backend_dir(app: &AppHandle) -> Option<PathBuf> {
 
 /// Merge the minimal GUI-launched PATH with the user's login-shell PATH so
 /// child tools (docker, rg, MCP stdio servers, …) resolve like a terminal launch.
-fn shell_path() -> String {
+pub(crate) fn shell_path() -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut parts: Vec<String> = std::env::var("PATH")
         .unwrap_or_default()

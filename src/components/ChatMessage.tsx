@@ -1863,7 +1863,7 @@ export function renderSegments(
     // keeps one identity across renders no matter which scan point ends up
     // triggering the flush.
     const key = `grp-${pending[0].index}`;
-    if (pending.length === 1) {
+    if (pending.length === 1 && !isSubagentCard(pending[0].activity)) {
       // یک فراخوانی تکی: narration مدل — اگر بود — به‌صورت ردیف جدا بالای
       // همین ردیف رندر می‌شود (TraceNarration) — مثل Claude.ai که کپشنِ
       // کارِ تکی در کادر جدا بالای ردیف ابزار دیده می‌شود.
@@ -1885,6 +1885,10 @@ export function renderSegments(
       // `captions` is reused (cleared) for the next run, and React reads the
       // prop at render time — by-reference passing would hand it an empty
       // array by then.
+      // A LONE sub-agent call (explore) also takes this path: ToolGroupView
+      // renders it as a pill carrying the short description of what that
+      // explore is looking for, which ToolSingleRow cannot show — so a single
+      // explore is no longer an anonymous row.
       trace.push(
         <ToolGroupView
           key={key}
@@ -2002,11 +2006,15 @@ export function renderSegments(
       pendingEdit.push({ activity, index: seg.index });
       return;
     }
-    // The explore parent card is intentionally NOT rendered in chat: its
-    // head row duplicates the sub-agent tool group that follows it. The
-    // forwarded sub-agent calls still render as their own tool group.
-    if (activity.tool === "explore") return;
-    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool) || isSubagentCard(activity)) {
+    // The explore parent card joins the read-only run instead of rendering as
+    // its own always-visible card: ToolGroupView turns every sub-agent call
+    // into a pill carrying its short description, so several PARALLEL explores
+    // stay distinguishable in the group header while their forwarded
+    // read/grep calls collapse into the same group. "task" keeps the full card.
+    if (
+      ALWAYS_VISIBLE_TOOLS.has(activity.tool) ||
+      (isSubagentCard(activity) && activity.tool !== "explore")
+    ) {
       flush();
       wrapTrace();
       flushEdits();

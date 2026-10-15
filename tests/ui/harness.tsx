@@ -185,6 +185,47 @@ function initialState(scenario: string | null) {
         chats: [chat({})],
         terminalPanelOpen: true,
       };
+    case "explore":
+      // Two PARALLEL explore runs in one step plus a read: the group header
+      // must show one pill per explore carrying its short description (so the
+      // user can tell what each one is looking for) instead of collapsing
+      // them into a single "Explore ×2" count.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                createdAt: now,
+                content: "",
+                toolActivity: [
+                  {
+                    tool: "explore",
+                    status: "running",
+                    args: {
+                      description: "Find the auth flow",
+                      prompt: "where is login handled",
+                    },
+                  },
+                  {
+                    tool: "explore",
+                    status: "done",
+                    args: {
+                      description: "Map the settings store",
+                      prompt: "how are settings persisted",
+                    },
+                    summary: "4 files",
+                  },
+                  { tool: "read", status: "done", args: { filePath: "a.ts" }, summary: "1 file" },
+                ],
+              },
+            ],
+          }),
+        ],
+      };
     case "composer":
     default:
       return {

@@ -18,8 +18,12 @@ Use this exact template for the summary (markdown, anchored to the conversation)
    <!-- What the user asked for, verbatim intent, constraints -->
 2. Decisions and approach:
    <!-- Key technical decisions made and why -->
-3. Work completed:
-   <!-- Files changed/created, commands run, with outcomes -->
+3. Work completed (DURABLE LEDGER — never drop an entry):
+   <!-- One bullet per finished item, each with the EXACT path (and line/function
+        when known), the commit hash when one was made, and the outcome.
+        This section is the ONLY record of finished work after compaction: an
+        item missing here WILL be redone from scratch. Copy entries forward
+        verbatim from a previous summary instead of re-summarizing them. -->
 4. Current state:
    <!-- What exists right now: files, branches, running processes -->
 5. Next steps:

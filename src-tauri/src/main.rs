@@ -10,6 +10,7 @@ mod trace;
 mod retention;
 mod scheduler;
 mod lsp;
+mod mcp;
 mod memory;
 mod backend_light;
 mod commands;

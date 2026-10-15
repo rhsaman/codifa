@@ -125,6 +125,7 @@ traceNarration|tests/traceNarration.ssr.test.tsx|--jsx=automatic --packages=exte
 planApproval|tests/planApproval.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 resumeNote|tests/resumeNote.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolEditGroup|tests/toolEditGroup.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+exploreHeader|tests/exploreHeader.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 terminalPanel|tests/terminalPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalPanelClosed|tests/terminalPanelClosed.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron

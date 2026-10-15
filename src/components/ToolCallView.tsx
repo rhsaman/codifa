@@ -131,6 +131,17 @@ function toolIcon(tool: string): string {
   return TOOL_ICON[tool] ?? "•";
 }
 
+/** MCP tools arrive as `mcp__<server>__<tool>`: show the bare tool name with
+ *  the connector as a suffix so the card stays readable. */
+export function toolLabel(tool: string): string {
+  if (tool.startsWith("mcp__")) {
+    const rest = tool.slice(5);
+    const i = rest.indexOf("__");
+    if (i > 0) return `${rest.slice(i + 2)} · ${rest.slice(0, i)}`;
+  }
+  return TOOL_LABEL[tool] ?? tool;
+}
+
 /** Natural-language piece per tool category for the group header sentence
  *  ("9 commands, 3 searches, 2 notes") — the Claude-app-style summary line
  *  instead of a raw tool-name tally. */
@@ -165,7 +176,7 @@ function groupSummary(activities: ToolActivity[]): string {
   for (const a of activities) counts[a.tool] = (counts[a.tool] || 0) + 1;
   return Object.entries(counts)
     .map(([tool, n]) => {
-      const name = TOOL_LABEL[tool] ?? tool;
+      const name = toolLabel(tool);
       return n > 1 ? `${name} ×${n}` : name;
     })
     .join(", ");
@@ -1396,13 +1407,13 @@ export const ToolGroupView = memo(function ToolGroupView({
     .filter(({ activity }) => isSubagentCard(activity))
     .map(({ activity, index }) => ({
       key: index,
-      label: TOOL_LABEL[activity.tool] ?? activity.tool,
+      label: toolLabel(activity.tool),
       desc: shortArg(String(activity.args?.description ?? ""), 70),
       running: activity.status === "running",
     }));
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
     if (isSubagentCard(a.activity)) return acc;
-    const label = TOOL_LABEL[a.activity.tool] ?? a.activity.tool;
+    const label = toolLabel(a.activity.tool);
     acc[label] = (acc[label] || 0) + 1;
     return acc;
   }, {});
@@ -1650,7 +1661,7 @@ export const ToolSubRow = memo(function ToolSubRow({
       >
         <StatusIcon status={activity.status} />
         <span className="tool-sub-name">
-          {TOOL_LABEL[activity.tool] ?? activity.tool}
+          {toolLabel(activity.tool)}
         </span>
         <span className="tool-sub-args" title={subSummary}>
           {subSummary}
@@ -1748,7 +1759,7 @@ const TraceRow = memo(function TraceRow({
     running && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs;
-  const label = TOOL_LABEL[activity.tool] ?? activity.tool;
+  const label = toolLabel(activity.tool);
   const detail = activity.summary
     ? fixZwsp(activity.summary)
     : subArgSummary(activity);
@@ -1909,7 +1920,7 @@ const ToolTimelineRow = memo(function ToolTimelineRow({
         {running ? <span className="spinner" /> : toolIcon(activity.tool)}
       </span>
       <span className="tool-timeline-label">
-        {TOOL_LABEL[activity.tool] ?? activity.tool}
+        {toolLabel(activity.tool)}
       </span>
       {detail && (
         <span className="tool-timeline-detail" title={detail}>
@@ -2053,7 +2064,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     running && activity.startedAt
       ? now - activity.startedAt
       : activity.elapsedMs;
-  const label = TOOL_LABEL[activity.tool] ?? activity.tool;
+  const label = toolLabel(activity.tool);
   const detail = activity.summary
     ? fixZwsp(activity.summary)
     : subArgSummary(activity);
@@ -2076,6 +2087,13 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   const onHeadClick = () => {
     if (isEdit) {
       if (messageId) openReview(messageId, reviewPathOf(activity));
+      return;
+    }
+    // Sub-agent (explore/task) cards: the report IS the payload, so clicking
+    // the card opens it in the side panel instead of expanding a cramped
+    // inline body (user request).
+    if (isSubagentCard(activity) && outputText.trim()) {
+      useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
     }
     if (outputText.length > TRACE_TEXT_PANEL_MIN) {
@@ -2366,12 +2384,12 @@ export const ToolCallView = memo(function ToolCallView({
             </>
           ) : isSubagentCard(activity) ? (
             activity.tool === "explore" ? (
-              (TOOL_LABEL[activity.tool] ?? activity.tool)
+              toolLabel(activity.tool)
             ) : (
               "sub-agent"
             )
           ) : (
-            (TOOL_LABEL[activity.tool] ?? activity.tool)
+            toolLabel(activity.tool)
           )}
         </span>
         {activity.tool === "task" && !!activity.args?.subagent_type && (

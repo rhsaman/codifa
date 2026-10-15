@@ -69,7 +69,6 @@ pub struct AgentRequest {
     #[allow(dead_code)]
     pub chat_id: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub mcp_servers: Value,
     /// Per-slot sub-agent model overrides from the UI's Tool Models settings
     /// (e.g. {"subagent": "providerId/model"}); empty = the parent model.
@@ -79,6 +78,12 @@ pub struct AgentRequest {
     /// entry routes to THAT provider's base URL / keys (cross-provider).
     #[serde(default)]
     pub providers: std::collections::HashMap<String, Value>,
+    /// The app data root (~/.codifa) where the skill store lives. Skills are
+    /// NOT workspace files: `/skills` reads them from the data root, so the
+    /// router must look there too — reading the workspace root found nothing
+    /// and silently disabled both auto-match and the decision model.
+    #[serde(default)]
+    pub data_root: String,
 }
 
 fn default_mode() -> String {
@@ -522,7 +527,12 @@ pub async fn run_turn(
         })
     });
     let skill_section = crate::skill_router::build_section_async(
-        &root,
+        // The skill store lives in the DATA root, not the workspace.
+        if req.data_root.is_empty() {
+            &root
+        } else {
+            &req.data_root
+        },
         &req.prompt,
         &req.skills,
         decision_cfg.as_ref().map(|c| (&client, c)),
@@ -581,11 +591,21 @@ pub async fn run_turn(
 
     // The explore sub-agent gets the full read/search set; the main agent
     // deliberately has NO search tools and must delegate via `explore`.
-    let schemas = if req.mode == "subagent" {
+    let mut schemas = if req.mode == "subagent" {
         research_schemas()
     } else {
         tool_schemas()
     };
+    // MCP connectors switched on in the composer become extra tools named
+    // `mcp__<server>__<tool>`; their schemas come from each server's
+    // tools/list. A connector that fails to start contributes no tools — but
+    // the reason is surfaced as a warning, so "the agent has no browser tool"
+    // is never a silent mystery again.
+    let (mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers);
+    for failure in mcp_failures {
+        emit(&AgentEvent::Warn { content: failure });
+    }
+    schemas.extend(mcp_schemas);
 
     let max_steps = if req.mode == "subagent" {
         SUBAGENT_MAX_STEPS
@@ -868,6 +888,11 @@ pub async fn run_turn(
                     "blocked: the main agent must not locate files via the terminal — delegate file discovery to the `explore` sub-agent".into(),
                     false,
                 )
+            } else if name.starts_with(crate::mcp::TOOL_PREFIX) {
+                match crate::mcp::call_tool(&req.mcp_servers, name, &args) {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
             } else {
                 match tools::dispatch(&root, name, &args, None) {
                     Ok(r) => (r, true),
@@ -1162,6 +1187,7 @@ async fn run_subagent(
         mcp_servers: Value::Null,
         subagent_models: std::collections::HashMap::new(),
         providers: parent.providers.clone(),
+        data_root: parent.data_root.clone(),
     };
 
     let mut report = String::new();
@@ -1232,6 +1258,16 @@ and git. \
 Use write_file/edit_file/run_terminal to make changes. \
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \
+A system message holding a compacted summary is AUTHORITATIVE history: every \
+item under its 'Work completed' ledger is already DONE — never redo, re-verify \
+or re-implement it, and never re-read a file just to confirm a change listed \
+there. Continue from its 'Next steps' only. \
+The conversation itself is the same kind of record: before you start any task, \
+scan the turns above (and any '[Interrupted before finishing. Already done this \
+turn]' block) for work that is ALREADY DONE. If a fix, file edit or commit is \
+listed there, it is finished — do NOT redo it, do NOT re-verify it, and do NOT \
+re-implement it from scratch. Say what is already done and continue from what \
+is actually left. Redoing finished work is a bug, not thoroughness. \
 Reply in the user's language. \
 Docstrings and comments in code must be English."
     )
@@ -1552,6 +1588,7 @@ mod tests {
             mcp_servers: Value::Null,
             subagent_models: std::collections::HashMap::new(),
             providers: std::collections::HashMap::new(),
+            data_root: String::new(),
         }
     }
 

@@ -418,18 +418,24 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
 // Always the native Rust agent loop (agent.rs) — no Python fallback.
 
 async fn chat_stream_entry(
+    State(st): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response<Body> {
-    chat_stream_native(body).await
+    chat_stream_native(body, st.data_root).await
 }
 
 /// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
 /// the same event protocol the Python sidecar emits.
-async fn chat_stream_native(body: Value) -> Response<Body> {
-    let req = match serde_json::from_value::<agent::AgentRequest>(body) {
+async fn chat_stream_native(body: Value, data_root: PathBuf) -> Response<Body> {
+    let mut req = match serde_json::from_value::<agent::AgentRequest>(body) {
         Ok(r) => r,
         Err(e) => return bad_request(&format!("invalid agent request: {e}")),
     };
+    // The skill store is a data-root directory, not a workspace one: hand the
+    // resolved root to the agent so skill routing reads the real store.
+    if req.data_root.is_empty() {
+        req.data_root = data_root.to_string_lossy().to_string();
+    }
     let (tx, rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

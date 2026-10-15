@@ -6,7 +6,9 @@ use serde_json::Value;
 
 use crate::llm::{self, LlmConfig};
 
-const TOOL_OUTPUT_MAX_CHARS: usize = 12_000;
+// 4k (was 12k): the summarizer prompt is the whole serialized history — 12k
+// chars per tool message made compaction a slow, huge-token LLM call.
+const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 const SUMMARY_TEMPLATE: &str = r#"
 
 Use this exact template for the summary (markdown, anchored to the conversation):
@@ -266,11 +268,20 @@ pub async fn compact_history(
     };
     const SYSTEM: &str = "You are a precise summarizer for a coding agent. Produce the anchored summary exactly in the requested template. Keep concrete details: file paths, commands, errors and their fixes.";
 
-    // Summarize on the primary model, then up to 3 retries on the fallback.
+    // Summarize on the primary model, then up to 2 retries on the fallback.
+    // Each attempt is bounded by the model's own timeout (llm::complete), so a
+    // slow primary cannot stack with slow fallback retries into minutes of
+    // waiting — the UI's Compacting spinner stays bounded.
     let mut outcome: Option<CompactOutcome> = None;
     let mut last_err = String::new();
-    for m in std::iter::once(model).chain(fallback.iter().take(if std::ptr::eq(model, fallback.unwrap_or(model)) { 0 } else { 3 }).copied()) {
-        for _attempt in 0..if std::ptr::eq(m, model) { 1 } else { 3 } {
+    let fallbacks: Vec<&LlmConfig> = if std::ptr::eq(model, fallback.unwrap_or(model)) {
+        Vec::new()
+    } else {
+        fallback.iter().copied().collect()
+    };
+    for m in std::iter::once(model).chain(fallbacks.into_iter()) {
+        let attempts = if std::ptr::eq(m, model) { 1 } else { 2 };
+        for _attempt in 0..attempts {
             match llm::complete(client, m, SYSTEM, &user_prompt).await {
                 Ok(r) if !r.text.trim().is_empty() => {
                     outcome = Some(CompactOutcome { summary: r.text.trim().to_string(), keep: recent.len(), usage: r.usage });

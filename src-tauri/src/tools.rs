@@ -682,6 +682,13 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 return Err("empty pattern: pass pattern='...' or patterns=[...]".into());
             }
             let joined = combined.join("|");
+            // Catch-all patterns (".", ".*", …) match every line of every file —
+            // a whole-tree scan disguised as a grep. Refuse them outright.
+            if matches!(joined.trim(), "." | ".*" | ".+" | "^" | "$" | "^$") {
+                return Err(format!(
+                    "catch-all pattern {joined:?} refused — grep a real token instead"
+                ));
+            }
             if count_grep_alternatives(&joined) > MAX_GREP_ALTERNATIVES
                 && s("path").is_empty()
                 && s("include").is_empty()

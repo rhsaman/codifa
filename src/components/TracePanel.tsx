@@ -81,7 +81,9 @@ export function formatTraceEntryAsText(entry: TraceEntry): string {
   if (entry.prompt) lines.push(`  prompt:\n${entry.prompt}`);
   const result = String((entry as { result?: string }).result || "");
   if (result) lines.push(`  result:\n${result}`);
-  if (!entry.prompt && !result) lines.push(`  detail: ${JSON.stringify(entry.detail ?? {})}`);
+  // An empty detail object is noise — only print it when it carries data.
+  const detailKeys = Object.keys(entry.detail ?? {});
+  if (!entry.prompt && !result && detailKeys.length > 0) lines.push(`  detail: ${JSON.stringify(entry.detail)}`);
   return lines.join("\n");
 }
 
@@ -337,8 +339,11 @@ export function traceEntrySearchParts(entry: TraceEntry): {
   const title = traceRowTitle(entry);
   const prompt = entry.prompt || "";
   const result = String((entry as { result?: string }).result || "");
+  // An empty detail object is noise — hide it instead of rendering "{}".
   const detailJson =
-    !prompt && !result ? JSON.stringify(entry.detail ?? {}, null, 2) : "";
+    !prompt && !result && Object.keys(entry.detail ?? {}).length > 0
+      ? JSON.stringify(entry.detail, null, 2)
+      : "";
   return { title, prompt, result, detailJson };
 }
 

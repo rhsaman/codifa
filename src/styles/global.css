@@ -22588,7 +22588,9 @@ tr[data-search-current] .fv-mark,
 
 .terminal-screen {
   position: absolute;
-  inset: 4px 10px 10px;
+  /* Full-bleed bottom: the old 4px bottom inset left a dark strip under
+     the xterm viewport that read as a stray black line. */
+  inset: 4px 10px 0;
   display: none;
 }
 
@@ -22598,6 +22600,18 @@ tr[data-search-current] .fv-mark,
 
 .terminal-screen .xterm {
   height: 100%;
+}
+
+/* The horizontal scrollbar painted a dark strip along the panel's bottom
+   (read as a "black line") and its appear/disappear oscillated the fit size.
+   xterm cols already match the container width, so horizontal overflow never
+   carries content — hide it. */
+.terminal-screen .xterm-viewport {
+  overflow-x: hidden;
+}
+
+.terminal-screen .xterm-viewport::-webkit-scrollbar:horizontal {
+  display: none;
 }
 
 .terminal-screen .xterm-viewport::-webkit-scrollbar {

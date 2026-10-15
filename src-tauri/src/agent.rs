@@ -23,6 +23,10 @@ const MAX_STEPS: usize = 60;
 const SUBAGENT_MAX_STEPS: usize = 12;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 const TOOL_RESULT_CAP: usize = 4000;
+/// Cap on the tool result forwarded to the MODEL: full multi-MB read/grep
+/// outputs ballooned the context (76k-token turns) and made every LLM
+/// round-trip crawl — the #1 cause of slow explore turns.
+const MODEL_RESULT_CAP: usize = 16_000;
 /// Sub-agent depth limit (mirrors graph.py: sub-agents cannot spawn more).
 const MAX_SUBAGENT_DEPTH: usize = 1;
 
@@ -575,10 +579,23 @@ pub async fn run_turn(
                 result: shown,
                 ok,
             });
+            // The model receives a capped copy too — a narrower re-read is one
+            // cheap tool call; an unbounded context is seconds per round-trip.
+            let mut for_model = result.clone();
+            if for_model.len() > MODEL_RESULT_CAP {
+                let mut end = MODEL_RESULT_CAP;
+                while end > 0 && !for_model.is_char_boundary(end) {
+                    end -= 1;
+                }
+                for_model.truncate(end);
+                for_model.push_str(
+                    "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
+                );
+            }
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": id,
-                "content": result,
+                "content": for_model,
             }));
         }
     }

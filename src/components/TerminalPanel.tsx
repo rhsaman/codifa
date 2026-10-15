@@ -369,7 +369,15 @@ export function TerminalPanel() {
       term.onData((data) => {
         void window.coder.terminalWrite(tab.id, data)
       })
+      let lastCols = -1
+      let lastRows = -1
       term.onResize(({ cols, rows }) => {
+        // Fit-loop guard: a scrollbar appearing/disappearing oscillates the fit
+        // size; re-sending an unchanged size makes zsh redraw the prompt line
+        // mid-typing (looked like extra characters appearing while typing).
+        if (cols === lastCols && rows === lastRows) return
+        lastCols = cols
+        lastRows = rows
         void window.coder.terminalResize(tab.id, cols, rows)
       })
       // Reserved chords must reach the window-level handler even while the

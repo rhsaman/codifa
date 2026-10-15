@@ -3,7 +3,7 @@
 //! Files older than their TTL are deleted once at app startup (cheap, no
 //! background janitor needed — the app restarts far more often than the TTL).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Retention windows (days). Traces are debug aids, checkpoints are undo
 /// history, uploads are imported attachments — none need to outlive these.
@@ -101,6 +101,7 @@ pub fn run_startup_sweep(data_root: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::UNIX_EPOCH;
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("codifa-retention-{}-{}", tag, std::process::id()));

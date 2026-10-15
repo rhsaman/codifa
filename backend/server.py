@@ -196,39 +196,8 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, model_validator
 
 import providers
-from agents import (
-    _compact_history,
-    _drain_steer,
-    _enqueue_steer,
-    _is_read_timeout,
-    _prune_history,
-    _remove_steer,
-    normalize_mode,
-    run_agent,
-)
-from graph import (
-    clear_chat_resume_checkpoint,
-    prune_stale_resume_checkpoints,
-)
 from llm import build_chat_model, llm_complete
 
-
-def wants_skill_or_mcp(text: str) -> bool:
-    """True when a prompt asks to create/edit/install/import skills or MCP connectors,
-    so the agent gets the `create_skill` / `create_mcp` tools for the turn.
-    `create_skill` overwrites an existing skill with the same name, so the same
-    grant covers both creating AND editing a skill.
-    Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
-    action; اسکیل/مهارت → skill target)."""
-    low = text.lower()
-    if re.search(r"/\s*(skill|mcp|connector|اسکیل|مهارت)", low):
-        return True
-    action = re.search(
-        r"\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)",
-        low,
-    )
-    target = re.search(r"\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)", low)
-    return bool(action and target)
 
 
 # Sidecar's own listening port, set in main(). Used to build the loopback
@@ -2682,6 +2651,17 @@ def _start_parent_watchdog() -> None:
     threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
 
 
+@app.get("/health")
+async def health() -> dict:
+    """Liveness probe for the Rust shell.
+
+    The public router serves its own native /health; this one lives on the
+    sidecar's private port and is what sidecar.rs polls while waiting for the
+    process to come up (and for its liveness probe afterwards).
+    """
+    return {"status": "ok", "version": "1.0.0"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codifa agent sidecar")
     parser.add_argument("--port", type=int, required=True)
@@ -2808,10 +2788,6 @@ def main() -> None:
     # Resume state is held in LangGraph's checkpointer (a SQLite DB under the
     # data root). On startup, reclaim any checkpoint left behind by an
     # interrupted turn that was never resumed (errors/crashes), keyed by age.
-    try:
-        asyncio.run(prune_stale_resume_checkpoints())
-    except Exception:  # noqa: BLE001, S110
-        pass
 
     # Still prune orphaned plan dirs on shutdown.
     try:

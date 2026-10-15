@@ -47,20 +47,32 @@ impl SidecarState {
 }
 
 fn find_backend_dir(app: &AppHandle) -> Option<PathBuf> {
-    let candidates = vec![
-        std::env::var("CODER_BACKEND").ok().map(PathBuf::from),
-        // Packaged layout first: a bundled app must always run its own backend
-        // copy, even when launched from the repo root (cwd would shadow it).
-        app.path()
-            .resource_dir()
-            .ok()
-            .map(|res| res.join("backend")),
-        // `tauri dev` runs from src-tauri/ — the repo root is its parent.
+    // In `tauri dev` the resource dir holds a copy of the backend that Tauri
+    // staged at build time — running it silently ignores source edits (and it
+    // goes stale the moment backend/ changes). Prefer the repo checkout while
+    // developing; the packaged layout wins in release builds.
+    let dev_candidates = [
         std::env::current_dir().ok().map(|d| d.join("backend")),
         std::env::current_dir()
             .ok()
             .and_then(|d| d.parent().map(|p| p.join("backend"))),
     ];
+    let packaged = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|res| res.join("backend"));
+    let mut candidates: Vec<Option<PathBuf>> = Vec::new();
+    if let Ok(p) = std::env::var("CODER_BACKEND") {
+        candidates.push(Some(PathBuf::from(p)));
+    }
+    if cfg!(debug_assertions) {
+        candidates.extend(dev_candidates);
+        candidates.push(packaged);
+    } else {
+        candidates.push(packaged);
+        candidates.extend(dev_candidates);
+    }
     for c in candidates.into_iter().flatten() {
         if c.join("server.py").exists() {
             return Some(c);
@@ -207,6 +219,11 @@ fn spawn_sidecar(
     }
     command.env("PATH", shell_path());
     command.env("PYTHONIOENCODING", "utf-8");
+    // A PYTHONHOME inherited from the parent (a dev shell, a launcher, a
+    // previous bundled run) points the venv python at a foreign stdlib and
+    // makes it exit immediately — the sidecar then never answers /health.
+    // Drop it; only the bundled base below may set it.
+    command.env_remove("PYTHONHOME");
     // The bundled venv ships a relocated copy of the uv-managed base python
     // (built with prefix /install); point PYTHONHOME at it so the stdlib and
     // encodings resolve inside the .app bundle.

@@ -174,6 +174,17 @@ function initialState(scenario: string | null) {
           }),
         ],
       };
+    case "terminal":
+      // Terminal panel with a stubbed pty (see the driver below): lets a
+      // browser driver assert that a fit does NOT oscillate — every resize
+      // pushed to the pty makes the shell redraw its prompt line, which is
+      // what looked like "extra characters typed by themselves".
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [chat({})],
+        terminalPanelOpen: true,
+      };
     case "composer":
     default:
       return {
@@ -183,7 +194,6 @@ function initialState(scenario: string | null) {
       };
   }
 }
-
 const params = new URLSearchParams(window.location.search);
 (useStore as any).setState(initialState(params.get("scenario")));// Browser drivers reach the store through this handle to seed or assert state.
 (window as any).__ui = {
@@ -205,7 +215,41 @@ const params = new URLSearchParams(window.location.search);
 };
 
 const root = createRoot(document.getElementById("root")!);
-if (params.get("scenario") === "plan-panel") {
+if (params.get("scenario") === "terminal") {
+  // Stub the pty bridge: one live session, and a counter of every resize the
+  // panel pushes (the oscillation signal). Data is echoed back so the screen
+  // renders something.
+  const resizes: Array<{ cols: number; rows: number }> = [];
+  const writes: string[] = [];
+  const dataCbs: Array<(id: string, data: string) => void> = [];
+  const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+  coder.terminalCreate = () =>
+    Promise.resolve({ id: "t1", shell: "zsh", cwd: "/tmp/codifa-ui-harness" });
+  coder.terminalList = () =>
+    Promise.resolve([{ id: "t1", shell: "zsh", cwd: "/tmp/codifa-ui-harness" }]);
+  coder.terminalWrite = (_id: string, data: string) => {
+    writes.push(data);
+    // Echo like a shell would, so the screen shows the typed text.
+    dataCbs.forEach((cb) => cb("t1", data));
+    return Promise.resolve(true);
+  };
+  coder.terminalResize = (_id: string, cols: number, rows: number) => {
+    resizes.push({ cols, rows });
+    return Promise.resolve(true);
+  };
+  coder.terminalKill = () => Promise.resolve(true);
+  coder.onTerminalData = (cb: (id: string, data: string) => void) => {
+    dataCbs.push(cb);
+    return () => {
+      const i = dataCbs.indexOf(cb);
+      if (i >= 0) dataCbs.splice(i, 1);
+    };
+  };
+  coder.onTerminalExit = () => () => {};
+  (window as any).__term = { resizes, writes };
+  const { TerminalPanel } = await import("../../src/components/TerminalPanel");
+  root.render(<TerminalPanel />);
+} else if (params.get("scenario") === "plan-panel") {
   // Standalone docked Plan panel (the App viewer group isn't mounted here).
   root.render(
     <div style={{ display: "flex", height: "100vh", background: "var(--bg, #0b0e14)" }}>
@@ -215,7 +259,7 @@ if (params.get("scenario") === "plan-panel") {
 } else if (params.get("scenario") === "app") {
   // Full App shell (titlebar + sidebar + chat + viewer group) for real-dock
   // geometry checks (RTL insets, split widths). Plan tab opens after mount.
-  const { App } = await import("../../src/App");
+  const { default: App } = await import("../../src/App");
   const { useViewerTabs } = await import("../../src/lib/viewerTabs");
   root.render(<App />);
   useViewerTabs.getState().openPlan();

@@ -22621,6 +22621,13 @@ tr[data-search-current] .fv-mark,
   overflow-x: hidden;
 }
 
+/* xterm paints a horizontal scrollbar when a line overflows the viewport —
+   it read as a stray dark strip along the bottom of the panel. Lines wrap
+   instead (VSCode behaviour). */
+.terminal-screen .xterm-viewport {
+  overflow-x: hidden !important;
+}
+
 .terminal-screen .xterm-viewport::-webkit-scrollbar {
   width: 8px;
 }

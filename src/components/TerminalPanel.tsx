@@ -129,6 +129,14 @@ export function TerminalPanel() {
     const rect = el.getBoundingClientRect()
     if (rect.width < 40 || rect.height < 40) return
     try {
+      // FitAddon + ResizeObserver can oscillate: a fit toggles the scrollbar,
+      // which changes the body size, which schedules another fit — and every
+      // fit pushes a resize to the pty, so the shell redraws its prompt line
+      // over and over (the "extra characters appear by themselves" bug).
+      // Only fit when the proposed geometry actually differs.
+      const proposed = entry.fit.proposeDimensions()
+      if (!proposed) return
+      if (proposed.cols === entry.term.cols && proposed.rows === entry.term.rows) return
       entry.fit.fit() // fires term.onResize → terminal:resize IPC
     } catch {
       /* fit before open() completed */

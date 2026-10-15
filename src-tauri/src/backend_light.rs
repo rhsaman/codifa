@@ -6,7 +6,7 @@
 //! the frontend keeps a single base URL and unchanged HTTP semantics.
 
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -541,6 +541,11 @@ pub fn router(state: AppState) -> Router {
         .route("/chats/:chat_id/traces", get(crate::trace::traces_list))
         .route("/chats/:chat_id/traces", delete(crate::trace::traces_clear))
         .fallback(proxy_fallback)
+        // The default axum body cap is 2 MB — the compact request carries the
+        // FULL chat history (tool outputs included) and /chat/stream carries
+        // image attachments, both far past 2 MB. hyper then closes the
+        // connection mid-body and WKWebView surfaces it as "Load failed".
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }

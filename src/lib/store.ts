@@ -1755,9 +1755,20 @@ export const useStore = create<State>((set, get) => ({
       ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
       embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
       embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
-      subagentModels: typeof raw.subagentModels === 'object' && raw.subagentModels !== null
-        ? { ...(raw.subagentModels as Record<string, string>) }
-        : {},
+      subagentModels: (() => {
+        if (typeof raw.subagentModels !== 'object' || raw.subagentModels === null) return {};
+        const m = { ...(raw.subagentModels as Record<string, string>) };
+        // One-time migration: the pre-rename "subagent" slot moves to "explore"
+        // (the key the native loop and the renamed Settings slot resolve). The
+        // legacy value is the user's latest explicit choice, so it wins over a
+        // stale "explore" entry left by an older build.
+        const legacy = (m.subagent ?? '').trim();
+        if (legacy) {
+          m.explore = legacy;
+          delete m.subagent;
+        }
+        return m;
+      })(),
       // Coerce numbers defensively: settings.json may round-trip numbers
       // through JSON safely, but the IPC layer or an older settings file
       // can hand us string-shaped digits ("30") or null. Accept anything that

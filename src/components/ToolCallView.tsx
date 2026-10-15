@@ -2333,7 +2333,9 @@ export const ToolCallView = memo(function ToolCallView({
         {fetchSummary && (
           <span className="tool-cmd">{fixZwsp(fetchSummary)}</span>
         )}
-        {activity.args && <ToolArgs args={activity.args} />}
+        {/* Sub-agent cards render their own description badge above — dumping
+            the raw args here garbled the head row (overlapping key fragments). */}
+        {activity.args && !isSubagentCard(activity) && <ToolArgs args={activity.args} />}
         {/* Trailing meta in ONE group pinned to the right edge by a single
             auto margin — without this the row only reached the right edge
             when the timer happened to render (write cards have no timer). */}

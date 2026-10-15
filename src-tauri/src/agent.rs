@@ -85,7 +85,10 @@ pub enum AgentEvent {
     /// Emitted when the tool FINISHES — resolves the running card.
     Tool { id: String, name: String, args: Value, result: String, ok: bool },
     Warn { content: String },
-    Usage { input_tokens: u64, output_tokens: u64 },
+    /// Carries the model + provider_id that actually served this request so
+    /// the frontend attributes sub-agent tokens to the SUB model, not the
+    /// parent's.
+    Usage { input_tokens: u64, output_tokens: u64, model: String, provider_id: String },
     Done { aborted: bool },
     Error { content: String },
 }
@@ -106,9 +109,10 @@ impl AgentEvent {
                 "result": result, "ok": ok,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
-            AgentEvent::Usage { input_tokens, output_tokens } => json!({
+            AgentEvent::Usage { input_tokens, output_tokens, model, provider_id } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "model": model, "provider_id": provider_id,
             }),
             AgentEvent::Done { aborted } => json!({"kind": "done", "aborted": aborted}),
             AgentEvent::Error { content } => json!({"kind": "error", "content": content}),
@@ -310,6 +314,8 @@ pub async fn run_turn(
         emit(&AgentEvent::Usage {
             input_tokens: in_tok,
             output_tokens: out_tok,
+            model: req.model.clone(),
+            provider_id: req.provider_id.clone(),
         });
         // Trace: one llm row per model call (model + tokens), like the
         // Python sidecar's trace panel rows.
@@ -643,6 +649,17 @@ mod tests {
         // The provider tool_call id rides along so the frontend can dedup
         // (no duplicate cards) and re-pair start/result events.
         assert_eq!(t["id"], "call1");
+        let t = AgentEvent::Usage {
+            input_tokens: 3,
+            output_tokens: 1,
+            model: "sub-model".into(),
+            provider_id: "p2".into(),
+        }
+        .to_json();
+        // The usage event names the model/provider that served the request so
+        // sub-agent tokens land under the SUB model in Model usage.
+        assert_eq!(t["model"], "sub-model");
+        assert_eq!(t["provider_id"], "p2");
         let ts = AgentEvent::ToolStart {
             id: "call1".into(),
             name: "explore".into(),

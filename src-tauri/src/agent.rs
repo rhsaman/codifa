@@ -76,6 +76,48 @@ fn default_mode() -> String {
     "build".to_string()
 }
 
+/// App data root for the native agent (mirrors trace.rs's fallback: the
+/// sidecar env var when set, else ~/.codifa).
+fn native_data_root() -> String {
+    if let Ok(d) = std::env::var("CODER_DATA_DIR") {
+        if !d.trim().is_empty() {
+            return d;
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".codifa").to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".codifa".into())
+}
+
+/// Extract the plan document from a plan-mode reply: from the first
+/// `## Plan`-style heading (English or Persian) to the end. Returns
+/// (title, body); None when the reply carries no plan heading.
+fn extract_plan_body(text: &str) -> Option<(String, String)> {
+    let mut start: Option<usize> = None;
+    let mut title = String::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let is_heading = (trimmed.starts_with('#')
+            && trimmed
+                .trim_start_matches('#')
+                .trim()
+                .to_lowercase()
+                .starts_with("plan"))
+            || trimmed.starts_with("# پلن");
+        if is_heading {
+            start = Some(idx);
+            title = trimmed.trim_start_matches('#').trim().to_string();
+            break;
+        }
+    }
+    let s = start?;
+    let body: String = text.lines().skip(s).collect::<Vec<_>>().join("\n");
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some((title, body))
+}
+
 /// One SSE event of the agent turn — serialized as `{"kind": ..., ...}`.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -92,6 +134,10 @@ pub enum AgentEvent {
     /// the frontend attributes sub-agent tokens to the SUB model, not the
     /// parent's.
     Usage { input_tokens: u64, output_tokens: u64, model: String, provider_id: String },
+    /// Plan mode finished: the collapsed plan document (title + markdown
+    /// body) — the frontend renders it as the Plan card and the docked
+    /// Plan viewer tab.
+    PlanCard { title: String, body: String },
     Done { aborted: bool },
     Error { content: String },
 }
@@ -118,6 +164,9 @@ impl AgentEvent {
                 "model": model, "provider_id": provider_id,
             }),
             AgentEvent::Done { aborted } => json!({"kind": "done", "aborted": aborted}),
+            AgentEvent::PlanCard { title, body } => {
+                json!({"kind": "plan_card", "title": title, "body": body})
+            }
             AgentEvent::Error { content } => json!({"kind": "error", "content": content}),
         }
     }
@@ -427,6 +476,26 @@ pub async fn run_turn(
             .collect();
 
         if tool_calls.is_empty() {
+            // Plan mode: persist the plan document to disk (native plans.rs,
+            // same layout the Python sidecar used) and emit plan_card so the
+            // frontend collapses the streamed plan into its Plan card.
+            if req.mode == "plan" {
+                if let Some((title, body)) = extract_plan_body(&text) {
+                    let data_root = native_data_root();
+                    let ws = crate::plans::workspace_slug_for_root(&root);
+                    let _ = crate::plans::save_plan(
+                        &data_root,
+                        &ws,
+                        &title,
+                        &body,
+                        &req.chat_id,
+                    );
+                    emit(&AgentEvent::PlanCard {
+                        title,
+                        body,
+                    });
+                }
+            }
             emit(&AgentEvent::Done { aborted: false });
             return Ok(());
         }

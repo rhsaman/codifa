@@ -450,6 +450,94 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
         })
 }
 
+// ---------- plans (native) ----------
+// The Python sidecar wrote plan files from graph.py with no HTTP endpoints;
+// the native agent owns the same on-disk layout now, and the renderer can
+// reload a plan after restart via GET /plan.
+
+#[derive(serde::Deserialize)]
+struct PlanSaveBody {
+    root: String,
+    #[serde(default)]
+    chat_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    content: String,
+}
+
+async fn plan_get(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
+    let ws = crate::plans::workspace_slug_for_root(&q.root);
+    match crate::plans::get_plan(&st.data_root.to_string_lossy(), &ws, &q.chat_id) {
+        Some(p) => Json(p).into_response(),
+        None => (StatusCode::NOT_FOUND, "no plan").into_response(),
+    }
+}
+
+async fn plan_save(State(st): State<AppState>, Json(body): Json<PlanSaveBody>) -> Response<Body> {
+    if body.root.trim().is_empty() {
+        return bad_request("root is required");
+    }
+    let ws = crate::plans::workspace_slug_for_root(&body.root);
+    match crate::plans::save_plan(
+        &st.data_root.to_string_lossy(),
+        &ws,
+        &body.title,
+        &body.content,
+        &body.chat_id,
+    ) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad_request(&e),
+    }
+}
+
+async fn plan_delete(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
+    let ws = crate::plans::workspace_slug_for_root(&q.root);
+    let removed = crate::plans::delete_plan(&st.data_root.to_string_lossy(), &ws, &q.chat_id);
+    Json(json!({"ok": true, "removed": removed})).into_response()
+}
+
+async fn plan_checklist_get(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
+    let ws = crate::plans::workspace_slug_for_root(&q.root);
+    Json(json!({
+        "items": crate::plans::get_checklist(&st.data_root.to_string_lossy(), &ws, &q.chat_id)
+    }))
+    .into_response()
+}
+
+async fn plan_checklist_save(
+    State(st): State<AppState>,
+    Json(body): Json<PlanChecklistBody>,
+) -> Response<Body> {
+    if body.root.trim().is_empty() {
+        return bad_request("root is required");
+    }
+    let ws = crate::plans::workspace_slug_for_root(&body.root);
+    crate::plans::save_checklist(
+        &st.data_root.to_string_lossy(),
+        &ws,
+        &body.chat_id,
+        &body.items,
+    );
+    Json(json!({"ok": true})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PlanQuery {
+    root: String,
+    #[serde(default)]
+    chat_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PlanChecklistBody {
+    root: String,
+    #[serde(default)]
+    chat_id: String,
+    #[serde(default)]
+    items: Value,
+}
+
 // ---------- proxy plumbing ----------
 
 async fn sidecar_base() -> Option<String> {
@@ -578,6 +666,11 @@ pub fn router(state: AppState) -> Router {
         .route("/chat/stream", post(chat_stream_entry))
         .route("/chats/:chat_id/traces", get(crate::trace::traces_list))
         .route("/chats/:chat_id/traces", delete(crate::trace::traces_clear))
+        .route("/plan", get(plan_get))
+        .route("/plan", post(plan_save))
+        .route("/plan", delete(plan_delete))
+        .route("/plan/checklist", get(plan_checklist_get))
+        .route("/plan/checklist", post(plan_checklist_save))
         .fallback(proxy_fallback)
         // The default axum body cap is 2 MB — the compact request carries the
         // FULL chat history (tool outputs included) and /chat/stream carries

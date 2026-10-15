@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { latestPlanDoc } from "../lib/planDoc";
+import { fetchPlan } from "../lib/api";
 import { prepareContent } from "../lib/bidi";
 import { mdComponents } from "./ChatMessage";
 
@@ -26,6 +27,24 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
     () => latestPlanDoc(chats, activeChatId),
     [chats, activeChatId],
   );
+  const chat = chats.find((c) => c.id === activeChatId);
+  // Disk fallback: the plan persists at <data>/plan/<ws>/<chat>/plan.md, so a
+  // restart (or a chat whose plan message was deleted) still shows the plan.
+  const [diskPlan, setDiskPlan] = useState<{ title: string; body: string } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setDiskPlan(null);
+    if (planDoc || !chat?.root) return;
+    fetchPlan(chat.root, chat.id)
+      .then((p) => {
+        if (alive && p?.content) setDiskPlan({ title: p.title || "", body: p.content });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [planDoc, chat?.root, chat?.id]);
+  const shown = planDoc ?? diskPlan;
 
   return (
     <aside
@@ -33,14 +52,14 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
       dir="ltr"
       aria-label="Implementation plan"
     >
-      {planDoc && (
+      {shown && (
         <button
           type="button"
           className={`review-header-btn plan-panel-float-copy${copied ? " copied" : ""}`}
           title="Copy plan"
           aria-label="Copy plan"
           onClick={() => {
-            void copyToClipboard(planDoc.body);
+            void copyToClipboard(shown.body);
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1200);
           }}
@@ -57,7 +76,7 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
           )}
         </button>
       )}
-      {planDoc ? (
+      {shown ? (
         // The markdown body carries its own headings (## Plan …) — no extra
         // title node, or every plan would render its heading twice. Bidi +
         // block direction follow the app setting (dir="auto" would resolve
@@ -68,7 +87,7 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
               {/* Shared mdComponents: inline file paths become clickable
                   file chips, fences get the same code-block chrome as chat. */}
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                {prepareContent(planDoc.body, dir)}
+                {prepareContent(shown.body, dir)}
               </ReactMarkdown>
             </div>
           </div>

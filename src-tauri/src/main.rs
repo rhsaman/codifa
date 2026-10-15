@@ -15,6 +15,7 @@ mod commands;
 mod compact;
 mod git;
 mod llm;
+mod plans;
 mod pty;
 mod secrets;
 mod sidecar;

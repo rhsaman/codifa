@@ -945,6 +945,26 @@ export interface CompactResult {
   usage?: CompactUsage
 }
 
+/** Native plan persistence (Rust router): the plan lives at
+ *  <data>/plan/<workspace-slug>/<chat-id>/plan.md. */
+export async function fetchPlan(
+  root: string,
+  chatId: string,
+): Promise<{ title: string; content: string } | null> {
+  const url = await ensureSidecar()
+  if (!url) return null
+  try {
+    const res = await fetch(
+      `${url}/plan?root=${encodeURIComponent(root)}&chat_id=${encodeURIComponent(chatId)}`,
+      { signal: AbortSignal.timeout(5000) },
+    )
+    if (!res.ok) return null
+    return (await res.json()) as { title: string; content: string }
+  } catch {
+    return null
+  }
+}
+
 /** Manual ``/compact`` — runs opencode-style compaction on the backend and
  *  returns the structured summary plus the number of recent turns to keep
  *  verbatim (opencode's token-budgeted tail). */

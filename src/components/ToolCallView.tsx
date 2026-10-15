@@ -167,11 +167,8 @@ function groupSummary(activities: ToolActivity[]): string {
     .join(", ");
 }
 
-/** A task card running the background sub-agent (opencode-style subagent;
- *  "general" is a legacy pre-rename type the backend still accepts).
- *  "explore" keeps the SAME sub-agent card layout, but the special
- *  "explore" color class is NOT applied to it — the user asked for the
- *  standard tool-call color only, nothing else about its rendering. */
+/** A sub-agent card (task/explore) — renders with the dedicated sub-agent
+ *  card layout and its "explore" CSS class, exactly as before the rename. */
 export const isSubagentCard = (a: ToolActivity) =>
   (a.tool === "task" &&
     (a.args?.subagent_type === "subagent" ||

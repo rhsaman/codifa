@@ -11411,6 +11411,100 @@ body.coder-dragging .chat-split-child {
   border-color: color-mix(in srgb, var(--thinking) 40%, var(--border));
 }
 
+/* Explore card: quiet discovery surface with a single accent edge.
+   Signature element is the thin gradient rail on the left; everything else
+   stays flat so long file lists scan fast. */
+.tool-card.explore {
+  --tool-color: color-mix(in srgb, var(--accent) 55%, var(--bg-hover));
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--bg-panel) 96%, var(--accent) 4%),
+      var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--tool-color) 22%, var(--border));
+  border-radius: 14px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.tool-card.explore .tool-card-head {
+  padding: 10px 14px;
+  gap: 10px;
+}
+
+.tool-card.explore .tool-card-head .tool-name {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+
+/* Redundant "explore" badge duplicates the title: visually mute it. */
+.tool-card.explore .tool-card-head .tool-badge {
+  background: color-mix(in srgb, var(--tool-color) 12%, transparent);
+  color: color-mix(in srgb, var(--text-dim) 85%, var(--tool-color) 15%);
+}
+
+.tool-card.explore .tool-card-head .tool-cmd.tool-task {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.tool-card.explore .tool-card-head .tool-sub-count {
+  background: color-mix(in srgb, var(--tool-color) 14%, transparent);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-card.explore .tool-sub-list {
+  position: relative;
+  margin: 0 8px 10px;
+  padding: 4px;
+  border: 1px solid color-mix(in srgb, var(--tool-color) 14%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 55%, var(--bg-panel) 45%);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16);
+}
+
+/* Single-line rows: label + path stay on one line with real ellipsis. */
+.tool-card.explore .tool-sub-row .tool-sub-name {
+  font-weight: 600;
+}
+
+.tool-card.explore .tool-sub-row .tool-sub-args {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.tool-card.explore .tool-sub-row .tool-sub-summary {
+  max-width: 16ch;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-card.explore .tool-sub-row .tool-ms {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+/* Flat divider rows replace the old tree spine + branch ticks. */
+.tool-card.explore .tool-sub-row {
+  position: relative;
+  border-radius: 8px;
+}
+
+.tool-card.explore .tool-sub-row:hover {
+  background: color-mix(in srgb, var(--tool-color) 8%, transparent);
+}
+
+.tool-card.explore .tool-sub-row+.tool-sub-row {
+  border-top: 1px solid color-mix(in srgb, var(--tool-color) 10%, transparent);
+}
+
+.tool-card.explore .tool-sub-row.running {
+  background: color-mix(in srgb, var(--tool-color) 10%, transparent);
+}
+
 /* Tool heads keep LTR item order (status/meta on the right) in every chat
    direction — same convention as .trace-row-head and .edit-group-row. */
 .tool-card-head {
@@ -12611,6 +12705,24 @@ body.coder-dragging .chat-split-child {
 
 .tool-cascade-item:hover {
   border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline));
+}
+
+/* Collapsed preview: same flat rows, no stacked mini-cards. */
+.tool-card.explore .tool-cascade {
+  background: none;
+  border-top: 1px solid color-mix(in srgb, var(--tool-color) 14%, transparent);
+  padding: 4px 8px 8px;
+}
+
+.tool-card.explore .tool-cascade-item {
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  margin-top: 0;
+}
+
+.tool-card.explore .tool-cascade-item+.tool-cascade-item {
+  border-top: 1px solid color-mix(in srgb, var(--tool-color) 10%, transparent);
 }
 
 /* Remaining tool args rendered as inline key:value chips in the card head —

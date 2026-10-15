@@ -820,40 +820,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const panelRef = useRef<HTMLDivElement>(null);
   // Tauri native drag events are enabled (dragDropEnabled: true) — WKWebView
   // swallows HTML5 drops of OS files, so the shell forwards the native drag
-  // phases + cursor position (see main.tsx onDragDropEvent). Each panel
-  // hit-tests the cursor against its own bounds, so in multi-window mode
-  // ONLY the panel under the cursor shows the overlay and receives the drop.
+  // phases + the TARGET WINDOW LABEL resolved in Rust (physical-bounds
+  // hit-test, see commands.rs window_under_cursor). A panel reacts only when
+  // its own window is the target, so in multi-window mode ONLY the window
+  // under the cursor shows the overlay and receives the drop.
   useEffect(() => {
-    type DragPos = { x: number; y: number } | null;
-    // Hit-test in GLOBAL screen coordinates when available: macOS broadcasts
-    // the native drag event to every app window, so a window-relative position
-    // matches the wrong window's panel too. Screen coords isolate the window
-    // actually under the cursor.
-    const inBounds = (pos: DragPos, screen: DragPos) => {
-      const r = panelRef.current?.getBoundingClientRect();
-      if (!r) return false;
-      if (screen) {
-        const sx = window.screenX + r.left;
-        const sy = window.screenY + r.top;
-        return screen.x >= sx && screen.x <= sx + r.width && screen.y >= sy && screen.y <= sy + r.height;
-      }
-      if (!pos) return false;
-      return pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom;
-    };
+    const myWindow = (window as unknown as { __CODIFA_WINDOW_LABEL__?: string }).__CODIFA_WINDOW_LABEL__;
+    const isTarget = (target: string | null | undefined) =>
+      !target || !myWindow || target === myWindow;
     const onNativeDrag = (e: Event) => {
-      const { phase, pos, screen } = (e as CustomEvent<{ phase: string; pos: DragPos; screen?: DragPos }>).detail;
+      const { phase, target } = (e as CustomEvent<{ phase: string; target?: string | null }>).detail;
       if (phase === "enter" || phase === "over") {
-        setDragOver(inBounds(pos, screen ?? null));
-      } else if (phase === "leave" || (phase === "drop" && !inBounds(pos, screen ?? null))) {
+        setDragOver(isTarget(target));
+      } else if (phase === "leave" || (phase === "drop" && !isTarget(target))) {
         setDragOver(false);
         dragDepth.current = 0;
       }
     };
     const onNativeDrop = (e: Event) => {
-      const { pos, screen, paths } = (e as CustomEvent<{ pos: DragPos; screen?: DragPos; paths?: string[] }>).detail;
+      const { target, paths } = (e as CustomEvent<{ target?: string | null; paths?: string[] }>).detail;
       setDragOver(false);
       dragDepth.current = 0;
-      if (!inBounds(pos, screen ?? null)) return; // dropped on another window/panel — not ours
+      if (!isTarget(target)) return; // dropped on another window — not ours
       for (const p of paths ?? []) addDroppedFile(p, p.split("/").pop() ?? p);
     };
     window.addEventListener("codifa:file-drag", onNativeDrag);

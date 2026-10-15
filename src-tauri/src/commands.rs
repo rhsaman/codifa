@@ -694,13 +694,27 @@ pub fn copy_text(text: String) -> bool {
     }
 }
 
-/// Global cursor position in PHYSICAL screen pixels. macOS broadcasts the
-/// native drag event to every app window, so the window-relative payload
-/// position cannot identify the hovered window — panels hit-test against
-/// this global position instead (see main.tsx onDragDropEvent).
+/// Label of the app window under the cursor (physical-bounds hit-test).
+/// macOS broadcasts the native drag event to EVERY app window, so the
+/// renderer cannot tell which window the cursor is over from the
+/// window-relative payload position. The shell resolves it here by
+/// comparing the global cursor position against each window's physical
+/// bounds (same coordinate space — no DPR conversion) and every window
+/// receives the target label; only the targeted window shows the drag
+/// overlay and attaches the dropped files.
 #[tauri::command]
-pub fn cursor_position(app: tauri::AppHandle) -> Option<(f64, f64)> {
-    app.cursor_position().ok().map(|p| (p.x, p.y))
+pub fn window_under_cursor(app: tauri::AppHandle) -> Option<String> {
+    let cursor = app.cursor_position().ok()?;
+    for (label, window) in app.webview_windows() {
+        let Ok(pos) = window.outer_position() else { continue };
+        let Ok(size) = window.outer_size() else { continue };
+        let (px, py) = (f64::from(pos.x), f64::from(pos.y));
+        let (w, h) = (f64::from(size.width), f64::from(size.height));
+        if cursor.x >= px && cursor.x < px + w && cursor.y >= py && cursor.y < py + h {
+            return Some(label);
+        }
+    }
+    None
 }
 
 #[tauri::command]

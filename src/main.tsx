@@ -25,55 +25,45 @@ const tauri = installTauriBridge()
 // Tauri drag-drop carries absolute file paths (Electron used webUtils in the
 // preload); record them so api.getPathForFile(file) stays synchronous.
 if (tauri) {
-  void import('@tauri-apps/api/webview').then(({ getCurrentWebview }) =>
+  void import('@tauri-apps/api/webview').then(({ getCurrentWebview }) => {
+    const myLabel = getCurrentWebview().label
+    // Panels read this to compare against the drag target label.
+    ;(window as unknown as { __CODIFA_WINDOW_LABEL__?: string }).__CODIFA_WINDOW_LABEL__ = myLabel
     void import('@tauri-apps/api/core').then(({ invoke }) => {
       getCurrentWebview().onDragDropEvent((event) => {
         const p = event.payload
-        // Physical -> logical CSS pixels so panels can hit-test their bounds.
-        const dpr = window.devicePixelRatio || 1
-        const pos =
-          p.type === 'enter' || p.type === 'over' || p.type === 'drop'
-            ? { x: p.position.x / dpr, y: p.position.y / dpr }
-            : null
         if (p.type === 'drop') {
-          const paths = p.paths
           recordDroppedPaths(
-            paths.map((path) => ({
+            p.paths.map((path) => ({
               name: path.split('/').pop() ?? path,
               path,
             })),
           )
         }
-        // macOS broadcasts the native drag event to EVERY app window, so the
-        // window-relative position cannot identify the hovered window. Resolve
-        // the GLOBAL cursor position and let panels hit-test in screen space.
-        void (async () => {
-          let screen: { x: number; y: number } | null = null
-          try {
-            const [sx, sy] = await invoke<[number, number]>('cursor_position')
-            screen = { x: sx / dpr, y: sy / dpr }
-          } catch {
-            // Fall back to the window-relative position (single-window case).
-          }
-          if (p.type === 'drop') {
+        // macOS broadcasts the native drag event to EVERY app window, so
+        // window-relative (or DPR-converted) coordinates cannot identify the
+        // hovered window. The shell resolves the target window in Rust with a
+        // physical-bounds hit-test and every window receives the target label —
+        // only the targeted window shows the overlay / attaches the files.
+        void invoke<string | null>('window_under_cursor')
+          .catch(() => null)
+          .then((target) => {
+            if (p.type === 'drop') {
+              window.dispatchEvent(
+                new CustomEvent('codifa:file-drop', {
+                  detail: { target, paths: p.paths },
+                }),
+              )
+            }
             window.dispatchEvent(
-              new CustomEvent('codifa:file-drop', {
-                detail: { pos, screen, paths: p.paths },
+              new CustomEvent('codifa:file-drag', {
+                detail: { phase: p.type, target },
               }),
             )
-          }
-          // Each chat panel listens for these events and hit-tests the cursor
-          // in screen space (multi-window: only the panel under the cursor
-          // shows the overlay and receives the dropped files).
-          window.dispatchEvent(
-            new CustomEvent('codifa:file-drag', {
-              detail: { phase: p.type, pos, screen },
-            }),
-          )
-        })()
+          })
       })
-    }),
-  )
+    })
+  })
 }
 
 // Flush-on-quit is handled by the shell: it sends `flush-persist` to the

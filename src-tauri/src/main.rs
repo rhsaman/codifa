@@ -7,6 +7,7 @@
 
 mod agent;
 mod trace;
+mod retention;
 mod lsp;
 mod memory;
 mod backend_light;
@@ -109,6 +110,15 @@ fn main() {
             pty::terminal_kill,
         ])
         .setup(|app| {
+            // Retention sweep: delete stale traces/checkpoints/uploads once
+            // at startup (background thread — never blocks boot).
+            {
+                let root = state::get_data_root(app.handle());
+                std::thread::spawn(move || {
+                    let summary = retention::run_startup_sweep(&root);
+                    println!("[{summary}]");
+                });
+            }
             // Start the Python sidecar in the background so the window paints
             // immediately; the renderer polls sidecar_url until it is ready.
             let handle = app.handle().clone();

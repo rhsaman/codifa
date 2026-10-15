@@ -243,7 +243,7 @@ fn uuid() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+    pub(crate) mod tests {
     use super::*;
 
     fn isolated(name: &str) -> PathBuf {
@@ -254,12 +254,14 @@ mod tests {
     }
 
     /// Serialize tests that mutate CODER_DATA_DIR (set_var is process-global
-    /// and parallel tests would otherwise race on the shared env).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// and parallel tests would otherwise race on the shared env). Public so
+    /// the trace tests (which also mutate the env) share the same lock —
+    /// two separate locks would deadlock.
+    pub(crate) static DATA_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn add_dedupes_and_searches() {
-        let _env = ENV_LOCK.lock();
+        let _env = DATA_DIR_LOCK.lock();
         let dir = isolated("dedup");
         assert_eq!(add("uses uv add for python packages", "long_term", "/w")["ok"], json!(true));
         // Near-duplicate: the new note's normalized text is a substring of an
@@ -278,7 +280,7 @@ mod tests {
 
     #[test]
     fn empty_and_unknown_type_are_handled() {
-        let _env = ENV_LOCK.lock();
+        let _env = DATA_DIR_LOCK.lock();
         let dir = isolated("types");
         assert!(add("   ", "long_term", "/w").get("error").is_some());
         // Unknown type falls back to long_term.
@@ -291,7 +293,7 @@ mod tests {
 
     #[test]
     fn delete_removes_only_target() {
-        let _env = ENV_LOCK.lock();
+        let _env = DATA_DIR_LOCK.lock();
         let dir = isolated("delete");
         add("alpha note", "long_term", "/w");
         let rec = add("beta note", "long_term", "/w");

@@ -79,7 +79,11 @@ pub enum AgentEvent {
     Status { stage: String, content: String },
     Text { content: String },
     Thinking { active: bool },
-    Tool { name: String, args: Value, result: String, ok: bool },
+    /// Emitted when a tool call STARTS — the frontend mints a running card.
+    /// `id` is the provider tool_call id so the frontend can dedup/re-pair.
+    ToolStart { id: String, name: String, args: Value },
+    /// Emitted when the tool FINISHES — resolves the running card.
+    Tool { id: String, name: String, args: Value, result: String, ok: bool },
     Warn { content: String },
     Usage { input_tokens: u64, output_tokens: u64 },
     Done { aborted: bool },
@@ -94,8 +98,11 @@ impl AgentEvent {
             }
             AgentEvent::Text { content } => json!({"kind": "text", "content": content}),
             AgentEvent::Thinking { active } => json!({"kind": "thinking", "active": active}),
-            AgentEvent::Tool { name, args, result, ok } => json!({
-                "kind": "tool", "name": name, "tool": name, "args": args,
+            AgentEvent::ToolStart { id, name, args } => json!({
+                "kind": "tool", "id": id, "name": name, "tool": name, "args": args,
+            }),
+            AgentEvent::Tool { id, name, args, result, ok } => json!({
+                "kind": "tool_result", "id": id, "name": name, "tool": name, "args": args,
                 "result": result, "ok": ok,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
@@ -212,9 +219,11 @@ static TURN_SEQ: AtomicU64 = AtomicU64::new(0);
 pub async fn run_turn(
     req: &AgentRequest,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     let _turn = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
     let root = req.root.clone();
+    let trace = crate::trace::TraceStore::new(req.chat_id.clone());
     let cfg = LlmConfig {
         provider: req.provider.clone(),
         model: req.model.clone(),
@@ -257,6 +266,14 @@ pub async fn run_turn(
         content: "Contacting model".into(),
     });
 
+    // Trace: the full system prompt of this turn (prompt row, like Python).
+    trace.record(crate::trace::TraceEntry {
+        kind: "prompt".into(),
+        summary: format!("prompt · {} chars", system.len()),
+        prompt: Some(system.clone()),
+        ..Default::default()
+    });
+
     // The explore sub-agent gets the full read/search set; the main agent
     // deliberately has NO search tools and must delegate via `explore`.
     let schemas = if req.mode == "subagent" {
@@ -266,6 +283,12 @@ pub async fn run_turn(
     };
 
     for _step in 0..MAX_STEPS {
+        // Client disconnect (Stop button closes the SSE stream) flips the
+        // cancel flag — bail out instead of burning provider tokens.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            emit(&AgentEvent::Done { aborted: true });
+            return Ok(());
+        }
         // stream_chat accumulates text/tool_calls itself; the sink only
         // forwards live text deltas to the SSE stream.
         let mut sink = |delta: &str| {
@@ -287,6 +310,19 @@ pub async fn run_turn(
         emit(&AgentEvent::Usage {
             input_tokens: in_tok,
             output_tokens: out_tok,
+        });
+        // Trace: one llm row per model call (model + tokens), like the
+        // Python sidecar's trace panel rows.
+        trace.record(crate::trace::TraceEntry {
+            kind: "llm".into(),
+            model: Some(req.model.clone()),
+            tokens: Some(crate::trace::Tokens {
+                input: in_tok,
+                output: out_tok,
+                total: in_tok + out_tok,
+            }),
+            summary: format!("{} · {} tokens", req.model, in_tok + out_tok),
+            ..Default::default()
         });
 
         let text = acc.text.clone();
@@ -322,16 +358,28 @@ pub async fn run_turn(
         }));
 
         for (id, name, raw_args) in &tool_calls {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                emit(&AgentEvent::Done { aborted: true });
+                return Ok(());
+            }
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
             emit(&AgentEvent::Status {
                 stage: "tool".into(),
                 content: name.clone(),
             });
+            // Two-phase protocol (like the Python sidecar): the start event
+            // mints a running card immediately, so long tools (explore) are
+            // visible while they work and Stop leaves a visible card.
+            emit(&AgentEvent::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+                args: args.clone(),
+            });
             let (result, ok) = if name == "explore" || name == "task" {
                 if req.mode == "subagent" {
                     ("sub-agents cannot spawn further sub-agents".into(), false)
                 } else {
-                    Box::pin(run_subagent(req, &args, emit)).await
+                    Box::pin(run_subagent(req, &args, emit, cancel)).await
                 }
             } else {
                 match tools::dispatch(&root, name, &args, None) {
@@ -345,7 +393,21 @@ pub async fn run_turn(
                 shown.truncate(TOOL_RESULT_CAP);
                 shown.push_str("\n… (truncated)");
             }
+            // Trace: one tool row per executed call (args + result).
+            trace.record(crate::trace::TraceEntry {
+                kind: "tool".into(),
+                summary: name.clone(),
+                prompt: Some(raw_args.clone()),
+                result: Some(shown.clone()),
+                detail: Some(serde_json::json!({
+                    "name": name,
+                    "ok": ok,
+                    "sub": req.mode == "subagent",
+                })),
+                ..Default::default()
+            });
             emit(&AgentEvent::Tool {
+                id: id.clone(),
                 name: name.clone(),
                 args: args.clone(),
                 result: shown,
@@ -376,9 +438,12 @@ pub async fn run_turn(
 /// model; "providerId/model" -> THAT provider's base URL + keys
 /// (cross-provider routing); a bare model id -> the parent provider.
 fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>) {
+    // The UI's Tool Models settings store the explore model under the
+    // "explore" key (agent name); "subagent" is the legacy alias.
     let entry = req
         .subagent_models
-        .get("subagent")
+        .get("explore")
+        .or_else(|| req.subagent_models.get("subagent"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if entry.is_empty() || entry == "main" || entry == "main_model" || entry == "main model" {
@@ -436,6 +501,7 @@ async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> (String, bool) {
     let description = args["description"].as_str().unwrap_or_default().to_string();
     let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
@@ -457,7 +523,7 @@ async fn run_subagent(
         provider_id: parent.provider_id.clone(),
         model: sub_model,
         base_url: sub_base,
-        api_key: String::new(),
+        api_key: parent.api_key.clone(),
         api_keys: sub_keys,
         root: parent.root.clone(),
         mode: "subagent".into(),
@@ -485,8 +551,11 @@ Report in English.",
             if let AgentEvent::Text { content } = ev {
                 report.push_str(content);
             }
+            // Forward sub-agent events to the parent stream so its tool
+            // calls are visible in the chat while explore works.
+            emit(ev);
         };
-        run_turn(&sub_req, &mut sink).await
+        run_turn(&sub_req, &mut sink, cancel).await
     };
     match res {
         Ok(()) => (report, true),
@@ -540,15 +609,29 @@ mod tests {
             json!({"kind": "done", "aborted": true})
         );
         let t = AgentEvent::Tool {
+            id: "call1".into(),
             name: "read".into(),
             args: json!({"filePath": "a"}),
             result: "x".into(),
             ok: true,
         }
         .to_json();
-        assert_eq!(t["kind"], "tool");
+        // Finished tools resolve the running card minted by ToolStart.
+        assert_eq!(t["kind"], "tool_result");
         assert_eq!(t["name"], "read");
         assert_eq!(t["ok"], true);
+        // The provider tool_call id rides along so the frontend can dedup
+        // (no duplicate cards) and re-pair start/result events.
+        assert_eq!(t["id"], "call1");
+        let ts = AgentEvent::ToolStart {
+            id: "call1".into(),
+            name: "explore".into(),
+            args: json!({}),
+        }
+        .to_json();
+        assert_eq!(ts["kind"], "tool");
+        assert_eq!(ts["tool"], "explore");
+        assert_eq!(ts["id"], "call1");
     }
 
     #[test]

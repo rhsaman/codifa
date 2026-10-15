@@ -107,11 +107,11 @@ export function applyToolEvent(
     let lastTaskIdx = -1;
     if (branch === undefined) {
       for (let i = 0; i < activities.length; i++) {
-        if (activities[i].tool === "task") lastTaskIdx = i;
+        if (activities[i].tool === "task" || activities[i].tool === "explore") lastTaskIdx = i;
       }
     }
     const next = activities.map((a, idx) => {
-      if (a.tool === "task") {
+      if (a.tool === "task" || a.tool === "explore") {
         // Parallel fan-out: nest each branch's sub-events under ITS OWN task
         // card. Legacy single-branch events (no branch id) nest into the task
         // card. Match regardless of status so a done parent still receives its

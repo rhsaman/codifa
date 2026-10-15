@@ -10,7 +10,7 @@ use axum::extract::{Query, State};
 use axum::http::{Request, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -367,13 +367,35 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
     };
     let (tx, rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Watcher: when the client disconnects (Stop button closes the fetch),
+    // the stream consumer drops the response body -> the sender side of the
+    // last clone goes away. We detect it via a weak handle: once the strong
+    // sender count hits zero (all clones dropped), flip the cancel flag so
+    // the agent loop bails instead of burning provider tokens.
+    let cancel_watcher = std::sync::Arc::clone(&cancel);
+    let watch_tx = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            // When the client disconnects (Stop button aborts the fetch), the
+            // response body — and with it the channel receiver — is dropped,
+            // which flips the sender's is_closed(). strong_count never reaches
+            // zero here because the agent task holds its own sender clone.
+            if watch_tx.is_closed() {
+                cancel_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+        }
+    });
     tokio::spawn(async move {
         let tx_err = tx.clone();
+        let cancel_flag = std::sync::Arc::clone(&cancel);
         let mut emit = move |ev: &agent::AgentEvent| {
             let line = format!("data: {}\n\n", ev.to_json());
             let _ = tx.send(Ok(axum::body::Bytes::from(line)));
         };
-        if let Err(e) = agent::run_turn(&req, &mut emit).await {
+        if let Err(e) = agent::run_turn(&req, &mut emit, &cancel_flag).await {
             let payload = serde_json::json!({"kind": "error", "content": e});
             let _ = tx_err.send(Ok(axum::body::Bytes::from(format!(
                 "data: {payload}\n\n"
@@ -516,6 +538,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
         .route("/chat/stream", post(chat_stream_entry))
+        .route("/chats/:chat_id/traces", get(crate::trace::traces_list))
+        .route("/chats/:chat_id/traces", delete(crate::trace::traces_clear))
         .fallback(proxy_fallback)
         .layer(middleware::from_fn(cors))
         .with_state(state)

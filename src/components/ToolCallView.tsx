@@ -2193,7 +2193,7 @@ export const ToolCallView = memo(function ToolCallView({
   return (
     <div
       className={`tool-card ${activity.status}${
-        isSubagentCard(activity) && activity.tool === "task" ? " explore" : ""
+        activity.tool === "explore" ? " explore" : ""
       }`}
     >
       <div

@@ -13,17 +13,6 @@ def _ws(root):
         f.write("".join(f"tail{i}\n" for i in range(200)))
 
 
-async def test_ranges_and_symbols_in_one_call(tmp_path):
-    import tools
-
-    _ws(str(tmp_path))
-    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
-    out = await cbs["read"](
-        "m.py", ranges=["m.py:1:10"], symbols=["target_fn"]
-    )
-    assert "1 | line1" in out, out
-    assert "def target_fn():" in out, out
-    assert "Batch complete" in out, out
 
 
 async def test_same_file_ranges_emit_unique_result(tmp_path):

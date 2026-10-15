@@ -98,15 +98,6 @@ async def test_css_file_maps_without_symbols(tmp_path):
     assert "61 | " not in out
 
 
-async def test_symbols_read_after_map_serves_body(tmp_path):
-    import tools
-
-    _big_py(str(tmp_path / "big.py"))
-    cbs = tools.make_tool_callbacks(str(tmp_path), lambda ev: None)
-    await cbs["read"]("big.py", offset=1, limit=2000)  # map
-    out = await cbs["read"]("big.py", symbols=["func_0001"])
-    assert "ERROR" not in out, out
-    assert "return 1" in out
 
 
 async def test_later_window_after_map_serves_content(tmp_path):

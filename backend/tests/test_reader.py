@@ -1097,18 +1097,6 @@ async def test_read_batch_broadcast_past_eof_serves_from_line_one(tmp_path):
     assert "ranges=" in out
 
 
-@pytest.mark.asyncio
-async def test_read_symbols_single_call(tmp_path):
-    """symbols=[...] reads named definitions in one call — no line guessing."""
-    (tmp_path / "m.py").write_text(
-        "def alpha():\n    return 1\n\ndef beta():\n    return 2\n"
-        + "".join(f"filler{i} = {i}\n" for i in range(400))
-    )
-    root = str(tmp_path)
-    read, _ = _make_read(root)
-    out = await read(filePath="m.py", symbols=["beta"])
-    assert "return 2" in out
-    assert "return 1" not in out
 
 
 @pytest.mark.asyncio

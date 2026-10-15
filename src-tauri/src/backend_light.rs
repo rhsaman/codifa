@@ -299,6 +299,39 @@ fn resolve_slot_target(
     }
 }
 
+/// Normalize the raw provider usage object to the frontend's CompactUsage
+/// shape. Providers use different key families (OpenAI: prompt_tokens /
+/// completion_tokens, Anthropic: input_tokens / output_tokens, Gemini:
+/// promptTokenCount / candidatesTokenCount) — the frontend reads
+/// input_tokens/output_tokens, so unmapped keys accrued as 0/0 and the
+/// Model usage panel showed nothing after a compact.
+fn normalize_compact_usage(raw: Option<Value>, model: &str) -> Option<Value> {
+    let obj = raw?.as_object()?.clone();
+    let num = |k: &str| obj.get(k).and_then(|v| v.as_u64());
+    let input = num("input_tokens")
+        .or_else(|| num("prompt_tokens"))
+        .or_else(|| num("promptTokenCount"));
+    let output = num("output_tokens")
+        .or_else(|| num("completion_tokens"))
+        .or_else(|| num("candidatesTokenCount"));
+    let cache_read = num("cache_read_tokens").or_else(|| num("cache_read_input_tokens"));
+    let cache_write =
+        num("cache_write_tokens").or_else(|| num("cache_creation_input_tokens"));
+    let mut norm = serde_json::Map::new();
+    norm.insert("input_tokens".into(), json!(input.unwrap_or(0)));
+    norm.insert("output_tokens".into(), json!(output.unwrap_or(0)));
+    if let Some(v) = cache_read {
+        norm.insert("cache_read_tokens".into(), json!(v));
+    }
+    if let Some(v) = cache_write {
+        norm.insert("cache_write_tokens".into(), json!(v));
+    }
+    // The model that ACTUALLY ran the summarizer (the compact slot may
+    // route cross-provider) — the frontend groups usage under it.
+    norm.insert("model".into(), json!(model));
+    Some(Value::Object(norm))
+}
+
 async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     if body.history.is_empty() {
         return Json(json!({ "summary": Value::Null, "keep": 0, "error": "no messages to compact" }))
@@ -322,7 +355,7 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     );
     let model = LlmConfig {
         provider: body.provider.clone(),
-        model: model_name,
+        model: model_name.clone(),
         base_url,
         api_keys,
         temperature: Some(0.2),
@@ -343,7 +376,12 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
         })
     };
     match compact::compact_history(&client, &model, fallback.as_ref(), &body.history, body.context_window, body.max_output, true).await {
-        Ok(Some(out)) => Json(json!({ "summary": out.summary, "keep": out.keep, "usage": out.usage })).into_response(),
+        Ok(Some(out)) => Json(json!({
+            "summary": out.summary,
+            "keep": out.keep,
+            "usage": normalize_compact_usage(out.usage, &model_name),
+        }))
+        .into_response(),
         Ok(None) => Json(json!({ "summary": Value::Null, "keep": 0, "error": "nothing to compact" })).into_response(),
         Err(e) => Json(json!({ "summary": Value::Null, "keep": 0, "error": e })).into_response(),
     }
@@ -742,5 +780,37 @@ mod tests {
         assert!(tmp.join("mcp").read_dir().unwrap().next().is_none());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn normalize_compact_usage_maps_provider_key_families() {
+        // OpenAI-compatible (the user's river provider): prompt_tokens family.
+        let u = normalize_compact_usage(
+            Some(json!({ "prompt_tokens": 120, "completion_tokens": 45 })),
+            "zai-org/GLM-5.3-Flash",
+        )
+        .unwrap();
+        assert_eq!(u["input_tokens"], 120);
+        assert_eq!(u["output_tokens"], 45);
+        assert_eq!(u["model"], "zai-org/GLM-5.3-Flash");
+
+        // Anthropic keys pass through; Gemini camelCase maps too.
+        let u = normalize_compact_usage(
+            Some(json!({ "input_tokens": 7, "output_tokens": 3 })),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(u["input_tokens"], 7);
+        let u = normalize_compact_usage(
+            Some(json!({ "promptTokenCount": 9, "candidatesTokenCount": 2 })),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(u["input_tokens"], 9);
+        assert_eq!(u["output_tokens"], 2);
+
+        // Missing/empty usage -> None (frontend skips accrual entirely).
+        assert!(normalize_compact_usage(None, "m").is_none());
+        assert!(normalize_compact_usage(Some(json!(null)), "m").is_none());
     }
 }

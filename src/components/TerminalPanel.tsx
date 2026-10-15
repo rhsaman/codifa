@@ -386,9 +386,20 @@ export function TerminalPanel() {
       // the active terminal tab (Cmd on Apple platforms, Ctrl elsewhere).
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== 'keydown' || ev.altKey || ev.shiftKey) return true
-        const apple = isApplePlatform()
-        const reserved = apple ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey
-        if (reserved && (ev.key === 'j' || ev.code === 'KeyJ' || ev.key === 'w' || ev.code === 'KeyW' || ev.key === 'm' || ev.code === 'KeyM')) return false
+        // Reserve BOTH Cmd and Ctrl (each without the other) for the app's
+        // chords on EVERY platform: Ctrl+M/Ctrl+J typed into the shell sent
+        // ^M (Enter — ran the half-typed line!) and ^J, which read as "extra
+        // characters while typing". They must bubble to the window-level
+        // handler instead. Ctrl+X arms the app's prefix chord (X then J
+        // toggles the panel) instead of sending ^X to the shell.
+        const chord = (ev.metaKey && !ev.ctrlKey) || (ev.ctrlKey && !ev.metaKey)
+        if (
+          chord &&
+          (ev.key === 'j' || ev.code === 'KeyJ' ||
+            ev.key === 'w' || ev.code === 'KeyW' ||
+            ev.key === 'm' || ev.code === 'KeyM' ||
+            ev.key === 'x' || ev.code === 'KeyX')
+        ) return false
         return true
       })
       entries.current.set(tab.id, { term, fit, el })

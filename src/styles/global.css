@@ -22614,6 +22614,13 @@ tr[data-search-current] .fv-mark,
   display: none;
 }
 
+/* Wide output never scrolls the panel horizontally — the horizontal
+   scrollbar read as a stray dark strip at the bottom of the terminal.
+   Lines wrap instead (same as VSCode). */
+.terminal-screen .xterm-viewport {
+  overflow-x: hidden;
+}
+
 .terminal-screen .xterm-viewport::-webkit-scrollbar {
   width: 8px;
 }

@@ -333,6 +333,71 @@ fn research_schemas() -> Vec<Value> {
 
 static TURN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Cap the UI echo, record the trace row, emit the Tool event and push the
+/// tool message — shared by the parallel (read-only batch) and sequential
+/// tool paths so both produce identical cards/traces/model messages.
+fn finish_tool(
+    messages: &mut Vec<Value>,
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    trace: &crate::trace::TraceStore,
+    id: &str,
+    name: &str,
+    args: &Value,
+    result: String,
+    ok: bool,
+    sub: bool,
+) {
+    // UI echo is capped; cap on a UTF-8 char boundary — byte slicing
+    // mid-char panics on Persian text.
+    let mut shown = result.clone();
+    if shown.len() > TOOL_RESULT_CAP {
+        let mut end = TOOL_RESULT_CAP;
+        while end > 0 && !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        shown.truncate(end);
+        shown.push_str("\n… (truncated)");
+    }
+    // Trace: one tool row per executed call (args + result).
+    trace.record(crate::trace::TraceEntry {
+        kind: "tool".into(),
+        summary: name.to_string(),
+        prompt: Some(serde_json::to_string(args).unwrap_or_default()),
+        result: Some(shown.clone()),
+        detail: Some(serde_json::json!({
+            "name": name,
+            "ok": ok,
+            "sub": sub,
+        })),
+        ..Default::default()
+    });
+    emit(&AgentEvent::Tool {
+        id: id.to_string(),
+        name: name.to_string(),
+        args: args.clone(),
+        result: shown,
+        ok,
+    });
+    // The model receives a capped copy too — a narrower re-read is one
+    // cheap tool call; an unbounded context is seconds per round-trip.
+    let mut for_model = result;
+    if for_model.len() > MODEL_RESULT_CAP {
+        let mut end = MODEL_RESULT_CAP;
+        while end > 0 && !for_model.is_char_boundary(end) {
+            end -= 1;
+        }
+        for_model.truncate(end);
+        for_model.push_str(
+            "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
+        );
+    }
+    messages.push(json!({
+        "role": "tool",
+        "tool_call_id": id,
+        "content": for_model,
+    }));
+}
+
 /// Run one full agent turn: stream the model, execute tool calls, repeat
 /// until the model answers without tool calls or MAX_STEPS is reached.
 /// Emits the same event protocol as the Python graph.
@@ -518,7 +583,72 @@ pub async fn run_turn(
             "tool_calls": calls_json,
         }));
 
+        // Read-only tools are side-effect free: run the step's batch
+        // concurrently (spawn_blocking + join) so N parallel greps cost one
+        // round-trip instead of N sequential ones — the explore sub-agent's
+        // wall time is dominated by these. Mutating tools and sub-agents
+        // stay sequential (ordering + cancel semantics).
+        let is_readonly = |name: &str| {
+            matches!(
+                name,
+                "read" | "grep" | "glob" | "current_time" | "system_stats"
+                    | "search_memory" | "lsp_definition" | "lsp_hover"
+                    | "lsp_symbols" | "lsp_diagnostics"
+            )
+        };
+        let mut batch: Vec<(String, String, Value)> = Vec::new();
+        let mut sequential: Vec<(String, String, String)> = Vec::new();
         for (id, name, raw_args) in &tool_calls {
+            if is_readonly(name) {
+                let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+                emit(&AgentEvent::Status {
+                    stage: "tool".into(),
+                    content: name.clone(),
+                });
+                emit(&AgentEvent::ToolStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                });
+                batch.push((id.clone(), name.clone(), args));
+            } else {
+                sequential.push((id.clone(), name.clone(), raw_args.clone()));
+            }
+        }
+        if !batch.is_empty() {
+            let root_c = root.clone();
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(_, name, args)| {
+                    let root = root_c.clone();
+                    let name = name.clone();
+                    let args = args.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match tools::dispatch(&root, &name, &args, None) {
+                            Ok(r) => (r, true),
+                            Err(e) => (e, false),
+                        }
+                    })
+                })
+                .collect();
+            for ((id, name, args), handle) in batch.into_iter().zip(handles) {
+                let (result, ok) = handle
+                    .await
+                    .unwrap_or(("tool task failed".into(), false));
+                finish_tool(
+                    &mut messages,
+                    emit,
+                    &trace,
+                    &id,
+                    &name,
+                    &args,
+                    result,
+                    ok,
+                    req.mode == "subagent",
+                );
+            }
+        }
+        for (id, name, raw_args) in &sequential {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 emit(&AgentEvent::Done { aborted: true });
                 return Ok(());
@@ -548,55 +678,17 @@ pub async fn run_turn(
                     Err(e) => (e, false),
                 }
             };
-            // UI echo is capped; the full result still goes to the model.
-            // Cap on a UTF-8 char boundary — byte slicing mid-char panics.
-            let mut shown = result.clone();
-            if shown.len() > TOOL_RESULT_CAP {
-                let mut end = TOOL_RESULT_CAP;
-                while end > 0 && !shown.is_char_boundary(end) {
-                    end -= 1;
-                }
-                shown.truncate(end);
-                shown.push_str("\n… (truncated)");
-            }
-            // Trace: one tool row per executed call (args + result).
-            trace.record(crate::trace::TraceEntry {
-                kind: "tool".into(),
-                summary: name.clone(),
-                prompt: Some(raw_args.clone()),
-                result: Some(shown.clone()),
-                detail: Some(serde_json::json!({
-                    "name": name,
-                    "ok": ok,
-                    "sub": req.mode == "subagent",
-                })),
-                ..Default::default()
-            });
-            emit(&AgentEvent::Tool {
-                id: id.clone(),
-                name: name.clone(),
-                args: args.clone(),
-                result: shown,
+            finish_tool(
+                &mut messages,
+                emit,
+                &trace,
+                id,
+                name,
+                &args,
+                result,
                 ok,
-            });
-            // The model receives a capped copy too — a narrower re-read is one
-            // cheap tool call; an unbounded context is seconds per round-trip.
-            let mut for_model = result.clone();
-            if for_model.len() > MODEL_RESULT_CAP {
-                let mut end = MODEL_RESULT_CAP;
-                while end > 0 && !for_model.is_char_boundary(end) {
-                    end -= 1;
-                }
-                for_model.truncate(end);
-                for_model.push_str(
-                    "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
-                );
-            }
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": for_model,
-            }));
+                req.mode == "subagent",
+            );
         }
     }
 

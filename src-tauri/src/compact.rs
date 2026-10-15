@@ -76,13 +76,27 @@ fn clean_tail(tail: &mut Vec<Value>) {
     }
 }
 
+/// Floor to the nearest UTF-8 char boundary at or before `max` (byte index).
+/// Byte slicing at a non-boundary panics — Persian text is multi-byte.
+fn trunc_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Serialize one older turn for the summarizer (agents.py `_serialize`):
 /// redact nothing here (app errors already rare in stored history), truncate
 /// huge tool outputs, and append plan/tool-activity extras when present.
 fn serialize(msg: &Value) -> String {
     let mut content = content_of(msg);
     if content.len() > TOOL_OUTPUT_MAX_CHARS {
-        content.truncate(TOOL_OUTPUT_MAX_CHARS);
+        let cut = trunc_bytes(&content, TOOL_OUTPUT_MAX_CHARS).len();
+        content.truncate(cut);
         content.push_str("\n[truncated]");
     }
     let mut extras: Vec<String> = Vec::new();
@@ -100,7 +114,7 @@ fn serialize(msg: &Value) -> String {
                 } else {
                     "pending".into()
                 };
-                Some(format!("- [{status}] {}", &text[..text.len().min(200)]))
+                Some(format!("- [{status}] {}", trunc_bytes(&text, 200)))
             })
             .collect();
         if !lines.is_empty() {
@@ -121,7 +135,7 @@ fn serialize(msg: &Value) -> String {
                 }
                 let mut line = format!("- {tool}()");
                 if let Some(s) = a["summary"].as_str() {
-                    line = format!("- {tool}() → {}", &s[..s.len().min(240)]);
+                    line = format!("- {tool}() → {}", trunc_bytes(s, 240));
                 }
                 if status == "error" {
                     line.push_str(" [FAILED]");
@@ -325,6 +339,22 @@ mod tests {
         assert!(s.contains("[truncated]"));
         assert!(s.contains("- [completed] do it"));
         assert!(s.contains("- read() → ok"));
+    }
+
+    #[test]
+    fn serialize_truncates_on_char_boundaries_persian() {
+        // Persian text is multi-byte — byte slicing mid-char used to panic
+        // ("end byte index 200 is not a char boundary").
+        let m = json!({
+            "role": "user",
+            "content": "سلام دنیا ".repeat(TOOL_OUTPUT_MAX_CHARS),
+            "plan": [{ "content": "بررسی وضعیت پروژه و مهاجرت به تائوری", "status": "completed" }],
+            "toolActivity": [{ "tool": "grep", "status": "done", "summary": "جست‌وجوی الگو در فایل‌های پروژه انجام شد" }],
+        });
+        let s = serialize(&m);
+        assert!(s.contains("[truncated]"));
+        assert!(s.contains("بررسی وضعیت پروژه"));
+        assert!(s.contains("جست‌وجوی الگو"));
     }
 
     #[test]

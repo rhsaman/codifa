@@ -460,9 +460,14 @@ pub async fn run_turn(
                 }
             };
             // UI echo is capped; the full result still goes to the model.
+            // Cap on a UTF-8 char boundary — byte slicing mid-char panics.
             let mut shown = result.clone();
             if shown.len() > TOOL_RESULT_CAP {
-                shown.truncate(TOOL_RESULT_CAP);
+                let mut end = TOOL_RESULT_CAP;
+                while end > 0 && !shown.is_char_boundary(end) {
+                    end -= 1;
+                }
+                shown.truncate(end);
                 shown.push_str("\n… (truncated)");
             }
             // Trace: one tool row per executed call (args + result).
@@ -592,7 +597,12 @@ fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
     for m in &mid {
         let c = m["content"].as_str().unwrap_or_default();
         if c.len() > 400 {
-            summary.push_str(&format!("- {}…\n", &c[..400]));
+            // Char-boundary-safe cut — byte slicing mid-char panics on Persian.
+            let mut end = 400;
+            while end > 0 && !c.is_char_boundary(end) {
+                end -= 1;
+            }
+            summary.push_str(&format!("- {}…\n", &c[..end]));
         } else if !c.is_empty() {
             summary.push_str(&format!("- {c}\n"));
         }
@@ -781,6 +791,27 @@ mod tests {
         assert_eq!(ts["kind"], "tool");
         assert_eq!(ts["tool"], "explore");
         assert_eq!(ts["id"], "call1");
+    }
+
+    #[test]
+    fn compact_subagent_messages_persian_char_boundaries() {
+        // The explore sub-agent compacts Persian content — the 400-byte cut
+        // used to slice mid-char and panic (compact.rs:103 crash report).
+        let mut messages = vec![json!({ "role": "system", "content": "sys" })];
+        for _ in 0..50 {
+            messages.push(json!({
+                "role": "user",
+                "content": "این یک متن فارسی طولانی برای آزمایش برش ایمن نویسه‌هاست ".repeat(20),
+            }));
+        }
+        messages.push(json!({ "role": "user", "content": "گزارش نهایی" }));
+        compact_subagent_messages(&mut messages, 4096);
+        // Head + summary + tail survive, all valid UTF-8 (no panic above).
+        assert!(messages.len() >= 3);
+        assert!(messages[0]["content"] == "sys");
+        let summary = messages[1]["content"].as_str().unwrap();
+        assert!(summary.contains("[Earlier research compacted]"));
+        assert!(messages.last().unwrap()["content"] == "گزارش نهایی");
     }
 
     #[test]

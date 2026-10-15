@@ -169,13 +169,14 @@ function groupSummary(activities: ToolActivity[]): string {
 
 /** A task card running the background sub-agent (opencode-style subagent;
  *  "general" is a legacy pre-rename type the backend still accepts).
- *  NOTE: "explore" is deliberately NOT a subagent card — the user asked for
- *  it to render like every other tool call row (same color), not as a big
- *  task card. */
+ *  "explore" keeps the SAME sub-agent card layout, but the special
+ *  "explore" color class is NOT applied to it — the user asked for the
+ *  standard tool-call color only, nothing else about its rendering. */
 export const isSubagentCard = (a: ToolActivity) =>
-  a.tool === "task" &&
-  (a.args?.subagent_type === "subagent" ||
-    a.args?.subagent_type === "general");
+  (a.tool === "task" &&
+    (a.args?.subagent_type === "subagent" ||
+      a.args?.subagent_type === "general")) ||
+  a.tool === "explore";
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;
@@ -2144,7 +2145,7 @@ export const ToolCallView = memo(function ToolCallView({
   // hidden until clicked.
   const [collapsed, setCollapsed] = useState(isSubagentCard(activity));
   const collapsible =
-    activity.tool === "task" &&
+    (activity.tool === "task" || activity.tool === "explore") &&
     ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary));
 
   const toolRunning = activity.status === "running" || (activity.children?.some((c) => c.status === "running") ?? false);
@@ -2194,7 +2195,9 @@ export const ToolCallView = memo(function ToolCallView({
 
   return (
     <div
-      className={`tool-card ${activity.status}${isSubagentCard(activity) ? " explore" : ""}`}
+      className={`tool-card ${activity.status}${
+        isSubagentCard(activity) && activity.tool === "task" ? " explore" : ""
+      }`}
     >
       <div
         className={`tool-card-head${collapsible ? " collapsible" : ""}${isWrite ? " write-head" : ""}`}
@@ -2239,7 +2242,11 @@ export const ToolCallView = memo(function ToolCallView({
               </span>
             </>
           ) : isSubagentCard(activity) ? (
-            "sub-agent"
+            activity.tool === "explore" ? (
+              (TOOL_LABEL[activity.tool] ?? activity.tool)
+            ) : (
+              "sub-agent"
+            )
           ) : (
             (TOOL_LABEL[activity.tool] ?? activity.tool)
           )}
@@ -2297,7 +2304,7 @@ export const ToolCallView = memo(function ToolCallView({
             {fixZwsp(String(activity.args.description))}
           </span>
         )}
-        {activity.tool === "task" &&
+        {(activity.tool === "task" || activity.tool === "explore") &&
           activity.children &&
           activity.children.length > 0 && (
             <span className="tool-badge tool-sub-count">
@@ -2365,7 +2372,7 @@ export const ToolCallView = memo(function ToolCallView({
       </div>
 
       {collapsed &&
-        activity.tool === "task" &&
+        (activity.tool === "task" || activity.tool === "explore") &&
         activity.children &&
         activity.children.length > 0 && (
           <ToolCascade activities={activity.children} />
@@ -2377,7 +2384,7 @@ export const ToolCallView = memo(function ToolCallView({
           {activity.summary && !isWrite && (
             <div className="tool-summary">{fixZwsp(activity.summary)}</div>
           )}
-          {activity.tool === "task" &&
+          {(activity.tool === "task" || activity.tool === "explore") &&
             activity.children &&
             activity.children.length > 0 && (
               <div className="tool-sub-list">

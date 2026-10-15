@@ -239,10 +239,64 @@ struct CompactBody {
     context_window: usize,
     #[serde(default)]
     max_output: usize,
+    /// Per-slot sub-agent model overrides (Tool Models settings); the
+    /// "compact" slot routes the summarizer to that model/provider.
+    #[serde(default)]
+    subagent_models: std::collections::HashMap<String, String>,
+    /// Full provider configs keyed by id for cross-provider slots.
+    #[serde(default)]
+    providers: std::collections::HashMap<String, Value>,
 }
 
 fn default_provider() -> String {
     "custom".into()
+}
+
+/// Resolve a Tool Models slot entry ("providerId/model" | bare model | "")
+/// to (model, base_url, api_keys) — shared by the compact and sub-agent
+/// slots; mirrors graph.py resolve_subagent_model.
+fn resolve_slot_target(
+    entry: &str,
+    parent_model: &str,
+    parent_base: &str,
+    parent_keys: &[String],
+    providers: &std::collections::HashMap<String, Value>,
+) -> (String, String, Vec<String>) {
+    let entry = entry.trim();
+    if entry.is_empty() || entry == "main" || entry == "main_model" || entry == "main model" {
+        return (parent_model.to_string(), parent_base.to_string(), parent_keys.to_vec());
+    }
+    let (provider_id, model) = match entry.split_once('/') {
+        Some((pid, m)) => (pid.trim(), m.trim()),
+        None => ("", entry),
+    };
+    if provider_id.is_empty() {
+        return (model.to_string(), parent_base.to_string(), parent_keys.to_vec());
+    }
+    match providers.get(provider_id) {
+        Some(cfg) => {
+            let base = cfg
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(parent_base)
+                .to_string();
+            let mut keys: Vec<String> = cfg
+                .get("apiKeys")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            if keys.is_empty() {
+                if let Some(k) = cfg.get("apiKey").and_then(Value::as_str) {
+                    keys.push(k.to_string());
+                }
+            }
+            if keys.is_empty() {
+                keys = parent_keys.to_vec();
+            }
+            (model.to_string(), base, keys)
+        }
+        None => (model.to_string(), parent_base.to_string(), parent_keys.to_vec()),
+    }
 }
 
 async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
@@ -251,17 +305,26 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
             .into_response();
     }
     let client = llm::http_client();
-    let model = LlmConfig {
-        provider: body.provider.clone(),
-        model: body.model.clone(),
-        base_url: body.base_url.clone(),
-        api_keys: {
+    // The "compact" Tool Models slot overrides the summarizer model
+    // ("providerId/model" routes cross-provider; empty = the chat model).
+    let (model_name, base_url, api_keys) = resolve_slot_target(
+        body.subagent_models.get("compact").map(|s| s.as_str()).unwrap_or(""),
+        &body.model,
+        &body.base_url,
+        &{
             let mut k = body.api_keys.clone();
             if k.is_empty() && !body.api_key.is_empty() {
                 k.push(body.api_key.clone());
             }
             k
         },
+        &body.providers,
+    );
+    let model = LlmConfig {
+        provider: body.provider.clone(),
+        model: model_name,
+        base_url,
+        api_keys,
         temperature: Some(0.2),
         max_tokens: Some(4096),
         timeout_secs: 300,

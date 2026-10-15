@@ -2298,7 +2298,11 @@ export const ToolCallView = memo(function ToolCallView({
             className="tool-cmd tool-task"
             title={String(activity.args.description)}
           >
-            {fixZwsp(String(activity.args.description))}
+            {fixZwsp(
+              String(activity.args.description).length > 120
+                ? `${String(activity.args.description).slice(0, 120)}…`
+                : String(activity.args.description),
+            )}
           </span>
         )}
         {(activity.tool === "task" || activity.tool === "explore") &&

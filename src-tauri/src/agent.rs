@@ -59,6 +59,14 @@ pub struct AgentRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub mcp_servers: Value,
+    /// Per-slot sub-agent model overrides from the UI's Tool Models settings
+    /// (e.g. {"subagent": "providerId/model"}); empty = the parent model.
+    #[serde(default)]
+    pub subagent_models: std::collections::HashMap<String, String>,
+    /// Full provider configs keyed by id, so a "providerId/model" sub-agent
+    /// entry routes to THAT provider's base URL / keys (cross-provider).
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, Value>,
 }
 
 fn default_mode() -> String {
@@ -110,7 +118,7 @@ fn tool_schemas() -> Vec<Value> {
         ("edit_file", "Replace an exact string in an existing file."),
         ("run_terminal", "Run a shell command in the workspace with a timeout."),
         ("current_time", "Current UTC time."),
-        ("explore", "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need."),
+        ("explore", "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question)."),
         ("save_memory", "Persist a durable note about the project for future sessions."),
     ]
     .into_iter()
@@ -138,6 +146,8 @@ fn tool_schemas() -> Vec<Value> {
                         "offset": {"type": "integer"},
                         "limit": {"type": "integer"},
                         "max_results": {"type": "integer"},
+                        "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
+                        "prompt": {"type": "string", "description": "The full research question for the sub-agent"},
                     },
                 },
             },
@@ -361,6 +371,67 @@ pub async fn run_turn(
 /// read/search tool set. The report is returned UNCAPPED — the main agent
 /// has no search tools of its own, so this report is its only source of
 /// data (UI echo is still capped by the caller).
+/// Resolve the explore sub-agent's model from the Tool Models settings.
+/// Mirrors graph.py resolve_subagent_model: "" / missing -> the parent
+/// model; "providerId/model" -> THAT provider's base URL + keys
+/// (cross-provider routing); a bare model id -> the parent provider.
+fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>) {
+    let entry = req
+        .subagent_models
+        .get("subagent")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if entry.is_empty() || entry == "main" || entry == "main_model" || entry == "main model" {
+        return (
+            req.model.clone(),
+            req.base_url.clone(),
+            req.api_keys.clone(),
+        );
+    }
+    let (provider_id, model) = match entry.split_once('/') {
+        Some((pid, m)) => (pid.trim().to_string(), m.trim().to_string()),
+        None => (String::new(), entry),
+    };
+    if provider_id.is_empty() {
+        // Bare model id: same provider as the parent.
+        return (model, req.base_url.clone(), req.api_keys.clone());
+    }
+    match req.providers.get(&provider_id) {
+        Some(cfg) => {
+            let base = cfg
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(&req.base_url)
+                .to_string();
+            let mut keys: Vec<String> = cfg
+                .get("apiKeys")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys.is_empty() {
+                if let Some(k) = cfg.get("apiKey").and_then(Value::as_str) {
+                    keys.push(k.to_string());
+                }
+            }
+            if keys.is_empty() {
+                keys = req.api_keys.clone();
+            }
+            (model, base, keys)
+        }
+        // Unknown provider id: fall back to the parent provider.
+        None => (
+            model,
+            req.base_url.clone(),
+            req.api_keys.clone(),
+        ),
+    }
+}
+
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
@@ -377,14 +448,17 @@ async fn run_subagent(
         content: description.clone(),
     });
 
-    // Read-only sub-request: same model config, research-only system prompt.
+    // Read-only sub-request: research-only system prompt. The model comes
+    // from the Tool Models "subagent" slot (cross-provider aware), falling
+    // back to the parent model when the slot is empty.
+    let (sub_model, sub_base, sub_keys) = resolve_subagent_target(parent);
     let sub_req = AgentRequest {
         provider: parent.provider.clone(),
         provider_id: parent.provider_id.clone(),
-        model: parent.model.clone(),
-        base_url: parent.base_url.clone(),
-        api_key: parent.api_key.clone(),
-        api_keys: parent.api_keys.clone(),
+        model: sub_model,
+        base_url: sub_base,
+        api_key: String::new(),
+        api_keys: sub_keys,
         root: parent.root.clone(),
         mode: "subagent".into(),
         prompt,
@@ -401,6 +475,8 @@ Report in English.",
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
+        subagent_models: std::collections::HashMap::new(),
+        providers: parent.providers.clone(),
     };
 
     let mut report = String::new();
@@ -564,5 +640,71 @@ mod tests {
         let req: AgentRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.mode, "build");
         assert!(req.api_keys.is_empty());
+    }
+
+    fn base_req() -> AgentRequest {
+        AgentRequest {
+            provider: "custom".into(),
+            provider_id: "p1".into(),
+            model: "main-model".into(),
+            base_url: "http://parent/v1".into(),
+            api_key: "pk".into(),
+            api_keys: vec!["pk".into()],
+            root: "/tmp/x".into(),
+            mode: "build".into(),
+            prompt: "hi".into(),
+            history: Vec::new(),
+            system_prompt: String::new(),
+            context_window: 0,
+            chat_id: String::new(),
+            mcp_servers: Value::Null,
+            subagent_models: std::collections::HashMap::new(),
+            providers: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn subagent_model_slot_defaults_to_parent() {
+        let req = base_req();
+        let (model, base, keys) = resolve_subagent_target(&req);
+        assert_eq!(model, "main-model");
+        assert_eq!(base, "http://parent/v1");
+        assert_eq!(keys, vec!["pk".to_string()]);
+    }
+
+    #[test]
+    fn subagent_model_slot_bare_model_uses_parent_provider() {
+        let mut req = base_req();
+        req.subagent_models
+            .insert("subagent".into(), "cheap-model".into());
+        let (model, base, _) = resolve_subagent_target(&req);
+        assert_eq!(model, "cheap-model");
+        assert_eq!(base, "http://parent/v1");
+    }
+
+    #[test]
+    fn subagent_model_slot_routes_cross_provider() {
+        let mut req = base_req();
+        req.subagent_models
+            .insert("subagent".into(), "p2/other-model".into());
+        req.providers.insert(
+            "p2".into(),
+            json!({"baseUrl": "http://other/v1", "apiKeys": ["ok1", "ok2"]}),
+        );
+        let (model, base, keys) = resolve_subagent_target(&req);
+        assert_eq!(model, "other-model");
+        assert_eq!(base, "http://other/v1");
+        assert_eq!(keys, vec!["ok1".to_string(), "ok2".to_string()]);
+    }
+
+    #[test]
+    fn subagent_model_slot_unknown_provider_falls_back() {
+        let mut req = base_req();
+        req.subagent_models
+            .insert("subagent".into(), "ghost/m".into());
+        let (model, base, keys) = resolve_subagent_target(&req);
+        assert_eq!(model, "m");
+        assert_eq!(base, "http://parent/v1");
+        assert_eq!(keys, vec!["pk".to_string()]);
     }
 }

@@ -18,6 +18,9 @@ use crate::tools;
 
 /// Maximum tool-loop iterations per turn (mirrors graph.py MAX_STEPS).
 const MAX_STEPS: usize = 60;
+/// The explore sub-agent must answer in seconds, not minutes — a much smaller
+/// step budget than the main agent's, with a forced final report (below).
+const SUBAGENT_MAX_STEPS: usize = 12;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 const TOOL_RESULT_CAP: usize = 4000;
 /// Sub-agent depth limit (mirrors graph.py: sub-agents cannot spawn more).
@@ -189,7 +192,7 @@ fn research_schemas() -> Vec<Value> {
     let schemas: &[(&str, &str, Value)] = &[
         (
             "read",
-            "Read a file (optionally a window via offset/limit).",
+            "Read a WINDOW of a file. For any file over ~300 lines ALWAYS pass offset/limit (200-line windows) — never read a whole large file.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
@@ -198,7 +201,7 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "grep",
-            "Regex content search under a path.",
+            "Regex content search. ALWAYS pass path (a directory or single file) and include (glob filter); keep patterns narrow (max 3 alternatives) and max_results small.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
@@ -209,7 +212,7 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "glob",
-            "Find files by glob pattern (path-scoped).",
+            "Find files by glob pattern. ALWAYS pass path scoped to the likely directory — never glob the whole tree.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
@@ -352,12 +355,25 @@ pub async fn run_turn(
         tool_schemas()
     };
 
-    for _step in 0..MAX_STEPS {
+    let max_steps = if req.mode == "subagent" {
+        SUBAGENT_MAX_STEPS
+    } else {
+        MAX_STEPS
+    };
+    for step in 0..max_steps {
         // Client disconnect (Stop button closes the SSE stream) flips the
         // cancel flag — bail out instead of burning provider tokens.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             emit(&AgentEvent::Done { aborted: true });
             return Ok(());
+        }
+        // Budget nudge (explore only): make the sub-agent report while it
+        // still has calls left instead of running out silently.
+        if req.mode == "subagent" && step + 3 == max_steps {
+            messages.push(json!({
+                "role": "user",
+                "content": "Tool budget nearly exhausted — report your findings in your NEXT answer; only call a tool if it is essential."
+            }));
         }
         // stream_chat accumulates text/tool_calls itself; the sink only
         // forwards live text deltas to the SSE stream.
@@ -498,6 +514,36 @@ pub async fn run_turn(
         }
     }
 
+    // Budget exhausted. The explore sub-agent must still hand the parent its
+    // findings: fold the tool results it already gathered into a report —
+    // no forced extra model call (the data is already in context).
+    if req.mode == "subagent" {
+        let mut report =
+            String::from("[Tool budget exhausted] Findings gathered so far:\n");
+        for m in messages.iter().rev() {
+            if m["role"].as_str() != Some("tool") {
+                continue;
+            }
+            let c = m["content"].as_str().unwrap_or_default();
+            if c.trim().is_empty() {
+                continue;
+            }
+            // Char-boundary-safe cut — byte slicing mid-char panics on Persian.
+            let mut end = 600.min(c.len());
+            while end > 0 && !c.is_char_boundary(end) {
+                end -= 1;
+            }
+            report.push_str("- ");
+            report.push_str(&c[..end]);
+            report.push_str("…\n");
+            if report.len() > 8000 {
+                break;
+            }
+        }
+        emit(&AgentEvent::Text { content: report });
+        emit(&AgentEvent::Done { aborted: false });
+        return Ok(());
+    }
     emit(&AgentEvent::Warn {
         content: format!("turn stopped after {MAX_STEPS} steps"),
     });

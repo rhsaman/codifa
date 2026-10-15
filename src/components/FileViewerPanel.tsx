@@ -622,12 +622,15 @@ export function FileViewerPanel({
         }
         // fs:read resolves (root, rel) and refuses to escape the root, so an
         // absolute path is read as (dir, basename) — its own containment.
-        const res = filePath.startsWith("/")
+        // A trailing ":42" line suffix inside the path would miss the file —
+        // strip it (the line reaches the viewer via its own prop).
+        const cleanPath = filePath.replace(/:\d+$/, "");
+        const res = cleanPath.startsWith("/")
           ? await api.fsRead(
-              filePath.slice(0, filePath.lastIndexOf("/")) || "/",
-              filePath.slice(filePath.lastIndexOf("/") + 1),
+              cleanPath.slice(0, cleanPath.lastIndexOf("/")) || "/",
+              cleanPath.slice(cleanPath.lastIndexOf("/") + 1),
             )
-          : await api.fsRead(root, filePath);
+          : await api.fsRead(root, cleanPath);
         if (!alive) return;
         setState(
           res?.content != null

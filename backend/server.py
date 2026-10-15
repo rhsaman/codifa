@@ -281,6 +281,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     _spawn_tracked(_bg(), "models-dev-preload")
 
+    # Prune orphaned plan dirs at startup too: the atexit prune never runs
+    # after a hard kill (crash / kill -9), so plans of deleted chats stayed
+    # on disk until the next graceful shutdown.
+    try:
+        import state_db as _startup_state_db
+
+        _startup_state_db.prune_orphan_plans()
+    except Exception:
+        logger.debug("startup plan prune failed", exc_info=True)
+
     async def _warm_local_voices() -> None:
         # Preload G2P + pocket TTS weights in the background so the first
         # speaker-icon click never pays the cold-load cost inside the

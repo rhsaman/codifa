@@ -5481,6 +5481,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const startRecording = async () => {
     if (recording || transcribing) return;
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        // WKWebView only exposes mediaDevices when the app carries the
+        // microphone usage description (Info.plist) — dev builds embed it.
+        throw new Error(
+          "Microphone unavailable — grant Codifa microphone access in System Settings, then restart the app.",
+        );
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // Prefer a format the sidecar's `av` can decode; fall back to whatever the
       // browser supports (Whisper handles webm/ogg/opus/wav via decode_audio).

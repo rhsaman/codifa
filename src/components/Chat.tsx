@@ -5267,6 +5267,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         reader.readAsDataURL(f);
       }
     }
+    // WKWebView sometimes exposes OS drags ONLY as file URLs (dataTransfer
+    // files is empty). Parse text/uri-list / public.file-url and attach by
+    // path so Finder drags still work.
+    if (dropped.length === 0) {
+      const raw =
+        e.dataTransfer.getData("text/uri-list") ||
+        e.dataTransfer.getData("public.file-url") ||
+        "";
+      for (const line of raw.split(/\r?\n/)) {
+        const url = line.trim();
+        if (!url.startsWith("file://")) continue;
+        let p = decodeURIComponent(url.replace(/^file:\/\/(?:localhost)?/, ""));
+        // Windows file:///C:/... yields "/C:/..." — strip the leading slash.
+        if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+        addDroppedFile(p, p.split("/").pop() ?? p);
+      }
+    }
   };
 
   // Long pastes never enter the textarea: they become a collapsed card above

@@ -296,9 +296,12 @@ export function filesFromNativeResult(
   const re = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,10})(?::(\d+))?/g;
   const seen = new Set<string>();
   const out: Array<Record<string, unknown>> = [];
+  // The scope the tool ran in (args.path) — bare filenames found in the
+  // result are resolved against it so the chip opens the real file.
+  const scopeDir = String(args?.path ?? args?.filePath ?? "").replace(/\/+$/, "");
   let m: RegExpExecArray | null;
   while ((m = re.exec(result)) !== null && out.length < 50) {
-    const file = m[1];
+    let file = m[1];
     // Skip prose fragments like "e.g" — require a known code extension or a
     // directory component so only real paths become chips.
     if (
@@ -306,6 +309,13 @@ export function filesFromNativeResult(
       !/\.(ts|tsx|js|jsx|mjs|cjs|py|rs|json|toml|md|css|scss|html|yaml|yml|txt|sh|go|java|rb|php|c|cpp|h|hpp|sql|lock|svg|png|jpg)$/i.test(file)
     )
       continue;
+    // Absolute paths must keep their leading slash: the regex above strips
+    // it, so "/Users/x/y.ts" became "Users/x/y.ts" which the viewer then
+    // resolved against the workspace root and failed with "No file exists".
+    if (result[m.index - 1] === "/") file = `/${file}`;
+    // A bare filename ("store.ts") is only resolvable inside the tool's
+    // scope directory — join it so the chip points at the real file.
+    else if (!file.includes("/") && scopeDir) file = `${scopeDir}/${file}`;
     if (seen.has(file)) continue;
     seen.add(file);
     out.push({ file, line: m[2] ? Number(m[2]) : undefined });

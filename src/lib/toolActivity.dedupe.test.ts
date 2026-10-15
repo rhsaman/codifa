@@ -271,6 +271,46 @@ console.log('۱۲) run_terminal/explore: result متنی به فایل تبدی�
   check('terminal بدون آیتم فایل', !out2[0].items || out2[0].items.length === 0, out2[0].items)
 }
 
+console.log('۱۳) مسیر مطلق در result: اسلش ابتدای مسیر حفظ می‌شود:')
+{
+  const ev1: SidecarEvent = {
+    kind: "tool",
+    tool: "grep",
+    args: { pattern: "x", path: "/w/src" },
+    id: "gp1",
+  } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "grep",
+    id: "gp1",
+    result: "/w/src/lib/store.ts:10: const a = 1",
+  } as any
+  const out1 = applyToolEvent([], ev1)
+  const out2 = resolveToolResult(out1, ev2)
+  const items = (out2[0].items ?? []) as unknown as Array<Record<string, unknown>>
+  check('مسیر مطلق دست‌نخورده است', String(items[0]?.file) === "/w/src/lib/store.ts", items)
+}
+
+console.log('۱۴) نام لخت فایل: با مسیر scope ی args کامل می‌شود:')
+{
+  const ev1: SidecarEvent = {
+    kind: "tool",
+    tool: "grep",
+    args: { pattern: "x", path: "/w/src/lib" },
+    id: "gp2",
+  } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "grep",
+    id: "gp2",
+    result: "store.ts:5: export const a",
+  } as any
+  const out1 = applyToolEvent([], ev1)
+  const out2 = resolveToolResult(out1, ev2)
+  const items = (out2[0].items ?? []) as unknown as Array<Record<string, unknown>>
+  check('نام لخت به مسیر کامل تبدیل شد', String(items[0]?.file) === "/w/src/lib/store.ts", items)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد.`)
   process.exit(1)

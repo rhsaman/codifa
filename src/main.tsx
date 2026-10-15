@@ -40,24 +40,28 @@ if (tauri) {
             })),
           )
         }
-        // macOS broadcasts the native drag event to EVERY app window, so
-        // window-relative (or DPR-converted) coordinates cannot identify the
-        // hovered window. The shell resolves the target window in Rust with a
-        // physical-bounds hit-test and every window receives the target label —
-        // only the targeted window shows the overlay / attaches the files.
+        // Two levels of hit-test: the Rust-resolved target label tells apart
+        // separate OS windows; the window-relative cursor (logical CSS px)
+        // tells apart chat PANELS that share one OS window (the app's
+        // multi-chat layout) — each panel compares pos with its own bounds.
+        const dpr = window.devicePixelRatio || 1
+        const pos =
+          p.type === 'enter' || p.type === 'over' || p.type === 'drop'
+            ? { x: p.position.x / dpr, y: p.position.y / dpr }
+            : null
         void invoke<string | null>('window_under_cursor')
           .catch(() => null)
           .then((target) => {
             if (p.type === 'drop') {
               window.dispatchEvent(
                 new CustomEvent('codifa:file-drop', {
-                  detail: { target, paths: p.paths },
+                  detail: { target, pos, paths: p.paths },
                 }),
               )
             }
             window.dispatchEvent(
               new CustomEvent('codifa:file-drag', {
-                detail: { phase: p.type, target },
+                detail: { phase: p.type, target, pos },
               }),
             )
           })

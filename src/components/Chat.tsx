@@ -826,22 +826,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // under the cursor shows the overlay and receives the drop.
   useEffect(() => {
     const myWindow = (window as unknown as { __CODIFA_WINDOW_LABEL__?: string }).__CODIFA_WINDOW_LABEL__;
-    const isTarget = (target: string | null | undefined) =>
+    const isTargetWindow = (target: string | null | undefined) =>
       !target || !myWindow || target === myWindow;
+    // Chat panels can share ONE OS window (multi-chat layout): the window
+    // label alone cannot tell them apart — hit-test the cursor against this
+    // panel's own bounds too.
+    const inPanel = (pos: { x: number; y: number } | null | undefined) => {
+      const r = panelRef.current?.getBoundingClientRect();
+      if (!r || !pos) return false;
+      return pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom;
+    };
     const onNativeDrag = (e: Event) => {
-      const { phase, target } = (e as CustomEvent<{ phase: string; target?: string | null }>).detail;
+      const { phase, target, pos } = (e as CustomEvent<{ phase: string; target?: string | null; pos?: { x: number; y: number } | null }>).detail;
       if (phase === "enter" || phase === "over") {
-        setDragOver(isTarget(target));
-      } else if (phase === "leave" || (phase === "drop" && !isTarget(target))) {
+        setDragOver(isTargetWindow(target) && inPanel(pos));
+      } else if (phase === "leave") {
         setDragOver(false);
         dragDepth.current = 0;
       }
     };
     const onNativeDrop = (e: Event) => {
-      const { target, paths } = (e as CustomEvent<{ target?: string | null; paths?: string[] }>).detail;
+      const { target, pos, paths } = (e as CustomEvent<{ target?: string | null; pos?: { x: number; y: number } | null; paths?: string[] }>).detail;
       setDragOver(false);
       dragDepth.current = 0;
-      if (!isTarget(target)) return; // dropped on another window — not ours
+      if (!isTargetWindow(target) || !inPanel(pos)) return; // another window/panel — not ours
       for (const p of paths ?? []) addDroppedFile(p, p.split("/").pop() ?? p);
     };
     window.addEventListener("codifa:file-drag", onNativeDrag);

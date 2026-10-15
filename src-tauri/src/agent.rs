@@ -245,11 +245,12 @@ fn research_schemas() -> Vec<Value> {
     let schemas: &[(&str, &str, Value)] = &[
         (
             "read",
-            "Read a WINDOW of a file. For any file over ~300 lines ALWAYS pass offset/limit (200-line windows) — never read a whole large file.",
+            "Read ONE file (single filePath — never a list). Default window is 400 lines; pass offset/limit for one window or ranges=[{\"offset\":..,\"limit\":..},…] for SEVERAL windows of the same file in one call.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
-                "limit": {"type": "integer"}
+                "limit": {"type": "integer"},
+                "ranges": {"type": "array", "items": {"type": "object", "properties": {"offset": {"type": "integer"}, "limit": {"type": "integer"}}}}
             }),
         ),
         (
@@ -702,6 +703,11 @@ pub async fn run_turn(
             let sub_all = futures_util::future::join_all(futures);
             let forward = async {
                 while let Some(ev) = rx.recv().await {
+                    // Stop must also abort the concurrent explores: the shared
+                    // cancel flag is checked on every forwarded event.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     match ev {
                         AgentEvent::Text { .. } | AgentEvent::Error { .. } => {}
                         _ => emit(&ev),

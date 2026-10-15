@@ -667,12 +667,33 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 let p = s("filePath");
                 if p.is_empty() { s("path") } else { p }
             };
+            // Single-path discipline: the batch form (filePaths: [...]) is no
+            // longer accepted — several windows of ONE file go through
+            // ranges=[{offset,limit},…] instead (user request).
+            if path.is_empty() && args["filePaths"].is_array() {
+                return Err(
+                    "read takes a single filePath — to read several windows of one file pass ranges=[{\"offset\":1,\"limit\":400},…]".into(),
+                );
+            }
+            let abs = resolve_safe(root, &path, true, permit)?;
+            // Multi-RANGE: several windows of the same file in one call.
+            if let Some(ranges) = args["ranges"].as_array() {
+                let mut out = String::new();
+                for r in ranges {
+                    let offset = r["offset"].as_u64().unwrap_or(1) as usize;
+                    let limit = r["limit"].as_u64().unwrap_or(400) as usize;
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(&read_window(&abs, offset, limit)?);
+                }
+                return Ok(out);
+            }
             let offset = args["offset"].as_u64().unwrap_or(1) as usize;
             // Windowed-read discipline: a whole-file read floods the context
             // and slows the agent down. Cap the default window; larger reads
             // must be explicit (offset/limit).
             let limit = args["limit"].as_u64().unwrap_or(400) as usize;
-            let abs = resolve_safe(root, &path, true, permit)?;
             read_window(&abs, offset, limit)
         }
         "grep" => {

@@ -247,11 +247,15 @@ export function resolveToolResult(
         summary: event.summary,
         engine: event.engine,
         items:
-          event.results ??
+          // Args-derived items FIRST: the native (Rust) result rows carry only
+          // bare filenames, while the tool's own args hold the real (absolute)
+          // path — event.results must not override them with unresolvable
+          // names ("No file exists at this path" on click). Python-sidecar
+          // events have no result string and fall through to event.results.
           (typeof event.result === "string"
-            ? (filesFromNativeResult(act.tool, event.result, act.args) as
+            ? (filesFromNativeResult(act.tool, event.result, act.args ?? event.args) as
                 unknown as SearchResultItem[] | undefined)
-            : undefined),
+            : undefined) ?? event.results,
         model: event.model || act.model,
         elapsedMs: now - (act.startedAt ?? now),
       };

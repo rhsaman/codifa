@@ -563,6 +563,9 @@ export function openWorkspaceFile(path: string, line?: number): void {
   }
   const st = useStore.getState();
   const root = st.chats.find((c) => c.id === st.activeChatId)?.root ?? st.root;
+  // Absolute paths must reach the viewer AS-IS: FileViewerPanel reads them
+  // as (dir, basename) with their own containment — joining them with the
+  // workspace root here produced "root/Users/..." which never exists.
   useViewerTabs.getState().openFile(clean, line, root);
 }
 

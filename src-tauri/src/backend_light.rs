@@ -420,13 +420,26 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            // When the client disconnects (Stop button aborts the fetch), the
-            // response body — and with it the channel receiver — is dropped,
-            // which flips the sender's is_closed().
-            if watch_tx.strong_count() == 0 {
-                cancel_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
-                break;
-            }
+    // When the client disconnects (Stop button aborts the fetch), the
+    // response body — and with it the channel receiver — is dropped, which
+    // flips the sender's is_closed(). strong_count() can NEVER reach zero
+    // mid-turn (the turn task itself holds a sender), so the old check only
+    // fired after the turn finished — Stop did not stop a running explore.
+    // WeakUnboundedSender has no is_closed: upgrade temporarily (the turn
+    // task keeps strong senders alive, so this succeeds mid-turn) and ask
+    // the strong handle whether the receiver is gone.
+    let receiver_gone = match watch_tx.upgrade() {
+        Some(s) => {
+            let closed = s.is_closed();
+            drop(s);
+            closed
+        }
+        None => true,
+    };
+    if receiver_gone {
+        cancel_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+        break;
+    }
         }
     });
     tokio::spawn(async move {

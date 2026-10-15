@@ -35,11 +35,14 @@ pub struct TraceStore {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn traces_dir() -> Option<PathBuf> {
-    let root = std::env::var("CODER_DATA_DIR").ok()?;
-    if root.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(root).join("traces"))
+    let root = match std::env::var("CODER_DATA_DIR") {
+        Ok(r) if !r.is_empty() => PathBuf::from(r),
+        // The app process itself may not have CODER_DATA_DIR set (it is
+        // only injected into the sidecar's env) — fall back to the same
+        // default the sidecar uses so traces land in ~/.codifa/traces.
+        _ => dirs::home_dir()?.join(".codifa"),
+    };
+    Some(root.join("traces"))
 }
 
 fn sanitize(chat_id: &str) -> String {

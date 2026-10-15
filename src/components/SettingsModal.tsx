@@ -2406,10 +2406,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               onSelect={setSubagentModel}
             />
             <ToolModelSelect
-              agent="subagent"
-              label="Sub-agent model"
-              desc="Background sub-agent spawned via the task tool (research, code search, delegated work). Falls back to the main model."
-              current={subagentModels.subagent || subagentModels.explore || ''}
+              agent="explore"
+              label="Explore model"
+              desc="Research sub-agent that does ALL file reading, searching and LSP lookups for the main agent and reports the full findings. Falls back to the main model."
+              current={subagentModels.explore || subagentModels.subagent || ''}
               onSelect={setSubagentModel}
             />
             <ToolModelSelect

@@ -345,10 +345,24 @@ pub fn grep_scope(
     } else {
         resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
     };
+    // A file scope (grep inside one file) cannot be current_dir — spawning rg
+    // there fails with ENOTDIR ("Not a directory"). Search from the file's
+    // parent directory, targeting the file itself.
+    let (search_dir, search_target) = if scope_abs.is_file() {
+        (
+            scope_abs.parent().unwrap_or(&root_real).to_path_buf(),
+            scope_abs
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        )
+    } else {
+        (scope_abs.clone(), ".".to_string())
+    };
 
     let cap = max_results.min(MAX_SEARCH_RESULTS);
     let mut cmd = std::process::Command::new(rg_binary());
-    cmd.current_dir(&scope_abs)
+    cmd.current_dir(&search_dir)
         .arg("--json")
         .arg("--line-number")
         .arg("--max-count")
@@ -360,7 +374,7 @@ pub fn grep_scope(
     if !include.is_empty() {
         cmd.arg("--glob").arg(include);
     }
-    cmd.arg("--").arg(pattern).arg(".");
+    cmd.arg("--").arg(pattern).arg(&search_target);
 
     let raw = cmd
         .output()
@@ -879,6 +893,20 @@ mod tests {
         assert!(out.contains(">1: fn alpha"));
         assert!(out.contains("2: fn beta"));
         assert_eq!(grep_scope(&tmp, "sub", "zzz_nothing", "", 10).unwrap(), "no matches");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn grep_scope_accepts_single_file_scope() {
+        // A file (not a directory) as the scope: rg cannot current_dir into a
+        // file (ENOTDIR, "Not a directory") — the scope must resolve to the
+        // file's parent with the file as the search target.
+        let tmp = std::env::temp_dir().join("codifa-grep-file-test");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("one.rs"), "fn alpha() {}\n").unwrap();
+        let file_scope = tmp.join("one.rs").to_string_lossy().into_owned();
+        let out = grep_scope(&tmp, &file_scope, "alpha", "", 10).unwrap();
+        assert!(out.contains("alpha"), "file-scope grep failed: {out}");
         fs::remove_dir_all(&tmp).ok();
     }
 

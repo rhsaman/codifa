@@ -5245,7 +5245,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     for (const f of dropped) {
       const p =
         window.coder.getPathForFile(f) || (f as File & { path?: string }).path;
-      if (p) addDroppedFile(p, f.name);
+      if (p) {
+        addDroppedFile(p, f.name);
+        continue;
+      }
+      // WKWebView gives no path for OS drags (Tauri native drag events are
+      // disabled so the HTML5 DnD handlers work). Images don't need a path —
+      // attach them by content as a data URL, like screenshots.
+      if (f.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          setImages((imgs) =>
+            imgs.some((i) => i.path === f.name)
+              ? imgs
+              : [
+                  ...imgs,
+                  { path: f.name, name: f.name, dataUrl: String(reader.result) },
+                ],
+          );
+        };
+        reader.readAsDataURL(f);
+      }
     }
   };
 

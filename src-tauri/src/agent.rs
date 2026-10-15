@@ -589,10 +589,15 @@ async fn run_subagent(
         history: Vec::new(),
         system_prompt: format!(
             "You are the explore sub-agent inside the workspace {}. \
-Search and read files (read/grep/glob/LSP tools) and report the FULL \
-findings — the main agent cannot search itself and relies entirely on \
-your report, so include exact file paths, line numbers, symbol names \
-and relevant code excerpts. You have NO write tools: never modify files. \
+Search TARGETED, not exhaustively — the main agent waits on you, so \
+every extra call wastes its time. Strategy: (1) start from manifest/config \
+files the task points at; (2) grep with NARROW patterns scoped to likely \
+directories (always pass path/include); (3) read only the line ranges you \
+need (offset/limit), never whole large files; (4) never glob the whole \
+tree or repeat a search with the same pattern. Aim for at most ~10 tool \
+calls, then report. Include exact file paths, line numbers, symbol names \
+and short code excerpts — the main agent cannot search itself and relies \
+entirely on your report. You have NO write tools: never modify files. \
 Report in English.",
             parent.root
         ),

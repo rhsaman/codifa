@@ -22,7 +22,8 @@ const MAX_COMMENTS_PER_CHAT = 100;
 const MAX_QUOTE_CHARS = 500;
 
 function makeId(): string {
-  const uuid = typeof crypto !== "undefined" ? crypto.randomUUID?.() : undefined;
+  const uuid =
+    typeof crypto !== "undefined" ? crypto.randomUUID?.() : undefined;
   if (uuid) return uuid;
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -37,7 +38,10 @@ the spot without searching. The locator kind matches the file nature:
 The file and position are stated explicitly (header + File/Sheet/Lines or
 Range lines) for fast direct edits. */
 export function formatFileComment(path: string, quote: string): string {
-  const short = quote.length > MAX_QUOTE_CHARS ? `${quote.slice(0, MAX_QUOTE_CHARS)}…` : quote;
+  const short =
+    quote.length > MAX_QUOTE_CHARS
+      ? `${quote.slice(0, MAX_QUOTE_CHARS)}…`
+      : quote;
   const quoted = `> ${short.split("\n").join("\n> ")}`;
   // Split off the locator after the LAST colon (workspace paths are relative,
   // so no drive-letter colon to worry about).
@@ -51,9 +55,14 @@ export function formatFileComment(path: string, quote: string): string {
   // Code/text lines: 42 / 42-45.
   const linesMatch = loc.match(/^(\d+(?:-\d+)?)$/);
   if (a1Match) {
-    const rawSheet = (a1Match[1] ?? "").trim().replace(/^'(.*)'$/, "$1").replace(/''/g, "'");
+    const rawSheet = (a1Match[1] ?? "")
+      .trim()
+      .replace(/^'(.*)'$/, "$1")
+      .replace(/''/g, "'");
     const range = a1Match[2];
-    const header = rawSheet ? `Comment on \`${file}\` (sheet ${rawSheet}, range ${range}):` : `Comment on \`${file}\` (range ${range}):`;
+    const header = rawSheet
+      ? `Comment on \`${file}\` (sheet ${rawSheet}, range ${range}):`
+      : `Comment on \`${file}\` (range ${range}):`;
     const sheetLine = rawSheet ? `\nSheet: ${rawSheet}` : "";
     return `${header}\n${quoted}\n\nFile: ${file}${sheetLine}\nRange: ${range}\n\nDirect edit: open file \`${file}\`${rawSheet ? ` at sheet \`${rawSheet}\`` : ""} at range ${range} without searching the workspace, and apply the request. Do NOT run Search Files.`;
   }
@@ -67,17 +76,32 @@ export function formatFileComment(path: string, quote: string): string {
     const lines = linesMatch[1];
     const single = !lines.includes("-");
     const header = `Comment on \`${file}\` (${single ? `line ${lines}` : `lines ${lines}`}):`;
-    return `${header}\n${quoted}\n\nFile: ${file}\nLines: ${lines}\n\nDirect edit: open file \`${file}\` at ${single ? `line ${lines}` : `lines ${lines}`} without searching the workspace, and apply the request. Do NOT run Search Files.`;
+    return `${header}\n${quoted}\n\nFile: ${file}\nLines: ${lines}\n\nDirect edit: open file \`${file}\` at ${single ? `line ${lines}` : `lines ${lines}`}`;
   }
   const body = `Comment on \`${path}\`:`;
   return `${body}\n${quoted}\n\nFile: ${path}\n\nDirect edit: open this exact file path without searching the workspace, go to the quoted text, and apply the request. Do NOT run Search Files.`;
 }
 
 /** Store a highlight without sending it. Quote is truncated for low RAM. */
-export function addFileComment(chatId: string, path: string, quote: string): FileComment {
-  const trimmed = quote.length > MAX_QUOTE_CHARS ? `${quote.slice(0, MAX_QUOTE_CHARS)}…` : quote;
-  const comment: FileComment = { id: makeId(), chatId, path, quote: trimmed, createdAt: Date.now() };
-  const list = [...(commentsByChat.get(chatId) ?? []), comment].slice(-MAX_COMMENTS_PER_CHAT);
+export function addFileComment(
+  chatId: string,
+  path: string,
+  quote: string,
+): FileComment {
+  const trimmed =
+    quote.length > MAX_QUOTE_CHARS
+      ? `${quote.slice(0, MAX_QUOTE_CHARS)}…`
+      : quote;
+  const comment: FileComment = {
+    id: makeId(),
+    chatId,
+    path,
+    quote: trimmed,
+    createdAt: Date.now(),
+  };
+  const list = [...(commentsByChat.get(chatId) ?? []), comment].slice(
+    -MAX_COMMENTS_PER_CHAT,
+  );
   commentsByChat.set(chatId, list);
   return comment;
 }
@@ -91,14 +115,20 @@ export function listFileComments(chatId: string, path?: string): FileComment[] {
 /** Store the highlight AND deliver it like the chat composer: idle sends as
 a normal message, streaming sends as a non-interrupting steer, and explicit
 queue (Ctrl/Cmd+Enter) or compacting/waiting states only queue it. */
-export function commentFileSelection(chatId: string, path: string, quote: string, opts?: { queue?: boolean }): FileComment {
+export function commentFileSelection(
+  chatId: string,
+  path: string,
+  quote: string,
+  opts?: { queue?: boolean },
+): FileComment {
   const comment = addFileComment(chatId, path, quote);
   const text = formatFileComment(path, comment.quote);
   const store = useStore.getState();
   const chat = store.chats.find((c) => c.id === chatId);
   const compacting = chat?.compacting ?? false;
   const streaming = chat?.messages.some((m) => m.streaming) ?? false;
-  const reconnecting = chat?.messages.some((m) => m.retry?.reconnecting) ?? false;
+  const reconnecting =
+    chat?.messages.some((m) => m.retry?.reconnecting) ?? false;
   const waiting = chat?.pendingAsk != null || chat?.pendingPermission != null;
   // Explicit queue (composer Cmd/Ctrl+Enter), compacting, or waiting for
   // ask/permission: only queue, never start or steer a turn.
@@ -110,7 +140,11 @@ export function commentFileSelection(chatId: string, path: string, quote: string
   // injected at the next tool call without interrupting the stream.
   if (streaming || reconnecting) {
     try {
-      const userMsg = store.addMessage(chatId, { role: "user", content: text, steerPending: true });
+      const userMsg = store.addMessage(chatId, {
+        role: "user",
+        content: text,
+        steerPending: true,
+      });
       void steerChat(chatId, userMsg.id, text);
     } catch {
       store.queueMessage(chatId, { id: comment.id, text, kind: "queue" });

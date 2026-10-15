@@ -282,8 +282,17 @@ export function filesFromNativeResult(
   if (tool === "read" || tool === "write_file" || tool === "edit_file") {
     return argPath ? [{ file: argPath }] : null;
   }
-  // Textual tools whose result is not a file listing.
-  if (tool === "run_terminal" || tool === "explore" || tool === "task") return null;
+  // Textual tools whose result is not a file listing. Memory results are
+  // prose/snippets — a filename regex-scaned out of them must not become a
+  // chip that hides the actual memory text.
+  if (
+    tool === "run_terminal" ||
+    tool === "explore" ||
+    tool === "task" ||
+    tool === "search_memory" ||
+    tool === "save_memory"
+  )
+    return null;
   const re = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,10})(?::(\d+))?/g;
   const seen = new Set<string>();
   const out: Array<Record<string, unknown>> = [];

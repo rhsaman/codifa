@@ -27,20 +27,37 @@ const tauri = installTauriBridge()
 if (tauri) {
   void import('@tauri-apps/api/webview').then(({ getCurrentWebview }) =>
     getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === 'drop') {
-        const paths = event.payload.paths
+      const p = event.payload
+      // Physical -> logical CSS pixels so panels can hit-test their bounds.
+      const dpr = window.devicePixelRatio || 1
+      const pos =
+        p.type === 'enter' || p.type === 'over' || p.type === 'drop'
+          ? { x: p.position.x / dpr, y: p.position.y / dpr }
+          : null
+      if (p.type === 'drop') {
+        const paths = p.paths
         recordDroppedPaths(
-          paths.map((p) => ({
-            name: p.split('/').pop() ?? p,
-            path: p,
+          paths.map((path) => ({
+            name: path.split('/').pop() ?? path,
+            path,
           })),
         )
-        // WKWebView swallows HTML5 drops of OS files, so the active chat
-        // panel listens for this custom event and attaches by real path.
+        // The hovered panel attaches the files by real path.
         window.dispatchEvent(
-          new CustomEvent('codifa:file-drop', { detail: paths }),
+          new CustomEvent('codifa:file-drop', {
+            detail: { pos, paths },
+          }),
         )
       }
+      // WKWebView swallows HTML5 drops of OS files. Each chat panel listens
+      // for these events, hit-tests the cursor against its own bounds (multi-
+      // window: only the panel under the cursor shows the overlay) and the
+      // hovered panel attaches the dropped files by real path.
+      window.dispatchEvent(
+        new CustomEvent('codifa:file-drag', {
+          detail: { phase: p.type, pos },
+        }),
+      )
     }),
   )
 }

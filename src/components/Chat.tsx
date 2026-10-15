@@ -817,18 +817,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   }, []);
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
+  const panelRef = useRef<HTMLDivElement>(null);
   // Tauri native drag events are enabled (dragDropEnabled: true) — WKWebView
-  // swallows HTML5 drops of OS files, so the shell forwards the real paths
-  // via this custom event (see main.tsx onDragDropEvent).
+  // swallows HTML5 drops of OS files, so the shell forwards the native drag
+  // phases + cursor position (see main.tsx onDragDropEvent). Each panel
+  // hit-tests the cursor against its own bounds, so in multi-window mode
+  // ONLY the panel under the cursor shows the overlay and receives the drop.
   useEffect(() => {
+    const inBounds = (pos: { x: number; y: number } | null) => {
+      if (!pos) return false;
+      const r = panelRef.current?.getBoundingClientRect();
+      return !!r && pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom;
+    };
+    const onNativeDrag = (e: Event) => {
+      const { phase, pos } = (e as CustomEvent<{ phase: string; pos: { x: number; y: number } | null }>).detail;
+      if (phase === "enter" || phase === "over") {
+        setDragOver(inBounds(pos));
+      } else if (phase === "leave" || (phase === "drop" && !inBounds(pos))) {
+        setDragOver(false);
+        dragDepth.current = 0;
+      }
+    };
     const onNativeDrop = (e: Event) => {
-      const paths = (e as CustomEvent<string[]>).detail ?? [];
+      const { pos, paths } = (e as CustomEvent<{ pos: { x: number; y: number } | null; paths?: string[] }>).detail;
       setDragOver(false);
       dragDepth.current = 0;
-      for (const p of paths) addDroppedFile(p, p.split("/").pop() ?? p);
+      if (!inBounds(pos)) return; // dropped on another panel — not ours
+      for (const p of paths ?? []) addDroppedFile(p, p.split("/").pop() ?? p);
     };
+    window.addEventListener("codifa:file-drag", onNativeDrag);
     window.addEventListener("codifa:file-drop", onNativeDrop);
-    return () => window.removeEventListener("codifa:file-drop", onNativeDrop);
+    return () => {
+      window.removeEventListener("codifa:file-drag", onNativeDrag);
+      window.removeEventListener("codifa:file-drop", onNativeDrop);
+    };
   }, []);
   // "+" action menu (files / screenshot / skills / MCP) — the single entry
   // point that keeps the bottom toolbar minimal.
@@ -6442,7 +6464,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (dirSel) useStore.getState().createWorkspace(dirSel);
     };
     return (
-      <div className="chat-panel">
+      <div className="chat-panel" ref={panelRef}>
         <div
           className="empty-state"
           style={{ display: "flex", height: "100%", alignItems: "center" }}

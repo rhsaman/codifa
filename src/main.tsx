@@ -26,38 +26,52 @@ const tauri = installTauriBridge()
 // preload); record them so api.getPathForFile(file) stays synchronous.
 if (tauri) {
   void import('@tauri-apps/api/webview').then(({ getCurrentWebview }) =>
-    getCurrentWebview().onDragDropEvent((event) => {
-      const p = event.payload
-      // Physical -> logical CSS pixels so panels can hit-test their bounds.
-      const dpr = window.devicePixelRatio || 1
-      const pos =
-        p.type === 'enter' || p.type === 'over' || p.type === 'drop'
-          ? { x: p.position.x / dpr, y: p.position.y / dpr }
-          : null
-      if (p.type === 'drop') {
-        const paths = p.paths
-        recordDroppedPaths(
-          paths.map((path) => ({
-            name: path.split('/').pop() ?? path,
-            path,
-          })),
-        )
-        // The hovered panel attaches the files by real path.
-        window.dispatchEvent(
-          new CustomEvent('codifa:file-drop', {
-            detail: { pos, paths },
-          }),
-        )
-      }
-      // WKWebView swallows HTML5 drops of OS files. Each chat panel listens
-      // for these events, hit-tests the cursor against its own bounds (multi-
-      // window: only the panel under the cursor shows the overlay) and the
-      // hovered panel attaches the dropped files by real path.
-      window.dispatchEvent(
-        new CustomEvent('codifa:file-drag', {
-          detail: { phase: p.type, pos },
-        }),
-      )
+    void import('@tauri-apps/api/core').then(({ invoke }) => {
+      getCurrentWebview().onDragDropEvent((event) => {
+        const p = event.payload
+        // Physical -> logical CSS pixels so panels can hit-test their bounds.
+        const dpr = window.devicePixelRatio || 1
+        const pos =
+          p.type === 'enter' || p.type === 'over' || p.type === 'drop'
+            ? { x: p.position.x / dpr, y: p.position.y / dpr }
+            : null
+        if (p.type === 'drop') {
+          const paths = p.paths
+          recordDroppedPaths(
+            paths.map((path) => ({
+              name: path.split('/').pop() ?? path,
+              path,
+            })),
+          )
+        }
+        // macOS broadcasts the native drag event to EVERY app window, so the
+        // window-relative position cannot identify the hovered window. Resolve
+        // the GLOBAL cursor position and let panels hit-test in screen space.
+        void (async () => {
+          let screen: { x: number; y: number } | null = null
+          try {
+            const [sx, sy] = await invoke<[number, number]>('cursor_position')
+            screen = { x: sx / dpr, y: sy / dpr }
+          } catch {
+            // Fall back to the window-relative position (single-window case).
+          }
+          if (p.type === 'drop') {
+            window.dispatchEvent(
+              new CustomEvent('codifa:file-drop', {
+                detail: { pos, screen, paths: p.paths },
+              }),
+            )
+          }
+          // Each chat panel listens for these events and hit-tests the cursor
+          // in screen space (multi-window: only the panel under the cursor
+          // shows the overlay and receives the dropped files).
+          window.dispatchEvent(
+            new CustomEvent('codifa:file-drag', {
+              detail: { phase: p.type, pos, screen },
+            }),
+          )
+        })()
+      })
     }),
   )
 }

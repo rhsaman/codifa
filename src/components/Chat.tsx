@@ -824,25 +824,36 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // hit-tests the cursor against its own bounds, so in multi-window mode
   // ONLY the panel under the cursor shows the overlay and receives the drop.
   useEffect(() => {
-    const inBounds = (pos: { x: number; y: number } | null) => {
-      if (!pos) return false;
+    type DragPos = { x: number; y: number } | null;
+    // Hit-test in GLOBAL screen coordinates when available: macOS broadcasts
+    // the native drag event to every app window, so a window-relative position
+    // matches the wrong window's panel too. Screen coords isolate the window
+    // actually under the cursor.
+    const inBounds = (pos: DragPos, screen: DragPos) => {
       const r = panelRef.current?.getBoundingClientRect();
-      return !!r && pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom;
+      if (!r) return false;
+      if (screen) {
+        const sx = window.screenX + r.left;
+        const sy = window.screenY + r.top;
+        return screen.x >= sx && screen.x <= sx + r.width && screen.y >= sy && screen.y <= sy + r.height;
+      }
+      if (!pos) return false;
+      return pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom;
     };
     const onNativeDrag = (e: Event) => {
-      const { phase, pos } = (e as CustomEvent<{ phase: string; pos: { x: number; y: number } | null }>).detail;
+      const { phase, pos, screen } = (e as CustomEvent<{ phase: string; pos: DragPos; screen?: DragPos }>).detail;
       if (phase === "enter" || phase === "over") {
-        setDragOver(inBounds(pos));
-      } else if (phase === "leave" || (phase === "drop" && !inBounds(pos))) {
+        setDragOver(inBounds(pos, screen ?? null));
+      } else if (phase === "leave" || (phase === "drop" && !inBounds(pos, screen ?? null))) {
         setDragOver(false);
         dragDepth.current = 0;
       }
     };
     const onNativeDrop = (e: Event) => {
-      const { pos, paths } = (e as CustomEvent<{ pos: { x: number; y: number } | null; paths?: string[] }>).detail;
+      const { pos, screen, paths } = (e as CustomEvent<{ pos: DragPos; screen?: DragPos; paths?: string[] }>).detail;
       setDragOver(false);
       dragDepth.current = 0;
-      if (!inBounds(pos)) return; // dropped on another panel — not ours
+      if (!inBounds(pos, screen ?? null)) return; // dropped on another window/panel — not ours
       for (const p of paths ?? []) addDroppedFile(p, p.split("/").pop() ?? p);
     };
     window.addEventListener("codifa:file-drag", onNativeDrag);

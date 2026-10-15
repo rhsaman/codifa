@@ -100,6 +100,7 @@ fn main() {
             commands::window_close,
             // drag & drop parity
             commands::get_path_for_file,
+            commands::cursor_position,
             // terminal
             pty::terminal_create,
             pty::terminal_list,

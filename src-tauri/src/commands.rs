@@ -694,6 +694,15 @@ pub fn copy_text(text: String) -> bool {
     }
 }
 
+/// Global cursor position in PHYSICAL screen pixels. macOS broadcasts the
+/// native drag event to every app window, so the window-relative payload
+/// position cannot identify the hovered window — panels hit-test against
+/// this global position instead (see main.tsx onDragDropEvent).
+#[tauri::command]
+pub fn cursor_position(app: tauri::AppHandle) -> Option<(f64, f64)> {
+    app.cursor_position().ok().map(|p| (p.x, p.y))
+}
+
 #[tauri::command]
 pub fn get_env(key: String) -> Option<String> {
     // Only a strict env-var name shape is accepted; the value is returned to

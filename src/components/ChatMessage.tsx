@@ -2157,6 +2157,11 @@ export const ChatMessageView = memo(
   // now appears only once real usage exists (same as the titlebar meter), so it
   // stays stable.
 
+  // Every system message is a context summary (compactChat is the only
+  // producer of role=system) — render ALL of them as the collapsed
+  // SummaryBlock, including older summaries marked compacted:true, which
+  // previously fell through to the prose branch and dumped the FULL
+  // summary text into the chat (the auto-compact "full text" bug).
   const isSummary = message.role === "system" && !message.modeSwitch;
   const isModeSwitch = message.modeSwitch === true;
 
@@ -2191,6 +2196,11 @@ export const ChatMessageView = memo(
   // runs in — the user doesn't want them rendered in the chat. Keep the message
   // in the data (the agent still receives it) but render nothing.
   if (isModeSwitch) return null;
+  // Folded messages (auto/manual compact) stay in the store for history but
+  // must NOT render their full text in the chat — the collapsed SummaryBlock
+  // represents them. Without this guard every folded turn kept dumping its
+  // whole content into the scrollback after a compact.
+  if (message.compacted) return null;
 
   // A steer confirmed by the backend (steer_applied) is rendered inline inside
   // the assistant message it interrupted — hide its own otherwise-bottom bubble.

@@ -403,9 +403,17 @@ fn finish_tool(
             end -= 1;
         }
         for_model.truncate(end);
-        for_model.push_str(
-            "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
-        );
+        // The main agent has no read tool, so "re-read a narrower window" would
+        // be a dead end for an explore report — point it at explore instead.
+        if name == "explore" || name == "task" {
+            for_model.push_str(
+                "\n… [report truncated for the model — ask explore again with a narrower question]",
+            );
+        } else {
+            for_model.push_str(
+                "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
+            );
+        }
     }
     messages.push(json!({
         "role": "tool",
@@ -962,6 +970,27 @@ fn is_file_search_command(cmd: &str) -> bool {
         })
 }
 
+/// Fold one sub-agent event into its report / error buffers. Text streamed
+/// BEFORE a search tool call is narration ("let me search…"), not the report:
+/// it is dropped when the tool starts, so only the answer written after the
+/// LAST search tool reaches the main agent (it used to receive every step's
+/// chatter, resent on each later step). Memory tools are exempt so a report
+/// written in the same step as save_memory survives.
+fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEvent) {
+    match ev {
+        AgentEvent::Text { content } => report.push_str(content),
+        // Capture the sub-agent's error so an empty report can say WHY it is
+        // empty (provider 400/401, tool failure, …).
+        AgentEvent::Error { content } => sub_error.push_str(content),
+        AgentEvent::ToolStart { name, .. }
+            if name.as_str() != "save_memory" && name.as_str() != "search_memory" =>
+        {
+            report.clear()
+        }
+        _ => {}
+    }
+}
+
 /// System prompt of the explore sub-agent: the research strategy plus a compact
 /// project layout, so it starts from REAL paths instead of guessing with glob
 /// (a traced run burned ~20 calls hunting for `backend/`), and explicit LSP
@@ -988,7 +1017,15 @@ that language and use grep + read.\n\
 5. Put independent calls in the SAME step (they run in parallel). Read only the \
 line ranges you need (offset/limit), never whole large files. Never repeat a \
 search with the same pattern.\n\n\
-Report: exact file paths, line numbers, symbol names and short code excerpts. \
+FINAL REPORT (your only text output — write nothing between tool calls): the \
+main agent has no read tool and edits files with exact-match strings, so precision \
+matters and padding costs it tokens on every later step. Format:\n\
+(a) ANSWER: 2-4 lines that directly answer the question.\n\
+(b) CODE: VERBATIM excerpts, each with path:start-end, ONLY for code it must edit \
+or rely on — copy the exact text, never paraphrase code.\n\
+(c) ALSO RELEVANT: other locations as `path:line — one line`.\n\
+Leave out the search trail, dead ends, irrelevant files and any restating of the \
+question. Aim for under ~6 KB.\n\
 You have NO write tools: never modify files. When you learn a durable key point \
 (decision, preference, gotcha), save it with save_memory — concise, under ~500 \
 chars, never whole files or outputs. Report in English.\n\n\
@@ -1040,13 +1077,7 @@ async fn run_subagent(
     let mut sub_error = String::new();
     let res = {
         let mut sink = |ev: &AgentEvent| {
-            match ev {
-                AgentEvent::Text { content } => report.push_str(content),
-                // Capture the sub-agent's error so an empty report can say WHY
-                // it is empty (provider 400/401, tool failure, …).
-                AgentEvent::Error { content } => sub_error.push_str(content),
-                _ => {}
-            }
+            fold_subagent_event(&mut report, &mut sub_error, ev);
             // Forward only structural sub-agent events (status/tool/usage/
             // thinking) to the parent stream so its tool calls stay visible
             // in the chat while explore works — the sub-agent's narration
@@ -1278,7 +1309,42 @@ mod tests {
         assert!(p.contains("FILES only") && p.contains("no matches"));
         // Still read-only and English-reporting.
         assert!(p.contains("NO write tools") && p.contains("Report in English"));
+        // Report contract: answer first, verbatim code only where it is needed.
+        assert!(p.contains("ANSWER") && p.contains("VERBATIM") && p.contains("nothing between tool calls"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_report_keeps_only_text_after_the_last_search_tool() {
+        let mut report = String::new();
+        let mut err = String::new();
+        let text = |s: &str| AgentEvent::Text { content: s.into() };
+        let tool = |n: &str| AgentEvent::ToolStart { id: "i".into(), name: n.into(), args: json!({}) };
+        fold_subagent_event(&mut report, &mut err, &text("Let me search..."));
+        fold_subagent_event(&mut report, &mut err, &tool("grep"));
+        fold_subagent_event(&mut report, &mut err, &text("Now reading..."));
+        fold_subagent_event(&mut report, &mut err, &tool("read"));
+        fold_subagent_event(&mut report, &mut err, &text("ANSWER: x"));
+        assert_eq!(report, "ANSWER: x");
+        // A report written in the same step as save_memory survives it.
+        fold_subagent_event(&mut report, &mut err, &tool("save_memory"));
+        fold_subagent_event(&mut report, &mut err, &text(" (saved)"));
+        assert_eq!(report, "ANSWER: x (saved)");
+        fold_subagent_event(&mut report, &mut err, &AgentEvent::Error { content: "boom".into() });
+        assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn explore_report_truncation_does_not_point_at_a_missing_read_tool() {
+        let mut messages: Vec<Value> = Vec::new();
+        let mut emit = |_: &AgentEvent| {};
+        let trace = crate::trace::TraceStore::new(String::new());
+        let big = "x".repeat(MODEL_RESULT_CAP + 100);
+        finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big.clone(), true, false);
+        let c = messages[0]["content"].as_str().unwrap();
+        assert!(c.contains("ask explore again") && !c.contains("offset/limit"));
+        finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big, true, true);
+        assert!(messages[1]["content"].as_str().unwrap().contains("offset/limit"));
     }
 
     #[test]

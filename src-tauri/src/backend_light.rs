@@ -639,6 +639,10 @@ fn add_cors_headers(res: &mut Response<Body>) {
     );
 }
 
+async fn health() -> Response<Body> {
+    Json(json!({"status": "ok", "version": "1.0.0"})).into_response()
+}
+
 /// Catch-all: every non-native path is proxied to the Python sidecar.
 async fn proxy_fallback(st: State<AppState>, req: Request<Body>) -> Response<Body> {
     let uri: &Uri = req.uri();
@@ -685,6 +689,7 @@ pub fn router(state: AppState) -> Router {
         .route("/schedule-runs/orphans", delete(crate::appstate::orphan_schedule_runs_clear))
         .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
         .route("/chats/title", post(crate::appstate::chat_title))
+        .route("/health", get(health))
         .fallback(proxy_fallback)
         // The default axum body cap is 2 MB — the compact request carries the
         // FULL chat history (tool outputs included) and /chat/stream carries

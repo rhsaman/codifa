@@ -36,6 +36,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
 walkdir = "2"
 tokio-stream = "0.1"
+# Scheduler loop: cron math needs civil-time date fields (UTC).
+chrono = "0.4"
 
 [profile.release]
 codegen-units = 1

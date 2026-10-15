@@ -8,6 +8,7 @@
 mod agent;
 mod trace;
 mod retention;
+mod scheduler;
 mod lsp;
 mod memory;
 mod backend_light;
@@ -116,6 +117,10 @@ fn main() {
             // at startup (background thread — never blocks boot).
             {
                 let root = state::get_data_root(app.handle());
+                // Native schedule due-check loop (migrated from the Python
+                // sidecar's _start_schedule_loop): polls every 30s, runs due
+                // tasks headless through the native agent, records runs.
+                scheduler::start_loop(root.clone());
                 std::thread::spawn(move || {
                     let summary = retention::run_startup_sweep(&root);
                     println!("[{summary}]");

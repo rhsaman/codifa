@@ -34,7 +34,7 @@ pub struct TraceStore {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn traces_dir() -> Option<PathBuf> {
+pub fn traces_dir() -> Option<PathBuf> {
     let root = match std::env::var("CODER_DATA_DIR") {
         Ok(r) if !r.is_empty() => PathBuf::from(r),
         // The app process itself may not have CODER_DATA_DIR set (it is

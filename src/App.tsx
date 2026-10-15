@@ -300,6 +300,13 @@ export default function App() {
           window.dispatchEvent(new CustomEvent('coder:toggle-live'))
           return
         }
+        // Ctrl+X then J toggles the bottom terminal panel (user request —
+        // alongside the existing Cmd/Ctrl+J direct chord).
+        if (k === 'j') {
+          e.preventDefault()
+          useStore.getState().toggleTerminalPanel()
+          return
+        }
         const sc = PREFIX_SHORTCUTS[k]
         if (sc) {
           e.preventDefault()

@@ -168,9 +168,9 @@ fn tool_schemas() -> Vec<Value> {
         ),
         (
             "save_memory",
-            "Persist a durable note about the project for future sessions.",
+            "Persist a durable note about the project for future sessions. Save ONLY key points: decisions, user preferences, gotchas, and facts worth remembering — never dump whole files, tool outputs or conversation text. Keep each note under ~500 chars.",
             json!({
-                "content": {"type": "string"},
+                "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
                 "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
             }),
         ),
@@ -739,6 +739,8 @@ Workspace root: {root}. Mode: {mode}. \
 You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
 Use write_file/edit_file/run_terminal to make changes. \
+When using save_memory, store ONLY concise key points (decisions, \
+preferences, gotchas) — never whole files or tool outputs. \
 Reply in the user's language. \
 Docstrings and comments in code must be English."
     )

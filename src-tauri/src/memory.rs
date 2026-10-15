@@ -105,7 +105,12 @@ pub fn add(content: &str, memory_type: &str, project_id: &str) -> Value {
         "long_term"
     };
     let content = if content.len() > MAX_CONTENT {
-        format!("{}\u{2026}", &content[..MAX_CONTENT])
+        // Cut on a UTF-8 char boundary — byte-slicing multi-byte text panics.
+        let mut end = MAX_CONTENT;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\u{2026}", &content[..end])
     } else {
         content.to_string()
     };
@@ -288,6 +293,21 @@ fn uuid() -> String {
         assert_eq!(rec["ok"], json!(true));
         let hits = search("rust", "/w", 15);
         assert_eq!(hits[0]["memory_type"], json!("long_term"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn add_truncates_on_char_boundary() {
+        let _env = DATA_DIR_LOCK.lock();
+        let dir = isolated("utf8");
+        // Multi-byte Persian text longer than MAX_CONTENT must not panic.
+        let long_fa = "مهاجرت به تائوری".repeat(400);
+        let rec = add(&long_fa, "long_term", "/w");
+        assert_eq!(rec["ok"], json!(true));
+        let hits = search("مهاجرت", "/w", 15);
+        assert_eq!(hits.len(), 1);
+        let stored = hits[0]["content"].as_str().unwrap();
+        assert!(stored.chars().count() <= MAX_CONTENT + 1);
         let _ = fs::remove_dir_all(dir);
     }
 

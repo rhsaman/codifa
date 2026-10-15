@@ -124,91 +124,143 @@ impl AgentEvent {
 /// delegates all research to the `explore` sub-agent and works only with the
 /// data the sub-agent returns (user request: main agent must not search).
 fn tool_schemas() -> Vec<Value> {
-    [
-        ("write_file", "Create or overwrite a file."),
-        ("edit_file", "Replace an exact string in an existing file."),
-        ("run_terminal", "Run a shell command in the workspace with a timeout."),
-        ("current_time", "Current UTC time."),
-        ("explore", "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question)."),
-        ("save_memory", "Persist a durable note about the project for future sessions."),
-    ]
-    .into_iter()
-    .map(|(name, desc)| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filePath": {"type": "string"},
-                        "path": {"type": "string"},
-                        "pattern": {"type": "string"},
-                        "patterns": {"type": "array", "items": {"type": "string"}},
-                        "include": {"type": "string"},
-                        "content": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean"},
-                        "edits": {"type": "array"},
-                        "command": {"type": "string"},
-                        "timeout": {"type": "integer"},
-                        "offset": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                        "max_results": {"type": "integer"},
-                        "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
-                        "prompt": {"type": "string", "description": "The full research question for the sub-agent"},
-                    },
+    // Per-tool schemas: the model only sees the args each tool actually
+    // accepts — a shared all-fields block made it emit empty filler
+    // (command:"", limit:0, filePath:""…) that garbled cards and traces.
+    let schemas: &[(&str, &str, Value)] = &[
+        (
+            "write_file",
+            "Create or overwrite a file.",
+            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+        ),
+        (
+            "edit_file",
+            "Replace an exact string in an existing file.",
+            json!({
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+                "edits": {"type": "array", "items": {"type": "object"}}
+            }),
+        ),
+        (
+            "run_terminal",
+            "Run a shell command in the workspace with a timeout.",
+            json!({"command": {"type": "string"}, "timeout": {"type": "integer"}}),
+        ),
+        ("current_time", "Current UTC time.", json!({})),
+        (
+            "explore",
+            "Delegate a search/research task to the explore sub-agent. It reads files, greps, globs and runs LSP lookups, then returns the FULL findings — you cannot search yourself, so ask it for everything you need. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
+            json!({
+                "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
+                "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
+            }),
+        ),
+        (
+            "save_memory",
+            "Persist a durable note about the project for future sessions.",
+            json!({
+                "content": {"type": "string"},
+                "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
+            }),
+        ),
+    ];
+    schemas
+        .iter()
+        .map(|(name, desc, props)| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": {"type": "object", "properties": props},
                 },
-            },
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 /// Tool schemas for the explore SUB-AGENT: the full read/search set the main
 /// agent no longer has (read/grep/glob/LSP) plus memory search.
 fn research_schemas() -> Vec<Value> {
-    [
-        ("read", "Read a file (optionally a window via offset/limit)."),
-        ("grep", "Regex content search under a path."),
-        ("glob", "Find files by glob pattern (path-scoped)."),
-        ("lsp_definition", "Jump to the definition of a symbol (LSP)."),
-        ("lsp_references", "Find references of a symbol (LSP)."),
-        ("lsp_hover", "Hover text/signature for a symbol (LSP)."),
-        ("lsp_symbols", "List definitions in one file (LSP)."),
-        ("lsp_diagnostics", "Diagnostics for one file (LSP)."),
-        ("search_memory", "Search previously saved project notes."),
-    ]
-    .into_iter()
-    .map(|(name, desc)| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filePath": {"type": "string"},
-                        "path": {"type": "string"},
-                        "pattern": {"type": "string"},
-                        "patterns": {"type": "array", "items": {"type": "string"}},
-                        "include": {"type": "string"},
-                        "offset": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                        "max_results": {"type": "integer"},
-                        "query": {"type": "string"},
-                        "symbol": {"type": "string"},
-                        "character": {"type": "integer"},
-                        "line": {"type": "integer"},
-                    },
+    // Per-tool schemas (see tool_schemas): only the args each tool accepts.
+    let schemas: &[(&str, &str, Value)] = &[
+        (
+            "read",
+            "Read a file (optionally a window via offset/limit).",
+            json!({
+                "filePath": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"}
+            }),
+        ),
+        (
+            "grep",
+            "Regex content search under a path.",
+            json!({
+                "pattern": {"type": "string"},
+                "patterns": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string"},
+                "include": {"type": "string"},
+                "max_results": {"type": "integer"}
+            }),
+        ),
+        (
+            "glob",
+            "Find files by glob pattern (path-scoped).",
+            json!({
+                "pattern": {"type": "string"},
+                "patterns": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string"},
+                "max_results": {"type": "integer"}
+            }),
+        ),
+        (
+            "lsp_definition",
+            "Jump to the definition of a symbol (LSP).",
+            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+        ),
+        (
+            "lsp_references",
+            "Find references of a symbol (LSP).",
+            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+        ),
+        (
+            "lsp_hover",
+            "Hover text/signature for a symbol (LSP).",
+            json!({"filePath": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "symbol": {"type": "string"}}),
+        ),
+        (
+            "lsp_symbols",
+            "List definitions in one file (LSP).",
+            json!({"filePath": {"type": "string"}, "query": {"type": "string"}}),
+        ),
+        (
+            "lsp_diagnostics",
+            "Diagnostics for one file (LSP).",
+            json!({"filePath": {"type": "string"}}),
+        ),
+        (
+            "search_memory",
+            "Search previously saved project notes.",
+            json!({"query": {"type": "string"}}),
+        ),
+    ];
+    schemas
+        .iter()
+        .map(|(name, desc, props)| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": {"type": "object", "properties": props},
                 },
-            },
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

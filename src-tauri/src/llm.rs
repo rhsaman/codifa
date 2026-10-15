@@ -391,8 +391,26 @@ async fn stream_with_key(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| (0u16, e.to_string()))?;
+    // Idle timeout: a stalled provider stream (no bytes for this long) must
+    // abort the turn with a clear error instead of hanging it forever (the
+    // user saw "waiting for model (59s)" stretch into minutes).
+    const IDLE_TIMEOUT_SECS: u64 = 90;
+    loop {
+        let chunk = match tokio::time::timeout(
+            std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await
+        {
+            Ok(Some(chunk)) => chunk.map_err(|e| (0u16, e.to_string()))?,
+            Ok(None) => break,
+            Err(_) => {
+                return Err((
+                    0u16,
+                    format!("provider stream stalled (no data for {IDLE_TIMEOUT_SECS}s)"),
+                ))
+            }
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
         // SSE frames are separated by a blank line.
         while let Some(pos) = buf.find("\n\n") {

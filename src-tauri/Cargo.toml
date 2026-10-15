@@ -30,7 +30,7 @@ percent-encoding = "2"
 libc = "0.2"
 # Phase 2: native HTTP router (light endpoints) + proxy to the Python sidecar
 axum = { version = "0.7", features = ["http1"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Phase 3-2: native agent tools (read/grep/glob/write/edit/terminal)
 regex = "1"

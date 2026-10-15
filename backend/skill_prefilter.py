@@ -18,7 +18,9 @@ routing degrades to the unfiltered behavior instead of breaking the turn.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,43 @@ def skill_text(skill: dict) -> str:
     if slug and parts[0] and slug.casefold() != parts[0].casefold():
         parts.append(slug)
     return " ".join(p for p in parts if p).strip()[:_SKILL_TEXT_MAX_CHARS]
+
+
+# Cache of skill passage vectors keyed by the store's content hash. Skill
+# texts are static between edits, so re-embedding the whole store on every
+# turn (which wakes the ~1.1 GB ONNX session each time) is pure waste: only
+# the query is embedded per turn; the store matrix is rebuilt only when the
+# skill set actually changes.
+_VECTOR_CACHE: dict[str, list[list[float]]] = {}
+_VECTOR_CACHE_LOCK = threading.Lock()
+_VECTOR_CACHE_MAX = 4
+
+
+def _store_hash(rows: list[dict]) -> str:
+    """Stable hash of the skill texts the matrix is built from."""
+    h = hashlib.sha256()
+    for s in rows:
+        h.update(skill_text(s).encode("utf-8", "ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _cached_vectors(rows: list[dict]) -> list[list[float]] | None:
+    """Embedding matrix for the skill store, cached by content hash."""
+    from embeddings import embed_passages
+
+    key = _store_hash(rows)
+    with _VECTOR_CACHE_LOCK:
+        hit = _VECTOR_CACHE.get(key)
+        if hit is not None:
+            return hit
+    vectors = embed_passages([skill_text(s) for s in rows])
+    with _VECTOR_CACHE_LOCK:
+        # Tiny LRU: keep only the most recent stores (multi-workspace safe).
+        _VECTOR_CACHE[key] = vectors
+        while len(_VECTOR_CACHE) > _VECTOR_CACHE_MAX:
+            _VECTOR_CACHE.pop(next(iter(_VECTOR_CACHE)))
+    return vectors
 
 
 def _top_indices(
@@ -93,14 +132,14 @@ def prefilter_skills(
     if not rows or not text or limit <= 0:
         return list(rows)
     try:
-        from embeddings import embed_passages, embed_queries, is_available
+        from embeddings import embed_queries, is_available
 
         if not is_available():
             return list(rows)
         queries = embed_queries([text[:1500]])
         if not queries:
             return list(rows)
-        vectors = embed_passages([skill_text(s) for s in rows])
+        vectors = _cached_vectors(rows)
         if len(vectors) != len(rows):
             return list(rows)
         picks = _top_indices(queries[0], vectors, limit)

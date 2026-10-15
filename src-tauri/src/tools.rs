@@ -290,6 +290,24 @@ fn collect_files(scope: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Locate the rg binary. The packaged macOS app inherits a minimal PATH
+/// (no /opt/homebrew/bin), so probe the common install locations before
+/// giving up — the agent's grep tool depends on ripgrep.
+fn rg_binary() -> String {
+    const CANDIDATES: &[&str] = &["rg", "/opt/homebrew/bin/rg", "/usr/local/bin/rg"];
+    for c in CANDIDATES {
+        if std::process::Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return (*c).to_string();
+        }
+    }
+    "rg".to_string()
+}
+
 /// Grep file contents via the ripgrep binary (rg) — parallel search,
 /// .gitignore-aware, far faster than the in-process walker below.
 /// No fallback (per user request): rg must be on PATH; a missing binary
@@ -322,7 +340,7 @@ pub fn grep_scope(
     };
 
     let cap = max_results.min(MAX_SEARCH_RESULTS);
-    let mut cmd = std::process::Command::new("rg");
+    let mut cmd = std::process::Command::new(rg_binary());
     cmd.current_dir(&scope_abs)
         .arg("--json")
         .arg("--line-number")

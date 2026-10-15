@@ -562,9 +562,15 @@ Report in English.",
                 AgentEvent::Error { content } => sub_error.push_str(content),
                 _ => {}
             }
-            // Forward sub-agent events to the parent stream so its tool
-            // calls are visible in the chat while explore works.
-            emit(ev);
+            // Forward only structural sub-agent events (status/tool/usage/
+            // thinking) to the parent stream so its tool calls stay visible
+            // in the chat while explore works — the sub-agent's narration
+            // (Text) and errors must never surface in the user's chat: the
+            // report goes to the PARENT agent as the tool result only.
+            match ev {
+                AgentEvent::Text { .. } | AgentEvent::Error { .. } => {}
+                _ => emit(ev),
+            }
         };
         run_turn(&sub_req, &mut sink, cancel).await
     };

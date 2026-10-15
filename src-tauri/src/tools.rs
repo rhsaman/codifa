@@ -396,7 +396,10 @@ pub fn grep_scope(
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            let abs = scope_abs.join(&path);
+            // Join against search_dir (the scope's PARENT when the scope is a
+            // single file) — joining against scope_abs itself doubled the
+            // path (file/filename), producing unopenable chips.
+            let abs = search_dir.join(&path);
             let abs = abs.components().collect::<std::path::PathBuf>();
             current_file = abs
                 .strip_prefix(&root_real)

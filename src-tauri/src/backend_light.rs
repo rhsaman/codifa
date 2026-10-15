@@ -431,12 +431,11 @@ async fn chat_stream_native(body: Value) -> Response<Body> {
     });
     tokio::spawn(async move {
         let tx_err = tx.clone();
-        let cancel_flag = std::sync::Arc::clone(&cancel);
         let mut emit = move |ev: &agent::AgentEvent| {
             let line = format!("data: {}\n\n", ev.to_json());
             let _ = tx.send(Ok(axum::body::Bytes::from(line)));
         };
-        if let Err(e) = agent::run_turn(&req, &mut emit, &cancel_flag).await {
+        if let Err(e) = agent::run_turn(&req, &mut emit, &cancel).await {
             let payload = serde_json::json!({"kind": "error", "content": e});
             let _ = tx_err.send(Ok(axum::body::Bytes::from(format!(
                 "data: {payload}\n\n"

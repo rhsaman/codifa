@@ -34,7 +34,7 @@ const MAX_SUBAGENT_DEPTH: usize = 1;
 // Request / events
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentRequest {
     pub provider: String,
     // Part of the public request contract; consumed in phase 3-3.
@@ -404,7 +404,7 @@ fn finish_tool(
 pub async fn run_turn(
     req: &AgentRequest,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &CancelFlag,
 ) -> Result<(), String> {
     let _turn = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
     let root = req.root.clone();
@@ -502,7 +502,7 @@ pub async fn run_turn(
                 });
             }
         };
-        let acc = match stream_chat(&client, &cfg, &messages, Some(&schemas), &mut sink).await
+        let acc = match stream_chat(&client, &cfg, &messages, Some(&schemas), &mut sink, Some(cancel)).await
         {
             Ok(acc) => acc,
             Err((_, e)) => {
@@ -648,7 +648,62 @@ pub async fn run_turn(
                 );
             }
         }
-        for (id, name, raw_args) in &sequential {
+        // Explore sub-agents in one step run CONCURRENTLY (tokio::spawn +
+        // join): the model often fires several research questions at once and
+        // each takes seconds — sequential execution multiplies the wall time.
+        // Mutating tools stay sequential (ordering + cancel semantics).
+        let mut explore_batch: Vec<(String, String, Value)> = Vec::new();
+        let mut rest: Vec<(String, String, String)> = Vec::new();
+        for call in sequential {
+            if call.1 == "explore" || call.1 == "task" {
+                let args: Value =
+                    serde_json::from_str(&call.2).unwrap_or_else(|_| json!({}));
+                emit(&AgentEvent::Status {
+                    stage: "tool".into(),
+                    content: call.1.clone(),
+                });
+                emit(&AgentEvent::ToolStart {
+                    id: call.0.clone(),
+                    name: call.1.clone(),
+                    args: args.clone(),
+                });
+                explore_batch.push((call.0, call.1, args));
+            } else {
+                rest.push(call);
+            }
+        }
+        if !explore_batch.is_empty() {
+            // Concurrent explores polled in THIS task via join_all — no
+            // tokio::spawn, so no Send bound and the turn still blocks until
+            // every report is back (explore stays synchronous by design).
+            let futures: Vec<_> = explore_batch
+                .iter()
+                .map(|(_id, _name, args)| {
+                    let req_c = req.clone();
+                    let args_c = args.clone();
+                    let cancel_c = std::sync::Arc::clone(cancel);
+                    Box::pin(async move {
+                        let mut sink = |_ev: &AgentEvent| {};
+                        run_subagent(&req_c, &args_c, &mut sink, &cancel_c).await
+                    })
+                })
+                .collect();
+            let results = futures_util::future::join_all(futures).await;
+            for ((id, name, args), (result, ok)) in explore_batch.into_iter().zip(results) {
+                finish_tool(
+                    &mut messages,
+                    emit,
+                    &trace,
+                    &id,
+                    &name,
+                    &args,
+                    result,
+                    ok,
+                    req.mode == "subagent",
+                );
+            }
+        }
+        for (id, name, raw_args) in &rest {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 emit(&AgentEvent::Done { aborted: true });
                 return Ok(());
@@ -666,17 +721,9 @@ pub async fn run_turn(
                 name: name.clone(),
                 args: args.clone(),
             });
-            let (result, ok) = if name == "explore" || name == "task" {
-                if req.mode == "subagent" {
-                    ("sub-agents cannot spawn further sub-agents".into(), false)
-                } else {
-                    Box::pin(run_subagent(req, &args, emit, cancel)).await
-                }
-            } else {
-                match tools::dispatch(&root, name, &args, None) {
-                    Ok(r) => (r, true),
-                    Err(e) => (e, false),
-                }
+            let (result, ok) = match tools::dispatch(&root, name, &args, None) {
+                Ok(r) => (r, true),
+                Err(e) => (e, false),
             };
             finish_tool(
                 &mut messages,
@@ -844,11 +891,15 @@ fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
     messages.extend(tail);
 }
 
+/// Shared cancel flag for spawned sub-agent tasks: flipping the parent's
+/// flag (Stop button) aborts every concurrent explore too.
+type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &CancelFlag,
 ) -> (String, bool) {
     let description = args["description"].as_str().unwrap_or_default().to_string();
     let prompt = args["prompt"].as_str().unwrap_or_default().to_string();

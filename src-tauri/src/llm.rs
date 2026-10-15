@@ -306,13 +306,14 @@ pub async fn stream_chat(
     messages: &[Value],
     tools: Option<&[Value]>,
     on_delta: DeltaSink<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamAcc, (u16, String)> {
     if cfg.api_keys.is_empty() {
         return Err((0, "no api key configured".into()));
     }
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match stream_with_key(client, cfg, key, messages, tools, on_delta).await {
+        match stream_with_key(client, cfg, key, messages, tools, on_delta, cancel).await {
             Ok(acc) => return Ok(acc),
             Err((status, body)) if is_key_error(status, &body) => {
                 last_err = format!("key rejected ({status}): {body}");
@@ -331,6 +332,7 @@ async fn stream_with_key(
     messages: &[Value],
     tools: Option<&[Value]>,
     on_delta: DeltaSink<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StreamAcc, (u16, String)> {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
     let (url, header_name, header_value) = match cfg.provider.as_str() {
@@ -428,6 +430,14 @@ async fn stream_with_key(
     // user saw "waiting for model (59s)" stretch into minutes).
     const IDLE_TIMEOUT_SECS: u64 = 90;
     loop {
+        // Stop button: the cancel flag is checked on every chunk read, so a
+        // running stream (including one inside an explore sub-agent) aborts
+        // immediately instead of finishing the whole model call first.
+        if let Some(c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err((0u16, "aborted by user".into()));
+            }
+        }
         let chunk = match tokio::time::timeout(
             std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
             stream.next(),

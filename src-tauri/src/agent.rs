@@ -589,10 +589,16 @@ fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
     }
     // Keep the system prompt (index 0) and the last few messages verbatim;
     // summarize the middle into one user message.
-    let keep_tail = 4.min(messages.len().saturating_sub(1));
+    let mut start = messages.len() - 4.min(messages.len().saturating_sub(1));
+    // Never orphan a tool message: if the tail would START with a `tool`
+    // reply whose assistant tool_calls got compacted away, extend the tail
+    // back until it starts with a non-tool message (providers reject orphans).
+    while start > 1 && messages[start]["role"].as_str() == Some("tool") {
+        start -= 1;
+    }
     let head = messages[0].clone();
-    let mid: Vec<Value> = messages[1..messages.len() - keep_tail].to_vec();
-    let tail: Vec<Value> = messages[messages.len() - keep_tail..].to_vec();
+    let mid: Vec<Value> = messages[1..start].to_vec();
+    let tail: Vec<Value> = messages[start..].to_vec();
     let mut summary = String::from("[Earlier research compacted] Key findings so far:\n");
     for m in &mid {
         let c = m["content"].as_str().unwrap_or_default();
@@ -791,6 +797,39 @@ mod tests {
         assert_eq!(ts["kind"], "tool");
         assert_eq!(ts["tool"], "explore");
         assert_eq!(ts["id"], "call1");
+    }
+
+    #[test]
+    fn compact_subagent_never_orphans_tool_messages() {
+        // If the tail boundary lands on a `tool` message whose assistant
+        // tool_calls were compacted away, providers reject the orphan with
+        // a 400. The tail must extend back to keep the pair together.
+        let mut messages = vec![json!({ "role": "system", "content": "sys" })];
+        for _ in 0..40 {
+            messages.push(json!({
+                "role": "user",
+                "content": "متن فارسی طولانی برای عبور از بودجه ی اتوکامپکت ".repeat(30),
+            }));
+        }
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{ "id": "c1", "type": "function" }],
+        }));
+        messages.push(json!({ "role": "tool", "tool_call_id": "c1", "content": "نتیجه ابزار" }));
+        messages.push(json!({ "role": "user", "content": "ادامه بده" }));
+        messages.push(json!({ "role": "assistant", "content": "پاسخ" }));
+        messages.push(json!({ "role": "user", "content": "یکی دیگر" }));
+        compact_subagent_messages(&mut messages, 4096);
+        // Every tool message must be preceded by its assistant tool_calls.
+        for (i, m) in messages.iter().enumerate().skip(1) {
+            if m["role"] == "tool" {
+                assert!(
+                    messages[i - 1]["tool_calls"].is_array(),
+                    "orphan tool message at index {i}"
+                );
+            }
+        }
     }
 
     #[test]

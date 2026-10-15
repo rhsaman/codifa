@@ -487,9 +487,47 @@ pub async fn run_turn(
     } else {
         req.system_prompt.clone()
     };
-    // Skills: the user's @mentions plus the in-code auto-match are inlined as
-    // full bodies (mirror of graph.py's SKILLS section). No picks = no tokens.
-    let skill_section = crate::skill_router::build_section(&root, &req.prompt, &req.skills);
+    // Skills: the user's @mentions plus the auto-match are inlined as full
+    // bodies (mirror of graph.py's SKILLS section). No picks = no tokens.
+    // The "decision" Tool Models slot, when set, picks the skills with a model
+    // call; otherwise the deterministic in-code matcher runs (no extra call).
+    let client = http_client();
+    let decision_cfg = req.subagent_models.get("decision").and_then(|slot| {
+        if slot.trim().is_empty() {
+            return None;
+        }
+        let (model, base_url, api_keys) = crate::backend_light::resolve_slot_target(
+            slot,
+            &req.model,
+            &req.base_url,
+            &cfg.api_keys,
+            &req.providers,
+        );
+        Some(LlmConfig {
+            // `provider` is the KIND (openrouter/anthropic/google/custom…):
+            // endpoint_and_auth switches on it to pick the URL path + auth
+            // header. Using the user-configured provider_id here sent every
+            // anthropic/google decision call to the OpenAI-compatible path.
+            provider: crate::backend_light::resolve_slot_kind(
+                slot,
+                &req.provider,
+                &req.providers,
+            ),
+            model,
+            base_url,
+            api_keys,
+            temperature: Some(0.0),
+            max_tokens: Some(32),
+            timeout_secs: 30,
+        })
+    });
+    let skill_section = crate::skill_router::build_section_async(
+        &root,
+        &req.prompt,
+        &req.skills,
+        decision_cfg.as_ref().map(|c| (&client, c)),
+    )
+    .await;
     if !skill_section.text.is_empty() {
         system.push_str(&skill_section.text);
     }
@@ -533,9 +571,7 @@ pub async fn run_turn(
     emit(&AgentEvent::Status {
         stage: "thinking".into(),
         content: "Contacting model".into(),
-    });
-
-    // Trace: the full system prompt of this turn (prompt row, like Python).
+    });    // Trace: the full system prompt of this turn (prompt row, like Python).
     trace.record(crate::trace::TraceEntry {
         kind: "prompt".into(),
         summary: format!("prompt · {} chars", system.len()),

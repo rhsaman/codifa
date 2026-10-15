@@ -618,8 +618,24 @@ pub async fn chat_title(
         &body.api_keys,
         &body.providers,
     );
+    // The kind selects the URL path + auth header. `provider` carries it; a
+    // legacy caller that only sent the configured id falls back to that.
+    let parent_kind = if body.provider.trim().is_empty() {
+        body.provider_id.as_str()
+    } else {
+        body.provider.as_str()
+    };
     let cfg = crate::llm::LlmConfig {
-        provider: if body.provider_id.is_empty() { body.provider.clone() } else { body.provider_id.clone() },
+        // `provider` is the KIND (openrouter/anthropic/google/custom…):
+        // endpoint_and_auth + normalize_base switch on it to pick the URL path
+        // and auth header. Filling it with the user-configured provider_id made
+        // every anthropic/google title call hit the OpenAI-compatible path
+        // (`{base}/chat/completions`) and fail.
+        provider: crate::backend_light::resolve_slot_kind(
+            &slot,
+            parent_kind,
+            &body.providers,
+        ),
         model,
         base_url,
         api_keys,

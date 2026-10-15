@@ -295,6 +295,37 @@ pub fn resolve_slot_target(
     }
 }
 
+/// The provider KIND a Tool Models slot entry routes to.
+///
+/// `resolve_slot_target` returns the model/base/keys but not the kind, and the
+/// kind is what selects the URL path + auth header (anthropic `/v1/messages`
+/// vs the OpenAI-compatible `/chat/completions`). A cross-provider slot — an
+/// anthropic decision/title model while the chat runs on openrouter — must not
+/// inherit the parent's kind, or every call hits the wrong endpoint.
+/// Falls back to the parent kind for a bare model or an unknown provider id.
+pub fn resolve_slot_kind(
+    entry: &str,
+    parent_kind: &str,
+    providers: &std::collections::HashMap<String, Value>,
+) -> String {
+    let entry = entry.trim();
+    let Some((provider_id, _)) = entry.split_once('/') else {
+        return parent_kind.to_string();
+    };
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return parent_kind.to_string();
+    }
+    providers
+        .get(provider_id)
+        .and_then(|cfg| cfg.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or(parent_kind)
+        .to_string()
+}
+
 /// Normalize the raw provider usage object to the frontend's CompactUsage
 /// shape. Providers use different key families (OpenAI: prompt_tokens /
 /// completion_tokens, Anthropic: input_tokens / output_tokens, Gemini:
@@ -704,6 +735,27 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn slot_kind_follows_the_slot_provider_not_the_parent() {
+        // A cross-provider slot (an anthropic decision/title model while the
+        // chat runs on openrouter) must resolve to the SLOT's kind: the kind
+        // selects the URL path + auth header, so inheriting the parent's kind
+        // sent every call to the wrong endpoint and the slot silently failed.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "p2".to_string(),
+            serde_json::json!({"kind": "anthropic", "baseUrl": "http://a/v1"}),
+        );
+        assert_eq!(resolve_slot_kind("p2/claude-x", "openrouter", &providers), "anthropic");
+        // Bare model, unknown provider id and an empty slot keep the parent.
+        assert_eq!(resolve_slot_kind("claude-x", "openrouter", &providers), "openrouter");
+        assert_eq!(resolve_slot_kind("ghost/m", "openrouter", &providers), "openrouter");
+        assert_eq!(resolve_slot_kind("", "openrouter", &providers), "openrouter");
+        // A provider entry without a kind also keeps the parent.
+        providers.insert("p3".to_string(), serde_json::json!({"baseUrl": "http://b/v1"}));
+        assert_eq!(resolve_slot_kind("p3/m", "openrouter", &providers), "openrouter");
+    }
 
     #[tokio::test]
     async fn git_status_serves_natively_and_fallback_proxies() {

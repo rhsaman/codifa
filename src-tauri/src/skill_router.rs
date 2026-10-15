@@ -7,8 +7,10 @@
 //! model prompt: anything else is loaded on demand via the `load_skill` tool,
 //! so a turn with no picks adds zero tokens.
 
+use reqwest::Client;
 use serde_json::Value;
 
+use crate::llm::LlmConfig;
 use crate::skills;
 
 /// Skills auto-matched per turn (0 disables auto-match).
@@ -184,9 +186,141 @@ pub struct SkillSection {
     pub missing: Vec<String>,
 }
 
-/// Assemble the SKILLS section: auto-matched bodies first, then the skills the
-/// user explicitly attached. `manual_names` are the `@mention` picks.
+/// Catalog handed to the decision model: one `name: description` line per
+/// skill, capped so a huge store cannot flood the router prompt.
+const DECISION_CATALOG_MAX_CHARS: usize = 6_000;
+/// Skills the decision model may pick per turn.
+const DECISION_MAX: usize = 2;
+
+fn decision_catalog(all: &[Value]) -> String {
+    let mut out = String::new();
+    for s in all {
+        let name = s["name"].as_str().unwrap_or_default().trim();
+        if name.is_empty() {
+            continue;
+        }
+        let desc = s["description"].as_str().unwrap_or_default().trim();
+        let line = if desc.is_empty() {
+            format!("- {name}\n")
+        } else {
+            format!("- {name}: {desc}\n")
+        };
+        if out.len() + line.len() > DECISION_CATALOG_MAX_CHARS {
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// Map the decision model's answer back to real skill names. Accepts a
+/// comma/newline separated list (optionally quoted or JSON-array shaped);
+/// unknown entries and explicit "none" answers are dropped.
+pub fn parse_decision(answer: &str, all: &[Value]) -> Vec<String> {
+    let cleaned = answer
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']' || c == '"' || c == '`');
+    let mut out: Vec<String> = Vec::new();
+    for raw in cleaned.split([',', '\n', ';']) {
+        let want = raw
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '-')
+            .trim()
+            .to_lowercase();
+        if want.is_empty() || want == "none" || want == "no" || want == "هیچ" {
+            continue;
+        }
+        let hit = all.iter().find(|s| {
+            let name = s["name"].as_str().unwrap_or_default().trim().to_lowercase();
+            let slug = s["slug"].as_str().unwrap_or_default().trim().to_lowercase();
+            name == want || slug == want
+        });
+        if let Some(s) = hit {
+            let name = s["name"].as_str().unwrap_or_default().to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        if out.len() >= DECISION_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// Ask the decision model which skills apply to this request. Err on any
+/// transport/provider failure so the caller can fall back to the in-code
+/// matcher instead of losing the turn's skills.
+pub async fn decide_with_model(
+    client: &Client,
+    cfg: &LlmConfig,
+    prompt: &str,
+    all: &[Value],
+) -> Result<Vec<String>, String> {
+    let catalog = decision_catalog(all);
+    if catalog.is_empty() {
+        return Ok(Vec::new());
+    }
+    let system = "You pick which skills apply to a coding request. Reply with the \
+                  exact skill names, comma-separated, best first, at most 2. \
+                  Reply NONE when no skill applies. No other text.";
+    let user = format!(
+        "Request:\n{}\n\nSkills:\n{catalog}",
+        prompt.chars().take(AUTO_SCAN_CHARS).collect::<String>()
+    );
+    let res = crate::llm::complete(client, cfg, system, &user).await?;
+    Ok(parse_decision(&res.text, all))
+}
+
+/// Load the skill store for a workspace root.
+fn load_skills(root: &str) -> Vec<Value> {
+    skills::list_skills(std::path::Path::new(root))["skills"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Deterministic in-code routing (no model call). Test-only: the turn always
+/// goes through `build_section_async`, which falls back to this matcher when
+/// no decision slot is configured or the model call fails.
+#[cfg(test)]
 pub fn build_section(root: &str, prompt: &str, manual_names: &[String]) -> SkillSection {
+    let all = load_skills(root);
+    let auto_names = if prompt.trim().is_empty() {
+        Vec::new()
+    } else {
+        auto_match(prompt, &all)
+    };
+    assemble(&all, auto_names, manual_names)
+}
+
+/// Model-backed routing: the "decision" Tool Models slot picks the skills.
+/// Falls back to the in-code matcher when the model call fails, so a broken
+/// router never costs the turn its skills.
+pub async fn build_section_async(
+    root: &str,
+    prompt: &str,
+    manual_names: &[String],
+    decision: Option<(&Client, &LlmConfig)>,
+) -> SkillSection {
+    let all = load_skills(root);
+    let auto_names = if prompt.trim().is_empty() {
+        Vec::new()
+    } else {
+        match decision {
+            Some((client, cfg)) => match decide_with_model(client, cfg, prompt, &all).await {
+                Ok(picked) => picked,
+                Err(_) => auto_match(prompt, &all),
+            },
+            None => auto_match(prompt, &all),
+        }
+    };
+    assemble(&all, auto_names, manual_names)
+}
+
+/// Assemble the SKILLS section from a resolved auto-match list: auto-matched
+/// bodies first, then the skills the user explicitly attached.
+fn assemble(all: &[Value], auto_names: Vec<String>, manual_names: &[String]) -> SkillSection {
     let mut manual: Vec<String> = Vec::new();
     for n in manual_names {
         let n = n.trim().to_lowercase();
@@ -194,15 +328,6 @@ pub fn build_section(root: &str, prompt: &str, manual_names: &[String]) -> Skill
             manual.push(n);
         }
     }
-    let all: Vec<Value> = skills::list_skills(std::path::Path::new(root))["skills"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let auto_names = if prompt.trim().is_empty() {
-        Vec::new()
-    } else {
-        auto_match(prompt, &all)
-    };
     // A skill the user attached is never also reported as auto-matched.
     let auto: Vec<Value> = auto_names
         .iter()
@@ -321,6 +446,29 @@ mod tests {
         assert_eq!(picks.len(), AUTO_MAX);
         // Ties keep store order.
         assert_eq!(picks, vec!["Alpha".to_string(), "Beta".to_string()]);
+    }
+
+    #[test]
+    fn parse_decision_maps_names_and_drops_noise() {
+        let all = vec![
+            skill("Movie Finder", "find movies", &[]),
+            skill("Git Commit", "commit messages", &[]),
+        ];
+        // Comma list, quoted, JSON-array shaped and slug forms all resolve.
+        assert_eq!(parse_decision("Movie Finder, Git Commit", &all), vec!["Movie Finder", "Git Commit"]);
+        assert_eq!(parse_decision("[\"movie-finder\"]", &all), vec!["Movie Finder"]);
+        // An explicit "none" and unknown names pick nothing.
+        assert!(parse_decision("NONE", &all).is_empty());
+        assert!(parse_decision("Ghost Skill", &all).is_empty());
+        // The pick count is capped.
+        assert_eq!(parse_decision("Movie Finder\nGit Commit", &all).len(), DECISION_MAX);
+    }
+
+    #[test]
+    fn decision_catalog_lists_names_and_descriptions() {
+        let all = vec![skill("Movie Finder", "find movies", &[])];
+        let catalog = decision_catalog(&all);
+        assert!(catalog.contains("Movie Finder: find movies"), "{catalog}");
     }
 
     #[test]

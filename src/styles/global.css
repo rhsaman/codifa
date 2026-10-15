@@ -12145,6 +12145,29 @@ body.coder-dragging .chat-split-child {
   font-size: 10px;
 }
 
+/* Sub-agent pill (explore/task): carries the short description of what that
+   run is looking for, so several PARALLEL explores stay distinguishable in
+   the group header instead of merging into one "Explore ×2" count. */
+.trace-pill-sub {
+  max-width: 260px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.trace-pill-sub.running {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.trace-pill-desc {
+  font-family: inherit;
+  font-weight: 400;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 190px;
+}
+
 /* Detail / args text: fills remaining space after the label, on the same
    line — e.g. "Edit File" + "ChatMessage.tsx". Slightly muted so the eye
    still lands on the label first, but no longer clipped to half the row: a

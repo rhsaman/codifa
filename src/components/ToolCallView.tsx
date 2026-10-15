@@ -1388,7 +1388,20 @@ export const ToolGroupView = memo(function ToolGroupView({
   // "Search Files", so counting by raw tool name produced TWO identical
   // "Search Files" pills side by side (one with ×N, one without) instead of
   // a single merged "Search Files ×N".
+  // Sub-agent cards (explore/task) are NOT counted into the label pills:
+  // each one gets its own pill carrying the short description of what it is
+  // looking for, so two parallel explores are distinguishable at a glance
+  // instead of collapsing into a single "Explore ×2".
+  const subagentPills = activities
+    .filter(({ activity }) => isSubagentCard(activity))
+    .map(({ activity, index }) => ({
+      key: index,
+      label: TOOL_LABEL[activity.tool] ?? activity.tool,
+      desc: shortArg(String(activity.args?.description ?? ""), 70),
+      running: activity.status === "running",
+    }));
   const toolCounts = activities.reduce<Record<string, number>>((acc, a) => {
+    if (isSubagentCard(a.activity)) return acc;
     const label = TOOL_LABEL[a.activity.tool] ?? a.activity.tool;
     acc[label] = (acc[label] || 0) + 1;
     return acc;
@@ -1423,6 +1436,16 @@ export const ToolGroupView = memo(function ToolGroupView({
             <span key={label} className="trace-pill">
               {label}
               {n > 1 && <span className="trace-pill-count">×{n}</span>}
+            </span>
+          ))}
+          {subagentPills.map(({ key, label, desc, running }) => (
+            <span
+              key={`sub-${key}`}
+              className={`trace-pill trace-pill-sub${running ? " running" : ""}`}
+              title={desc || label}
+            >
+              {label}
+              {desc && <span className="trace-pill-desc">{desc}</span>}
             </span>
           ))}
         </span>

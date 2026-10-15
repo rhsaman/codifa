@@ -41,14 +41,22 @@ if (tauri) {
           )
         }
         // Two levels of hit-test: the Rust-resolved target label tells apart
-        // separate OS windows; the window-relative cursor (logical CSS px)
-        // tells apart chat PANELS that share one OS window (the app's
-        // multi-chat layout) — each panel compares pos with its own bounds.
+        // separate OS windows; the window-relative cursor tells apart chat
+        // PANELS that share one OS window (the app's multi-chat layout).
+        // Tauri v2 emits the drag position in LOGICAL CSS px on macOS —
+        // dividing by devicePixelRatio halved the coordinates and mapped a
+        // drop on the lower chat panel onto the upper one (confirmed twice
+        // in live testing). Only normalize when the point falls outside the
+        // viewport, which indicates a platform reporting physical px.
+        const rawPos =
+          p.type === 'enter' || p.type === 'over' || p.type === 'drop'
+            ? { x: p.position.x, y: p.position.y }
+            : null
         const dpr = window.devicePixelRatio || 1
         const pos =
-          p.type === 'enter' || p.type === 'over' || p.type === 'drop'
-            ? { x: p.position.x / dpr, y: p.position.y / dpr }
-            : null
+          rawPos && (rawPos.x > window.innerWidth || rawPos.y > window.innerHeight)
+            ? { x: rawPos.x / dpr, y: rawPos.y / dpr }
+            : rawPos
         void invoke<string | null>('window_under_cursor')
           .catch(() => null)
           .then((target) => {

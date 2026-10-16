@@ -153,6 +153,7 @@ pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, St
     }
     let content = fs::read_to_string(abs)
         .map_err(|_| format!("binary file (read skipped): {}", abs.display()))?;
+    let total = content.lines().count();
     let start = offset.saturating_sub(1);
     let mut out = String::new();
     for line in content.lines().skip(start).take(limit) {
@@ -163,6 +164,19 @@ pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, St
             out.push_str(line);
         }
         out.push('\n');
+    }
+    if out.is_empty() {
+        // An empty window is never data: say WHY it is empty, otherwise the
+        // caller burns another round guessing (a traced run read offset=100000
+        // of a short file and got a silent blank).
+        return Ok(if total == 0 {
+            format!("{} is empty (0 lines)", abs.display())
+        } else {
+            format!(
+                "offset {offset} is past the end of {} ({total} lines) — read offset=1",
+                abs.display()
+            )
+        });
     }
     Ok(out)
 }
@@ -178,13 +192,21 @@ fn list_dir(abs: &Path, offset: usize, limit: usize) -> Result<String, String> {
         })
         .collect();
     entries.sort();
+    let total = entries.len();
     let start = offset.saturating_sub(1);
-    Ok(entries
-        .into_iter()
-        .skip(start)
-        .take(limit)
-        .collect::<Vec<_>>()
-        .join("\n"))
+    let page: Vec<String> = entries.into_iter().skip(start).take(limit).collect();
+    if page.is_empty() {
+        // Same rule as read_window: an empty listing must explain itself.
+        return Ok(if total == 0 {
+            format!("{} is empty (no entries)", abs.display())
+        } else {
+            format!(
+                "offset {offset} is past the end of {} ({total} entries) — read offset=1",
+                abs.display()
+            )
+        });
+    }
+    Ok(page.join("\n"))
 }
 
 /// Parse `ranges` entries ("path:offset:limit", "start:end", "[start,end]")
@@ -805,7 +827,8 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             // a whole-tree scan disguised as a grep. Refuse them outright.
             if matches!(joined.trim(), "." | ".*" | ".+" | "^" | "$" | "^$") {
                 return Err(format!(
-                    "catch-all pattern {joined:?} refused — grep a real token instead"
+                    "catch-all pattern {joined:?} refused — grep a real token instead \
+(to read a file use read with offset/limit)"
                 ));
             }
             if count_grep_alternatives(&joined) > MAX_GREP_ALTERNATIVES
@@ -1322,6 +1345,24 @@ mod tests {
         assert!(out.contains("a.rs:1-102") && out.contains("more lines — read a.rs offset=41"), "{out}");
         assert!(!out.contains("v90"), "{out}");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_window_past_the_end_explains_itself() {
+        // A silent blank window made a traced run read offset=100000 of a short
+        // file and burn a round guessing why it got nothing.
+        let dir = std::env::temp_dir().join(format!("codifa-readwin-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let short = dir.join("short.txt");
+        fs::write(&short, "a\nb\nc\n").unwrap();
+        let out = read_window(&short, 100000, 400).unwrap();
+        assert!(out.contains("past the end") && out.contains("3 lines"), "{out}");
+        let empty = dir.join("empty.txt");
+        fs::write(&empty, "").unwrap();
+        assert!(read_window(&empty, 1, 400).unwrap().contains("is empty"));
+        // A directory listing past the end explains itself the same way.
+        assert!(list_dir(&dir, 999, 10).unwrap().contains("past the end"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

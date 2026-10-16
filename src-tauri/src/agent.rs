@@ -248,7 +248,7 @@ fn tool_schemas() -> Vec<Value> {
         ),
         (
             "explore",
-            "Delegate ONE research question to the explore sub-agent (it reads files, greps, globs, runs LSP lookups and returns the FULL findings — you cannot search yourself). IMPORTANT: when a task spans several independent areas, call explore SEVERAL TIMES IN THE SAME STEP — parallel calls run CONCURRENTLY and cost one round-trip, while one giant explore is slow and returns a shallow report. Prefer 2-4 focused explores (one per area/file group) over a single broad one. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
+            "Delegate research to the explore sub-agent (it reads files, greps, globs, runs LSP lookups and returns the FULL findings — you cannot search yourself). ALWAYS split the work: call explore SEVERAL TIMES IN THE SAME STEP, one focused question per area/file group — parallel calls run CONCURRENTLY and cost ONE round-trip, while a single broad explore is the slowest and shallowest option. Prefer 2-4 focused explores over one giant one; only a genuinely single-area question justifies a single call. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
             json!({
                 "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
@@ -640,6 +640,11 @@ pub async fn run_turn(
     } else {
         MAX_STEPS
     };
+    // Lookups already executed in THIS turn. A repeat of the same read window
+    // or grep is pure waste — the payload is already in the context above —
+    // and the explore prompt forbids it, yet a traced run re-read three files
+    // in round 3 that round 1 had returned and repeated a refused grep.
+    let mut seen_lookups: std::collections::HashSet<String> = std::collections::HashSet::new();
     for step in 0..max_steps {
         // Client disconnect (Stop button closes the SSE stream) flips the
         // cancel flag — bail out instead of burning provider tokens.
@@ -764,6 +769,7 @@ pub async fn run_turn(
         };
         let mut batch: Vec<(String, String, Value)> = Vec::new();
         let mut sequential: Vec<(String, String, String)> = Vec::new();
+        let mut repeats: Vec<(String, String, Value)> = Vec::new();
         for (id, name, raw_args) in &tool_calls {
             if is_readonly(name) {
                 let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
@@ -776,7 +782,15 @@ pub async fn run_turn(
                     name: name.clone(),
                     args: args.clone(),
                 });
-                batch.push((id.clone(), name.clone(), args));
+                // A repeat of an identical lookup answers with a pointer
+                // instead of the payload again (see `seen_lookups`).
+                let key = lookup_key(name, &args);
+                let is_repeat = key.is_some_and(|k| !seen_lookups.insert(k));
+                if is_repeat {
+                    repeats.push((id.clone(), name.clone(), args));
+                } else {
+                    batch.push((id.clone(), name.clone(), args));
+                }
             } else {
                 sequential.push((id.clone(), name.clone(), raw_args.clone()));
             }
@@ -813,6 +827,21 @@ pub async fn run_turn(
                     req.mode == "subagent",
                 );
             }
+        }
+        for (id, name, args) in repeats {
+            finish_tool(
+                &mut messages,
+                emit,
+                &trace,
+                &id,
+                &name,
+                &args,
+                "already returned above — this exact lookup is in your context; \
+use what it showed, read a DIFFERENT window, or move on"
+                    .into(),
+                true,
+                req.mode == "subagent",
+            );
         }
         // Explore sub-agents in one step run CONCURRENTLY (tokio::spawn +
         // join): the model often fires several research questions at once and
@@ -951,10 +980,10 @@ pub async fn run_turn(
             );
         }
 
-        // Explore only: a step with a single call is a wasted model round trip
-        // when more lookups were foreseeable. The hint rides on that call's
-        // own result, so it costs no extra request and never cuts a report.
-        if let Some(hint) = single_call_hint(&req.mode, tool_calls.len()) {
+        // A step with a single call is a wasted model round trip when more
+        // lookups were foreseeable. The hint rides on that call's own result,
+        // so it costs no extra request and never cuts a report.
+        if let Some(hint) = single_call_hint(&req.mode, &tool_calls) {
             if let Some(last) = messages.last_mut() {
                 if last["role"].as_str() == Some("tool") {
                     if let Some(c) = last["content"].as_str() {
@@ -1158,12 +1187,64 @@ fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEv
     }
 }
 
-/// Batching reminder appended to the result of an explore step that issued a
-/// single tool call. Read-only calls of one step run in parallel, so every
-/// extra step costs seconds (one model round trip) for no extra information.
-fn single_call_hint(mode: &str, calls_in_step: usize) -> Option<&'static str> {
-    (mode == "subagent" && calls_in_step == 1).then_some(
-        "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
+/// Identity of a repeatable read-only lookup: a read window (file + offset +
+/// limit) or a grep (pattern + scope). Two calls with the same key return the
+/// same payload, so the second one is answered with a pointer instead of the
+/// body — the content is already in the context above.
+fn lookup_key(name: &str, args: &Value) -> Option<String> {
+    let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
+    match name {
+        "read" => {
+            let file = s("filePath");
+            if file.is_empty() {
+                return None;
+            }
+            let offset = args["offset"].as_u64().unwrap_or(1);
+            let limit = args["limit"].as_u64().unwrap_or(400);
+            Some(format!("read|{file}|{offset}|{limit}"))
+        }
+        "grep" => {
+            // The model sends either `pattern` or a `patterns` array.
+            let mut pattern = s("pattern");
+            if pattern.is_empty() {
+                if let Some(list) = args["patterns"].as_array() {
+                    pattern = list
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}");
+                }
+            }
+            if pattern.is_empty() {
+                return None;
+            }
+            Some(format!("grep|{pattern}|{}|{}", s("path"), s("include")))
+        }
+        _ => None,
+    }
+}
+
+/// Batching reminder appended to the result of a step that issued a single
+/// tool call. Read-only calls of one step run in parallel, so every extra step
+/// costs seconds (one model round trip) for no extra information.
+///
+/// Two audiences, because the waste differs:
+/// - the explore sub-agent: one lookup per step burns rounds;
+/// - the MAIN agent: one broad explore is slow and comes back shallow, while
+///   the same step could have carried several focused explores concurrently
+///   (a traced turn fired a single wide explore and got a 4-round report).
+fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'static str> {
+    if calls.len() != 1 {
+        return None;
+    }
+    if mode == "subagent" {
+        return Some(
+            "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
+        );
+    }
+    let name = calls[0].1.as_str();
+    (name == "explore" || name == "task").then_some(
+        "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
     )
 }
 
@@ -1181,6 +1262,14 @@ is the number of ROUNDS (steps), not the number of calls: issue every call you c
 already foresee together in ONE step (they run in parallel) — a grep per \
 identifier/keyword variant, lsp_symbols for likely files, reads of files the \
 question names — then act on all the results at once. Aim for 2-3 rounds.\n\n\
+HARD RULE: never issue a step with a single call while you still have a \
+question whose answer could change what you do next. If you catch yourself \
+about to send one call, add the other calls you already know you need (the \
+next file's window, the second keyword, the symbol lookup) to the SAME step. \
+A one-call step is only correct when it is genuinely the last thing you need \
+before the report. Never read a file you have not located, and never guess an \
+offset: read offset=1, or the window a result pointed you at — an offset past \
+the end returns nothing and wastes a whole round.\n\
 How to search — never blindly. First decide what the question gives you, enter at \
 the matching step below, and move from the cheapest PRECISE tool to the next:\n\
 1. Paths and directories come from PROJECT LAYOUT (below), never from guessing. \
@@ -1329,7 +1418,8 @@ You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
 When a task spans several independent areas, fire SEVERAL `explore` calls \
 IN THE SAME STEP (they run concurrently, one round-trip) — one focused \
-explore per area/file group, never a single broad one. \
+explore per area/file group. A single broad explore is the slowest, \
+shallowest option; only a genuinely single-area question justifies one call. \
 NEVER use run_terminal to find or inspect files (find/grep/rg/ls) — file \
 discovery goes through `explore` only; run_terminal is for builds, tests \
 and git. \
@@ -1531,6 +1621,9 @@ mod tests {
         assert!(p.contains("lsp_definition") && p.contains("lsp_references") && p.contains("lsp_symbols"));
         // find_symbol is the one-call replacement for the grep -> lsp chain.
         assert!(p.contains("find_symbol"), "{p}");
+        // The single-call rule and the offset rule are what stop the 4-round
+        // serial runs seen in a real trace.
+        assert!(p.contains("HARD RULE") && p.contains("never guess an"), "{p}");
         assert!(p.contains("FILES only") && p.contains("no matches"));
         // Still read-only and English-reporting.
         assert!(p.contains("NO write tools") && p.contains("Report in English"));
@@ -1562,11 +1655,53 @@ mod tests {
     }
 
     #[test]
-    fn single_call_steps_of_explore_get_a_batching_hint() {
-        assert!(single_call_hint("subagent", 1).unwrap().contains("NEXT step"));
-        // Batched steps and the main agent's steps are left alone.
-        assert!(single_call_hint("subagent", 3).is_none());
-        assert!(single_call_hint("agent", 1).is_none());
+    fn repeated_lookups_are_detected_but_distinct_windows_are_not() {
+        // Same file + same window (an omitted offset/limit means the default
+        // window) is a repeat: the body is already in the context.
+        let a = json!({"filePath": "src/a.ts", "offset": 1, "limit": 400});
+        let b = json!({"filePath": "src/a.ts"});
+        assert_eq!(lookup_key("read", &a), lookup_key("read", &b));
+        // A different window of the same file is a real read.
+        let c = json!({"filePath": "src/a.ts", "offset": 401, "limit": 400});
+        assert_ne!(lookup_key("read", &a), lookup_key("read", &c));
+        // Grep keys carry the scope, so the same pattern in another directory
+        // is a different lookup.
+        let g1 = json!({"pattern": "foo", "path": "src"});
+        let g2 = json!({"pattern": "foo", "path": "backend"});
+        assert_ne!(lookup_key("grep", &g1), lookup_key("grep", &g2));
+        assert_eq!(
+            lookup_key("grep", &g1),
+            lookup_key("grep", &json!({"pattern": "foo", "path": "src"}))
+        );
+        // The `patterns` array form keys the same way as a single pattern.
+        assert_eq!(
+            lookup_key("grep", &json!({"patterns": ["a", "b"]})),
+            lookup_key("grep", &json!({"patterns": ["a", "b"]}))
+        );
+        // Shapes without a target are never deduped (nothing to compare).
+        assert!(lookup_key("read", &json!({"path": "src"})).is_none());
+        assert!(lookup_key("grep", &json!({"path": "src"})).is_none());
+        assert!(lookup_key("glob", &json!({"pattern": "**/*.ts"})).is_none());
+    }
+
+    #[test]
+    fn single_call_steps_get_a_batching_hint() {
+        let one = |name: &str| vec![("c1".to_string(), name.to_string(), "{}".to_string())];
+        // The explore sub-agent: one lookup per step burns rounds.
+        assert!(single_call_hint("subagent", &one("grep"))
+            .unwrap()
+            .contains("NEXT step"));
+        // The main agent: a single broad explore wastes the concurrent fan-out
+        // (a traced turn fired one wide explore and got a 4-round report).
+        let main = single_call_hint("agent", &one("explore")).unwrap();
+        assert!(main.contains("CONCURRENTLY") && main.contains("2-4 focused explores"), "{main}");
+        // Batched steps are left alone, and so is a single non-explore call.
+        let two = vec![
+            ("a".to_string(), "grep".to_string(), "{}".to_string()),
+            ("b".to_string(), "read".to_string(), "{}".to_string()),
+        ];
+        assert!(single_call_hint("subagent", &two).is_none());
+        assert!(single_call_hint("agent", &one("run_terminal")).is_none());
     }
 
     #[test]

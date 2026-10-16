@@ -698,13 +698,17 @@ pub async fn run_turn(
             .as_ref()
             .map(|c| crate::skill_router::SkillRouter::Model(&client, c))
     };
+    // The skill store lives in the DATA root, not the workspace. A caller that
+    // omits `data_root` (e.g. a scheduled run) must still find the store, so
+    // fall back to the native data root rather than the workspace — reading the
+    // workspace found no skills at all, which silently disabled auto-loading.
+    let skill_root = if req.data_root.is_empty() {
+        native_data_root()
+    } else {
+        req.data_root.clone()
+    };
     let skill_section = crate::skill_router::build_section_async(
-        // The skill store lives in the DATA root, not the workspace.
-        if req.data_root.is_empty() {
-            &root
-        } else {
-            &req.data_root
-        },
+        &skill_root,
         &req.prompt,
         &req.skills,
         decision_router,

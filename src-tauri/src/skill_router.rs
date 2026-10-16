@@ -7,7 +7,9 @@
 //! model prompt: anything else is loaded on demand via the `load_skill` tool,
 //! so a turn with no picks adds zero tokens.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use reqwest::Client;
 use serde_json::Value;
@@ -257,11 +259,13 @@ pub async fn decide_with_model(
     client: &Client,
     cfg: &LlmConfig,
     prompt: &str,
+    rows: &[Value],
     all: &[Value],
 ) -> Result<Vec<String>, String> {
-    // Rank first: the catalog is capped, so an unfiltered store would hand the
-    // model an alphabetical head instead of the relevant slice.
-    let catalog = decision_catalog(&prefilter(prompt, all));
+    // The caller already ranked the store; the catalog is capped, so an
+    // unfiltered store would hand the model an alphabetical head instead of
+    // the relevant slice.
+    let catalog = decision_catalog(rows);
     if catalog.is_empty() {
         return Ok(Vec::new());
     }
@@ -360,6 +364,85 @@ pub fn prefilter(prompt: &str, rows: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Cached passage vectors for skill texts, keyed by the exact text embedded.
+///
+/// Skills change rarely, so caching turns the per-turn cost into a single query
+/// embed; a changed skill text simply misses and is embedded again.
+static SKILL_VECTORS: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
+
+/// Passage vectors for `texts`, embedding only the ones not cached yet.
+fn embed_skill_texts(texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    let cache = SKILL_VECTORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+    let mut missing: Vec<(usize, String)> = Vec::new();
+    {
+        let guard = cache.lock().ok()?;
+        for (i, t) in texts.iter().enumerate() {
+            match guard.get(t) {
+                Some(v) => out.push(Some(v.clone())),
+                None => {
+                    out.push(None);
+                    missing.push((i, t.clone()));
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        let batch: Vec<String> = missing.iter().map(|(_, t)| t.clone()).collect();
+        let vecs = crate::embeddings::embed_passages(&batch).ok()?;
+        let mut guard = cache.lock().ok()?;
+        for ((i, t), v) in missing.into_iter().zip(vecs) {
+            guard.insert(t, v.clone());
+            out[i] = Some(v);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Rank `rows` by `scores` (higher first), keeping store order on ties.
+fn rank_by_scores(rows: &[Value], scores: &[f32]) -> Vec<Value> {
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    idx.sort_by(|a, b| scores[*b].partial_cmp(&scores[*a]).unwrap_or(Ordering::Equal));
+    idx.into_iter()
+        .take(PREFILTER_LIMIT)
+        .map(|i| rows[i].clone())
+        .collect()
+}
+
+/// Top-`PREFILTER_LIMIT` skills for the request, ranked by embedding similarity.
+///
+/// The decision router only ever sees a slice of the store, and a lexical ranker
+/// cannot bridge a Persian request and English skill metadata: it ranked the
+/// design skills below unrelated ones, so Laya was offered the wrong candidates
+/// and picked them. Embedding the request against each skill's text (the same e5
+/// model the index uses) ranks by meaning instead. Falls back to the lexical
+/// ranker when the embedding model is unavailable, so routing never breaks.
+pub async fn prefilter_async(prompt: &str, rows: &[Value]) -> Vec<Value> {
+    let text = prompt.trim();
+    if rows.is_empty() || text.is_empty() {
+        return rows.to_vec();
+    }
+    let query: String = text.chars().take(PREFILTER_QUERY_CHARS).collect();
+    let texts: Vec<String> = rows.iter().map(skill_text).collect();
+    let ranked = tokio::task::spawn_blocking(move || {
+        let q = crate::embeddings::embed_queries(&[query]).ok()?;
+        let docs = embed_skill_texts(&texts)?;
+        let qv = q.first()?;
+        Some(
+            docs.iter()
+                .map(|d| crate::embeddings::cosine(qv, d))
+                .collect::<Vec<f32>>(),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+    match ranked {
+        Some(scores) => rank_by_scores(rows, &scores),
+        None => prefilter(prompt, rows),
+    }
+}
+
 /// Deterministic in-code routing (no model call). Test-only: the turn always
 /// goes through `build_section_async`, which falls back to this matcher when
 /// no decision slot is configured or the model call fails.
@@ -385,34 +468,19 @@ pub enum SkillRouter<'a> {
     Laya,
 }
 
-/// Route with the on-device Laya classifier through the sidecar.
+/// Route with the on-device Laya classifier, in-process.
 ///
 /// Any failure returns Err so the caller falls back to the in-code matcher.
-async fn decide_with_laya(prompt: &str, all: &[Value]) -> Result<Vec<String>, String> {
-    let base = crate::sidecar::current_url().ok_or("sidecar not ready")?;
-    // The native agent owns candidate ranking; the sidecar only executes the
-    // Laya checkpoint (a torch/transformers model with no Rust runtime).
-    let body = serde_json::json!({ "prompt": prompt, "rows": prefilter(prompt, all) });
-    let res = crate::llm::http_client()
-        .post(format!("{}/skills/route", base.trim_end_matches('/')))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+async fn decide_with_laya(prompt: &str, rows: &[Value]) -> Result<Vec<String>, String> {
+    // The native agent owns candidate ranking; Laya only classifies the
+    // prefiltered slice. Loading the graph takes seconds and inference is
+    // CPU-bound, so it runs on a blocking thread instead of stalling the
+    // async runtime that is also driving the turn.
+    let prompt = prompt.to_string();
+    let rows = rows.to_vec();
+    tokio::task::spawn_blocking(move || crate::laya::predict(&prompt, &rows))
         .await
-        .map_err(|e| format!("laya route: {e}"))?;
-    let v: Value = res.json().await.map_err(|e| format!("laya route: {e}"))?;
-    if let Some(err) = v["error"].as_str() {
-        return Err(err.to_string());
-    }
-    // `null` means Laya is unavailable (not downloaded / load failure).
-    let Some(arr) = v["skills"].as_array() else {
-        return Err("laya unavailable".to_string());
-    };
-    Ok(arr
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect())
+        .map_err(|e| format!("laya task failed: {e}"))?
 }
 
 /// Model-backed routing: the "decision" Tool Models slot picks the skills.
@@ -428,14 +496,16 @@ pub async fn build_section_async(
     let auto_names = if prompt.trim().is_empty() {
         Vec::new()
     } else {
+        // Rank once, then let the configured router choose from that slice.
+        let rows = prefilter_async(prompt, &all).await;
         match decision {
             Some(SkillRouter::Model(client, cfg)) => {
-                match decide_with_model(client, cfg, prompt, &all).await {
+                match decide_with_model(client, cfg, prompt, &rows, &all).await {
                     Ok(picked) => picked,
                     Err(_) => auto_match(prompt, &all),
                 }
             }
-            Some(SkillRouter::Laya) => match decide_with_laya(prompt, &all).await {
+            Some(SkillRouter::Laya) => match decide_with_laya(prompt, &rows).await {
                 Ok(picked) => picked,
                 Err(_) => auto_match(prompt, &all),
             },
@@ -560,6 +630,27 @@ mod tests {
         // Pasted logs past the scan cap are not scanned.
         let long = format!("summarize {}", "x".repeat(AUTO_SCAN_CHARS + 10));
         assert!(auto_match(&long, &all).is_empty());
+    }
+
+    #[test]
+    fn rank_by_scores_orders_descending_and_caps_the_slice() {
+        let rows: Vec<Value> = (0..PREFILTER_LIMIT + 5)
+            .map(|i| skill(&format!("S{i}"), "text", &[]))
+            .collect();
+        // The last row is the best match; the ranking must surface it first.
+        let mut scores = vec![0.1f32; rows.len()];
+        scores[rows.len() - 1] = 0.9;
+        let ranked = rank_by_scores(&rows, &scores);
+        assert_eq!(ranked.len(), PREFILTER_LIMIT);
+        assert_eq!(ranked[0]["name"], format!("S{}", rows.len() - 1));
+    }
+
+    #[tokio::test]
+    async fn prefilter_async_short_circuits_without_work() {
+        // No rows or no request text must not touch the embedding model.
+        let all = vec![skill("Git Workflow", "branching", &[])];
+        assert_eq!(prefilter_async("", &all).await.len(), 1);
+        assert!(prefilter_async("anything", &[]).await.is_empty());
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn spawn_evictor() {
 /// ONNX Runtime environment, created once and shared by every session.
 static ENV: OnceLock<Environment> = OnceLock::new();
 
-fn ort_env() -> Result<&'static Environment, String> {
+pub fn ort_env() -> Result<&'static Environment, String> {
     if let Some(env) = ENV.get() {
         return Ok(env);
     }
@@ -103,7 +103,7 @@ fn slot() -> &'static Mutex<Option<Result<Embedder, String>>> {
 }
 
 /// The user-level data root, mirroring the sidecar's `CODER_DATA_DIR` default.
-fn data_root() -> PathBuf {
+pub fn data_root() -> PathBuf {
     std::env::var("CODER_DATA_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())

@@ -353,15 +353,24 @@ async fn embedding_status() -> Response<Body> {
     Json(crate::embeddings::status()).into_response()
 }
 
+/// GET /models/decision-status — is the Laya decision router present?
+///
+/// Reports presence without loading the graph: the int8 model is a few hundred
+/// MB, and a status check must not pull that into RAM.
+async fn decision_status() -> Response<Body> {
+    Json(crate::laya::status()).into_response()
+}
+
 /// POST /models/unload — free every cached local model.
 ///
-/// The embedding session is native, so it is dropped here; Whisper, the local
-/// TTS weights and the Laya classifier still live in the Python sidecar, so the
-/// request is forwarded there and the two reports are merged. Best-effort
-/// throughout: a sidecar that is down must not fail the endpoint.
+/// The embedding session and the Laya decision graph are native, so both are
+/// dropped here; Whisper and the local TTS weights still live in the Python
+/// sidecar, so the request is forwarded there and the two reports are merged.
+/// Best-effort throughout: a sidecar that is down must not fail the endpoint.
 async fn models_unload(State(st): State<AppState>) -> Response<Body> {
     crate::embeddings::unload();
-    let mut freed = json!({ "embedding": true });
+    let laya = crate::laya::unload();
+    let mut freed = json!({ "embedding": true, "laya": laya });
     if let Some(base) = sidecar_base().await {
         if let Ok(res) = st.http.post(format!("{base}/models/unload")).send().await {
             if let Ok(body) = res.json::<Value>().await {
@@ -1122,6 +1131,7 @@ pub fn router(state: AppState) -> Router {
         // RAG memory + index, native (the sidecar's /index/* and /memory/*
         // and the embedding half of /models/* are gone).
         .route("/models/embedding-status", get(embedding_status))
+        .route("/models/decision-status", get(decision_status))
         .route("/models/unload", post(models_unload))
         .route("/index/status", get(index_status))
         .route("/index/run", post(index_run))

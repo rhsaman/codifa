@@ -744,10 +744,10 @@ async def models_status() -> dict:
 async def models_unload() -> dict:
     """Drop the Python-owned local weights, freeing idle RAM.
 
-    The embedding ONNX session is native now — the Rust router unloads it
-    itself and merges the result — so this endpoint only covers the models
-    the sidecar still owns: Whisper (1.5-3 GB), the local TTS weights and
-    the Laya decision weights. Safe anytime; next use reloads lazily.
+    The embedding ONNX session and the Laya decision graph are native now —
+    the Rust router unloads them itself and merges the result — so this
+    endpoint only covers the models the sidecar still owns: Whisper (1.5-3 GB)
+    and the local TTS weights. Safe anytime; next use reloads lazily.
     """
     freed: dict[str, bool] = {}
     try:
@@ -761,13 +761,6 @@ async def models_unload() -> dict:
         freed["tts"] = bool(_unload_tts()) if callable(_unload_tts) else False
     except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
         freed["tts"] = False
-    try:
-        import laya_router as _laya
-
-        _unload_laya = getattr(_laya, "unload", None)
-        freed["laya"] = bool(_unload_laya()) if callable(_unload_laya) else False
-    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
-        freed["laya"] = False
     return {"ok": True, "freed": freed}
 
 
@@ -2142,48 +2135,6 @@ def _start_parent_watchdog() -> None:
             os._exit(0)  # graceful path hung: hard exit
 
     threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
-
-
-class SkillRouteRequest(BaseModel):
-    """Request text plus the prefiltered skill candidates to route over."""
-
-    prompt: str = ""
-    rows: list[dict] = []
-    chat_id: str = ""
-
-
-class SkillRouteResponse(BaseModel):
-    """Routed skill names; ``skills`` is null when Laya is unavailable."""
-
-    skills: list[str] | None = None
-    error: str = ""
-
-
-@app.post("/skills/route")
-async def skills_route(req: SkillRouteRequest) -> SkillRouteResponse:
-    """Route a request to skills with the on-device Laya classifier.
-
-    The native Rust agent owns the turn loop AND candidate ranking (it hands
-    over an already-ranked slice), but Laya is a torch/transformers checkpoint
-    with no Rust runtime, so the agent asks this endpoint instead of dropping
-    back to the keyword matcher (which silently ignored the user's
-    Decision-model choice). ``skills: null`` means routing is unavailable (not
-    downloaded / load failure) so the caller inlines nothing.
-    """
-    try:
-        import laya_router
-    except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
-        return SkillRouteResponse(error=f"laya unavailable: {exc}")
-    rows = [r for r in (req.rows or []) if str(r.get("name") or "").strip()]
-    if not rows:
-        return SkillRouteResponse(skills=[])
-    try:
-        picks = laya_router.predict(req.prompt, rows, req.chat_id)
-    except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
-        return SkillRouteResponse(error=f"laya route failed: {exc}")
-    if picks is None:
-        return SkillRouteResponse(error="laya unavailable")
-    return SkillRouteResponse(skills=[str(n) for n in picks])
 
 
 @app.get("/health")

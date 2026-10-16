@@ -19,6 +19,7 @@ mod commands;
 mod compact;
 mod embeddings;
 mod indexer;
+mod laya;
 mod vector_store;
 mod websearch;
 mod git;

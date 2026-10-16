@@ -146,12 +146,12 @@ def test_unload_whisper_manual_drops_cache(monkeypatch):
 
 
 def test_models_unload_frees_python_owned_weights(monkeypatch):
-    """POST /models/unload drops the sidecar-owned whisper, TTS and Laya weights.
+    """POST /models/unload drops the sidecar-owned whisper and TTS weights.
 
-    The embedding session is native now (the Rust router drops it and merges
-    the report), so this endpoint only covers what Python still owns.
+    The embedding session and the Laya decision graph are native now (the Rust
+    router drops them and merges the report), so this endpoint only covers what
+    Python still owns.
     """
-    import laya_router
     import local_tts
 
     monkeypatch.setattr(server, "_whisper_model", object())
@@ -159,15 +159,12 @@ def test_models_unload_frees_python_owned_weights(monkeypatch):
     monkeypatch.setattr(local_tts, "_POCKET_MODEL", object())
     monkeypatch.setattr(local_tts, "_G2P_MODEL", None)
     monkeypatch.setattr(local_tts, "_tts_evict_timer", None)
-    monkeypatch.setattr(laya_router, "_agent", object())
-    monkeypatch.setattr(laya_router, "_agent_dir", "/laya")
-    monkeypatch.setattr(laya_router, "_laya_evict_timer", None)
     client = TestClient(server.app)
     resp = client.post("/models/unload")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    assert body["freed"] == {"whisper": True, "tts": True, "laya": True}
+    assert body["freed"] == {"whisper": True, "tts": True}
     assert server._whisper_model is None
 
 

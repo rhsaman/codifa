@@ -73,6 +73,32 @@ fn history_recap(m: &Value) -> String {
             if !status.is_empty() {
                 line.push_str(&format!(" [{status}]"));
             }
+            // The RESULT matters as much as the call. Listing only the tool
+            // name tells the model a grep ran but not what it found, so it
+            // re-runs the same search on the next turn — the reported
+            // "it keeps searching again" loop. `summary` is the frontend's
+            // one-line result digest; `results[].content` carries the payload
+            // for tools that keep one.
+            if let Some(sum) = a.get("summary").and_then(Value::as_str) {
+                if !sum.trim().is_empty() {
+                    line.push_str(&format!(
+                        " → {}",
+                        sum.chars().take(300).collect::<String>()
+                    ));
+                }
+            }
+            if let Some(results) = a.get("results").and_then(Value::as_array) {
+                for r in results.iter().take(2) {
+                    if let Some(c) = r.get("content").and_then(Value::as_str) {
+                        if !c.trim().is_empty() {
+                            line.push_str(&format!(
+                                "\n    {}",
+                                c.chars().take(400).collect::<String>()
+                            ));
+                        }
+                    }
+                }
+            }
             lines.push(line);
         }
         if !lines.is_empty() {
@@ -1656,6 +1682,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn history_recap_carries_tool_results_not_just_calls() {
+        // A recap that lists only tool names tells the model a grep ran but
+        // not what it found, so it re-runs the same search next turn. The
+        // result digest must survive into the recap.
+        let m = json!({
+            "role": "assistant",
+            "content": "done",
+            "toolActivity": [
+                {"tool": "grep", "args": {"pattern": "foo"}, "status": "done",
+                 "summary": "3 hits in 2 files"},
+                {"tool": "read", "status": "running"}
+            ]
+        });
+        let recap = history_recap(&m);
+        assert!(recap.contains("grep"), "{recap}");
+        assert!(recap.contains("3 hits in 2 files"), "{recap}");
+        // A still-running call is not reported as completed work.
+        // (Match the list item, not the bare word: "already" contains "read".)
+        assert!(!recap.contains("- read"), "{recap}");
     }
 
     #[test]

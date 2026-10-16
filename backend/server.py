@@ -682,13 +682,6 @@ async def credits(req: Annotated[ModelsRequest, Query()]) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-# تست مدل (POST /models/test): کل پرامپت کوچک باید در MODEL_TEST_TIMEOUT ثانیه
-# جواب بدهد؛ سقف کلاینت HTTP عمداً کوچک‌تر از آن است تا خطای خودِ پرووایدر
-# زودتر (و با پیام خودش) به UI برسد و سقف بیرونی فقط ترمز دستی باشد.
-MODEL_TEST_TIMEOUT = 15  # ثانیه — بودجه کل تست
-MODEL_TEST_CLIENT_TIMEOUT = 12  # ثانیه — سقف کلاینت (کوچک‌تر از بودجه کل)
-
-
 class ModelTestBatchRequest(ModelsRequest):
     """POST /models/test-batch — probe many models in one round trip.
 

@@ -198,7 +198,6 @@ from pydantic import BaseModel, model_validator
 import providers
 
 
-
 # Sidecar's own listening port, set in main(). Used to build the loopback
 # redirect_uri for Google OAuth (the consent page lands back on this process).
 _SIDECAR_PORT = 0

@@ -49,30 +49,21 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# `tauri dev` runs a DEBUG build. Full debuginfo on our own crate is what made
-# dev eat gigabytes of RAM: every generic instantiation keeps its DWARF, and
-# unoptimized code allocates far more temporaries than the release build (which
-# is why the packaged app felt fine). Line tables are enough for a backtrace,
-# and opt-level 1 removes the worst of the unoptimized temporaries while keeping
-# incremental rebuilds fast.
+# `tauri dev` runs a DEBUG build, and that build is what made the machine
+# stutter: with ~10 crates compiling in parallel, rustc alone peaked at ~1.4 GB.
+# Two knobs fix it without giving up usable dev runtime:
+#
+# * `debug = 1` — full DWARF is the single biggest codegen memory consumer
+#   (every generic instantiation keeps its debug info in RAM). Line tables keep
+#   backtraces readable for a fraction of the cost, and dependencies drop debug
+#   info entirely.
+# * `opt-level = 1` — the previous `2` ran the full optimizer on every
+#   dependency (tauri, tokio, reqwest, rusqlite, image, ...), which is what
+#   pushed individual rustc processes to 150-250 MB. Level 1 keeps the
+#   store/JSON/PTY hot paths fast enough that dev does not feel sluggish.
 [profile.dev]
 debug = 1
 opt-level = 1
-
-# `tauri dev` runs a DEBUG build. Two knobs matter here:
-#
-# * `debug = 0` — full DWARF debug info is the single biggest memory consumer
-#   during codegen: rustc holds it all in RAM per crate, and with ~10 crates
-#   compiling in parallel that alone reached ~1.4 GB and made the machine
-#   stutter. Line tables (`debug = 1`) keep backtraces readable for a fraction
-#   of the cost.
-# * `opt-level = 1` for dependencies — the previous `2` ran the full optimizer
-#   on every dependency (tauri, tokio, reqwest, rusqlite, image, ...), which is
-#   what pushed individual rustc processes to 150-250 MB. Level 1 keeps the
-#   store/JSON/PTY hot paths fast enough that dev does not feel sluggish while
-#   cutting compile memory substantially.
-[profile.dev]
-debug = 1
 
 [profile.dev.package."*"]
 opt-level = 1

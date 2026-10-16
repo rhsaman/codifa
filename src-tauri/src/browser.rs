@@ -355,13 +355,19 @@ where
 /// polls every ~1.2s while it is open, so only a closed panel goes idle.
 const IDLE_REAP: Duration = Duration::from_secs(600);
 
+/// Whether a session idle for `elapsed` should be reaped. Pure so the policy is
+/// unit-tested without spawning a real Chromium.
+fn should_reap(elapsed: Duration, ttl: Duration) -> bool {
+    elapsed >= ttl
+}
+
 /// Kill sessions nobody has touched for `IDLE_REAP`. Called on every session
 /// lookup (i.e. on each panel poll), so a closed panel's Chromium is released
 /// without needing a background thread.
 fn reap_idle(guard: &mut Vec<(String, BrowserProc)>) {
     let now = std::time::Instant::now();
     guard.retain_mut(|(_, proc)| {
-        if now.duration_since(proc.last_used) < IDLE_REAP {
+        if !should_reap(now.duration_since(proc.last_used), IDLE_REAP) {
             return true;
         }
         let _ = proc.child.kill();
@@ -1112,6 +1118,17 @@ mod tests {
         store_viewport("no-such-chat-xyz", (900, 600));
         // No session exists, so nothing is stored and the default stands.
         assert_eq!(session_viewport("no-such-chat-xyz"), DEFAULT_VIEWPORT);
+    }
+
+    #[test]
+    fn idle_sessions_are_reaped_but_fresh_ones_are_kept() {
+        // A Chromium is ~150-300 MB and one is spawned per chat, so a closed
+        // panel's session must be released instead of piling up until exit.
+        let ttl = Duration::from_secs(600);
+        assert!(!should_reap(Duration::from_secs(0), ttl));
+        assert!(!should_reap(Duration::from_secs(599), ttl));
+        assert!(should_reap(Duration::from_secs(600), ttl));
+        assert!(should_reap(Duration::from_secs(3600), ttl));
     }
 
     #[test]

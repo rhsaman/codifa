@@ -1163,7 +1163,7 @@ fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEv
 /// extra step costs seconds (one model round trip) for no extra information.
 fn single_call_hint(mode: &str, calls_in_step: usize) -> Option<&'static str> {
     (mode == "subagent" && calls_in_step == 1).then_some(
-        "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, lsp_symbols, reads of the exact windows), then write the report.",
+        "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
     )
 }
 

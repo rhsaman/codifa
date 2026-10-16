@@ -80,6 +80,119 @@ fn bad_request(msg: &str) -> Response<Body> {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
+// --- model probe (native; replaces the sidecar's /models/test) --------------
+
+/// Total budget for one probe (mirrors the sidecar's MODEL_TEST_TIMEOUT).
+const MODEL_TEST_TIMEOUT_SECS: u64 = 15;
+/// Client-side cap, smaller than the budget so the real provider error wins.
+const MODEL_TEST_CLIENT_TIMEOUT_SECS: u64 = 12;
+/// Chat-representative reservation so a provider's quota pre-check behaves
+/// like a real turn: a tiny cap can pass while the chat's 32K reservation
+/// fails with 402, producing a false tick. Actual burn stays ~1 token.
+const MODEL_TEST_MAX_TOKENS: u32 = 32_000;
+/// Probes in flight per batch round (the sidecar used a semaphore of 10).
+const MODEL_TEST_BATCH_CONCURRENCY: usize = 10;
+
+/// Body of POST /models/test and /models/test-batch.
+#[derive(serde::Deserialize)]
+pub struct ModelTestBody {
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    provider_id: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_keys: Vec<String>,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// Probe one model with a tiny completion; returns the reply or the reason.
+///
+/// Uses the same one-shot path as a real turn, so the probe exercises the
+/// exact provider+model the picker shows.
+async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String> {
+    if model.trim().is_empty() {
+        return Err("no model selected".into());
+    }
+    let mut keys = body.api_keys.clone();
+    if keys.is_empty() {
+        // Keyless local endpoints (ollama / llama.cpp) still answer; the
+        // sidecar sent an empty key rather than refusing the probe.
+        keys.push(String::new());
+    }
+    let cfg = LlmConfig {
+        provider: body.provider.clone(),
+        model: model.to_string(),
+        base_url: body.base_url.clone(),
+        api_keys: keys,
+        temperature: None,
+        max_tokens: Some(MODEL_TEST_MAX_TOKENS),
+        timeout_secs: MODEL_TEST_CLIENT_TIMEOUT_SECS,
+    };
+    let client = llm::http_client();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(MODEL_TEST_TIMEOUT_SECS),
+        llm::complete(&client, &cfg, "", "Reply with the single word: OK"),
+    )
+    .await
+    .map_err(|_| format!("timeout — model did not answer in {MODEL_TEST_TIMEOUT_SECS}s"))?;
+    let text = res?.text.trim().to_string();
+    if text.is_empty() {
+        return Err(
+            "empty reply — model returned no content (quota exhausted or route unavailable)"
+                .into(),
+        );
+    }
+    Ok(text.chars().take(200).collect())
+}
+
+/// POST /models/test — probe one model with a tiny completion.
+pub async fn models_test(Json(body): Json<ModelTestBody>) -> Response {
+    match probe_model(&body, &body.model).await {
+        Ok(reply) => Json(json!({ "ok": true, "reply": reply })).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": err })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /models/test-batch — probe many models, one HTTP round trip.
+pub async fn models_test_batch(Json(body): Json<ModelTestBody>) -> Response {
+    let models: Vec<String> = body
+        .models
+        .iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .take(100)
+        .collect();
+    if models.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": "no models selected" })),
+        )
+            .into_response();
+    }
+    // Bounded concurrency: a 100-model group test must not open 100 sockets.
+    let mut results: Vec<Value> = Vec::with_capacity(models.len());
+    for chunk in models.chunks(MODEL_TEST_BATCH_CONCURRENCY) {
+        let part = futures_util::future::join_all(chunk.iter().map(|m| async {
+            match probe_model(&body, m).await {
+                Ok(reply) => json!({ "model": m, "ok": true, "reply": reply }),
+                Err(error) => json!({ "model": m, "ok": false, "error": error }),
+            }
+        }))
+        .await;
+        results.extend(part);
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
 fn git_response(result: Result<Value, git::GitError>) -> Response<Body> {
     match result {
         Ok(v) => Json(v).into_response(),
@@ -286,11 +399,18 @@ pub fn resolve_slot_target(
         Some(cfg) => {
             let base = cfg
                 .get("baseUrl")
+                .or_else(|| cfg.get("base_url"))
                 .and_then(Value::as_str)
                 .unwrap_or(parent_base)
                 .to_string();
+            // The renderer sends provider configs with camelCase keys
+            // (`apiKeys`, `baseUrl`), while the sidecar's own contract used
+            // snake_case. Reading only `apiKeys` left the key list EMPTY for
+            // every cross-provider slot, so the title/compact call failed with
+            // "no api key configured" and the chat stayed untitled.
             let mut keys: Vec<String> = cfg
                 .get("apiKeys")
+                .or_else(|| cfg.get("api_keys"))
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default();
@@ -810,6 +930,8 @@ pub fn router(state: AppState) -> Router {
         .route("/git/checkout", post(git_checkout))
         .route("/git/push", post(git_push))
         .route("/system-prompts", get(crate::appstate::system_prompts_get))
+        .route("/models/test", post(models_test))
+        .route("/models/test-batch", post(models_test_batch))
         .route("/skills", get(skills_list))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
@@ -881,6 +1003,52 @@ mod tests {
         assert!(!is_local_router_entry("main"));
         assert!(!is_local_router_entry("p1/laya"));
         assert!(!is_local_router_entry("layax"));
+    }
+
+    #[test]
+    fn slot_target_reads_the_renderer_camel_case_provider_config() {
+        // The renderer sends provider configs as camelCase (`apiKeys`,
+        // `baseUrl`). Reading only `apiKeys` left the key list empty for every
+        // cross-provider slot, so /chats/title failed with "no api key
+        // configured" and a new chat stayed untitled.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "p1".to_string(),
+            serde_json::json!({
+                "kind": "openai",
+                "baseUrl": "http://camel/v1",
+                "apiKeys": ["sk-camel"],
+            }),
+        );
+        let (model, base, keys) =
+            resolve_slot_target("p1/gpt-x", "parent", "http://parent/v1", &[], &providers);
+        assert_eq!(model, "gpt-x");
+        assert_eq!(base, "http://camel/v1");
+        assert_eq!(keys, vec!["sk-camel".to_string()]);
+
+        // The sidecar's own snake_case contract keeps working.
+        let mut snake = std::collections::HashMap::new();
+        snake.insert(
+            "p2".to_string(),
+            serde_json::json!({"base_url": "http://snake/v1", "api_keys": ["sk-snake"]}),
+        );
+        let (_, base2, keys2) =
+            resolve_slot_target("p2/m", "parent", "http://parent/v1", &[], &snake);
+        assert_eq!(base2, "http://snake/v1");
+        assert_eq!(keys2, vec!["sk-snake".to_string()]);
+
+        // A single `apiKey` is honoured, and an unknown provider id falls back
+        // to the parent's base + keys instead of losing them.
+        let mut single = std::collections::HashMap::new();
+        single.insert("p3".to_string(), serde_json::json!({"apiKey": "sk-one"}));
+        let (_, base3, keys3) =
+            resolve_slot_target("p3/m", "parent", "http://parent/v1", &["sk-parent".into()], &single);
+        assert_eq!(base3, "http://parent/v1");
+        assert_eq!(keys3, vec!["sk-one".to_string()]);
+        let (_, base4, keys4) =
+            resolve_slot_target("ghost/m", "parent", "http://parent/v1", &["sk-parent".into()], &single);
+        assert_eq!(base4, "http://parent/v1");
+        assert_eq!(keys4, vec!["sk-parent".to_string()]);
     }
 
     #[test]

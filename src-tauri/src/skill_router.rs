@@ -7,6 +7,8 @@
 //! model prompt: anything else is loaded on demand via the `load_skill` tool,
 //! so a turn with no picks adds zero tokens.
 
+use std::collections::HashSet;
+
 use reqwest::Client;
 use serde_json::Value;
 
@@ -257,7 +259,9 @@ pub async fn decide_with_model(
     prompt: &str,
     all: &[Value],
 ) -> Result<Vec<String>, String> {
-    let catalog = decision_catalog(all);
+    // Rank first: the catalog is capped, so an unfiltered store would hand the
+    // model an alphabetical head instead of the relevant slice.
+    let catalog = decision_catalog(&prefilter(prompt, all));
     if catalog.is_empty() {
         return Ok(Vec::new());
     }
@@ -280,6 +284,82 @@ fn load_skills(root: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Candidates handed to the decision router per turn. Large enough for the
+/// router to choose well (Laya answers over at most 30 options, the external
+/// catalog fits ~60-100 short lines), small enough to keep its prompt tiny.
+pub const PREFILTER_LIMIT: usize = 50;
+/// Chars of the request ranked against the store.
+const PREFILTER_QUERY_CHARS: usize = 1500;
+
+/// Rankable text for one skill: name + description + fa_keywords + slug.
+fn skill_text(s: &Value) -> String {
+    let name = s["name"].as_str().unwrap_or_default().trim();
+    let mut parts: Vec<String> = Vec::new();
+    if !name.is_empty() {
+        parts.push(name.to_string());
+    }
+    let desc = s["description"].as_str().unwrap_or_default().trim();
+    if !desc.is_empty() {
+        parts.push(desc.to_string());
+    }
+    if let Some(kws) = s["fa_keywords"].as_array() {
+        let joined = kws
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            parts.push(joined);
+        }
+    }
+    let slug = s["slug"].as_str().unwrap_or_default().trim().replace('-', " ");
+    if !slug.is_empty() && !name.is_empty() && !slug.eq_ignore_ascii_case(name) {
+        parts.push(slug);
+    }
+    parts.join(" ")
+}
+
+/// Top-`PREFILTER_LIMIT` skills for the request, best first.
+///
+/// The decision router only ever sees a slice of the store, so handing it the
+/// raw (alphabetical) order would cut off almost everything past the head once
+/// the store grows. Ranking is lexical — token overlap between the request and
+/// each skill's name/description/keywords — because the native agent has no
+/// embedding runtime; it is deterministic, instant and dependency-free.
+///
+/// Fail-open by design: an empty request or an empty store returns the store
+/// order unchanged, so routing degrades to the unfiltered behavior instead of
+/// breaking the turn.
+pub fn prefilter(prompt: &str, rows: &[Value]) -> Vec<Value> {
+    let text = prompt.trim();
+    if rows.is_empty() || text.is_empty() {
+        return rows.to_vec();
+    }
+    let query: String = text.chars().take(PREFILTER_QUERY_CHARS).collect();
+    let q_tokens: HashSet<String> = tokenize(&query)
+        .into_iter()
+        .filter(|t| t.len() >= 3)
+        .collect();
+    if q_tokens.is_empty() {
+        return rows.to_vec();
+    }
+    let mut scored: Vec<(i32, usize)> = Vec::with_capacity(rows.len());
+    for (i, s) in rows.iter().enumerate() {
+        let s_tokens: HashSet<String> = tokenize(&skill_text(s)).into_iter().collect();
+        let score = q_tokens.iter().filter(|t| s_tokens.contains(*t)).count() as i32;
+        scored.push((score, i));
+    }
+    // Stable: ties keep store order.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(PREFILTER_LIMIT)
+        .map(|(_, i)| rows[i].clone())
+        .collect()
+}
+
 /// Deterministic in-code routing (no model call). Test-only: the turn always
 /// goes through `build_section_async`, which falls back to this matcher when
 /// no decision slot is configured or the model call fails.
@@ -294,6 +374,47 @@ pub fn build_section(root: &str, prompt: &str, manual_names: &[String]) -> Skill
     assemble(&all, auto_names, manual_names)
 }
 
+/// How the turn's skills are chosen.
+pub enum SkillRouter<'a> {
+    /// A provider model (the "decision" Tool Models slot) picks the skills.
+    Model(&'a Client, &'a LlmConfig),
+    /// The downloaded on-device Laya classifier. It is a torch/transformers
+    /// checkpoint, so only the Python sidecar can execute it — the native
+    /// agent asks it over HTTP instead of dropping back to the keyword
+    /// matcher (which silently ignored the user's Decision-model choice).
+    Laya,
+}
+
+/// Route with the on-device Laya classifier through the sidecar.
+///
+/// Any failure returns Err so the caller falls back to the in-code matcher.
+async fn decide_with_laya(prompt: &str, all: &[Value]) -> Result<Vec<String>, String> {
+    let base = crate::sidecar::current_url().ok_or("sidecar not ready")?;
+    // The native agent owns candidate ranking; the sidecar only executes the
+    // Laya checkpoint (a torch/transformers model with no Rust runtime).
+    let body = serde_json::json!({ "prompt": prompt, "rows": prefilter(prompt, all) });
+    let res = crate::llm::http_client()
+        .post(format!("{}/skills/route", base.trim_end_matches('/')))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("laya route: {e}"))?;
+    let v: Value = res.json().await.map_err(|e| format!("laya route: {e}"))?;
+    if let Some(err) = v["error"].as_str() {
+        return Err(err.to_string());
+    }
+    // `null` means Laya is unavailable (not downloaded / load failure).
+    let Some(arr) = v["skills"].as_array() else {
+        return Err("laya unavailable".to_string());
+    };
+    Ok(arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
 /// Model-backed routing: the "decision" Tool Models slot picks the skills.
 /// Falls back to the in-code matcher when the model call fails, so a broken
 /// router never costs the turn its skills.
@@ -301,14 +422,20 @@ pub async fn build_section_async(
     root: &str,
     prompt: &str,
     manual_names: &[String],
-    decision: Option<(&Client, &LlmConfig)>,
+    decision: Option<SkillRouter<'_>>,
 ) -> SkillSection {
     let all = load_skills(root);
     let auto_names = if prompt.trim().is_empty() {
         Vec::new()
     } else {
         match decision {
-            Some((client, cfg)) => match decide_with_model(client, cfg, prompt, &all).await {
+            Some(SkillRouter::Model(client, cfg)) => {
+                match decide_with_model(client, cfg, prompt, &all).await {
+                    Ok(picked) => picked,
+                    Err(_) => auto_match(prompt, &all),
+                }
+            }
+            Some(SkillRouter::Laya) => match decide_with_laya(prompt, &all).await {
                 Ok(picked) => picked,
                 Err(_) => auto_match(prompt, &all),
             },

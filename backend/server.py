@@ -2456,6 +2456,48 @@ def _start_parent_watchdog() -> None:
     threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
 
 
+class SkillRouteRequest(BaseModel):
+    """Request text plus the prefiltered skill candidates to route over."""
+
+    prompt: str = ""
+    rows: list[dict] = []
+    chat_id: str = ""
+
+
+class SkillRouteResponse(BaseModel):
+    """Routed skill names; ``skills`` is null when Laya is unavailable."""
+
+    skills: list[str] | None = None
+    error: str = ""
+
+
+@app.post("/skills/route")
+async def skills_route(req: SkillRouteRequest) -> SkillRouteResponse:
+    """Route a request to skills with the on-device Laya classifier.
+
+    The native Rust agent owns the turn loop AND candidate ranking (it hands
+    over an already-ranked slice), but Laya is a torch/transformers checkpoint
+    with no Rust runtime, so the agent asks this endpoint instead of dropping
+    back to the keyword matcher (which silently ignored the user's
+    Decision-model choice). ``skills: null`` means routing is unavailable (not
+    downloaded / load failure) so the caller inlines nothing.
+    """
+    try:
+        import laya_router
+    except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
+        return SkillRouteResponse(error=f"laya unavailable: {exc}")
+    rows = [r for r in (req.rows or []) if str(r.get("name") or "").strip()]
+    if not rows:
+        return SkillRouteResponse(skills=[])
+    try:
+        picks = laya_router.predict(req.prompt, rows, req.chat_id)
+    except Exception as exc:  # noqa: BLE001 — routing never breaks the turn
+        return SkillRouteResponse(error=f"laya route failed: {exc}")
+    if picks is None:
+        return SkillRouteResponse(error="laya unavailable")
+    return SkillRouteResponse(skills=[str(n) for n in picks])
+
+
 @app.get("/health")
 async def health() -> dict:
     """Liveness probe for the Rust shell.

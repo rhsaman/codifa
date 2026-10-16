@@ -520,15 +520,9 @@ pub async fn run_turn(
         .get("decision")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let decision_cfg = if decision_slot.is_empty() {
-        None
-    } else if crate::backend_light::is_local_router_entry(&decision_slot) {
-        emit(&AgentEvent::Warn {
-            content: "the local Laya decision router is not available in the native agent \
-— using the built-in skill matcher for this turn (pick a provider model in \
-Settings → Tools → Decision to route with a model)"
-                .into(),
-        });
+    let decision_cfg = if decision_slot.is_empty()
+        || crate::backend_light::is_local_router_entry(&decision_slot)
+    {
         None
     } else {
         let (model, base_url, api_keys) = crate::backend_light::resolve_slot_target(
@@ -556,6 +550,17 @@ Settings → Tools → Decision to route with a model)"
             timeout_secs: 30,
         })
     };
+    // The on-device Laya classifier is a downloaded torch checkpoint, so only
+    // the Python sidecar can run it; the native agent asks it over HTTP rather
+    // than silently dropping back to the keyword matcher (which is what the
+    // old "not available in the native agent" warning did).
+    let decision_router = if crate::backend_light::is_local_router_entry(&decision_slot) {
+        Some(crate::skill_router::SkillRouter::Laya)
+    } else {
+        decision_cfg
+            .as_ref()
+            .map(|c| crate::skill_router::SkillRouter::Model(&client, c))
+    };
     let skill_section = crate::skill_router::build_section_async(
         // The skill store lives in the DATA root, not the workspace.
         if req.data_root.is_empty() {
@@ -565,7 +570,7 @@ Settings → Tools → Decision to route with a model)"
         },
         &req.prompt,
         &req.skills,
-        decision_cfg.as_ref().map(|c| (&client, c)),
+        decision_router,
     )
     .await;
     if !skill_section.text.is_empty() {

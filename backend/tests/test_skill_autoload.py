@@ -267,6 +267,58 @@ def test_manual_persist_loads_by_same_name_and_slug():
         assert "REVIEW-BODY" in out, f"query {query!r}: {out[:120]!r}"
 
 
+def test_skills_route_endpoint_serves_laya_picks(monkeypatch):
+    """POST /skills/route runs the on-device Laya router for the native agent.
+
+    Laya is a torch/transformers checkpoint, so only the sidecar can execute
+    it; the Rust agent calls this endpoint instead of silently dropping back
+    to its keyword matcher (which ignored the user's Decision-model choice).
+    """
+    import asyncio
+
+    import laya_router
+    import server
+
+    monkeypatch.setattr(
+        laya_router, "predict", lambda prompt, candidates, chat_id="": ["Movie Finder"]
+    )
+    rows = [{"name": "Movie Finder", "description": "find good movies"}]
+    out = asyncio.run(
+        server.skills_route(server.SkillRouteRequest(prompt="find a movie", rows=rows))
+    )
+    assert out.skills == ["Movie Finder"]
+    assert not out.error
+
+    # `None` from Laya (not downloaded / load failure) is reported as an error
+    # so the caller falls back to its own matcher instead of inlining nothing.
+    monkeypatch.setattr(
+        laya_router, "predict", lambda prompt, candidates, chat_id="": None
+    )
+    out = asyncio.run(
+        server.skills_route(server.SkillRouteRequest(prompt="x", rows=rows))
+    )
+    assert out.skills is None
+    assert out.error
+
+    # A raising router never breaks the turn either.
+    def _boom(prompt, candidates, chat_id=""):
+        raise RuntimeError("no torch")
+
+    monkeypatch.setattr(laya_router, "predict", _boom)
+    out = asyncio.run(
+        server.skills_route(server.SkillRouteRequest(prompt="x", rows=rows))
+    )
+    assert out.skills is None
+    assert "no torch" in out.error
+
+    # No candidates at all: nothing to route, and that is NOT an error.
+    out = asyncio.run(
+        server.skills_route(server.SkillRouteRequest(prompt="x", rows=[]))
+    )
+    assert out.skills == []
+    assert not out.error
+
+
 if __name__ == "__main__":
     asyncio.run(asyncio.gather(*[
         test_task_subagent_receives_skills_catalog_and_load_skill(),

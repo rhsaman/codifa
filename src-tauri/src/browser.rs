@@ -291,32 +291,43 @@ async fn cdp_calls(port: u16, calls: Vec<(&'static str, Value)>) -> Result<Vec<V
     Ok(out)
 }
 
-/// Run CDP commands with the session's emulated viewport re-applied first.
+/// Device-metrics override params for an emulated viewport.
+fn viewport_override(w: u32, h: u32) -> Value {
+    json!({
+        "width": w,
+        "height": h,
+        "deviceScaleFactor": 1,
+        "mobile": false,
+    })
+}
+
+/// Prepend the session's viewport override to a batch of CDP calls.
 ///
 /// `Emulation.setDeviceMetricsOverride` is scoped to the CDP SESSION, and every
 /// call here opens a fresh WebSocket — so an override set by an earlier
 /// /browser/viewport request is already gone by the time the next command runs.
 /// That is why the frame (and the input coordinate space) stayed at the launch
-/// size no matter what the ruler said. Re-applying it on each connection makes
-/// the size stick for screenshots AND for click/type/scroll coordinates.
+/// size no matter what the ruler said. Riding along in the SAME batch makes the
+/// size stick for screenshots AND for click/type/scroll coordinates.
+fn with_viewport_override(
+    w: u32,
+    h: u32,
+    calls: Vec<(&'static str, Value)>,
+) -> Vec<(&'static str, Value)> {
+    let mut all = Vec::with_capacity(calls.len() + 1);
+    all.push(("Emulation.setDeviceMetricsOverride", viewport_override(w, h)));
+    all.extend(calls);
+    all
+}
+
+/// Run CDP commands with the session's emulated viewport re-applied first.
 async fn cdp_calls_sized(
     port: u16,
     chat: &str,
     calls: Vec<(&'static str, Value)>,
 ) -> Result<Vec<Value>, String> {
     let (w, h) = session_viewport(chat);
-    let mut all = Vec::with_capacity(calls.len() + 1);
-    all.push((
-        "Emulation.setDeviceMetricsOverride",
-        json!({
-            "width": w,
-            "height": h,
-            "deviceScaleFactor": 1,
-            "mobile": false,
-        }),
-    ));
-    all.extend(calls);
-    let mut out = cdp_calls(port, all).await?;
+    let mut out = cdp_calls(port, with_viewport_override(w, h, calls)).await?;
     out.remove(0);
     Ok(out)
 }
@@ -946,12 +957,7 @@ pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
         cdp_call(
             port,
             "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": w,
-                "height": h,
-                "deviceScaleFactor": 1,
-                "mobile": false,
-            }),
+            viewport_override(w, h),
         )
         .await?;
         Ok(Value::Null)
@@ -1118,6 +1124,25 @@ mod tests {
         store_viewport("no-such-chat-xyz", (900, 600));
         // No session exists, so nothing is stored and the default stands.
         assert_eq!(session_viewport("no-such-chat-xyz"), DEFAULT_VIEWPORT);
+    }
+
+    #[test]
+    fn viewport_override_rides_in_the_same_batch_as_the_command() {
+        // The override is session-scoped and every call opens a fresh
+        // WebSocket, so it MUST travel with the command it applies to —
+        // otherwise the frame and the input coordinates stay at the launch
+        // size and the panel never fits the pane (the responsive bug).
+        let batch = with_viewport_override(
+            420,
+            800,
+            vec![("Page.captureScreenshot", json!({"format": "jpeg"}))],
+        );
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].0, "Emulation.setDeviceMetricsOverride");
+        assert_eq!(batch[0].1["width"], 420);
+        assert_eq!(batch[0].1["height"], 800);
+        assert_eq!(batch[0].1["mobile"], false);
+        assert_eq!(batch[1].0, "Page.captureScreenshot");
     }
 
     #[test]

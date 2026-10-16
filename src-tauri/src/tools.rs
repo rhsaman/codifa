@@ -1325,6 +1325,29 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_routes_find_symbol_with_its_own_args() {
+        // The tool is only usable if the dispatcher knows the name AND reads
+        // symbol/path/include (not the LSP filePath shape).
+        let tmp = find_symbol_fixture();
+        let root = tmp.to_str().unwrap();
+        let out = dispatch(root, "find_symbol", &json!({"symbol": "compact_history"}), None).unwrap();
+        assert!(out.contains("definition(s)") && out.contains("src/compact.rs"), "{out}");
+        // path/include scope the search like every other search tool.
+        let scoped = dispatch(
+            root,
+            "find_symbol",
+            &json!({"symbol": "Handle", "path": "backend", "include": "*.go"}),
+            None,
+        )
+        .unwrap();
+        assert!(scoped.contains("backend/g.go") && !scoped.contains("src/compact.rs"), "{scoped}");
+        // A regex is rejected with the bare-identifier hint, not a silent miss.
+        let err = dispatch(root, "find_symbol", &json!({"symbol": "a.*b"}), None).unwrap_err();
+        assert!(err.contains("bare identifier"), "{err}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn system_stats_lists_processes() {
         let out = system_stats("", 5).expect("system_stats should work");
         assert!(out.contains("total RSS"), "missing header: {out}");

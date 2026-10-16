@@ -1,1 +1,0 @@
-persistHeartbeat|tests/persistHeartbeat.test.ts|--packages=external --external:electron

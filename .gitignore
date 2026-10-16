@@ -61,6 +61,7 @@ backend/tests/pytest-of-*/
 backend/tests/coder-test-*/
 pytest_full_result.txt
 tests/.tmp-*
+tests/.fe-run.*
 tests/dump-ssr.out.mjs
 .tmp-*.mjs
 

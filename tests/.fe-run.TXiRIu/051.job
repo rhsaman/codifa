@@ -1,1 +1,0 @@
-codeBlock|tests/codeBlock.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron

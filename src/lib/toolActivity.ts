@@ -284,6 +284,7 @@ export function resolveToolResult(
  *  is kept verbatim in `ToolActivity.resultText` and rendered as-is — without
  *  this the whole result was dropped and the card showed no output at all. */
 export const TEXT_RESULT_TOOLS = new Set([
+  "find_symbol",
   "lsp_symbols",
   "lsp_hover",
   "lsp_definition",

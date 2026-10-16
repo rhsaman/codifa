@@ -69,7 +69,8 @@ chmod +x "$WORK/one.sh"
 JOBS_LIST="$WORK/jobs.txt"
 cat > "$JOBS_LIST" <<'EOF'
 sections|tests/sections.test.ts|-
-mcpTools|tests/mcpTools.test.ts|-
+browserViewport|tests/browserViewport.test.ts|--packages=external --external:electron
+mcpTools|tests/mcpTools.test.ts|--packages=external --external:electron
 forkSection|tests/forkSection.test.ts|--external:electron
 readingMode|tests/readingMode.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 loadingScreen|tests/loadingScreen.ssr.test.tsx|--jsx=automatic --packages=external --external:electron

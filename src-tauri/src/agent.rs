@@ -307,6 +307,15 @@ fn research_schemas() -> Vec<Value> {
             }),
         ),
         (
+            "find_symbol",
+            "Definition(s) with their bodies PLUS every usage of ONE identifier, in a single call — replaces the grep -> lsp_definition -> lsp_references chain (three round trips) and needs no language server, so it works for every language. Pass symbol (a bare identifier: letters, digits, _ or $ — never a regex) and optionally path (directory or file) and include (glob filter) to scope it. Use this FIRST when the question names a symbol; fall back to lsp_* only when you need type/signature info.",
+            json!({
+                "symbol": {"type": "string", "description": "Bare identifier to look up (no regex)"},
+                "path": {"type": "string", "description": "Directory or file to scope the search (optional)"},
+                "include": {"type": "string", "description": "Glob filter such as *.rs (optional)"}
+            }),
+        ),
+        (
             "lsp_definition",
             "Jump to the DEFINITION of a symbol and show its body (LSP) — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. No need to know line/character.",
             json!({
@@ -748,7 +757,7 @@ pub async fn run_turn(
             !mcp_names.contains(name)
                 && matches!(
                     name,
-                    "read" | "grep" | "glob" | "current_time" | "system_stats"
+                    "read" | "grep" | "glob" | "find_symbol" | "current_time" | "system_stats"
                         | "search_memory" | "load_skill" | "lsp_definition" | "lsp_references"
                         | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
                 )
@@ -940,6 +949,19 @@ pub async fn run_turn(
                 ok,
                 req.mode == "subagent",
             );
+        }
+
+        // Explore only: a step with a single call is a wasted model round trip
+        // when more lookups were foreseeable. The hint rides on that call's
+        // own result, so it costs no extra request and never cuts a report.
+        if let Some(hint) = single_call_hint(&req.mode, tool_calls.len()) {
+            if let Some(last) = messages.last_mut() {
+                if last["role"].as_str() == Some("tool") {
+                    if let Some(c) = last["content"].as_str() {
+                        last["content"] = json!(format!("{c}\n\n{hint}"));
+                    }
+                }
+            }
         }
     }
 
@@ -1136,6 +1158,15 @@ fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEv
     }
 }
 
+/// Batching reminder appended to the result of an explore step that issued a
+/// single tool call. Read-only calls of one step run in parallel, so every
+/// extra step costs seconds (one model round trip) for no extra information.
+fn single_call_hint(mode: &str, calls_in_step: usize) -> Option<&'static str> {
+    (mode == "subagent" && calls_in_step == 1).then_some(
+        "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, lsp_symbols, reads of the exact windows), then write the report.",
+    )
+}
+
 /// System prompt of the explore sub-agent: the research strategy plus a compact
 /// project layout, so it starts from REAL paths instead of guessing with glob
 /// (a traced run burned ~20 calls hunting for `backend/`), and explicit LSP
@@ -1144,24 +1175,39 @@ fn explore_system_prompt(root: &str) -> String {
     let layout = tools::layout_snapshot(root, 3500);
     format!(
         "You are the explore sub-agent inside the workspace {root}. \
-The main agent waits on you and cannot search itself, so be fast and precise: \
-aim for at most ~10 tool calls, then report.\n\n\
-How to search:\n\
-1. PROJECT LAYOUT (below) lists real paths. Start from it; never glob to discover \
-directories or file names you can already see there.\n\
-2. To find where a symbol is defined or used: ONE grep for the bare identifier \
-scoped with path/include, then lsp_definition / lsp_references with filePath + \
-symbol (no line/character needed). To locate things inside a big file use \
-lsp_symbols (names + line ranges), then read only that window.\n\
-3. glob lists FILES only (never directories) and matches the pattern against the \
+The main agent waits on you and cannot search itself, so be fast and precise. \
+Every model round trip costs seconds while tools cost milliseconds, so what matters \
+is the number of ROUNDS (steps), not the number of calls: issue every call you can \
+already foresee together in ONE step (they run in parallel) — a grep per \
+identifier/keyword variant, lsp_symbols for likely files, reads of files the \
+question names — then act on all the results at once. Aim for 2-3 rounds.\n\n\
+How to search — never blindly. First decide what the question gives you, enter at \
+the matching step below, and move from the cheapest PRECISE tool to the next:\n\
+1. Paths and directories come from PROJECT LAYOUT (below), never from guessing. \
+glob lists FILES only (never directories) and matches the pattern against the \
 path relative to `path`; `**/` matches zero or more directories. To list a \
 directory, read its path. A 'no matches' answer is final: do NOT retry it with \
 variations — switch tool, or re-read the layout.\n\
-4. If an lsp_* tool says the language server is unavailable, stop using LSP for \
+2. The question names a FILE (or the layout makes the file obvious): lsp_symbols \
+on it (names + line ranges), then read ONLY the window you need. Never read a big \
+file whole.\n\
+3. The question names a SYMBOL / identifier: ONE find_symbol call with the bare \
+identifier (scope it with path/include taken from the layout) — it returns the \
+definition(s) with their bodies AND the usages together, so it replaces the \
+grep -> lsp_definition -> lsp_references chain. Reach for lsp_definition / \
+lsp_references only when you need type/signature info or the language server's \
+view of a name find_symbol could not resolve.\n\
+4. The question describes a BEHAVIOUR with no names: ONE grep scoped to the likely \
+directory/include with 2-3 alternative keywords (a|b|c) — several such greps for \
+different directories go in the same step; then continue from step 2 or 3 on what \
+it found.\n\
+5. If an lsp_* tool says the language server is unavailable, stop using LSP for \
 that language and use grep + read.\n\
-5. Put independent calls in the SAME step (they run in parallel). Read only the \
-line ranges you need (offset/limit), never whole large files. Never repeat a \
-search with the same pattern.\n\n\
+6. Before each step, for every call ask: which exact question does it answer, and \
+what will I do differently depending on the result? Drop any call that cannot \
+change your next action. Grep shows only a few lines around each hit — read the \
+window you need, but never re-read what a result already showed and never repeat \
+a search with the same pattern.\n\n\
 FINAL REPORT (your only text output — write nothing between tool calls): the \
 main agent has no read tool and edits files with exact-match strings, so precision \
 matters and padding costs it tokens on every later step. Format:\n\
@@ -1423,7 +1469,7 @@ mod tests {
             .collect();
         // Main agent must NOT have search/read tools — research is delegated.
         // Memory tools live on the explore sub-agent too (user request).
-        for banned in ["read", "grep", "glob", "lsp_definition", "lsp_symbols", "save_memory", "search_memory"] {
+        for banned in ["read", "grep", "glob", "find_symbol", "lsp_definition", "lsp_symbols", "save_memory", "search_memory"] {
             assert!(!names.contains(&banned), "main agent must not have {banned}");
         }
         assert!(names.contains(&"explore"));
@@ -1456,6 +1502,7 @@ mod tests {
             "read",
             "grep",
             "glob",
+            "find_symbol",
             "lsp_definition",
             "lsp_references",
             "lsp_hover",
@@ -1482,11 +1529,15 @@ mod tests {
         assert!(p.contains("backend/: server.py"), "{p}");
         // LSP + glob semantics are spelled out (the old prompt never named LSP).
         assert!(p.contains("lsp_definition") && p.contains("lsp_references") && p.contains("lsp_symbols"));
+        // find_symbol is the one-call replacement for the grep -> lsp chain.
+        assert!(p.contains("find_symbol"), "{p}");
         assert!(p.contains("FILES only") && p.contains("no matches"));
         // Still read-only and English-reporting.
         assert!(p.contains("NO write tools") && p.contains("Report in English"));
         // Report contract: answer first, verbatim code only where it is needed.
         assert!(p.contains("ANSWER") && p.contains("VERBATIM") && p.contains("nothing between tool calls"));
+        // Latency guidance: rounds (not calls) are the cost, batch in ONE step.
+        assert!(p.contains("ROUNDS") && p.contains("ONE step"), "{p}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1508,6 +1559,14 @@ mod tests {
         assert_eq!(report, "ANSWER: x (saved)");
         fold_subagent_event(&mut report, &mut err, &AgentEvent::Error { content: "boom".into() });
         assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn single_call_steps_of_explore_get_a_batching_hint() {
+        assert!(single_call_hint("subagent", 1).unwrap().contains("NEXT step"));
+        // Batched steps and the main agent's steps are left alone.
+        assert!(single_call_hint("subagent", 3).is_none());
+        assert!(single_call_hint("agent", 1).is_none());
     }
 
     #[test]

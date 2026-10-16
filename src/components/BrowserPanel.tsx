@@ -5,8 +5,10 @@ import {
   WIDTH_RULER_STEP,
   WIDTH_SLIDER_MAX,
   WIDTH_SLIDER_MIN,
+  capAfterPoll,
   clampViewportSize,
   fitWidthTarget,
+  frameZoom,
   rulerLabelForWidth,
   rulerPctForWidth,
   rulerWidthForPct,
@@ -70,10 +72,17 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   // last manually applied width — like Chrome shrinking the layout viewport
   // when the pane narrows and growing it back up to the set size.
   const [fitToPane, setFitToPane] = useState<boolean>(true);
+  // Pane (stage) box in CSS px. Drives BOTH the fit-to-pane width and the
+  // on-screen zoom of the frame, so a splitter drag or a window resize
+  // rescales the frame immediately.
+  const [pane, setPane] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   // "..." overflow menu (CDP endpoint for DevTools comes from the backend
   // on demand — see openDevTools).
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const capWRef = useRef<number>(DEFAULT_VIEWPORT_SIZE.width);
+  // Last size WE applied (manual or fit). A status poll that echoes this back
+  // is our own resize, not an external one, so it must not touch the cap.
+  const appliedRef = useRef<{ w: number; h: number } | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
   const sizeRef = useRef(viewport);
@@ -163,9 +172,12 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         const h = st.viewport.height;
         const prev = sizeRef.current;
         if (w !== prev.w || h !== prev.h) {
-          // An external resize becomes the new fit cap, so follow mode does
-          // not shrink it back (own applies already synced sizeRef above).
-          capWRef.current = w;
+          // Only a GENUINE external resize (agent/CDP) becomes the new cap.
+          // A poll echoing our own apply must not touch it: a fit-shrunk
+          // width would otherwise collapse the cap, and once cap === current
+          // width the fit target never differs again — the panel freezes at
+          // one size and the ruler appears to do nothing.
+          capWRef.current = capAfterPoll(appliedRef.current, w, h, capWRef.current);
           setViewport({ w, h });
           // Follow external resizes (agent/CDP) in the manual inputs too —
           // but never clobber the drafts while the user is typing.
@@ -187,7 +199,10 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         if (typeof shot.width === "number") {
           const prev = sizeRef.current;
           if (shot.width !== prev.w || shot.height !== prev.h) {
-            capWRef.current = shot.width;
+            // Do NOT touch capWRef here: the cap is the user's MANUAL width.
+            // Overwriting it with the polled (possibly fit-shrunk) size made
+            // the pane unable to grow back — after one narrow fit the cap stuck
+            // at the small width, so widening the panel never re-fitted.
             setViewport({ w: shot.width, h: shot.height });
             if (shouldSyncViewportDrafts(prev.w, prev.h, shot.width, shot.height, isEditingDims())) {
               syncDrafts(shot.width, shot.height);
@@ -415,9 +430,22 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         method: "POST",
         body: JSON.stringify({ width, height }),
       });
-      if (updateCap) capWRef.current = width;
-      // Sync the ref immediately: the viewport effect runs after render, and
+      if (updateCap) {
+        // A manual size (ruler / numeric inputs) becomes the new CAP, but the
+        // pane keeps driving the width below it. Follow mode is deliberately
+        // NOT switched off here: the panel must stay responsive when the user
+        // drags the splitter or resizes the window, which is exactly what the
+        // old setFitToPane(false) broke — after one ruler touch the width was
+        // frozen forever. The toolbar's Responsive button still toggles it.
+        capWRef.current = width;
+        // A pending debounced pane fit must not undo the choice the user just
+        // made (a ruler drag fires applySize while a fit may still be queued).
+        if (fitTimer.current) window.clearTimeout(fitTimer.current);
+        fitTimer.current = null;
+      }
+      // Sync the refs immediately: the viewport effect runs after render, and
       // a poll in between would misread our own resize as an external one.
+      appliedRef.current = { w: width, h: height };
       sizeRef.current = { w: width, h: height };
       setViewport({ w: width, h: height });
       syncDrafts(width, height);
@@ -435,12 +463,21 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   useEffect(() => {
     const host = stageRef.current;
     if (!host || typeof ResizeObserver === "undefined") return;
+    // The pane box is recorded on EVERY resize, not only in follow mode: the
+    // frame's on-screen zoom is derived from it, so dragging the splitter or
+    // resizing the window rescales the frame even while the emulated viewport
+    // is pinned by the ruler.
+    const measure = (w: number, h: number): void => {
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+      setPane((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
+    };
     const ro = new ResizeObserver((entries) => {
-      if (!fitToPane || !active) return;
       const entry = entries[0];
       if (!entry) return;
       const paneW = Math.round(entry.contentRect.width);
-      if (!Number.isFinite(paneW) || paneW <= 0) return;
+      const paneH = Math.round(entry.contentRect.height);
+      measure(paneW, paneH);
+      if (!fitToPane || !active) return;
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
       fitTimer.current = window.setTimeout(() => {
         fitTimer.current = null;
@@ -450,6 +487,16 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       }, 400);
     });
     ro.observe(host);
+    // Apply once on mount / when follow mode is switched back on, so the
+    // toggle takes effect without waiting for a pane resize.
+    const rect = host.getBoundingClientRect();
+    measure(Math.round(rect.width), Math.round(rect.height));
+    if (fitToPane && active) {
+      const paneW = Math.round(rect.width);
+      const cur = sizeRef.current;
+      const target = fitWidthTarget(paneW, capWRef.current);
+      if (target !== cur.w) void applySize(target, cur.h, false);
+    }
     return () => {
       ro.disconnect();
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
@@ -578,6 +625,14 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     }
   }
 
+  // On-screen size of the emulated frame. The frame is never upscaled past
+  // 1:1 and always shrinks to fit the pane, so the ruler visibly changes the
+  // frame size AND a splitter drag / window resize refits it. The CSS used to
+  // stretch the image to the pane, which made every viewport change invisible.
+  const zoom = frameZoom(pane.w, pane.h, viewport.w, viewport.h);
+  const frameW = Math.max(1, Math.round(viewport.w * zoom));
+  const frameH = Math.max(1, Math.round(viewport.h * zoom));
+
   return (
     <div className="browser-panel">
       {/* Chrome-style toolbar: history + ONE omnibox + session controls */}
@@ -611,6 +666,21 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
           onClick={() => void historyAction("reload")}
         >
           <ReloadIcon />
+        </button>
+        <button
+          type="button"
+          className={"browser-tool-btn" + (fitToPane ? " browser-tool-btn--on" : "")}
+          title={
+            fitToPane
+              ? "Following the panel width — click to keep a fixed size"
+              : "Fixed size — click to fit the panel width"
+          }
+          aria-label="Fit to panel"
+          aria-pressed={fitToPane}
+          disabled={!active}
+          onClick={() => setFitToPane((v) => !v)}
+        >
+          <FitIcon />
         </button>
         <div className="browser-omnibox-wrap">
           <span className="browser-omnibox-icon" aria-hidden="true">
@@ -802,7 +872,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         {loading ? (
           <div className="viewer-empty">Starting virtual browser…</div>
         ) : image ? (
-          <div className="browser-stage-inner">
+          <div className="browser-stage-inner" style={{ width: frameW, height: frameH }}>
             <img
               src={image}
               alt="Virtual browser"
@@ -886,6 +956,17 @@ function SvgIcon({ children, size = 16 }: { children: React.ReactNode; size?: nu
     >
       {children}
     </svg>
+  );
+}
+
+function FitIcon() {
+  return (
+    <SvgIcon>
+      <path d="M4 9V4h5" />
+      <path d="M20 15v5h-5" />
+      <path d="M15 4h5v5" />
+      <path d="M9 20H4v-5" />
+    </SvgIcon>
   );
 }
 

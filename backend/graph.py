@@ -184,7 +184,21 @@ from llm import (
     model_key_fallback,
     normalize_tool_transcript,
 )
-from mcp_bridge import build_mcp_tools, is_browser_mcp_tool
+# MCP tools are owned by the native Rust agent (src-tauri/src/mcp.rs); the
+# Python engine below is dead code kept only for its pure helpers, so the
+# bridge is stubbed instead of imported.
+def build_mcp_tools(*_args, **_kwargs):
+    """Stub: MCP connectors are native now (src-tauri/src/mcp.rs)."""
+    return [], _noop_cleanup
+
+
+async def _noop_cleanup() -> None:
+    return None
+
+
+def is_browser_mcp_tool(name: str) -> bool:
+    """Stub: browser tools come from the native MCP client."""
+    return "browser" in (name or "").lower()
 from tool_batching import (
     execute_readonly_calls,
     merge_same_scope_greps,

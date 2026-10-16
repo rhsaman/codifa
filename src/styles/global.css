@@ -21290,7 +21290,10 @@ mark.trace-hit-active {
 .browser-stage {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  /* No scrollbars: the frame is always scaled to fit (max-width/height 100%),
+     and a scrollbar would change the content box, re-triggering the fit
+     observer in a loop that snaps the viewport back to the pane width. */
+  overflow: hidden;
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -21338,18 +21341,24 @@ mark.trace-hit-active {
    declaration order: the frame letterboxes inside the stage (fits BOTH axes
    of any panel size), the device row wraps instead of truncating the size
    label, and the toolbar mouse toggle gets an active accent. */
-.browser-panel .browser-stage-inner {
-  height: 100%;
-  display: flex;
+.browser-panel .browser-stage {
   align-items: center;
-  justify-content: center;
+}
+
+/* The frame's box is set inline from the emulated viewport scaled by the
+   fit zoom (see frameZoom). It must NOT be stretched to the pane: stretching
+   made every viewport change invisible, so the ruler appeared to do nothing. */
+.browser-panel .browser-stage-inner {
+  height: auto;
+  display: block;
+  flex: 0 0 auto;
 }
 
 .browser-panel .browser-stage-img {
-  width: auto;
-  height: auto;
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
   object-fit: contain;
 }
 

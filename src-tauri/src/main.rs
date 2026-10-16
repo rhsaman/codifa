@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod browser;
 mod computer;
 mod trace;
 mod retention;
@@ -124,6 +125,13 @@ fn main() {
                 // sidecar's _start_schedule_loop): polls every 30s, runs due
                 // tasks headless through the native agent, records runs.
                 scheduler::start_loop(root.clone());
+                // Install the built-in MCP connectors (docker, playwright) that
+                // are missing — migrated from the Python sidecar's
+                // seed_builtin_mcp, which ran on every start.
+                let seeded = skills::seed_builtin_mcp(&root);
+                if !seeded.is_empty() {
+                    println!("[mcp] seeded builtin connectors: {}", seeded.join(", "));
+                }
                 std::thread::spawn(move || {
                     let summary = retention::run_startup_sweep(&root);
                     println!("[{summary}]");
@@ -184,6 +192,10 @@ fn main() {
                     // native close path saves the window state.
                     sidecar::stop_sidecar(&app, 5000);
                     pty::kill_all_terminal_sessions(&app);
+                    // Chromium sessions are per-chat and outlive the panel, so
+                    // they must be reaped here or every visited chat leaves a
+                    // browser process behind.
+                    browser::kill_all_sessions();
                     app.state::<Quitting>()
                         .0
                         .store(true, std::sync::atomic::Ordering::Relaxed);

@@ -270,13 +270,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001, S110 — best-effort shutdown signal
         pass
 
-    # Close all cached MCP sessions on exit.
-    try:
-        from mcp_bridge import shutdown_mcp_sessions
-
-        await shutdown_mcp_sessions()
-    except Exception:
-        logger.warning("shutdown_mcp_sessions failed", exc_info=True)
+    # MCP sessions are owned by the native Rust client (src-tauri/src/mcp.rs)
+    # and closed per turn, so there is nothing to shut down here.
 
 
 app = FastAPI(title="Codifa agent sidecar", lifespan=lifespan)
@@ -535,199 +530,9 @@ class CheckpointRestoreRequest(BaseModel):
 
 
 # --- virtual browser (Playwright) ------------------------------------------ #
-# Isolated headless Chromium for the Browser viewer tab. Screenshots and
-# clicks go through this session only, so the user's real mouse/keyboard are
-# never touched (backend/browser_session.py holds the actual page).
-
-class BrowserLaunchRequest(BaseModel):
-    url: str = "about:blank"
-    chat_id: str = ""
-
-
-class BrowserClickRequest(BaseModel):
-    x: int
-    y: int
-    chat_id: str = ""
-
-
-class BrowserTypeRequest(BaseModel):
-    text: str
-    chat_id: str = ""
-
-
-class BrowserKeyRequest(BaseModel):
-    key: str
-    chat_id: str = ""
-
-
-class BrowserNavigateRequest(BaseModel):
-    url: str
-    chat_id: str = ""
-
-
-class BrowserScrollRequest(BaseModel):
-    dx: int = 0
-    dy: int = 0
-    chat_id: str = ""
-
-
-class BrowserViewportRequest(BaseModel):
-    width: int
-    height: int
-    chat_id: str = ""
-
-
-class BrowserMoveRequest(BaseModel):
-    x: int
-    y: int
-    chat_id: str = ""
-
-
-@app.post("/browser/viewport")
-async def browser_viewport(req: BrowserViewportRequest) -> dict:
-    """Resize the virtual browser viewport (responsive device presets)."""
-    import browser_session
-
-    return await browser_session.set_viewport(req.width, req.height, req.chat_id)
-
-
-@app.post("/browser/move")
-async def browser_move(req: BrowserMoveRequest) -> dict:
-    """Move the virtual cursor (hover) inside the browser — no real mouse."""
-    import browser_session
-
-    return await browser_session.move(req.x, req.y, req.chat_id)
-
-
-@app.get("/browser/status")
-async def browser_status(chat_id: str = "") -> dict:
-    """Whether a virtual browser session is currently alive."""
-    import browser_session
-
-    return browser_session.status(chat_id)
-
-
-@app.get("/browser/devtools-url")
-async def browser_devtools_url(chat_id: str = "") -> dict:
-    """Verified DevTools frontend URL to open in the OS browser."""
-    import browser_session
-
-    return await browser_session.devtools_url(chat_id)
-
-
-@app.post("/browser/launch")
-async def browser_launch(req: BrowserLaunchRequest) -> dict:
-    """Start the virtual browser (or navigate it when already running)."""
-    import browser_session
-
-    return await browser_session.launch(req.url.strip() or "about:blank", req.chat_id)
-
-
-@app.get("/browser/screenshot")
-async def browser_screenshot(chat_id: str = "") -> dict:
-    """Latest JPEG frame of the virtual browser viewport (base64)."""
-    import browser_session
-
-    return await browser_session.screenshot(chat_id)
-
-
-@app.post("/browser/click")
-async def browser_click(req: BrowserClickRequest) -> dict:
-    """Virtual click at viewport pixel coordinates — no real mouse involved."""
-    import browser_session
-
-    return await browser_session.click(req.x, req.y, req.chat_id)
-
-
-@app.post("/browser/type")
-async def browser_type(req: BrowserTypeRequest) -> dict:
-    """Type text into the focused element inside the virtual browser."""
-    import browser_session
-
-    return await browser_session.type_text(req.text, req.chat_id)
-
-
-@app.post("/browser/key")
-async def browser_key(req: BrowserKeyRequest) -> dict:
-    """Press a key (Enter, Tab, Escape, ...) inside the virtual browser."""
-    import browser_session
-
-    return await browser_session.press_key(req.key, req.chat_id)
-
-
-@app.post("/browser/navigate")
-async def browser_navigate(req: BrowserNavigateRequest) -> dict:
-    """Navigate the virtual browser to a URL."""
-    import browser_session
-
-    return await browser_session.navigate(req.url.strip(), req.chat_id)
-
-
-class BrowserSearchRequest(BaseModel):
-    """Omnibox query for the virtual browser (Google → Bing → DuckDuckGo)."""
-
-    query: str
-    chat_id: str = ""
-
-
-@app.post("/browser/search")
-async def browser_search(req: BrowserSearchRequest) -> dict:
-    """Search the web: Google first, falling back to Bing then DuckDuckGo."""
-    import browser_session
-
-    return await browser_session.search(req.query, req.chat_id)
-
-
-@app.post("/browser/scroll")
-async def browser_scroll(req: BrowserScrollRequest) -> dict:
-    """Scroll the virtual browser viewport."""
-    import browser_session
-
-    return await browser_session.scroll(req.dx, req.dy, req.chat_id)
-
-
-class BrowserHistoryRequest(BaseModel):
-    """History control for the virtual browser (back / forward / reload)."""
-
-    action: str
-    chat_id: str = ""
-
-
-@app.post("/browser/history")
-async def browser_history(req: BrowserHistoryRequest) -> dict:
-    """Run a history action (back, forward, reload) in the virtual browser."""
-    import browser_session
-
-    return await browser_session.history(req.action.strip().lower(), req.chat_id)
-
-
-class BrowserCloseRequest(BaseModel):
-    chat_id: str = ""
-
-
-@app.post("/browser/close")
-async def browser_close(req: BrowserCloseRequest | None = None) -> dict:
-    """Shut down the virtual browser session."""
-    import browser_session
-
-    return await browser_session.close(req.chat_id if req else "")
-
-
-class BrowserOpenChatsRequest(BaseModel):
-    chat_ids: list[str] = []
-
-
-@app.post("/browser/open-chats")
-async def browser_open_chats(req: BrowserOpenChatsRequest | None = None) -> dict:
-    """Mark which chats are open in the UI (exempt from idle eviction)."""
-    import browser_session
-
-    try:
-        browser_session.set_open_chats(req.chat_ids if req else [])
-    except Exception:  # noqa: BLE001, S110 — tracking never breaks the caller
-        pass
-    return {"ok": True}
-
+# The session is NATIVE now (src-tauri/src/browser.rs): the Rust router owns
+# the headless Chromium and serves /browser/* itself, so no Python route or
+# model remains here.
 
 # --- git ------------------------------------------------------------------- #
 # ابزارهای git برای پنل فرانت‌اند (GitPanel) — همان توابع امنِ
@@ -2371,7 +2176,6 @@ class SteerRequest(BaseModel):
     prompt: str = ""
     attachments: list[str] = []
     images: list = []  # قرارداد یکسان با ChatRequest شامل path و dataUrl
-    mcp_servers: dict = {}
     skills: list[str] = []
     # Full-fidelity history snapshot (same shape as ChatRequest.history).
     # Accepted for forward-compat but intentionally NOT enqueued: a running
@@ -2750,14 +2554,8 @@ def main() -> None:
     except Exception:  # noqa: BLE001, S110 — logging must never kill the sidecar
         pass
 
-    # Disable broken stdio MCP connectors (e.g. a docker MCP with invalid flags)
-    # as soon as the sidecar starts, so they never spam errors during use.
-    try:
-        from tools import validate_mcp_servers
-
-        validate_mcp_servers()
-    except Exception:  # noqa: BLE001, S110 — broken connectors are handled lazily
-        pass
+    # MCP connector validation and builtin seeding are native now — see
+    # src-tauri/src/skills.rs (seed_builtin_mcp) and src-tauri/src/mcp.rs.
 
     # Seed built-in skills from backend/skills/*.md on every startup (no-op for
     # skills that already exist, so user edits/deletions are never overwritten).
@@ -2765,14 +2563,6 @@ def main() -> None:
         from tools import sync_builtin_skills
 
         sync_builtin_skills()
-    except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
-        pass
-
-    # Install the built-in MCP connectors (e.g. the Docker MCP) on first run.
-    try:
-        from tools import seed_builtin_mcp
-
-        seed_builtin_mcp()
     except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
         pass
 

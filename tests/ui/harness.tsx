@@ -328,6 +328,20 @@ if (params.get("scenario") === "diff") {
       <PlanPanel />
     </div>,
   );
+} else if (params.get("scenario") === "browser") {
+  // Real BrowserPanel against the REAL native Rust router (src-tauri/src/browser.rs).
+  // `?port=<router port>` points the panel's sidecarFetch at the running app, so
+  // this exercises the migrated /browser/* endpoints end-to-end in a browser.
+  const port = params.get("port") ?? "";
+  const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+  coder.getSidecarUrl = () => Promise.resolve(port ? `http://127.0.0.1:${port}` : null);
+  coder.probeSidecar = () => Promise.resolve(true);
+  const { BrowserPanel } = await import("../../src/components/BrowserPanel");
+  root.render(
+    <div style={{ display: "flex", height: "100vh", background: "var(--bg, #0b0e14)" }}>
+      <BrowserPanel chatId="probe-native" />
+    </div>,
+  );
 } else if (params.get("scenario") === "app") {
   // Full App shell (titlebar + sidebar + chat + viewer group) for real-dock
   // geometry checks (RTL insets, split widths). Plan tab opens after mount.

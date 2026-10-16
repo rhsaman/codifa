@@ -2662,46 +2662,8 @@ def _retire_renamed_builtins() -> None:
             _state_db.delete_skill(old_name)
 
 
-# Built-in MCP connectors shipped with the app. They are seeded on first run
-# and exempt from startup validation (which would otherwise delete them on
-# machines where the underlying tool isn't installed) — a broken builtin only
-# surfaces if the model actually calls one of its tools.
-_BUILTIN_MCP_SERVERS: dict[str, dict] = {
-    "docker": {
-        "command": "docker",
-        "args": ["mcp", "gateway", "run"],
-    },
-    "playwright": {
-        "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest"],
-    },
-}
-
-
-def seed_builtin_mcp() -> list[str]:
-    """Install built-in MCP connectors that are missing (no-op otherwise).
-
-    Seeds every builtin whose name is NOT already stored under ``mcp/`` —
-    existing entries (user edits) are never overwritten, and NEW builtins
-    (e.g. playwright added after docker) are seeded on the next start even
-    when the table already has entries.
-    """
-    try:
-        existing = _state_db.list_mcp()
-    except Exception:  # noqa: BLE001
-        return []
-    existing_names = set(existing or {})
-    seeded: list[str] = []
-    for name, cfg in _BUILTIN_MCP_SERVERS.items():
-        if name in existing_names:
-            continue
-        try:
-            _state_db.save_mcp(name, json.dumps(cfg, ensure_ascii=False))
-            seeded.append(name)
-        except Exception:  # noqa: BLE001, S112
-            continue
-    return seeded
-
+# Built-in MCP connectors (docker, playwright) are seeded natively now —
+# see src-tauri/src/skills.rs (builtin_mcp_servers / seed_builtin_mcp).
 
 # e5 cosine similarity sits in a compressed band overall — even unrelated
 # short sentences (esp. Persian) score ~0.88-0.89, so a cosine-alone cutoff
@@ -2811,80 +2773,6 @@ def upsert_mcp_server(root: str, name: str, cfg: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"name": name, "error": str(exc)}
     return {"name": name, "ok": True}
-
-
-def _probe_stdio_server(cmd: list[str], timeout: float = 2.5) -> str | None:
-    """Try launching a stdio MCP command; return an error message, or None if it
-    started (stayed alive) or there's nothing to run.
-
-    Broken configs (bad flags, missing binary, immediate crash) exit quickly
-    with a non-zero code, so we capture that to detect them. A server that stays
-    alive waiting on stdin is considered fine and is terminated.
-    """
-    if not cmd:
-        return None
-    try:
-        if shutil.which(cmd[0]) is None:
-            return f"command not found: {cmd[0]}"
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            _, err = proc.communicate(timeout=timeout)
-            if proc.returncode not in (0, None):
-                msg = (err or b"").decode("utf-8", errors="replace").strip()
-                return (
-                    f"exit {proc.returncode}: {msg[:200]}"
-                    if msg
-                    else f"exit {proc.returncode}"
-                )
-            return None
-        except subprocess.TimeoutExpired:
-            # Still running — looks healthy. Kill the probe.
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            return None
-    except Exception as exc:  # noqa: BLE001
-        return str(exc)
-
-
-def validate_mcp_servers() -> list[str]:
-    """Check every stdio connector in the app data folder and remove the ones
-    that fail to start (bad command, wrong flags, immediate crash).
-
-    Returns the names of the servers that were removed so the app can warn the
-    user. HTTP/SSE (url) connectors are not probed at startup.
-    """
-    servers = _state_db.list_mcp()
-    if not servers:
-        return []
-
-    removed: list[str] = []
-    for name, cfg in list(servers.items()):
-        if not isinstance(cfg, dict):
-            continue
-        if name in _BUILTIN_MCP_SERVERS:
-            # Builtin connectors (e.g. the Docker MCP) survive startup
-            # validation even when the tool isn't installed — the failure only
-            # surfaces if the model calls one of its tools.
-            continue
-        if cfg.get("url"):
-            continue  # remote — validated lazily on use
-        cmd = [str(cfg.get("command", ""))]
-        if not cmd or not cmd[0]:
-            continue
-        for a in cfg.get("args") or []:
-            if isinstance(a, str):
-                cmd.append(a)
-        err = _probe_stdio_server(cmd)
-        if err:
-            removed.append(name)
-            _state_db.delete_mcp(name)
-            print(f"[coder] MCP server {name!r} disabled at startup: {err}", flush=True)
-    return removed
 
 
 class EditAmbiguousError(ValueError):
@@ -10639,7 +10527,10 @@ When you need to read several files, read multiple independent files in parallel
              the tree, so the newly-revealed options can usually be acted on
              by selector too, not just the control that opened them.
         """
-        import computer_use as cu
+        # Computer Use is native now (src-tauri/src/computer.rs) and bound only
+        # when the composer switch is on; the Python engine that owned this tool
+        # is gone, so there is nothing to dispatch here.
+        return "computer use is handled by the native agent"
 
         # The model sometimes serializes `steps` as a JSON string instead of a
         # list (the same coercion grep/glob list args already have). Parse it

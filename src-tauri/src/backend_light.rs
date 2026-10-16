@@ -21,6 +21,7 @@ use crate::llm::{self, LlmConfig};
 use crate::sidecar;
 use crate::skills;
 use crate::state::get_data_root;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -680,6 +681,104 @@ async fn health() -> Response<Body> {
     Json(json!({"status": "ok", "version": "1.0.0"})).into_response()
 }
 
+// ---------- /browser/* (native in-app browser) ----------
+//
+// The panel sends `chat_id` as a query param on GET and inside the JSON body
+// on POST (see BrowserPanel.sidecarFetch), so both are accepted here.
+
+fn chat_id_of(body: &Value, query: &HashMap<String, String>) -> String {
+    body.get("chat_id")
+        .and_then(Value::as_str)
+        .or_else(|| query.get("chat_id").map(String::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn browser_status(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
+    let chat = q.get("chat_id").cloned().unwrap_or_default();
+    Json(crate::browser::status(&chat)).into_response()
+}
+
+async fn browser_launch(Json(body): Json<Value>) -> Response<Body> {
+    let url = body["url"].as_str().unwrap_or("about:blank");
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::launch(url, &chat)).into_response()
+}
+
+/// Navigate an ALREADY running session (the panel's address bar).
+async fn browser_navigate(Json(body): Json<Value>) -> Response<Body> {
+    let url = body["url"].as_str().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::navigate_to(url, &chat)).into_response()
+}
+
+async fn browser_screenshot(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
+    let chat = q.get("chat_id").cloned().unwrap_or_default();
+    Json(crate::browser::screenshot(&chat)).into_response()
+}
+
+async fn browser_click(Json(body): Json<Value>) -> Response<Body> {
+    let x = body["x"].as_i64().unwrap_or_default();
+    let y = body["y"].as_i64().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::click(x, y, &chat)).into_response()
+}
+
+async fn browser_move(Json(body): Json<Value>) -> Response<Body> {
+    let x = body["x"].as_i64().unwrap_or_default();
+    let y = body["y"].as_i64().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::move_mouse(x, y, &chat)).into_response()
+}
+
+async fn browser_type(Json(body): Json<Value>) -> Response<Body> {
+    let text = body["text"].as_str().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::type_text(text, &chat)).into_response()
+}
+
+async fn browser_key(Json(body): Json<Value>) -> Response<Body> {
+    let key = body["key"].as_str().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::press_key(key, &chat)).into_response()
+}
+
+async fn browser_scroll(Json(body): Json<Value>) -> Response<Body> {
+    let dx = body["dx"].as_i64().unwrap_or_default();
+    let dy = body["dy"].as_i64().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::scroll(dx, dy, &chat)).into_response()
+}
+
+async fn browser_viewport(Json(body): Json<Value>) -> Response<Body> {
+    let w = body["width"].as_u64().unwrap_or(1280) as u32;
+    let h = body["height"].as_u64().unwrap_or(800) as u32;
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::set_viewport(w, h, &chat)).into_response()
+}
+
+async fn browser_history(Json(body): Json<Value>) -> Response<Body> {
+    let action = body["action"].as_str().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::history(action, &chat)).into_response()
+}
+
+async fn browser_search(Json(body): Json<Value>) -> Response<Body> {
+    let query = body["query"].as_str().unwrap_or_default();
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::search(query, &chat)).into_response()
+}
+
+async fn browser_devtools_url(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
+    let chat = q.get("chat_id").cloned().unwrap_or_default();
+    Json(crate::browser::devtools_url(&chat)).into_response()
+}
+
+async fn browser_close(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(crate::browser::close(&chat)).into_response()
+}
+
 /// Catch-all: every non-native path is proxied to the Python sidecar.
 async fn proxy_fallback(st: State<AppState>, req: Request<Body>) -> Response<Body> {
     let uri: &Uri = req.uri();
@@ -726,6 +825,23 @@ pub fn router(state: AppState) -> Router {
         .route("/schedule-runs/orphans", delete(crate::appstate::orphan_schedule_runs_clear))
         .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
         .route("/chats/title", post(crate::appstate::chat_title))
+        // In-app browser (migrated from the Python sidecar's browser_session):
+        // the right-side panel polls frames and posts input here, and the
+        // agent's Playwright MCP attaches to the same Chromium via /browser/cdp.
+        .route("/browser/status", get(browser_status))
+        .route("/browser/launch", post(browser_launch))
+        .route("/browser/navigate", post(browser_navigate))
+        .route("/browser/screenshot", get(browser_screenshot))
+        .route("/browser/click", post(browser_click))
+        .route("/browser/move", post(browser_move))
+        .route("/browser/type", post(browser_type))
+        .route("/browser/key", post(browser_key))
+        .route("/browser/scroll", post(browser_scroll))
+        .route("/browser/viewport", post(browser_viewport))
+        .route("/browser/history", post(browser_history))
+        .route("/browser/search", post(browser_search))
+        .route("/browser/devtools-url", get(browser_devtools_url))
+        .route("/browser/close", post(browser_close))
         .route("/health", get(health))
         .fallback(proxy_fallback)
         // The default axum body cap is 2 MB — the compact request carries the

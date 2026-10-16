@@ -397,6 +397,43 @@ pub fn list_mcp(root: &Path) -> Value {
     })
 }
 
+/// Built-in MCP connectors installed on first run (mirrors the Python
+/// sidecar's `_BUILTIN_MCP_SERVERS`). They are seeded by NAME: an entry the
+/// user already edited is never overwritten, and a builtin added later (e.g.
+/// playwright after docker) is still seeded on the next start.
+pub fn builtin_mcp_servers() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "docker",
+            json!({"command": "docker", "args": ["mcp", "gateway", "run"]}),
+        ),
+        (
+            "playwright",
+            json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
+        ),
+    ]
+}
+
+/// Install the built-in MCP connectors that are missing. Returns the names
+/// that were seeded (empty when everything was already present).
+pub fn seed_builtin_mcp(root: &Path) -> Vec<String> {
+    let existing = list_mcp(root);
+    let names: Vec<String> = existing["mcpServers"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut seeded = Vec::new();
+    for (name, cfg) in builtin_mcp_servers() {
+        if names.iter().any(|n| n == name) {
+            continue;
+        }
+        if save_mcp(root, &json!({"name": name, "cfg": cfg})).is_ok() {
+            seeded.push(name.to_string());
+        }
+    }
+    seeded
+}
+
 /// POST /mcp — save one connector (`{name, cfg}`).
 pub fn save_mcp(root: &Path, body: &Value) -> Result<Value, String> {
     let name = body["name"].as_str().unwrap_or("").trim().to_string();

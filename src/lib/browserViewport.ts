@@ -72,6 +72,39 @@ export function fitWidthTarget(paneW: number, capW: number, minW: number = VIEWP
   return Math.max(minW, Math.min(capW, Math.round(paneW)))
 }
 
+/**
+ * The fit cap after a status poll reports `w`x`h`.
+ *
+ * A poll that echoes the size WE just applied is our own resize coming back,
+ * so the cap must stay put. Only a genuine external resize (agent / CDP)
+ * becomes the new cap. Regression this guards: a fit-shrunk width used to
+ * overwrite the cap, and once cap === current width the fit target never
+ * differed again — the panel froze at one size and the ruler did nothing.
+ *
+ * `own` is the last size this panel applied (null before the first apply).
+ */
+export function capAfterPoll(
+  own: { w: number; h: number } | null,
+  w: number,
+  h: number,
+  capW: number,
+): number {
+  if (own && own.w === w && own.h === h) return capW
+  return w
+}
+
+/** On-screen zoom for the emulated frame: never upscale past 1:1, shrink to
+ *  fit the pane on either axis. Pure so the responsive fit is unit-tested.
+ *
+ *  The frame must be RENDERED at this scale instead of being stretched to the
+ *  pane: stretching made every viewport change invisible (a 375px viewport and
+ *  a 1600px one both filled the pane), which is why the ruler looked dead. */
+export function frameZoom(paneW: number, paneH: number, vw: number, vh: number): number {
+  if (!Number.isFinite(paneW) || !Number.isFinite(paneH) || paneW <= 0 || paneH <= 0) return 1
+  if (!Number.isFinite(vw) || !Number.isFinite(vh) || vw <= 0 || vh <= 0) return 1
+  return Math.min(1, paneW / vw, paneH / vh)
+}
+
 /** True when an incoming viewport size should overwrite the manual drafts: only on a real change and never while editing. */
 export function shouldSyncViewportDrafts(prevW: number, prevH: number, nextW: number, nextH: number, editing: boolean): boolean {
   if (editing) return false

@@ -265,44 +265,22 @@ fn is_playwright_cfg(cfg: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Ask the sidecar to start (or reuse) this chat's in-app browser and return
-/// its CDP endpoint. The sidecar owns the headless Chromium the right-side
-/// Browser panel mirrors, so pointing Playwright MCP at that endpoint keeps
-/// the agent and the panel on the SAME browser — nothing opens outside the
-/// app. Returns None when the sidecar is down or the session cannot start.
+/// Ask the native browser session for this chat's CDP endpoint. The Rust
+/// router owns the headless Chromium the right-side Browser panel mirrors, so
+/// pointing Playwright MCP at that endpoint keeps the agent and the panel on
+/// the SAME browser — nothing opens outside the app. Returns None when the
+/// session cannot start (the caller then falls back to --headless).
 fn in_app_cdp_endpoint(chat_id: &str) -> Option<String> {
-    let base = crate::sidecar::current_url()?;
-    let chat = chat_id.to_string();
-    std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .ok()?;
-        let body: Value = client
-            .post(format!("{base}/browser/launch"))
-            .json(&json!({"url": "about:blank", "chat_id": chat}))
-            .send()
-            .ok()?
-            .json()
-            .ok()?;
-        if body.get("ok").and_then(Value::as_bool) != Some(true) {
-            return None;
-        }
-        let endpoint = body.get("cdp").and_then(Value::as_str)?;
-        // The endpoint is only useful when the browser is ACTUALLY listening.
-        // Playwright MCP exits immediately on an unreachable --cdp-endpoint,
-        // which surfaced to the user as "the browser tool is unavailable" —
-        // worse than the old behaviour of opening its own window. Probe the
-        // port first and let the caller fall back to --headless.
-        let addr = endpoint.strip_prefix("http://")?;
-        let addr: std::net::SocketAddr = addr.parse().ok()?;
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
-        Some(endpoint.to_string())
-    })
-    .join()
-    .ok()
-    .flatten()
+    let endpoint = crate::browser::cdp_endpoint(chat_id)?;
+    // The endpoint is only useful when the browser is ACTUALLY listening.
+    // Playwright MCP exits immediately on an unreachable --cdp-endpoint, which
+    // surfaced to the user as "the browser tool is unavailable" — worse than
+    // the old behaviour of opening its own window. Probe the port first and
+    // let the caller fall back to --headless.
+    let addr = endpoint.strip_prefix("http://")?;
+    let addr: std::net::SocketAddr = addr.parse().ok()?;
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    Some(endpoint)
 }
 
 /// The config to actually connect with. `@playwright/mcp` normally launches a

@@ -359,18 +359,23 @@ pub fn layout_snapshot(root: &str, budget: usize) -> String {
 /// (no /opt/homebrew/bin), so probe the common install locations before
 /// giving up — the agent's grep tool depends on ripgrep.
 fn rg_binary() -> String {
-    const CANDIDATES: &[&str] = &["rg", "/opt/homebrew/bin/rg", "/usr/local/bin/rg"];
-    for c in CANDIDATES {
-        if std::process::Command::new(c)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return (*c).to_string();
+    // Probed once per process: every grep used to spawn an extra `rg --version`.
+    static RG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RG.get_or_init(|| {
+        const CANDIDATES: &[&str] = &["rg", "/opt/homebrew/bin/rg", "/usr/local/bin/rg"];
+        for c in CANDIDATES {
+            if std::process::Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return (*c).to_string();
+            }
         }
-    }
-    "rg".to_string()
+        "rg".to_string()
+    })
+    .clone()
 }
 
 /// Grep file contents via the ripgrep binary (rg) — parallel search,
@@ -815,6 +820,7 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             let max = args["max_results"].as_u64().unwrap_or(50) as usize;
             grep_scope(Path::new(root), &s("path"), &joined, &s("include"), max)
         }
+        "find_symbol" => find_symbol(Path::new(root), &s("symbol"), &s("path"), &s("include")),
         "glob" => {
             let mut patterns = vec![s("pattern")];
             if let Some(extra) = args["patterns"].as_array() {
@@ -1036,12 +1042,287 @@ fn system_stats(filter: &str, top: usize) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// find_symbol: definition + body + usages of an identifier in ONE call
+// ---------------------------------------------------------------------------
+
+const FIND_SYMBOL_MAX_DEFS: usize = 3;
+const FIND_SYMBOL_BODY_LINES: usize = 40;
+const FIND_SYMBOL_MAX_USAGES: usize = 25;
+
+/// `(path, line, text)` rows from ONE rg run: no context, at most 6 matching
+/// lines per file, workspace noise dirs excluded, paths relative to `search_dir`.
+fn rg_rows(
+    search_dir: &Path,
+    target: &str,
+    include: &str,
+    extra: &[&str],
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<(String, usize, String)>, String> {
+    let mut cmd = std::process::Command::new(rg_binary());
+    cmd.current_dir(search_dir)
+        .stdin(std::process::Stdio::null())
+        .args([
+            "--line-number", "--no-heading", "--with-filename", "--color", "never",
+            "--no-messages", "--max-count", "6",
+        ])
+        .args(extra);
+    for d in SKIP_DIRS {
+        cmd.arg("--glob").arg(format!("!{d}"));
+    }
+    if !include.is_empty() {
+        cmd.arg("--glob").arg(include);
+    }
+    cmd.arg("-e").arg(pattern).arg("--").arg(target);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("ripgrep (rg) is required but could not be run: {e}"))?;
+    if out.status.code() == Some(2) && out.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let mut rows = Vec::new();
+    for l in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = l.splitn(3, ':');
+        let (Some(p), Some(n), Some(t)) = (it.next(), it.next(), it.next()) else { continue };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        rows.push((p.trim_start_matches("./").to_string(), n, t.to_string()));
+        if rows.len() >= limit {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace())
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// Last 0-based line of the definition that starts at `start`, found by
+/// indentation (language-agnostic): everything deeper than the definition line
+/// belongs to it, plus a closing `}` / `end` at the same indent. Signature
+/// continuations at the base indent (`) -> T {`, `where`, `{`) are skipped.
+fn definition_end(lines: &[&str], start: usize) -> usize {
+    let base = indent_width(lines[start]);
+    let mut end = start;
+    let mut i = start + 1;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        let t = l.trim_start();
+        let ind = indent_width(l);
+        if ind > base {
+            end = i;
+        } else if ind == base && (t.starts_with(')') || t.starts_with(']') || t.starts_with("where") || t.starts_with('{')) {
+            end = i;
+        } else {
+            if ind == base && (t.starts_with('}') || t == "end" || t.starts_with("end ")) {
+                end = i;
+            }
+            break;
+        }
+        i += 1;
+    }
+    end
+}
+
+/// Definition(s) with their bodies plus the usages of ONE identifier, in a
+/// single call — replaces the grep -> lsp_definition -> lsp_references chain
+/// (three model round trips) and needs no language server, so it works for
+/// every language. Case-sensitive, whole-word.
+pub fn find_symbol(root: &Path, symbol: &str, scope: &str, include: &str) -> Result<String, String> {
+    let symbol = symbol.trim();
+    if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        return Err(format!(
+            "find_symbol takes ONE bare identifier (letters, digits, _ or $), got {symbol:?} — use grep for patterns"
+        ));
+    }
+    let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let scope_abs = if scope.is_empty() {
+        root_real.clone()
+    } else {
+        resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
+    };
+    let (search_dir, target) = if scope_abs.is_file() {
+        (
+            scope_abs.parent().unwrap_or(&root_real).to_path_buf(),
+            scope_abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into()),
+        )
+    } else {
+        (scope_abs.clone(), ".".to_string())
+    };
+
+    let esc = regex::escape(symbol);
+    let def_pat = format!(
+        r"\b(fn|def|class|struct|enum|trait|type|interface|const|static|function|func|let|var|mod)\s+{esc}\b|func\s*\([^)]*\)\s*{esc}\b"
+    );
+    let (defs, uses) = std::thread::scope(|s| {
+        let d = s.spawn(|| rg_rows(&search_dir, &target, include, &[], &def_pat, 20));
+        let u = s.spawn(|| rg_rows(&search_dir, &target, include, &["-w", "--fixed-strings"], symbol, 120));
+        (d.join().unwrap_or_else(|_| Err("search thread failed".into())), u.join().unwrap_or_else(|_| Err("search thread failed".into())))
+    });
+    let defs = defs?;
+    let uses = uses?;
+
+    let rel = |p: &str| -> String {
+        let abs = search_dir.join(p).components().collect::<std::path::PathBuf>();
+        abs.strip_prefix(&root_real).unwrap_or(&abs).to_string_lossy().to_string()
+    };
+    let defs: Vec<(String, usize, String)> = defs.into_iter().map(|(p, n, t)| (rel(&p), n, t)).collect();
+    let usages: Vec<(String, usize, String)> = uses
+        .into_iter()
+        .map(|(p, n, t)| (rel(&p), n, t))
+        .filter(|(p, n, _)| !defs.iter().any(|(dp, dn, _)| dp == p && dn == n))
+        .collect();
+
+    if defs.is_empty() && usages.is_empty() {
+        return Ok(format!(
+            "no matches for symbol `{symbol}` (case-sensitive, whole word). This answer is final for this spelling — try another spelling, or grep with a looser pattern."
+        ));
+    }
+
+    let mut out = format!(
+        "find_symbol `{symbol}`: {} definition(s), {} usage(s)\n",
+        defs.len(),
+        usages.len()
+    );
+    if !defs.is_empty() {
+        out.push_str("\nDEFINITIONS\n");
+        for (path, line, text) in defs.iter().take(FIND_SYMBOL_MAX_DEFS) {
+            let abs = root_real.join(path);
+            let Ok(src) = fs::read_to_string(&abs) else {
+                out.push_str(&format!("{path}:{line}  {}\n", text.trim()));
+                continue;
+            };
+            let lines: Vec<&str> = src.lines().collect();
+            let start = line.saturating_sub(1).min(lines.len().saturating_sub(1));
+            if lines.is_empty() {
+                continue;
+            }
+            let full_end = definition_end(&lines, start);
+            let end = full_end.min(start + FIND_SYMBOL_BODY_LINES - 1);
+            out.push_str(&format!("{path}:{}-{}\n", start + 1, full_end + 1));
+            for (i, l) in lines.iter().enumerate().take(end + 1).skip(start) {
+                let shown: String = l.chars().take(200).collect();
+                out.push_str(&format!("  {}: {shown}\n", i + 1));
+            }
+            if full_end > end {
+                out.push_str(&format!(
+                    "  … (+{} more lines — read {path} offset={} for the rest)\n",
+                    full_end - end,
+                    end + 2
+                ));
+            }
+        }
+        if defs.len() > FIND_SYMBOL_MAX_DEFS {
+            out.push_str(&format!("(+{} more definitions, bodies omitted)\n", defs.len() - FIND_SYMBOL_MAX_DEFS));
+            for (path, line, text) in defs.iter().skip(FIND_SYMBOL_MAX_DEFS) {
+                let shown: String = text.trim().chars().take(140).collect();
+                out.push_str(&format!("  {path}:{line}  {shown}\n"));
+            }
+        }
+    }
+    if !usages.is_empty() {
+        out.push_str("\nUSAGES (definitions excluded; at most 6 per file)\n");
+        for (path, line, text) in usages.iter().take(FIND_SYMBOL_MAX_USAGES) {
+            let shown: String = text.trim().chars().take(160).collect();
+            out.push_str(&format!("{path}:{line}  {shown}\n"));
+        }
+        if usages.len() > FIND_SYMBOL_MAX_USAGES {
+            out.push_str(&format!("(+{} more usages — scope with path/include)\n", usages.len() - FIND_SYMBOL_MAX_USAGES));
+        }
+    }
+    Ok(out)
+}
+
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+
+    fn find_symbol_fixture() -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("codifa-findsym-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::create_dir_all(tmp.join("backend")).unwrap();
+        fs::create_dir_all(tmp.join("target")).unwrap();
+        fs::write(tmp.join("src/compact.rs"), "// compact_history docs\npub async fn compact_history(\n    a: u8,\n) -> u8\nwhere\n    u8: Copy,\n{\n    let x = 1;\n    x\n}\n\nfn other() {}\n").unwrap();
+        fs::write(tmp.join("src/main.rs"), "fn main() {\n    compact_history(1);\n    // سلام compact_history\n}\n").unwrap();
+        fs::write(tmp.join("backend/srv.py"), "def compact_history(x):\n    y = x\n    return y\n\ndef other():\n    pass\n").unwrap();
+        fs::write(tmp.join("backend/g.go"), "package b\nfunc (s *S) Handle(x int) int {\n\treturn x\n}\n").unwrap();
+        fs::write(tmp.join("target/junk.rs"), "fn compact_history() {}\n").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn definition_end_handles_rust_signatures_python_and_one_liners() {
+        let rs: Vec<&str> = "pub fn f(\n    a: u8,\n) -> u8\nwhere\n    u8: Copy,\n{\n    a\n}\n\nfn g() {}".lines().collect();
+        assert_eq!(definition_end(&rs, 0), 7);
+        let py: Vec<&str> = "def f(x):\n    y = 1\n\n    return y\n\ndef g():\n    pass".lines().collect();
+        assert_eq!(definition_end(&py, 0), 3);
+        let one: Vec<&str> = "const A: u8 = 1;\nconst B: u8 = 2;".lines().collect();
+        assert_eq!(definition_end(&one, 0), 0);
+    }
+
+    #[test]
+    fn find_symbol_returns_definitions_with_bodies_and_usages_in_one_call() {
+        let tmp = find_symbol_fixture();
+        let out = find_symbol(&tmp, "compact_history", "", "").unwrap();
+        assert!(out.contains("2 definition(s)") && out.contains("usage(s)"), "{out}");
+        // Rust def: whole multi-line signature + body, found by indentation.
+        assert!(out.contains("src/compact.rs:2-10"), "{out}");
+        assert!(out.contains("  8:     let x = 1;") && out.contains("  10: }"), "{out}");
+        // Python def too, and build output (target/) is never searched.
+        assert!(out.contains("backend/srv.py:1-3") && !out.contains("target/"), "{out}");
+        // Usages exclude the definition lines themselves and keep Persian text intact.
+        assert!(out.contains("USAGES") && out.contains("src/main.rs:2  compact_history(1);"), "{out}");
+        assert!(out.contains("src/main.rs:3  // سلام compact_history"), "{out}");
+        assert!(!out.contains("src/compact.rs:2  "), "definition leaked into usages: {out}");
+        // Scoped to one file.
+        let one = find_symbol(&tmp, "compact_history", "backend/srv.py", "").unwrap();
+        assert!(one.contains("1 definition(s)") && !one.contains("src/compact.rs"), "{one}");
+        // Go method receivers count as definitions.
+        let go = find_symbol(&tmp, "Handle", "", "*.go").unwrap();
+        assert!(go.contains("backend/g.go:2-4"), "{go}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_symbol_rejects_patterns_and_reports_misses_as_final() {
+        let tmp = find_symbol_fixture();
+        assert!(find_symbol(&tmp, "a.*b", "", "").unwrap_err().contains("bare identifier"));
+        assert!(find_symbol(&tmp, "", "", "").is_err());
+        let miss = find_symbol(&tmp, "nothing_here_xyz", "", "").unwrap();
+        assert!(miss.starts_with("no matches for symbol") && miss.contains("final"), "{miss}");
+        assert!(find_symbol(&tmp, "x", "../../etc", "").is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn long_bodies_are_cut_with_a_pointer_to_the_rest() {
+        let tmp = std::env::temp_dir().join(format!("codifa-findsym-long-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let mut body = String::from("fn big() {\n");
+        for i in 0..100 { body.push_str(&format!("    let v{i} = {i};\n")); }
+        body.push_str("}\n");
+        fs::write(tmp.join("a.rs"), body).unwrap();
+        let out = find_symbol(&tmp, "big", "", "").unwrap();
+        assert!(out.contains("a.rs:1-102") && out.contains("more lines — read a.rs offset=41"), "{out}");
+        assert!(!out.contains("v90"), "{out}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn system_stats_lists_processes() {

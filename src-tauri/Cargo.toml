@@ -36,6 +36,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 regex = "1"
 walkdir = "2"
 tokio-stream = "0.1"
+# Native in-app browser: Chromium is driven over the CDP WebSocket protocol
+# (navigate/screenshot/click/type), which reqwest cannot speak.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (UTC).
 chrono = "0.4"
 
@@ -46,12 +49,34 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# `tauri dev` runs a DEBUG build: without this the store/JSON/PTY hot paths
-# run unoptimized and the whole app feels far slower than the Electron release
-# build. Optimizing dependencies (not our crate) keeps incremental builds fast
-# while making dev runtime close to release.
+# `tauri dev` runs a DEBUG build. Full debuginfo on our own crate is what made
+# dev eat gigabytes of RAM: every generic instantiation keeps its DWARF, and
+# unoptimized code allocates far more temporaries than the release build (which
+# is why the packaged app felt fine). Line tables are enough for a backtrace,
+# and opt-level 1 removes the worst of the unoptimized temporaries while keeping
+# incremental rebuilds fast.
+[profile.dev]
+debug = 1
+opt-level = 1
+
+# `tauri dev` runs a DEBUG build. Two knobs matter here:
+#
+# * `debug = 0` — full DWARF debug info is the single biggest memory consumer
+#   during codegen: rustc holds it all in RAM per crate, and with ~10 crates
+#   compiling in parallel that alone reached ~1.4 GB and made the machine
+#   stutter. Line tables (`debug = 1`) keep backtraces readable for a fraction
+#   of the cost.
+# * `opt-level = 1` for dependencies — the previous `2` ran the full optimizer
+#   on every dependency (tauri, tokio, reqwest, rusqlite, image, ...), which is
+#   what pushed individual rustc processes to 150-250 MB. Level 1 keeps the
+#   store/JSON/PTY hot paths fast enough that dev does not feel sluggish while
+#   cutting compile memory substantially.
+[profile.dev]
+debug = 1
+
 [profile.dev.package."*"]
-opt-level = 2
+opt-level = 1
+debug = false
 
 [dev-dependencies]
 tower = "0.5.3"

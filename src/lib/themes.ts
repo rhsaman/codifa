@@ -8,7 +8,7 @@ export interface Theme {
   workspaceColors: string[]
 }
 
-export const DEFAULT_THEME = 'catppuccin'
+export const DEFAULT_THEME = 'rose-pine'
 
 export const THEMES: Theme[] = [
   {

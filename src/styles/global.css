@@ -1,40 +1,43 @@
 :root {
-  --bg: #1e1e2e;
-  --bg-alt: #181825;
-  --bg-panel: #313244;
+  /* Pre-hydration fallback: mirrors DEFAULT_THEME (rose-pine) so the first
+     paint matches the theme the app settles on — no flash of another palette
+     before injectThemeStyles() + the App effect apply [data-theme]. */
+  --bg: #191724;
+  --bg-alt: #21202e;
+  --bg-panel: #1f1d2e;
   /* Inset "well" surface for expanded tool bodies (DURATION/SUMMARY/ARGS):
      derived from the theme itself — sits between the chat background (--bg)
      and the card frame (--bg-panel), so the body reads as recessed vs the
      frame without leaving the theme palette. */
   --bg-inset: color-mix(in srgb, var(--bg) 60%, var(--bg-panel) 40%);
   /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs). */
-  --bg-raised: #45475a;
-  --bg-input: #45475a;
-  --bg-hover: #45475a;
-  --border: #45475a;
-  --text: #cdd6f4;
-  --text-dim: #a6adc8;
-  --accent: #89b4fa;
-  --accent-dim: #45475a;
-  --on-accent: #11111b;
-  --danger: #f38ba8;
-  --success: #a6e3a1;
-  --link: #89b4fa;
+  --bg-raised: #403d52;
+  --bg-input: #26233a;
+  --bg-hover: #403d52;
+  --border: #524f67;
+  --text: #e0def4;
+  --text-dim: #b0abc8;
+  --accent: #ebbcba;
+  --accent-dim: #403d52;
+  --on-accent: #191724;
+  --danger: #eb6f92;
+  --success: #9ccfd8;
+  --link: #4a9bc0;
   /* Freshly-processed (non-cached) tokens, shown next to the cached (⚡)
-     badge in the Model usage panel -- Catppuccin Mocha peach. */
-  --fresh: #fab387;
-  /* Per-provider dot colors for the Model usage panel — fallback (Catppuccin). */
-  --provider-openrouter: #fab387;
-  --provider-google: #f9e2af;
-  --provider-nvidia: #94e2d5;
-  --provider-cloudflare: #89b4fa;
-  --provider-tokenrouter: #cba6f7;
-  --provider-ollama: #f5c2e7;
-  --provider-custom: #a6adc8;
+     badge in the Model usage panel -- Rose Pine gold. */
+  --fresh: #f6c177;
+  /* Per-provider dot colors for the Model usage panel — fallback (Rose Pine). */
+  --provider-openrouter: #f6c177;
+  --provider-google: #9ccfd8;
+  --provider-nvidia: #31748f;
+  --provider-cloudflare: #c4a7e7;
+  --provider-tokenrouter: #ebbcba;
+  --provider-ollama: #6e6a86;
+  --provider-custom: #e0def4;
   /* Tool-call category colors are derived from the theme accent via
      --tool-color overrides on each card class: single = full accent,
      group = muted mix, explore = dimmer mix. No fixed per-category vars. */
-  --thinking: #f9e2af;
+  --thinking: #f6c177;
   --radius: 14px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
   --focus-ring: 0 0 0 2px color-mix(in srgb, var(--text) 25%, transparent);

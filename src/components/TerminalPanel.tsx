@@ -59,17 +59,18 @@ function cwdBasename(cwd: string): string {
 }
 
 /** Map the app's active theme CSS variables onto the xterm palette so the
- *  terminal never looks bolted-on. Falls back to the Catppuccin defaults. */
+ *  terminal never looks bolted-on. Falls back to the Rose Pine defaults
+ *  (DEFAULT_THEME) for the pre-hydration paint. */
 function xtermTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement)
   const v = (name: string, fallback: string): string => cs.getPropertyValue(name).trim() || fallback
   return {
-    background: v('--bg-alt', '#181825'),
-    foreground: v('--text', '#cdd6f4'),
-    cursor: v('--text', '#cdd6f4'),
-    cursorAccent: v('--bg-alt', '#181825'),
-    selectionBackground: v('--accent-dim', '#45475a'),
-    selectionForeground: v('--text', '#cdd6f4'),
+    background: v('--bg-alt', '#21202e'),
+    foreground: v('--text', '#e0def4'),
+    cursor: v('--text', '#e0def4'),
+    cursorAccent: v('--bg-alt', '#21202e'),
+    selectionBackground: v('--accent-dim', '#403d52'),
+    selectionForeground: v('--text', '#e0def4'),
   }
 }
 

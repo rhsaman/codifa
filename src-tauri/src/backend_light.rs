@@ -249,6 +249,18 @@ fn default_provider() -> String {
     "custom".into()
 }
 
+/// Decision-slot value selecting the downloaded on-device Laya router
+/// (mirrors `laya_router.LAYA_ENTRY`). It is a local classifier, NOT a provider
+/// model, so it must never be resolved as a bare model name: doing that sent
+/// the call to the parent provider with the literal model "laya", which failed
+/// and silently dropped the turn back to the in-code matcher.
+pub const LAYA_ENTRY: &str = "laya";
+
+/// True when a Tool Models slot selects the local on-device router.
+pub fn is_local_router_entry(entry: &str) -> bool {
+    entry.trim().eq_ignore_ascii_case(LAYA_ENTRY)
+}
+
 /// Resolve a Tool Models slot entry ("providerId/model" | bare model | "")
 /// to (model, base_url, api_keys) — shared by the compact and sub-agent
 /// slots; mirrors graph.py resolve_subagent_model.
@@ -857,6 +869,19 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn local_router_slot_is_recognised_not_treated_as_a_model() {
+        // The decision slot may hold the local on-device router sentinel. It is
+        // not a model name: resolving it as one sent "laya" to the parent
+        // provider and failed, so the slot looked like it did nothing.
+        assert!(is_local_router_entry("laya"));
+        assert!(is_local_router_entry("  Laya "));
+        assert!(!is_local_router_entry(""));
+        assert!(!is_local_router_entry("main"));
+        assert!(!is_local_router_entry("p1/laya"));
+        assert!(!is_local_router_entry("layax"));
+    }
 
     #[test]
     fn slot_kind_follows_the_slot_provider_not_the_parent() {

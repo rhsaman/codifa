@@ -510,12 +510,29 @@ pub async fn run_turn(
     // The "decision" Tool Models slot, when set, picks the skills with a model
     // call; otherwise the deterministic in-code matcher runs (no extra call).
     let client = http_client();
-    let decision_cfg = req.subagent_models.get("decision").and_then(|slot| {
-        if slot.trim().is_empty() {
-            return None;
-        }
+    // The decision slot may hold the local on-device router sentinel (Laya).
+    // That is a Python-side classifier with no native equivalent, so it must
+    // NOT be resolved as a bare model name — doing so sent the literal model
+    // "laya" to the parent provider, failed, and silently fell back to the
+    // in-code matcher, which made the user's Settings choice look inert.
+    let decision_slot = req
+        .subagent_models
+        .get("decision")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let decision_cfg = if decision_slot.is_empty() {
+        None
+    } else if crate::backend_light::is_local_router_entry(&decision_slot) {
+        emit(&AgentEvent::Warn {
+            content: "the local Laya decision router is not available in the native agent \
+— using the built-in skill matcher for this turn (pick a provider model in \
+Settings → Tools → Decision to route with a model)"
+                .into(),
+        });
+        None
+    } else {
         let (model, base_url, api_keys) = crate::backend_light::resolve_slot_target(
-            slot,
+            &decision_slot,
             &req.model,
             &req.base_url,
             &cfg.api_keys,
@@ -527,7 +544,7 @@ pub async fn run_turn(
             // header. Using the user-configured provider_id here sent every
             // anthropic/google decision call to the OpenAI-compatible path.
             provider: crate::backend_light::resolve_slot_kind(
-                slot,
+                &decision_slot,
                 &req.provider,
                 &req.providers,
             ),
@@ -538,7 +555,7 @@ pub async fn run_turn(
             max_tokens: Some(32),
             timeout_secs: 30,
         })
-    });
+    };
     let skill_section = crate::skill_router::build_section_async(
         // The skill store lives in the DATA root, not the workspace.
         if req.data_root.is_empty() {

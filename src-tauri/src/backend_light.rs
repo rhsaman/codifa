@@ -1298,4 +1298,67 @@ mod tests {
         assert!(normalize_compact_usage(None, "m").is_none());
         assert!(normalize_compact_usage(Some(json!(null)), "m").is_none());
     }
+
+    #[tokio::test]
+    async fn model_probe_rejects_an_empty_selection() {
+        // The probe moved native (it was the last live consumer of the
+        // LangChain model factory); the 400 contract must survive the move.
+        let app = router(new_state(std::env::temp_dir()));
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/models/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"provider":"custom","model":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/models/test-batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"provider":"custom","models":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn model_probe_reports_a_failure_per_model_without_failing_the_batch() {
+        // An unreachable provider must mark that model failed (no green tick)
+        // while the batch itself still answers 200 — the UI ticks per model.
+        let app = router(new_state(std::env::temp_dir()));
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/models/test-batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"custom","base_url":"http://127.0.0.1:1","api_keys":["k"],"models":["m"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = &body["results"][0];
+        assert_eq!(item["model"], "m");
+        assert_eq!(item["ok"], false);
+        assert!(
+            item["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "a failed probe must carry the reason: {body}"
+        );
+    }
 }

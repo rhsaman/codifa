@@ -563,6 +563,45 @@ mod tests {
     }
 
     #[test]
+    fn prefilter_ranks_the_relevant_skills_first() {
+        // The decision router only ever sees a slice of the store, so the
+        // ranking must put the relevant skills in that slice instead of
+        // handing the model an alphabetical head.
+        let all = vec![
+            skill("Git Workflow", "branching and commits", &[]),
+            skill("UI UX Pro Max", "design modern interfaces", &["طراحی", "رابط کاربری"]),
+            skill("Movie Finder", "find movies", &[]),
+        ];
+        let ranked = prefilter("برای صفحه لندینگ یک طراحی UI مدرن بساز", &all);
+        assert_eq!(ranked[0]["name"], "UI UX Pro Max");
+        // Every row survives (the store is smaller than the cap).
+        assert_eq!(ranked.len(), all.len());
+    }
+
+    #[test]
+    fn prefilter_caps_the_catalog_and_keeps_the_best() {
+        // A store larger than the cap must still surface the matching skill.
+        let mut all: Vec<Value> = (0..PREFILTER_LIMIT + 20)
+            .map(|i| skill(&format!("Filler {i}"), "unrelated filler text", &[]))
+            .collect();
+        all.push(skill("Landing Page Design", "design landing pages", &[]));
+        let ranked = prefilter("design a landing page for my product", &all);
+        assert_eq!(ranked.len(), PREFILTER_LIMIT);
+        assert_eq!(ranked[0]["name"], "Landing Page Design");
+    }
+
+    #[test]
+    fn prefilter_fails_open_on_empty_input() {
+        // Routing must degrade to the unfiltered store, never to an empty one.
+        let all = vec![skill("Git Workflow", "branching", &[])];
+        assert_eq!(prefilter("", &all).len(), 1);
+        assert_eq!(prefilter("   ", &all).len(), 1);
+        assert!(prefilter("anything", &[]).is_empty());
+        // A query with no rankable tokens (all < 3 chars) keeps store order.
+        assert_eq!(prefilter("a b", &all).len(), 1);
+    }
+
+    #[test]
     fn auto_match_is_capped_and_stable() {
         let all = vec![
             skill("Alpha", "alpha thing", &[]),

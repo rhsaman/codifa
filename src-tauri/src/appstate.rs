@@ -663,7 +663,13 @@ pub async fn chat_title(
         }
     }
 
-    let mut last_error = String::new();
+    // Report the FIRST candidate's failure, not the last: the first candidate
+    // is the model the user actually picked (the title slot), so its error is
+    // the actionable one. Reporting the last fallback's error hid the real
+    // cause — a misconfigured title slot surfaced as "no api key configured"
+    // from the parent-model fallback, which sent debugging in the wrong
+    // direction entirely.
+    let mut first_error = String::new();
     let mut usage = Value::Null;
     for (c_kind, c_model, c_base, c_keys) in candidates {
         let cfg = crate::llm::LlmConfig {
@@ -688,12 +694,18 @@ pub async fn chat_title(
                 if !title.is_empty() {
                     return Json(json!({ "title": title, "usage": usage })).into_response();
                 }
-                last_error = "model returned an empty title".into();
+                if first_error.is_empty() {
+                    first_error = "model returned an empty title".into();
+                }
             }
-            Err(e) => last_error = e,
+            Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e;
+                }
+            }
         }
     }
-    Json(json!({ "title": Value::Null, "usage": usage, "error": last_error })).into_response()
+    Json(json!({ "title": Value::Null, "usage": usage, "error": first_error })).into_response()
 }
 
 /// Reduce a raw model reply to a usable one-line title.

@@ -1391,7 +1391,10 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
             }
             let offset = args["offset"].as_u64().unwrap_or(1);
             let limit = args["limit"].as_u64().unwrap_or(400);
-            Some(format!("read|{file}|{offset}|{limit}"))
+            // `ranges` selects other windows of the same file: without it in the
+            // key, a second read of a DIFFERENT range was answered as a repeat.
+            let ranges = args["ranges"].to_string(); // "null" when absent
+            Some(format!("read|{file}|{offset}|{limit}|{ranges}"))
         }
         "grep" => {
             // The model sends either `pattern` or a `patterns` array.
@@ -1409,6 +1412,13 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
                 return None;
             }
             Some(format!("grep|{pattern}|{}|{}", s("path"), s("include")))
+        }
+        "find_symbol" => {
+            let symbol = s("symbol");
+            if symbol.is_empty() {
+                return None;
+            }
+            Some(format!("find_symbol|{symbol}|{}|{}", s("path"), s("include")))
         }
         _ => None,
     }
@@ -1882,6 +1892,11 @@ mod tests {
         // A different window of the same file is a real read.
         let c = json!({"filePath": "src/a.ts", "offset": 401, "limit": 400});
         assert_ne!(lookup_key("read", &a), lookup_key("read", &c));
+        // Different `ranges` of one file are different lookups (same ranges repeat).
+        let r1 = json!({"filePath": "src/a.ts", "ranges": [{"offset": 1, "limit": 50}]});
+        let r2 = json!({"filePath": "src/a.ts", "ranges": [{"offset": 200, "limit": 50}]});
+        assert_ne!(lookup_key("read", &r1), lookup_key("read", &r2));
+        assert_eq!(lookup_key("read", &r1), lookup_key("read", &r1.clone()));
         // Grep keys carry the scope, so the same pattern in another directory
         // is a different lookup.
         let g1 = json!({"pattern": "foo", "path": "src"});
@@ -1896,6 +1911,12 @@ mod tests {
             lookup_key("grep", &json!({"patterns": ["a", "b"]})),
             lookup_key("grep", &json!({"patterns": ["a", "b"]}))
         );
+        // find_symbol dumps definition bodies + usages: the same symbol in the
+        // same scope is a repeat, a different scope is a real lookup.
+        let f1 = json!({"symbol": "foo", "path": "src"});
+        assert_eq!(lookup_key("find_symbol", &f1), lookup_key("find_symbol", &f1.clone()));
+        assert_ne!(lookup_key("find_symbol", &f1), lookup_key("find_symbol", &json!({"symbol": "foo", "path": "backend"})));
+        assert!(lookup_key("find_symbol", &json!({"path": "src"})).is_none());
         // Shapes without a target are never deduped (nothing to compare).
         assert!(lookup_key("read", &json!({"path": "src"})).is_none());
         assert!(lookup_key("grep", &json!({"path": "src"})).is_none());

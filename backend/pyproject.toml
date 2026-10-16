@@ -20,6 +20,12 @@ dependencies = [
     "torch>=2.2",
     "transformers>=4.40",
     "safetensors>=0.4",
+    # The one-time Laya -> ONNX export (scripts/export-laya-onnx.py) runs from
+    # this venv right after the decision model is downloaded, so the export
+    # toolchain ships with the app. Both are small next to torch, which is
+    # already here for the local TTS weights.
+    "onnx>=1.16",
+    "onnxscript>=0.1",
     "python-multipart>=0.0.32",
     "huggingface-hub>=0.23",
     "pocket-tts @ git+https://github.com/mallahyari/pocket-tts@main",

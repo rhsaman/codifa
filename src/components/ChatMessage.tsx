@@ -1,6 +1,7 @@
 import {
   memo,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -17,6 +18,7 @@ import {
   prepareContent,
   stripBidiMarks,
 } from "../lib/bidi";
+import { fixArrowDirections, rehypeArrows } from "../lib/arrowDir";
 import { copyToClipboard } from "../lib/clipboard";
 import { dedupDocPaths, extractInlinePathParts, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
@@ -853,6 +855,31 @@ export const mdComponents = {
     </div>
   ),
 };
+
+const PROSE_REMARK_PLUGINS = [remarkGfm];
+const PROSE_REHYPE_PLUGINS = [rehypeArrows];
+
+/** One markdown prose block. Besides rendering, it fixes the direction of
+ *  arrows in RTL text (see lib/arrowDir.ts). The layout effect has no deps on
+ *  purpose: a streaming re-render replaces text nodes, so the mirror state is
+ *  re-measured after every commit (before paint, so nothing flickers). */
+function MarkdownProse({ text }: { text: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (ref.current) fixArrowDirections(ref.current);
+  });
+  return (
+    <div ref={ref} className="chat-message markdown-body" dir="auto">
+      <ReactMarkdown
+        remarkPlugins={PROSE_REMARK_PLUGINS}
+        rehypePlugins={PROSE_REHYPE_PLUGINS}
+        components={mdComponents}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 const fmtTokens = (n?: number): string => {
   if (!n) return "0";
@@ -1904,18 +1931,14 @@ export function renderSegments(
 
   const renderProse = (key: string, text: string) => {
     nodes.push(
-      <div key={key} className="chat-message markdown-body" dir="auto">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          components={mdComponents}
-        >
-          {cachedPrepare(
-            `${message.id}:seg:${key}`,
-            text,
-            useStore.getState().dir,
-          )}
-        </ReactMarkdown>
-      </div>,
+      <MarkdownProse
+        key={key}
+        text={cachedPrepare(
+          `${message.id}:seg:${key}`,
+          text,
+          useStore.getState().dir,
+        )}
+      />,
     );
   };
 
@@ -2428,14 +2451,7 @@ export const ChatMessageView = memo(
         ) : (
           <>
             <div className="msg-bubble">
-              <div className="chat-message markdown-body" dir="auto">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={mdComponents}
-                >
-                  {cachedPrepare(message.id, cap.shown, dir)}
-                </ReactMarkdown>
-              </div>
+              <MarkdownProse text={cachedPrepare(message.id, cap.shown, dir)} />
             </div>
             {cap.over && (
               <button

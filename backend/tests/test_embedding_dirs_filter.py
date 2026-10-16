@@ -58,6 +58,33 @@ def test_decision_partial_dir_not_ready_and_status_section(tmp_path, monkeypatch
     assert "running" not in st["decision"]
 
 
+def test_decision_downloaded_but_not_exported(tmp_path, monkeypatch):
+    # The downloader fetches the torch checkpoint; the native router needs the
+    # ONNX export. That state must be distinguishable so the card can point at
+    # the one-time export instead of offering a re-download.
+    monkeypatch.setattr(model_download, "_models_dir", lambda: str(tmp_path))
+    laya = tmp_path / "laya--convaiinnovations--laya"
+    laya.mkdir()
+    (laya / "model.safetensors").write_text("x")
+    (laya / "rl_agent_config.json").write_text("{}")
+    dirs = model_download.decision_dirs()
+    assert dirs[0]["ready"] is True
+    assert dirs[0]["exported"] is False
+
+
+def test_decision_onnx_only_install_is_ready(tmp_path, monkeypatch):
+    # After `export-laya-onnx.py --prune-weights` the torch checkpoint is gone
+    # and only the ONNX graphs the native router loads remain. That install is
+    # complete, so the card must not keep offering a download.
+    monkeypatch.setattr(model_download, "_models_dir", lambda: str(tmp_path))
+    laya = tmp_path / "laya--convaiinnovations--laya"
+    (laya / "onnx").mkdir(parents=True)
+    (laya / "onnx" / "model.int8.onnx").write_text("x")
+    dirs = model_download.decision_dirs()
+    assert dirs[0]["ready"] is True
+    assert dirs[0]["exported"] is True
+
+
 def test_decision_legacy_models_dir_renamed(tmp_path, monkeypatch):
     # Pre-fix downloads lived under models--<repo>; the startup rename moves
     # them to the release layout so the model keeps being found.

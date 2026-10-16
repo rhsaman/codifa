@@ -134,6 +134,18 @@ fn ready_dir(dir: &Path) -> bool {
         && dir.join("rl_agent_config.json").is_file()
 }
 
+/// The folder holds the downloaded checkpoint but no exported graph yet.
+///
+/// The downloader fetches the torch checkpoint; the native router needs the
+/// ONNX export of it (`scripts/export-laya-onnx.py`). Telling the two apart
+/// matters because they need different actions from the user: download vs.
+/// run the one-time export.
+fn needs_export(dir: &Path) -> bool {
+    graph_path(dir).is_none()
+        && dir.join("model.safetensors").is_file()
+        && dir.join("rl_agent_config.json").is_file()
+}
+
 /// Concrete model dir for `prompt`; `None` when nothing usable is downloaded.
 ///
 /// Prefers the multilingual checkpoint for non-Latin requests (e.g. Persian)
@@ -185,10 +197,20 @@ fn special_id(dir: &Path, tokenizer: &Tokenizer, key: &str, fallback: &str) -> R
 
 fn load(prompt: &str) -> Result<Laya, String> {
     let dir = model_dir(prompt).ok_or_else(|| {
-        format!(
-            "laya model not downloaded (expected {LAYA_DIR} under {}/models)",
-            data_root().display()
-        )
+        let base = data_root().join("models").join(LAYA_DIR);
+        if needs_export(&base) || needs_export(&base.join(MULTILINGUAL)) {
+            // Downloaded but not converted: the app has no torch, so this is a
+            // one-time offline step rather than something it can do itself.
+            format!(
+                "laya is downloaded but not exported to ONNX yet — run \
+                 `backend/.venv/bin/python scripts/export-laya-onnx.py` once"
+            )
+        } else {
+            format!(
+                "laya model not downloaded (expected {LAYA_DIR} under {}/models)",
+                data_root().display()
+            )
+        }
     })?;
     let graph = graph_path(&dir).ok_or_else(|| "laya onnx graph missing".to_string())?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer").join("tokenizer.json"))
@@ -488,11 +510,23 @@ pub fn status() -> Value {
             _ => None,
         });
     let available = dir.is_some();
+    // Downloaded-but-not-exported is a distinct state: the Settings card can
+    // then point at the one-time export instead of offering a re-download.
+    let base = data_root().join("models").join(LAYA_DIR);
+    let pending_export = !available
+        && (needs_export(&base) || needs_export(&base.join(MULTILINGUAL)));
     serde_json::json!({
         "available": available,
         "loaded": loaded.unwrap_or(false),
+        "needs_export": pending_export,
         "dir": dir.map(|d| d.display().to_string()).unwrap_or_default(),
-        "error": if available { "" } else { "laya model not downloaded" },
+        "error": if available {
+            ""
+        } else if pending_export {
+            "downloaded — run scripts/export-laya-onnx.py once to enable it"
+        } else {
+            "laya model not downloaded"
+        },
     })
 }
 
@@ -565,6 +599,31 @@ mod tests {
         let s = status();
         assert!(s.get("available").is_some());
         assert!(s.get("error").is_some());
+    }
+
+    #[test]
+    fn needs_export_distinguishes_downloaded_from_exported() {
+        // The downloader fetches the torch checkpoint; the router needs the
+        // ONNX export. Telling them apart is what lets the app say "run the
+        // export" instead of "download the model" for a downloaded install.
+        let dir = std::env::temp_dir().join(format!("laya-needs-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing at all: neither downloaded nor exported.
+        assert!(!needs_export(&dir));
+
+        // Checkpoint present, no graph: downloaded but not exported.
+        std::fs::write(dir.join("model.safetensors"), "x").unwrap();
+        std::fs::write(dir.join("rl_agent_config.json"), "{}").unwrap();
+        assert!(needs_export(&dir));
+
+        // Graph present: exported, so no export is pending.
+        std::fs::create_dir_all(dir.join("onnx")).unwrap();
+        std::fs::write(dir.join("onnx").join("model.int8.onnx"), "x").unwrap();
+        assert!(!needs_export(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End-to-end routing against the real exported graph.

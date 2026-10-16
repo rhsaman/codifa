@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from collections import deque
@@ -436,6 +437,80 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 _SNAPSHOT_MAX_WORKERS = 4
 _SNAPSHOT_ETAG_TIMEOUT = 30
 
+#: Files a decision-model (Laya) download does not need. The snapshot ships
+#: three sub-builds (base, multilingual, typed-decisions) plus eval plots and
+#: README assets; the router only ever loads the base and multilingual ONNX
+#: graphs, so the rest is ~1 GB of dead weight on the user's disk.
+_DECISION_IGNORE = ["typed-decisions/*", "eval/*", "assets/*"]
+
+#: Budget for the one-time ONNX export that follows a Laya download. The export
+#: builds a 28-layer encoder twice (base + multilingual) and quantizes both,
+#: which takes minutes on a laptop; the cap only exists so a wedged run cannot
+#: hold the download thread forever.
+_EXPORT_TIMEOUT_S = 3600
+
+
+def _export_command(script: str, dest: str) -> list[str]:
+    """Command that runs the export, preferring the venv's own toolchain.
+
+    `onnx`/`onnxscript` are declared in pyproject so a packaged build has them,
+    but a dev checkout may not have synced since they were added. `uv run
+    --with` supplies them for that one run instead of failing the export.
+    """
+    args = [script, "--model-dir", dest, "--prune-weights"]
+    try:
+        import onnx  # noqa: F401
+        import onnxscript  # noqa: F401
+
+        return [sys.executable, *args]
+    except ImportError:
+        pass
+    uv = shutil.which("uv")
+    if not uv:
+        return [sys.executable, *args]
+    return [uv, "run", "--with", "onnx", "--with", "onnxscript", "python", *args]
+
+
+def _export_decision_onnx(dest: str) -> None:
+    """Convert a freshly downloaded Laya checkpoint to ONNX.
+
+    The native router loads an ONNX graph, not the torch checkpoint, so a
+    download on its own would leave the decision slot unusable. Running the
+    export here keeps the old "download it and it works" behaviour.
+
+    Runs as a subprocess on purpose: the export peaks at a few GB while torch
+    builds and quantizes the graph, and that memory must not sit inside the
+    sidecar (already the largest process on the machine).
+    """
+    import subprocess
+
+    script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "export-laya-onnx.py",
+    )
+    if not os.path.isfile(script):
+        print(f"[models] export script not found at {script}", flush=True)
+        return
+    print(f"[models] exporting {dest} to ONNX (one-time, takes a few minutes)", flush=True)
+    try:
+        proc = subprocess.run(
+            _export_command(script, dest),
+            capture_output=True,
+            text=True,
+            timeout=_EXPORT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        print("[models] onnx export timed out", flush=True)
+        return
+    for line in (proc.stdout or "").strip().splitlines()[-4:]:
+        print(f"[models] export: {line}", flush=True)
+    if proc.returncode != 0:
+        print(
+            f"[models] onnx export failed: {(proc.stderr or '').strip()[-300:]}",
+            flush=True,
+        )
+
 
 def _make_tqdm_class(kind: str, controls: dict[str, threading.Event]):
     """کلاس پروگرس سازگار با ``snapshot_download`` که بایت، درصد و سرعت را
@@ -567,9 +642,12 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
                 endpoint=base_url or None,
                 max_workers=_SNAPSHOT_MAX_WORKERS,
                 etag_timeout=_SNAPSHOT_ETAG_TIMEOUT,
+                ignore_patterns=_DECISION_IGNORE if kind == KIND_DECISION else None,
                 tqdm_class=tqdm_class,  # type: ignore[arg-type]
             )
             print(f"[models] {kind} download finished", flush=True)
+            if kind == KIND_DECISION:
+                _export_decision_onnx(dest)
             with _LOCK:
                 if _RUNS.get(kind) == run:
                     _clear_state(kind)
@@ -808,9 +886,26 @@ def decision_dirs() -> list[dict]:
                 "dir": name,
                 "size": _dir_size(root),
                 "ready": _decision_ready(root),
+                "exported": _decision_exported(root),
             }
         )
     return out
+
+
+def _decision_exported(root: str) -> bool:
+    """True when the ONNX graph the native router loads is present.
+
+    The downloader fetches the torch checkpoint; the native router needs the
+    ONNX export of it (``scripts/export-laya-onnx.py``). Reporting the two
+    separately lets the Settings card tell "not downloaded" apart from
+    "downloaded but not exported yet", which need different actions.
+    """
+    for sub in ("", "multilingual"):
+        d = os.path.join(root, sub) if sub else root
+        for name in ("model.int8.onnx", "model.onnx"):
+            if os.path.isfile(os.path.join(d, "onnx", name)):
+                return True
+    return False
 
 
 def _decision_ready(root: str) -> bool:
@@ -833,10 +928,24 @@ def _decision_ready(root: str) -> bool:
 
 
 def _dir_has_weights(root: str) -> bool:
-    """Non-empty weight file (safetensors / bin / onnx) directly under root."""
-    for name in ("model.safetensors", "pytorch_model.bin", "model.bin", "model.onnx"):
+    """Non-empty weight file (safetensors / bin / onnx) under root.
+
+    The ONNX graphs the native router loads live in an ``onnx/`` subfolder, and
+    the torch checkpoints they were exported from may have been pruned
+    afterwards (``export-laya-onnx.py --prune-weights``), so either layout
+    counts as ready — otherwise a pruned install would look incomplete and the
+    Settings card would keep offering a download that is already done.
+    """
+    candidates = [
+        os.path.join(root, name)
+        for name in ("model.safetensors", "pytorch_model.bin", "model.bin", "model.onnx")
+    ]
+    candidates += [
+        os.path.join(root, "onnx", name) for name in ("model.int8.onnx", "model.onnx")
+    ]
+    for path in candidates:
         try:
-            if os.path.isfile(os.path.join(root, name)) and os.path.getsize(os.path.join(root, name)) > 0:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
                 return True
         except OSError:
             continue

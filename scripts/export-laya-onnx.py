@@ -268,14 +268,71 @@ def export_one(model_dir: str, sub: str, rl_common, torch) -> str:
     print(f"[{label}] wrote {quant_path} ({qsize_mb:.0f} MB) max|int8-torch|={qdiff:.2e}")
     if qdiff > 0.5:
         raise SystemExit(f"[{label}] int8 graph diverged too far (diff={qdiff})")
+
+    # The fp32 graph is only an intermediate — the router loads the int8 one.
+    # Leaving it behind costs ~3 GB across the two builds, because the dynamo
+    # exporter writes the weights to a sidecar `.data` file next to the graph.
+    # That is more disk than the torch checkpoint this export replaces.
+    for stale in (out_path, out_path + ".data"):
+        if os.path.isfile(stale):
+            os.remove(stale)
     return quant_path
+
+
+def clean_export_inputs(model_dir: str) -> int:
+    """Delete everything the export consumed or left behind; returns bytes freed.
+
+    Two kinds of dead weight accumulate in a snapshot:
+
+    * the torch checkpoints (``*.safetensors``) — only an input to this script,
+      ~2 GB across the shipped sub-builds;
+    * the fp32 ONNX graph and its ``.data`` weight sidecar — the dynamo
+      exporter writes the weights next to the graph, so a run that predates the
+      cleanup in :func:`export_one` (or one interrupted mid-export) leaves
+      ~1.6 GB per sub-build that the router never loads, because it prefers
+      ``model.int8.onnx``.
+
+    Re-exporting needs the checkpoints again, which means re-downloading; that
+    is the trade this makes.
+    """
+    freed = 0
+    for root, _dirs, files in os.walk(model_dir):
+        for name in files:
+            if not (
+                name.endswith(".safetensors")
+                or name == "model.onnx"
+                or name == "model.onnx.data"
+            ):
+                continue
+            path = os.path.join(root, name)
+            try:
+                freed += os.path.getsize(path)
+                os.remove(path)
+            except OSError:  # noqa: BLE001, S110 — a locked file must not abort the sweep
+                continue
+    return freed
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     ap.add_argument("--preflight-only", action="store_true")
+    ap.add_argument(
+        "--prune-weights",
+        action="store_true",
+        help="delete the torch checkpoints after a successful export",
+    )
+    ap.add_argument(
+        "--clean-only",
+        action="store_true",
+        help="only delete export inputs and orphaned fp32 graphs (no export)",
+    )
     args = ap.parse_args()
+
+    if args.clean_only:
+        freed = clean_export_inputs(args.model_dir)
+        print(f"freed {freed / 1048576:.0f} MB")
+        return 0
 
     if not preflight(args.model_dir):
         return 1
@@ -302,6 +359,9 @@ def main() -> int:
         if path:
             written.append(path)
     print(f"done in {time.time() - started:.0f}s: {len(written)} graph(s)")
+    if args.prune_weights and written:
+        freed = clean_export_inputs(args.model_dir)
+        print(f"freed {freed / 1048576:.0f} MB of export inputs")
     return 0 if written else 1
 
 

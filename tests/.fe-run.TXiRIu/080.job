@@ -1,0 +1,1 @@
+chatRenameInput|tests/chatRenameInput.test.ts|--jsx=automatic --packages=external --external:electron

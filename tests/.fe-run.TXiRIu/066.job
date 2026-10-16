@@ -1,0 +1,1 @@
+modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --external:electron

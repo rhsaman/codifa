@@ -1,0 +1,1 @@
+ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electron

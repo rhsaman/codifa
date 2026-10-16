@@ -1,0 +1,1 @@
+fileSuggest|tests/fileSuggest.test.ts|--packages=external --external:electron

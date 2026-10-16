@@ -1,0 +1,1 @@
+fetchAndPersist|tests/fetchAndPersist.test.ts|--packages=external --external:electron

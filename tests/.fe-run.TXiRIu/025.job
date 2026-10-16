@@ -1,0 +1,1 @@
+webResults|tests/webResults.ssr.test.tsx|--jsx=automatic --packages=external --external:electron

@@ -1,0 +1,1 @@
+usageChip|tests/usageChip.ssr.test.tsx|--jsx=automatic --packages=external --external:electron

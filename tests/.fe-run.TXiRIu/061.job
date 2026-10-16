@@ -1,0 +1,1 @@
+todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron

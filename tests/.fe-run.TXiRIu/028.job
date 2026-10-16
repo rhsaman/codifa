@@ -1,0 +1,1 @@
+streamChatReconnect|tests/streamChatReconnect.test.ts|--packages=external --external:electron

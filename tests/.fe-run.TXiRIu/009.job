@@ -1,0 +1,1 @@
+retryStore|tests/retryStore.test.ts|--packages=external --external:electron

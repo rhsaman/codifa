@@ -1,0 +1,1 @@
+mcpTools|tests/mcpTools.test.ts|--packages=external --external:electron

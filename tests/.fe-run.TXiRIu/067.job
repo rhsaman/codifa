@@ -1,0 +1,1 @@
+manualContext|tests/manualContext.test.ts|--packages=external --external:electron

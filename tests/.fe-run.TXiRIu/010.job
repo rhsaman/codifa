@@ -1,0 +1,1 @@
+retryStream|tests/retryStream.test.ts|--packages=external --external:electron

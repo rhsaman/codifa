@@ -1,0 +1,1 @@
+engineBadge|tests/engineBadge.ssr.test.tsx|--jsx=automatic --packages=external --external:electron

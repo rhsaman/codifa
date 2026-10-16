@@ -46,7 +46,7 @@ impl SidecarState {
     }
 }
 
-fn find_backend_dir(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn find_backend_dir(app: &AppHandle) -> Option<PathBuf> {
     // In `tauri dev` the resource dir holds a copy of the backend that Tauri
     // staged at build time — running it silently ignores source edits (and it
     // goes stale the moment backend/ changes). Prefer the repo checkout while

@@ -466,7 +466,7 @@ async def doc_read(req: DocReadRequest) -> dict:
     """Extract or render a PDF / Word / Excel / text file for the right-hand
     file viewer (which cannot parse those formats itself)."""
     import doc_tools
-    from tools import PathEscapeError, resolve_safe
+    from workspace_fs import PathEscapeError, resolve_safe
 
     p = (req.path or "").strip()
     if not p:
@@ -2129,7 +2129,7 @@ async def memory_stats(
     root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
     vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
 ) -> MemoryStatsResponse:
-    from tools import open_vector_store
+    from workspace_fs import open_vector_store
 
     if not root or not os.path.isdir(root):
         raise HTTPException(status_code=400, detail="invalid project root")
@@ -2144,7 +2144,7 @@ async def memory_stats(
 
 @app.post("/memory/clear")
 async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
-    from tools import open_vector_store
+    from workspace_fs import open_vector_store
 
     if not req.root or not os.path.isdir(req.root):
         raise HTTPException(status_code=400, detail="invalid project root")
@@ -2206,7 +2206,7 @@ class CleanupRunResponse(BaseModel):
 
 def _open_store(root: str, vector_db_path: str):
     """Open the workspace store or raise 400 with a clear message."""
-    from tools import open_vector_store
+    from workspace_fs import open_vector_store
 
     if not root or not os.path.isdir(root):
         raise HTTPException(status_code=400, detail="invalid project root")
@@ -2413,7 +2413,7 @@ def main() -> None:
         import logging.handlers
 
         from _log_filter import ServerErrorOnlyFilter
-        from tools import user_coder_dir
+        from workspace_fs import user_coder_dir
 
         _log_dir = user_coder_dir()
         os.makedirs(_log_dir, exist_ok=True)
@@ -2477,15 +2477,9 @@ def main() -> None:
 
     # MCP connector validation and builtin seeding are native now — see
     # src-tauri/src/skills.rs (seed_builtin_mcp) and src-tauri/src/mcp.rs.
-
-    # Seed built-in skills from backend/skills/*.md on every startup (no-op for
-    # skills that already exist, so user edits/deletions are never overwritten).
-    try:
-        from tools import sync_builtin_skills
-
-        sync_builtin_skills()
-    except Exception:  # noqa: BLE001, S110 — a seed failure must not kill the sidecar
-        pass
+    # Built-in SKILL seeding is native too (skills::seed_builtin_skills, run
+    # from the Tauri setup hook) — the sidecar no longer touches the skill
+    # store, so it needs no langchain-bearing helper module for it.
 
     import uvicorn
 

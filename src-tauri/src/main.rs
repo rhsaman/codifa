@@ -132,6 +132,15 @@ fn main() {
                 if !seeded.is_empty() {
                     println!("[mcp] seeded builtin connectors: {}", seeded.join(", "));
                 }
+                // Seed/re-sync the shipped built-in skills (migrated from the
+                // Python sidecar's sync_builtin_skills). The shipped markdown
+                // lives in the backend checkout / bundled resource dir.
+                if let Some(backend) = sidecar::find_backend_dir(app.handle()) {
+                    let seeded = skills::seed_builtin_skills(&root, &backend.join("skills"));
+                    if !seeded.is_empty() {
+                        println!("[skills] seeded builtin skills: {}", seeded.join(", "));
+                    }
+                }
                 std::thread::spawn(move || {
                     let summary = retention::run_startup_sweep(&root);
                     println!("[{summary}]");

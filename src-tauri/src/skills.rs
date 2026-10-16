@@ -370,6 +370,140 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     }))
 }
 
+/// Collapse every whitespace run to a single space.
+///
+/// The shipped markdown and the stored copy are produced by different code
+/// paths (file read vs. frontmatter-stripped store row), so they differ in
+/// trailing newlines, CRLF and indentation. Comparing them raw made every
+/// startup re-seed every built-in; normalizing makes the comparison mean what
+/// it says: "did the shipped text actually change?".
+fn norm_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Drop a leading `# <name>` heading line.
+///
+/// `sync_skill` writes `# {name}\n\n{content}` while the shipped `.md` already
+/// carries its own `# {name}` heading, so the stored body and the shipped body
+/// differ by exactly that one line. Comparing them without stripping it made
+/// every startup re-seed every built-in (and the re-seed is what the test
+/// caught).
+fn strip_heading(s: &str, name: &str) -> String {
+    let t = s.trim_start();
+    if let Some(rest) = t.strip_prefix('#') {
+        let (head, body) = match rest.find('\n') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        if head.trim().eq_ignore_ascii_case(name.trim()) {
+            return body.to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Seed/re-sync the shipped built-in skills from `backend/skills/*.md`.
+///
+/// Mirrors the Python sidecar's `sync_builtin_skills` (which lived in the now
+/// dead tools.py): a shipped skill that is missing from the user's store is
+/// created, and one whose shipped markdown changed (body OR frontmatter) is
+/// re-seeded so official fixes propagate without manual deletion. User-created
+/// skills are never touched, and extra files in a skill folder survive.
+///
+/// Returns the names that were seeded or re-synced.
+pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(shipped_dir) else {
+        return Vec::new();
+    };
+    let existing = list_skills(root);
+    let rows = existing["skills"].as_array().cloned().unwrap_or_default();
+    // Map name/slug -> (description, body, fa_keywords) so a shipped change to
+    // any of the three triggers a re-sync below.
+    let mut meta: std::collections::HashMap<String, (String, String, Vec<String>)> =
+        std::collections::HashMap::new();
+    for s in &rows {
+        let entry = (
+            norm_ws(s["description"].as_str().unwrap_or("")),
+            norm_ws(&strip_heading(
+                s["content"].as_str().unwrap_or(""),
+                s["name"].as_str().unwrap_or(""),
+            )),
+            s["fa_keywords"]
+                .as_array()
+                .map(|a| {
+                    let mut v: Vec<String> = a
+                        .iter()
+                        .filter_map(|k| k.as_str())
+                        .map(|k| k.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                        .collect();
+                    v.sort();
+                    v
+                })
+                .unwrap_or_default(),
+        );
+        for key in [s["name"].as_str(), s["slug"].as_str()].into_iter().flatten() {
+            if !key.is_empty() {
+                meta.insert(key.to_string(), entry.clone());
+            }
+        }
+    }
+
+    let mut seeded: Vec<String> = Vec::new();
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let (name, slug, description, fa_keywords) = parse_frontmatter(&raw);
+        if name.is_empty() {
+            continue;
+        }
+        let body = if raw.starts_with("---") {
+            raw.find("\n---")
+                .map(|i| raw[i + 4..].trim_start_matches('\n').to_string())
+                .unwrap_or_else(|| raw.clone())
+        } else {
+            raw.clone()
+        };
+        // sync_skill re-adds a `# {name}` heading, so drop the shipped one
+        // first — otherwise every re-seed writes a duplicated heading and the
+        // stored body never matches the shipped one (which made every startup
+        // re-seed every built-in).
+        let body = strip_heading(&body, &name);
+        let mut sorted_fa = fa_keywords.clone();
+        sorted_fa.sort();
+        let shipped = (
+            norm_ws(&description),
+            norm_ws(&body),
+            sorted_fa,
+        );
+        let unchanged = meta
+            .get(&name)
+            .or_else(|| meta.get(&slug))
+            .map(|cur| *cur == shipped)
+            .unwrap_or(false);
+        if unchanged {
+            continue;
+        }
+        let payload = json!({
+            "name": name,
+            "description": description,
+            "content": body,
+            "fa_keywords": fa_keywords,
+        });
+        if sync_skill(root, &payload).is_ok() {
+            seeded.push(name);
+        }
+    }
+    seeded
+}
+
 // --- mcp endpoints -----------------------------------------------------------
 
 /// GET /mcp — list connectors as `{name: config}` plus builtins.
@@ -508,5 +642,43 @@ mod tests {
         assert_eq!(sanitize_extra_filename("../evil"), None);
         assert_eq!(sanitize_extra_filename(".hidden"), None);
         assert_eq!(sanitize_extra_filename("no space.txt"), None);
+    }
+
+    #[test]
+    fn seed_builtin_skills_creates_then_skips_unchanged() {
+        let tmp = std::env::temp_dir().join(format!("codifa-seed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+        )
+        .unwrap();
+
+        // First run seeds the shipped skill.
+        let first = seed_builtin_skills(&store, &shipped);
+        assert_eq!(first, vec!["Movie Finder".to_string()]);
+        let listed = list_skills(&store);
+        assert_eq!(listed["skills"][0]["name"], "Movie Finder");
+        assert_eq!(listed["skills"][0]["fa_keywords"][0], "film");
+
+        // Second run is a no-op: the stored copy already matches the shipped one.
+        assert!(seed_builtin_skills(&store, &shipped).is_empty());
+
+        // A shipped body change re-syncs the built-in.
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nUPDATED\n",
+        )
+        .unwrap();
+        assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
+        assert!(list_skills(&store)["skills"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("UPDATED"));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

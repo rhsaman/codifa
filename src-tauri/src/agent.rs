@@ -27,6 +27,80 @@ const TOOL_RESULT_CAP: usize = 4000;
 /// outputs ballooned the context (76k-token turns) and made every LLM
 /// round-trip crawl — the #1 cause of slow explore turns.
 const MODEL_RESULT_CAP: usize = 16_000;
+
+/// Cap on an explore/task report forwarded to the model.
+///
+/// A report is the main agent's ONLY view of the code — it has no read/grep
+/// tools of its own — so a truncated report means the search results inside it
+/// are simply lost and the agent re-delegates the same question. Reports get a
+/// larger budget than a raw tool result, and are cut from the MIDDLE (see
+/// finish_tool) so both the answer at the head and the details at the tail
+/// survive.
+const EXPLORE_REPORT_CAP: usize = 40_000;
+
+/// Per-result budget when a sub-agent runs out of steps and its gathered tool
+/// results are folded into a report (see run_turn). A grep/read result IS the
+/// finding, so this is far larger than a UI echo cap.
+const SUBAGENT_FOLD_RESULT_CHARS: usize = 4_000;
+
+/// Fold a history message's non-prose state into its content so the model can
+/// see what already happened.
+///
+/// The frontend keeps the durable record of a turn on the message object
+/// (`toolActivity`, `preservedToolSummary`, `plan`) and sends only `role` +
+/// `content` in `history`. Without this recap the model saw prose alone, could
+/// not tell which tools had already run, and re-searched the same files every
+/// turn — the reported "context keeps shrinking and it re-searches" loop.
+/// Mirrors graph.py's history projection (which rebuilt real tool_calls; a
+/// textual recap is used here because it needs no synthetic tool-call ids).
+fn history_recap(m: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(acts) = m.get("toolActivity").and_then(Value::as_array) {
+        let mut lines: Vec<String> = Vec::new();
+        for a in acts {
+            let tool = a.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let status = a.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "running" {
+                continue;
+            }
+            let mut line = format!("- {tool}");
+            if let Some(args) = a.get("args") {
+                let s = serde_json::to_string(args).unwrap_or_default();
+                if !s.is_empty() && s != "{}" {
+                    line.push_str(&format!(" {}", s.chars().take(200).collect::<String>()));
+                }
+            }
+            if !status.is_empty() {
+                line.push_str(&format!(" [{status}]"));
+            }
+            lines.push(line);
+        }
+        if !lines.is_empty() {
+            parts.push(format!(
+                "\n[Tools already run in this turn — do NOT re-run them:\n{}]",
+                lines.join("\n")
+            ));
+        }
+    }
+    if let Some(p) = m.get("preservedToolSummary").and_then(Value::as_str) {
+        if !p.trim().is_empty() {
+            parts.push(p.to_string());
+        }
+    }
+    if let Some(items) = m.get("plan").and_then(Value::as_array) {
+        let done = items
+            .iter()
+            .filter(|i| i.get("status").and_then(Value::as_str) == Some("completed"))
+            .count();
+        if done > 0 {
+            parts.push(format!(
+                "\n[Checklist progress {done}/{} — do NOT re-execute completed steps.]",
+                items.len()
+            ));
+        }
+    }
+    parts.concat()
+}
 /// Sub-agent depth limit (mirrors graph.py: sub-agents cannot spawn more).
 const MAX_SUBAGENT_DEPTH: usize = 1;
 
@@ -446,19 +520,35 @@ fn finish_tool(
     // The model receives a capped copy too — a narrower re-read is one
     // cheap tool call; an unbounded context is seconds per round-trip.
     let mut for_model = result;
-    if for_model.len() > MODEL_RESULT_CAP {
-        let mut end = MODEL_RESULT_CAP;
-        while end > 0 && !for_model.is_char_boundary(end) {
-            end -= 1;
-        }
-        for_model.truncate(end);
-        // The main agent has no read tool, so "re-read a narrower window" would
-        // be a dead end for an explore report — point it at explore instead.
-        if name == "explore" || name == "task" {
-            for_model.push_str(
-                "\n… [report truncated for the model — ask explore again with a narrower question]",
+    let is_report = name == "explore" || name == "task";
+    let cap = if is_report { EXPLORE_REPORT_CAP } else { MODEL_RESULT_CAP };
+    if for_model.len() > cap {
+        if is_report {
+            // Cut the MIDDLE, not the tail: the head holds the answer and the
+            // tail holds the search results / file list, and the main agent
+            // cannot re-read either on its own. Only the middle is dropped,
+            // with an explicit pointer to ask for it again.
+            let head_len = cap / 2;
+            let mut head_end = head_len;
+            while head_end > 0 && !for_model.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            let mut tail_start = for_model.len() - (cap - head_len);
+            while tail_start < for_model.len() && !for_model.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            let omitted = tail_start - head_end;
+            for_model = format!(
+                "{}\n… [{omitted} chars omitted from the middle of this report — the head and the tail are intact; ask explore for the omitted section if you need it]\n{}",
+                &for_model[..head_end],
+                &for_model[tail_start..]
             );
         } else {
+            let mut end = cap;
+            while end > 0 && !for_model.is_char_boundary(end) {
+                end -= 1;
+            }
+            for_model.truncate(end);
             for_model.push_str(
                 "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
             );
@@ -599,7 +689,14 @@ pub async fn run_turn(
             m.get("role").and_then(Value::as_str),
             m.get("content").and_then(Value::as_str),
         ) {
-            messages.push(json!({"role": role, "content": content}));
+            // Carry the turn's non-prose state (tools run, preserved summary,
+            // checklist) into the content — see history_recap.
+            let recap = history_recap(m);
+            if recap.is_empty() {
+                messages.push(json!({"role": role, "content": content}));
+            } else {
+                messages.push(json!({"role": role, "content": format!("{content}{recap}")}));
+            }
         }
     }
     if !req.prompt.is_empty() {
@@ -1022,6 +1119,8 @@ use what it showed, read a DIFFERENT window, or move on"
     if req.mode == "subagent" {
         let mut report =
             String::from("[Tool budget exhausted] Findings gathered so far:\n");
+        // Newest first: the most recent searches are the ones the report was
+        // building toward, so they must survive the cap below.
         for m in messages.iter().rev() {
             if m["role"].as_str() != Some("tool") {
                 continue;
@@ -1031,14 +1130,22 @@ use what it showed, read a DIFFERENT window, or move on"
                 continue;
             }
             // Char-boundary-safe cut — byte slicing mid-char panics on Persian.
-            let mut end = 600.min(c.len());
+            // The per-result budget is generous because a grep/read result IS
+            // the finding: cutting it to a few hundred chars dropped the very
+            // search hits the parent asked for, and it re-delegated the same
+            // question. The whole report is capped by EXPLORE_REPORT_CAP, the
+            // same budget a normal report gets.
+            let mut end = SUBAGENT_FOLD_RESULT_CHARS.min(c.len());
             while end > 0 && !c.is_char_boundary(end) {
                 end -= 1;
             }
             report.push_str("- ");
             report.push_str(&c[..end]);
-            report.push_str("…\n");
-            if report.len() > 8000 {
+            if end < c.len() {
+                report.push_str("…");
+            }
+            report.push('\n');
+            if report.len() > EXPLORE_REPORT_CAP {
                 break;
             }
         }
@@ -1727,15 +1834,21 @@ mod tests {
     }
 
     #[test]
-    fn explore_report_truncation_does_not_point_at_a_missing_read_tool() {
+    fn explore_report_truncation_keeps_head_and_tail_and_never_points_at_read() {
         let mut messages: Vec<Value> = Vec::new();
         let mut emit = |_: &AgentEvent| {};
         let trace = crate::trace::TraceStore::new(String::new());
-        let big = "x".repeat(MODEL_RESULT_CAP + 100);
-        finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big.clone(), true, false);
+        // A report longer than the report cap: the head (answer) AND the tail
+        // (search results / file list) must both survive — the main agent has
+        // no read tool, so a lost tail is lost work it would re-delegate.
+        let big = format!("HEAD{}TAIL", "x".repeat(EXPLORE_REPORT_CAP + 100));
+        finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big, true, false);
         let c = messages[0]["content"].as_str().unwrap();
-        assert!(c.contains("ask explore again") && !c.contains("offset/limit"));
-        finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big, true, true);
+        assert!(c.contains("HEAD") && c.contains("TAIL"), "head and tail must survive");
+        assert!(c.contains("ask explore") && !c.contains("offset/limit"));
+        // A raw tool result still points at a narrower read window.
+        let big2 = "x".repeat(MODEL_RESULT_CAP + 100);
+        finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big2, true, true);
         assert!(messages[1]["content"].as_str().unwrap().contains("offset/limit"));
     }
 

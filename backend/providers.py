@@ -400,7 +400,15 @@ def normalize_base_url(provider: str, base_url: str) -> str:
                     break
             return base
         return base
-    return _expand_base(meta.get("base_url") or "", provider)
+    static = _expand_base(meta.get("base_url") or "", provider)
+    if static:
+        return static
+    # Unknown kind, or a kind whose static base is empty (e.g. a user-added
+    # gateway row such as an opencode.ai endpoint): honor the user-supplied URL
+    # instead of returning "". An empty base builds a RELATIVE "/models" URL,
+    # which httpx rejects with "Request URL is missing an 'http://' or
+    # 'https://' protocol" — surfacing in the UI as a bare "Fetch failed".
+    return (base_url or "").strip().rstrip("/")
 
 
 def _expand_base(template: str, provider: str) -> str:
@@ -457,6 +465,11 @@ def _models_endpoint(provider: str, base_url: str) -> tuple[str, str]:
         base = (base_url or OLLAMA_BASE).rstrip("/")
         return base + "/api/tags", "tags"
     base = normalize_base_url(provider, base_url)
+    if not base:
+        raise ProviderError(
+            f"no base URL configured for provider {provider!r} — set one in "
+            "Settings → Providers before fetching models"
+        )
     query = meta.get("models_query") or ""
     return base + "/models" + query, "openai"
 

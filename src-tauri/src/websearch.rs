@@ -195,26 +195,6 @@ async fn tavily(
     Ok(out)
 }
 
-/// The text the model receives for a hit list: engine-agnostic, numbered,
-/// each hit with its URL and snippet. The structured rows ride along in the
-/// tool event so the UI can render clickable result links.
-pub fn render_text(query: &str, hits: &[Value]) -> String {
-    let mut out = format!("web_search {query:?} — {} result(s)\n", hits.len());
-    for (i, h) in hits.iter().enumerate() {
-        out.push_str(&format!(
-            "\n{}. {}\n   {}\n",
-            i + 1,
-            h["title"].as_str().unwrap_or_default(),
-            h["url"].as_str().unwrap_or_default()
-        ));
-        let snippet = h["snippet"].as_str().unwrap_or_default();
-        if !snippet.is_empty() {
-            out.push_str(&format!("   {snippet}\n"));
-        }
-    }
-    out
-}
-
 /// Run `query` against the configured engines, top to bottom.
 ///
 /// `plugins` is the Settings → Plugins list verbatim: `order` decides priority
@@ -352,15 +332,6 @@ mod tests {
         let first = err.find("First:").expect("First must be reported");
         let second = err.find("Second:").expect("Second must be reported");
         assert!(first < second, "order 0 must be tried first: {err}");
-    }
-
-    #[test]
-    fn render_text_lists_every_hit_with_its_url() {
-        let hits = json!([{"title": "T", "url": "https://e.com", "snippet": "S"}]);
-        let text = render_text("q", hits.as_array().unwrap());
-        assert!(text.contains("https://e.com"), "{text}");
-        assert!(text.contains("S"), "{text}");
-        assert!(text.contains("1 result(s)"), "{text}");
     }
 
     /// Live network check: DuckDuckGo needs no key, so it must answer even

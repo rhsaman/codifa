@@ -169,11 +169,6 @@ pub fn model_dir(prompt: &str) -> Option<PathBuf> {
     }
 }
 
-/// True when a usable Laya build is downloaded (no model load).
-pub fn is_available() -> bool {
-    model_dir("").is_some() || model_dir("فارسی").is_some()
-}
-
 /// Resolve a special token's id for one sub-build.
 ///
 /// The two builds name their special tokens differently (the base ModernBERT
@@ -633,7 +628,7 @@ mod tests {
     #[test]
     #[ignore = "needs the exported laya model; run with --ignored"]
     fn laya_real_model_routes_a_persian_request_to_the_right_skill() {
-        if !is_available() {
+        if model_dir("").is_none() && model_dir("فارسی").is_none() {
             eprintln!("skipping: laya model not exported");
             return;
         }

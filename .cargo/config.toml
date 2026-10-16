@@ -1,0 +1,13 @@
+# ONNX Runtime's prebuilt macOS binaries — fetched by `ort`'s `download-binaries`
+# feature — are compiled against macOS 13.4. Rust's `aarch64-apple-darwin` target
+# defaults to linking at 11.0, so the linker rejects the runtime's CoreML objects
+# with `Undefined symbols: ___isPlatformVersionAtLeast` and the release build
+# fails. Pinning the deployment target to the runtime's own minimum makes the
+# link succeed; the bundle's `minimumSystemVersion` is raised to match, since the
+# app genuinely cannot run on anything older.
+#
+# `[env]` applies to rustc invocations (which forward it to the linker as
+# `-mmacosx-version-min`) and to build scripts. It does not override a value the
+# caller already exported, so an explicit override still wins.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.4"

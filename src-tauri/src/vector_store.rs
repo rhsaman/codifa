@@ -18,8 +18,6 @@ use crate::embeddings;
 
 /// Doc kinds, mirroring the Python constants.
 pub const KIND_FILE: &str = "file";
-pub const KIND_WEB: &str = "web";
-pub const KIND_MEMORY: &str = "memory";
 
 /// Retention limits, mirroring `StoreConfig` defaults.
 #[derive(Debug, Clone, Copy)]
@@ -59,18 +57,6 @@ impl StoreConfig {
     }
 }
 
-/// One search hit.
-#[derive(Debug, Clone)]
-pub struct Hit {
-    pub doc_id: i64,
-    pub chunk_id: i64,
-    pub text: String,
-    pub score: f32,
-    pub kind: String,
-    pub file_path: String,
-    pub key: String,
-}
-
 /// Aggregate counts for `/memory/stats`.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -83,17 +69,11 @@ pub struct Stats {
 pub struct VectorStore {
     conn: Mutex<Connection>,
     config: StoreConfig,
-    dim: usize,
 }
 
 /// `{base_dir}/{slug}.vectors.sqlite` — the same name the Python store used.
 pub fn db_path_for(base_dir: &Path, workspace_slug: &str) -> PathBuf {
     base_dir.join(format!("{workspace_slug}.vectors.sqlite"))
-}
-
-/// The global web/fetch RAG store (shared across workspaces).
-pub fn web_rag_path_for(base_dir: &Path) -> PathBuf {
-    base_dir.join("web.vectors.sqlite")
 }
 
 /// Stable per-workspace slug: the absolute path with separators folded to `-`.
@@ -126,7 +106,6 @@ impl VectorStore {
         let store = Self {
             conn: Mutex::new(conn),
             config,
-            dim: embeddings::embed_dim(),
         };
         store.init_schema()?;
         Ok(store)
@@ -280,19 +259,6 @@ impl VectorStore {
         Ok(id)
     }
 
-    /// Content hash of a stored doc, so an unchanged file is skipped.
-    pub fn doc_hash(&self, key: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT content_hash FROM docs WHERE key = ?1",
-            params![key],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
     /// `key -> (mtime, size)` for every doc of `kind`.
     ///
     /// The indexer uses this to decide what changed without reading a single
@@ -346,62 +312,6 @@ impl VectorStore {
             |r| r.get(0),
         )
         .map_err(|e| format!("count failed: {e}"))
-    }
-
-    /// Brute-force cosine search over the stored chunks.
-    ///
-    /// `kind` filters by doc kind when non-empty. Vectors are L2-normalized at
-    /// write time, so the dot product IS the cosine similarity.
-    pub fn search(&self, query_vec: &[f32], limit: usize, kind: &str) -> Result<Vec<Hit>, String> {
-        let conn = self.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
-        let sql = if kind.is_empty() {
-            "SELECT c.id, c.doc_id, c.txt, c.vec, d.kind, d.file_path, d.key
-             FROM chunks c JOIN docs d ON d.id = c.doc_id"
-        } else {
-            "SELECT c.id, c.doc_id, c.txt, c.vec, d.kind, d.file_path, d.key
-             FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE d.kind = ?1"
-        };
-        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare failed: {e}"))?;
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, i64, String, Vec<u8>, String, String, String)> {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        };
-        let rows = if kind.is_empty() {
-            stmt.query_map([], map_row)
-                .map_err(|e| format!("query failed: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-        } else {
-            stmt.query_map(params![kind], map_row)
-                .map_err(|e| format!("query failed: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-        }
-        .map_err(|e| format!("row read failed: {e}"))?;
-
-        let mut hits: Vec<Hit> = rows
-            .into_iter()
-            .map(|(chunk_id, doc_id, text, blob, kind, file_path, key)| {
-                let vec = blob_to_vec(&blob);
-                Hit {
-                    doc_id,
-                    chunk_id,
-                    text,
-                    score: embeddings::cosine(query_vec, &vec),
-                    kind,
-                    file_path,
-                    key,
-                }
-            })
-            .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        hits.truncate(limit);
-        Ok(hits)
     }
 
     /// Counts for `/memory/stats`.
@@ -477,11 +387,6 @@ impl VectorStore {
     pub fn config(&self) -> StoreConfig {
         self.config
     }
-
-    /// Vector width this store was opened with.
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
 }
 
 fn insert_chunks(
@@ -507,12 +412,6 @@ fn vec_to_blob(vec: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
-}
-
-fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 /// SHA-256 of whitespace-normalized text, truncated to 24 hex chars.
@@ -544,21 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_then_search_returns_the_closest_chunk() {
-        let (store, path) = temp_store();
-        let chunks = vec!["alpha text".to_string(), "beta text".to_string()];
-        let vectors = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
-        store
-            .upsert_doc("k1", KIND_FILE, "a.rs", "A", &chunks, &vectors)
-            .expect("upsert");
-        let hits = store.search(&[1.0, 0.0], 5, "").expect("search");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].text, "alpha text");
-        assert!(hits[0].score > hits[1].score);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn upserting_the_same_key_replaces_its_chunks() {
         let (store, path) = temp_store();
         store
@@ -570,21 +454,6 @@ mod tests {
         let stats = store.stats().expect("stats");
         assert_eq!(stats.docs, 1, "same key must not duplicate the doc");
         assert_eq!(stats.chunks, 1, "old chunks must be purged");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn search_can_filter_by_kind() {
-        let (store, path) = temp_store();
-        store
-            .upsert_doc("f", KIND_FILE, "a.rs", "A", &["file".into()], &[vec![1.0, 0.0]])
-            .expect("file");
-        store
-            .upsert_doc("w", KIND_WEB, "", "W", &["web".into()], &[vec![1.0, 0.0]])
-            .expect("web");
-        let hits = store.search(&[1.0, 0.0], 5, KIND_WEB).expect("search");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].kind, KIND_WEB);
         let _ = std::fs::remove_file(path);
     }
 

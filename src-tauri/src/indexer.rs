@@ -9,7 +9,7 @@
 //! files on demand, so pre-embedding a whole repo is wasted work. When off,
 //! the run only prunes stale `file:` docs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::embeddings;
 use crate::vector_store::{self, VectorStore, KIND_FILE};
@@ -26,8 +26,6 @@ const MAX_CHUNKS_PER_FILE: usize = 60;
 /// vectors: on a small machine the ONNX session plus the queued tensors is
 /// exactly what pushes the process into swap and takes the OS down.
 const MAX_CHUNKS_PER_RUN: usize = 600;
-/// Upper bound on files walked in one pass.
-const MAX_FILES: usize = 10_000;
 
 /// Extensions worth embedding (mirrors the Python `_TEXT_EXTENSIONS`).
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -364,41 +362,6 @@ pub fn store_path(root: &str, base_dir: &str) -> PathBuf {
     vector_store::db_path_for(&base, &vector_store::workspace_slug_for_root(root))
 }
 
-/// Is `path` inside `root`? Guards the indexer against escaping the workspace.
-///
-/// A path that does not exist yet (a file about to be written) is resolved
-/// through its nearest existing ancestor, so the guard works before creation
-/// and stays correct across symlinked temp dirs (macOS `/var` -> `/private/var`).
-pub fn is_inside(root: &Path, path: &Path) -> bool {
-    let root = resolve_existing(root);
-    let path = resolve_existing(path);
-    path.starts_with(&root)
-}
-
-/// Canonicalize `p`, falling back to canonicalizing its nearest existing
-/// ancestor and re-appending the missing tail.
-fn resolve_existing(p: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(p) {
-        return real;
-    }
-    let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = p.to_path_buf();
-    while let Some(parent) = cur.parent().map(Path::to_path_buf) {
-        if let Some(name) = cur.file_name() {
-            missing.push(name.to_os_string());
-        }
-        if let Ok(real) = std::fs::canonicalize(&parent) {
-            let mut out = real;
-            for name in missing.iter().rev() {
-                out.push(name);
-            }
-            return out;
-        }
-        cur = parent;
-    }
-    p.to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,11 +415,6 @@ mod tests {
             )
             .expect("upsert");
         assert_eq!(store.count_docs(KIND_FILE).unwrap(), 1);
-
-        // And the retrieval side: a query must come back with hits.
-        let q = embeddings::embed_queries(&["کامنت فارسی".to_string()]).expect("embed query");
-        let hits = store.search(&q[0], 5, KIND_FILE).expect("search");
-        assert!(!hits.is_empty(), "no hits for a query over indexed text");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -527,7 +485,7 @@ mod tests {
         std::fs::write(dir.join("node_modules/skip.js"), "x").expect("write");
         std::fs::write(dir.join("logo.png"), "x").expect("write");
 
-        let found = scan_workspace(dir.to_str().unwrap(), MAX_FILES);
+        let found = scan_workspace(dir.to_str().unwrap(), 10_000);
         let rels: Vec<&str> = found.iter().map(|f| f.rel.as_str()).collect();
         assert!(rels.contains(&"src/main.rs"), "got {rels:?}");
         assert!(!rels.iter().any(|r| r.contains("node_modules")));
@@ -555,7 +513,7 @@ mod tests {
             .expect("seed");
 
         // AUTO_INDEX_CODE is unset in tests, so the run only prunes.
-        let stats = index_workspace(&store, dir.to_str().unwrap(), 10, MAX_FILES);
+        let stats = index_workspace(&store, dir.to_str().unwrap(), 10, 10_000);
         assert_eq!(stats.pruned, 1, "stale file doc must be pruned");
         assert_eq!(store.count_docs(KIND_FILE).unwrap_or(-1), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -572,10 +530,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn is_inside_rejects_paths_outside_the_root() {
-        let dir = std::env::temp_dir();
-        assert!(is_inside(&dir, &dir.join("x")));
-        assert!(!is_inside(&dir, Path::new("/etc/hosts")));
-    }
 }

@@ -11,7 +11,7 @@
 //! retrieval quality. The session is built once and reused; a failed load is
 //! remembered so a missing model does not retry on every call.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -305,11 +305,6 @@ pub fn embed_dim() -> usize {
     }
 }
 
-/// Is the model present and loadable? Loads it on first call.
-pub fn is_available() -> bool {
-    with_embedder(|_| Ok(())).is_ok()
-}
-
 /// Diagnostics for `/models/embedding-status`.
 ///
 /// Deliberately does NOT load the model: the session is ~1 GB, and a status
@@ -349,11 +344,6 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Path helper used by tests and the indexer.
-pub fn model_dir_for(root: &Path) -> PathBuf {
-    root.join("models")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,7 +381,7 @@ mod tests {
     #[test]
     #[ignore = "needs the downloaded e5 model; run with --ignored"]
     fn embed_real_model_produces_normalized_vectors_with_semantic_order() {
-        if !is_available() {
+        if model_dir().is_none() {
             eprintln!("skipping: embedding model not downloaded");
             return;
         }

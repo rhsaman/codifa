@@ -99,8 +99,6 @@ pub struct ModelTestBody {
     #[serde(default = "default_provider")]
     provider: String,
     #[serde(default)]
-    provider_id: String,
-    #[serde(default)]
     base_url: String,
     #[serde(default)]
     api_keys: Vec<String>,
@@ -151,7 +149,7 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
 }
 
 /// POST /models/test — probe one model with a tiny completion.
-pub async fn models_test(Json(body): Json<ModelTestBody>) -> Response {
+pub async fn models_test(Json(body): Json<ModelTestBody>) -> Response<Body> {
     match probe_model(&body, &body.model).await {
         Ok(reply) => Json(json!({ "ok": true, "reply": reply })).into_response(),
         Err(err) => (
@@ -163,7 +161,7 @@ pub async fn models_test(Json(body): Json<ModelTestBody>) -> Response {
 }
 
 /// POST /models/test-batch — probe many models, one HTTP round trip.
-pub async fn models_test_batch(Json(body): Json<ModelTestBody>) -> Response {
+pub async fn models_test_batch(Json(body): Json<ModelTestBody>) -> Response<Body> {
     let models: Vec<String> = body
         .models
         .iter()
@@ -180,11 +178,20 @@ pub async fn models_test_batch(Json(body): Json<ModelTestBody>) -> Response {
     }
     // Bounded concurrency: a 100-model group test must not open 100 sockets.
     let mut results: Vec<Value> = Vec::with_capacity(models.len());
+    // Borrow the body once, outside the closures: an `async move` block would
+    // otherwise capture `body` by value and the first iteration would move it
+    // out of the FnMut closure.
+    let body_ref = &body;
     for chunk in models.chunks(MODEL_TEST_BATCH_CONCURRENCY) {
-        let part = futures_util::future::join_all(chunk.iter().map(|m| async {
-            match probe_model(&body, m).await {
-                Ok(reply) => json!({ "model": m, "ok": true, "reply": reply }),
-                Err(error) => json!({ "model": m, "ok": false, "error": error }),
+        let part = futures_util::future::join_all(chunk.iter().map(|m| {
+            // The async block outlives the loop body, so it must own its model
+            // name instead of borrowing it from `chunk`.
+            let model = m.clone();
+            async move {
+                match probe_model(body_ref, &model).await {
+                    Ok(reply) => json!({ "model": model, "ok": true, "reply": reply }),
+                    Err(error) => json!({ "model": model, "ok": false, "error": error }),
+                }
             }
         }))
         .await;

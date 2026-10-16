@@ -1104,6 +1104,37 @@ async def _ollama_info(
     return ctx, out
 
 
+def resolve_keys(
+    provider: str = "",
+    api_key: str = "",
+    env_var: str = "",
+    api_keys: list[str] | tuple[str, ...] | str | None = None,
+) -> list[str]:
+    """Ordered API keys for a provider, top = tried first.
+
+    Accepts the new ``api_keys`` list plus the legacy single ``api_key`` /
+    ``env_var`` shapes so old settings keep working; env chain is kept as a
+    last-resort fallback only.
+
+    Lives here (not in the deleted LangChain model factory) because provider
+    key resolution is provider metadata, and this module is the only live
+    caller.
+    """
+    out: list[str] = []
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    for k in list(api_keys or []):
+        if isinstance(k, str) and k.strip() and k.strip() not in out:
+            out.append(k.strip())
+    if isinstance(api_key, str) and api_key.strip() and api_key.strip() not in out:
+        out.append(api_key.strip())
+    if not out:
+        env = env_key(provider=provider, env_var=env_var or "")
+        if env and env not in out:
+            out.append(env)
+    return out
+
+
 async def fetch_credits(
     provider: str,
     base_url: str = "",
@@ -1119,11 +1150,7 @@ async def fetch_credits(
     if provider != "openrouter":
         return {}
     url = f"{OPENROUTER_BASE}/credits"
-    try:
-        from llm import resolve_keys as _resolve_keys
-        keys = _resolve_keys(provider, api_key, env_var, api_keys)
-    except Exception:  # noqa: BLE001 — any resolver failure falls back to raw keys
-        keys = [k for k in [api_key, env_key(provider, env_var)] if k]
+    keys = resolve_keys(provider, api_key, env_var, api_keys)
     if not keys:
         keys = [""]
     last_exc: Exception | None = None
@@ -1179,8 +1206,7 @@ async def list_models(
         return cached[1]
 
     try:
-        from llm import resolve_keys as _resolve_keys2
-        _keys = _resolve_keys2(provider, api_key, env_var, api_keys)
+        _keys = resolve_keys(provider, api_key, env_var, api_keys)
     except Exception:  # noqa: BLE001 — any resolver failure falls back to raw keys
         _keys = [k for k in [api_key, env_key(provider, env_var)] if k]
     if not _keys:

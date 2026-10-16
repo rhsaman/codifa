@@ -196,7 +196,6 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, model_validator
 
 import providers
-from llm import build_chat_model, llm_complete
 
 
 
@@ -377,12 +376,6 @@ class ModelsRequest(BaseModel):
     api_keys: list[str] = []
     base_url: str = ""
     provider_id: str = ""
-
-
-class ModelTestRequest(ModelsRequest):
-    """POST /models/test — probing one model with a tiny completion."""
-
-    model: str = ""
 
 
 class ModelDownloadRequest(BaseModel):
@@ -696,121 +689,15 @@ MODEL_TEST_TIMEOUT = 15  # ثانیه — بودجه کل تست
 MODEL_TEST_CLIENT_TIMEOUT = 12  # ثانیه — سقف کلاینت (کوچک‌تر از بودجه کل)
 
 
-@app.post("/models/test")
-async def models_test(req: ModelTestRequest) -> dict:
-    """Send a tiny one-shot completion to check a model actually works.
-
-    Uses the same build_chat_model + llm_complete path as a real chat turn
-    (the pattern proven in backend/live_test_providers.py) so the probe
-    exercises the exact provider+model the picker shows.
-    """
-    if not req.model:
-        raise HTTPException(status_code=400, detail="no model selected")
-    try:
-        mo = build_chat_model(
-            req.provider,
-            req.model,
-            req.base_url,
-            req.api_key,
-            req.env_var,
-            req.api_keys,
-            timeout=MODEL_TEST_CLIENT_TIMEOUT,
-            provider_id=req.provider_id,
-            # Chat-representative max_tokens so the provider's quota
-            # pre-check behaves like a real turn: a tiny cap
-            # can pass while the chat's 32K reservation fails with
-            # 402, producing a false tick. Actual burn stays ~1 token
-            # ("OK"), only the reservation is checked.
-            max_tokens=32000,
-            thinking_level="off",
-        )
-        text, _usage = await asyncio.wait_for(
-            llm_complete(mo, user="Reply with the single word: OK"),
-            timeout=MODEL_TEST_TIMEOUT,
-        )
-        if not (text or "").strip():
-            raise HTTPException(
-                status_code=400,
-                detail="empty reply — model returned no content (quota exhausted or route unavailable)",
-            )
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"timeout — model did not answer in {MODEL_TEST_TIMEOUT}s",
-        ) from exc
-    except providers.ProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # the real provider error must reach the UI
-        raise HTTPException(
-            status_code=400, detail=f"{type(exc).__name__}: {exc}"
-        ) from exc
-    return {"ok": True, "reply": (text or "").strip()[:200]}
-
-
 class ModelTestBatchRequest(ModelsRequest):
-    """POST /models/test-batch — probe many models in one round trip."""
+    """POST /models/test-batch — probe many models in one round trip.
+
+    Served natively by the Rust router (src-tauri/src/backend_light.rs); the
+    model probe was the last live consumer of the LangChain model factory, so
+    moving it native let the whole langchain/langgraph dependency tree go.
+    """
 
     models: list[str] = []
-
-
-@app.post("/models/test-batch")
-async def models_test_batch(req: ModelTestBatchRequest) -> dict:
-    """Probe many models concurrently, same probe as single test.
-
-    Single HTTP round trip for group tests (composer + settings selectors).
-    Each model uses the exact same build_chat_model + llm_complete path as
-    POST /models/test and a real chat turn, so a 402/insufficient-quota
-    failure marks that model as failed instead of ticking it.
-    """
-    models = [str(m or "").strip() for m in (req.models or []) if str(m or "").strip()][:100]
-    if not models:
-        raise HTTPException(status_code=400, detail="no models selected")
-    sem = asyncio.Semaphore(10)
-
-    async def _probe(model: str) -> dict:
-        async with sem:
-            try:
-                mo = build_chat_model(
-                    req.provider,
-                    model,
-                    req.base_url,
-                    req.api_key,
-                    req.env_var,
-                    req.api_keys,
-                    timeout=MODEL_TEST_CLIENT_TIMEOUT,
-                    provider_id=req.provider_id,
-                    # Chat-representative max_tokens so the provider's quota
-                    # pre-check behaves like a real turn: a tiny cap
-                    # can pass while the chat's 32K reservation fails with
-                    # 402, producing a false tick. Actual burn stays ~1 token
-                    # ("OK"), only the reservation is checked.
-                    max_tokens=32000,
-                    thinking_level="off",
-                )
-                text, _usage = await asyncio.wait_for(
-                    llm_complete(mo, user="Reply with the single word: OK"),
-                    timeout=MODEL_TEST_TIMEOUT,
-                )
-                if not (text or "").strip():
-                    return {
-                        "model": model,
-                        "ok": False,
-                        "error": "empty reply — model returned no content (quota exhausted or route unavailable)",
-                    }
-                return {"model": model, "ok": True, "reply": (text or "").strip()[:200]}
-            except asyncio.TimeoutError:
-                return {
-                    "model": model,
-                    "ok": False,
-                    "error": f"timeout — model did not answer in {MODEL_TEST_TIMEOUT}s",
-                }
-            except providers.ProviderError as exc:
-                return {"model": model, "ok": False, "error": str(exc)}
-            except Exception as exc:  # noqa: BLE001 — real provider error per model
-                return {"model": model, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    results = await asyncio.gather(*(_probe(m) for m in models))
-    return {"results": list(results)}
 
 
 # --- managed on-device models (whisper / embedding) --------------------- #

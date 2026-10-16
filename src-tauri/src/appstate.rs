@@ -625,39 +625,124 @@ pub async fn chat_title(
     } else {
         body.provider.as_str()
     };
-    let cfg = crate::llm::LlmConfig {
-        // `provider` is the KIND (openrouter/anthropic/google/custom…):
-        // endpoint_and_auth + normalize_base switch on it to pick the URL path
-        // and auth header. Filling it with the user-configured provider_id made
-        // every anthropic/google title call hit the OpenAI-compatible path
-        // (`{base}/chat/completions`) and fail.
-        provider: crate::backend_light::resolve_slot_kind(
-            &slot,
-            parent_kind,
-            &body.providers,
-        ),
-        model,
-        base_url,
-        api_keys,
-        temperature: Some(0.2),
-        max_tokens: Some(24),
-        timeout_secs: 30,
-    };
+    // `provider` is the KIND (openrouter/anthropic/google/custom…):
+    // endpoint_and_auth + normalize_base switch on it to pick the URL path and
+    // auth header. Filling it with the user-configured provider_id made every
+    // anthropic/google title call hit the OpenAI-compatible path
+    // (`{base}/chat/completions`) and fail.
+    let kind = crate::backend_light::resolve_slot_kind(&slot, parent_kind, &body.providers);
     let prompt = format!(
         "Generate a short chat title (max 6 words, no quotes) for a conversation starting with:\n{}",
         body.text.chars().take(400).collect::<String>()
     );
     let client = crate::llm::http_client();
-    match crate::llm::complete(&client, &cfg, "You generate concise chat titles.", &prompt).await {
-        Ok(res) => {
-            let title = res.text.trim().trim_matches(|c| c == '"' || c == '\n').to_string();
-            Json(json!({ "title": title, "usage": res.usage })).into_response()
+
+    // Fallback chain (title slot -> compact slot -> the chat model), mirroring
+    // the Python handler: a slot that is unset, misconfigured or simply
+    // unreachable must not leave the chat untitled. Each attempt is one cheap
+    // one-shot completion, so trying the next candidate costs one round trip.
+    let mut candidates: Vec<(String, String, String, Vec<String>)> =
+        vec![(kind, model, base_url, api_keys)];
+    for fallback_slot in ["compact", ""] {
+        let entry = if fallback_slot.is_empty() {
+            String::new()
+        } else {
+            body.subagent_models.get(fallback_slot).cloned().unwrap_or_default()
+        };
+        let (f_model, f_base, f_keys) = crate::backend_light::resolve_slot_target(
+            &entry,
+            &body.model,
+            &body.base_url,
+            &body.api_keys,
+            &body.providers,
+        );
+        let f_kind = crate::backend_light::resolve_slot_kind(&entry, parent_kind, &body.providers);
+        let cand = (f_kind, f_model, f_base, f_keys);
+        if !candidates.contains(&cand) {
+            candidates.push(cand);
         }
-        Err(e) => Json(json!({ "title": Value::Null, "usage": Value::Null, "error": e })).into_response()
     }
+
+    let mut last_error = String::new();
+    let mut usage = Value::Null;
+    for (c_kind, c_model, c_base, c_keys) in candidates {
+        let cfg = crate::llm::LlmConfig {
+            provider: c_kind,
+            model: c_model,
+            base_url: c_base,
+            api_keys: c_keys,
+            temperature: Some(0.2),
+            // Reasoning models spend their first tokens on the thinking block,
+            // so the old tiny cap (24) returned an EMPTY title for them and the
+            // chat stayed untitled. A title is a few tokens, so a generous cap
+            // costs nothing while leaving room for the reasoning preamble.
+            max_tokens: Some(512),
+            timeout_secs: 30,
+        };
+        match crate::llm::complete(&client, &cfg, "You generate concise chat titles.", &prompt).await {
+            Ok(res) => {
+                if usage.is_null() {
+                    usage = res.usage.clone().unwrap_or(Value::Null);
+                }
+                let title = clean_title(&res.text);
+                if !title.is_empty() {
+                    return Json(json!({ "title": title, "usage": usage })).into_response();
+                }
+                last_error = "model returned an empty title".into();
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    Json(json!({ "title": Value::Null, "usage": usage, "error": last_error })).into_response()
+}
+
+/// Reduce a raw model reply to a usable one-line title.
+///
+/// Reasoning models wrap their answer in a ` thinking…</think>` block and often
+/// quote or bullet the title; both would otherwise land in the sidebar verbatim.
+fn clean_title(raw: &str) -> String {
+    let mut text = raw.to_string();
+    for (open, close) in [(" thinking", "</think>"), ("<thinking>", "</thinking>")] {
+        while let (Some(a), Some(b)) = (text.find(open), text.find(close)) {
+            if b < a {
+                break;
+            }
+            text.replace_range(a..b + close.len(), "");
+        }
+    }
+    let line = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['#', '-', '*', ' ']).trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    line.trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '.' || c == ':')
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
 }
 
 // --- axum handlers -----------------------------------------------------------
+
+#[cfg(test)]
+mod title_tests {
+    use super::clean_title;
+
+    #[test]
+    fn clean_title_strips_reasoning_and_decoration() {
+        // A reasoning model's think block must never reach the sidebar.
+        assert_eq!(clean_title(" thinkingweighing options</think>Fix the browser panel"), "Fix the browser panel");
+        assert_eq!(clean_title("<thinking>x</thinking>Terminal scrollbar"), "Terminal scrollbar");
+        // Bullets, quotes and trailing punctuation are decoration, not title.
+        assert_eq!(clean_title("- \"Compact summary ledger\""), "Compact summary ledger");
+        assert_eq!(clean_title("## Plan: migrate to Rust."), "Plan: migrate to Rust");
+        // A think-only reply has no title at all — the caller must fall back.
+        assert_eq!(clean_title(" thinkingonly thinking</think>"), "");
+        assert_eq!(clean_title("   \n  "), "");
+        // Long replies are cut to a sidebar-sized line.
+        assert_eq!(clean_title(&"a".repeat(200)).chars().count(), 80);
+    }
+}
 
 pub async fn app_state_get(State(st): State<crate::backend_light::AppState>) -> Response {
     Json(get_state(&st.data_root)).into_response()

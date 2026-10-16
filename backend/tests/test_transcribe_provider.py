@@ -145,17 +145,17 @@ def test_unload_whisper_manual_drops_cache(monkeypatch):
     assert server.unload_whisper() is False
 
 
-def test_models_unload_frees_all_weights(monkeypatch):
-    """POST /models/unload drops embedding, whisper, TTS and Laya weights."""
-    import embeddings
+def test_models_unload_frees_python_owned_weights(monkeypatch):
+    """POST /models/unload drops the sidecar-owned whisper, TTS and Laya weights.
+
+    The embedding session is native now (the Rust router drops it and merges
+    the report), so this endpoint only covers what Python still owns.
+    """
     import laya_router
     import local_tts
 
     monkeypatch.setattr(server, "_whisper_model", object())
     monkeypatch.setattr(server, "_whisper_evict_timer", None)
-    monkeypatch.setattr(embeddings, "_CACHE", {"session": object()})
-    monkeypatch.setattr(embeddings, "_active_embeds", 0)
-    monkeypatch.setattr(embeddings, "_evict_timer", None)
     monkeypatch.setattr(local_tts, "_POCKET_MODEL", object())
     monkeypatch.setattr(local_tts, "_G2P_MODEL", None)
     monkeypatch.setattr(local_tts, "_tts_evict_timer", None)
@@ -167,31 +167,8 @@ def test_models_unload_frees_all_weights(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    assert body["freed"] == {"embedding": True, "whisper": True, "tts": True, "laya": True}
+    assert body["freed"] == {"whisper": True, "tts": True, "laya": True}
     assert server._whisper_model is None
-
-
-def test_index_run_uses_limited_default_budget(monkeypatch, tmp_path):
-    """Empty budget must not wake the embedder for the whole repo."""
-    import indexer
-
-    captured: dict = {}
-
-    def fake_index(store, root, budget=0):
-        captured["budget"] = budget
-        return {"total": 1, "indexed": 1, "pruned": 0, "skipped": 0, "unchanged": 0}
-
-    monkeypatch.setattr(server, "_open_store", lambda root, path: object())
-    monkeypatch.setattr(indexer, "index_workspace", fake_index)
-    # Patch the already-imported reference inside server.index_run.
-    monkeypatch.setattr("indexer.index_workspace", fake_index)
-    client = TestClient(server.app)
-    resp = client.post("/index/run", json={"root": str(tmp_path), "budget": 0})
-    assert resp.status_code == 200
-    assert captured["budget"] == 120
-    resp = client.post("/index/run", json={"root": str(tmp_path), "budget": 9999})
-    assert resp.status_code == 200
-    assert captured["budget"] == 500
 
 
 def test_no_provider_field_uses_local():

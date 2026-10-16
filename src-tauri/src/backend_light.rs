@@ -338,17 +338,42 @@ pub struct RagBody {
 }
 
 /// Documents embedded per indexing run when the caller does not say.
-const DEFAULT_INDEX_BUDGET: usize = 120;
+///
+/// Deliberately small: a run holds the ONNX session plus every queued vector,
+/// and on an 8 GB machine a large default is what drives the process into swap.
+/// Callers that want a full index pass an explicit `budget`.
+const DEFAULT_INDEX_BUDGET: usize = 40;
+
+/// Files walked per run when the caller does not say. The walk itself is cheap,
+/// but every entry is held in memory and the store's metadata is loaded whole.
+const DEFAULT_INDEX_MAX_FILES: usize = 2_000;
 
 /// GET /models/embedding-status — is the e5 model present and loadable?
 async fn embedding_status() -> Response<Body> {
     Json(crate::embeddings::status()).into_response()
 }
 
-/// POST /models/unload — drop the embedding session and free its memory.
-async fn models_unload() -> Response<Body> {
+/// POST /models/unload — free every cached local model.
+///
+/// The embedding session is native, so it is dropped here; Whisper, the local
+/// TTS weights and the Laya classifier still live in the Python sidecar, so the
+/// request is forwarded there and the two reports are merged. Best-effort
+/// throughout: a sidecar that is down must not fail the endpoint.
+async fn models_unload(State(st): State<AppState>) -> Response<Body> {
     crate::embeddings::unload();
-    Json(json!({ "ok": true })).into_response()
+    let mut freed = json!({ "embedding": true });
+    if let Some(base) = sidecar_base().await {
+        if let Ok(res) = st.http.post(format!("{base}/models/unload")).send().await {
+            if let Ok(body) = res.json::<Value>().await {
+                if let Some(map) = body.get("freed").and_then(|v| v.as_object()) {
+                    for (k, v) in map {
+                        freed[k] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+    Json(json!({ "ok": true, "freed": freed })).into_response()
 }
 
 /// GET /index/status — does this workspace need a first index, and how big is
@@ -394,9 +419,12 @@ async fn index_run(Json(body): Json<RagBody>) -> Response<Body> {
         &store,
         &body.root,
         body.budget.unwrap_or(DEFAULT_INDEX_BUDGET),
-        body.max_files.unwrap_or(10_000),
+        body.max_files.unwrap_or(DEFAULT_INDEX_MAX_FILES),
     );
     let _ = store.enforce_limits();
+    // Indexing is a batch job: hand the ~1 GB ONNX session back to the OS as
+    // soon as it finishes instead of keeping it resident until the idle timer.
+    crate::embeddings::unload();
     Json(stats).into_response()
 }
 

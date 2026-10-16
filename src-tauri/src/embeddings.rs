@@ -12,7 +12,9 @@
 //! remembered so a missing model does not retry on every call.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ort::environment::Environment;
 use ort::session::builder::GraphOptimizationLevel;
@@ -26,6 +28,9 @@ const QUERY_PREFIX: &str = "query: ";
 const PASSAGE_PREFIX: &str = "passage: ";
 /// e5 truncates at 512 tokens; longer input is cut, not rejected.
 const MAX_LEN: usize = 512;
+/// Texts per ONNX run. A whole file's chunks in one call builds a huge tensor
+/// and aborts the native runtime, so the batch is kept small.
+const MAX_BATCH: usize = 8;
 /// Fallback dimension when the model has not been loaded yet (e5-base = 768).
 const DEFAULT_DIM: usize = 768;
 
@@ -37,6 +42,47 @@ struct Embedder {
 
 /// `None` = not loaded yet, `Some(Err)` = load failed (do not retry).
 static EMBEDDER: OnceLock<Mutex<Option<Result<Embedder, String>>>> = OnceLock::new();
+
+/// Unix seconds of the last embed call. The session holds ~1.1 GB, so an idle
+/// one is dropped rather than kept for the rest of the session (the Python
+/// sidecar did the same with its evict timer).
+static LAST_USE: AtomicU64 = AtomicU64::new(0);
+/// How long the session may sit unused before it is released. Short on
+/// purpose: the session is ~1 GB and this app runs on machines where that is a
+/// meaningful share of physical RAM, so an idle one is dropped quickly.
+const IDLE_EVICT_SECS: u64 = 60;
+/// How often the evictor checks. Cheap: one atomic load per tick.
+const EVICT_TICK_SECS: u64 = 30;
+/// Guards the one-time evictor spawn.
+static EVICTOR: OnceLock<()> = OnceLock::new();
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Start the idle evictor once. It only ever drops an already-loaded session,
+/// so it costs nothing while the embedder is unused.
+fn spawn_evictor() {
+    EVICTOR.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(EVICT_TICK_SECS));
+            let last = LAST_USE.load(Ordering::Relaxed);
+            if last == 0 || now_secs().saturating_sub(last) < IDLE_EVICT_SECS {
+                continue;
+            }
+            // Only evict when nothing is mid-embed: a held lock means busy.
+            if let Ok(mut guard) = slot().try_lock() {
+                if guard.is_some() {
+                    *guard = None;
+                    LAST_USE.store(0, Ordering::Relaxed);
+                }
+            }
+        });
+    });
+}
 
 /// ONNX Runtime environment, created once and shared by every session.
 static ENV: OnceLock<Environment> = OnceLock::new();
@@ -127,6 +173,19 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        // One ONNX run per small sub-batch. A whole file's chunks (up to 60)
+        // in a single call builds a [60, 512] tensor and aborts the native
+        // runtime — the process dies instead of returning an error, which is
+        // what killed the app on the first real indexing run.
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for group in texts.chunks(MAX_BATCH) {
+            out.extend(self.encode_group(group, prefix)?);
+        }
+        Ok(out)
+    }
+
+    /// One ONNX run for a small group of texts.
+    fn encode_group(&mut self, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
         let encodings = self
             .tokenizer
@@ -211,11 +270,18 @@ fn with_embedder<T>(f: impl FnOnce(&mut Embedder) -> Result<T, String>) -> Resul
     let mut guard = slot().lock().map_err(|_| "embedder lock poisoned".to_string())?;
     if guard.is_none() {
         *guard = Some(load());
+        spawn_evictor();
     }
-    match guard.as_mut().expect("just filled") {
+    let out = match guard.as_mut().expect("just filled") {
         Ok(emb) => f(emb),
         Err(err) => Err(err.clone()),
+    };
+    // Mark the session in use only on success, so a failed call does not keep
+    // a broken session alive.
+    if out.is_ok() {
+        LAST_USE.store(now_secs(), Ordering::Relaxed);
     }
+    out
 }
 
 /// Embed passages (documents to be retrieved). Cached per text by the caller.
@@ -245,30 +311,36 @@ pub fn is_available() -> bool {
 }
 
 /// Diagnostics for `/models/embedding-status`.
+///
+/// Deliberately does NOT load the model: the session is ~1 GB, and a status
+/// check must not pull that into RAM on a machine where it is a large share of
+/// physical memory. It reports the already-loaded dimension when there is one,
+/// and otherwise just whether the files are on disk.
 pub fn status() -> serde_json::Value {
     let dir = model_dir();
-    match with_embedder(|emb| Ok(emb.dim)) {
-        Ok(dim) => serde_json::json!({
-            "available": true,
-            "model": EMBEDDING_REPO,
-            "dir": dir.map(|d| d.display().to_string()).unwrap_or_default(),
-            "dimension": dim,
-            "error": "",
-        }),
-        Err(err) => serde_json::json!({
-            "available": false,
-            "model": EMBEDDING_REPO,
-            "dir": dir.map(|d| d.display().to_string()).unwrap_or_default(),
-            "dimension": 0,
-            "error": err,
-        }),
-    }
+    let loaded = slot()
+        .lock()
+        .ok()
+        .and_then(|guard| match guard.as_ref() {
+            Some(Ok(emb)) => Some(emb.dim),
+            _ => None,
+        });
+    let present = dir.is_some();
+    serde_json::json!({
+        "available": present,
+        "loaded": loaded.is_some(),
+        "model": EMBEDDING_REPO,
+        "dir": dir.map(|d| d.display().to_string()).unwrap_or_default(),
+        "dimension": loaded.unwrap_or(if present { DEFAULT_DIM } else { 0 }),
+        "error": if present { "" } else { "embedding model not downloaded" },
+    })
 }
 
 /// Drop the loaded session so its memory is returned to the OS.
 pub fn unload() {
     if let Ok(mut guard) = slot().lock() {
         *guard = None;
+        LAST_USE.store(0, Ordering::Relaxed);
     }
 }
 

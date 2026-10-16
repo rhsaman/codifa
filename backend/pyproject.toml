@@ -8,18 +8,17 @@ dependencies = [
     "fastapi>=0.115.0",
     "httpx>=0.27.0",
     "uvicorn>=0.30.0",
-    "ddgs>=9.14.4",
-    "cryptography>=42.0.0",
     "faster-whisper>=1.2.1",
+    # numpy/torch/transformers/safetensors are still required: the Laya
+    # decision classifier and the local TTS weights are torch checkpoints, so
+    # only Python can run them. onnxruntime, sqlite-vec, tokenizers,
+    # markdownify, ddgs, cryptography and pillow were dropped — the RAG
+    # embedder (ort), the vector store (rusqlite), markdown conversion, web
+    # search and secret storage are native now.
     "numpy>=1.26",
-    "onnxruntime>=1.18",
     "torch>=2.2",
     "transformers>=4.40",
     "safetensors>=0.4",
-    "tokenizers>=0.19",
-    "sqlite-vec>=0.1.9",
-    "markdownify>=0.13.1",
-    "pillow>=12.3.0",
     "python-multipart>=0.0.32",
     "huggingface-hub>=0.23",
     "pocket-tts @ git+https://github.com/mallahyari/pocket-tts@main",

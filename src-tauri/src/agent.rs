@@ -188,6 +188,11 @@ pub struct AgentRequest {
     /// never bound, so the agent cannot touch the desktop at all.
     #[serde(default)]
     pub allow_computer: bool,
+    /// Web-search engines from Settings → Plugins, verbatim and in priority
+    /// order: `order` 0 is the primary and higher orders are fallbacks tried in
+    /// turn, so the user's list order IS the fallback chain.
+    #[serde(default)]
+    pub search_plugins: Vec<Value>,
 }
 
 fn default_mode() -> String {
@@ -354,6 +359,14 @@ fn tool_schemas() -> Vec<Value> {
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
             }),
         ),
+        (
+            "web_search",
+            "Search the web and return ranked results (title, url, snippet). Use it for facts, docs and current information. The engines come from Settings → Plugins and are tried in the user's order until one answers.",
+            json!({
+                "query": {"type": "string", "description": "The search query"},
+                "max_results": {"type": "integer", "description": "How many results to return (default 5)"}
+            }),
+        ),
     ];
     schemas
         .iter()
@@ -474,6 +487,14 @@ fn research_schemas() -> Vec<Value> {
             json!({
                 "name": {"type": "string", "description": "Skill name or slug"},
                 "file": {"type": "string", "description": "Optional extra file of that skill"}
+            }),
+        ),
+        (
+            "web_search",
+            "Search the web and return ranked results (title, url, snippet). Use it for facts, docs and current information. The engines come from Settings → Plugins and are tried in the user's order until one answers.",
+            json!({
+                "query": {"type": "string", "description": "The search query"},
+                "max_results": {"type": "integer", "description": "How many results to return (default 5)"}
             }),
         ),
     ];
@@ -1106,6 +1127,16 @@ use what it showed, read a DIFFERENT window, or move on"
                     Ok(r) => (r, true),
                     Err(e) => (e, false),
                 }
+            } else if name == "web_search" {
+                // Native web search: the engine chain is the user's Settings →
+                // Plugins order, so this must run here (async) rather than in
+                // the sync `tools::dispatch`.
+                let query = args["query"].as_str().unwrap_or_default();
+                let max = args["max_results"].as_u64().unwrap_or(5) as usize;
+                match crate::websearch::search(&req.search_plugins, query, max).await {
+                    Ok(r) => (r, true),
+                    Err(e) => (e, false),
+                }
             } else {
                 match tools::dispatch(&root, name, &args, None) {
                     Ok(r) => (r, true),
@@ -1510,6 +1541,9 @@ async fn run_subagent(
         data_root: parent.data_root.clone(),
         // Sub-agents are research-only: desktop control is never delegated.
         allow_computer: false,
+        // Web search IS research, so the sub-agent inherits the same engine
+        // chain the user configured for the parent turn.
+        search_plugins: parent.search_plugins.clone(),
     };
 
     let mut report = String::new();
@@ -1742,6 +1776,9 @@ mod tests {
         assert!(names.contains(&"explore"));
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"run_terminal"));
+        // Web search is not file discovery: the main agent may search the web
+        // itself (the engines come from Settings → Plugins).
+        assert!(names.contains(&"web_search"));
     }
 
     #[test]
@@ -1999,6 +2036,7 @@ mod tests {
             providers: std::collections::HashMap::new(),
             data_root: String::new(),
             allow_computer: false,
+            search_plugins: Vec::new(),
         }
     }
 

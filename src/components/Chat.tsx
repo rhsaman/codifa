@@ -3071,8 +3071,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         content: text,
         attachments: atts,
         images: sendImgs,
-        mcpServers: effectiveMcpServers,
-        skills: effectiveSkills,
+                  mcpServers: effectiveMcpServers,
+          skills: effectiveSkills,
         // Capture the CURRENT chat mode on the user bubble so the transcript
         // stays consistent: every user message records which mode it ran in.
         // This also guarantees a retry (which re-sends via send()) inherits the
@@ -4308,6 +4308,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               modelReasoning(activeProvider, activeProvider.model),
             ),
           mcpServers: effectiveMcpServers,
+          // Settings → Plugins order decides the web_search engine chain
+          // (top = primary, below = fallbacks tried in order).
+          searchPlugins: s.searchPlugins,
           skills: effectiveSkills,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,

@@ -436,6 +436,9 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         data_root: String::new(),
         // Headless scheduled runs never touch the desktop.
         allow_computer: false,
+        // A scheduled run has no UI session, so it uses the default engine
+        // chain (DuckDuckGo) rather than a user's Settings → Plugins order.
+        search_plugins: Vec::new(),
     };
 
     let mut final_text = String::new();

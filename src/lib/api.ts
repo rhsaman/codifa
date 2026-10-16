@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -665,6 +665,9 @@ export interface StreamParams {
    *  provider payload / models.dev catalog. */
   modelReasoning?: boolean
   mcpServers?: Record<string, McpServerConfig>
+  /** Web-search engines from Settings → Plugins, in priority order: the top
+   *  engine is the primary and the ones below are fallbacks tried in order. */
+  searchPlugins?: SearchPluginConfig[]
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
   /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
@@ -807,6 +810,7 @@ export async function streamChat(
           thinking_level: params.thinkingLevel ?? '',
           model_reasoning: params.modelReasoning ?? false,
           mcp_servers: params.mcpServers ?? {},
+          search_plugins: params.searchPlugins ?? [],
           skills: params.skills ?? [],
           allow_create: params.allowCreate ?? false,
           cap: params.cap ?? {},

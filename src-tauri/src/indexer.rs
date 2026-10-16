@@ -22,6 +22,10 @@ const CHUNK_CHARS: usize = 1_200;
 const CHUNK_OVERLAP: usize = 120;
 /// Max chunks per file: one huge doc must not queue thousands of vectors.
 const MAX_CHUNKS_PER_FILE: usize = 60;
+/// Max chunks embedded in ONE run. A batch job must not queue thousands of
+/// vectors: on a small machine the ONNX session plus the queued tensors is
+/// exactly what pushes the process into swap and takes the OS down.
+const MAX_CHUNKS_PER_RUN: usize = 600;
 /// Upper bound on files walked in one pass.
 const MAX_FILES: usize = 10_000;
 
@@ -167,6 +171,23 @@ pub fn scan_workspace(root: &str, max_files: usize) -> Vec<FileInfo> {
     out
 }
 
+/// Largest byte index <= `idx` that sits on a char boundary.
+///
+/// Chunk sizes are byte budgets, but slicing a `str` at an arbitrary byte
+/// panics on multi-byte text: Persian comments and strings are two bytes per
+/// character, so a naive `split_at` crashed the whole indexing run. Every
+/// slice below goes through this.
+fn floor_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Split text into overlapping chunks on line boundaries.
 pub fn chunk_text(text: &str) -> Vec<String> {
     if text.is_empty() {
@@ -182,7 +203,11 @@ pub fn chunk_text(text: &str) -> Vec<String> {
             }
             let mut rest = line;
             while rest.len() > CHUNK_CHARS {
-                let (head, tail) = rest.split_at(CHUNK_CHARS);
+                let cut = floor_boundary(rest, CHUNK_CHARS);
+                if cut == 0 {
+                    break;
+                }
+                let (head, tail) = rest.split_at(cut);
                 chunks.push(head.to_string());
                 rest = tail;
             }
@@ -193,7 +218,7 @@ pub fn chunk_text(text: &str) -> Vec<String> {
             chunks.push(std::mem::take(&mut current));
             // Carry the tail of the previous chunk as overlap.
             if let Some(prev) = chunks.last() {
-                let start = prev.len().saturating_sub(CHUNK_OVERLAP);
+                let start = floor_boundary(prev, prev.len().saturating_sub(CHUNK_OVERLAP));
                 let carry: String = prev[start..].to_string();
                 current.push_str(&carry);
             }
@@ -217,6 +242,15 @@ pub struct IndexStats {
     pub pruned: usize,
     pub skipped: usize,
     pub unchanged: usize,
+    /// Chunks actually embedded in this run (bounded by `MAX_CHUNKS_PER_RUN`).
+    pub chunks: usize,
+}
+
+/// May a file contributing `next` chunks still start, given `done` already
+/// embedded in this run? The first file always starts, so a single file larger
+/// than the cap is still indexed instead of stalling the run forever.
+pub fn fits_run_cap(done: usize, next: usize) -> bool {
+    done == 0 || done + next <= MAX_CHUNKS_PER_RUN
 }
 
 /// Incrementally index changed/new files and prune deleted ones.
@@ -250,7 +284,7 @@ pub fn index_workspace(store: &VectorStore, root: &str, budget: usize, max_files
     }
 
     for info in &scan {
-        if stats.indexed >= budget {
+        if stats.indexed >= budget || stats.chunks >= MAX_CHUNKS_PER_RUN {
             break;
         }
         let key = format!("file:{}", info.rel);
@@ -271,6 +305,12 @@ pub fn index_workspace(store: &VectorStore, root: &str, budget: usize, max_files
             stats.skipped += 1;
             continue;
         }
+        // Stop before a file that would blow the per-run cap, so the run's
+        // peak memory stays bounded no matter how large the tree is.
+        if !fits_run_cap(stats.chunks, chunks.len()) {
+            break;
+        }
+        stats.chunks += chunks.len();
         let Ok(vectors) = embeddings::embed_passages(&chunks) else {
             stats.skipped += 1;
             continue;
@@ -364,6 +404,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunk_text_handles_multibyte_text_without_panicking() {
+        // Persian is two bytes per character, so a byte-offset slice used to
+        // panic mid-character and kill the whole indexing run.
+        let line = "# کامنت فارسی برای تست برش متن چندبایتی\n";
+        let text = line.repeat(200);
+        let chunks = chunk_text(&text);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(c.len() <= CHUNK_CHARS + CHUNK_OVERLAP + line.len());
+        }
+        // A single long multibyte line is hard-split too.
+        let long = "ب".repeat(CHUNK_CHARS * 3);
+        let split = chunk_text(&long);
+        assert!(split.len() > 1);
+        assert!(split.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "loads the real ONNX model"]
+    fn real_model_embeds_and_stores_persian_chunks() {
+        // Reproduces the first real indexing run: many chunks of multibyte
+        // text through the real model and the real store. This used to abort
+        // the process with no error message.
+        let dir = std::env::temp_dir().join(format!("codifa-idx-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let text = "# کامنت فارسی برای تست ایندکس\nfn main() { println!(\"سلام\"); }\n".repeat(300);
+        let chunks = chunk_text(&text);
+        assert!(chunks.len() > 1, "expected several chunks, got {}", chunks.len());
+
+        let vectors = embeddings::embed_passages(&chunks).expect("embed passages");
+        assert_eq!(vectors.len(), chunks.len());
+        assert_eq!(vectors[0].len(), 768);
+
+        let store = VectorStore::open(&dir.join("s.sqlite"), vector_store::StoreConfig::default())
+            .expect("open store");
+        store
+            .upsert_doc(
+                "file:src/main.rs",
+                KIND_FILE,
+                "src/main.rs",
+                "src/main.rs",
+                &chunks,
+                &vectors,
+            )
+            .expect("upsert");
+        assert_eq!(store.count_docs(KIND_FILE).unwrap(), 1);
+
+        // And the retrieval side: a query must come back with hits.
+        let q = embeddings::embed_queries(&["کامنت فارسی".to_string()]).expect("embed query");
+        let hits = store.search(&q[0], 5, KIND_FILE).expect("search");
+        assert!(!hits.is_empty(), "no hits for a query over indexed text");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn should_index_accepts_code_and_rejects_binaries() {
         assert!(should_index("src/main.rs", None));
         assert!(should_index("README.md", None));
@@ -406,6 +504,17 @@ mod tests {
     fn chunk_text_hard_splits_a_single_giant_line() {
         let chunks = chunk_text(&"x".repeat(CHUNK_CHARS * 3));
         assert!(chunks.len() >= 3);
+    }
+
+    #[test]
+    fn run_cap_bounds_chunks_but_always_admits_the_first_file() {
+        // A run must stop queueing vectors once the cap is reached, otherwise a
+        // large tree holds thousands of vectors plus the ONNX session at once.
+        assert!(fits_run_cap(0, MAX_CHUNKS_PER_RUN), "the first file always starts");
+        assert!(fits_run_cap(0, MAX_CHUNKS_PER_RUN + 500), "even a huge first file");
+        assert!(fits_run_cap(MAX_CHUNKS_PER_RUN - 10, 10));
+        assert!(!fits_run_cap(MAX_CHUNKS_PER_RUN - 10, 11));
+        assert!(!fits_run_cap(MAX_CHUNKS_PER_RUN, 1));
     }
 
     #[test]

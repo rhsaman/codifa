@@ -740,30 +740,16 @@ async def models_status() -> dict:
     return {"status": data, "piper": snapshot}
 
 
-@app.get("/models/embedding-status")
-async def models_embedding_status() -> dict:
-    """RAG embedder diagnostics: model loaded? what dimension? why not?."""
-    from embeddings import status as embed_status
-
-    return embed_status()
-
-
 @app.post("/models/unload")
 async def models_unload() -> dict:
-    """Drop cached local-model weights immediately, freeing idle RAM.
+    """Drop the Python-owned local weights, freeing idle RAM.
 
-    Unloads the embedding ONNX session (~1.1 GB), the Whisper model
-    (1.5-3 GB), the local TTS weights and the Laya decision weights.
-    Safe anytime; next use reloads lazily. Used by the manual free-memory
-    action in Settings.
+    The embedding ONNX session is native now — the Rust router unloads it
+    itself and merges the result — so this endpoint only covers the models
+    the sidecar still owns: Whisper (1.5-3 GB), the local TTS weights and
+    the Laya decision weights. Safe anytime; next use reloads lazily.
     """
     freed: dict[str, bool] = {}
-    try:
-        from embeddings import unload as _unload_embed
-
-        freed["embedding"] = bool(_unload_embed())
-    except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
-        freed["embedding"] = False
     try:
         freed["whisper"] = bool(unload_whisper())
     except Exception:  # noqa: BLE001 -- unload is best-effort, never fail the endpoint
@@ -2101,189 +2087,12 @@ def _subagent_job_view(job: dict) -> dict:
     }
 
 
-class MemoryRequest(BaseModel):
-    """Root + optional vector-store folder for memory stats / clear."""
-
-    root: str = ""
-    vector_db_path: str = ""
-
-
-class MemoryStatsResponse(BaseModel):
-    available: bool = False
-    db: str = ""
-    docs: int = 0
-    chunks: int = 0
-    kinds: dict[str, int] = {}
-    max_docs: int = 0
-    max_chunks: int = 0
-    ttl_days: int = 0
-
-
-class MemoryClearResponse(BaseModel):
-    ok: bool = False
-    error: str = ""
-
-
-@app.get("/memory/stats")
-async def memory_stats(
-    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
-    vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
-) -> MemoryStatsResponse:
-    from workspace_fs import open_vector_store
-
-    if not root or not os.path.isdir(root):
-        raise HTTPException(status_code=400, detail="invalid project root")
-    store = open_vector_store(root, vector_db_path)
-    if store is None:
-        return MemoryStatsResponse()
-    try:
-        return MemoryStatsResponse(available=True, **store.stats())
-    except Exception as exc:  # noqa: BLE001
-        return MemoryStatsResponse(available=False, db="", error=str(exc))
-
-
-@app.post("/memory/clear")
-async def memory_clear(req: MemoryRequest) -> MemoryClearResponse:
-    from workspace_fs import open_vector_store
-
-    if not req.root or not os.path.isdir(req.root):
-        raise HTTPException(status_code=400, detail="invalid project root")
-    store = open_vector_store(req.root, req.vector_db_path)
-    if store is None:
-        raise HTTPException(status_code=503, detail="could not open vector store")
-    try:
-        store.clear()
-        return MemoryClearResponse(ok=True)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"could not clear vector store: {exc}") from exc
-
-
 # ---------------------------------------------------------------------------
-# Index / retrieval / cleanup endpoints
+# RAG memory / index / cleanup are native now (see src-tauri/src/indexer.rs,
+# vector_store.rs, embeddings.rs and retention.rs): the Rust router serves
+# /index/*, /memory/*, /models/embedding-status and /models/unload itself, so
+# the duplicate handlers that used to live here are gone.
 # ---------------------------------------------------------------------------
-
-
-class IndexStatusResponse(BaseModel):
-    available: bool = False
-    db: str = ""
-    docs: int = 0
-    chunks: int = 0
-    kinds: dict[str, int] = {}
-    embedder: bool = False
-    needs_index: bool = False
-
-
-class IndexRunRequest(BaseModel):
-    root: str = ""
-    vector_db_path: str = ""
-    vector_config: dict | None = None
-    budget: int = 0  # 0 = default limited budget (avoid waking embedder on open)
-
-
-class IndexRunResponse(BaseModel):
-    ok: bool = False
-    total: int = 0
-    indexed: int = 0
-    pruned: int = 0
-    skipped: int = 0
-    unchanged: int = 0
-    error: str = ""
-
-
-class CleanupRunRequest(BaseModel):
-    root: str = ""
-    vector_db_path: str = ""
-
-
-class CleanupRunResponse(BaseModel):
-    ok: bool = False
-    evicted: int = 0
-    pruned_files: int = 0
-    vacuumed: bool = False
-    cache_purged: int = 0
-    error: str = ""
-
-
-def _open_store(root: str, vector_db_path: str):
-    """Open the workspace store or raise 400 with a clear message."""
-    from workspace_fs import open_vector_store
-
-    if not root or not os.path.isdir(root):
-        raise HTTPException(status_code=400, detail="invalid project root")
-    store = open_vector_store(root, vector_db_path)
-    if store is None:
-        raise HTTPException(status_code=503, detail="vector store unavailable")
-    return store
-
-
-@app.get("/index/status")
-async def index_status(
-    root: Annotated[str, Query(min_length=1, description="Workspace root")] = "",
-    vector_db_path: Annotated[str, Query(description="Optional vector-store folder")] = "",
-) -> IndexStatusResponse:
-    # Lightweight gate: file-presence check only, never loads the model so
-    # status polling does not pin the ~1.1 GB session in RAM.
-    from embeddings import is_available as embedder_available
-    from indexer import needs_index
-
-    try:
-        store = _open_store(root, vector_db_path)
-    except HTTPException:
-        return IndexStatusResponse()
-    try:
-        stats = store.stats()
-        return IndexStatusResponse(
-            available=True,
-            db=str(getattr(store, "_db_path", "")),
-            docs=int(stats.get("docs", 0)),
-            chunks=int(stats.get("chunks", 0)),
-            kinds=dict(stats.get("by_kind", {})),
-            embedder=embedder_available(),
-            needs_index=bool(needs_index(store, root)),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return IndexStatusResponse(available=False, error=str(exc))
-
-
-@app.post("/index/run")
-async def index_run(req: IndexRunRequest) -> IndexRunResponse:
-    from indexer import index_workspace
-
-    store = _open_store(req.root, req.vector_db_path)
-    # Cap the per-run embed budget so opening a workspace never wakes the
-    # ~1.1 GB embedder for the whole repo; manual runs can still pass an
-    # explicit budget up to the max.
-    _default_budget = 120
-    _max_budget = 500
-    try:
-        raw_budget = int(req.budget or 0)
-    except (TypeError, ValueError):
-        raw_budget = 0
-    if raw_budget <= 0:
-        budget = _default_budget
-    else:
-        budget = min(raw_budget, _max_budget)
-    try:
-        result = index_workspace(
-            store,
-            req.root,
-            budget=budget,
-        )
-        return IndexRunResponse(ok=True, **result)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"indexing failed: {exc}") from exc
-
-
-@app.post("/cleanup/run")
-async def cleanup_run(req: CleanupRunRequest) -> CleanupRunResponse:
-    from cleanup import run_cleanup
-
-    store = _open_store(req.root, req.vector_db_path)
-    try:
-        report = run_cleanup(store, req.root)
-        return CleanupRunResponse(ok=True, **report)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"cleanup failed: {exc}") from exc
 
 
 def _start_parent_watchdog() -> None:

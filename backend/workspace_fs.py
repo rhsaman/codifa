@@ -4,8 +4,9 @@ Extracted from the old ``tools.py`` agent registry (now dead — the agent
 engine lives in Rust) so that the sidecar's remaining helpers no longer drag
 ``langchain_core`` into the dependency tree.
 
-Only pure-stdlib and local ``state_db``/``vector_store`` imports live here:
-this module must stay importable without any LLM framework installed.
+Only pure-stdlib and local ``state_db`` imports live here: this module must
+stay importable without any LLM framework installed. The RAG vector store is
+native now (src-tauri/src/vector_store.rs), so nothing here touches it.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import os
 import tempfile
 
 import state_db as _state_db
-from vector_store import StoreConfig, VectorStore, db_path_for
 
 # Name of the sidecar log file inside the data root (``~/.codifa``).
 LOG_FILENAME = "sidecar.log"
@@ -120,34 +120,3 @@ def resolve_safe(
         raise PathEscapeError(f"path escapes project root: {rel_path}")
 
     return target
-
-
-def open_vector_store(
-    root: str, base_dir: str = "", config: dict | None = None
-) -> VectorStore | None:
-    """Open (or create) the workspace's RAG vector store for durable memory.
-
-    One sqlite file per workspace under ``base_dir`` (default
-    ``~/.codifa/vector-db``). Returns ``None`` when it can't be opened so
-    callers degrade gracefully — never raises.
-    """
-    base_dir = base_dir or _state_db.vector_db_dir()
-    try:
-        os.makedirs(base_dir, exist_ok=True)
-        slug = _state_db.workspace_slug_for_root(root)
-        db_path = db_path_for(base_dir, slug)
-        return VectorStore(db_path, StoreConfig.from_dict(config))
-    except Exception as exc:  # noqa: BLE001
-        # Surface the failure instead of returning None silently, so a broken
-        # vector store / missing embedding model is visible in the sidecar log.
-        try:
-            with open(
-                os.path.join(user_coder_dir(), LOG_FILENAME),
-                "a",
-                encoding="utf-8",
-            ) as fh:
-                fh.write(f"[vector-store] open failed for {root!r}: {exc!r}\n")
-        except OSError:
-            pass
-        print(f"[vector-store] open failed for {root!r}: {exc!r}", flush=True)
-        return None

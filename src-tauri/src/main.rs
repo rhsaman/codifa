@@ -20,6 +20,7 @@ mod compact;
 mod embeddings;
 mod indexer;
 mod vector_store;
+mod websearch;
 mod git;
 mod llm;
 mod plans;

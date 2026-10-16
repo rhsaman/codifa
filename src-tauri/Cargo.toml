@@ -49,6 +49,12 @@ chrono = "0.4"
 # prebuilt runtime at build time so no system ONNX install is required.
 ort = { version = "2.0.0-rc.14", features = ["download-binaries"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# DuckDuckGo's HTML endpoint refuses a plain TLS client (anti-bot challenge /
+# handshake timeout — verified with curl, reqwest and httpx alike). The Python
+# `ddgs` package solves this with `primp`'s browser TLS impersonation, and
+# `primp` is itself a Rust crate, so the keyless engine uses it directly.
+# Tavily keeps using reqwest; primp is only for DuckDuckGo.
+primp = { version = "2", default-features = false, features = ["gzip", "brotli", "deflate", "cookies", "form"] }
 
 [profile.release]
 codegen-units = 1

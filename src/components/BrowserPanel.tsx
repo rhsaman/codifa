@@ -471,34 +471,35 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
       setPane((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
     };
-    const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const paneW = Math.round(entry.contentRect.width);
-      const paneH = Math.round(entry.contentRect.height);
-      measure(paneW, paneH);
+    const readPane = (): { w: number; h: number } => ({
+      w: Math.round(host.clientWidth),
+      h: Math.round(host.clientHeight),
+    });
+    // One handler for both triggers: the observer (splitter drag) and the
+    // window resize. Reading clientWidth keeps it consistent with the initial
+    // measurement, and the window listener covers embeddings where the
+    // observer does not fire.
+    const onResize = (): void => {
+      const { w, h } = readPane();
+      measure(w, h);
       if (!fitToPane || !active) return;
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
       fitTimer.current = window.setTimeout(() => {
         fitTimer.current = null;
         const cur = sizeRef.current;
-        const target = fitWidthTarget(paneW, capWRef.current);
+        const target = fitWidthTarget(w, capWRef.current);
         if (target !== cur.w) void applySize(target, cur.h, false);
       }, 400);
-    });
+    };
+    const ro = new ResizeObserver(onResize);
     ro.observe(host);
+    window.addEventListener("resize", onResize);
     // Apply once on mount / when follow mode is switched back on, so the
     // toggle takes effect without waiting for a pane resize.
-    const rect = host.getBoundingClientRect();
-    measure(Math.round(rect.width), Math.round(rect.height));
-    if (fitToPane && active) {
-      const paneW = Math.round(rect.width);
-      const cur = sizeRef.current;
-      const target = fitWidthTarget(paneW, capWRef.current);
-      if (target !== cur.w) void applySize(target, cur.h, false);
-    }
+    onResize();
     return () => {
       ro.disconnect();
+      window.removeEventListener("resize", onResize);
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
       fitTimer.current = null;
     };

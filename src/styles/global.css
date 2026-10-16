@@ -21352,6 +21352,11 @@ mark.trace-hit-active {
   height: auto;
   display: block;
   flex: 0 0 auto;
+  /* Safety net: the inline size is the DESIRED frame size, but it must never
+     overflow the pane. Clamping here keeps the frame fitted even before the
+     pane measurement lands, and object-fit keeps the page undistorted. */
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .browser-panel .browser-stage-img {

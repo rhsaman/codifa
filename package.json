@@ -39,10 +39,10 @@
     "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:frontend": "bash tests/run-frontend.sh",
     "clean": "node -e \"import('fs').then(f=>f.rmSync('release',{recursive:true,force:true}))\"",
-    "dist": "npm run build && npm run tauri build",
-    "dist:mac": "npm run build && npm run tauri build -- --target aarch64-apple-darwin",
-    "dist:win": "npm run build && npm run tauri build -- --target x86_64-pc-windows-msvc",
-    "dist:linux": "npm run build && npm run tauri build",
+    "dist": "npm run tauri build",
+    "dist:mac": "npm run tauri build -- --target aarch64-apple-darwin",
+    "dist:win": "npm run tauri build -- --target x86_64-pc-windows-msvc",
+    "dist:linux": "npm run tauri build",
     "tauri": "tauri"
   },
   "dependencies": {

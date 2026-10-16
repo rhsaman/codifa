@@ -19,12 +19,6 @@ dependencies = [
     "tokenizers>=0.19",
     "sqlite-vec>=0.1.9",
     "markdownify>=0.13.1",
-    # langchain-core is still required: tools.py imports BaseTool at module
-    # level and server.py imports path/vector helpers from tools.py. The agent
-    # engine itself is native Rust — langgraph, langchain-openai,
-    # langchain-google-genai, langchain-anthropic and langgraph-checkpoint-sqlite
-    # were only used by the deleted graph.py/llm.py and are gone.
-    "langchain-core>=1.6.0",
     "pillow>=12.3.0",
     "python-multipart>=0.0.32",
     "huggingface-hub>=0.23",

@@ -35,7 +35,7 @@ import re
 
 # Reuse the file tools' text-extension / skip-dir lists so the indexer and the
 # agent's own navigation agree on what is a code file.
-from tools import _BINARY_EXTENSIONS, _SKIP_DIRS, _TEXT_EXTENSIONS, MAX_FILES
+from file_types import _BINARY_EXTENSIONS, _SKIP_DIRS, _TEXT_EXTENSIONS, MAX_FILES
 from vector_store import KIND_FILE, VectorStore
 
 INDEX_MAX_FILE_BYTES = 2_000_000  # per-file cap: don't embed giant files

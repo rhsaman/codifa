@@ -310,6 +310,155 @@ async fn skills_sync(State(st): State<AppState>, Json(body): Json<Value>) -> Res
     }
 }
 
+// --- RAG memory + index (native; replaces the sidecar's /index/* and
+// /memory/* and the embedding half of /models/*) --------------------------
+
+/// Query params shared by the RAG endpoints.
+#[derive(serde::Deserialize)]
+pub struct RagQuery {
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub vector_db_path: String,
+}
+
+/// Body of POST /index/run and /memory/clear.
+#[derive(serde::Deserialize)]
+pub struct RagBody {
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub vector_db_path: String,
+    #[serde(default)]
+    pub budget: Option<usize>,
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    #[serde(default)]
+    pub config: Option<Value>,
+}
+
+/// Documents embedded per indexing run when the caller does not say.
+const DEFAULT_INDEX_BUDGET: usize = 120;
+
+/// GET /models/embedding-status — is the e5 model present and loadable?
+async fn embedding_status() -> Response<Body> {
+    Json(crate::embeddings::status()).into_response()
+}
+
+/// POST /models/unload — drop the embedding session and free its memory.
+async fn models_unload() -> Response<Body> {
+    crate::embeddings::unload();
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// GET /index/status — does this workspace need a first index, and how big is
+/// the store?
+async fn index_status(Query(q): Query<RagQuery>) -> Response<Body> {
+    if q.root.trim().is_empty() || !std::path::Path::new(&q.root).is_dir() {
+        return bad_request("invalid project root");
+    }
+    let Some(store) = crate::indexer::open_store(&q.root, &q.vector_db_path, None) else {
+        return Json(json!({
+            "available": false,
+            "needs_index": false,
+            "docs": 0,
+            "chunks": 0,
+            "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
+        }))
+        .into_response();
+    };
+    let stats = store.stats().unwrap_or_default();
+    Json(json!({
+        "available": true,
+        "needs_index": crate::indexer::needs_index(&store, &q.root),
+        "docs": stats.docs,
+        "chunks": stats.chunks,
+        "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
+    }))
+    .into_response()
+}
+
+/// POST /index/run — incrementally index changed files and prune deleted ones.
+async fn index_run(Json(body): Json<RagBody>) -> Response<Body> {
+    if body.root.trim().is_empty() || !std::path::Path::new(&body.root).is_dir() {
+        return bad_request("invalid project root");
+    }
+    let Some(store) = crate::indexer::open_store(&body.root, &body.vector_db_path, body.config.as_ref())
+    else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "could not open vector store").into_response();
+    };
+    if store.ensure_dim().is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "embedding model unavailable").into_response();
+    }
+    let stats = crate::indexer::index_workspace(
+        &store,
+        &body.root,
+        body.budget.unwrap_or(DEFAULT_INDEX_BUDGET),
+        body.max_files.unwrap_or(10_000),
+    );
+    let _ = store.enforce_limits();
+    Json(stats).into_response()
+}
+
+/// GET /memory/stats — doc/chunk counts and the retention limits in force.
+async fn memory_stats(Query(q): Query<RagQuery>) -> Response<Body> {
+    if q.root.trim().is_empty() || !std::path::Path::new(&q.root).is_dir() {
+        return bad_request("invalid project root");
+    }
+    let Some(store) = crate::indexer::open_store(&q.root, &q.vector_db_path, None) else {
+        return Json(json!({
+            "available": false, "db": "", "docs": 0, "chunks": 0,
+            "kinds": {}, "max_docs": 0, "max_chunks": 0, "ttl_days": 0,
+        }))
+        .into_response();
+    };
+    let cfg = store.config();
+    match store.stats() {
+        Ok(stats) => {
+            let kinds: serde_json::Map<String, Value> = stats
+                .kinds
+                .iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect();
+            Json(json!({
+                "available": true,
+                "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
+                "docs": stats.docs,
+                "chunks": stats.chunks,
+                "kinds": kinds,
+                "max_docs": cfg.max_docs,
+                "max_chunks": cfg.max_chunks,
+                "ttl_days": cfg.ttl_days,
+            }))
+            .into_response()
+        }
+        Err(err) => Json(json!({
+            "available": false, "db": "", "docs": 0, "chunks": 0,
+            "kinds": {}, "max_docs": 0, "max_chunks": 0, "ttl_days": 0,
+            "error": err,
+        }))
+        .into_response(),
+    }
+}
+
+/// POST /memory/clear — drop every stored doc and chunk for the workspace.
+async fn memory_clear(Json(body): Json<RagBody>) -> Response<Body> {
+    if body.root.trim().is_empty() || !std::path::Path::new(&body.root).is_dir() {
+        return bad_request("invalid project root");
+    }
+    let Some(store) = crate::indexer::open_store(&body.root, &body.vector_db_path, None) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "could not open vector store").into_response();
+    };
+    match store.clear() {
+        Ok(()) => {
+            store.vacuum();
+            Json(json!({ "ok": true, "error": "" })).into_response()
+        }
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not clear vector store: {err}"))
+            .into_response(),
+    }
+}
+
 async fn mcp_list(State(st): State<AppState>) -> Response<Body> {
     Json(skills::list_mcp(&st.data_root)).into_response()
 }
@@ -942,6 +1091,14 @@ pub fn router(state: AppState) -> Router {
         .route("/skills", get(skills_list))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
+        // RAG memory + index, native (the sidecar's /index/* and /memory/*
+        // and the embedding half of /models/* are gone).
+        .route("/models/embedding-status", get(embedding_status))
+        .route("/models/unload", post(models_unload))
+        .route("/index/status", get(index_status))
+        .route("/index/run", post(index_run))
+        .route("/memory/stats", get(memory_stats))
+        .route("/memory/clear", post(memory_clear))
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))

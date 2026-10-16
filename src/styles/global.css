@@ -3513,6 +3513,14 @@ textarea {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
+/* Single window or window fullscreen: no border — there is nothing to
+   separate, so the pane blends into the chat area. Placed after the tree
+   border rules so it wins at equal specificity. */
+.chat-windows.single .chat-window,
+.chat-windows.window-full .chat-window {
+  border: none;
+}
+
 /* The unified overlay is the drop highlight (dashed page inside it); the
    pane's own drop-active border would paint a second outline on top. */
 
@@ -6625,6 +6633,8 @@ body.coder-dragging .chat-split-child {
 
 .code-block pre {
   margin: 0;
+  /* Long lines scroll horizontally instead of clipping at the panel edge. */
+  overflow-x: auto;
   border: none;
   border-radius: 0;
   background: var(--bg) !important;
@@ -22138,6 +22148,9 @@ tr[data-search-current] .fv-mark,
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* Wide children (code blocks, long unbroken lines) scroll horizontally
+     inside the body instead of being clipped by the panel edge. */
+  min-width: 0;
   background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
@@ -22199,6 +22212,8 @@ tr[data-search-current] .fv-mark,
   margin: 0;
   padding: 10px 14px 16px;
   font-family: var(--font-mono);
+  /* Long lines scroll horizontally instead of clipping at the panel edge. */
+  overflow-x: auto;
   font-size: 12.5px;
   line-height: 1.6;
   white-space: pre-wrap;

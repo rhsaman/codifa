@@ -25,6 +25,8 @@ image = "0.25"
 rand = "0.8"
 base64 = "0.22"
 dirs = "5"
+# Content hashing for the RAG store's change detection (SHA-256, truncated).
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 percent-encoding = "2"
 libc = "0.2"
@@ -41,6 +43,12 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (UTC).
 chrono = "0.4"
+# Native RAG embeddings: the e5 ONNX model runs in-process via ONNX Runtime
+# (the same runtime the Python sidecar used), and the HuggingFace tokenizer
+# reads the model's own tokenizer.json. `download-binaries` fetches the
+# prebuilt runtime at build time so no system ONNX install is required.
+ort = { version = "2.0.0-rc.14", features = ["download-binaries"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 [profile.release]
 codegen-units = 1

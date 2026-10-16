@@ -64,6 +64,12 @@ tests/.tmp-*
 tests/.fe-run.*
 tests/dump-ssr.out.mjs
 .tmp-*.mjs
+# Throwaway live-probe scripts (scratch harnesses for manual verification —
+# never part of the suite; they were committed by accident twice).
+.probe-*.py
+.probe-*.mjs
+.probe-*.ts
+.probe-*.sh
 
 # Playwright MCP temp files (logs, snapshots)
 backend/.playwright-mcp/

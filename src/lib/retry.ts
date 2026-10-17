@@ -174,10 +174,19 @@ export class AutoRetryScheduler {
   private epoch = 0
   private stopped = false
   private timer: unknown = null
+  // Timer indirection is assigned explicitly instead of using TypeScript
+  // parameter properties: those EMIT runtime code, which Node's strip-only
+  // TypeScript mode refuses to execute. `tests/retry.test.ts` loads this module
+  // with plain `node`, so the whole file must stay erasable-only syntax.
+  private setTimer: (cb: () => void, ms: number) => unknown
+  private clearTimerFn: (id: unknown) => void
   constructor(
-    private setTimer: (cb: () => void, ms: number) => unknown = (cb, ms) => setTimeout(cb, ms),
-    private clearTimerFn: (id: unknown) => void = (id) => clearTimeout(id as number),
-  ) {}
+    setTimer: (cb: () => void, ms: number) => unknown = (cb, ms) => setTimeout(cb, ms),
+    clearTimerFn: (id: unknown) => void = (id) => clearTimeout(id as number),
+  ) {
+    this.setTimer = setTimer
+    this.clearTimerFn = clearTimerFn
+  }
   /** True after an explicit Stop, until the next turn begins. */
   get isStopped(): boolean {
     return this.stopped

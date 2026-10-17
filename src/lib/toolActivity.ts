@@ -1,6 +1,7 @@
 import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
 
-/** شمارش +N -M را از رشته‌ی unified diff استخراج می‌کند (خطوط +++/--- نادیده گرفته می‌شوند). */
+/** Extract the +N / -M tally from a unified diff string (the `+++` / `---`
+ *  file-header lines are skipped). */
 export function diffStatsFromUnified(diff: string): DiffStats {
   let adds = 0;
   let dels = 0;
@@ -13,10 +14,10 @@ export function diffStatsFromUnified(diff: string): DiffStats {
 }
 
 /**
- * جمع +N -M سطح یک ترن را از روی فعالیت‌های edit_file/write_file حساب می‌کند
- * (برای هدر Review به سبک کدکس). فقط ابزارهایی که در buildReviewTurn لیست
- * می‌شوند شمرده می‌شوند تا عدد هدر با جمع فایل‌های لیست یکی باشد؛
- * فعالیت‌های بدون diff نادیده گرفته می‌شوند.
+ * Turn-level +N / -M tally over the edit_file/write_file activities (the
+ * Codex-style Review header). Only the tools buildReviewTurn lists are
+ * counted, so the header total always matches the listed files; activities
+ * without a diff are skipped.
  */
 export function aggregateTurnStats(activities: ToolActivity[]): DiffStats {
   let adds = 0;
@@ -54,6 +55,13 @@ export function makeToolActivity(event: SidecarEvent): ToolActivity {
   return {
     tool: event.tool ?? "tool",
     args: event.args,
+    // Some backends put the change on the tool event itself (the tool callback
+    // can arrive before the dedicated `diff` event), so carry it over here
+    // instead of losing the edit until a second event shows up.
+    summary: event.summary,
+    diff: event.diff,
+    diffStats: event.diff ? diffStatsFromUnified(event.diff) : undefined,
+    checkpoint: event.checkpoint,
     status: "running",
     startedAt: Date.now(),
     // Prefer the provider-native string id when present (Anthropic tool_use.id,
@@ -66,6 +74,30 @@ export function makeToolActivity(event: SidecarEvent): ToolActivity {
     sub: event.sub,
     branch: typeof event.branch === "number" ? event.branch : undefined,
     model: event.model || undefined,
+  };
+}
+
+/** Fold a re-emitted card into the card already on the timeline. The later
+ *  event may carry richer fields (the tool callback arrives after the stream
+ *  part, or the `diff` event merged in Chat.tsx lands separately), so every
+ *  field prefers the incoming value and falls back to the stored one. Keeping
+ *  `diff`/`diffStats`/`checkpoint`/`summary` alive across re-emits is what
+ *  lets Review show the change instead of "No changes in this turn." */
+function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivity {
+  return {
+    ...existing,
+    args: incoming.args ?? existing.args,
+    model: incoming.model ?? existing.model,
+    summary: incoming.summary ?? existing.summary,
+    diff: incoming.diff ?? existing.diff,
+    diffStats: incoming.diffStats ?? existing.diffStats,
+    checkpoint: incoming.checkpoint ?? existing.checkpoint,
+    // The stream-part re-emit of a sub-agent card carries NO branch id (only
+    // the backend's Branch-wrapped ToolStart does). Dropping the stored branch
+    // here orphaned every later sub-event: they matched no card, got promoted
+    // to top-level cards in the chat, and the Explore panel showed "No tool
+    // calls". The branch must survive re-emits.
+    branch: incoming.branch ?? existing.branch,
   };
 }
 
@@ -126,14 +158,9 @@ export function applyToolEvent(
         // De-dup a sub-event whose callId is already on the card.
         const dup = findExisting(childList);
         if (dup) {
-          const merged: ToolActivity = {
-            ...dup.existing,
-            // The re-emit may carry a richer status/args (e.g. the tool
-            // callback arrives AFTER the stream part), so prefer non-empty
-            // values from the incoming event.
-            args: act.args ?? dup.existing.args,
-            model: act.model ?? dup.existing.model,
-          };
+          // The re-emit may carry a richer status/args (e.g. the tool callback
+          // arrives AFTER the stream part), so it wins field by field.
+          const merged = mergeReEmit(dup.existing, act);
           const nextChildren = childList.slice();
           nextChildren[dup.idx] = merged;
           return { ...a, children: nextChildren };
@@ -150,11 +177,7 @@ export function applyToolEvent(
     // tool the trace shows.
     const dupTop = findExisting(next);
     if (dupTop) {
-      const merged: ToolActivity = {
-        ...dupTop.existing,
-        args: act.args ?? dupTop.existing.args,
-        model: act.model ?? dupTop.existing.model,
-      };
+      const merged = mergeReEmit(dupTop.existing, act);
       const arr = next.slice();
       arr[dupTop.idx] = merged;
       return arr;
@@ -164,11 +187,7 @@ export function applyToolEvent(
   // Top-level path: drop the duplicate if the same callId is already there.
   const dup = findExisting(activities);
   if (dup) {
-    const merged: ToolActivity = {
-      ...dup.existing,
-      args: act.args ?? dup.existing.args,
-      model: act.model ?? dup.existing.model,
-    };
+    const merged = mergeReEmit(dup.existing, act);
     const next = activities.slice();
     next[dup.idx] = merged;
     return next;
@@ -206,6 +225,12 @@ export function resolveToolResult(
     // task card) carries `sub=true` itself — it must resolve by id like any
     // other card, otherwise the promoted card stays "running" forever.
     if (sub && isTop && act.sub !== true) {
+      // A sub-result belongs to ONE branch: another explore's card must not
+      // look inside, or two parallel explores whose providers reuse tool-call
+      // ids ("call_0") would resolve each other's children.
+      if (gotBranch && act.branch !== undefined && act.branch !== event.branch) {
+        return act;
+      }
       if (act.children && act.children.length > 0) {
         const children = act.children.map((c) => resolved(c, false));
         if (children.some((c, i) => c !== act.children![i])) {
@@ -227,7 +252,12 @@ export function resolveToolResult(
     // Sub-results attach regardless of status; top-level results keep requiring
     // a still-running target (existing behaviour).
     const target = idMatch;
-    const branchMatch = gotBranch && act.branch === event.branch;
+    // Branch matching is the legacy path for events that carry no id. An
+    // event with a provider id resolves ONLY its own call: every child of an
+    // explore shares the explore's branch, so matching on the branch alone
+    // marked all of its still-running siblings done on the first result.
+    const branchMatch =
+      gotBranch && typeof event.id !== "string" && act.branch === event.branch;
     const fallback =
       !gotId &&
       !gotBranch &&
@@ -280,9 +310,13 @@ export function resolveToolResult(
 }
 
 /** Tools whose native result is plain prose with no file paths (LSP lookups,
- *  memory search). `filesFromNativeResult` returns null for them, so their text
- *  is kept verbatim in `ToolActivity.resultText` and rendered as-is — without
- *  this the whole result was dropped and the card showed no output at all. */
+ *  memory search, explore/task reports). `filesFromNativeResult` returns null
+ *  for them, so their text is kept verbatim in `ToolActivity.resultText` and
+ *  rendered as-is — without this the whole result was dropped and the card
+ *  showed no output at all. For explore/task this text is also the ONLY record
+ *  of the findings: the backend's history recap reads `resultText` to tell the
+ *  next turn what was already researched (see history_recap in agent.rs), so
+ *  dropping it made the main agent re-delegate the same question. */
 export const TEXT_RESULT_TOOLS = new Set([
   "find_symbol",
   "lsp_symbols",
@@ -292,6 +326,8 @@ export const TEXT_RESULT_TOOLS = new Set([
   "lsp_diagnostics",
   "search_memory",
   "save_memory",
+  "explore",
+  "task",
 ]);
 
 /** Extract file rows from a native (Rust) tool's plain-text result so the UI

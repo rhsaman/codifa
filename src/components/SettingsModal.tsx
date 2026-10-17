@@ -42,7 +42,6 @@ function bareModelFor(p: ProviderConfig, m: string): string {
 // raw provider id / kind ("custom-xyz/model" → "My Provider/model").
 export function toolModelLabel(current: string, providers: ReadonlyArray<ProviderConfig>): string {
   if (!current) return 'Main model'
-  if (current === 'laya') return 'Laya (local)'
   const slash = current.indexOf('/')
   if (slash > 0) {
     const pid = current.slice(0, slash)
@@ -77,7 +76,6 @@ export function toolModelTarget(
 ): { providerId: string; model: string } | null {
   if (!current) return null
   if (current === 'main model' || current === 'main_model' || current === 'main') return null
-  if (current === 'laya') return null
   const slash = current.indexOf('/')
   if (slash > 0) {
     const pid = current.slice(0, slash)
@@ -279,15 +277,6 @@ function ToolModelSelect({
               >
                 {noneLabel}
               </button>
-              {agent === 'decision' && (!q || 'laya (local)'.includes(q)) && (
-                <button
-                  className={`model-select-item ${current === 'laya' ? 'current' : ''}`}
-                  onMouseDown={(e) => { e.preventDefault(); onSelect(agent, 'laya'); closeMenu(); inputRef.current?.blur() }}
-                  type="button"
-                >
-                  Laya (local)
-                </button>
-              )}
               {visibleProviders.map(({ p, models }) => {
                 const isOpen = q ? true : expanded.has(p.id)
                 return (
@@ -572,8 +561,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
   const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
   const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
-  const ragWebTtlDays = useStore((s) => s.ragWebTtlDays ?? 90)
-  const setRagWebTtlDays = useStore((s) => s.setRagWebTtlDays)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
 
@@ -708,10 +695,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     void refreshModels()
     const id = setInterval(
       () => void refreshModels(),
-      mStatus?.whisper?.running || mStatus?.embedding?.running || mStatus?.decision?.running || mStatus?.piper?.state === 'downloading' ? 1000 : 2500,
+      mStatus?.whisper?.running || mStatus?.piper?.state === 'downloading' ? 1000 : 2500,
     )
     return () => clearInterval(id)
-  }, [refreshModels, mStatus?.whisper?.running, mStatus?.embedding?.running, mStatus?.decision?.running, mStatus?.piper?.state])
+  }, [refreshModels, mStatus?.whisper?.running, mStatus?.piper?.state])
 
   const piperRunState = (): ModelRunState | undefined => {
     const p = mStatus?.piper
@@ -725,33 +712,21 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return undefined
   }
 
-  const isRunning = (kind: 'whisper' | 'embedding' | 'piper' | 'decision') => {
+  const isRunning = (kind: 'whisper' | 'piper') => {
     if (kind === 'piper') return mStatus?.piper?.state === 'downloading'
-    if (kind === 'decision') return mStatus?.decision?.running?.state === 'downloading'
-    return (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running?.state ===
-      'downloading'
+    return mStatus?.whisper?.running?.state === 'downloading'
   }
 
   const runState = (kind: ManagedModelKind): ModelRunState | undefined => {
     if (kind === 'piper') return piperRunState()
-    if (kind === 'decision') return mStatus?.decision?.running
-    return (kind === 'whisper' ? mStatus?.whisper : mStatus?.embedding)?.running
+    return mStatus?.whisper?.running
   }
 
-  const embeddingStatus = mStatus?.embedding
-
-  const actDownload = async (kind: 'whisper' | 'embedding' | 'piper' | 'decision') => {
+  const actDownload = async (kind: 'whisper' | 'piper') => {
     const pocketDefault = 'mehdi-hf/pocket-tts-farsi-v2'
     const rawTts = (ttsModel ?? '').trim()
     const pocketRepo = rawTts.includes('/') ? rawTts : pocketDefault
-    const repo =
-      kind === 'whisper'
-        ? whisperModel
-        : kind === 'piper'
-          ? pocketRepo
-          : kind === 'decision'
-            ? 'convaiinnovations/laya'
-            : 'intfloat/multilingual-e5-base'
+    const repo = kind === 'whisper' ? whisperModel : pocketRepo
     const base = kind === 'piper' ? ((settings as { ttsBaseUrl?: string }).ttsBaseUrl ?? '') : ''
     setModelsMsg('')
     try {
@@ -797,7 +772,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
   }
 
-  const actRemove = async (kind: 'whisper' | 'embedding' | 'piper' | 'decision', repo: string) => {
+  const actRemove = async (kind: 'whisper' | 'piper', repo: string) => {
     setModelsMsg('')
     try {
       await removeModel(kind, repo)
@@ -2227,44 +2202,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
           </div>
 
-          {/* ===== RAG web/fetch storage TTL ===== */}
-          <div className="settings-group">
-            <div className="settings-group-head">
-              <span className="settings-group-icon">🗄️</span>
-              <div>
-                <div className="settings-group-title">RAG storage (web/fetch)</div>
-                <div className="settings-group-desc">
-                  When an embedding model is available, web/fetch results are also stored in the
-                  local vector store for semantic recall. This TTL also controls how long web/fetch
-                  text cache (above) stays valid. Without an embedding model, web search and fetch
-                  still work (just no RAG recall). Store is <b>shared</b> across all workspaces.
-                </div>
-              </div>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">RAG web/fetch storage TTL</div>
-                <div className="settings-row-desc">
-                  How long stored web/fetch chunks remain in the vector store before expiring.
-                  Default: <code>90</code> days.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={1}
-                  max={3650}
-                  value={ragWebTtlDays}
-                  onChange={(e) => setRagWebTtlDays(Number(e.target.value))}
-                  dir="ltr"
-                  aria-label="RAG web/fetch storage TTL in days"
-                />
-                <span className="field-unit">days</span>
-              </div>
-            </div>
-          </div>
-
           {/* ===== Result cache ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
@@ -2371,7 +2308,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             </div>
             <div className="hint">
               Pick separate models for the built-in tools (web, vision,
-              compact, decision, subagent, schedule, title). Leave a field empty to use the main model (the one chosen in the
+              compact, subagent, schedule, title). Leave a field empty to use the main model (the one chosen in the
               composer), or type "main model" to pin a tool to the main model explicitly.
               Tools only consume main-model tokens when you set them to the main model or
               their own model is unavailable.
@@ -2396,13 +2333,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               label="Compact model"
               desc="Conversation summariser — compacts chat history to stay under the context window."
               current={subagentModels.compact || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
-              agent="decision"
-              label="Decision model"
-              desc="Tiny router that picks which skills to auto-load for a message (semantic matching, not keywords). Falls back to the main model. Download Laya in the Models tab."
-              current={subagentModels.decision || ''}
               onSelect={setSubagentModel}
             />
             <ToolModelSelect
@@ -2462,55 +2392,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     onPause={() => actPause('whisper')}
                     onResume={() => actResume('whisper')}
                     onCancel={() => actCancel('whisper')}
-                  />
-                </div>
-              </div>
-
-              <div className="model-card">
-                <div className="model-card-head">
-                  <div className="model-card-titles">
-                    <span className="model-card-title">Memory</span>
-                    <span className="model-card-desc">Local embeddings for recall. Search still works without it.</span>
-                  </div>
-                  <ModelBadge status={embeddingStatus} />
-                </div>
-                <div className="model-card-body">
-                  <ModelProgress running={runState('embedding')} />
-                  <ModelStatusCard status={embeddingStatus} running={isRunning('embedding')} onRemove={(repo) => actRemove('embedding', repo)} />
-                  <ModelControls
-                    running={runState('embedding')}
-                    canDownload={!(embeddingStatus?.dirs ?? []).some((d) => d.ready)}
-                    onDownload={() => actDownload('embedding')}
-                    onPause={() => actPause('embedding')}
-                    onResume={() => actResume('embedding')}
-                    onCancel={() => actCancel('embedding')}
-                  />
-                </div>
-              </div>
-
-              <div className="model-card">
-                <div className="model-card-head">
-                  <div className="model-card-titles">
-                    <span className="model-card-title">Decision model (Laya)</span>
-                    <span className="model-card-desc">Tiny local router that picks which skills to auto-load (semantic matching). Used by the Decision model in the Tools tab.</span>
-                  </div>
-                  <ModelBadge status={mStatus?.decision} />
-                </div>
-                <div className="model-card-body">
-                  <ModelProgress running={runState('decision')} />
-                  <ModelStatusCard
-                    status={mStatus?.decision}
-                    running={isRunning('decision')}
-                    emptyHint="Not downloaded — skill auto-matching stays keyword-based until you download it."
-                    onRemove={(repo) => actRemove('decision', repo)}
-                  />
-                  <ModelControls
-                    running={runState('decision')}
-                    canDownload={!(mStatus?.decision?.dirs ?? []).some((d) => d.ready)}
-                    onDownload={() => actDownload('decision')}
-                    onPause={() => actPause('decision')}
-                    onResume={() => actResume('decision')}
-                    onCancel={() => actCancel('decision')}
                   />
                 </div>
               </div>
@@ -2951,52 +2832,6 @@ function ModelStatusLine({
       <button className="btn tiny danger" onClick={onRemove}>
         Remove
       </button>
-    </div>
-  )
-}
-
-/** Embedding/decision card: lists every downloaded repo build with its own Remove. */
-function ModelStatusCard({
-  status,
-  running,
-  onRemove,
-  emptyHint,
-}: {
-  status?: import('../lib/api').ModelKindStatus
-  running: boolean
-  onRemove: (repo: string) => void
-  /** Shown when nothing is downloaded yet; defaults to the embedding hint. */
-  emptyHint?: string
-}) {
-  if (status?.running?.state === 'paused')
-    return <div className="hint">Paused — Resume continues from where it stopped.</div>
-  if (running) return null
-  if (status?.running?.state === 'error')
-    return (
-      <div className="hint" style={{ color: 'var(--danger)' }}>
-        Download failed: {status.running.error}
-      </div>
-    )
-  const dirs = status?.dirs ?? []
-  if (dirs.length === 0)
-    return (
-      <div className="hint">
-        {emptyHint ?? 'Not downloaded — RAG memory & web recall stay off until you download one.'}
-      </div>
-    )
-  return (
-    <div className="mcp-list">
-      {dirs.map((d) => (
-        <div key={d.dir} className="skill-actions">
-          <span className="hint">
-            <code>{d.repo}</code> · {fmtBytes(d.size)}
-            {d.ready ? ' · ready' : ' · incomplete'}
-          </span>
-          <button className="btn tiny danger" onClick={() => onRemove(d.repo)}>
-            Remove
-          </button>
-        </div>
-      ))}
     </div>
   )
 }

@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { menuLeft, menuTop, type MenuPlacement } from "../lib/tabBar";
 import { fmtAgo } from "../lib/time";
+
+/** Default rendered width (px) of the dropdown, mirrored from `.tab-list-menu`. */
+const MENU_WIDTH = 410;
 
 export interface TabListEntry {
   key: string;
@@ -33,16 +38,25 @@ export function TabListButton({
   sections,
   label,
   footer,
+  placement = "bottom",
+  menuWidth,
 }: {
   sections: TabListSection[];
   label: string;
   footer?: TabListFooter;
+  /** Which way the dropdown opens: below the trigger (chat bar) or flipped to
+   *  the window's left (viewer rail, which hugs the right edge). */
+  placement?: MenuPlacement;
+  /** Rendered width (px) of the dropdown, used to keep it inside the viewport;
+   *  defaults to the width `.tab-list-menu` declares. */
+  menuWidth?: number;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const [query, setQuery] = useState("");
   const wrapRef = useRef<HTMLSpanElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -63,6 +77,16 @@ export function TabListButton({
     };
   }, [open]);
 
+  // Keep the fixed menu fully on screen: measure it once rendered and clamp
+  // its top so it never pokes out of the viewport bottom.
+  useEffect(() => {
+    if (!open || !pos) return;
+    const h = menuRef.current?.offsetHeight;
+    if (!h) return;
+    const top = menuTop(pos.top, h, window.innerHeight);
+    if (top !== pos.top) setPos({ ...pos, top });
+  }, [open, pos]);
+
   const toggle = () => {
     if (open) {
       setOpen(false);
@@ -70,10 +94,8 @@ export function TabListButton({
     }
     const r = wrapRef.current?.getBoundingClientRect();
     if (r) {
-      // Clamp inside the viewport: the chevron can sit near the window's
-      // right edge (RTL), and the fixed menu must never poke out.
-      const left = Math.max(12, Math.min(r.left, window.innerWidth - 412));
-      setPos({ top: r.bottom + 6, left });
+      // Clamp inside the viewport: the fixed menu must never poke out.
+      setPos({ top: r.bottom + 6, left: menuLeft(r.left, menuWidth ?? MENU_WIDTH, window.innerWidth, placement) });
     }
     setQuery("");
     setOpen(true);
@@ -115,9 +137,11 @@ export function TabListButton({
           <path d="M6 9.5l6 6 6-6" />
         </svg>
       </button>
-      {open && pos && (
+      {open && pos &&
+        createPortal(
         <div
-          className="tab-list-menu"
+          ref={menuRef}
+          className={`tab-list-menu open-${placement}`}
           role="menu"
           style={{ position: "fixed", top: pos.top, left: pos.left }}
           onMouseDown={(e) => e.stopPropagation()}
@@ -213,8 +237,9 @@ export function TabListButton({
               {footer.label}
             </button>
           )}
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
     </span>
   );
 }

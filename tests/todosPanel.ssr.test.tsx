@@ -292,19 +292,13 @@ console.log("۲۱) پنل Trace — عنوان ردیف و فیلتر جست‌�
   check("عنوان ابزار از نام ابزار ساخته می‌شود", traceRowTitle({ id: "t", at: 1, kind: "tool", summary: "", detail: { name: "read" } } as any) === "read")
 }
 
-console.log("۲۲) ساب‌ایجنت‌ها — توابع خالص پنل و کارت تسک بعد از rename:")
+console.log("۲۲) ساب‌ایجنت‌ها — کارت تسک بعد از rename:")
 {
-  const { subagentAge, subagentStatusLabel } = await import("../src/components/TodosPanel")
-  const now = 1700000000
-  check("عمر ۵۹ ثانیه → 0:59", subagentAge(now - 59, now) === "0:59", subagentAge(now - 59, now))
-  check("عمر ۱۲۵ ثانیه → 2:05", subagentAge(now - 125, now) === "2:05", subagentAge(now - 125, now))
-  check("created_at در آینده → 0:00", subagentAge(now + 30, now) === "0:00")
-  check("running برچسب running", subagentStatusLabel("running") === "running")
-  check("completed برچسب done", subagentStatusLabel("completed") === "done")
-  check("failed برچسب failed", subagentStatusLabel("failed") === "failed")
-  check("stopped برچسب stopped", subagentStatusLabel("stopped") === "stopped")
-  check("وضعیت ناشناخته خودش برمی‌گردد", subagentStatusLabel("weird") === "weird")
-
+  // NOTE: the background sub-agent PANEL was removed; its pure helpers
+  // (subagentAge / subagentStatusLabel, previously exported from TodosPanel)
+  // were deleted with it, so there is nothing left to unit-test there. The live
+  // sub-agent surface is the task/explore tool CARD in the transcript, checked
+  // below via isSubagentCard.
   // rename explore → subagent: کارت‌های تسک با هر دو نام باید کارت ساب‌ایجنت
   // بمانند (کارتِ با نام جدید قبلاً به کارت عمومی می‌افتاد — باگ).
   const { isSubagentCard } = await import("../src/components/ToolCallView")

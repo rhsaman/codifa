@@ -25,8 +25,6 @@ image = "0.25"
 rand = "0.8"
 base64 = "0.22"
 dirs = "5"
-# Content hashing for the RAG store's change detection (SHA-256, truncated).
-sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 percent-encoding = "2"
 libc = "0.2"
@@ -43,12 +41,6 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (UTC).
 chrono = "0.4"
-# Native RAG embeddings: the e5 ONNX model runs in-process via ONNX Runtime
-# (the same runtime the Python sidecar used), and the HuggingFace tokenizer
-# reads the model's own tokenizer.json. `download-binaries` fetches the
-# prebuilt runtime at build time so no system ONNX install is required.
-ort = { version = "2.0.0-rc.14", features = ["download-binaries"] }
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # DuckDuckGo's HTML endpoint refuses a plain TLS client (anti-bot challenge /
 # handshake timeout — verified with curl, reqwest and httpx alike). The Python
 # `ddgs` package solves this with `primp`'s browser TLS impersonation, and
@@ -56,9 +48,22 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # Tavily keeps using reqwest; primp is only for DuckDuckGo.
 primp = { version = "2", default-features = false, features = ["gzip", "brotli", "deflate", "cookies", "form"] }
 
+# Release profile tuned for an 8 GB machine.
+#
+# `lto = true` (fat LTO) + `codegen-units = 1` builds the whole crate graph as a
+# single codegen unit, which means rustc/LTO holds every monomorphised body and
+# object file in RAM at once. On this project (bundled SQLite, rustls, tauri,
+# image) that peaked past physical memory and the machine fell back to 20 GB of
+# swap. THIN LTO keeps cross-crate inlining but
+# processes modules independently, so the peak stays a fraction of fat LTO while
+# the produced code is close in quality (a few percent slower at most).
+#
+# `codegen-units = 4` lets codegen run in parallel instead of one giant unit,
+# which both lowers the peak (no single multi-GB rustc) and shortens the build.
+# Raise back to 1 or switch `lto = true` only when building on a >= 16 GB host.
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 4
+lto = "thin"
 opt-level = "s"
 panic = "abort"
 strip = true

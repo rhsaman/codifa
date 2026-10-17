@@ -1,0 +1,123 @@
+// SSR test: long tool output stays INSIDE the chat.
+//
+// Auto-opening the right-hand panel from a long tool result was removed — long
+// output is now collapsed into a scrollable block in the chat, and the panel
+// only opens from an explicit user click (row/button). These checks pin the
+// rendered contract: collapsed by default, body reachable, panel untouched.
+;(globalThis as any).window = {
+  addEventListener: () => {},
+  coder: new Proxy(
+    {},
+    {
+      get: (_t, prop) => {
+        if (prop === 'then') return undefined
+        return async () => {}
+      },
+    },
+  ),
+}
+;(globalThis as any).localStorage = {
+  getItem: () => null,
+  setItem: () => {},
+  removeItem: () => {},
+}
+
+const { renderToString } = await import('react-dom/server')
+const { ChatMessageView } = await import('../src/components/ChatMessage')
+const { useViewerTabs } = await import('../src/lib/viewerTabs')
+
+let failed = 0
+function check(name: string, cond: boolean, extra?: unknown) {
+  if (cond) {
+    console.log(`  ✅ ${name}`)
+  } else {
+    failed++
+    console.error(`  ❌ ${name}`, extra ?? '')
+  }
+}
+
+const LONG_TAIL = 'tail-marker-of-a-very-long-output'
+function longOutput(lines = 120) {
+  const body = Array.from({ length: lines }, (_, i) => `log line ${i + 1}`).join('\n')
+  return `${body}\n${LONG_TAIL}`
+}
+
+function makeMessage(toolActivity: Array<unknown>) {
+  return {
+    id: 'm-output',
+    role: 'assistant' as const,
+    content: '',
+    createdAt: Date.now(),
+    segments: toolActivity.map((_, index) => ({ kind: 'tool', index })) as never,
+    toolActivity: toolActivity as never,
+  }
+}
+
+function resetViewer() {
+  useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as never)
+}
+
+console.log('1) خروجی بلند ترمینال داخل چت کالپس می‌شود و پنل راست باز نمی‌شود:')
+{
+  resetViewer()
+  const msg = makeMessage([
+    { tool: 'run_terminal', status: 'done', args: { command: 'npm run build' }, items: [{ content: longOutput() }] },
+    { tool: 'read', status: 'done', args: { filePath: 'a.ts' }, summary: longOutput(60) },
+  ])
+  const html = renderToString(<ChatMessageView message={msg} />)
+  const vt = useViewerTabs.getState()
+  check('پنل راست باز نشد', vt.paneOpen === false, vt.paneOpen)
+  check('هیچ تب متنی ساخته نشد', vt.tabs.length === 0, vt.tabs.map((t) => t.id))
+  check('خروجی بلند در چت هست', html.includes(LONG_TAIL))
+  check('بلوک کالپس‌شدنی رندر شد', html.includes('tool-out-collapse'))
+  check(
+    'بلوک به‌صورت پیش‌فرض بسته است',
+    /<details[^>]*class="[^"]*tool-out-collapse[^"]*"[^>]*>/.test(html.replace(/<!--.*?-->/g, '')) &&
+      !/<details[^>]*\bopen\b[^>]*class="[^"]*tool-out-collapse/.test(html),
+    html.slice(0, 400),
+  )
+  check('خروجی بلند اسکرول عمودی دارد', html.includes('trace-expand-pre'))
+}
+
+console.log('2) خروجی کوتاه بدون بلوک اضافی رندر می‌شود:')
+{
+  resetViewer()
+  const msg = makeMessage([
+    { tool: 'read', status: 'done', args: { filePath: 'a.ts' }, summary: 'one short line' },
+    { tool: 'grep', status: 'done', args: { pattern: 'x' }, summary: '2 matches' },
+  ])
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('بدون details اضافی', !html.includes('tool-out-collapse'), html.slice(0, 300))
+  check('پنل همچنان بسته است', useViewerTabs.getState().paneOpen === false)
+}
+
+console.log('3) راه دستی باز کردن خروجی در پنل حفظ شده است:')
+{
+  resetViewer()
+  const msg = makeMessage([
+    {
+      tool: 'grep',
+      status: 'done',
+      args: { pattern: 'x' },
+      items: [
+        { file: 'a.ts', line: 1, text: 'x' },
+        { file: 'b.ts', line: 2, text: 'x' },
+        { file: 'c.ts', line: 3, text: 'x' },
+        { file: 'd.ts', line: 4, text: 'x' },
+      ],
+    },
+    { tool: 'read', status: 'done', args: { filePath: 'a.ts' }, summary: '1 file' },
+  ])
+  const html = renderToString(<ChatMessageView message={msg} />)
+  check('دکمهٔ «بیشتر» برای باز کردن در پنل هست', html.includes('file-result-more-btn'))
+  resetViewer()
+  useViewerTabs.getState().openText('grep results', 'body', 'md')
+  check('openText دستی پنل را باز می‌کند', useViewerTabs.getState().paneOpen === true)
+}
+
+if (failed > 0) {
+  console.error(`\n${failed} check(s) failed`)
+  process.exit(1)
+} else {
+  console.log('\nهمه بررسی‌های خروجی بلند ابزار موفق بود')
+}

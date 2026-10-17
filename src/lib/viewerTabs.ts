@@ -75,6 +75,11 @@ export interface ViewerTab {
   traceTaskId?: string
   /** Short label for a sub-agent trace tab (job description). */
   traceTitle?: string
+  /** Explore tab: the sub-agent run it shows, addressed by the owning message
+   *  id + the run's index into message.toolActivity, read live from the store
+   *  so running calls and the final report update in place. */
+  exploreMessageId?: string
+  exploreIndex?: number
   /** File-viewer tab: path as written (relative to the workspace root or
    *  absolute), optional line to scroll to, and the workspace root captured
    *  at open time so the panel survives chat switches. */
@@ -121,6 +126,10 @@ interface ViewerTabsState {
    *  mode: "md" renders the body as markdown (default), "text" keeps it
    *  verbatim (terminal logs read better raw). */
   openText: (title: string, body: string, format?: 'md' | 'text') => void
+  /** Open ONE sub-agent run's tool group in the Explore panel. Chat-scoped
+   *  with one tab per chat: clicking another run retargets the same tab
+   *  instead of stacking a tab per run. */
+  openExplore: (messageId: string, index: number, title?: string, chatId?: string) => void
   closeViewer: (id: string) => void
   /** Close all viewer tabs, or only the tabs visible in one chat.
    *  Closed tabs land in the "Recently closed" list so they can be
@@ -645,6 +654,29 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? entry : t))
+        : [...s.tabs, entry])
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openExplore: (messageId, index, title, chatId) =>
+    set((s) => {
+      // One explore tab per chat: reopening retargets the same tab in place.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('explore', cid)
+      const label = (title ?? '').trim()
+      const entry: ViewerTab = {
+        id,
+        kind: 'explore',
+        chatId: cid,
+        title: label ? `Explore · ${label.slice(0, 60)}` : 'Explore',
+        exploreMessageId: messageId,
+        exploreIndex: index,
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? { ...t, ...entry } : t))
         : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }

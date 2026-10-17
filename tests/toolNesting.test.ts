@@ -119,6 +119,20 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
     acts[0]?.resultText === undefined && (acts[0]?.items?.length ?? 0) === 1, acts[0])
 }
 
+// 9) explore/task keep their report text. That text is the ONLY record of the
+//    research in the transcript (explore returns no file rows), and the
+//    backend's history recap reads `resultText` to tell the next turn what was
+//    already found — dropping it made the main agent re-delegate the same work.
+{
+  const report = 'Repository uses a single sidecar; see agent.rs:120'
+  const acts = resolveToolResult(
+    applyToolEvent([], toolEvent({ tool: 'explore', call_id: 9, args: { prompt: 'trace usage' } })),
+    resultEvent({ tool: 'explore', call_id: 9, status: 'done', result: report }),
+  )
+  check('explore keeps its report text', acts[0]?.resultText === report, acts[0]?.resultText)
+  check('explore result makes no file chips', !acts[0]?.items, acts[0]?.items)
+}
+
 if (failed > 0) {
   console.error(`\n${failed} toolNesting check(s) FAILED`)
   process.exit(1)

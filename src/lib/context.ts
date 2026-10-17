@@ -538,12 +538,19 @@ export function estimateBreakdownParts(
     }
   }
   const messages = Math.round(msgChars / CHARS_PER_TOKEN)
-  // Match estimateContextChars builtin-prompt floor so the fallback estimate
-  // attributes the base prompt to System prompt, not to System tools gap.
+  // NO fixed floor here: this function's contract (and its tests) is "no fixed
+  // floors" — a fabricated 16k-char prompt would swallow the whole meter total
+  // of a fresh chat and pin the System prompt row to a number the backend never
+  // reported. The real prompt size arrives via `systemPromptChars`; until then
+  // the uncovered remainder is attributed to System tools by
+  // buildContextBreakdown, which reconciles every row against the meter total.
+  // (estimateContextChars keeps ITS OWN floor on purpose: the meter itself must
+  // not read 0% before the first usage event — but the popover only ever SPLITS
+  // that total, it does not re-estimate the prompt.)
   const systemPromptTokens =
     opts.systemPromptChars != null
       ? Math.round(opts.systemPromptChars / CHARS_PER_TOKEN)
-      : Math.round((systemPrompt.length + 16000) / CHARS_PER_TOKEN)
+      : Math.round(systemPrompt.length / CHARS_PER_TOKEN)
   const systemToolsTokens =
     opts.systemToolsChars != null
       ? Math.round(opts.systemToolsChars / CHARS_PER_TOKEN)

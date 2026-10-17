@@ -101,8 +101,15 @@ console.log('4b) چیپ فایل: آیکن همیشه سمت چپ مسیر اس�
   const iconChunk = fileHtml.slice(chipIdx, nameIdx > 0 ? nameIdx : fileHtml.length)
   check('آیکن svg قبل از نام مسیر رندر شده است',
     nameIdx > chipIdx && iconChunk.includes('<svg'), iconChunk.slice(0, 200))
+  // Chip: the visible text is the BASENAME (`foo.ts:12`) — the full path lives
+  // in the chip's title attribute, which sits BEFORE `file-chip-name` in the
+  // markup. So assert the visible label comes after the icon, and that the full
+  // path is still carried by the tooltip above it.
   check('متن مسیر بعد از آیکن می‌آید',
-    nameIdx > 0 && fileHtml.indexOf('src/foo.ts', nameIdx) > nameIdx)
+    nameIdx > 0 && fileHtml.indexOf('foo.ts:12', nameIdx) > nameIdx)
+  check('مسیر کامل در tooltip چیپ است',
+    nameIdx > 0 && fileHtml.indexOf('src/foo.ts', chipIdx) > chipIdx &&
+      fileHtml.indexOf('src/foo.ts', chipIdx) < nameIdx)
 }
 
 console.log('4c) آیکون فایل: نشان برند هر زبان (بدون گرادیان/متن DOM بیرون svg):')

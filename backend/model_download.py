@@ -1,13 +1,9 @@
 """Download / inspect / remove the on-device ML models.
 
-Two models are managed:
+One model is managed:
 
 * **Whisper** (voice input) — a faster-whisper / CTranslate2 snapshot in
   ``models/whisper/`` (default repo ``Systran/faster-whisper-medium``).
-* **Embedding** (RAG memory / web recall) — an e5-style ONNX model in an
-  HF-cache-style folder ``models/models--<org>--<name>/`` (default
-  ``intfloat/multilingual-e5-base``). Every downloaded repo keeps its own
-  folder, so several builds can coexist and be removed independently.
 
 Downloads use ``huggingface_hub.snapshot_download`` (the same mechanism as
 ``download-whisper.py``) and support arbitrary HF mirror endpoints via the
@@ -24,7 +20,6 @@ import logging
 import os
 import re
 import shutil
-import sys
 import threading
 import time
 from collections import deque
@@ -35,8 +30,6 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = _MODULE_DIR
 
 KIND_WHISPER = "whisper"
-KIND_EMBEDDING = "embedding"
-KIND_DECISION = "decision"
 
 # Download tuning for slow / filtered networks (applied in start_download):
 # fewer parallel file workers = steadier per-file speed and less connection
@@ -53,8 +46,6 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 WHISPER_DEFAULT_REPO = "Systran/faster-whisper-medium"
-EMBEDDING_DEFAULT_REPO = "intfloat/multilingual-e5-base"
-DECISION_DEFAULT_REPO = "convaiinnovations/laya"
 # Subfolder of the models root holding huggingface_hub's own cache layout.
 _HUB_CACHE_DIRNAME = "hub-cache"
 
@@ -77,9 +68,8 @@ def _raw_models_root() -> str:
 def _models_dir() -> str:
     """Model storage under the user data root.
 
-    Every caller (embeddings.model_dir, whisper_dir, whisper_ready,
-    embedding_dirs, status) goes through this function, so the legacy
-    ``backend/whisper`` / ``backend/models--*`` migration runs once per
+    Every caller (whisper_dir, whisper_ready, status) goes through this
+    function, so the legacy ``backend/whisper`` migration runs once per
     process, regardless of who calls first.
     """
     global _migrated
@@ -88,7 +78,6 @@ def _models_dir() -> str:
         with _MIGRATE_LOCK:
             if not _migrated:
                 _migrate_legacy_models(target)
-                _migrate_decision_dir_name(target)
                 _migrated = True
     return target
 
@@ -121,44 +110,17 @@ def whisper_dir() -> str:
     return os.path.join(_models_dir(), f"whisper--{slug}") if slug else os.path.join(_models_dir(), "whisper")
 
 
-def _embedding_dir(repo: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
-    return os.path.join(_models_dir(), f"models--{slug}") if slug else ""
-
-
-def _decision_dirname(repo: str) -> str:
-    """Decision-model folder name: the official release layout
-    ``<model>--<org>--<name>`` (e.g. ``laya--convaiinnovations--laya``),
-    so a manually downloaded copy is found without any rename."""
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(repo).replace("/", "--")).strip("-")
-    model = str(repo).strip().split("/")[-1]
-    return f"{model}--{slug}" if slug else ""
-
-
-def _decision_dir(repo: str) -> str:
-    """Absolute path of the decision-model folder ('' for a blank repo)."""
-    name = _decision_dirname(repo)
-    return os.path.join(_models_dir(), name) if name else ""
-
-
 def _migrate_legacy_models(target_root: str | None = None) -> None:
-    """Move models previously stored under ``backend/whisper`` /
-    ``backend/models--*`` into the data-root ``models/`` folder so an app that
-    already downloaded them keeps working after the path change.
+    """Move models previously stored under ``backend/whisper`` into the
+    data-root ``models/`` folder so an app that already downloaded them keeps
+    working after the path change.
 
     ``target_root`` is passed by ``_models_dir()`` to avoid recursing back
     into itself; ``status()`` calls this with no argument, which is fine
     since it only re-checks already-migrated dirs (cheap, idempotent).
     """
     target_root = target_root or _raw_models_root()
-    legacy_dirs = [
-        os.path.join(BACKEND_DIR, "whisper"),
-        *[
-            os.path.join(BACKEND_DIR, name)
-            for name in os.listdir(BACKEND_DIR)
-            if name.startswith("models--")
-        ],
-    ]
+    legacy_dirs = [os.path.join(BACKEND_DIR, "whisper")]
     for src in legacy_dirs:
         if not os.path.isdir(src):
             continue
@@ -170,27 +132,6 @@ def _migrate_legacy_models(target_root: str | None = None) -> None:
             shutil.move(src, dest)
         except Exception:  # noqa: BLE001, S112 — migration must never crash startup
             continue
-
-
-def _migrate_decision_dir_name(root: str | None = None) -> None:
-    """Rename a pre-fix ``models--<repo>`` decision download to the release
-    layout ``<model>--<org>--<name>`` so it keeps being found. Skipped when the
-    release-layout folder already exists (never touches user data).
-
-    Computes the old name inline: calling ``_embedding_dir`` here would
-    re-enter ``_models_dir`` mid-migration (the ``_migrated`` flag is still
-    unset at that point) and recurse forever.
-    """
-    root = root or _raw_models_root()
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", DECISION_DEFAULT_REPO.replace("/", "--")).strip("-")
-    old = os.path.join(root, f"models--{slug}")
-    new = os.path.join(root, _decision_dirname(DECISION_DEFAULT_REPO))
-    if not os.path.isdir(old) or os.path.isdir(new):
-        return
-    try:
-        os.rename(old, new)
-    except OSError:  # migration must never crash startup
-        pass
 
 
 # --- live download state (one entry per kind) --------------------------- #
@@ -437,81 +378,6 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 _SNAPSHOT_MAX_WORKERS = 4
 _SNAPSHOT_ETAG_TIMEOUT = 30
 
-#: Files a decision-model (Laya) download does not need. The snapshot ships
-#: three sub-builds (base, multilingual, typed-decisions) plus eval plots and
-#: README assets; the router only ever loads the base and multilingual ONNX
-#: graphs, so the rest is ~1 GB of dead weight on the user's disk.
-_DECISION_IGNORE = ["typed-decisions/*", "eval/*", "assets/*"]
-
-#: Budget for the one-time ONNX export that follows a Laya download. The export
-#: builds a 28-layer encoder twice (base + multilingual) and quantizes both,
-#: which takes minutes on a laptop; the cap only exists so a wedged run cannot
-#: hold the download thread forever.
-_EXPORT_TIMEOUT_S = 3600
-
-
-def _export_command(script: str, dest: str) -> list[str]:
-    """Command that runs the export, preferring the venv's own toolchain.
-
-    `onnx`/`onnxscript` are declared in pyproject so a packaged build has them,
-    but a dev checkout may not have synced since they were added. `uv run
-    --with` supplies them for that one run instead of failing the export.
-    """
-    args = [script, "--model-dir", dest, "--prune-weights"]
-    try:
-        import onnx  # noqa: F401
-        import onnxscript  # noqa: F401
-
-        return [sys.executable, *args]
-    except ImportError:
-        pass
-    uv = shutil.which("uv")
-    if not uv:
-        return [sys.executable, *args]
-    return [uv, "run", "--with", "onnx", "--with", "onnxscript", "python", *args]
-
-
-def _export_decision_onnx(dest: str) -> None:
-    """Convert a freshly downloaded Laya checkpoint to ONNX.
-
-    The native router loads an ONNX graph, not the torch checkpoint, so a
-    download on its own would leave the decision slot unusable. Running the
-    export here keeps the old "download it and it works" behaviour.
-
-    Runs as a subprocess on purpose: the export peaks at a few GB while torch
-    builds and quantizes the graph, and that memory must not sit inside the
-    sidecar (already the largest process on the machine).
-    """
-    import subprocess
-
-    script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "scripts",
-        "export-laya-onnx.py",
-    )
-    if not os.path.isfile(script):
-        print(f"[models] export script not found at {script}", flush=True)
-        return
-    print(f"[models] exporting {dest} to ONNX (one-time, takes a few minutes)", flush=True)
-    try:
-        proc = subprocess.run(
-            _export_command(script, dest),
-            capture_output=True,
-            text=True,
-            timeout=_EXPORT_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        print("[models] onnx export timed out", flush=True)
-        return
-    for line in (proc.stdout or "").strip().splitlines()[-4:]:
-        print(f"[models] export: {line}", flush=True)
-    if proc.returncode != 0:
-        print(
-            f"[models] onnx export failed: {(proc.stderr or '').strip()[-300:]}",
-            flush=True,
-        )
-
-
 def _make_tqdm_class(kind: str, controls: dict[str, threading.Event]):
     """کلاس پروگرس سازگار با ``snapshot_download`` که بایت، درصد و سرعت را
     ثبت می‌کند و به پرچم‌های مکث/توقف واکنش نشان می‌دهد.
@@ -600,7 +466,7 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
     repo = (repo or "").strip()
     if not repo:
         return False
-    kind = kind or KIND_EMBEDDING
+    kind = kind or KIND_WHISPER
     base_url = (base_url or "").strip()
 
     with _LOCK:
@@ -619,15 +485,8 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
         controls["pause"].clear()
         controls["cancel"].clear()
 
-    if kind == KIND_WHISPER:
-        dest = whisper_dir()
-    elif kind == KIND_DECISION:
-        dest = _decision_dir(repo)
-    else:
-        dest = _embedding_dir(repo)
+    dest = whisper_dir()
     _set_downloading(kind, repo, base_url, _dir_size(dest))
-    # NOTE: decision (Laya) downloads use the release folder layout
-    # laya--<org>--<name>, so pause/resume/remove work through the same helpers.
     tqdm_class = _make_tqdm_class(kind, controls)
 
     def _run() -> None:
@@ -642,12 +501,9 @@ def start_download(kind: str, repo: str, base_url: str = "") -> bool:
                 endpoint=base_url or None,
                 max_workers=_SNAPSHOT_MAX_WORKERS,
                 etag_timeout=_SNAPSHOT_ETAG_TIMEOUT,
-                ignore_patterns=_DECISION_IGNORE if kind == KIND_DECISION else None,
                 tqdm_class=tqdm_class,  # type: ignore[arg-type]
             )
             print(f"[models] {kind} download finished", flush=True)
-            if kind == KIND_DECISION:
-                _export_decision_onnx(dest)
             with _LOCK:
                 if _RUNS.get(kind) == run:
                     _clear_state(kind)
@@ -725,12 +581,7 @@ def remove(kind: str, repo: str) -> bool:
         if controls is not None:
             controls["cancel"].set()
             controls["pause"].clear()
-    if kind == KIND_WHISPER:
-        target = whisper_dir()
-    elif kind == KIND_DECISION:
-        target = _decision_dir(repo)
-    else:
-        target = _embedding_dir(repo)
+    target = whisper_dir()
     if not os.path.isdir(target):
         _clear_state(kind)
         return False
@@ -799,170 +650,9 @@ def whisper_ready() -> bool:
     return False
 
 
-def _embed_ready(root: str) -> bool:
-    """True when ``root`` holds a usable e5 ONNX model (snapshots or flat)."""
-    snapshots = os.path.join(root, "snapshots")
-    if os.path.isdir(snapshots):
-        for d in os.listdir(snapshots):
-            cand = os.path.join(snapshots, d)
-            if os.path.isdir(cand) and os.path.isfile(
-                os.path.join(cand, "onnx", "model.onnx")
-            ):
-                return True
-    return os.path.isfile(os.path.join(root, "tokenizer.json")) and os.path.isfile(
-        os.path.join(root, "onnx", "model.onnx")
-    )
-
-
-def embedding_dirs() -> list[dict]:
-    """All downloaded embedding model dirs, newest first."""
-    out: list[dict] = []
-    root_dir = _models_dir()
-    if not os.path.isdir(root_dir):
-        return out
-    for name in sorted(os.listdir(root_dir), reverse=True):
-        if not name.startswith("models--"):
-            continue
-        root = os.path.join(root_dir, name)
-        if not os.path.isdir(root):
-            continue
-        repo = name[len("models--") :].replace("--", "/")
-        if repo == DECISION_DEFAULT_REPO:
-            # The decision model (Laya) has its own Settings card; never list
-            # it there as an (always-incomplete) embedding build.
-            continue
-        out.append(
-            {
-                "repo": repo,
-                "dir": name,
-                "size": _dir_size(root),
-                "ready": _embed_ready(root),
-            }
-        )
-    return out
-
-
-def decision_model_dir() -> str:
-    """Absolute path to a ready Laya decision-model dir; '' when none.
-
-    Prefers the newest ready dir from :func:`decision_dirs` and resolves it
-    to the concrete folder holding the weights (a ``snapshots/<rev>``
-    subdir or the flat repo root), mirroring ``embeddings.model_dir``.
-    """
-    for entry in decision_dirs():
-        if not entry.get("ready"):
-            continue
-        name = str(entry.get("dir") or "")
-        if not name:
-            continue
-        root = os.path.join(_models_dir(), name)
-        snapshots = os.path.join(root, "snapshots")
-        if os.path.isdir(snapshots):
-            for rev in sorted(os.listdir(snapshots), reverse=True):
-                cand = os.path.join(snapshots, rev)
-                if os.path.isdir(cand) and _dir_has_weights(cand):
-                    return cand
-        if _dir_has_weights(root):
-            return root
-    return ""
-
-
-def decision_dirs() -> list[dict]:
-    """Downloaded decision-model dirs (Laya).
-
-    The folder uses the official release layout ``<model>--<org>--<name>``
-    (e.g. ``laya--convaiinnovations--laya``) so a manually downloaded copy
-    is found as-is; the decision slot is pinned to the default Laya repo
-    (there is no per-repo picker for it), so at most one dir can exist.
-    """
-    out: list[dict] = []
-    root_dir = _models_dir()
-    name = _decision_dirname(DECISION_DEFAULT_REPO)
-    root = os.path.join(root_dir, name)
-    if name and os.path.isdir(root):
-        out.append(
-            {
-                "repo": DECISION_DEFAULT_REPO,
-                "dir": name,
-                "size": _dir_size(root),
-                "ready": _decision_ready(root),
-                "exported": _decision_exported(root),
-            }
-        )
-    return out
-
-
-def _decision_exported(root: str) -> bool:
-    """True when the ONNX graph the native router loads is present.
-
-    The downloader fetches the torch checkpoint; the native router needs the
-    ONNX export of it (``scripts/export-laya-onnx.py``). Reporting the two
-    separately lets the Settings card tell "not downloaded" apart from
-    "downloaded but not exported yet", which need different actions.
-    """
-    for sub in ("", "multilingual"):
-        d = os.path.join(root, sub) if sub else root
-        for name in ("model.int8.onnx", "model.onnx"):
-            if os.path.isfile(os.path.join(d, "onnx", name)):
-                return True
-    return False
-
-
-def _decision_ready(root: str) -> bool:
-    """True when ``root`` holds a usable decision model (snapshots or flat).
-
-    Laya ships safetensors weights plus tokenizer/config files; a half-
-    downloaded dir (only configs / .cache partials) must report incomplete so
-    the Settings card keeps offering Download (= resume via HTTP Range).
-    """
-    snapshots = os.path.join(root, "snapshots")
-    if os.path.isdir(snapshots):
-        for d in os.listdir(snapshots):
-            cand = os.path.join(snapshots, d)
-            if not os.path.isdir(cand):
-                continue
-            if _dir_has_weights(cand):
-                return True
-        return False
-    return _dir_has_weights(root)
-
-
-def _dir_has_weights(root: str) -> bool:
-    """Non-empty weight file (safetensors / bin / onnx) under root.
-
-    The ONNX graphs the native router loads live in an ``onnx/`` subfolder, and
-    the torch checkpoints they were exported from may have been pruned
-    afterwards (``export-laya-onnx.py --prune-weights``), so either layout
-    counts as ready — otherwise a pruned install would look incomplete and the
-    Settings card would keep offering a download that is already done.
-    """
-    candidates = [
-        os.path.join(root, name)
-        for name in ("model.safetensors", "pytorch_model.bin", "model.bin", "model.onnx")
-    ]
-    candidates += [
-        os.path.join(root, "onnx", name) for name in ("model.int8.onnx", "model.onnx")
-    ]
-    for path in candidates:
-        try:
-            if os.path.isfile(path) and os.path.getsize(path) > 0:
-                return True
-        except OSError:
-            continue
-    return False
-
-
 def status() -> dict:
     """Complete state for the Settings UI: per-kind download status + dirs."""
     _migrate_legacy_models()
-    embed: dict = {"dirs": embedding_dirs()}
-    if download_state(KIND_EMBEDDING):
-        embed["running"] = download_state(KIND_EMBEDDING)
-
-    decision: dict = {"dirs": decision_dirs()}
-    if download_state(KIND_DECISION):
-        decision["running"] = download_state(KIND_DECISION)
-
     whisper: dict = {"dirs": []}
     if download_state(KIND_WHISPER):
         whisper["running"] = download_state(KIND_WHISPER)
@@ -977,7 +667,7 @@ def status() -> dict:
                 "ready": whisper_ready(),
             }
         ]
-    out = {"whisper": whisper, "embedding": embed, "decision": decision}
+    out = {"whisper": whisper}
     try:
         _tripwire_external_deletion(out)
     except Exception:  # noqa: BLE001, S110 — diagnostics never break status
@@ -1007,14 +697,6 @@ def _tripwire_external_deletion(status_out: dict) -> None:
     the app (system cleaner, another process, manual delete).
     """
     ready_now: set[str] = set()
-    for _section in (
-        status_out.get("embedding") or {},
-        status_out.get("decision") or {},
-    ):
-        for _d in (_section.get("dirs") or []):
-            _name = str((_d or {}).get("dir") or "")
-            if _name and (_d or {}).get("ready"):
-                ready_now.add(_name)
     for _w in (status_out.get("whisper", {}) or {}).get("dirs", []) or []:
         _name = str((_w or {}).get("dir") or "")
         if _name and (_w or {}).get("ready"):

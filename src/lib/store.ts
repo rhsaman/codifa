@@ -644,8 +644,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -730,7 +730,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -746,7 +746,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, vectorDbPath, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, embeddingModel, embeddingBaseUrl, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, ragWebTtlDays, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1012,15 +1012,10 @@ interface State {
   fontSize: number
   setFontSize: (n: number) => void
   /** Directory for the per-workspace RAG vector store; "" = default. */
-  vectorDbPath: string
-  setVectorDbPath: (p: string) => void
   /** How many top web_search results are auto-fetched for real page content (0 = off, snippet-only). */
   webSearchAutoFetch: number
   setWebSearchAutoFetch: (n: number) => void
-  /** TTL for web/fetch text cache + RAG storage (days). */
-  ragWebTtlDays: number
-  setRagWebTtlDays: (d: number) => void
-  /** User-level data root (skills/plans/mcp + vector stores). */
+  /** User-level data root (skills/plans/mcp). */
   dataPath: string
   setDataPath: (p: string) => void
   /** On-device model preferences (Settings → Models). */
@@ -1040,8 +1035,6 @@ interface State {
   ttsVoice: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks: TtsFallback[]
-  embeddingModel: string
-  embeddingBaseUrl: string
   setWhisperModel: (m: string) => void
   setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
@@ -1051,8 +1044,6 @@ interface State {
   setTtsModel: (m: string) => void
   setTtsVoice: (v: string) => void
   setTtsFallbacks: (f: TtsFallback[]) => void
-  setEmbeddingModel: (m: string) => void
-  setEmbeddingBaseUrl: (u: string) => void
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
@@ -1380,9 +1371,7 @@ export const useStore = create<State>((set, get) => ({
   theme: DEFAULT_THEME,
   dir: 'rtl',
   fontSize: 14,
-  vectorDbPath: '',
   webSearchAutoFetch: 3,
-  ragWebTtlDays: 90,
   whisperModel: 'Systran/faster-whisper-medium',
   whisperBaseUrl: '',
   sttProviderId: 'local',
@@ -1392,8 +1381,6 @@ export const useStore = create<State>((set, get) => ({
   ttsModel: 'tts-1',
   ttsVoice: 'alloy',
   ttsFallbacks: [],
-  embeddingModel: 'intfloat/multilingual-e5-base',
-  embeddingBaseUrl: '',
   recentModels: [],
   subagentModels: {},
   cacheTtlMinutes: 60,
@@ -1740,7 +1727,6 @@ export const useStore = create<State>((set, get) => ({
       root,
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       fontSize,
-      vectorDbPath: typeof raw.vectorDbPath === 'string' ? raw.vectorDbPath : '',
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
       whisperModel: typeof raw.whisperModel === 'string' && raw.whisperModel.trim() ? raw.whisperModel : 'Systran/faster-whisper-medium',
       whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
@@ -1753,8 +1739,6 @@ export const useStore = create<State>((set, get) => ({
       ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
-      embeddingModel: typeof raw.embeddingModel === 'string' && raw.embeddingModel.trim() ? raw.embeddingModel : 'intfloat/multilingual-e5-base',
-      embeddingBaseUrl: typeof raw.embeddingBaseUrl === 'string' ? raw.embeddingBaseUrl : '',
       subagentModels: (() => {
         if (typeof raw.subagentModels !== 'object' || raw.subagentModels === null) return {};
         const m = { ...(raw.subagentModels as Record<string, string>) };
@@ -1776,11 +1760,6 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
-      // Migration: اگه settings قدیمی webSearchTtlDays داشت ولی ragWebTtlDays نداشت،
-      // مقدار webSearchTtlDays → ragWebTtlDays منتقل بشه.
-      ragWebTtlDays: coercePositiveInt(raw.ragWebTtlDays, 0)
-        || coercePositiveInt((raw as Record<string, unknown>).webSearchTtlDays, 0)
-        || 90,
       // 0 is a valid, deliberate value (auto-fetch disabled) — keep it.
       webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 3, 0, 10),
       // Hard desktop-control switch: absent/false in old settings files = OFF.
@@ -2196,12 +2175,6 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  setVectorDbPath: (vectorDbPath) => {
-    set({ vectorDbPath: (vectorDbPath ?? '').trim() })
-    get().persist()
-  },
-
-
   setDataPath: (dataPath) => {
     set({ dataPath: (dataPath ?? '').trim() })
     get().persist()
@@ -2248,24 +2221,12 @@ export const useStore = create<State>((set, get) => ({
     set({ ttsFallbacks: normalizeTtsFallbacks(f) })
     get().persist()
   },
-  setEmbeddingModel: (m) => {
-    set({ embeddingModel: (m ?? '').trim() || 'intfloat/multilingual-e5-base' })
-    get().persist()
-  },
-  setEmbeddingBaseUrl: (u) => {
-    set({ embeddingBaseUrl: (u ?? '').trim() })
-    get().persist()
-  },
   setWebSearchAutoFetch: (n) => {
     // 0 is a valid, deliberate value (disable auto-fetch) — unlike the TTL
     // setters above, we can't fall back with `|| default` since that would
     // silently turn 0 back into the default.
     const r = Math.round(n)
     set({ webSearchAutoFetch: Number.isFinite(r) ? Math.max(0, Math.min(10, r)) : 3 })
-    get().persist()
-  },
-  setRagWebTtlDays: (d) => {
-    set({ ragWebTtlDays: Math.max(1, Math.round(d) || 90) })
     get().persist()
   },
 

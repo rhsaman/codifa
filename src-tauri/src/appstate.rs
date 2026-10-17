@@ -89,9 +89,9 @@ pub fn system_prompts() -> Value {
 const DEFAULT_SETTINGS_KEYS: &[&str] = &[
     "providers", "activeProviderId", "systemPrompts", "mcpServers", "mcpEnabled",
     "modes", "compactHeadroom", "root", "dir", "recentModels", "sidebarOpen",
-    "fontSize", "vectorDbPath", "dataPath", "whisperModel", "whisperBaseUrl",
-    "sttProviderId", "sttModel", "embeddingModel", "embeddingBaseUrl",
-    "ragWebTtlDays", "subagentModels", "memory", "memoryTtlDays", "memoryMaxDocs",
+    "fontSize", "dataPath", "whisperModel", "whisperBaseUrl",
+    "sttProviderId", "sttModel",
+    "subagentModels", "memory", "memoryTtlDays", "memoryMaxDocs",
     "memoryMaxChunks", "workspaceColors", "pinnedWorkspaces", "workspaces",
     "searchPlugins", "searchConsole", "pinnedChats",
 ];

@@ -682,10 +682,6 @@ export interface StreamParams {
   /** User pre-approved desktop-app control (the `computer` tool's mutating
    *  actions) for this session/workspace — set by "Always allow". */
   allowComputer?: boolean
-  /** Directory for the per-workspace RAG vector store ("" = backend default). */
-  vectorDbPath?: string
-  /** Size / TTL bounds for the RAG store (max_docs, max_chunks, ttl_days). */
-  vectorConfig?: { ttl_days: number; max_docs: number; max_chunks: number }
   /** Per-subagent model overrides (explore, vision, compact). */
   subagentModels?: Record<string, string>
   /** Full provider configs keyed by provider id, so a "providerId/model"
@@ -731,6 +727,13 @@ export async function streamChat(
   // respawns the sidecar and resumes from the on-disk checkpointer, instead of
   // silently stranding the user on a manual resend.
   let gotDone = false
+  // A terminal `error` event (the turn died on a provider failure) is an
+  // intentional end of the stream: the backend follows it with `done`, but an
+  // older/broken producer may close right after the error. Treating that EOF
+  // as a dropped connection stacked "Connection lost mid-turn" on top of the
+  // real provider error — the wrong message users hit on ONE of two concurrent
+  // chats.
+  let gotTerminalError = false
   // Whether ANY event (incl. keepalive) was delivered on this attempt. Used to
   // distinguish a genuine sidecar crash-before-output (no events — heal with a
   // reconnect) from an interrupted mid-turn stream (events already flowing — do
@@ -738,6 +741,7 @@ export async function streamChat(
   let gotAnyEvent = false
   const wrappedOnEvent = (e: SidecarEvent) => {
     if (e?.kind === 'done') gotDone = true
+    if (e?.kind === 'error') gotTerminalError = true
     gotAnyEvent = true
     onEvent(e)
   }
@@ -817,8 +821,6 @@ export async function streamChat(
           allow_outside: params.allowOutside ?? false,
           allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
-          vector_db_path: params.vectorDbPath ?? "",
-          vector_config: params.vectorConfig ?? null,
           subagent_models: params.subagentModels ?? {},
           providers: params.providers ?? {},
           // Single auto-compaction threshold as a percentage of the raw window.
@@ -879,7 +881,7 @@ export async function streamChat(
       // flush any pending multi-byte UTF-8 tail (decoder.decode() with no args).
       buffer += decoder.decode()
       if (buffer.trim()) parseFrame(buffer)
-      if (!gotDone) {
+      if (!gotDone && !gotTerminalError) {
         // The sidecar died mid-stream (segfault/OOM) and the socket closed
         // without a graceful `done`. Surface it as a drop so the self-healing
         // reconnect (below) respawns the sidecar and resumes from the on-disk
@@ -1237,7 +1239,7 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
 // Local TTS kind stays "piper" for backend API compat; it now serves
 // pocket-tts-farsi-v2 with a bundled default voice.
 
-export type ManagedModelKind = "whisper" | "embedding" | "piper" | "decision"
+export type ManagedModelKind = "whisper" | "piper"
 
 export interface PiperStatus {
   state: string
@@ -1278,8 +1280,6 @@ export interface ModelKindStatus {
 
 export interface ModelsStatus {
   whisper: ModelKindStatus
-  embedding: ModelKindStatus
-  decision?: ModelKindStatus
   piper?: PiperStatus
 }
 
@@ -1301,14 +1301,12 @@ export async function downloadModel(
 /** Poll the current download state + on-disk model dirs. */
 export async function getModelsStatus(): Promise<ModelsStatus> {
   const url = await ensureSidecar()
-  if (!url) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  if (!url) return { whisper: { dirs: [] } }
   const res = await fetch(`${url}/models/status`)
-  if (!res.ok) return { whisper: { dirs: [] }, embedding: { dirs: [] } }
+  if (!res.ok) return { whisper: { dirs: [] } }
   const data = (await res.json()) as ModelsStatus
   return {
     whisper: data.whisper ?? { dirs: [] },
-    embedding: data.embedding ?? { dirs: [] },
-    decision: data.decision,
     piper: data.piper,
   }
 }
@@ -1475,6 +1473,8 @@ export async function syncSkill(params: {
   previousName?: string
   content?: string
   description?: string
+  /** Persian phrases that should trigger this skill (comma-separated string or list). */
+  faKeywords?: string | string[]
   delete?: boolean
   files?: Record<string, string>
   deletedFiles?: string[]
@@ -1490,6 +1490,7 @@ export async function syncSkill(params: {
         previous_name: params.previousName ?? "",
         content: params.content ?? "",
         description: params.description ?? "",
+        fa_keywords: params.faKeywords ?? "",
         delete: params.delete ?? false,
         // Multi-file (Codex-style) skills: extra file contents to upsert.
         // Omitted when undefined so single-file skills are unaffected.
@@ -1561,68 +1562,6 @@ export async function deleteMcp(name: string): Promise<void> {
     })
   } catch {
     /* best effort */
-  }
-}
-
-export interface MemoryStats {
-  available: boolean
-  db: string
-  docs: number
-  chunks: number
-  kinds: Record<string, number>
-  max_docs: number
-  max_chunks: number
-  ttl_days: number
-}
-
-/** RAG store usage for a workspace (docs/chunks + active TTL/caps). */
-export async function getMemoryStats(
-  root: string,
-  vectorDbPath?: string,
-): Promise<MemoryStats> {
-  const url = await ensureSidecar()
-  const empty: MemoryStats = {
-    available: false,
-    db: "",
-    docs: 0,
-    chunks: 0,
-    kinds: {},
-    max_docs: 0,
-    max_chunks: 0,
-    ttl_days: 0,
-  }
-  if (!url || !root) return empty
-  try {
-    const qs = new URLSearchParams({ root })
-    if (vectorDbPath) qs.set("vector_db_path", vectorDbPath)
-    const res = await fetch(`${url}/memory/stats?${qs.toString()}`)
-    if (!res.ok) return empty
-    return { ...empty, ...((await res.json()) as Partial<MemoryStats>) }
-  } catch {
-    return empty
-  }
-}
-
-/** Wipe the workspace's RAG store (memory notes + saved web chunks). */
-export async function clearMemory(
-  root: string,
-  vectorDbPath?: string,
-): Promise<{ ok: boolean; error?: string }> {
-  const url = await ensureSidecar()
-  if (!url || !root) return { ok: false, error: "no active workspace" }
-  try {
-    const res = await fetch(`${url}/memory/clear`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root, vector_db_path: vectorDbPath ?? "" }),
-    })
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { detail?: string }
-      return { ok: false, error: body.detail || `clear failed (${res.status})` }
-    }
-    return (await res.json()) as { ok: boolean; error?: string }
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
 

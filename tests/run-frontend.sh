@@ -128,6 +128,8 @@ planApproval|tests/planApproval.test.ts|--jsx=automatic --packages=external --al
 resumeNote|tests/resumeNote.test.ts|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolEditGroup|tests/toolEditGroup.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 exploreHeader|tests/exploreHeader.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+explorePanel|tests/explorePanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+toolOutputPanel|tests/toolOutputPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 terminalPanel|tests/terminalPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalPanelClosed|tests/terminalPanelClosed.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
@@ -159,6 +161,8 @@ selectionBar|tests/selectionBar.test.ts|
 workspacePath|tests/workspacePath.test.ts|
 cmuxNvim|tests/cmuxNvim.test.ts|-
 historySubmit|tests/historySubmit.test.ts|-
+historyPayload|tests/historyPayload.test.ts|-
+viewerTabRail|tests/viewerTabRail.ssr.test.tsx|--jsx=automatic --loader:.mp3=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

@@ -41,7 +41,7 @@ function makeMessage(toolActivity: Array<unknown>) {
   }
 }
 
-console.log('1) دو explore موازی → دو پیل جدا با توضیح هدف هرکدام:')
+console.log('1) دو explore موازی → دو کارت مستقل، هر کدام با هدر «Explore · توضیح»:')
 {
   const msg = makeMessage([
     {
@@ -57,9 +57,26 @@ console.log('1) دو explore موازی → دو پیل جدا با توضیح �
     },
   ])
   const html = renderToString(<ChatMessageView message={msg} />)
+  // React SSR splits adjacent text nodes with `<!-- -->` separators: strip
+  // comments (and tags) before matching rendered header text.
+  const plain = html.replace(/<!--.*?-->/g, '')
+  const text = plain.replace(/<[^>]*>/g, '')
   check('پیل ساب‌ایجنت رندر شد', html.includes('trace-pill-sub'))
-  check('توضیح explore اول در هدر هست', html.includes('Find the auth flow'))
-  check('توضیح explore دوم در هدر هست', html.includes('Map the settings store'))
+  check(
+    'هر explore کارت تول‌گروپ مستقل خودش را دارد',
+    (html.match(/class="tool-group/g) || []).length === 2,
+    (html.match(/class="tool-group/g) || []).length,
+  )
+  check(
+    'هدر کارت اول «Explore · توضیح» است',
+    text.includes('Explore · Find the auth flow'),
+    text.slice(0, 300),
+  )
+  check(
+    'هدر کارت دوم توضیح خودش را دارد',
+    text.includes('Explore · Map the settings store'),
+    text.slice(0, 300),
+  )
   check(
     'دو پیل جدا (نه یک ×2)',
     (html.match(/trace-pill-sub/g) || []).length === 2,

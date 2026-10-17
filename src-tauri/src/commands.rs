@@ -1545,36 +1545,57 @@ pub async fn start_update(app: AppHandle, window: tauri::WebviewWindow) -> OpRes
     }
     let total = res.content_length().unwrap_or(0);
     let mut stream = res.bytes_stream();
-    let mut chunks: Vec<u8> = vec![];
     use futures_util::StreamExt;
+    use std::io::Write as _;
+    // Stream straight to disk: buffering a ~350 MB installer in a Vec blew the
+    // process up by gigabytes at peak (the biggest transient memory spike in
+    // the app). The file is written to a temp path and only renamed into place
+    // once the byte count matches, so a failed download never looks complete.
+    let tmp = dest.with_extension("part");
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => return OpResult::err(e.to_string()),
+    };
+    let mut written: u64 = 0;
     let mut last_pct = 0u32;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
-            Err(e) => return OpResult::err(e.to_string()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return OpResult::err(e.to_string());
+            }
         };
-        chunks.extend_from_slice(&chunk);
+        if let Err(e) = file.write_all(&chunk) {
+            let _ = std::fs::remove_file(&tmp);
+            return OpResult::err(e.to_string());
+        }
+        written += chunk.len() as u64;
         if total > 0 {
-            let pct = ((chunks.len() as f64 / total as f64) * 100.0) as u32;
+            let pct = ((written as f64 / total as f64) * 100.0) as u32;
             if pct != last_pct {
                 last_pct = pct.min(99);
                 let _ = window.emit("updater:progress", serde_json::json!({"phase": "downloading", "percent": last_pct}));
             }
         }
     }
-    if total > 0 && chunks.len() as u64 != total {
-        let _ = std::fs::remove_file(&dest);
-        let _ = std::fs::remove_file(&size_file);
-        return OpResult::err(format!(
-            "Download incomplete: got {} of {} bytes — click Retry to download again",
-            chunks.len(),
-            total
-        ));
-    }
-    if let Err(e) = std::fs::write(&dest, &chunks) {
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp);
         return OpResult::err(e.to_string());
     }
-    if let Err(e) = std::fs::write(&size_file, chunks.len().to_string()) {
+    drop(file);
+    if total > 0 && written != total {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&size_file);
+        return OpResult::err(format!(
+            "Download incomplete: got {written} of {total} bytes — click Retry to download again"
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return OpResult::err(e.to_string());
+    }
+    if let Err(e) = std::fs::write(&size_file, written.to_string()) {
         return OpResult::err(e.to_string());
     }
     let _ = window.emit("updater:progress", serde_json::json!({"phase": "installing", "percent": 100}));

@@ -1,11 +1,15 @@
 //! Native in-app browser session (migrated from the Python sidecar's
 //! `browser_session.py`).
 //!
-//! One headless Chromium per chat, driven over the Chrome DevTools Protocol.
-//! The right-side Browser panel polls `/browser/screenshot` for JPEG frames and
-//! posts its clicks/keys back through `/browser/*`, while the agent's Playwright
-//! MCP connector attaches to the SAME browser via `--cdp-endpoint` — so both
-//! sides drive one page and nothing ever opens outside the app.
+//! ONE shared headless Chromium serves the whole app, driven over the Chrome
+//! DevTools Protocol. Each chat gets its own TAB plus its own CDP session
+//! (`Target.attachToTarget` + `sessionId`), so isolation comes from tabs rather
+//! than from processes: N open chats cost one Chromium instead of N, while
+//! cookies/logins stay shared. The right-side Browser panel polls
+//! `/browser/screenshot` for JPEG frames and posts its clicks/keys back through
+//! `/browser/*`, while the agent's Playwright MCP connector attaches to the SAME
+//! browser via `--cdp-endpoint` — so both sides drive one page and nothing ever
+//! opens outside the app.
 //!
 //! The user's real mouse and keyboard are never touched: every input goes
 //! through CDP. All entry points are safe to call while the session is down —
@@ -22,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Viewport a fresh session starts with (mirrors browser_session.DEFAULT_VIEWPORT).
+/// Viewport a fresh tab starts with (mirrors browser_session.DEFAULT_VIEWPORT).
 const DEFAULT_VIEWPORT: (u32, u32) = (1280, 800);
 /// JPEG quality for the panel's frames (mirrors the Python `quality=60`).
 const SCREENSHOT_QUALITY: u32 = 60;
@@ -30,24 +34,40 @@ const SCREENSHOT_QUALITY: u32 = 60;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-CDP-command timeout.
 const CDP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the whole browser may sit unused before it is reaped. The panel
+/// polls every ~1.2s while open, so only "no panel anywhere" goes idle.
+const IDLE_REAP: Duration = Duration::from_secs(600);
 
-/// A live Chromium owned by one chat.
+/// The one shared Chromium the whole app drives.
+///
+/// A single browser (with a single `--user-data-dir` profile) serves every
+/// chat: cookies and logins stay shared, and N open chats cost one Chromium
+/// instead of N. Per-chat isolation comes from tabs, not from processes.
 struct BrowserProc {
     child: Child,
     port: u16,
-    /// Emulated viewport. Persisted per session so the panel's ruler and
+    /// Last time ANY tab touched the browser, for idle reaping of the process.
+    last_used: Instant,
+}
+
+/// One tab inside the shared browser, keyed by normalized chat id. Each chat
+/// drives its own tab through its own CDP session, so chats never interact.
+#[derive(Clone)]
+struct Tab {
+    target_id: String,
+    /// Emulated viewport, persisted per tab so the panel's ruler and
     /// fit-to-pane resizes STICK: every `/browser/status` and screenshot
     /// reports this size, and a poll can never reset the user's choice.
     viewport: (u32, u32),
-    /// Last time this session was used. A Chromium is ~150-300 MB, and one is
-    /// spawned per chat, so sessions that nobody polls any more must be reaped
-    /// instead of accumulating until the app exits.
-    last_used: std::time::Instant,
 }
 
-/// Sessions keyed by normalized chat id. `Vec` (not `HashMap`) so the static
-/// stays `const`-constructible without a lazy initializer.
-static SESSIONS: Mutex<Vec<(String, BrowserProc)>> = Mutex::new(Vec::new());
+/// The shared browser process. `Option` (not a lazy cell) so the static stays
+/// `const`-constructible.
+static BROWSER: Mutex<Option<BrowserProc>> = Mutex::new(None);
+
+/// Tabs keyed by normalized chat id. `Vec` (not `HashMap`) so the static stays
+/// `const`-constructible without a lazy initializer.
+static TABS: Mutex<Vec<(String, Tab)>> = Mutex::new(Vec::new());
 
 // ---------------------------------------------------------------------------
 // Paths and process discovery
@@ -75,21 +95,10 @@ fn data_root() -> PathBuf {
         .join(".codifa")
 }
 
-/// Persistent profile dir for one chat, so cookies/logins survive a restart.
-fn profile_dir(chat: &str) -> PathBuf {
-    let base = data_root().join("browser-profile");
-    if chat == "default" {
-        return base;
-    }
-    let safe: String = chat
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
-        .collect();
-    base.join(format!(
-        "chat-{}",
-        if safe.is_empty() { "x".to_string() } else { safe }
-    ))
+/// The single shared persistent profile, so cookies/logins survive a restart
+/// and every chat sees the same signed-in state (one browser, one profile).
+fn profile_dir() -> PathBuf {
+    data_root().join("browser-profile")
 }
 
 /// Resolve an executable on PATH (a GUI-launched app has a minimal PATH, so
@@ -209,46 +218,73 @@ fn http_get_json(port: u16, path: &str) -> Result<Value, String> {
     serde_json::from_slice(&buf[start..]).map_err(|e| format!("cdp http body: {e}"))
 }
 
-/// WebSocket URL of the page target (the tab the panel mirrors).
-fn page_ws_url(port: u16) -> Result<String, String> {
-    let list = http_get_json(port, "/json/list")?;
-    let arr = list
-        .as_array()
-        .ok_or_else(|| "cdp target list is not an array".to_string())?;
-    for t in arr {
-        if t["type"].as_str() != Some("page") {
-            continue;
-        }
-        if let Some(ws) = t["webSocketDebuggerUrl"].as_str() {
-            if !ws.is_empty() {
-                return Ok(ws.to_string());
-            }
-        }
-    }
-    Err("no debuggable page target".into())
+/// WebSocket URL of the BROWSER-level endpoint (`/json/version`). All work then
+/// happens through `Target.attachToTarget{flatten:true}` + `sessionId`, which is
+/// what lets one WebSocket drive many tabs — one per chat — side by side.
+fn browser_ws_url(port: u16) -> Result<String, String> {
+    let info = http_get_json(port, "/json/version")?;
+    info["webSocketDebuggerUrl"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "no browser websocket endpoint".to_string())
 }
 
-/// One CDP connection to the page target.
+/// Open a new tab and return its target id.
+async fn create_target(cdp: &mut Cdp, url: &str) -> Result<String, String> {
+    let res = cdp.send("Target.createTarget", json!({"url": url})).await?;
+    res["targetId"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "Target.createTarget returned no targetId".to_string())
+}
+
+/// Close a tab, ignoring "already gone" (Chrome drops a target when its last
+/// session detaches, so a second close is a no-op rather than an error).
+async fn close_target(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
+    match cdp
+        .send("Target.closeTarget", json!({"targetId": target_id}))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("No target") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Browser-level CDP connection: one WebSocket, one `sessionId` per tab.
 struct Cdp {
     ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     next_id: u64,
+    /// Session id of the tab this connection is currently driving.
+    session: Option<String>,
 }
 
 impl Cdp {
-    async fn connect(ws_url: &str) -> Result<Self, String> {
+    async fn connect(port: u16) -> Result<Self, String> {
+        let ws_url = browser_ws_url(port)?;
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| format!("cdp connect failed: {e}"))?;
-        Ok(Self { ws, next_id: 1 })
+        Ok(Self {
+            ws,
+            next_id: 1,
+            session: None,
+        })
     }
 
-    /// Send one command and wait for its matching reply.
+    /// Send one command and wait for its matching reply. Commands carry the
+    /// current `sessionId` (flatten mode), so replies come back on the same
+    /// socket tagged with the same id.
     async fn send(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let msg = json!({"id": id, "method": method, "params": params});
+        let mut msg = json!({"id": id, "method": method, "params": params});
+        if let Some(session) = &self.session {
+            msg["sessionId"] = json!(session);
+        }
         self.ws
             .send(Message::Text(msg.to_string().into()))
             .await
@@ -278,15 +314,49 @@ impl Cdp {
             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
         }
     }
+
+    /// Attach to one tab and make it the session every later command targets.
+    async fn attach(&mut self, target_id: &str) -> Result<(), String> {
+        let res = self
+            .send(
+                "Target.attachToTarget",
+                json!({"targetId": target_id, "flatten": true}),
+            )
+            .await?;
+        let session = res["sessionId"]
+            .as_str()
+            .ok_or_else(|| "attachToTarget returned no sessionId".to_string())?;
+        self.session = Some(session.to_string());
+        Ok(())
+    }
 }
 
-/// Run a sequence of CDP commands over ONE connection.
-async fn cdp_calls(port: u16, calls: Vec<(&'static str, Value)>) -> Result<Vec<Value>, String> {
-    let ws = page_ws_url(port)?;
-    let mut cdp = Cdp::connect(&ws).await?;
+/// Run a sequence of CDP commands against `tab` over ONE connection.
+async fn cdp_calls(tab: &Tab, calls: Vec<(&'static str, Value)>) -> Result<Vec<Value>, String> {
+    cdp_calls_on(tab, calls, true).await
+}
+
+/// `attach` controls the viewport override: the tab's emulated size is
+/// re-applied first for screenshots and input, but not for navigation (which
+/// must not drag the emulated size into the next page's first paint).
+async fn cdp_calls_on(
+    tab: &Tab,
+    calls: Vec<(&'static str, Value)>,
+    with_viewport: bool,
+) -> Result<Vec<Value>, String> {
+    let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
+    let mut cdp = Cdp::connect(port).await?;
+    cdp.attach(&tab.target_id).await?;
+    let mut calls = calls;
+    if with_viewport {
+        calls = with_viewport_override(tab.viewport.0, tab.viewport.1, calls);
+    }
     let mut out = Vec::with_capacity(calls.len());
     for (method, params) in calls {
         out.push(cdp.send(method, params).await?);
+    }
+    if with_viewport && !out.is_empty() {
+        out.remove(0); // the override's own reply
     }
     Ok(out)
 }
@@ -301,11 +371,11 @@ fn viewport_override(w: u32, h: u32) -> Value {
     })
 }
 
-/// Prepend the session's viewport override to a batch of CDP calls.
+/// Prepend the tab's viewport override to a batch of CDP calls.
 ///
 /// `Emulation.setDeviceMetricsOverride` is scoped to the CDP SESSION, and every
 /// call here opens a fresh WebSocket — so an override set by an earlier
-/// /browser/viewport request is already gone by the time the next command runs.
+/// /browser/viewport request would be gone by the time the next command runs.
 /// That is why the frame (and the input coordinate space) stayed at the launch
 /// size no matter what the ruler said. Riding along in the SAME batch makes the
 /// size stick for screenshots AND for click/type/scroll coordinates.
@@ -320,32 +390,13 @@ fn with_viewport_override(
     all
 }
 
-/// Run CDP commands with the session's emulated viewport re-applied first.
-async fn cdp_calls_sized(
-    port: u16,
-    chat: &str,
-    calls: Vec<(&'static str, Value)>,
-) -> Result<Vec<Value>, String> {
-    let (w, h) = session_viewport(chat);
-    let mut out = cdp_calls(port, with_viewport_override(w, h, calls)).await?;
-    out.remove(0);
-    Ok(out)
-}
-
-/// Run one CDP command.
-async fn cdp_call(port: u16, method: &'static str, params: Value) -> Result<Value, String> {
-    Ok(cdp_calls(port, vec![(method, params)])
-        .await?
-        .pop()
-        .unwrap_or(Value::Null))
-}
-
 /// Drive an async CDP operation from a sync caller (the router handlers and the
 /// MCP connector are both sync). A fresh thread owns the runtime, so this is
 /// safe from inside the axum runtime too.
-fn block_on<F>(fut: F) -> Result<Value, String>
+fn block_on<F, T>(fut: F) -> Result<T, String>
 where
-    F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
 {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -359,67 +410,51 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Session registry
+// Browser + tab registry
 // ---------------------------------------------------------------------------
 
-/// How long a session may sit unused before its Chromium is reaped. The panel
-/// polls every ~1.2s while it is open, so only a closed panel goes idle.
-const IDLE_REAP: Duration = Duration::from_secs(600);
-
-/// Whether a session idle for `elapsed` should be reaped. Pure so the policy is
-/// unit-tested without spawning a real Chromium.
+/// Whether an idle browser should be reaped. Pure so the policy is unit-tested
+/// without spawning a real Chromium.
 fn should_reap(elapsed: Duration, ttl: Duration) -> bool {
     elapsed >= ttl
 }
 
-/// Kill sessions nobody has touched for `IDLE_REAP`. Called on every session
-/// lookup (i.e. on each panel poll), so a closed panel's Chromium is released
-/// without needing a background thread.
-fn reap_idle(guard: &mut Vec<(String, BrowserProc)>) {
-    let now = std::time::Instant::now();
-    guard.retain_mut(|(_, proc)| {
-        if !should_reap(now.duration_since(proc.last_used), IDLE_REAP) {
-            return true;
+/// Port of the live shared browser, or None when it is down. Reaps a browser
+/// nobody has touched for `IDLE_REAP` (the process, not the profile) and forgets
+/// its tabs, since a dead browser can serve none of them.
+fn alive_port() -> Option<u16> {
+    let mut guard = BROWSER.lock().ok()?;
+    let reap = guard
+        .as_ref()
+        .map(|b| should_reap(b.last_used.elapsed(), IDLE_REAP))
+        .unwrap_or(false);
+    if reap {
+        if let Some(mut b) = guard.take() {
+            let _ = b.child.kill();
+            let _ = b.child.wait();
+            forget_all_tabs();
         }
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
-        false
-    });
-}
-
-/// Port of a live session, reaping a crashed Chromium so it never looks active.
-fn session_port(chat: &str) -> Option<u16> {
-    let mut guard = SESSIONS.lock().ok()?;
-    reap_idle(&mut guard);
-    let idx = guard.iter().position(|(k, _)| k == chat)?;
-    let alive = guard[idx].1.child.try_wait().ok().flatten().is_none();
-    if !alive {
-        let (_, mut proc) = guard.remove(idx);
-        let _ = proc.child.kill();
-        return None;
     }
-    guard[idx].1.last_used = std::time::Instant::now();
-    Some(guard[idx].1.port)
-}
-
-/// Emulated viewport of a live session (falls back to the default size).
-fn session_viewport(chat: &str) -> (u32, u32) {
-    let Ok(guard) = SESSIONS.lock() else {
-        return DEFAULT_VIEWPORT;
-    };
-    guard
-        .iter()
-        .find(|(k, _)| k == chat)
-        .map(|(_, p)| p.viewport)
-        .unwrap_or(DEFAULT_VIEWPORT)
-}
-
-/// Remember a session's viewport so later polls report the same size.
-fn store_viewport(chat: &str, size: (u32, u32)) {
-    if let Ok(mut guard) = SESSIONS.lock() {
-        if let Some((_, proc)) = guard.iter_mut().find(|(k, _)| k == chat) {
-            proc.viewport = size;
+    match guard.as_mut() {
+        Some(b) => {
+            // A crashed process must never look active.
+            if b.child.try_wait().ok().flatten().is_some() {
+                let mut dead = guard.take().expect("browser entry just checked");
+                let _ = dead.child.kill();
+                forget_all_tabs();
+                return None;
+            }
+            b.last_used = Instant::now();
+            Some(b.port)
         }
+        None => None,
+    }
+}
+
+/// Drop every tab entry (called when the shared browser dies).
+fn forget_all_tabs() {
+    if let Ok(mut tabs) = TABS.lock() {
+        tabs.clear();
     }
 }
 
@@ -469,13 +504,9 @@ fn stderr_tail(profile: &std::path::Path) -> String {
     }
 }
 
-/// Start one Chromium for `profile`. stderr is captured to a file so a startup
-/// failure can be REPORTED instead of surfacing as a bare timeout.
-fn try_launch(
-    bin: &std::path::Path,
-    port: u16,
-    profile: &std::path::Path,
-) -> Result<Child, String> {
+/// Start the shared Chromium against `profile`. stderr is captured to a file so
+/// a startup failure can be REPORTED instead of surfacing as a bare timeout.
+fn try_launch(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Result<Child, String> {
     std::fs::create_dir_all(profile).map_err(|e| format!("cannot create profile dir: {e}"))?;
     clear_stale_profile_lock(profile);
     let err_file = std::fs::File::create(profile.join("chromium-stderr.log"))
@@ -503,11 +534,7 @@ fn try_launch(
 }
 
 /// Wait until Chromium's debugging port answers, or report why it never did.
-fn wait_for_port(
-    child: &mut Child,
-    port: u16,
-    profile: &std::path::Path,
-) -> Result<(), String> {
+fn wait_for_port(child: &mut Child, port: u16, profile: &std::path::Path) -> Result<(), String> {
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     loop {
         if http_get_json(port, "/json/version").is_ok() {
@@ -530,16 +557,16 @@ fn wait_for_port(
     }
 }
 
-/// Start Chromium for one chat and wait until its debugging port answers.
-fn spawn_browser(chat: &str) -> Result<u16, String> {
+/// Start the shared Chromium (once) and wait until its debugging port answers.
+fn spawn_browser() -> Result<u16, String> {
     let bin = find_chromium().ok_or_else(|| {
         "no Chromium available — install Google Chrome or run `npx playwright install chromium`"
             .to_string()
     })?;
     let port = pick_port()?;
-    let profile = profile_dir(chat);
+    let profile = profile_dir();
 
-    // First attempt: the chat's persistent profile, so logins/cookies survive.
+    // First attempt: the shared persistent profile, so logins/cookies survive.
     let mut child = try_launch(&bin, port, &profile)?;
     if let Err(first) = wait_for_port(&mut child, port, &profile) {
         // A profile another (dead) Chromium still owns can block startup even
@@ -547,76 +574,160 @@ fn spawn_browser(chat: &str) -> Result<u16, String> {
         // the panel always gets a browser instead of a dead session.
         let _ = child.kill();
         let _ = child.wait();
-        let fresh = std::env::temp_dir().join(format!(
-            "codifa-browser-{}-{port}",
-            std::process::id()
-        ));
+        let fresh = std::env::temp_dir().join(format!("codifa-browser-{}", std::process::id()));
         let mut retry = try_launch(&bin, port, &fresh)?;
         wait_for_port(&mut retry, port, &fresh)
             .map_err(|second| format!("{first}; retry on a fresh profile: {second}"))?;
         child = retry;
     }
 
-    let mut guard = SESSIONS.lock().map_err(|_| "browser lock poisoned")?;
-    // A previous entry for this chat (e.g. a crashed process) is replaced.
-    if let Some(idx) = guard.iter().position(|(k, _)| k == chat) {
-        let (_, mut old) = guard.remove(idx);
+    let mut guard = BROWSER.lock().map_err(|_| "browser lock poisoned")?;
+    // A previous process (e.g. a crashed one) is replaced.
+    if let Some(mut old) = guard.take() {
         let _ = old.child.kill();
+        let _ = old.child.wait();
     }
-    guard.push((
-        chat.to_string(),
-        BrowserProc {
-            child,
-            port,
-            viewport: DEFAULT_VIEWPORT,
-            last_used: std::time::Instant::now(),
-        },
-    ));
+    *guard = Some(BrowserProc {
+        child,
+        port,
+        last_used: Instant::now(),
+    });
     Ok(port)
 }
 
-/// Kill one chat's Chromium and forget it.
-fn kill_session(chat: &str) -> bool {
-    let Ok(mut guard) = SESSIONS.lock() else {
+/// Port of the shared browser, starting it (and nothing else) when needed.
+fn ensure_browser() -> Result<u16, String> {
+    match alive_port() {
+        Some(p) => Ok(p),
+        None => spawn_browser(),
+    }
+}
+
+/// The chat's tab, opening it on `about:blank` when the chat has none yet.
+/// A tab whose target vanished (surfaced as a `No target` CDP error) is
+/// replaced rather than returned, so a stale entry never wedges a chat.
+async fn ensure_tab_async(chat: &str) -> Result<Tab, String> {
+    let existing = TABS
+        .lock()
+        .ok()
+        .and_then(|tabs| tabs.iter().find(|(k, _)| k == chat).map(|(_, t)| t.clone()));
+    if let Some(tab) = existing {
+        if tab_usable(tab.target_id.as_str()).await {
+            return Ok(tab);
+        }
+        TABS.lock()
+            .ok()
+            .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
+    }
+    let port = ensure_browser()?;
+    let mut cdp = Cdp::connect(port).await?;
+    let target_id = create_target(&mut cdp, "about:blank").await?;
+    let tab = Tab {
+        target_id,
+        viewport: DEFAULT_VIEWPORT,
+    };
+    if let Ok(mut tabs) = TABS.lock() {
+        tabs.retain(|(k, _)| k != chat);
+        tabs.push((chat.to_string(), tab.clone()));
+    }
+    Ok(tab)
+}
+
+/// True when a target still exists in the browser.
+async fn tab_usable(target_id: &str) -> bool {
+    let Some(port) = alive_port() else {
         return false;
     };
-    let Some(idx) = guard.iter().position(|(k, _)| k == chat) else {
+    let Ok(mut cdp) = Cdp::connect(port).await else {
         return false;
     };
-    let (_, mut proc) = guard.remove(idx);
-    let _ = proc.child.kill();
-    let _ = proc.child.wait();
+    match cdp
+        .send("Target.getTargetInfo", json!({"targetId": target_id}))
+        .await
+    {
+        Ok(res) => res["targetInfo"]["targetId"].as_str() == Some(target_id),
+        Err(_) => false,
+    }
+}
+
+/// Synchronous wrapper around `ensure_tab_async`.
+fn ensure_tab(chat: &str) -> Result<Tab, String> {
+    let chat = chat.to_string();
+    block_on(async move { ensure_tab_async(&chat).await })
+}
+
+/// The chat's registered tab without creating one.
+fn existing_tab(chat: &str) -> Option<Tab> {
+    TABS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(k, _)| k == chat)
+        .map(|(_, t)| t.clone())
+}
+
+/// Remember a tab's viewport so later polls report the same size.
+fn store_viewport(chat: &str, size: (u32, u32)) {
+    if let Ok(mut tabs) = TABS.lock() {
+        if let Some((_, tab)) = tabs.iter_mut().find(|(k, _)| k == chat) {
+            tab.viewport = size;
+        }
+    }
+}
+
+/// Close one chat's tab. The shared browser stays up: other chats may be using
+/// it, and a fresh panel reuses the warm process (and its profile).
+fn close_tab(chat: &str) -> bool {
+    let Some(tab) = existing_tab(chat) else {
+        return false;
+    };
+    TABS.lock()
+        .ok()
+        .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
+    let _ = block_on(async move {
+        let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
+        let mut cdp = Cdp::connect(port).await?;
+        close_target(&mut cdp, &tab.target_id).await?;
+        Ok(Value::Null)
+    });
     true
 }
 
-/// Kill every live Chromium session. Called on app shutdown so no orphaned
-/// browser keeps holding memory after the window is gone.
+/// Kill the shared browser (and with it every tab). Called on app shutdown so
+/// no orphaned browser keeps holding memory after the window is gone.
 pub fn kill_all_sessions() -> usize {
-    let Ok(mut guard) = SESSIONS.lock() else {
-        return 0;
+    let tabs = TABS.lock().ok().map(|t| t.len()).unwrap_or(0);
+    let mut guard = match BROWSER.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
     };
-    let count = guard.len();
-    for (_, mut proc) in guard.drain(..) {
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
+    match guard.take() {
+        Some(mut proc) => {
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+            tabs.max(1)
+        }
+        None => 0,
     }
-    count
 }
 
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
-/// Current page URL, or "" when it cannot be read.
-fn current_url(port: u16) -> String {
+/// Current page URL of a tab, or "" when it cannot be read.
+fn current_url(tab: &Tab) -> String {
+    let tab = tab.clone();
     let fut = async move {
-        let res = cdp_call(
-            port,
-            "Runtime.evaluate",
-            json!({"expression": "location.href", "returnByValue": true}),
+        let res = cdp_calls(
+            &tab,
+            vec![(
+                "Runtime.evaluate",
+                json!({"expression": "location.href", "returnByValue": true}),
+            )],
         )
         .await?;
-        Ok(res["result"]["value"].clone())
+        Ok(res.into_iter().next().unwrap_or(Value::Null)["result"]["value"].clone())
     };
     match block_on(fut) {
         Ok(v) => v.as_str().unwrap_or_default().to_string(),
@@ -627,7 +738,7 @@ fn current_url(port: u16) -> String {
 /// The `status` payload the panel polls (same keys as the Python sidecar).
 pub fn status(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({
             "ok": true,
             "active": false,
@@ -638,80 +749,93 @@ pub fn status(chat_id: &str) -> Value {
             "cdp": Value::Null,
         });
     };
-    let url = current_url(port);
-    let (w, h) = session_viewport(&chat);
+    let url = current_url(&tab);
     json!({
         "ok": true,
         "active": true,
         "url": url,
-        "viewport": {"width": w, "height": h},
+        "viewport": {"width": tab.viewport.0, "height": tab.viewport.1},
         "available": true,
         "chat": chat,
-        "cdp": format!("http://127.0.0.1:{port}"),
+        "cdp": alive_port().map(|p| format!("http://127.0.0.1:{p}")),
     })
 }
 
-/// CDP endpoint of a chat's browser, starting it when needed. Used by the MCP
-/// connector so Playwright attaches to the panel's Chromium.
+/// CDP endpoint of the shared browser, starting it when needed. Used by the MCP
+/// connector so Playwright attaches to the panel's Chromium. The endpoint is
+/// browser-level, so Playwright MCP drives the same tabs the panel does.
 pub fn cdp_endpoint(chat_id: &str) -> Option<String> {
     let chat = normalize_chat(chat_id);
-    let port = match session_port(&chat) {
-        Some(p) => p,
-        None => spawn_browser(&chat).ok()?,
-    };
+    // The MCP connector needs the chat's tab to exist so the agent and the
+    // panel stay on one page; `ensure_tab` starts the browser when needed.
+    ensure_tab(&chat).ok()?;
+    let port = alive_port()?;
     Some(format!("http://127.0.0.1:{port}"))
 }
 
-/// Navigate the page (idempotent: a running session is reused).
-fn navigate(port: u16, url: &str) -> Result<(), String> {
+/// Navigate a tab (idempotent: an existing tab is reused).
+async fn navigate(tab: &Tab, url: &str) -> Result<(), String> {
+    let tab = tab.clone();
     let url = url.to_string();
     let fut = async move {
-        cdp_call(port, "Page.navigate", json!({"url": url})).await?;
+        cdp_calls_on(&tab, vec![("Page.navigate", json!({"url": url}))], false).await?;
         Ok(Value::Null)
     };
     block_on(fut).map(|_| ())
 }
 
-/// Navigate an already-running session (the panel's address bar). Unlike
-/// `launch` this never starts a browser: a down session reports the same
+/// Navigate an already-open chat tab (the panel's address bar). Unlike `launch`
+/// this never starts a browser: a down session reports the same
 /// "browser is not running" error the panel already handles.
 pub fn navigate_to(url: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let target = url.trim();
     if target.is_empty() {
         return json!({"ok": false, "error": "empty url"});
     }
-    match navigate(port, target) {
-        Ok(()) => {
+    let tab_for_call = tab.clone();
+    let target_owned = target.to_string();
+    let fut = async move {
+        navigate(&tab_for_call, &target_owned).await?;
+        Ok(Value::Null)
+    };
+    match block_on(fut) {
+        Ok(_) => {
             // Give the navigation a moment to commit so the returned url is the
             // new page rather than the one being left.
             std::thread::sleep(Duration::from_millis(400));
-            json!({"ok": true, "url": current_url(port)})
+            json!({"ok": true, "url": current_url(&tab)})
         }
         Err(e) => json!({"ok": false, "error": format!("navigation failed: {e}")}),
     }
 }
 
-/// Launch (or reuse) the chat's browser and optionally navigate it.
+/// Launch (or reuse) the chat's tab and optionally navigate it.
 pub fn launch(url: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
     let target = url.trim();
-    let port = match session_port(&chat) {
-        Some(p) => p,
-        None => match spawn_browser(&chat) {
-            Ok(p) => p,
+    let tab = match existing_tab(&chat) {
+        Some(t) => t,
+        None => match ensure_tab(&chat) {
+            Ok(t) => t,
             Err(e) => return json!({"ok": false, "error": e}),
         },
     };
-    // A fresh session starts on about:blank; only navigate when asked for a
-    // real page (and not the one already showing).
+    // A fresh tab starts on about:blank; only navigate when asked for a real
+    // page (and not the one already showing).
     if !target.is_empty() && target != "about:blank" {
-        let current = current_url(port);
+        let current = current_url(&tab);
         if current != target {
-            if let Err(e) = navigate(port, target) {
+            let tab_for_call = tab.clone();
+            let target_owned = target.to_string();
+            let fut = async move {
+                navigate(&tab_for_call, &target_owned).await?;
+                Ok(Value::Null)
+            };
+            if let Err(e) = block_on(fut) {
                 return json!({"ok": false, "error": format!("navigation failed: {e}")});
             }
         }
@@ -725,20 +849,17 @@ pub fn launch(url: &str, chat_id: &str) -> Value {
 /// The device-metrics override is re-applied on THIS connection right before
 /// the capture: `Emulation.setDeviceMetricsOverride` is scoped to the CDP
 /// session, and every call here opens a fresh WebSocket, so an override set by
-/// an earlier /browser/viewport call is already gone by the time we capture —
-/// which is why the frame stayed at the launch size no matter what the ruler
-/// said. Applying both in one connection makes the size stick.
+/// an earlier /browser/viewport call would be gone by the time we capture.
 pub fn screenshot(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    let (w, h) = session_viewport(&chat);
-    let chat_for_call = chat.clone();
+    let (w, h) = tab.viewport;
+    let tab_for_call = tab.clone();
     let fut = async move {
-        let res = cdp_calls_sized(
-            port,
-            &chat_for_call,
+        let res = cdp_calls(
+            &tab_for_call,
             vec![(
                 "Page.captureScreenshot",
                 json!({"format": "jpeg", "quality": SCREENSHOT_QUALITY}),
@@ -749,14 +870,12 @@ pub fn screenshot(chat_id: &str) -> Value {
     };
     match block_on(fut) {
         Ok(data) => match data.as_str() {
-            Some(b64) if !b64.is_empty() => {
-                json!({
-                    "ok": true,
-                    "image": format!("data:image/jpeg;base64,{b64}"),
-                    "width": w,
-                    "height": h,
-                })
-            }
+            Some(b64) if !b64.is_empty() => json!({
+                "ok": true,
+                "image": format!("data:image/jpeg;base64,{b64}"),
+                "width": w,
+                "height": h,
+            }),
             _ => json!({"ok": false, "error": "empty screenshot"}),
         },
         Err(e) => json!({"ok": false, "error": e}),
@@ -764,23 +883,16 @@ pub fn screenshot(chat_id: &str) -> Value {
 }
 
 /// Dispatch one mouse event at viewport coordinates.
-fn mouse_event(
-    port: u16,
-    chat: &str,
-    kind: &'static str,
-    x: i64,
-    y: i64,
-    extra: Value,
-) -> Result<(), String> {
-    let chat = chat.to_string();
+fn mouse_event(tab: &Tab, kind: &'static str, x: i64, y: i64, extra: Value) -> Result<(), String> {
+    let tab = tab.clone();
     let fut = async move {
         let mut params = json!({"type": kind, "x": x, "y": y});
-        if let Some(obj) = extra.as_object() {
-            for (k, v) in obj {
-                params[k] = v.clone();
+        if let (Some(dst), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                dst.insert(k.clone(), v.clone());
             }
         }
-        cdp_calls_sized(port, &chat, vec![("Input.dispatchMouseEvent", params)]).await?;
+        cdp_calls(&tab, vec![("Input.dispatchMouseEvent", params)]).await?;
         Ok(Value::Null)
     };
     block_on(fut).map(|_| ())
@@ -789,12 +901,11 @@ fn mouse_event(
 /// Click at viewport coordinates.
 pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let press = mouse_event(
-        port,
-        &chat,
+        &tab,
         "mousePressed",
         x,
         y,
@@ -804,8 +915,7 @@ pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
         return json!({"ok": false, "error": e});
     }
     match mouse_event(
-        port,
-        &chat,
+        &tab,
         "mouseReleased",
         x,
         y,
@@ -819,10 +929,10 @@ pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
 /// Move the virtual cursor (hover).
 pub fn move_mouse(x: i64, y: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    match mouse_event(port, &chat, "mouseMoved", x, y, json!({"buttons": 0})) {
+    match mouse_event(&tab, "mouseMoved", x, y, json!({"buttons": 0})) {
         Ok(()) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -831,15 +941,14 @@ pub fn move_mouse(x: i64, y: i64, chat_id: &str) -> Value {
 /// Type text into the focused element.
 pub fn type_text(text: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
+    let tab_for_call = tab.clone();
     let text = text.to_string();
-    let chat_for_call = chat.clone();
     let fut = async move {
-        cdp_calls_sized(
-            port,
-            &chat_for_call,
+        cdp_calls(
+            &tab_for_call,
             vec![("Input.insertText", json!({"text": text}))],
         )
         .await?;
@@ -875,14 +984,14 @@ fn key_spec(name: &str) -> Option<(i64, &'static str, &'static str)> {
 /// Press one key (a named key, or a single character typed literally).
 pub fn press_key(key: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let Some((code, name, dom_code)) = key_spec(key) else {
         // Not a named key: type it as text (matches the Python fallback).
         return type_text(key, &chat);
     };
-    let chat_for_call = chat.clone();
+    let tab_for_call = tab.clone();
     let fut = async move {
         let base = json!({
             "windowsVirtualKeyCode": code,
@@ -894,9 +1003,8 @@ pub fn press_key(key: &str, chat_id: &str) -> Value {
         down["type"] = json!("keyDown");
         let mut up = base;
         up["type"] = json!("keyUp");
-        cdp_calls_sized(
-            port,
-            &chat_for_call,
+        cdp_calls(
+            &tab_for_call,
             vec![
                 ("Input.dispatchKeyEvent", down),
                 ("Input.dispatchKeyEvent", up),
@@ -914,15 +1022,14 @@ pub fn press_key(key: &str, chat_id: &str) -> Value {
 /// Scroll the page by a wheel delta.
 pub fn scroll(dx: i64, dy: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    let chat_for_call = chat.clone();
+    let (w, h) = tab.viewport;
+    let tab_for_call = tab.clone();
     let fut = async move {
-        let (w, h) = session_viewport(&chat_for_call);
-        cdp_calls_sized(
-            port,
-            &chat_for_call,
+        cdp_calls(
+            &tab_for_call,
             vec![(
                 "Input.dispatchMouseEvent",
                 json!({
@@ -943,21 +1050,22 @@ pub fn scroll(dx: i64, dy: i64, chat_id: &str) -> Value {
     }
 }
 
-/// Resize the emulated viewport. The size is REMEMBERED on the session so the
+/// Resize the emulated viewport. The size is REMEMBERED on the tab so the
 /// panel's ruler and fit-to-pane resizes survive the next status poll.
 pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     // Guard against a zero/absurd size from a mid-typing input.
     let w = width.clamp(200, 4096);
     let h = height.clamp(200, 4096);
+    let tab_for_call = tab.clone();
     let fut = async move {
-        cdp_call(
-            port,
-            "Emulation.setDeviceMetricsOverride",
-            viewport_override(w, h),
+        cdp_calls_on(
+            &tab_for_call,
+            vec![("Emulation.setDeviceMetricsOverride", viewport_override(w, h))],
+            false,
         )
         .await?;
         Ok(Value::Null)
@@ -974,7 +1082,7 @@ pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
 /// Back / forward / reload through the page's own history.
 pub fn history(action: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let expr = match action {
@@ -983,11 +1091,14 @@ pub fn history(action: &str, chat_id: &str) -> Value {
         "reload" => "location.reload()",
         other => return json!({"ok": false, "error": format!("unknown history action: {other}")}),
     };
+    let tab_for_call = tab.clone();
     let fut = async move {
-        cdp_call(
-            port,
-            "Runtime.evaluate",
-            json!({"expression": expr, "returnByValue": true}),
+        cdp_calls(
+            &tab_for_call,
+            vec![(
+                "Runtime.evaluate",
+                json!({"expression": expr, "returnByValue": true}),
+            )],
         )
         .await?;
         Ok(Value::Null)
@@ -1002,7 +1113,7 @@ pub fn history(action: &str, chat_id: &str) -> Value {
 /// that actually loads wins, and its results URL is returned for the address bar.
 pub fn search(query: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let q = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC)
@@ -1014,13 +1125,19 @@ pub fn search(query: &str, chat_id: &str) -> Value {
     ];
     let mut last = String::new();
     for (host, url) in engines {
-        if let Err(e) = navigate(port, &url) {
+        let tab_for_call = tab.clone();
+        let url_for_call = url.clone();
+        let fut = async move {
+            navigate(&tab_for_call, &url_for_call).await?;
+            Ok(Value::Null)
+        };
+        if let Err(e) = block_on(fut) {
             last = e;
             continue;
         }
         // Give the engine a moment to commit the navigation before reading back.
         std::thread::sleep(Duration::from_millis(600));
-        let href = current_url(port);
+        let href = current_url(&tab);
         if href.contains(host) {
             return json!({"ok": true, "url": href});
         }
@@ -1029,15 +1146,29 @@ pub fn search(query: &str, chat_id: &str) -> Value {
     json!({"ok": false, "error": format!("search failed: {last}")})
 }
 
-/// DevTools frontend URL for the page target (opened in the user's browser).
+/// DevTools frontend URL opened in the user's browser. DevTools drives a TAB, so
+/// the frontend points at the tab's own websocket target (`/json/list` is
+/// browser-wide and each page target still carries its own debugger url), never
+/// at the browser-level endpoint — the latter is not inspectable.
 pub fn devtools_url(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(port) = session_port(&chat) else {
+    let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    let ws = match page_ws_url(port) {
-        Ok(w) => w,
-        Err(e) => return json!({"ok": false, "error": e}),
+    let Some(port) = alive_port() else {
+        return json!({"ok": false, "error": "browser is not running"});
+    };
+    let ws = match http_get_json(port, "/json/list")
+        .ok()
+        .and_then(|list| {
+            list.as_array()?.iter().find_map(|t| {
+                (t["id"].as_str() == Some(tab.target_id.as_str()))
+                    .then(|| t["webSocketDebuggerUrl"].as_str().map(str::to_string))
+                    .flatten()
+            })
+        }) {
+        Some(ws) => ws,
+        None => return json!({"ok": false, "error": "no tab websocket endpoint"}),
     };
     let ws_arg = ws
         .strip_prefix("ws://")
@@ -1049,10 +1180,10 @@ pub fn devtools_url(chat_id: &str) -> Value {
     })
 }
 
-/// Close one chat's browser.
+/// Close one chat's tab (the shared browser keeps running for the other chats).
 pub fn close(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let removed = kill_session(&chat);
+    let removed = close_tab(&chat);
     json!({"ok": true, "closed": removed})
 }
 
@@ -1068,14 +1199,13 @@ mod tests {
     }
 
     #[test]
-    fn profile_dir_is_per_chat_and_path_safe() {
-        let base = profile_dir("default");
+    fn profile_dir_is_shared_and_stable() {
+        // One browser, one profile: every chat must resolve to the SAME dir so
+        // cookies/logins stay shared (the per-chat dirs were the memory hog).
+        let base = profile_dir();
         assert!(base.ends_with("browser-profile"), "{}", base.display());
-        let chat = profile_dir("../../etc/passwd");
-        assert!(chat.starts_with(&base), "{}", chat.display());
-        // Traversal characters never survive into the directory name.
-        assert!(!chat.to_string_lossy().contains(".."));
-        assert!(!chat.to_string_lossy().contains('/'.to_string().as_str()) || chat.starts_with(&base));
+        assert_eq!(base, profile_dir());
+        assert!(!base.to_string_lossy().contains("default/"));
     }
 
     #[test]
@@ -1114,16 +1244,29 @@ mod tests {
             assert_eq!(v["ok"], false, "{v}");
             assert_eq!(v["error"], "browser is not running", "{v}");
         }
+        // Closing a tab that does not exist is a no-op, not an error.
+        assert_eq!(close("no-such-chat-xyz")["closed"], false);
     }
 
     #[test]
-    fn viewport_is_remembered_per_session() {
-        // The panel's ruler / fit-to-pane resize must survive the next poll:
-        // status and screenshot report the STORED size, not the default.
-        assert_eq!(session_viewport("no-such-chat-xyz"), DEFAULT_VIEWPORT);
-        store_viewport("no-such-chat-xyz", (900, 600));
-        // No session exists, so nothing is stored and the default stands.
-        assert_eq!(session_viewport("no-such-chat-xyz"), DEFAULT_VIEWPORT);
+    fn viewport_is_remembered_per_tab() {
+        let chat = "browser-test-viewport";
+        // No tab yet: there is nothing to attach a size to.
+        store_viewport(chat, (900, 600));
+        assert!(existing_tab(chat).is_none());
+
+        // With a tab present the size sticks, so the panel's ruler and
+        // fit-to-pane resize survive the next status poll and screenshot.
+        TABS.lock().unwrap().push((
+            chat.to_string(),
+            Tab {
+                target_id: "T-viewport".to_string(),
+                viewport: DEFAULT_VIEWPORT,
+            },
+        ));
+        store_viewport(chat, (900, 600));
+        assert_eq!(existing_tab(chat).unwrap().viewport, (900, 600));
+        assert!(close_tab(chat));
     }
 
     #[test]
@@ -1146,9 +1289,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_sessions_are_reaped_but_fresh_ones_are_kept() {
-        // A Chromium is ~150-300 MB and one is spawned per chat, so a closed
-        // panel's session must be released instead of piling up until exit.
+    fn idle_browser_is_reaped_but_a_fresh_one_is_kept() {
+        // One Chromium (~150-300 MB) is shared, so it is only released when no
+        // panel anywhere has polled it for a while.
         let ttl = Duration::from_secs(600);
         assert!(!should_reap(Duration::from_secs(0), ttl));
         assert!(!should_reap(Duration::from_secs(599), ttl));
@@ -1162,5 +1305,69 @@ mod tests {
         let v = navigate_to("   ", "no-such-chat-xyz");
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], "browser is not running");
+    }
+
+    /// Live check that TWO chats share ONE Chromium yet drive two separate
+    /// tabs (the whole point of the shared-browser refactor).
+    ///
+    /// Ignored by default: it starts a real Chromium, which is far too slow and
+    /// too environment-dependent for the normal unit suite. Run it on demand:
+    /// `cargo test --ignored shared_browser_serves_isolated_tabs`.
+    #[test]
+    #[ignore]
+    fn shared_browser_serves_isolated_tabs() {
+        let (a, b) = ("live-tab-a", "live-tab-b");
+        let tab_a = ensure_tab(a).expect("first tab");
+        let tab_b = ensure_tab(b).expect("second tab");
+        assert_ne!(tab_a.target_id, tab_b.target_id, "chats must not share a tab");
+        assert!(tab_usable_sync(&tab_a.target_id), "first tab must be live");
+        assert!(tab_usable_sync(&tab_b.target_id), "second tab must be live");
+        // One process, two tabs.
+        assert_eq!(BROWSER.lock().unwrap().as_ref().map(|_| 1), Some(1));
+        assert_eq!(TABS.lock().unwrap().len(), 2);
+        assert!(close_tab(a));
+        assert!(close_tab(b));
+        let killed = kill_all_sessions();
+        assert!(killed >= 1, "the shared browser must be reaped");
+    }
+
+    /// `tab_usable` is async; the live test is sync like every public entry.
+    fn tab_usable_sync(target_id: &str) -> bool {
+        let target = target_id.to_string();
+        block_on(async move { Ok::<Value, String>(json!(tab_usable(&target).await)) })
+            .map(|v| v.as_bool().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn tabs_are_isolated_by_chat_key() {
+        for (chat, target) in [("chat-a", "T1"), ("chat-b", "T2")] {
+            let mut tabs = TABS.lock().unwrap();
+            tabs.retain(|(k, _)| k != chat);
+            tabs.push((
+                chat.to_string(),
+                Tab {
+                    target_id: target.to_string(),
+                    viewport: DEFAULT_VIEWPORT,
+                },
+            ));
+        }
+        assert_eq!(
+            existing_tab("chat-a").map(|t| t.target_id),
+            Some("T1".to_string())
+        );
+        assert_eq!(
+            existing_tab("chat-b").map(|t| t.target_id),
+            Some("T2".to_string())
+        );
+        // The tab's viewport is remembered per tab, not globally.
+        store_viewport("chat-a", (640, 480));
+        assert_eq!(existing_tab("chat-a").unwrap().viewport, (640, 480));
+        assert_eq!(existing_tab("chat-b").unwrap().viewport, DEFAULT_VIEWPORT);
+        // Closing one chat releases only its own tab.
+        assert!(close_tab("chat-a"));
+        assert!(existing_tab("chat-a").is_none());
+        assert!(existing_tab("chat-b").is_some());
+        assert!(close_tab("chat-b"));
     }
 }

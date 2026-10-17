@@ -43,6 +43,29 @@ const EXPLORE_REPORT_CAP: usize = 40_000;
 /// finding, so this is far larger than a UI echo cap.
 const SUBAGENT_FOLD_RESULT_CHARS: usize = 4_000;
 
+/// Slice of a tool's stored prose result (`resultText`) echoed into the history
+/// recap for ordinary tools.
+const RECAP_RESULT_CHARS: usize = 400;
+/// Same slice for an explore/task report. That report is the main agent's ONLY
+/// view of the code, so the recap must carry it at (near) full length —
+/// otherwise the next turn receives a short digest, cannot answer from it, and
+/// re-delegates the very same question.
+const RECAP_EXPLORE_CHARS: usize = 8_000;
+
+/// UI-echo budget for one tool result. The echo is also what the frontend stores
+/// as `resultText`, i.e. the ONLY source the next turn's history recap is built
+/// from. An explore/task report must therefore be echoed at least as long as
+/// the recap reads it: with the flat 4 KB echo cap the report was cut before the
+/// recap's 8 KB budget could apply, and its tail (later CODE blocks, ALSO
+/// RELEVANT) was lost between turns.
+fn ui_echo_cap(tool: &str) -> usize {
+    if matches!(tool, "explore" | "task") {
+        RECAP_EXPLORE_CHARS
+    } else {
+        TOOL_RESULT_CAP
+    }
+}
+
 /// Fold a history message's non-prose state into its content so the model can
 /// see what already happened.
 ///
@@ -97,6 +120,20 @@ fn history_recap(m: &Value) -> String {
                             ));
                         }
                     }
+                }
+            }
+            // Native tool results arrive as `resultText` (the frontend keeps
+            // the prose verbatim for prose-only tools). Without this the recap
+            // showed the explore CALL but not a single finding, so the main
+            // agent re-delegated research it had already paid for.
+            if let Some(text) = a.get("resultText").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    let cap = if matches!(tool, "explore" | "task") {
+                        RECAP_EXPLORE_CHARS
+                    } else {
+                        RECAP_RESULT_CHARS
+                    };
+                    line.push_str(&format!("\n    {}", text.chars().take(cap).collect::<String>()));
                 }
             }
             lines.push(line);
@@ -188,6 +225,12 @@ pub struct AgentRequest {
     /// never bound, so the agent cannot touch the desktop at all.
     #[serde(default)]
     pub allow_computer: bool,
+    /// True when the turn asks to create/edit a skill or an MCP connector
+    /// (`/create-skill`, `/create-mcp`). The `create_skill` / `create_mcp`
+    /// tools are bound ONLY then, so an ordinary turn cannot silently rewrite
+    /// the user's skill store or connector list.
+    #[serde(default)]
+    pub allow_create: bool,
     /// Web-search engines from Settings → Plugins, verbatim and in priority
     /// order: `order` 0 is the primary and higher orders are fallbacks tried in
     /// turn, so the user's list order IS the fallback chain.
@@ -197,6 +240,44 @@ pub struct AgentRequest {
 
 fn default_mode() -> String {
     "build".to_string()
+}
+
+impl AgentRequest {
+    /// Snapshot of this turn handed to each explore/task sub-agent.
+    ///
+    /// `history` is set to EMPTY on purpose: `run_subagent` never reads the
+    /// parent's transcript (it rebuilds its own `history: Vec::new()`), yet a
+    /// plain `req.clone()` deep-copies the whole conversation — and the
+    /// parallel explore path clones once PER explore in the step, so a
+    /// four-explore step copied the entire chat four times only to drop it.
+    /// The fields are listed explicitly (no `..self.clone()`, which would still
+    /// copy `history`) so a future field addition must be decided here.
+    fn subagent_snapshot(&self) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            provider_id: self.provider_id.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            api_keys: self.api_keys.clone(),
+            root: self.root.clone(),
+            mode: self.mode.clone(),
+            prompt: self.prompt.clone(),
+            // Never inherited — see the doc comment above.
+            history: Vec::new(),
+            system_prompt: self.system_prompt.clone(),
+            skills: self.skills.clone(),
+            context_window: self.context_window,
+            chat_id: self.chat_id.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            subagent_models: self.subagent_models.clone(),
+            providers: self.providers.clone(),
+            data_root: self.data_root.clone(),
+            allow_computer: self.allow_computer,
+            allow_create: self.allow_create,
+            search_plugins: self.search_plugins.clone(),
+        }
+    }
 }
 
 /// App data root for the native agent (mirrors trace.rs's fallback: the
@@ -252,11 +333,31 @@ pub enum AgentEvent {
     ToolStart { id: String, name: String, args: Value },
     /// Emitted when the tool FINISHES — resolves the running card.
     Tool { id: String, name: String, args: Value, result: String, ok: bool },
+    /// Unified diff of an edit_file/write_file call. Emitted while the card is
+    /// still "running" so the frontend folds it into the card and the Review
+    /// panel can show/revert the change — without it Review always answered
+    /// "No changes in this turn." (the Python sidecar used to emit this; the
+    /// native agent must too).
+    Diff { tool: String, path: String, diff: String },
     Warn { content: String },
     /// Carries the model + provider_id that actually served this request so
     /// the frontend attributes sub-agent tokens to the SUB model, not the
     /// parent's.
-    Usage { input_tokens: u64, output_tokens: u64, model: String, provider_id: String },
+    ///
+    /// `sub` marks a request made by the explore sub-agent. The frontend must
+    /// NOT let those replace the parent's context meter / message badge (a
+    /// sub-agent request is small and isolated — it never enters the parent's
+    /// context), so without the flag the meter dropped to the explore's 5-16k
+    /// every time an explore ran.
+    Usage { input_tokens: u64, output_tokens: u64, model: String, provider_id: String, sub: bool },
+    /// A tool event tagged with the sub-agent branch it belongs to. Serialized
+    /// as the inner event plus `branch` (and `sub`). Without the tags the
+    /// explore card never gets a branch id, so every call the explore makes
+    /// is an orphan and the frontend promotes it to a flat top-level card
+    /// ("Search Files ×48" in the chat) instead of nesting it under the card.
+    /// `sub` is false for the explore/task card's own start event (it must
+    /// stay a top-level card) and true for the calls made INSIDE it.
+    Branch { branch: u64, sub: bool, inner: Box<AgentEvent> },
     /// Plan mode finished: the collapsed plan document (title + markdown
     /// body) — the frontend renders it as the Plan card and the docked
     /// Plan viewer tab.
@@ -283,12 +384,22 @@ impl AgentEvent {
                 "kind": "tool_result", "id": id, "name": name, "tool": name, "args": args,
                 "result": result, "ok": ok,
             }),
+            AgentEvent::Diff { tool, path, diff } => json!({
+                "kind": "diff", "tool": tool, "path": path, "diff": diff,
+            }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
-            AgentEvent::Usage { input_tokens, output_tokens, model, provider_id } => json!({
+            AgentEvent::Usage { input_tokens, output_tokens, model, provider_id, sub } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "model": model, "provider_id": provider_id,
+                "sub": sub,
             }),
+            AgentEvent::Branch { branch, sub, inner } => {
+                let mut v = inner.to_json();
+                v["branch"] = json!(branch);
+                v["sub"] = json!(sub);
+                v
+            }
             AgentEvent::Done { aborted } => json!({"kind": "done", "aborted": aborted}),
             AgentEvent::PlanCard { title, body } => {
                 json!({"kind": "plan_card", "title": title, "body": body})
@@ -308,7 +419,7 @@ impl AgentEvent {
 /// Tool schemas for the MAIN agent: no search/read tools — the main agent
 /// delegates all research to the `explore` sub-agent and works only with the
 /// data the sub-agent returns (user request: main agent must not search).
-fn tool_schemas() -> Vec<Value> {
+fn tool_schemas(allow_create: bool) -> Vec<Value> {
     // Per-tool schemas: the model only sees the args each tool actually
     // accepts — a shared all-fields block made it emit empty filler
     // (command:"", limit:0, filePath:""…) that garbled cards and traces.
@@ -344,6 +455,31 @@ fn tool_schemas() -> Vec<Value> {
             }),
         ),
         (
+            "create_skill",
+            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass fa_keywords: the user's own Persian phrases for when this skill applies (comma-separated, e.g. \"ترجمه کن, translate this\") — the skill catalog shows them, so a Persian request finds the skill without any embedding. Pass previous_name when renaming an existing skill so its extra files survive.",
+            json!({
+                "name": {"type": "string", "description": "Skill name (also the folder slug)"},
+                "description": {"type": "string", "description": "One-line English summary of when to use this skill"},
+                "content": {"type": "string", "description": "The skill body: step-by-step instructions the agent follows"},
+                "fa_keywords": {"type": "string", "description": "Comma-separated Persian phrases that should trigger this skill"},
+                "previous_name": {"type": "string", "description": "Old name when renaming an existing skill"},
+                "extra_files": {"type": "object", "description": "Optional extra files: filename -> content"},
+                "delete": {"type": "boolean", "description": "Delete the skill instead of writing it"}
+            }),
+        ),
+        (
+            "create_mcp",
+            "Create or update an MCP connector (the `/create-mcp` flow). Pass EITHER command (+ optional args/env) for a stdio server, OR url for an HTTP one. To EDIT an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it (the old file is removed so no stale duplicate is left). The connector is saved but stays off until the user enables it in the composer's MCP picker.",
+            json!({
+                "name": {"type": "string", "description": "Connector name (also the file name)"},
+                "command": {"type": "string", "description": "Executable for a stdio server (e.g. npx)"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments for the stdio command"},
+                "env": {"type": "object", "description": "Optional environment variables for the stdio server"},
+                "url": {"type": "string", "description": "Endpoint for an HTTP connector (instead of command)"},
+                "previous_name": {"type": "string", "description": "Old name when renaming an existing connector"}
+            }),
+        ),
+        (
             "load_skill",
             "Load the FULL body of one stored skill by name (or one of its extra files via `file`). Skills that obviously match the request are already inlined in your prompt — call this only for a skill you need but were not given.",
             json!({
@@ -370,6 +506,11 @@ fn tool_schemas() -> Vec<Value> {
     ];
     schemas
         .iter()
+        // The skill/connector authoring tools are bound only for a turn that
+        // actually asked for them (see AgentRequest::allow_create).
+        .filter(|(name, _, _)| {
+            allow_create || !matches!(*name, "create_skill" | "create_mcp")
+        })
         .map(|(name, desc, props)| {
             json!({
                 "type": "function",
@@ -470,7 +611,7 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "search_memory",
-            "Search previously saved project notes.",
+            "Search previously saved project notes. Every hit carries an `id` — pass it to delete_memory to remove a note that is stale or wrong.",
             json!({"query": {"type": "string"}}),
         ),
         (
@@ -479,6 +620,13 @@ fn research_schemas() -> Vec<Value> {
             json!({
                 "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
                 "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
+            }),
+        ),
+        (
+            "delete_memory",
+            "Delete ONE saved note by its id (the `id` field returned by search_memory). Use it to drop a note that turned out to be wrong or obsolete.",
+            json!({
+                "memory_id": {"type": "string", "description": "Id of the note to delete (from search_memory)"}
             }),
         ),
         (
@@ -519,6 +667,11 @@ fn research_schemas() -> Vec<Value> {
 
 static TURN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Source of sub-agent branch ids. Process-wide (not per step) because the
+/// frontend matches `branch` across every card in a message — two explores in
+/// different steps must never share an id or each would show the other's calls.
+static BRANCH_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Cap the UI echo, record the trace row, emit the Tool event and push the
 /// tool message — shared by the parallel (read-only batch) and sequential
 /// tool paths so both produce identical cards/traces/model messages.
@@ -535,9 +688,10 @@ fn finish_tool(
 ) {
     // UI echo is capped; cap on a UTF-8 char boundary — byte slicing
     // mid-char panics on Persian text.
+    let echo_cap = ui_echo_cap(name);
     let mut shown = result.clone();
-    if shown.len() > TOOL_RESULT_CAP {
-        let mut end = TOOL_RESULT_CAP;
+    if shown.len() > echo_cap {
+        let mut end = echo_cap;
         while end > 0 && !shown.is_char_boundary(end) {
             end -= 1;
         }
@@ -642,62 +796,9 @@ pub async fn run_turn(
     } else {
         req.system_prompt.clone()
     };
-    // Skills: the user's @mentions plus the auto-match are inlined as full
-    // bodies (mirror of graph.py's SKILLS section). No picks = no tokens.
-    // The "decision" Tool Models slot, when set, picks the skills with a model
-    // call; otherwise the deterministic in-code matcher runs (no extra call).
-    let client = http_client();
-    // The decision slot may hold the local on-device router sentinel (Laya).
-    // That is a Python-side classifier with no native equivalent, so it must
-    // NOT be resolved as a bare model name — doing so sent the literal model
-    // "laya" to the parent provider, failed, and silently fell back to the
-    // in-code matcher, which made the user's Settings choice look inert.
-    let decision_slot = req
-        .subagent_models
-        .get("decision")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let decision_cfg = if decision_slot.is_empty()
-        || crate::backend_light::is_local_router_entry(&decision_slot)
-    {
-        None
-    } else {
-        let (model, base_url, api_keys) = crate::backend_light::resolve_slot_target(
-            &decision_slot,
-            &req.model,
-            &req.base_url,
-            &cfg.api_keys,
-            &req.providers,
-        );
-        Some(LlmConfig {
-            // `provider` is the KIND (openrouter/anthropic/google/custom…):
-            // endpoint_and_auth switches on it to pick the URL path + auth
-            // header. Using the user-configured provider_id here sent every
-            // anthropic/google decision call to the OpenAI-compatible path.
-            provider: crate::backend_light::resolve_slot_kind(
-                &decision_slot,
-                &req.provider,
-                &req.providers,
-            ),
-            model,
-            base_url,
-            api_keys,
-            temperature: Some(0.0),
-            max_tokens: Some(32),
-            timeout_secs: 30,
-        })
-    };
-    // The on-device Laya classifier is a downloaded torch checkpoint, so only
-    // the Python sidecar can run it; the native agent asks it over HTTP rather
-    // than silently dropping back to the keyword matcher (which is what the
-    // old "not available in the native agent" warning did).
-    let decision_router = if crate::backend_light::is_local_router_entry(&decision_slot) {
-        Some(crate::skill_router::SkillRouter::Laya)
-    } else {
-        decision_cfg
-            .as_ref()
-            .map(|c| crate::skill_router::SkillRouter::Model(&client, c))
-    };
+    // Skills: the system prompt carries a catalog of the installed skills and
+    // the model loads the ones it needs via `load_skill` (the Codex/Claude
+    // pattern). Only the skills the user attached are inlined whole.
     // The skill store lives in the DATA root, not the workspace. A caller that
     // omits `data_root` (e.g. a scheduled run) must still find the store, so
     // fall back to the native data root rather than the workspace — reading the
@@ -707,22 +808,9 @@ pub async fn run_turn(
     } else {
         req.data_root.clone()
     };
-    let skill_section = crate::skill_router::build_section_async(
-        &skill_root,
-        &req.prompt,
-        &req.skills,
-        decision_router,
-    )
-    .await;
+    let skill_section = crate::skill_router::build_section(&skill_root, &req.skills);
     if !skill_section.text.is_empty() {
         system.push_str(&skill_section.text);
-    }
-    if !skill_section.auto.is_empty() {
-        emit(&AgentEvent::Skills {
-            skills: skill_section.auto.clone(),
-            manual: false,
-            note: None,
-        });
     }
     if !skill_section.missing.is_empty() {
         emit(&AgentEvent::Skills {
@@ -777,7 +865,7 @@ pub async fn run_turn(
     let mut schemas = if req.mode == "subagent" {
         research_schemas()
     } else {
-        tool_schemas()
+        tool_schemas(req.allow_create)
     };
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
@@ -844,6 +932,12 @@ pub async fn run_turn(
             Ok(acc) => acc,
             Err((_, e)) => {
                 emit(&AgentEvent::Error { content: e });
+                // Terminal `done` after the error: the event protocol requires
+                // it (the client treats an EOF without `done` as a dropped
+                // connection). Without it the stream ended silently and the UI
+                // stacked "Connection lost mid-turn" on top of the real
+                // provider error — reported on one of two concurrent chats.
+                emit(&AgentEvent::Done { aborted: false });
                 return Ok(());
             }
         };
@@ -853,6 +947,7 @@ pub async fn run_turn(
             output_tokens: out_tok,
             model: req.model.clone(),
             provider_id: req.provider_id.clone(),
+            sub: req.mode == "subagent",
         });
         // Trace: one llm row per model call (model + tokens), like the
         // Python sidecar's trace panel rows.
@@ -1017,7 +1112,7 @@ use what it showed, read a DIFFERENT window, or move on"
         // join): the model often fires several research questions at once and
         // each takes seconds — sequential execution multiplies the wall time.
         // Mutating tools stay sequential (ordering + cancel semantics).
-        let mut explore_batch: Vec<(String, String, Value)> = Vec::new();
+        let mut explore_batch: Vec<(String, String, Value, u64)> = Vec::new();
         let mut rest: Vec<(String, String, String)> = Vec::new();
         for call in sequential {
             if call.1 == "explore" || call.1 == "task" {
@@ -1027,12 +1122,19 @@ use what it showed, read a DIFFERENT window, or move on"
                     stage: "tool".into(),
                     content: call.1.clone(),
                 });
-                emit(&AgentEvent::ToolStart {
-                    id: call.0.clone(),
-                    name: call.1.clone(),
-                    args: args.clone(),
+                let branch = BRANCH_SEQ.fetch_add(1, Ordering::Relaxed);
+                // The card carries its branch id so the calls the explore
+                // makes (tagged with the same id) nest under it.
+                emit(&AgentEvent::Branch {
+                    branch,
+                    sub: false,
+                    inner: Box::new(AgentEvent::ToolStart {
+                        id: call.0.clone(),
+                        name: call.1.clone(),
+                        args: args.clone(),
+                    }),
                 });
-                explore_batch.push((call.0, call.1, args));
+                explore_batch.push((call.0, call.1, args, branch));
             } else {
                 rest.push(call);
             }
@@ -1048,8 +1150,9 @@ use what it showed, read a DIFFERENT window, or move on"
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             let futures: Vec<_> = explore_batch
                 .iter()
-                .map(|(_id, _name, args)| {
-                    let req_c = req.clone();
+                .map(|(_id, _name, args, branch)| {
+                    let branch = *branch;
+                    let req_c = req.subagent_snapshot();
                     let args_c = args.clone();
                     let cancel_c = std::sync::Arc::clone(cancel);
                     let tx = tx.clone();
@@ -1057,7 +1160,7 @@ use what it showed, read a DIFFERENT window, or move on"
                         let mut sink = move |ev: &AgentEvent| {
                             let _ = tx.send(ev.clone());
                         };
-                        run_subagent(&req_c, &args_c, &mut sink, &cancel_c).await
+                        run_subagent(&req_c, &args_c, branch, &mut sink, &cancel_c).await
                     })
                 })
                 .collect();
@@ -1079,7 +1182,7 @@ use what it showed, read a DIFFERENT window, or move on"
                 }
             };
             let (results, _) = tokio::join!(sub_all, forward);
-            for ((id, name, args), (result, ok)) in explore_batch.into_iter().zip(results) {
+            for ((id, name, args, _branch), (result, ok)) in explore_batch.into_iter().zip(results) {
                 finish_tool(
                     &mut messages,
                     emit,
@@ -1111,6 +1214,19 @@ use what it showed, read a DIFFERENT window, or move on"
                 name: name.clone(),
                 args: args.clone(),
             });
+            // Capture the pre-edit content so a unified diff can be emitted
+            // after the call — without it the Review panel answers "No changes
+            // in this turn." for every edit. A missing file (brand-new
+            // write_file) diffs as pure additions.
+            let pre_edit = if name == "edit_file" || name == "write_file" {
+                let p = args["path"]
+                    .as_str()
+                    .or_else(|| args["filePath"].as_str())
+                    .unwrap_or_default();
+                Some(crate::tools::read_pre_edit(&root, p).unwrap_or_default())
+            } else {
+                None
+            };
             let (result, ok) = if name == "run_terminal"
                 && req.mode != "subagent"
                 && is_file_search_command(args["command"].as_str().unwrap_or_default())
@@ -1147,6 +1263,28 @@ use what it showed, read a DIFFERENT window, or move on"
                     Err(e) => (e, false),
                 }
             };
+            // Emit the unified diff while the card is still "running" — the
+            // frontend folds it into the card (and the Review panel) before
+            // the Tool result resolves the card to done.
+            if ok {
+                if let Some(old) = pre_edit {
+                    let p = args["path"]
+                        .as_str()
+                        .or_else(|| args["filePath"].as_str())
+                        .unwrap_or_default();
+                    if let Ok(target) = crate::tools::resolve_safe(&root, p, false, None) {
+                        let newc = std::fs::read_to_string(target).unwrap_or_default();
+                        let diff = crate::tools::unified_diff(p, &old, &newc);
+                        if !diff.is_empty() {
+                            emit(&AgentEvent::Diff {
+                                tool: name.clone(),
+                                path: p.to_string(),
+                                diff,
+                            });
+                        }
+                    }
+                }
+            }
             finish_tool(
                 &mut messages,
                 emit,
@@ -1369,7 +1507,10 @@ fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEv
         // empty (provider 400/401, tool failure, …).
         AgentEvent::Error { content } => sub_error.push_str(content),
         AgentEvent::ToolStart { name, .. }
-            if name.as_str() != "save_memory" && name.as_str() != "search_memory" =>
+            if !matches!(
+                name.as_str(),
+                "save_memory" | "search_memory" | "delete_memory"
+            ) =>
         {
             report.clear()
         }
@@ -1502,7 +1643,10 @@ main agent has no read tool and edits files with exact-match strings, so precisi
 matters and padding costs it tokens on every later step. Format:\n\
 (a) ANSWER: 2-4 lines that directly answer the question.\n\
 (b) CODE: VERBATIM excerpts, each with path:start-end, ONLY for code it must edit \
-or rely on — copy the exact text, never paraphrase code.\n\
+or rely on — copy the exact text, never paraphrase code. `read` output has a \
+`path (lines a-b):` header and an `N: ` prefix on every line: N is the line \
+number, NOT file content — use it for start-end, but never copy the header or \
+the prefix into CODE (the main agent edits by exact-match strings).\n\
 (c) ALSO RELEVANT: other locations as `path:line — one line`.\n\
 Leave out the search trail, dead ends, irrelevant files and any restating of the \
 question. Aim for under ~6 KB.\n\
@@ -1516,6 +1660,7 @@ PROJECT LAYOUT (dir: entries; hidden dirs and build output omitted):\n{layout}"
 async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
+    branch: u64,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
     cancel: &CancelFlag,
 ) -> (String, bool) {
@@ -1555,6 +1700,8 @@ async fn run_subagent(
         data_root: parent.data_root.clone(),
         // Sub-agents are research-only: desktop control is never delegated.
         allow_computer: false,
+        // Authoring tools are never delegated either.
+        allow_create: false,
         // Web search IS research, so the sub-agent inherits the same engine
         // chain the user configured for the parent turn.
         search_plugins: parent.search_plugins.clone(),
@@ -1571,7 +1718,18 @@ async fn run_subagent(
             // (Text) and errors must never surface in the user's chat: the
             // report goes to the PARENT agent as the tool result only.
             match ev {
-                AgentEvent::Text { .. } | AgentEvent::Error { .. } => {}
+                // The sub-run's own Done must not reach the parent stream
+                // (it would read as the PARENT turn finishing).
+                AgentEvent::Text { .. } | AgentEvent::Error { .. } | AgentEvent::Done { .. } => {}
+                // Tool calls are tagged with this explore's branch so they
+                // nest under its card instead of floating in the chat.
+                AgentEvent::ToolStart { .. } | AgentEvent::Tool { .. } => {
+                    emit(&AgentEvent::Branch {
+                        branch,
+                        sub: true,
+                        inner: Box::new(ev.clone()),
+                    })
+                }
                 _ => emit(ev),
             }
         };
@@ -1682,8 +1840,11 @@ mod tests {
             output_tokens: 1,
             model: "sub-model".into(),
             provider_id: "p2".into(),
+            sub: true,
         }
         .to_json();
+        // Sub-agent usage is flagged so the context meter ignores it.
+        assert_eq!(t["sub"], true);
         // The usage event names the model/provider that served the request so
         // sub-agent tokens land under the SUB model in Model usage.
         assert_eq!(t["model"], "sub-model");
@@ -1697,6 +1858,35 @@ mod tests {
         assert_eq!(ts["kind"], "tool");
         assert_eq!(ts["tool"], "explore");
         assert_eq!(ts["id"], "call1");
+    }
+
+    #[test]
+    fn branch_wrapper_tags_the_inner_event_without_changing_its_shape() {
+        let inner_call = AgentEvent::ToolStart {
+            id: "c9".into(),
+            name: "grep".into(),
+            args: json!({"pattern": "x"}),
+        };
+        let v = AgentEvent::Branch { branch: 7, sub: true, inner: Box::new(inner_call) }.to_json();
+        assert_eq!(v["kind"], "tool");
+        assert_eq!(v["tool"], "grep");
+        assert_eq!(v["id"], "c9");
+        assert_eq!(v["branch"], 7);
+        assert_eq!(v["sub"], true);
+        // The explore card's own start carries the branch but is NOT a sub
+        // event — it has to stay a top-level card the children nest under.
+        let card = AgentEvent::Branch {
+            branch: 7,
+            sub: false,
+            inner: Box::new(AgentEvent::ToolStart {
+                id: "e1".into(),
+                name: "explore".into(),
+                args: json!({}),
+            }),
+        }
+        .to_json();
+        assert_eq!(card["branch"], 7);
+        assert_eq!(card["sub"], false);
     }
 
     #[test]
@@ -1755,6 +1945,42 @@ mod tests {
     }
 
     #[test]
+    fn history_recap_carries_explore_findings_at_length() {
+        // explore's findings reach the backend only as `resultText` (the
+        // frontend stores prose results verbatim for prose-only tools, and
+        // explore/task are among them). Recap the call without the findings and
+        // the next turn re-delegates research it already paid for, so the
+        // report must survive AND keep more than an ordinary tool's digest.
+        let report = "x".repeat(2_000);
+        let m = json!({
+            "role": "assistant",
+            "content": "researched",
+            "toolActivity": [
+                {"tool": "explore", "args": {"prompt": "trace usage"}, "status": "done",
+                 "resultText": report},
+                {"tool": "lsp_hover", "args": {}, "status": "done",
+                 "resultText": "fn usage_meter() -> Usage"}
+            ]
+        });
+        let recap = history_recap(&m);
+        assert!(
+            recap.contains(&"x".repeat(1_000)),
+            "explore report must survive beyond the ordinary digest cap: {}",
+            recap.len()
+        );
+        assert!(recap.contains("usage_meter"), "{recap}");
+    }
+
+    #[test]
+    fn explore_report_echo_is_not_cut_below_the_recap_budget() {
+        // The recap can only carry what the UI echo kept (`resultText`), so the
+        // echo budget for a report may never be smaller than the recap's.
+        assert!(ui_echo_cap("explore") >= RECAP_EXPLORE_CHARS);
+        assert!(ui_echo_cap("task") >= RECAP_EXPLORE_CHARS);
+        assert_eq!(ui_echo_cap("grep"), TOOL_RESULT_CAP);
+    }
+
+    #[test]
     fn compact_subagent_messages_persian_char_boundaries() {
         // The explore sub-agent compacts Persian content — the 400-byte cut
         // used to slice mid-char and panic (compact.rs:103 crash report).
@@ -1777,14 +2003,24 @@ mod tests {
 
     #[test]
     fn tool_schemas_main_agent_has_no_search_tools() {
-        let schemas = tool_schemas();
+        let schemas = tool_schemas(false);
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
         // Main agent must NOT have search/read tools — research is delegated.
         // Memory tools live on the explore sub-agent too (user request).
-        for banned in ["read", "grep", "glob", "find_symbol", "lsp_definition", "lsp_symbols", "save_memory", "search_memory"] {
+        for banned in [
+            "read",
+            "grep",
+            "glob",
+            "find_symbol",
+            "lsp_definition",
+            "lsp_symbols",
+            "save_memory",
+            "search_memory",
+            "delete_memory",
+        ] {
             assert!(!names.contains(&banned), "main agent must not have {banned}");
         }
         assert!(names.contains(&"explore"));
@@ -1796,10 +2032,31 @@ mod tests {
     }
 
     #[test]
+    fn authoring_tools_are_bound_only_when_the_turn_asks_for_them() {
+        // An ordinary turn must not be able to rewrite the skill store or the
+        // connector list, so the authoring tools are gated on allow_create.
+        let names = |allow: bool| -> Vec<String> {
+            tool_schemas(allow)
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let plain = names(false);
+        assert!(!plain.contains(&"create_skill".to_string()));
+        assert!(!plain.contains(&"create_mcp".to_string()));
+        // load_skill stays available: reading a skill is not authoring.
+        assert!(plain.contains(&"load_skill".to_string()));
+
+        let authoring = names(true);
+        assert!(authoring.contains(&"create_skill".to_string()));
+        assert!(authoring.contains(&"create_mcp".to_string()));
+    }
+
+    #[test]
     fn explore_schema_asks_for_parallel_calls() {
         // The model only parallelizes when the tool description says so: one
         // broad explore used to be the default and made turns slow/shallow.
-        let schemas = tool_schemas();
+        let schemas = tool_schemas(false);
         let desc = schemas
             .iter()
             .find(|s| s["function"]["name"] == "explore")
@@ -1828,6 +2085,7 @@ mod tests {
             "lsp_diagnostics",
             "search_memory",
             "save_memory",
+            "delete_memory",
         ] {
             assert!(names.contains(&expected), "missing schema: {expected}");
         }
@@ -1859,6 +2117,9 @@ mod tests {
         assert!(p.contains("ANSWER") && p.contains("VERBATIM") && p.contains("nothing between tool calls"));
         // Latency guidance: rounds (not calls) are the cost, batch in ONE step.
         assert!(p.contains("ROUNDS") && p.contains("ONE step"), "{p}");
+        // `read` numbers its lines; the report must not carry that scaffolding
+        // into CODE excerpts the main agent will use as exact-match edit strings.
+        assert!(p.contains("line number") && p.contains("never copy the header"), "{p}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1981,6 +2242,41 @@ mod tests {
     }
 
     #[test]
+    fn create_skill_persists_persian_keywords_into_the_catalog() {
+        use crate::tools::dispatch;
+        let dir = std::env::temp_dir().join(format!("codifa-create-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+
+        let out = dispatch(
+            root,
+            "create_skill",
+            &json!({
+                "name": "Movie Finder",
+                "description": "find movies",
+                "content": "Step 1: ask for the genre.",
+                "fa_keywords": "فیلم, سینما",
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("Movie Finder"), "{out}");
+
+        // The keywords must reach the catalog, otherwise a Persian request
+        // could never match this skill (the catalog is all the model sees).
+        let section = crate::skill_router::build_section(root, &[]);
+        assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
+        assert!(section.text.contains("Movie Finder: find movies"), "{}", section.text);
+
+        // A missing name/content is rejected instead of writing a broken skill.
+        assert!(dispatch(root, "create_skill", &json!({"content": "x"}), None).is_err());
+        assert!(dispatch(root, "create_skill", &json!({"name": "x"}), None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_skill_returns_body_and_lists_names_when_missing() {
         use crate::tools::dispatch;
         let dir = std::env::temp_dir().join(format!("codifa-load-skill-{}", std::process::id()));
@@ -2061,6 +2357,7 @@ mod tests {
             providers: std::collections::HashMap::new(),
             data_root: String::new(),
             allow_computer: false,
+            allow_create: false,
             search_plugins: Vec::new(),
         }
     }
@@ -2108,5 +2405,33 @@ mod tests {
         assert_eq!(model, "m");
         assert_eq!(base, "http://parent/v1");
         assert_eq!(keys, vec!["pk".to_string()]);
+    }
+
+    #[test]
+    fn subagent_snapshot_drops_history_but_keeps_settings() {
+        // A four-explore step snapshots the parent once per explore. The
+        // transcript must not ride along: run_subagent never reads it, so a
+        // full clone only copies the whole chat (megabytes on a long one)
+        // once per parallel sub-agent before it is thrown away.
+        let mut req = base_req();
+        req.history = vec![json!({"role": "user", "content": "x".repeat(1000)})];
+        req.chat_id = "chat-1".into();
+        req.search_plugins = vec![json!({"kind": "duckduckgo"})];
+        req.context_window = 200_000;
+        req.mcp_servers = json!({"srv": {"command": "x"}});
+
+        let snap = req.subagent_snapshot();
+
+        assert!(snap.history.is_empty(), "snapshot must not carry history");
+        // The parent's own history is untouched (the turn keeps using it).
+        assert_eq!(req.history.len(), 1);
+        // Settings the sub-agent genuinely reads still flow through.
+        assert_eq!(snap.model, req.model);
+        assert_eq!(snap.root, req.root);
+        assert_eq!(snap.chat_id, "chat-1");
+        assert_eq!(snap.context_window, 200_000);
+        assert_eq!(snap.search_plugins, req.search_plugins);
+        assert_eq!(snap.mcp_servers, req.mcp_servers);
+        assert_eq!(snap.api_keys, req.api_keys);
     }
 }

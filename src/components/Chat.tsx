@@ -86,6 +86,7 @@ import { isBrowserTool } from "../lib/mcpTools";
 
 import type { SkillRow, TranscribeProviderOpts } from "../lib/api";
 import { supportsReasoning } from "../lib/thinking";
+import { projectHistoryMessage } from "../lib/historyPayload";
 import { allModes, getMode } from "../lib/modes";
 import {
   extractMentionSkills,
@@ -228,7 +229,7 @@ function wantsSkillOrMcp(text: string): boolean {
     /\b(install|add|create|import|save|set up|setup|copy|edit|update|modify|change|fix|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ذخیره|اضافه|ویرایش|ادیت|اصلاح|تغییر|حذف|آپدیت|بروز)/.test(
       low,
     );
-  const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|سورس)/.test(low);
+  const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|کانکتور|ام‌سی‌پی)/.test(low);
   return action && target;
 }
 
@@ -3164,38 +3165,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         (a, b) =>
           (a.role === "system" ? -1 : 0) - (b.role === "system" ? -1 : 0),
       )
-      .map((m) => ({
-        role: m.role,
-        content: m.content,
-        thinking: m.thinking,
-        plan: m.plan,
-        mode: m.mode,
-        toolActivity: (m.toolActivity ?? []).filter(
-          (a) => a.status !== "running",
-        ),
-        // Sent to the model only — UI never renders this field. The backend
-        // folds it into the AIMessage's content so a retry knows what was
-        // already done without re-executing completed tools.
-        preservedToolSummary: m.preservedToolSummary,
-        // Re-send images carried by earlier user messages so the backend can
-        // re-analyze them (vision-cached by content) — without this the model
-        // "forgets" an attached image on the very next turn.
-        ...(m.images?.length
-          ? {
-              images: m.images.flatMap(
-                (i): Array<string | { path: string; dataUrl: string }> => {
-                  if (!i.dataUrl) return [i.path];
-                  const clean = sanitizeImageDataUrl(i.dataUrl);
-                  return clean ? [{ path: i.path, dataUrl: clean }] : [];
-                },
-              ),
-            }
-          : {}),
-      }));
-    // Cast: SearchResultItem fields (title, url, snippet) are valid JSON-
-    // serializable keys; the narrower StreamParams type omits them but they
-    // survive the round-trip fine.  The pre-existing sliceToBudget wrapper
-    // masked this mismatch with an implicit any.
+      // Send ONLY what the Rust side reads (agent.rs `history_recap`): role,
+      // content, the finished tool cards, preservedToolSummary and the plan.
+      // Inline image data URLs, `thinking` and the full tool output used to
+      // ride along on every turn — the backend never read them, but each send
+      // re-serialized and re-parsed them (the long-chat memory spike).
+      // See src/lib/historyPayload.ts.
+      .map(projectHistoryMessage);
     const history = allHistory as StreamParams["history"];
 
     const abort = new AbortController();
@@ -4317,12 +4293,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerUse,
-          vectorDbPath: s.vectorDbPath,
-          vectorConfig: {
-            ttl_days: s.ragWebTtlDays,
-            max_docs: 500,
-            max_chunks: 4000,
-          },
           subagentModels: s.subagentModels,
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
@@ -4764,8 +4734,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         });
         void send(
           target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
-            : `Create a new MCP connector from this description: "${rest}". Use the create_mcp tool to add it, choosing a good name and command/URL/config that fits the description. Ask me only for anything essential that is genuinely missing; otherwise just create it. Do not modify files for this.`,
+            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass fa_keywords: the user's own Persian phrases for when this skill applies (comma-separated, e.g. "ترجمه کن, translate this") — without them a Persian request cannot find the skill. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
+            : `Create a new MCP connector or edit an existing one from this description: "${rest}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
           [],
           [],
           true,

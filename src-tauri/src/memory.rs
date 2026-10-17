@@ -229,7 +229,6 @@ pub fn search(query: &str, project_id: &str, limit: usize) -> Vec<Value> {
 }
 
 /// Delete one note by id; returns true when a note was removed.
-#[allow(dead_code)] // wired for the future delete_memory tool (parity with Python)
 pub fn delete(mid: &str) -> bool {
     let _guard = MEM_LOCK.lock();
     let path = memories_path();

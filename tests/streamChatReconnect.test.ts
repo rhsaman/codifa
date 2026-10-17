@@ -11,6 +11,8 @@
 //  - a stream ending without `done` after events → throws (no auto-retry)
 //  - SSE ": keepalive" comments are forwarded as "keepalive" events (heartbeat)
 
+export {}
+
 // Stub the Electron bridge so ensureSidecar() returns a fixed URL. This MUST
 // run before importing api.ts (which touches window.coder at module load).
 ;(globalThis as any).window = {
@@ -241,6 +243,34 @@ async function run() {
     }
     check('۷) استریم بدون done (با event قبلی) → auto-reconnect نمی‌شود', streamCalls === 1, streamCalls)
     check('۷) خطا "Connection lost mid-turn" برگشت', threwMsg.includes('Connection lost mid-turn'), threwMsg)
+  }
+
+  // 8) Stream ends with an `error` event but NO `done` → NOT a connection loss.
+  //    `error` is terminal: the backend emits it when the turn dies on a
+  //    provider failure (and the Rust router now always follows it with
+  //    `done`). Treating the following EOF as a dropped connection stacked the
+  //    misleading "Connection lost mid-turn" banner on top of the real error —
+  //    the wrong message users saw on ONE of two concurrent chats.
+  {
+    let streamCalls = 0
+    const received: any[] = []
+    ;(globalThis as any).fetch = async (url: string) => {
+      if (url.endsWith('/health')) return new Response(null, { status: 200 })
+      if (url.endsWith('/chat/stream')) streamCalls++
+      return makeStreamResponse([
+        { kind: 'text', content: 'partial' },
+        { kind: 'error', content: 'provider rejected: rate limit' },
+      ])
+    }
+    let threwMsg = ''
+    try {
+      await streamChat(baseParams, (e) => received.push(e))
+    } catch (err) {
+      threwMsg = (err as Error).message
+    }
+    check('۸) خطای پایانی پراوایدر به «قطع اتصال» تبدیل نمی‌شود', threwMsg === '', threwMsg)
+    check('۸) event خطا به UI رسید', received.some((e) => e.kind === 'error'), received)
+    check('۸) دوباره‌تلاش ناخواسته انجام نشد', streamCalls === 1, streamCalls)
   }
 
   if (failed > 0) {

@@ -310,192 +310,6 @@ async fn skills_sync(State(st): State<AppState>, Json(body): Json<Value>) -> Res
     }
 }
 
-// --- RAG memory + index (native; replaces the sidecar's /index/* and
-// /memory/* and the embedding half of /models/*) --------------------------
-
-/// Query params shared by the RAG endpoints.
-#[derive(serde::Deserialize)]
-pub struct RagQuery {
-    #[serde(default)]
-    pub root: String,
-    #[serde(default)]
-    pub vector_db_path: String,
-}
-
-/// Body of POST /index/run and /memory/clear.
-#[derive(serde::Deserialize)]
-pub struct RagBody {
-    #[serde(default)]
-    pub root: String,
-    #[serde(default)]
-    pub vector_db_path: String,
-    #[serde(default)]
-    pub budget: Option<usize>,
-    #[serde(default)]
-    pub max_files: Option<usize>,
-    #[serde(default)]
-    pub config: Option<Value>,
-}
-
-/// Documents embedded per indexing run when the caller does not say.
-///
-/// Deliberately small: a run holds the ONNX session plus every queued vector,
-/// and on an 8 GB machine a large default is what drives the process into swap.
-/// Callers that want a full index pass an explicit `budget`.
-const DEFAULT_INDEX_BUDGET: usize = 40;
-
-/// Files walked per run when the caller does not say. The walk itself is cheap,
-/// but every entry is held in memory and the store's metadata is loaded whole.
-const DEFAULT_INDEX_MAX_FILES: usize = 2_000;
-
-/// GET /models/embedding-status — is the e5 model present and loadable?
-async fn embedding_status() -> Response<Body> {
-    Json(crate::embeddings::status()).into_response()
-}
-
-/// GET /models/decision-status — is the Laya decision router present?
-///
-/// Reports presence without loading the graph: the int8 model is a few hundred
-/// MB, and a status check must not pull that into RAM.
-async fn decision_status() -> Response<Body> {
-    Json(crate::laya::status()).into_response()
-}
-
-/// POST /models/unload — free every cached local model.
-///
-/// The embedding session and the Laya decision graph are native, so both are
-/// dropped here; Whisper and the local TTS weights still live in the Python
-/// sidecar, so the request is forwarded there and the two reports are merged.
-/// Best-effort throughout: a sidecar that is down must not fail the endpoint.
-async fn models_unload(State(st): State<AppState>) -> Response<Body> {
-    crate::embeddings::unload();
-    let laya = crate::laya::unload();
-    let mut freed = json!({ "embedding": true, "laya": laya });
-    if let Some(base) = sidecar_base().await {
-        if let Ok(res) = st.http.post(format!("{base}/models/unload")).send().await {
-            if let Ok(body) = res.json::<Value>().await {
-                if let Some(map) = body.get("freed").and_then(|v| v.as_object()) {
-                    for (k, v) in map {
-                        freed[k] = v.clone();
-                    }
-                }
-            }
-        }
-    }
-    Json(json!({ "ok": true, "freed": freed })).into_response()
-}
-
-/// GET /index/status — does this workspace need a first index, and how big is
-/// the store?
-async fn index_status(Query(q): Query<RagQuery>) -> Response<Body> {
-    if q.root.trim().is_empty() || !std::path::Path::new(&q.root).is_dir() {
-        return bad_request("invalid project root");
-    }
-    let Some(store) = crate::indexer::open_store(&q.root, &q.vector_db_path, None) else {
-        return Json(json!({
-            "available": false,
-            "needs_index": false,
-            "docs": 0,
-            "chunks": 0,
-            "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
-        }))
-        .into_response();
-    };
-    let stats = store.stats().unwrap_or_default();
-    Json(json!({
-        "available": true,
-        "needs_index": crate::indexer::needs_index(&store, &q.root),
-        "docs": stats.docs,
-        "chunks": stats.chunks,
-        "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
-    }))
-    .into_response()
-}
-
-/// POST /index/run — incrementally index changed files and prune deleted ones.
-async fn index_run(Json(body): Json<RagBody>) -> Response<Body> {
-    if body.root.trim().is_empty() || !std::path::Path::new(&body.root).is_dir() {
-        return bad_request("invalid project root");
-    }
-    let Some(store) = crate::indexer::open_store(&body.root, &body.vector_db_path, body.config.as_ref())
-    else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "could not open vector store").into_response();
-    };
-    if store.ensure_dim().is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "embedding model unavailable").into_response();
-    }
-    let stats = crate::indexer::index_workspace(
-        &store,
-        &body.root,
-        body.budget.unwrap_or(DEFAULT_INDEX_BUDGET),
-        body.max_files.unwrap_or(DEFAULT_INDEX_MAX_FILES),
-    );
-    let _ = store.enforce_limits();
-    // Indexing is a batch job: hand the ~1 GB ONNX session back to the OS as
-    // soon as it finishes instead of keeping it resident until the idle timer.
-    crate::embeddings::unload();
-    Json(stats).into_response()
-}
-
-/// GET /memory/stats — doc/chunk counts and the retention limits in force.
-async fn memory_stats(Query(q): Query<RagQuery>) -> Response<Body> {
-    if q.root.trim().is_empty() || !std::path::Path::new(&q.root).is_dir() {
-        return bad_request("invalid project root");
-    }
-    let Some(store) = crate::indexer::open_store(&q.root, &q.vector_db_path, None) else {
-        return Json(json!({
-            "available": false, "db": "", "docs": 0, "chunks": 0,
-            "kinds": {}, "max_docs": 0, "max_chunks": 0, "ttl_days": 0,
-        }))
-        .into_response();
-    };
-    let cfg = store.config();
-    match store.stats() {
-        Ok(stats) => {
-            let kinds: serde_json::Map<String, Value> = stats
-                .kinds
-                .iter()
-                .map(|(k, v)| (k.clone(), json!(v)))
-                .collect();
-            Json(json!({
-                "available": true,
-                "db": crate::indexer::store_path(&q.root, &q.vector_db_path).display().to_string(),
-                "docs": stats.docs,
-                "chunks": stats.chunks,
-                "kinds": kinds,
-                "max_docs": cfg.max_docs,
-                "max_chunks": cfg.max_chunks,
-                "ttl_days": cfg.ttl_days,
-            }))
-            .into_response()
-        }
-        Err(err) => Json(json!({
-            "available": false, "db": "", "docs": 0, "chunks": 0,
-            "kinds": {}, "max_docs": 0, "max_chunks": 0, "ttl_days": 0,
-            "error": err,
-        }))
-        .into_response(),
-    }
-}
-
-/// POST /memory/clear — drop every stored doc and chunk for the workspace.
-async fn memory_clear(Json(body): Json<RagBody>) -> Response<Body> {
-    if body.root.trim().is_empty() || !std::path::Path::new(&body.root).is_dir() {
-        return bad_request("invalid project root");
-    }
-    let Some(store) = crate::indexer::open_store(&body.root, &body.vector_db_path, None) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "could not open vector store").into_response();
-    };
-    match store.clear() {
-        Ok(()) => {
-            store.vacuum();
-            Json(json!({ "ok": true, "error": "" })).into_response()
-        }
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not clear vector store: {err}"))
-            .into_response(),
-    }
-}
-
 async fn mcp_list(State(st): State<AppState>) -> Response<Body> {
     Json(skills::list_mcp(&st.data_root)).into_response()
 }
@@ -553,18 +367,6 @@ struct CompactBody {
 
 fn default_provider() -> String {
     "custom".into()
-}
-
-/// Decision-slot value selecting the downloaded on-device Laya router
-/// (mirrors `laya_router.LAYA_ENTRY`). It is a local classifier, NOT a provider
-/// model, so it must never be resolved as a bare model name: doing that sent
-/// the call to the parent provider with the literal model "laya", which failed
-/// and silently dropped the turn back to the in-code matcher.
-pub const LAYA_ENTRY: &str = "laya";
-
-/// True when a Tool Models slot selects the local on-device router.
-pub fn is_local_router_entry(entry: &str) -> bool {
-    entry.trim().eq_ignore_ascii_case(LAYA_ENTRY)
 }
 
 /// Resolve a Tool Models slot entry ("providerId/model" | bare model | "")
@@ -743,6 +545,14 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
 // ---------- /chat/stream ----------
 // Always the native Rust agent loop (agent.rs) — no Python fallback.
 
+/// SSE heartbeat period. The client's stall watchdog reads an SSE stream that
+/// goes silent for too long as a dead connection, so the Python sidecar kept
+/// the stream alive with `: keepalive` comments every ~15s while the agent was
+/// thinking or running a slow tool. The Rust router must do the same: without
+/// a heartbeat a long silent stretch (much likelier when two chats share one
+/// provider) was aborted as a connection loss.
+const SSE_KEEPALIVE_SECS: u64 = 15;
+
 async fn chat_stream_entry(
     State(st): State<AppState>,
     Json(body): Json<Value>,
@@ -801,8 +611,40 @@ async fn chat_stream_native(body: Value, data_root: PathBuf) -> Response<Body> {
     }
         }
     });
+    // Heartbeat emitter. Uses a WEAK handle on purpose: the temporary upgrade
+    // lives only inside one tick, so the heartbeat can never keep the body
+    // open after the turn ends (a strong clone here left the SSE stream
+    // hanging after `done`). `turn_done` is the deterministic exit for the
+    // last tick after the turn finished.
+    let turn_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ka_tx = tx.downgrade();
+    let ka_done = std::sync::Arc::clone(&turn_done);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(SSE_KEEPALIVE_SECS)).await;
+            if ka_done.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match ka_tx.upgrade() {
+                Some(s) => {
+                    let sent = s
+                        .send(Ok(axum::body::Bytes::from_static(b": keepalive\n\n")))
+                        .is_ok();
+                    drop(s);
+                    // Send error = the receiver is gone (client disconnected).
+                    if !sent {
+                        break;
+                    }
+                }
+                // No strong senders left: the turn finished — nothing to keep
+                // alive, so exit and let the body complete.
+                None => break,
+            }
+        }
+    });
     tokio::spawn(async move {
         let tx_err = tx.clone();
+        let done_flag = turn_done;
         let mut emit = move |ev: &agent::AgentEvent| {
             let line = format!("data: {}\n\n", ev.to_json());
             let _ = tx.send(Ok(axum::body::Bytes::from(line)));
@@ -812,7 +654,13 @@ async fn chat_stream_native(body: Value, data_root: PathBuf) -> Response<Body> {
             let _ = tx_err.send(Ok(axum::body::Bytes::from(format!(
                 "data: {payload}\n\n"
             ))));
+            // A fatal turn error is still a TERMINAL state: the protocol
+            // requires `done` or the client reports "Connection lost mid-turn"
+            // on top of the real error.
+            let done = agent::AgentEvent::Done { aborted: false }.to_json();
+            let _ = tx_err.send(Ok(axum::body::Bytes::from(format!("data: {done}\n\n"))));
         }
+        done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     Response::builder()
         .status(StatusCode::OK)
@@ -1128,15 +976,6 @@ pub fn router(state: AppState) -> Router {
         .route("/skills", get(skills_list))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
-        // RAG memory + index, native (the sidecar's /index/* and /memory/*
-        // and the embedding half of /models/* are gone).
-        .route("/models/embedding-status", get(embedding_status))
-        .route("/models/decision-status", get(decision_status))
-        .route("/models/unload", post(models_unload))
-        .route("/index/status", get(index_status))
-        .route("/index/run", post(index_run))
-        .route("/memory/stats", get(memory_stats))
-        .route("/memory/clear", post(memory_clear))
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
@@ -1193,19 +1032,6 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
-
-    #[test]
-    fn local_router_slot_is_recognised_not_treated_as_a_model() {
-        // The decision slot may hold the local on-device router sentinel. It is
-        // not a model name: resolving it as one sent "laya" to the parent
-        // provider and failed, so the slot looked like it did nothing.
-        assert!(is_local_router_entry("laya"));
-        assert!(is_local_router_entry("  Laya "));
-        assert!(!is_local_router_entry(""));
-        assert!(!is_local_router_entry("main"));
-        assert!(!is_local_router_entry("p1/laya"));
-        assert!(!is_local_router_entry("layax"));
-    }
 
     #[test]
     fn slot_target_reads_the_renderer_camel_case_provider_config() {

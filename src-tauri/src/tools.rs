@@ -138,12 +138,28 @@ fn coder_dir() -> Option<PathBuf> {
 // read
 // ---------------------------------------------------------------------------
 
+/// Slice one line to the byte cap without splitting a UTF-8 character (a raw
+/// byte slice panics on any multi-byte character crossing the boundary).
+fn truncated_line(line: &str) -> String {
+    if line.len() <= MAX_LINE_LENGTH {
+        return line.to_string();
+    }
+    let mut end = MAX_LINE_LENGTH;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} …[truncated]", &line[..end])
+}
+
+/// One read window of a file: its lines, or the reason the window is empty.
+enum Window {
+    Lines(Vec<String>),
+    Empty(String),
+}
+
 /// Read one window of a file (1-indexed offset, line count) with the same
 /// truncation rules as tools.py: 2MB byte cap, 2000-char line cap.
-pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, String> {
-    if abs.is_dir() {
-        return list_dir(abs, offset, limit);
-    }
+fn file_window(abs: &Path, offset: usize, limit: usize) -> Result<Window, String> {
     let meta = fs::metadata(abs).map_err(|e| format!("file not found: {e}"))?;
     if meta.len() as usize > MAX_READ_BYTES {
         return Err(format!(
@@ -154,31 +170,80 @@ pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, St
     let content = fs::read_to_string(abs)
         .map_err(|_| format!("binary file (read skipped): {}", abs.display()))?;
     let total = content.lines().count();
-    let start = offset.saturating_sub(1);
-    let mut out = String::new();
-    for line in content.lines().skip(start).take(limit) {
-        if line.len() > MAX_LINE_LENGTH {
-            out.push_str(&line[..MAX_LINE_LENGTH]);
-            out.push_str(" …[truncated]");
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    if out.is_empty() {
+    let lines: Vec<String> = content
+        .lines()
+        .skip(offset.saturating_sub(1))
+        .take(limit)
+        .map(truncated_line)
+        .collect();
+    if lines.is_empty() {
         // An empty window is never data: say WHY it is empty, otherwise the
         // caller burns another round guessing (a traced run read offset=100000
         // of a short file and got a silent blank).
-        return Ok(if total == 0 {
+        return Ok(Window::Empty(if total == 0 {
             format!("{} is empty (0 lines)", abs.display())
         } else {
             format!(
                 "offset {offset} is past the end of {} ({total} lines) — read offset=1",
                 abs.display()
             )
-        });
+        }));
     }
-    Ok(out)
+    Ok(Window::Lines(lines))
+}
+
+/// Bare window text (no line numbers) — the shape non-agent callers expect.
+pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, String> {
+    if abs.is_dir() {
+        return list_dir(abs, offset, limit);
+    }
+    match file_window(abs, offset, limit)? {
+        Window::Lines(lines) => {
+            let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+            for line in lines {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        Window::Empty(notice) => Ok(notice),
+    }
+}
+
+/// Read one window for the agent loop: the same lines, each carrying its
+/// 1-based number under a `<label> (lines a-b):` header, so the model can cite
+/// a line instead of re-reading the file to pin its number down. Directory
+/// listings keep their plain form.
+pub fn read_window_block(abs: &Path, label: &str, offset: usize, limit: usize) -> Result<String, String> {
+    if abs.is_dir() {
+        return read_window(abs, offset, limit);
+    }
+    match file_window(abs, offset, limit)? {
+        Window::Lines(lines) => Ok(numbered_window(label, offset.max(1), &lines)),
+        Window::Empty(notice) => Ok(notice),
+    }
+}
+
+/// Render one read window as numbered lines under a range header.
+///
+/// The raw window (bare lines, no numbers) cost the caller an extra round: a
+/// traced explore re-read offsets 4730 and 222 in the very turn after they were
+/// already delivered, because nothing in the output pinned a real line number
+/// it could cite, and a multi-range read glued several windows together with no
+/// marker for where each one started. The header states the file and the
+/// inclusive line span; every line carries its 1-based number, right-aligned so
+/// digits do not shift the code.
+pub fn numbered_window(label: &str, first_line: usize, lines: &[String]) -> String {
+    if lines.is_empty() {
+        return format!("{label} (lines {first_line}+): (empty window)\n");
+    }
+    let last = first_line + lines.len() - 1;
+    let width = last.to_string().len();
+    let mut out = format!("{label} (lines {first_line}-{last}):\n");
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(&format!("{:>width$}: {line}\n", first_line + i, width = width));
+    }
+    out
 }
 
 /// Directory listing (one entry per line, subdirs marked with `/`).
@@ -632,6 +697,98 @@ pub fn glob_scope(root: &Path, scope: &str, pattern: &str, max_results: usize) -
 // write / edit
 // ---------------------------------------------------------------------------
 
+/// Read a file's current content for diffing before an edit. A missing or
+/// unreadable file yields an empty string (a brand-new write_file then diffs
+/// as pure additions).
+pub fn read_pre_edit(root: &str, path: &str) -> Option<String> {
+    let target = resolve_safe(root, path, false, None).ok()?;
+    fs::read_to_string(target).ok()
+}
+
+/// Minimal unified diff (`--- a/…` / `+++ b/…` + one hunk with 3 context
+/// lines). Not a minimal-edit LCS diff: the common prefix/suffix is trimmed
+/// and the changed middle is emitted as -old/+new — exact, cheap, and enough
+/// for the Review panel and the frontend's hunk parser.
+pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut pre = 0usize;
+    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < a.len() - pre
+        && suf < b.len() - pre
+        && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    if pre == a.len() && pre == b.len() {
+        return String::new(); // identical content
+    }
+    const CTX: usize = 3;
+    let head_start = pre.saturating_sub(CTX);
+    let del = &a[pre..a.len() - suf];
+    let add = &b[pre..b.len() - suf];
+    let tail_end = (a.len() - suf + CTX).min(a.len());
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        head_start + 1,
+        (pre - head_start) + del.len() + suf,
+        head_start + 1,
+        (pre - head_start) + add.len() + suf
+    ));
+    for l in &a[head_start..pre] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in del {
+        out.push('-');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in add {
+        out.push('+');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in &a[a.len() - suf..tail_end] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn unified_diff_marks_changed_middle() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+        let new = "a\nb\nc\nD\ne\nf\ng\nh\ni\nj\nk\nl\n";
+        let d = unified_diff("f.txt", old, new);
+        assert!(d.starts_with("--- a/f.txt\n+++ b/f.txt\n"));
+        assert!(d.contains("-d\n+D\n"));
+        assert!(d.contains("@@ -"));
+    }
+
+    #[test]
+    fn unified_diff_new_file_is_all_additions() {
+        let d = unified_diff("n.txt", "", "hello\n");
+        assert!(d.contains("+hello\n"));
+        assert!(!d.contains("\n-"));
+    }
+
+    #[test]
+    fn unified_diff_identical_is_empty() {
+        assert_eq!(unified_diff("x.txt", "same\n", "same\n"), "");
+    }
+}
+
 /// Overwrite a file with new content (brand-new files or full rewrites).
 pub fn write_file(root: &str, path: &str, content: &str, permit: Option<&Value>) -> Result<String, String> {
     let target = resolve_safe(root, path, false, permit)?;
@@ -802,7 +959,7 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                     if !out.is_empty() {
                         out.push_str("\n\n");
                     }
-                    out.push_str(&read_window(&abs, offset, limit)?);
+                    out.push_str(&read_window_block(&abs, &path, offset, limit)?);
                 }
                 return Ok(out);
             }
@@ -811,7 +968,7 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             // and slows the agent down. Cap the default window; larger reads
             // must be explicit (offset/limit).
             let limit = args["limit"].as_u64().unwrap_or(400) as usize;
-            read_window(&abs, offset, limit)
+            read_window_block(&abs, &path, offset, limit)
         }
         "grep" => {
             let mut patterns = vec![s("pattern")];
@@ -958,6 +1115,23 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
         "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query")),
         "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath")),
         // Native memory store (JSONL layer of memory_manager.py).
+        "delete_memory" => {
+            // Accept both spellings: the schema advertises `memory_id`, but a
+            // model copying an id out of a search result often writes `id`.
+            let mid = {
+                let m = s("memory_id");
+                if m.is_empty() { s("id") } else { m }
+            };
+            let mid = mid.trim();
+            if mid.is_empty() {
+                return Err("delete_memory requires memory_id (the id from search_memory)".into());
+            }
+            Ok(if crate::memory::delete(mid) {
+                format!("deleted memory {mid}")
+            } else {
+                format!("no memory with id {mid}")
+            })
+        }
         "save_memory" => {
             let t = s("memory_type");
             let mtype: &str = if t.is_empty() { "long_term" } else { &t };
@@ -975,6 +1149,79 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
         }
         // Load one stored skill's body on demand (the auto-matcher inlines the
         // obvious picks; anything else costs one tool call instead of a
+        // Create or update a skill from a command (the Codex/Claude
+        // `create_skill` flow). `fa_keywords` is what makes the skill findable
+        // from a Persian request: the catalog line carries them, so the model
+        // can match the user's own wording without any embedding or classifier.
+        "create_skill" => {
+            let name = s("name");
+            if name.trim().is_empty() {
+                return Err("create_skill requires name".into());
+            }
+            let content = s("content");
+            if content.trim().is_empty() {
+                return Err("create_skill requires content".into());
+            }
+            let mut body = json!({
+                "name": name,
+                "previous_name": s("previous_name"),
+                "content": content,
+                "description": s("description"),
+                "fa_keywords": args["fa_keywords"].clone(),
+            });
+            if args["delete"].as_bool().unwrap_or(false) {
+                body["delete"] = json!(true);
+            }
+            if let Some(extra) = args["extra_files"].as_object() {
+                body["extra_files"] = json!(extra);
+            }
+            let res = crate::skills::sync_skill(Path::new(root), &body)?;
+            Ok(format!(
+                "Skill saved: {}\nThe catalog in the system prompt now lists it, so it can be \
+                 loaded on demand in later turns.",
+                res["name"].as_str().unwrap_or(&name)
+            ))
+        }
+        // Create or update an MCP connector from a command (the `/create-mcp`
+        // flow). A connector is either a stdio server (command + args) or an
+        // HTTP one (url), so both shapes are accepted and stored verbatim.
+        // Editing an existing connector works two ways: pass the SAME name to
+        // overwrite it in place, or pass previous_name to rename it (the old
+        // file is removed so no stale duplicate is left behind).
+        "create_mcp" => {
+            let name = s("name");
+            if name.trim().is_empty() {
+                return Err("create_mcp requires name".into());
+            }
+            let mut cfg = serde_json::Map::new();
+            let command = s("command");
+            let url = s("url");
+            if !command.trim().is_empty() {
+                cfg.insert("command".into(), json!(command));
+                if let Some(args) = args["args"].as_array() {
+                    cfg.insert("args".into(), json!(args));
+                }
+            } else if !url.trim().is_empty() {
+                cfg.insert("url".into(), json!(url));
+            } else {
+                return Err("create_mcp requires either command (stdio) or url (http)".into());
+            }
+            if let Some(env) = args["env"].as_object() {
+                cfg.insert("env".into(), json!(env));
+            }
+            let prev = s("previous_name");
+            if !prev.is_empty() && prev != name {
+                let _ = crate::skills::delete_mcp(Path::new(root), &json!({"name": prev}));
+            }
+            let res = crate::skills::save_mcp(
+                Path::new(root),
+                &json!({"name": name, "cfg": Value::Object(cfg)}),
+            )?;
+            Ok(format!(
+                "Connector saved: {}\nEnable it in the composer's MCP picker to use its tools.",
+                res["name"].as_str().unwrap_or(&name)
+            ))
+        }
         // prompt-sized body). `file` reads an extra file of that skill.
         "load_skill" => {
             let name = s("name");
@@ -1274,6 +1521,52 @@ mod tests {
 
 
 
+    /// delete_memory must remove exactly one note by the id search_memory hands
+    /// out, answer a plain miss for an unknown id, and refuse an empty id.
+    #[test]
+    fn delete_memory_dispatch_removes_one_note() {
+        let _guard = crate::memory::tests::DATA_DIR_LOCK.lock();
+        let data = std::env::temp_dir().join(format!("codifa-delmem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&data);
+        fs::create_dir_all(&data).unwrap();
+        let project = std::env::temp_dir().join(format!("codifa-delmem-proj-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&project);
+        fs::create_dir_all(&project).unwrap();
+        let prev = std::env::var("CODER_DATA_DIR").ok();
+        std::env::set_var("CODER_DATA_DIR", &data);
+        let root = project.to_str().unwrap();
+
+        let added = dispatch(root, "save_memory", &json!({"content": "keep this note"}), None).unwrap();
+        let id = serde_json::from_str::<Value>(&added).unwrap()["memory"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(dispatch(root, "search_memory", &json!({"query": "note"}), None)
+            .unwrap()
+            .contains(&id));
+
+        let del = dispatch(root, "delete_memory", &json!({"memory_id": &id}), None).unwrap();
+        assert!(del.contains("deleted memory"), "{del}");
+        assert_eq!(
+            dispatch(root, "search_memory", &json!({"query": "note"}), None).unwrap(),
+            "no matching memories"
+        );
+        // The bare `id` spelling (copied straight from a search hit) works too,
+        // and an unknown id is a plain miss rather than an error.
+        assert!(dispatch(root, "delete_memory", &json!({"id": "no-such-id"}), None)
+            .unwrap()
+            .contains("no memory with id"));
+        // No id at all is a usage error, never a silent success.
+        assert!(dispatch(root, "delete_memory", &json!({}), None).is_err());
+
+        match prev {
+            Some(v) => std::env::set_var("CODER_DATA_DIR", v),
+            None => std::env::remove_var("CODER_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(&data);
+        let _ = fs::remove_dir_all(&project);
+    }
+
     fn find_symbol_fixture() -> std::path::PathBuf {
         let tmp = std::env::temp_dir().join(format!("codifa-findsym-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = fs::remove_dir_all(&tmp);
@@ -1433,7 +1726,43 @@ mod tests {
     }
 
     #[test]
-    fn read_window_truncates_long_lines() {
+    fn read_window_block_numbers_lines_under_a_range_header() {
+            let dir = std::env::temp_dir().join("codifa_read_block_test");
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("sample.txt");
+            fs::write(&file, "alpha\nbeta\ngamma\ndelta\n").unwrap();
+
+            // Every line carries its 1-based number under the window's header, so
+            // the caller can cite a line without re-reading the file.
+            let block = read_window_block(&file, "sample.txt", 2, 2).unwrap();
+            assert_eq!(block, "sample.txt (lines 2-3):\n2: beta\n3: gamma\n");
+
+            // offset 0 reads the same first line as offset 1, and the header must
+        // not announce a line 0 that no file has.
+        let zero = read_window_block(&file, "sample.txt", 0, 1).unwrap();
+        assert_eq!(zero, "sample.txt (lines 1-1):\n1: alpha\n");
+
+        // A window past the end still explains itself instead of a blank.
+            let past = read_window_block(&file, "sample.txt", 99, 5).unwrap();
+            assert!(past.contains("past the end"), "{past}");
+
+            // Long lines are cut at the byte cap without splitting a character.
+            let long = format!("{}{}{}", "x".repeat(MAX_LINE_LENGTH - 10), "\u{1F600}", "y".repeat(20));
+            fs::write(&file, format!("{long}\n")).unwrap();
+            let block = read_window_block(&file, "sample.txt", 1, 1).unwrap();
+            assert!(block.ends_with("[truncated]\n"), "{block}");
+            assert!(block.contains('\u{1F600}'), "{block}");
+
+            let plain = read_window(&file, 1, 1).unwrap();
+            assert!(plain.starts_with("xxxx"), "{plain}");
+            assert!(!plain.contains("1: "), "{plain}");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn read_window_truncates_long_lines() {
         let tmp = std::env::temp_dir().join("codifa-read-test.txt");
         let long = "x".repeat(3000);
         fs::write(&tmp, format!("short\n{long}\n")).unwrap();

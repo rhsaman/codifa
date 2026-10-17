@@ -22932,3 +22932,199 @@ tr[data-search-current] .fv-mark,
     transform: scale(1.15);
   }
 }
+
+/* --- vertical viewer tab rail -------------------------------------------
+   The side pane's tabs sit in an icon-only rail pinned to the pane's PHYSICAL
+   right edge (so it stays on the right in both directions). The rail keeps a
+   FIXED width: hovering never resizes the viewer content or repaints the rail
+   — a hovered tab instead unfolds its title leftward OVER the content. */
+.viewer-pane-body {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  --viewer-rail-width: 42px;
+}
+
+.viewer-pane-body > .viewer-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  /* Constant rail gutter, so opening/closing tabs never shifts the viewer. */
+  padding-right: var(--viewer-rail-width);
+}
+
+.viewer-pane-body .viewer-pane-head {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--viewer-rail-width);
+  height: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 4px;
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  background: none;
+  /* Visible so a widened tab's label can escape the rail. */
+  overflow: visible;
+  z-index: 2;
+  /* The rail overlays the viewer content: it must never act as the frameless
+     window's drag region, or hovering/clicking its icons gets swallowed. */
+  -webkit-app-region: no-drag;
+}
+
+.viewer-pane-body .viewer-pane-spacer {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Panel/collapse icons lead the rail: pinned to its top edge. */
+.viewer-pane-body .viewer-pane-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.viewer-pane-body .viewer-tabs-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  flex: 0 1 auto;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  border-bottom: 0;
+  overflow: visible;
+  scrollbar-width: none;
+}
+
+/* A rail tab is one full-width icon row centered on the rail's axis — the
+   very same column as the panel/action icons stacked above it. */
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab {
+  position: relative;
+  width: 100%;
+  height: 32px;
+  min-width: 0;
+  max-width: none;
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  border-radius: 6px;
+  overflow: visible;
+}
+
+/* Hovering must not nudge a rail icon off that center axis. */
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover {
+  transform: none;
+}
+
+.viewer-tabs-rail .viewer-tab-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Icon-only rail: the label is hidden until hover, then it unfolds leftward
+   OVER the content as an overlay anchored to the tab's own box — the rail's
+   layout (and the viewer's width) never move. Hover-only: a clicked tab does
+   NOT stay wide once the pointer leaves. */
+.viewer-tabs-rail .editor-tab-label {
+  display: none;
+}
+
+.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-label {
+  display: flex;
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  /* Unfold to the LEFT of the tab so its icon square stays visible. */
+  right: 100%;
+  z-index: 3;
+  align-items: center;
+  width: max-content;
+  /* Short titles still get a comfortable unfolded width (icon + title + close). */
+  min-width: 150px;
+  max-width: 280px;
+  padding: 0 12px;
+  border: 1px solid;
+  border-color: inherit;
+  border-radius: 6px;
+  background: inherit;
+  box-shadow: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Closing a tab: the close button lives INSIDE the unfolded label surface,
+   BEFORE the title so it lands at the label's left edge — away from the
+   tab's icon. It appears only while the tab is hovered (unfolded wide). */
+.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close {
+  flex: 0 0 auto;
+  margin-right: 12px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Drop markers follow the rail's vertical axis. */
+.viewer-tabs-rail .editor-tab.drop-before {
+  box-shadow: inset 0 2px 0 currentColor;
+}
+
+.viewer-tabs-rail .editor-tab.drop-after {
+  box-shadow: inset 0 -2px 0 currentColor;
+}
+
+/* Rail buttons (tab list, "+", fullscreen, panel/collapse) are icon squares:
+   one full-width row each, glyph centered on the rail's axis. */
+.viewer-pane-body .viewer-pane-head .tab-list-btn,
+.viewer-pane-body .viewer-pane-head .editor-tab-new,
+.viewer-pane-body .viewer-pane-head .editor-tab-full,
+.viewer-pane-body .viewer-pane-head .titlebar-icon-btn {
+  width: 100%;
+  height: 30px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+}
+
+.viewer-pane-body .viewer-pane-head .viewer-add-wrap,
+.viewer-pane-body .viewer-pane-head .viewer-pane-full {
+  width: 100%;
+}
+
+/* The wraps keep their horizontal-bar paddings otherwise; in the rail every
+   button must fill the row so its glyph lands on the shared center line. */
+.viewer-pane-body .viewer-pane-head .tab-list-wrap,
+.viewer-pane-body .viewer-pane-head .viewer-add-wrap {
+  padding: 0;
+}
+
+/* `.tab-bar.viewer-tabs` re-declares the window drag region for the horizontal
+   strip; inside the overlaying rail that swallows hover/click on the icons. */
+.viewer-pane-body .viewer-pane-head .tab-bar.viewer-tabs {
+  -webkit-app-region: no-drag;
+}

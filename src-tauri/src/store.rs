@@ -5,8 +5,9 @@
 //! never stalls the webview's main thread (the "chat updates late" lag).
 
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -37,7 +38,9 @@ const CHATS_TTL: Duration = Duration::from_millis(1000);
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 struct WriteQueue {
-    pending: Mutex<Option<(PathBuf, serde_json::Map<String, Value>)>>,
+    /// The document awaits the writer thread here; kept behind an `Arc` so the
+    /// cache and the queued job reference ONE allocation instead of two copies.
+    pending: Mutex<Option<(PathBuf, Arc<serde_json::Map<String, Value>>)>>,
     cv: Condvar,
 }
 
@@ -63,7 +66,9 @@ fn ensure_writer() {
                 let job = guard.take();
                 drop(guard);
                 if let Some((path, map)) = job {
-                    if write_document(&path, &Value::Object(map.clone())) {
+                    // On success the flushed document becomes the cache entry —
+                    // the same allocation, never a post-write copy of the doc.
+                    if write_document(&path, &map) {
                         let mut cache = cache_slot().lock().unwrap();
                         *cache = Some(DocCache { value: map, at: Instant::now() });
                     }
@@ -78,12 +83,12 @@ fn ensure_writer() {
 pub fn flush_pending(_app: &AppHandle) {
     let job = write_queue().pending.lock().unwrap().take();
     if let Some((path, map)) = job {
-        let _ = write_document(&path, &Value::Object(map));
+        let _ = write_document(&path, &map);
     }
 }
 
 struct DocCache {
-    value: serde_json::Map<String, Value>,
+    value: Arc<serde_json::Map<String, Value>>,
     at: Instant,
 }
 
@@ -103,7 +108,7 @@ fn store_path(app: &AppHandle) -> PathBuf {
     get_data_root(app).join("settings.json")
 }
 
-fn read_all(app: &AppHandle) -> serde_json::Map<String, Value> {
+fn read_all(app: &AppHandle) -> Arc<serde_json::Map<String, Value>> {
     // Newest state lives in the write queue until the writer flushes it —
     // the on-disk file may lag behind by up to WRITE_DEBOUNCE.
     {
@@ -121,13 +126,13 @@ fn read_all(app: &AppHandle) -> serde_json::Map<String, Value> {
             }
         }
     }
-    let parsed = match fs::read_to_string(store_path(app)) {
+    let parsed = Arc::new(match fs::read_to_string(store_path(app)) {
         Ok(raw) => serde_json::from_str::<Value>(&raw)
             .ok()
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default(),
         Err(_) => serde_json::Map::new(),
-    };
+    });
     {
         let mut cache = cache_slot().lock().unwrap();
         *cache = Some(DocCache { value: parsed.clone(), at: Instant::now() });
@@ -135,14 +140,21 @@ fn read_all(app: &AppHandle) -> serde_json::Map<String, Value> {
     parsed
 }
 
-fn write_document(path: &PathBuf, value: &Value) -> bool {
+/// Serialize straight into the temp file (streamed through a `BufWriter`, so
+/// no multi-MB `String` is ever materialized) and rename it into place, so a
+/// crash never truncates the store.
+fn write_document(path: &Path, value: &serde_json::Map<String, Value>) -> bool {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
-    // Atomic write: temp file + rename so a crash never truncates the store.
     let tmp = path.with_extension("json.tmp");
-    if fs::write(&tmp, pretty).is_err() {
+    let file = match fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut writer = BufWriter::new(file);
+    if serde_json::to_writer_pretty(&mut writer, value).is_err() || writer.flush().is_err() {
+        let _ = fs::remove_file(&tmp);
         return false;
     }
     fs::rename(&tmp, path).is_ok()
@@ -152,7 +164,9 @@ fn write_document(path: &PathBuf, value: &Value) -> bool {
 pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = write_lock().lock().unwrap();
-        let mut map = read_all(&app);
+        // A write needs the document owned; with the cache and the writer thread
+        // sharing it via `Arc`, that copy happens at most once per set.
+        let mut map = Arc::try_unwrap(read_all(&app)).unwrap_or_else(|shared| (*shared).clone());
         if key == "settings" {
             // settings.json is a FLAT document shared with the Python sidecar
             // and also holds sibling keys written via store_set ("chats", ...).
@@ -166,27 +180,29 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
         } else {
             map.insert(key.clone(), value);
         }
-        // Update the in-memory doc immediately (reads stay fresh) and hand the
-        // full document to the coalescing writer — no per-set disk write.
+        // Publish the document ONCE and let the cache and the writer share that
+        // single allocation through an `Arc` — the old code kept a private copy
+        // in each, so every mid-stream store_set duplicated the whole document.
+        let shared = Arc::new(map);
         {
             let mut cache = cache_slot().lock().unwrap();
-            *cache = Some(DocCache { value: map.clone(), at: Instant::now() });
+            *cache = Some(DocCache { value: shared.clone(), at: Instant::now() });
         }
         if key == "chats" {
             // Fold the written subset into the merge cache instead of dropping
-            // it: dropping forced a full re-scan of every per-chat file on the
-            // next read — the chat-switch lag while streaming.
+            // it (dropping forced a full re-scan of every per-chat file on the
+            // next read — the chat-switch lag while streaming). The cached list
+            // is TAKEN rather than cloned, so the merge keeps only one copy.
             let mut slot = chats_cache_slot().lock().unwrap();
-            if let Some((cached, at)) = slot.as_mut() {
-                let incoming = map.get("chats").cloned().unwrap_or(Value::Null);
-                *cached = merge_chat_lists([cached.clone(), incoming]);
-                *at = Instant::now();
+            if let Some((cached, _)) = slot.take() {
+                let incoming = shared.get("chats").cloned().unwrap_or(Value::Null);
+                slot.replace((merge_chat_lists([cached, incoming]), Instant::now()));
             }
         }
         {
             let q = write_queue();
             let mut pending = q.pending.lock().unwrap();
-            *pending = Some((store_path(&app), map));
+            *pending = Some((store_path(&app), shared));
             q.cv.notify_one();
         }
         ensure_writer();
@@ -199,14 +215,22 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
 #[tauri::command]
 pub async fn store_get(app: AppHandle, key: String) -> Option<Value> {
     tauri::async_runtime::spawn_blocking(move || {
-        let raw = fs::read_to_string(store_path(&app)).ok()?;
-        let v: Value = serde_json::from_str(&raw).ok()?;
+        // A missing store still reports None (not an empty document), so the
+        // frontend's "no settings yet" branch keeps working.
+        if !store_path(&app).is_file() {
+            return None;
+        }
+        // Serve from the shared in-memory document instead of re-reading and
+        // re-parsing the multi-MB settings.json on every keystroke: the write
+        // queue holds the newest state and the short-TTL cache re-reads disk, so
+        // changes made by the Python sidecar still show up.
+        let doc = read_all(&app);
         // settings.json IS the settings document: the Python sidecar reads/writes
         // it flat (state_db.settings_path), and Electron's store-db exposed the
         // whole file under the "settings" key. Any other key is a plain entry in
         // the same document.
         if key == "settings" {
-            return Some(v);
+            return Some(Value::Object((*doc).clone()));
         }
         if key == "chats" {
             // Serve the merged list from cache when fresh; the merge reads
@@ -219,11 +243,11 @@ pub async fn store_get(app: AppHandle, key: String) -> Option<Value> {
                     }
                 }
             }
-            let merged = merge_chats_from_disk(&app, v.get("chats"));
+            let merged = merge_chats_from_disk(&app, doc.get("chats"));
             *chats_cache_slot().lock().unwrap() = Some((merged.clone(), Instant::now()));
             return Some(merged);
         }
-        v.get(key).cloned()
+        doc.get(&key).cloned()
     })
     .await
     .ok()
@@ -329,5 +353,26 @@ mod tests {
         let merged = merge_chat_lists([Value::Array(vec![disk])]);
         assert_eq!(merged.as_array().unwrap().len(), 1);
         assert_eq!(merged[0]["id"], "x");
+    }
+
+    /// The streamed atomic write must round-trip the document and leave no
+    /// temp file behind (the store is the app's single source of truth).
+    #[test]
+    fn write_document_round_trips_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "codifa-store-{}-write-document",
+            std::process::id()
+        ));
+        let path = dir.join("settings.json");
+        let mut map = serde_json::Map::new();
+        map.insert("theme".to_string(), serde_json::json!("rose-pine"));
+        map.insert("chats".to_string(), serde_json::json!([{"id": "a"}]));
+
+        assert!(write_document(&path, &map));
+        let back: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["theme"], "rose-pine");
+        assert_eq!(back["chats"][0]["id"], "a");
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

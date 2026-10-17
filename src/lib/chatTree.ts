@@ -269,8 +269,11 @@ export function appendChat(
 ): ChatTreeNode {
   if (!node) return makeLeaf(chatId)
   if (containsChat(node, chatId)) return node
-  // Explicit opens always create a window (never replace); drag splits stay
-  // capped by CHAT_WINDOW_MAX inside dropOnto/dropOntoRoot.
+  // Explicit opens never replace an existing window — but they DO respect the
+  // window cap: CHAT_WINDOW_MAX is a hard limit on every path (drag splits are
+  // capped inside dropOnto/dropOntoRoot and the UI guards its buttons), so a
+  // 7th window can never appear.
+  if (leafCount(node) >= CHAT_WINDOW_MAX) return node
   if (node.kind === 'leaf') {
     return makeSplit(dir, [node, makeLeaf(chatId)])
   }

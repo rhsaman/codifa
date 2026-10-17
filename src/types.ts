@@ -162,11 +162,8 @@ export interface Settings {
   sidebarOpen?: boolean
   /** Docked right panel (todos + future sections) — persisted like sidebarOpen. */
   rightPanelOpen?: boolean
-  /** Directory for the per-workspace RAG vector store (memory + web chunks).
-   *  Empty string = default ({dataPath}/vector-db). */
-  vectorDbPath?: string
-  /** User-level data root: skills/plans/mcp files and the
-   *  vector store all live under this folder. Default: ~/.codifa. */
+  /** User-level data root: skills/plans/mcp files live under this folder.
+   *  Default: ~/.codifa. */
   dataPath?: string
   /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */
   whisperModel?: string
@@ -191,11 +188,6 @@ export interface Settings {
   liveModel?: string
   /** Live voice id used for the realtime session (e.g. alloy). */
   liveVoice?: string
-  /** On-device embedding (RAG memory) model: repo id + optional mirror. */
-  embeddingModel?: string
-  embeddingBaseUrl?: string
-  /** TTL for web/fetch text cache + RAG storage (days). Default: 90. */
-  ragWebTtlDays?: number
   /** How many top web_search results get their page content auto-fetched
    *  before answering (0 = off, snippet-only). Default: 3. */
   webSearchAutoFetch?: number

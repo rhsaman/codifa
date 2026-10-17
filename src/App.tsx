@@ -611,56 +611,60 @@ export default function App() {
                   }
                   aria-label="Viewers"
                 >
-                  {/* Pane header: tab-list chevron + viewer tabs + the "+"
-                      opener on the left, the panel toggle (todos/schedules
-                      mode) and the pane collapse on the right. */}
-                  <div className="viewer-pane-head">
-                    <ViewerTabListButton />
-                    <ViewerTabBar />
-                    <ViewerAddButton />
-                    <ViewerPaneFullscreenButton />
-                    <span className="viewer-pane-spacer" aria-hidden="true" />
-                    <div className="viewer-pane-actions">
-                      <button
-                        className="titlebar-icon-btn panel-toggle"
-                        title={panelMode ? 'Show viewer tabs' : 'Show panel — todos, schedules, sub-agents'}
-                        aria-label={panelMode ? 'Show viewer tabs' : 'Show panel'}
-                        aria-pressed={panelMode}
-                        onClick={() => useViewerTabs.getState().togglePanelMode()}
-                      >
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                          <path d="M3 9.5h18" />
-                          <path d="M7 13.5h7M7 16.5h5" />
-                        </svg>
-                      </button>
-                      <button
-                        className="titlebar-icon-btn"
-                        title="Hide side pane"
-                        aria-label="Hide side pane"
-                        onClick={() => useViewerTabs.getState().setPaneOpen(false)}
-                      >
-                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                          <path d="M15 4v16" />
-                          <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
-                        </svg>
-                      </button>
+                  {/* Pane body: viewer content beside a vertical icon rail
+                      pinned to the pane's right edge — the panel/collapse
+                      icons on top, then the tab-list chevron, the "+" opener,
+                      fullscreen and the tabs themselves below them. */}
+                  <div className="viewer-pane-body">
+                    <div
+                      className="viewer-content"
+                      key={panelMode ? 'panel' : 'windows'}
+                      style={{
+                        flex: "1 1 auto",
+                        display: "flex",
+                        flexDirection: "column",
+                        minHeight: 0,
+                        minWidth: 0,
+                        overflow: "hidden",
+                      }}
+                    >
+                      <ViewerWindows />
                     </div>
-                  </div>
-                  <div
-                    className="viewer-content"
-                    key={panelMode ? 'panel' : 'windows'}
-                    style={{
-                      flex: "1 1 auto",
-                      display: "flex",
-                      flexDirection: "column",
-                      minHeight: 0,
-                      minWidth: 0,
-                      overflow: "hidden",
-                    }}
-                  >
-                    <ViewerWindows />
+                    <div className="viewer-pane-head">
+                      <div className="viewer-pane-actions">
+                        <button
+                          className="titlebar-icon-btn"
+                          title="Hide side pane"
+                          aria-label="Hide side pane"
+                          onClick={() => useViewerTabs.getState().setPaneOpen(false)}
+                        >
+                          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                            <path d="M15 4v16" />
+                            <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
+                          </svg>
+                        </button>
+                        <button
+                          className="titlebar-icon-btn panel-toggle"
+                          title={panelMode ? 'Show viewer tabs' : 'Show panel — todos, schedules, sub-agents'}
+                          aria-label={panelMode ? 'Show viewer tabs' : 'Show panel'}
+                          aria-pressed={panelMode}
+                          onClick={() => useViewerTabs.getState().togglePanelMode()}
+                        >
+                          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                            <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                            <path d="M3 9.5h18" />
+                            <path d="M7 13.5h7M7 16.5h5" />
+                          </svg>
+                        </button>
+                      </div>
+                      <ViewerTabListButton />
+                      <ViewerPaneFullscreenButton />
+                      <ViewerTabBar />
+                      {/* The "+" opener sits right below the tabs. */}
+                      <ViewerAddButton />
+                      <span className="viewer-pane-spacer" aria-hidden="true" />
+                    </div>
                   </div>
                 </section>
               </>

@@ -707,17 +707,13 @@ async def models_download(req: ModelDownloadRequest) -> dict:
         return {"ok": True, "kind": _PIPER_KIND, "model": voice}
     import model_download
 
-    kind = (req.kind or "").strip() or model_download.KIND_EMBEDDING
+    kind = (req.kind or "").strip() or model_download.KIND_WHISPER
     if kind not in (
         model_download.KIND_WHISPER,
-        model_download.KIND_EMBEDDING,
-        model_download.KIND_DECISION,
     ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     if kind == model_download.KIND_WHISPER:
         default_repo = model_download.WHISPER_DEFAULT_REPO
-    elif kind == model_download.KIND_DECISION:
-        default_repo = model_download.DECISION_DEFAULT_REPO
     else:
         default_repo = model_download.EMBEDDING_DEFAULT_REPO
     model = (req.model or "").strip() or default_repo
@@ -812,8 +808,6 @@ async def models_remove(req: ModelRemoveRequest) -> dict:
 
     if kind not in (
         model_download.KIND_WHISPER,
-        model_download.KIND_EMBEDDING,
-        model_download.KIND_DECISION,
     ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")
     removed = model_download.remove(kind, req.model)
@@ -826,8 +820,6 @@ def _require_model_kind(kind: str) -> str:
     kind = (kind or "").strip().lower()
     if kind not in (
         model_download.KIND_WHISPER,
-        model_download.KIND_EMBEDDING,
-        model_download.KIND_DECISION,
         _PIPER_KIND,
     ):
         raise HTTPException(status_code=400, detail=f"unknown model kind: {kind!r}")

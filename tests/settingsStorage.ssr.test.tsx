@@ -46,9 +46,7 @@ check('عنوان Data & maintenance', html.includes('Data &amp; maintenance') |
 check('فیلد Data path', html.includes('Data path'))
 check('دکمه Apply & move data', html.includes('Apply &amp; move data') || html.includes('Apply & move data'))
 
-console.log('3) تنظیمات TTL ذخیره‌سازی در Storage هست:')
-check('RAG web/fetch storage TTL', html.includes('RAG web/fetch storage TTL') || html.includes('RAG web/fetch storage TTL'.toLowerCase()))
-check('مقدار پیش‌فرض ۹۰ روز (RAG)', html.includes('Default: <code>90</code> days'))
+console.log('3) تنظیمات ذخیره‌سازی در Storage هست:')
 check('Cache TTL', html.includes('Cache TTL'))
 
 console.log('4) تب Storage وجود دارد:')

@@ -1,13 +1,20 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
-import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
+import { dropSide, edgeScroll, menuLeft, menuTop, tabMove } from "../lib/tabBar";
 import { useViewerTabs, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
 import { fmtAgo } from "../lib/time";
+
+/** Fixed width (px) of the "+" dropdown, used to clamp it on screen. */
+const ADD_MENU_WIDTH = 242;
+
+/** Width (px) of the tab-list dropdown, mirrored from `.tab-list-menu`. */
+const TAB_LIST_MENU_WIDTH = 410;
 
 function ReviewIcon() {
   return (
@@ -75,6 +82,7 @@ export function ViewerAddButton() {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const wrapRef = useRef<HTMLSpanElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -93,6 +101,16 @@ export function ViewerAddButton() {
     };
   }, [open]);
 
+  // Clamp the fixed menu fully inside the viewport once its height is known:
+  // the rail's menus open near the window edge, where the pane runs short.
+  useEffect(() => {
+    if (!open || !pos) return;
+    const h = menuRef.current?.offsetHeight;
+    if (!h) return;
+    const top = menuTop(pos.top, h, window.innerHeight);
+    if (top !== pos.top) setPos({ ...pos, top });
+  }, [open, pos]);
+
   const toggle = () => {
     if (open) {
       setOpen(false);
@@ -100,10 +118,8 @@ export function ViewerAddButton() {
     }
     const r = wrapRef.current?.getBoundingClientRect();
     if (r) {
-      // Clamp inside the viewport: near the window's right edge (RTL) the
-      // dropdown must never poke out.
-      const left = Math.max(12, Math.min(r.left, window.innerWidth - 242));
-      setPos({ top: r.bottom + 6, left });
+      // Opens toward the window's left: the "+" hugs the pane's right edge.
+      setPos({ top: r.bottom + 6, left: menuLeft(r.left, ADD_MENU_WIDTH, window.innerWidth, "left") });
     }
     setOpen(true);
   };
@@ -128,8 +144,10 @@ export function ViewerAddButton() {
       >
         +
       </button>
-      {open && pos && (
+      {open && pos &&
+        createPortal(
         <div
+          ref={menuRef}
           className="ws-menu viewer-add-menu"
           role="menu"
           style={{ position: "fixed", top: pos.top, left: pos.left }}
@@ -153,8 +171,9 @@ export function ViewerAddButton() {
               </button>
             );
           })}
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
     </span>
   );
 }
@@ -271,6 +290,8 @@ export function ViewerTabListButton() {
     <TabListButton
       sections={sections}
       label="Tab list"
+      placement="left"
+      menuWidth={TAB_LIST_MENU_WIDTH}
       footer={{
         label: visibleCount > 0 ? `Close all tabs (${visibleCount})` : "No open tabs",
         title: "Close all tabs of the active chat (kept in Recently closed)",
@@ -312,18 +333,19 @@ export function ViewerTabBar() {
   return (
     <div
       ref={barRef}
-      className="tab-bar viewer-tabs"
+      className="tab-bar viewer-tabs viewer-tabs-rail"
       role="tablist"
       aria-label="Viewers"
+      aria-orientation="vertical"
       onDragOver={(e) => {
         if (!dragId) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = "move";
-        // Dragging near a bar edge scrolls it, so off-screen tabs stay reachable.
+        // Dragging near a rail edge scrolls it, so off-screen tabs stay reachable.
         const bar = barRef.current;
         if (!bar) return;
-        const delta = edgeScroll(e.clientX, bar.getBoundingClientRect());
-        if (delta) bar.scrollLeft += delta;
+        const delta = edgeScroll(e.clientY, bar.getBoundingClientRect(), "y");
+        if (delta) bar.scrollTop += delta;
       }}
       onDrop={(e) => {
         // Tabs handle their own drop; empty space past the last tab drops at the end.
@@ -331,7 +353,7 @@ export function ViewerTabBar() {
         const els = barRef.current?.querySelectorAll<HTMLElement>('[role="tab"]');
         const lastEl = els && els.length > 0 ? els[els.length - 1] : null;
         const lastTab = tabs[tabs.length - 1];
-        if (!lastEl || !lastTab || e.clientX <= lastEl.getBoundingClientRect().right) return;
+        if (!lastEl || !lastTab || e.clientY <= lastEl.getBoundingClientRect().bottom) return;
         const from = e.dataTransfer.getData("text/plain") || dragId;
         if (!from || from === lastTab.id) return;
         e.preventDefault();
@@ -355,7 +377,7 @@ export function ViewerTabBar() {
             tabIndex={0}
             draggable
             className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging" : ""}${dropCls}`}
-            title={title}
+            aria-label={title}
             onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
@@ -364,7 +386,7 @@ export function ViewerTabBar() {
                 return;
               }
               // Alt+Arrow moves the focused tab without dragging the mouse.
-              const target = tabMove(tabs.map((x) => x.id), t.id, e.key, e.altKey);
+              const target = tabMove(tabs.map((x) => x.id), t.id, e.key, e.altKey, "y");
               if (!target) return;
               e.preventDefault();
               useViewerTabs.getState().moveViewerTab(t.id, target.toId, target.after);
@@ -381,7 +403,7 @@ export function ViewerTabBar() {
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = dropSide(e.clientX, rect) === "after";
+              const after = dropSide(e.clientY, rect, "y") === "after";
               setDropTarget((prev) =>
                 prev?.id === t.id && prev.after === after ? prev : { id: t.id, after },
               );
@@ -394,7 +416,7 @@ export function ViewerTabBar() {
               const from = e.dataTransfer.getData("text/plain") || dragId;
               if (from && from !== t.id) {
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = dropSide(e.clientX, rect) === "after";
+                const after = dropSide(e.clientY, rect, "y") === "after";
                 useViewerTabs.getState().moveViewerTab(from, t.id, after);
               }
               clearDrag();
@@ -408,20 +430,24 @@ export function ViewerTabBar() {
                 <Icon />
               )}
             </span>
-            <span className="editor-tab-label" dir="ltr">{title}</span>
-            <button
-              type="button"
-              className="editor-tab-close"
-              title="Close viewer"
-              aria-label={`Close ${title}`}
-              draggable={false}
-              onClick={(e) => {
-                e.stopPropagation();
-                useViewerTabs.getState().closeViewer(t.id);
-              }}
-            >
-              <CloseIcon />
-            </button>
+            <span className="editor-tab-label" dir="ltr">
+              {/* Sits BEFORE the title so it lands at the label's left edge,
+                  away from the tab's icon. */}
+              <button
+                type="button"
+                className="editor-tab-close"
+                title="Close viewer"
+                aria-label={`Close ${title}`}
+                draggable={false}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useViewerTabs.getState().closeViewer(t.id);
+                }}
+              >
+                <CloseIcon />
+              </button>
+              {title}
+            </span>
           </div>
         );
       })}

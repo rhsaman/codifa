@@ -2147,21 +2147,14 @@ export const ChatMessageView = memo(
       voice,
     });
     const chain: SpeakProviderOpts[] = [];
-    const isLocalTts = st.ttsProviderId === "local";
-    // Local mode has no provider entry: the local voice is passed via the
-    // TtsLocalRequest below, so the chain stays empty and no remote call
-    // is ever attempted while local is ON.
-    const primary = isLocalTts ? undefined : providers.find((p) => p.id === st.ttsProviderId);
+    const primary = providers.find((p) => p.id === st.ttsProviderId);
     if (primary) chain.push(toSpeakOpts(primary, st.ttsModel, st.ttsVoice));
-    // When the on-device voice is ON, never contact a remote provider.
-    if (!isLocalTts) {
-      for (const fb of st.ttsFallbacks ?? []) {
-        const p = providers.find((x) => x.id === fb.providerId);
-        if (!p) continue;
-        chain.push(toSpeakOpts(p, fb.model, fb.voice));
-      }
+    for (const fb of st.ttsFallbacks ?? []) {
+      const p = providers.find((x) => x.id === fb.providerId);
+      if (!p) continue;
+      chain.push(toSpeakOpts(p, fb.model, fb.voice));
     }
-    if (chain.length === 0 && !isLocalTts) {
+    if (chain.length === 0) {
       const msg = "برای پخش صدا ابتدا یک پروایدر TTS در تنظیمات ← مدل‌ها انتخاب کنید";
       const bannerChatId = useStore.getState().chats.find((c) => c.messages.some((m) => m.id === message.id))?.id;
       if (bannerChatId) useStore.getState().setChatTtsError(bannerChatId, msg);
@@ -2177,7 +2170,7 @@ export const ChatMessageView = memo(
       return;
     }
     try {
-      await ttsToggle(speakable, chain, { ttsProviderId: st.ttsProviderId, ttsModel: st.ttsModel, ttsBaseUrl: st.settings?.ttsBaseUrl, ttsVoice: st.ttsVoice });
+      await ttsToggle(speakable, chain);
     } catch (err) {
       const friendly = friendlyTtsError(err);
       if (!friendly) return;

@@ -10,6 +10,40 @@ import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTy
 import { FileChip, FileIcon } from "./FileIcon";
 import { getHighlightedLines } from "./ChatMessage";
 
+/** Native PDF pane: WKWebView renders PDFs itself, so the viewer shows the
+ *  file through a Blob object URL instead of backend-rasterized page images.
+ *  The URL is created once per file and revoked on unmount/change (leaking one
+ *  per opened PDF would pin the whole file in memory for the session). */
+function PdfViewer({ base64, title }: { base64: string; title?: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    // base64 → bytes without a data-URL detour; `atob` yields a binary string
+    // that must be widened to bytes or the PDF header is corrupted.
+    let bin: string;
+    try {
+      bin = atob(base64);
+    } catch {
+      setUrl(null);
+      return;
+    }
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const objectUrl = URL.createObjectURL(
+      new Blob([bytes], { type: "application/pdf" }),
+    );
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [base64]);
+  if (!url) return <div className="file-viewer-note">Preparing PDF…</div>;
+  return (
+    <iframe
+      className="file-viewer-pdf"
+      src={url}
+      title={title ? `${title} (PDF)` : "PDF"}
+    />
+  );
+}
+
 /** Never paint more than this many characters of ONE file: a multi-megabyte
  *  log would freeze the tab. Copy keeps the FULL text. */
 const FILE_RENDER_CAP = 400_000;
@@ -278,6 +312,8 @@ export function FileViewerPanel({
     loading: boolean;
     content?: string;
     imageData?: string;
+    /** Whole-file base64 of a PDF handed to the webview's own PDF renderer. */
+    pdfBase64?: string;
     html?: string;
     pages?: string[];
     error?: string;
@@ -622,7 +658,23 @@ export function FileViewerPanel({
         // Excel as styled HTML (headings, tables, fonts — uploads under the
         // data root included).
         if (DOC_EXTS.has(ext)) {
-          const doc = await readDocumentText(root || "", absPath, ext === "pdf" ? "pages" : DOC_TEXT_EXTS.has(ext) ? "text" : "html", SHEET_EXTS.has(ext) && sheet.trim() ? { sheet: sheet.trim() } : undefined);
+          // PDF: the webview renders PDFs natively, so hand it the bytes
+          // instead of asking the backend to rasterize pages — no PDF engine
+          // is bundled, and the native pane has selection/zoom for free.
+          if (ext === "pdf") {
+            const b64 = await api.readPdfBase64(absPath);
+            if (!alive) return;
+            setState(
+              b64
+                ? { loading: false, pdfBase64: b64 }
+                : {
+                    loading: false,
+                    error: `Could not load this PDF (missing, or larger than 64 MB): ${absPath}`,
+                  },
+            );
+            return;
+          }
+          const doc = await readDocumentText(root || "", absPath, DOC_TEXT_EXTS.has(ext) ? "text" : "html", SHEET_EXTS.has(ext) && sheet.trim() ? { sheet: sheet.trim() } : undefined);
           if (!alive) return;
           if (doc.error && ext === "csv") {
             const fallback = await readDocumentText(root || "", absPath, "text");
@@ -1116,7 +1168,7 @@ export function FileViewerPanel({
             document.body,
           )
         : null}
-      {state.loading && state.content == null && state.html == null && state.pages == null && state.imageData == null && !state.error && <div className="file-viewer-note">Loading…</div>}
+      {state.loading && state.content == null && state.html == null && state.pages == null && state.imageData == null && state.pdfBase64 == null && !state.error && <div className="file-viewer-note">Loading…</div>}
       {state.error && <div className="file-viewer-note">⚠ {state.error}</div>}
       {state.error && similar.length > 0 && (
         <div className="fv-suggest">
@@ -1140,6 +1192,9 @@ export function FileViewerPanel({
         <div className="file-viewer-image">
           <img src={state.imageData} alt={fileBasename(filePath)} />
         </div>
+      )}
+      {state.pdfBase64 && (
+        <PdfViewer base64={state.pdfBase64} title={fileBasename(filePath)} />
       )}
       {state.pages && (
         <div className="file-viewer-pages">

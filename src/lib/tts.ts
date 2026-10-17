@@ -46,7 +46,7 @@ export function friendlyTtsError(err: unknown): string {
   if (!msg) return 'پخش صدا ناموفق بود — دوباره تلاش کنید'
   const lower = msg.toLowerCase()
   if (lower.includes('aborted') || lower.includes('aborterror')) return ''
-  if (msg.includes('Python agent not ready')) return 'سرویس صوتی آماده نیست — برنامه را دوباره راه‌اندازی کنید'
+  if (msg.includes('the local backend is not ready')) return 'سرویس صوتی آماده نیست — برنامه را دوباره راه‌اندازی کنید'
   if (lower.includes('failed to fetch') || lower.includes('networkerror') || lower.includes('load failed'))
     return 'ارتباط با سرویس صوتی قطع شد — اتصال اینترنت/سرور محلی را بررسی کنید'
   if (lower.includes('timeout') || lower.includes('timed out'))
@@ -137,61 +137,6 @@ export function setTtsRetryConfig(cfg: Record<string, unknown>): void {
 /** Normalize a single provider opts or a primary+fallback chain into a chain. */
 function toTtsChain(opts: SpeakProviderOpts | SpeakProviderOpts[]): SpeakProviderOpts[] {
   return Array.isArray(opts) ? opts : [opts]
-}
-
-/** Local TTS request settings (mirrors Settings tts* fields without importing the store). */
-export interface TtsLocalRequest {
-  ttsProviderId?: string
-  ttsModel?: string
-  ttsBaseUrl?: string
-  ttsVoice?: string
-}
-
-/** Default local voice id used when ttsModel is empty (pocket-tts-farsi-v2). */
-export const LOCAL_TTS_DEFAULT_MODEL = 'default'
-
-/**
- * Local-first single-sentence fetch (STT-style fallback).
- * When cfg.ttsProviderId is 'local', try the on-device voice once via
- * speakTextStream (kind 'local', model ttsModel or default, baseUrl ttsBaseUrl);
- * any throw (missing model / sidecar down) falls through to the remote
- * fallback chain via fetchSentenceRobust. Non-local ids delegate directly
- * to fetchSentenceRobust so remote behavior is unchanged.
- */
-export async function fetchSentenceWithLocalFallback(
-  sentence: string,
-  cfg: TtsLocalRequest,
-  fallback: SpeakProviderOpts | SpeakProviderOpts[],
-  signal: AbortSignal,
-): Promise<Blob> {
-  const remote = toTtsChain(fallback)
-  if (cfg.ttsProviderId !== 'local') return fetchSentenceRobust(sentence, remote, signal)
-  const rawModel = (cfg.ttsModel ?? '').trim()
-  const rawVoice = (cfg.ttsVoice ?? '').trim()
-  // Only a real local voice id is sent; remote TTS model ids (containing
-  // '/' or known remote names), remote voices (e.g. 'alloy') and the 'local'
-  // provider id would otherwise shadow the bundled pocket voice. Legacy
-  // Piper ids ('fa_IR-*') resolve to the pocket default voice server-side.
-  const isLocalVoiceId = (v: string): boolean => {
-    if (!v) return false
-    if (v.toLowerCase() === 'local') return false
-    if (v.includes('/') || v.includes('\\')) return false
-    if (v === 'tts-1' || v === 'tts-1-hd') return false
-    if (v.endsWith('.onnx') || v.endsWith('.onnx.json')) return false
-    return true
-  }
-  const resolvedVoice = [rawModel, rawVoice].find(isLocalVoiceId) ?? LOCAL_TTS_DEFAULT_MODEL
-  const localOpts: SpeakProviderOpts = {
-    kind: 'local',
-    baseUrl: (cfg.ttsBaseUrl ?? '').trim(),
-    model: resolvedVoice,
-  }
-  try {
-    return await speakTextStream(sentence, localOpts, undefined, signal)
-  } catch (err) {
-    // Local ON means fully offline: never contact a remote provider.
-    throw err
-  }
 }
 
 /** Abort-aware sleep between retry rounds; throws immediately when aborted. */
@@ -290,7 +235,6 @@ export async function playTts(
   text: string,
   opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
-  local?: TtsLocalRequest,
 ): Promise<void> {
   stopTtsGlobal()
   const controller = new AbortController()
@@ -306,9 +250,7 @@ export async function playTts(
   // once per sentence (default model fa_IR-amir-medium), then fall back to the
   // remote chain on any error. Remote selection uses the chain directly.
   const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
-    local && local.ttsProviderId === 'local'
-      ? fetchSentenceWithLocalFallback(sentence, local, chain, signal)
-      : fetchSentenceRobust(sentence, chain, signal)
+    fetchSentenceRobust(sentence, chain, signal)
   const sentences = splitTtsSentences(text)
   // متن خیلی کوتاه: همان مسیر تک‌فایل قبلی (بدون صف).
   const queue = sentences.length > 1 ? sentences : [text]
@@ -402,7 +344,6 @@ export async function playTtsStream(
   source: TtsStreamSource,
   opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
-  local?: TtsLocalRequest,
 ): Promise<void> {
   stopTtsGlobal()
   const controller = new AbortController()
@@ -414,9 +355,7 @@ export async function playTtsStream(
   notifyTts()
   const chain = toTtsChain(opts)
   const fetchOne = (sentence: string, signal: AbortSignal): Promise<Blob> =>
-    local && local.ttsProviderId === 'local'
-      ? fetchSentenceWithLocalFallback(sentence, local, chain, signal)
-      : fetchSentenceRobust(sentence, chain, signal)
+    fetchSentenceRobust(sentence, chain, signal)
   let played = 0
   let failStreak = 0
   let playedAny = false
@@ -690,7 +629,6 @@ export async function toggleTts(
   text: string,
   opts: SpeakProviderOpts | SpeakProviderOpts[],
   owner: number,
-  local?: TtsLocalRequest,
 ): Promise<void> {
   if (activeOwner === owner) {
     if (activeStatus === 'speaking') {
@@ -706,7 +644,7 @@ export async function toggleTts(
       return
     }
   }
-  await playTts(text, opts, owner, local)
+  await playTts(text, opts, owner)
 }
 
 /** پخش‌کننده TTS هر پیام — همه نمونه‌ها روی یک پخش سراسری سوارند. */
@@ -733,15 +671,15 @@ export function useTtsPlayback() {
   }, [myId])
 
   const play = useCallback(
-    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[], local?: TtsLocalRequest) => {
-      await playTts(text, opts, myId, local)
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
+      await playTts(text, opts, myId)
     },
     [myId],
   )
 
   const toggle = useCallback(
-    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[], local?: TtsLocalRequest) => {
-      await toggleTts(text, opts, myId, local)
+    async (text: string, opts: SpeakProviderOpts | SpeakProviderOpts[]) => {
+      await toggleTts(text, opts, myId)
     },
     [myId],
   )

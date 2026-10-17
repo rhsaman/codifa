@@ -69,6 +69,7 @@ const bridge: CoderApi = {
   copyText: (text) => invoke<boolean>('copy_text', { text }),
   searchContent: (root, query) => invoke<SearchMatch[]>('search_content', { root, query }),
   readImage: (absPath) => invoke<string | null>('read_image', { absPath }),
+  readPdfBase64: (absPath) => invoke<string | null>('read_pdf_base64', { absPath }),
   normalizeImage: (absPath) => invoke('normalize_image', { absPath }),
   captureScreen: () => invoke('capture_screen'),
   captureRegion: () => invoke('capture_region'),

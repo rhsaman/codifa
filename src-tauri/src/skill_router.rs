@@ -24,6 +24,70 @@ pub struct SkillSection {
     pub text: String,
     /// Attached names that no longer exist in the store.
     pub missing: Vec<String>,
+    /// Names AUTO-MATCHED from the user's prompt this turn. The renderer shows
+    /// them as ⚡ chips, so the user can see which skill actually ran.
+    pub matched: Vec<String>,
+}
+
+/// Auto-match budget: how many skills one turn may pick up from the prompt.
+const MAX_AUTO_MATCHED: usize = 3;
+/// Minimum score (see `skill_score`) before a skill is auto-inlined. 2 means a
+/// single name word is not enough on its own — the request must agree on two
+/// signals, or carry one complete `fa_keywords` phrase.
+const MATCH_MIN_SCORE: usize = 2;
+
+/// Lowercase + whitespace-collapse, used for prompt/keyword matching.
+fn normalize_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Distinctive words of a phrase (4+ chars), for partial keyword hits.
+fn words_of(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.chars().count() >= 4)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// How well one skill matches an already-normalized prompt.
+///
+/// Weighted on purpose: the user's own `fa_keywords` phrase is the strongest
+/// signal (it is literally what they type), then the skill's name/slug, then
+/// the individual words of a multi-word keyword. The description is
+/// deliberately NOT used — it is prose, and matching it fired on almost every
+/// request.
+fn skill_score(s: &Value, hay: &str) -> usize {
+    let mut score = 0usize;
+    let name_words = words_of(s["name"].as_str().unwrap_or_default());
+    let slug_words = words_of(s["slug"].as_str().unwrap_or_default());
+    let name_hits = name_words
+        .iter()
+        .chain(slug_words.iter())
+        .filter(|w| hay.contains(w.as_str()))
+        .count();
+    // Capped so a generic name cannot outrank a real keyword match.
+    score += name_hits.min(2);
+
+    if let Some(kws) = s["fa_keywords"].as_array() {
+        for kw in kws.iter().filter_map(Value::as_str) {
+            let kw = normalize_text(kw);
+            if kw.chars().count() < 3 {
+                continue;
+            }
+            if hay.contains(&kw) {
+                // The complete phrase is in the request: strongest signal.
+                score += 3;
+            } else {
+                // Multi-word keyword ("landing page design") still matches a
+                // shorter paraphrase ("landing page") word by word.
+                score += words_of(&kw)
+                    .iter()
+                    .filter(|w| hay.contains(w.as_str()))
+                    .count();
+            }
+        }
+    }
+    score
 }
 
 /// One inlined skill (the ones the user attached with `@mention`).
@@ -103,13 +167,16 @@ fn load_skills(root: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Build the SKILLS section for one turn: the catalog of installed skills plus
-/// the full bodies of the ones the user attached.
+/// Build the SKILLS section for one turn: the catalog of installed skills, the
+/// bodies of the ones the user attached, and the bodies of the ones that
+/// AUTO-MATCH the request.
 ///
 /// The catalog is what makes on-demand loading possible — without it the model
 /// has no way to know a skill exists. Attached skills are inlined whole because
-/// the user asked for them explicitly.
-pub fn build_section(root: &str, manual_names: &[String]) -> SkillSection {
+/// the user asked for them explicitly; auto-matched ones are inlined too, since
+/// leaving the pick to the model meant it mostly skipped the `load_skill` call
+/// and the user never saw which skill applied (no badge, no effect).
+pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
     let all = load_skills(root);
     let mut text = String::new();
 
@@ -163,7 +230,60 @@ pub fn build_section(root: &str, manual_names: &[String]) -> SkillSection {
         );
     }
 
-    SkillSection { text, missing }
+    // ---- AUTO-MATCH from the prompt -------------------------------------
+    // This is the "decision router": instead of only listing the catalog and
+    // hoping the model calls `load_skill`, the turn's own prompt is scored
+    // against every installed skill and the best fits are inlined. The user
+    // sees them as ⚡ chips, and the model no longer has to guess.
+    let hay = normalize_text(prompt);
+    let mut matched: Vec<String> = Vec::new();
+    if !hay.is_empty() {
+        let mut scored: Vec<(usize, &Value)> = all
+            .iter()
+            .filter(|s| {
+                // An attached skill is already inlined — never duplicate it.
+                !picked.iter().any(|p| p["name"] == s["name"])
+            })
+            .map(|s| (skill_score(s, &hay), s))
+            .filter(|(score, _)| *score >= MATCH_MIN_SCORE)
+            .collect();
+        // Highest score first; ties keep the store's name order (stable sort).
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.truncate(MAX_AUTO_MATCHED);
+        for (_, s) in scored {
+            let name = s["name"].as_str().unwrap_or_default().trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            matched.push(name);
+        }
+        if !matched.is_empty() {
+            text.push_str(
+                "\n\n=== AUTO-MATCHED SKILLS ===\n\
+                 These skills were picked for THIS request from its keywords. Adopt \
+                 their role and follow their instructions (the decision is already \
+                 made — do NOT call load_skill for them).\n",
+            );
+            let bodies: Vec<String> = matched_bodies(&all, &matched);
+            text.push_str(&bodies.join("\n\n"));
+        }
+    }
+
+    SkillSection { text, missing, matched }
+}
+
+/// Formatted bodies for the auto-matched names, in the given order.
+fn matched_bodies(all: &[Value], matched: &[String]) -> Vec<String> {
+    matched
+        .iter()
+        .filter_map(|n| {
+            all.iter().find(|s| {
+                s["name"].as_str().unwrap_or_default().trim().to_lowercase()
+                    == n.to_lowercase()
+            })
+        })
+        .map(format_skill_body)
+        .collect()
 }
 
 #[cfg(test)]
@@ -179,6 +299,43 @@ mod tests {
             "content": format!("body of {name}"),
             "files": [],
         })
+    }
+
+    #[test]
+    fn auto_match_picks_from_the_prompt_keywords() {
+        // The user's own Persian phrase must match without any embedding —
+        // that is what `fa_keywords` exists for.
+        let movie = json!({
+            "name": "Movie Finder",
+            "slug": "movie-finder",
+            "description": "find movies",
+            "fa_keywords": ["فیلم", "سریال"],
+            "content": "BODY",
+            "files": [],
+        });
+        let trans = json!({
+            "name": "translation",
+            "slug": "translation",
+            "description": "translate",
+            "fa_keywords": ["ترجمه", "ترجمه کن"],
+            "content": "BODY",
+            "files": [],
+        });
+        let hay = normalize_text("یه فیلم خوب معرفی کن");
+        assert!(skill_score(&movie, &hay) >= MATCH_MIN_SCORE);
+        // An unrelated request must NOT drag a skill in.
+        let other = normalize_text("refactor this module");
+        assert!(skill_score(&trans, &other) < MATCH_MIN_SCORE);
+    }
+
+    #[test]
+    fn auto_match_needs_two_signals_or_a_whole_keyword() {
+        let mut s = skill("Summarization", "summarize text");
+        s["fa_keywords"] = json!(["خلاصه کن"]);
+        // A bare shared word is not enough on its own...
+        assert!(skill_score(&s, &normalize_text("a short note")) < MATCH_MIN_SCORE);
+        // ...but one complete keyword phrase is decisive.
+        assert!(skill_score(&s, &normalize_text("این متن رو خلاصه کن")) >= MATCH_MIN_SCORE);
     }
 
     #[test]
@@ -246,20 +403,20 @@ mod tests {
         let root = dir.to_str().unwrap();
 
         // The catalog is what lets the model load a skill on demand.
-        let plain = build_section(root, &[]);
+        let plain = build_section("", root, &[]);
         assert!(plain.text.contains("=== AVAILABLE SKILLS ==="), "{}", plain.text);
         assert!(plain.text.contains("Movie Finder: find movies"), "{}", plain.text);
         assert!(!plain.text.contains("BODY HERE"), "catalog must not inline bodies");
         assert!(plain.missing.is_empty());
 
         // An attached skill is inlined whole.
-        let attached = build_section(root, &["Movie Finder".into()]);
+        let attached = build_section("", root, &["Movie Finder".into()]);
         assert!(attached.text.contains("=== ATTACHED SKILLS ==="), "{}", attached.text);
         assert!(attached.text.contains("BODY HERE"), "{}", attached.text);
         assert!(attached.missing.is_empty());
 
         // A deleted/renamed attachment is reported instead of silently ignored.
-        let gone = build_section(root, &["Ghost Skill".into()]);
+        let gone = build_section("", root, &["Ghost Skill".into()]);
         assert_eq!(gone.missing, vec!["ghost skill".to_string()]);
         assert!(!gone.text.contains("ATTACHED SKILLS"));
 
@@ -271,7 +428,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("codifa-skill-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let section = build_section(dir.to_str().unwrap(), &[]);
+        let section = build_section("", dir.to_str().unwrap(), &[]);
         assert!(section.text.is_empty(), "{}", section.text);
         assert!(section.missing.is_empty());
         let _ = std::fs::remove_dir_all(&dir);

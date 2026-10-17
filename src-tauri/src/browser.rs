@@ -104,7 +104,7 @@ fn profile_dir() -> PathBuf {
 /// Resolve an executable on PATH (a GUI-launched app has a minimal PATH, so
 /// the login-shell PATH is merged in first — same helper the sidecar uses).
 fn which(name: &str) -> Option<PathBuf> {
-    let path = crate::sidecar::shell_path();
+    let path = crate::shell_env::shell_path();
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
         if candidate.is_file() {

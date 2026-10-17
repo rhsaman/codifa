@@ -442,6 +442,15 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         // A scheduled run has no UI session, so it uses the default engine
         // chain (DuckDuckGo) rather than a user's Settings → Plugins order.
         search_plugins: Vec::new(),
+        // Headless runs have no UI to compact against, so they keep the
+        // default threshold and no summarizer override; mid-turn compaction
+        // still protects them from a "context length exceeded" hard failure.
+        compact_at_percent: 80,
+        fallback_provider: String::new(),
+        fallback_model: String::new(),
+        fallback_base_url: String::new(),
+        fallback_api_key: String::new(),
+        fallback_api_keys: Vec::new(),
     };
 
     let mut final_text = String::new();

@@ -124,22 +124,20 @@ async function run() {
     check('۲) در نهایت event های داده رسید', received.filter((e) => e.kind !== 'retry').length === 2, received)
   }
 
-  // 3) Mid-stream drop AFTER events received → NOT auto-reconnected (intentional).
-  //    When events were already flowing, the drop is treated as an interruption
-  //    (client disconnect / user navigated away) rather than a sidecar crash.
-  //    Auto-reconnecting here would cause the unwanted "Provider hiccup during
-  //    idle" behavior.  Instead, streamChat throws so the UI can show a manual
-  //    Retry banner that resumes from the on-disk LangGraph checkpoint.
+  // 3) Mid-stream drop AFTER events received → AUTO-RESUMED (phase 1 of the
+  //    Tauri migration). A transport drop is not model silence, so the turn
+  //    continues from its checkpoint instead of stranding the user on a manual
+  //    Retry banner. No timer is involved — the socket closing IS the signal.
   {
-    let calls = 0
+    let streamCalls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
-      calls++
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
-      // First attempt drops mid-stream; no second attempt should happen.
+      streamCalls++
+      // First stream attempt drops mid-way (after 'a'); the second completes.
       return makeStreamResponse(
         [{ kind: 'text', content: 'a' }, { kind: 'text', content: 'b' }, { kind: 'done' }],
-        calls === 2,
+        streamCalls === 1,
       )
     }
     let threwMsg = ''
@@ -148,9 +146,15 @@ async function run() {
     } catch (err) {
       threwMsg = (err as Error).message
     }
-    check('۳) قطع وسط استریم بعد از event → auto-reconnect نمی‌شود', calls === 2, calls)
-    check('۳) خطا "Connection lost mid-turn" برگشت', threwMsg.includes('Connection lost mid-turn'), threwMsg)
-    check('۳) event های جزئی قبل از قطع رسیدند', received.some((e) => e.kind === 'text'), received)
+    check('۳) قطع وسط استریم → خودکار ادامه می‌دهد (بدون throw)', threwMsg === '', threwMsg)
+    check('۳) استریم دوباره درخواست شد', streamCalls === 2, streamCalls)
+    check(
+      '۳) رویداد retry با reconnecting فرستاده شد',
+      received.some((e) => e.kind === 'retry' && e.reconnecting === true),
+      received.filter((e) => e.kind === 'retry'),
+    )
+    check('۳) ایونت‌های جزئی قبل از قطع رسیدند', received.some((e) => e.kind === 'text'), received)
+    check('۳) استریم نهایی کامل شد', received.some((e) => e.kind === 'done'), received)
   }
 
   // 4) Manual abort → no reconnect, AbortError propagates.
@@ -221,17 +225,18 @@ async function run() {
   }
 
   // 7) Stream ends WITHOUT a terminal `done` but AFTER delivering events →
-  //    NOT auto-reconnected (same as case 3). The gotAnyEvent flag is true
-  //    because a "text" event was delivered before the stream closed, so
-  //    streamChat throws "Connection lost mid-turn" instead of reconnecting.
-  //    The UI shows a Retry banner; clicking it resumes from the checkpoint.
+  //    AUTO-RESUMED (same rule as case 3): a socket that closes mid-turn is a
+  //    transport drop, so the request is re-sent and the backend continues
+  //    from the interrupted turn's checkpoint. It only stops recovering when a
+  //    terminal `error` event arrives (the turn really died) or the attempt
+  //    budget (MAX_RECONNECT_ATTEMPTS) is exhausted.
   {
     let streamCalls = 0
     const received: any[] = []
     ;(globalThis as any).fetch = async (url: string) => {
       if (url.endsWith('/health')) return new Response(null, { status: 200 })
-      if (url.endsWith('/chat/stream')) streamCalls++
-      // First attempt closes at EOF with NO `done` (simulates a sidecar crash).
+      streamCalls++
+      // First attempt closes at EOF with NO `done` (simulates a hard drop).
       if (streamCalls === 1) return makeStreamResponse([{ kind: 'text', content: 'partial' }])
       return makeStreamResponse([{ kind: 'text', content: 'rest' }, { kind: 'done' }])
     }
@@ -241,8 +246,14 @@ async function run() {
     } catch (err) {
       threwMsg = (err as Error).message
     }
-    check('۷) استریم بدون done (با event قبلی) → auto-reconnect نمی‌شود', streamCalls === 1, streamCalls)
-    check('۷) خطا "Connection lost mid-turn" برگشت', threwMsg.includes('Connection lost mid-turn'), threwMsg)
+    check('۷) استریم بدون done → خودکار ادامه می‌دهد (بدون throw)', threwMsg === '', threwMsg)
+    check('۷) استریم دوباره درخواست شد', streamCalls === 2, streamCalls)
+    check(
+      '۷) رویداد retry با reconnecting فرستاده شد',
+      received.some((e) => e.kind === 'retry' && e.reconnecting === true),
+      received.filter((e) => e.kind === 'retry'),
+    )
+    check('۷) ادامه‌ی ترن و done رسیدند', received.some((e) => e.kind === 'text' && e.content === 'rest') && received.some((e) => e.kind === 'done'), received)
   }
 
   // 8) Stream ends with an `error` event but NO `done` → NOT a connection loss.

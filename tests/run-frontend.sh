@@ -110,6 +110,7 @@ bidi|tests/bidi.test.ts|-
 fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
 chatTree|src/lib/chatTree.test.ts|
+webkitDeadKey|src/lib/webkitDeadKey.test.ts|
 fileDrag|src/lib/fileDrag.test.ts|
 chatWindowMeta|src/lib/chatWindowMeta.test.ts|
 chatClose|src/lib/chatClose.test.ts|
@@ -129,6 +130,7 @@ resumeNote|tests/resumeNote.test.ts|--jsx=automatic --packages=external --alias:
 toolEditGroup|tests/toolEditGroup.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 exploreHeader|tests/exploreHeader.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 explorePanel|tests/explorePanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+exploreVisual|tests/exploreVisual.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolOutputPanel|tests/toolOutputPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 terminalPanel|tests/terminalPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron

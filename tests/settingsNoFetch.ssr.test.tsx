@@ -159,7 +159,10 @@ console.log('5) On-device models UI (Models tab):')
   check('Tools tab renders the tool-model selectors', toolsHtml.includes('Tool Models'))
   const modelsHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="models" />)
   check('Models tab shows the STT card', modelsHtml.includes('Speech to Text'))
-  check('Models tab offers Download', modelsHtml.includes('Download'))
+  // The on-device models (and their Download button) were removed with the
+  // local TTS/Whisper engines: this tab only configures EXTERNAL providers now.
+  check('Models tab is the external Media Providers tab', modelsHtml.includes('Media Providers'))
+  check('Models tab offers no on-device download', !modelsHtml.includes('Download'))
   check('No network calls while rendering', networkCalls === 0, networkCalls)
 }
 

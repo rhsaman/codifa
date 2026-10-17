@@ -22,7 +22,7 @@ export default defineConfig(({ mode }) => {
       // The Rust build tree changes constantly during `tauri dev`; watching
       // it triggers endless page reloads.
       watch: {
-        ignored: ['**/src-tauri/target/**', '**/backend/.venv/**'],
+        ignored: ['**/src-tauri/target/**'],
       },
     },
     // webOnly is kept as a named flag so harness scripts can detect the mode.

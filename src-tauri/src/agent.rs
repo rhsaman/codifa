@@ -18,9 +18,36 @@ use crate::tools;
 
 /// Maximum tool-loop iterations per turn (mirrors graph.py MAX_STEPS).
 const MAX_STEPS: usize = 60;
+/// Mid-turn auto-compaction: how many times ONE turn may fold its history.
+/// A single turn can run MAX_STEPS tool calls, so a fold has to be possible
+/// while the agent works — but more than a handful would mean the summarizer
+/// itself is thrashing.
+const MAX_COMPACTIONS_PER_TURN: usize = 4;
+/// Context window assumed when the renderer does not know the model's real one
+/// (a custom model without metadata sends 0). Without this fallback mid-turn
+/// auto-compaction would be silently disabled for those models.
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Output budget for the auto-compaction summary.
+const COMPACT_MAX_OUTPUT: usize = 4096;
+/// The summarizer is a side call, so it keeps a real timeout: a hung
+/// summarizer must not freeze the very turn it is trying to shrink.
+const COMPACT_TIMEOUT_SECS: u64 = 300;
 /// The explore sub-agent must answer in seconds, not minutes — a much smaller
 /// step budget than the main agent's, with a forced final report (below).
 const SUBAGENT_MAX_STEPS: usize = 12;
+/// How many times ONE explore sub-agent may be attempted before the parent
+/// gives up on it.
+///
+/// A sub-agent runs INSIDE the parent turn on the parent's own stream, so the
+/// frontend's reconnect ladder can never observe it failing — a provider hiccup
+/// (or a run that produced nothing at all) used to be final, and the user just
+/// watched a dead explore card while the turn stalled ("explore sometimes hangs
+/// and does nothing").
+const SUBAGENT_MAX_ATTEMPTS: usize = 3;
+/// Backoff between explore attempts. Sub-second on purpose: this retries a
+/// FAILED call — it never "gives the model more time" (model silence is not a
+/// failure anywhere in this agent).
+const SUBAGENT_RETRY_BACKOFF_MS: u64 = 600;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 const TOOL_RESULT_CAP: usize = 4000;
 /// Cap on the tool result forwarded to the MODEL: full multi-MB read/grep
@@ -236,10 +263,34 @@ pub struct AgentRequest {
     /// turn, so the user's list order IS the fallback chain.
     #[serde(default)]
     pub search_plugins: Vec<Value>,
+    /// Auto-compaction threshold as a percentage of the RAW context window —
+    /// the renderer has always sent this (the Python graph consumed it), and
+    /// the native loop now honours it MID-TURN: once a turn's wire history
+    /// outgrows `context_window * compact_at_percent / 100`, the older half is
+    /// folded into a running summary instead of waiting for the next turn.
+    #[serde(default = "default_compact_percent")]
+    pub compact_at_percent: u64,
+    /// Per-slot sub-agent models, used to route the summarizer through the
+    /// user's "compact" Tool Models entry (empty = the active model).
+    #[serde(default)]
+    pub fallback_provider: String,
+    #[serde(default)]
+    pub fallback_model: String,
+    #[serde(default)]
+    pub fallback_base_url: String,
+    #[serde(default)]
+    pub fallback_api_key: String,
+    #[serde(default)]
+    pub fallback_api_keys: Vec<String>,
 }
 
 fn default_mode() -> String {
     "build".to_string()
+}
+
+/// Matches the UI's own default (Settings → compact threshold).
+fn default_compact_percent() -> u64 {
+    80
 }
 
 impl AgentRequest {
@@ -276,6 +327,14 @@ impl AgentRequest {
             allow_computer: self.allow_computer,
             allow_create: self.allow_create,
             search_plugins: self.search_plugins.clone(),
+            // Sub-agents never auto-compact mid-turn (they have their own
+            // budget), but the snapshot stays a faithful copy of the turn.
+            compact_at_percent: self.compact_at_percent,
+            fallback_provider: self.fallback_provider.clone(),
+            fallback_model: self.fallback_model.clone(),
+            fallback_base_url: self.fallback_base_url.clone(),
+            fallback_api_key: self.fallback_api_key.clone(),
+            fallback_api_keys: self.fallback_api_keys.clone(),
         }
     }
 }
@@ -322,7 +381,225 @@ fn extract_plan_body(text: &str) -> Option<(String, String)> {
     Some((title, body))
 }
 
-/// One SSE event of the agent turn — serialized as `{"kind": ..., ...}`.
+/// One queued mid-turn steer: the renderer's user-message id (so the bubble can
+/// be moved inline) plus the prompt text to inject.
+#[derive(Clone, Debug)]
+pub struct SteerMessage {
+    pub id: String,
+    pub prompt: String,
+}
+
+/// Chats with a turn currently running. `/chat/steer` consults it to answer
+/// `ok: false` when nothing is running (the renderer then re-sends the message
+/// as the next turn instead of leaving it stuck as pending).
+fn running_turns() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    RUNNING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mid-turn steer inbox: chat_id -> messages typed while that turn is running.
+/// The loop drains it before every model call, so a steer lands in the SAME turn
+/// with the whole conversation already in `messages` above it — the model keeps
+/// every tool result it had produced instead of restarting from the steer alone
+/// (the "steering forgets what it was doing" bug).
+fn steer_inbox() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<SteerMessage>>> {
+    static INBOX: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<SteerMessage>>>,
+    > = std::sync::OnceLock::new();
+    INBOX.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Monotonic id for a user-answer gate (`ask_user` / `confirm_action`).
+fn next_gate_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("gate-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Open user-answer gates: gate id -> the oneshot that resumes the waiting
+/// turn. Resolved by POST /ask/respond or /permission/respond (see
+/// `deliver_answer`). The turn BLOCKS on the oneshot until the renderer
+/// answers, so a permission/ask popup really pauses the agent.
+fn answer_gates() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>,
+> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Deliver an answer to a waiting gate. False when no such gate is open (a
+/// stale or duplicate answer) — the renderer then simply ignores it.
+pub fn deliver_answer(id: &str, payload: Value) -> bool {
+    let tx = answer_gates()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+    match tx {
+        Some(tx) => tx.send(payload).is_ok(),
+        None => false,
+    }
+}
+
+/// Block the turn until the renderer answers `id`.
+///
+/// There is deliberately NO deadline: the user may take as long as they need
+/// (the popup stays open). The 500 ms tick is NOT a timeout — it only re-reads
+/// the cancel flag so the Stop button still ends a wait that nobody answered.
+async fn await_answer(id: &str, cancel: &std::sync::atomic::AtomicBool) -> Option<Value> {
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<Value>();
+    answer_gates()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string(), tx);
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), &mut rx).await {
+            Ok(res) => return res.ok(),
+            Err(_) => {
+                if cancel.load(Ordering::Relaxed) {
+                    answer_gates()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(id);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Map a model-invented tool name onto the REAL advertised one.
+///
+/// Models are RL-trained on other agents' vocabularies (`read_client`,
+/// `read_file`, `view_file`, `shell`, `bash`, `todos`…), so a perfectly correct
+/// intent sent under a foreign name was answered with the generic
+/// "unknown tool" error — and a traced explore retried the same wrong name 75
+/// times, burning the whole tool budget. The alias resolves ONLY when the
+/// canonical name is really advertised, so the model is never handed a tool
+/// that does not exist in this run.
+fn canonical_tool_name(name: &str, advertised: &[String]) -> Option<String> {
+    let norm = |s: &str| s.trim().to_lowercase().replace(['-', ' '], "_");
+    let n = norm(name);
+    // 1) Case / dash / underscore-insensitive match on a real advertised name.
+    if let Some(hit) = advertised.iter().find(|a| norm(a) == n) {
+        return Some(hit.clone());
+    }
+    // 2) Known cross-agent aliases -> the advertised canonical name.
+    let canonical = match n.as_str() {
+        "read_client" | "read_file" | "readfile" | "view_file" | "read_text_file" | "get_file" => {
+            "read"
+        }
+        "search_files" | "search_content" | "ripgrep" | "search_in_files" => "grep",
+        "find_files" | "list_dir" | "ls" | "list_directory" => "glob",
+        "shell" | "bash" | "sh" | "run_command" | "execute_command" | "terminal" | "run" => {
+            "run_terminal"
+        }
+        "search_web" | "websearch" | "google" => "web_search",
+        "skill" | "load_skill_file" => "load_skill",
+        "task" | "subagent" => "explore",
+        "create_file" | "writefile" => "write_file",
+        "str_replace" | "replace_in_file" | "editfile" => "edit_file",
+        "plan" | "todos" | "todo_write" | "write_todos" | "update_todos" => "update_plan",
+        "ask" | "question" | "ask_question" => "ask_user",
+        "permission" | "request_permission" => "confirm_action",
+        _ => return None,
+    };
+    if advertised.iter().any(|a| a == canonical) {
+        Some(canonical.to_string())
+    } else {
+        None
+    }
+}
+
+/// Queue a message to inject into the running turn for `chat_id`.
+/// Returns false when no turn is running — the caller should tell the renderer
+/// so it re-sends the message as a normal next turn.
+#[must_use]
+pub fn push_steer(chat_id: &str, id: &str, prompt: &str) -> bool {
+    if chat_id.trim().is_empty() || !running_turns().lock().unwrap().contains(chat_id) {
+        return false;
+    }
+    steer_inbox()
+        .lock()
+        .unwrap()
+        .entry(chat_id.to_string())
+        .or_default()
+        .push(SteerMessage { id: id.to_string(), prompt: prompt.to_string() });
+    true
+}
+
+/// Drop a queued steer the user deleted before the agent read it.
+pub fn cancel_steer(chat_id: &str, id: &str) {
+    if let Some(list) = steer_inbox().lock().unwrap().get_mut(chat_id) {
+        list.retain(|s| s.id != id);
+    }
+}
+
+/// Take (and clear) every steer queued for this chat.
+fn drain_steers(chat_id: &str) -> Vec<SteerMessage> {
+    steer_inbox()
+        .lock()
+        .unwrap()
+        .remove(chat_id)
+        .unwrap_or_default()
+}
+
+/// Move every queued steer into the running conversation and tell the renderer.
+/// Returns how many steers were delivered.
+///
+/// Called at the top of every step AND right before the turn would end. The
+/// end-of-turn call is what fixes "steer behaves like a queue": when the model
+/// answered without tool calls the loop used to `return`, leaving the steer in
+/// the inbox where `SteerGuard::drop` erased it — so the message only ever
+/// arrived as a brand-new turn, i.e. after all the work had already finished.
+fn deliver_steers(
+    messages: &mut Vec<Value>,
+    chat_id: &str,
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+) -> usize {
+    let steers = drain_steers(chat_id);
+    if steers.is_empty() {
+        return 0;
+    }
+    let mut ids: Vec<String> = Vec::with_capacity(steers.len());
+    for steer in steers {
+        if steer.prompt.trim().is_empty() {
+            continue;
+        }
+        messages.push(json!({"role": "user", "content": steer.prompt}));
+        ids.push(steer.id);
+    }
+    let n = ids.len();
+    if n > 0 {
+        emit(&AgentEvent::SteerApplied { ids });
+    }
+    n
+}
+
+/// RAII marker for a running turn: registers the chat for `/chat/steer` and
+/// guarantees the inbox + flag are cleared however `run_turn` exits (normal
+/// return, early `return Ok(())`, or a panic unwinding the task).
+struct SteerGuard(String);
+
+impl SteerGuard {
+    fn new(chat_id: &str) -> Self {
+        if !chat_id.trim().is_empty() {
+            running_turns().lock().unwrap().insert(chat_id.to_string());
+        }
+        SteerGuard(chat_id.to_string())
+    }
+}
+
+impl Drop for SteerGuard {
+    fn drop(&mut self) {
+        if !self.0.trim().is_empty() {
+            running_turns().lock().unwrap().remove(&self.0);
+        }
+        // A steer nobody consumed must not leak into the next turn of this chat.
+        steer_inbox().lock().unwrap().remove(&self.0);
+    }
+}
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Status { stage: String, content: String },
@@ -365,6 +642,30 @@ pub enum AgentEvent {
     /// Auto-matched / attached skills for this turn (the frontend renders
     /// them as ⚡ chips on the assistant message).
     Skills { skills: Vec<String>, manual: bool, note: Option<String> },
+    /// Mid-turn steer messages were injected into the running turn. `ids` are
+    /// the renderer's user-message ids so it can move each bubble inline (right
+    /// after the tool call that carried it) and clear its `steerPending` flag.
+    SteerApplied { ids: Vec<String> },
+    /// Auto-compaction started mid-turn — the renderer shows its loading
+    /// banner until the `Compact`/`CompactFailed` event lands.
+    CompactStart {},
+    /// Auto-compaction finished: `content` is the summary, `keep` the number
+    /// of trailing history entries preserved verbatim, `usage` the summarizer
+    /// call's token usage (None when the provider reported none).
+    Compact { content: String, keep: usize, usage: Option<Value> },
+    /// Auto-compaction failed — NOTHING was dropped, the turn continues with
+    /// the full history (the renderer surfaces a retry banner).
+    CompactFailed { content: String },
+    /// The checklist was written by `update_plan`: the renderer replaces its
+    /// todo list with `items` (serialized as `kind:"plan"`). Without this event
+    /// the tool persisted the file but the Todos panel stayed empty.
+    Plan { items: Value, chat_id: String },
+    /// The agent asked the user a question and is WAITING for the answer
+    /// (POST /ask/respond). The renderer shows its ask popup.
+    Ask { id: String, question: String, options: Value },
+    /// The agent is waiting for permission to run a destructive /
+    /// out-of-workspace action (POST /permission/respond).
+    Permission { id: String, action: String, path: String, reason: String, scope: String },
     Done { aborted: bool },
     Error { content: String },
 }
@@ -411,6 +712,30 @@ impl AgentEvent {
                 }
                 v
             }
+            AgentEvent::SteerApplied { ids } => {
+                json!({"kind": "steer_applied", "ids": ids})
+            }
+            AgentEvent::CompactStart {} => json!({"kind": "compact_start"}),
+            AgentEvent::Compact { content, keep, usage } => {
+                let mut v = json!({"kind": "compact", "content": content, "keep": keep});
+                if let Some(u) = usage {
+                    v["usage"] = u.clone();
+                }
+                v
+            }
+            AgentEvent::CompactFailed { content } => {
+                json!({"kind": "compact_failed", "content": content})
+            }
+            AgentEvent::Plan { items, chat_id } => json!({
+                "kind": "plan", "items": items, "chat_id": chat_id,
+            }),
+            AgentEvent::Ask { id, question, options } => json!({
+                "kind": "ask", "id": id, "question": question, "options": options,
+            }),
+            AgentEvent::Permission { id, action, path, reason, scope } => json!({
+                "kind": "permission", "id": id, "action": action, "path": path,
+                "reason": reason, "scope": scope,
+            }),
             AgentEvent::Error { content } => json!({"kind": "error", "content": content}),
         }
     }
@@ -456,15 +781,50 @@ fn tool_schemas(allow_create: bool) -> Vec<Value> {
         ),
         (
             "create_skill",
-            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass fa_keywords: the user's own Persian phrases for when this skill applies (comma-separated, e.g. \"ترجمه کن, translate this\") — the skill catalog shows them, so a Persian request finds the skill without any embedding. Pass previous_name when renaming an existing skill so its extra files survive.",
+            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH fields: `description` — ONE short line of ENGLISH saying WHEN to use the skill — and `fa_keywords` — the user's own PERSIAN phrases for when it applies (comma-separated, e.g. \"ترجمه کن, translate this\"). The skill catalog shows both, so a Persian request finds the skill without any embedding. Pass previous_name when renaming an existing skill so its extra files survive.",
             json!({
                 "name": {"type": "string", "description": "Skill name (also the folder slug)"},
-                "description": {"type": "string", "description": "One-line English summary of when to use this skill"},
+                "description": {"type": "string", "description": "REQUIRED. One-line ENGLISH summary of when to use this skill"},
                 "content": {"type": "string", "description": "The skill body: step-by-step instructions the agent follows"},
-                "fa_keywords": {"type": "string", "description": "Comma-separated Persian phrases that should trigger this skill"},
+                "fa_keywords": {"type": "string", "description": "REQUIRED. Comma-separated PERSIAN phrases the user would say to trigger this skill"},
                 "previous_name": {"type": "string", "description": "Old name when renaming an existing skill"},
                 "extra_files": {"type": "object", "description": "Optional extra files: filename -> content"},
                 "delete": {"type": "boolean", "description": "Delete the skill instead of writing it"}
+            }),
+        ),
+        (
+            "update_plan",
+            "Set/replace the live todo checklist shown in the Todos panel (also persisted to disk next to the plan). Call it ONCE after writing the plan, then again whenever an item's status changes. ALWAYS send the COMPLETE list, in order — it REPLACES the previous one.",
+            json!({
+                "items": {
+                    "type": "array",
+                    "description": "The complete checklist, in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "Short imperative item (name the file it touches)"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            }),
+        ),
+        (
+            "ask_user",
+            "Ask the user ONE question and WAIT for the answer. Use it when the request is ambiguous or you hit a genuine fork with no clearly-correct default. `options` are short choices; the user may also type a free answer.",
+            json!({
+                "question": {"type": "string"},
+                "options": {"type": "array", "items": {"type": "string"}, "description": "2-5 short choices"}
+            }),
+        ),
+        (
+            "confirm_action",
+            "Ask the user to APPROVE a destructive or out-of-workspace action and WAIT for the decision (returns allowed/denied). Use it before deleting outside the workspace, installing packages, or running an irreversible command.",
+            json!({
+                "action": {"type": "string", "description": "What you want to do — short and concrete"},
+                "path": {"type": "string", "description": "The file/folder it touches, if any"},
+                "reason": {"type": "string", "description": "Why it is needed"}
             }),
         ),
         (
@@ -762,6 +1122,18 @@ fn finish_tool(
     }));
 }
 
+/// One message on the explore fan-in channel.
+///
+/// `Done` is what lets each explore resolve its OWN card the instant it lands
+/// (via `finish_tool`) while the others are still running. Without it the
+/// parent could only tick the cards after every sibling had finished — a
+/// finished explore kept its spinner for minutes and the whole batch ticked
+/// together, which is exactly what the user saw.
+enum SubMsg {
+    Ev(AgentEvent),
+    Done { id: String, name: String, args: Value, result: String, ok: bool },
+}
+
 /// Run one full agent turn: stream the model, execute tool calls, repeat
 /// until the model answers without tool calls or MAX_STEPS is reached.
 /// Emits the same event protocol as the Python graph.
@@ -771,6 +1143,10 @@ pub async fn run_turn(
     cancel: &CancelFlag,
 ) -> Result<(), String> {
     let _turn = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Register this chat as "running" for the whole turn so `/chat/steer` can
+    // inject a message into it, and guarantee the registry + inbox are cleared
+    // however we exit (normal return, early return, or a panic unwinding).
+    let _steer_guard = SteerGuard::new(&req.chat_id);
     let root = req.root.clone();
     let trace = crate::trace::TraceStore::new(req.chat_id.clone());
     let cfg = LlmConfig {
@@ -786,7 +1162,11 @@ pub async fn run_turn(
         },
         temperature: None,
         max_tokens: None,
-        timeout_secs: 600,
+        // No practical cap on a chat turn: the user explicitly does not want a
+        // seconds-based error while a provider is still answering (slow
+        // gateways and reasoning models can take many minutes). Stop still
+        // aborts instantly via the cancel flag.
+        timeout_secs: crate::llm::NO_TIMEOUT_SECS,
     };
 
     // Assemble the message list: system + history + current user prompt.
@@ -808,9 +1188,59 @@ pub async fn run_turn(
     } else {
         req.data_root.clone()
     };
-    let skill_section = crate::skill_router::build_section(&skill_root, &req.skills);
+    let skill_section = crate::skill_router::build_section(&req.prompt, &skill_root, &req.skills);
     if !skill_section.text.is_empty() {
         system.push_str(&skill_section.text);
+    }
+    // Tell the renderer which skills this turn actually picked up, so the user
+    // sees ⚡ chips on the assistant message. `manual: false` is what makes the
+    // frontend stamp `autoSkills` (a `manual: true` event is the missing-attach
+    // warning and carries no names).
+    if !skill_section.matched.is_empty() {
+        emit(&AgentEvent::Skills {
+            skills: skill_section.matched.clone(),
+            manual: false,
+            note: None,
+        });
+    }
+    // Read the saved plan + live checklist BACK FROM DISK. The native loop only
+    // ever wrote them (plans.rs), so after an app restart (or on the next turn)
+    // the agent had forgotten the plan it was executing and re-planned from
+    // scratch, redoing finished work. Both files are keyed by
+    // workspace-slug + chat-id, exactly as plans.rs stores them.
+    if !req.chat_id.trim().is_empty() {
+        let ws = crate::plans::workspace_slug_for_root(&root);
+        if let Some(plan) = crate::plans::get_plan(&skill_root, &ws, &req.chat_id) {
+            let body = plan["content"].as_str().unwrap_or("").trim().to_string();
+            if !body.is_empty() {
+                system.push_str(&format!(
+                    "\n\n=== SAVED PLAN (from disk — follow it, do NOT re-plan) ===\n{body}\n"
+                ));
+            }
+        }
+        let checklist = crate::plans::get_checklist(&skill_root, &ws, &req.chat_id);
+        if let Some(items) = checklist.as_array() {
+            if !items.is_empty() {
+                let mut lines = String::new();
+                for it in items {
+                    let status = it["status"].as_str().unwrap_or("pending");
+                    let mark = match status {
+                        "completed" => "x",
+                        "in_progress" => "~",
+                        _ => " ",
+                    };
+                    lines.push_str(&format!(
+                        "- [{mark}] {}\n",
+                        it["content"].as_str().unwrap_or_default()
+                    ));
+                }
+                system.push_str(&format!(
+                    "\n\n=== CHECKLIST (from disk) ===\n{lines}\
+                     Keep it current with update_plan as you finish items; never redo a \
+                     completed one.\n"
+                ));
+            }
+        }
     }
     if !skill_section.missing.is_empty() {
         emit(&AgentEvent::Skills {
@@ -872,7 +1302,7 @@ pub async fn run_turn(
     // tools/list. A connector that fails to start contributes no tools — but
     // the reason is surfaced as a warning, so "the agent has no browser tool"
     // is never a silent mystery again.
-    let (mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers, &req.chat_id);
+    let (mut mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers, &req.chat_id);
     for failure in mcp_failures {
         emit(&AgentEvent::Warn { content: failure });
     }
@@ -886,11 +1316,48 @@ pub async fn run_turn(
         .iter()
         .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
         .collect();
+    // Drop any MCP tool whose name collides with a NATIVE tool. Two schemas
+    // advertising the same `function.name` made the model see the same tool
+    // twice (the duplicated tool pills / "×2" counters in the UI) and made
+    // dispatch ambiguous — a bare MCP name shadows the native one. The native
+    // tool wins: it is always available and does not depend on a connector
+    // being up.
+    let native_names: std::collections::HashSet<String> = schemas
+        .iter()
+        .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+        .collect();
+    mcp_schemas.retain(|s| {
+        s["function"]["name"]
+            .as_str()
+            .map(|n| !native_names.contains(n))
+            .unwrap_or(false)
+    });
     schemas.extend(mcp_schemas);
     // Desktop control is a hard on/off switch (composer → Computer Use): when
     // it is off the tool is never bound, so the model cannot even try.
+    // The name is checked first because this push happens AFTER the MCP filter:
+    // a connector exposing a tool literally named `computer` would otherwise
+    // collide and the model would see the same name on two rows.
     if req.allow_computer && req.mode != "subagent" {
-        schemas.push(crate::computer::schema());
+        let taken = schemas
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some("computer"));
+        if !taken {
+            schemas.push(crate::computer::schema());
+        }
+    }
+    // Final guard: the model must never be advertised the same tool name twice.
+    // Two rows sharing one name made the UI render duplicate tool cards (`read`
+    // four times, `read_client` twice) and left the model guessing which schema
+    // to follow. The FIRST occurrence wins — a native tool outranks a connector.
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        schemas.retain(|s| {
+            s["function"]["name"]
+                .as_str()
+                .map(|n| seen.insert(n.to_string()))
+                .unwrap_or(false)
+        });
     }
     // The exact tool names this run advertised. A call to any other name is a
     // hallucination (a traced explore called a non-existent `read_client` 75
@@ -913,7 +1380,20 @@ pub async fn run_turn(
     // and the explore prompt forbids it, yet a traced run re-read three files
     // in round 3 that round 1 had returned and repeated a refused grep.
     let mut seen_lookups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Mid-turn auto-compaction state. `compact_rounds` bounds how many times a
+    // single turn may fold its history (a turn can run MAX_STEPS tool calls, so
+    // folding must be possible while the agent works — but the summarizer must
+    // not thrash either).
+    let mut compact_rounds: usize = 0;
+
     for step in 0..max_steps {
+        // Drain any mid-turn steer BEFORE this model call: the steer is appended
+        // as an extra user message, so the model keeps the whole conversation
+        // (every prior tool result and the original task) above it — a steer
+        // refines the running work instead of restarting from the steer alone.
+        // This fixes "steering made it forget everything and only do the steered
+        // message, abandoning the work in progress".
+        deliver_steers(&mut messages, &req.chat_id, emit);
         // Client disconnect (Stop button closes the SSE stream) flips the
         // cancel flag — bail out instead of burning provider tokens.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -927,6 +1407,126 @@ pub async fn run_turn(
                 "role": "user",
                 "content": "Tool budget nearly exhausted — report your findings in your NEXT answer; only call a tool if it is essential."
             }));
+        }
+
+        // --- Mid-turn auto-compaction ---------------------------------------
+        // The context can blow past the model's window DURING a turn: this loop
+        // runs up to MAX_STEPS tool calls and every result is appended to
+        // `messages`. Waiting for the next turn (the frontend-only behaviour)
+        // meant a long turn kept growing until the provider hard-failed with
+        // "context length exceeded". Fold the older part of the history here,
+        // between model calls, so the running turn keeps a working context.
+        // Only the main agent compacts: the explore sub-agent has its own
+        // separate budget (compact_subagent_messages, run before the loop).
+        if req.mode != "subagent" && compact_rounds < MAX_COMPACTIONS_PER_TURN {
+            let ctx = if req.context_window == 0 {
+                DEFAULT_CONTEXT_WINDOW
+            } else {
+                req.context_window as usize
+            };
+            let threshold = ctx * req.compact_at_percent.clamp(1, 99) as usize / 100;
+            // messages[0] is the system prompt; the wire history is the rest.
+            let fold_at = fold_prefix_len(&messages[1..]);
+            if fold_at > 0 && estimate_wire_tokens(&messages[1..]) >= threshold {
+                compact_rounds += 1;
+                let older: Vec<Value> = messages[1..1 + fold_at].to_vec();
+                let tail: Vec<Value> = messages[1 + fold_at..].to_vec();
+                // The summarizer may be routed to the user's "compact" Tool
+                // Models slot (empty entry = the active chat model), exactly
+                // like the manual /chat/compact path.
+                let (slot_model, slot_base, slot_keys) = crate::backend_light::resolve_slot_target(
+                    req.subagent_models.get("compact").map(String::as_str).unwrap_or(""),
+                    &cfg.model,
+                    &cfg.base_url,
+                    &cfg.api_keys,
+                    &req.providers,
+                );
+                let has_slot = !slot_model.is_empty() && slot_model != cfg.model;
+                let compact_model = LlmConfig {
+                    provider: cfg.provider.clone(),
+                    model: slot_model.clone(),
+                    base_url: slot_base,
+                    api_keys: slot_keys,
+                    temperature: Some(0.2),
+                    max_tokens: Some(COMPACT_MAX_OUTPUT as u32),
+                    // A side call keeps a real timeout: a hung summarizer must
+                    // not freeze the turn it is trying to shrink.
+                    timeout_secs: COMPACT_TIMEOUT_SECS,
+                };
+                // Fallback = the active chat model, mirroring the manual path's
+                // subagent -> main-model retry.
+                let compact_fallback = if has_slot {
+                    Some(LlmConfig {
+                        provider: cfg.provider.clone(),
+                        model: cfg.model.clone(),
+                        base_url: cfg.base_url.clone(),
+                        api_keys: cfg.api_keys.clone(),
+                        temperature: Some(0.2),
+                        max_tokens: Some(COMPACT_MAX_OUTPUT as u32),
+                        timeout_secs: COMPACT_TIMEOUT_SECS,
+                    })
+                } else {
+                    None
+                };
+                emit(&AgentEvent::CompactStart {});
+                match crate::compact::compact_history(
+                    &client,
+                    &compact_model,
+                    compact_fallback.as_ref(),
+                    &older,
+                    ctx,
+                    COMPACT_MAX_OUTPUT,
+                    true,
+                )
+                .await
+                {
+                    Ok(Some(out)) if !out.summary.trim().is_empty() => {
+                        // Keep the marker opencode/compact.rs uses so a later
+                        // fold MERGES this summary instead of stacking a second
+                        // heading — and so the model reads it as a checkpoint.
+                        let mut summary_text = out.summary.trim().to_string();
+                        if !summary_text
+                            .to_lowercase()
+                            .starts_with("[compacted earlier context]")
+                        {
+                            summary_text =
+                                format!("[Compacted earlier context]\n\n{summary_text}");
+                        }
+                        // Rebuild the conversation: system + summary + the
+                        // verbatim tail. The tail always starts at an assistant
+                        // entry (see fold_prefix_len), so every `tool` result
+                        // stays with the call that produced it.
+                        let mut next: Vec<Value> = Vec::with_capacity(tail.len() + 2);
+                        next.push(messages[0].clone());
+                        next.push(json!({"role": "user", "content": summary_text}));
+                        next.extend(tail.iter().cloned());
+                        messages = next;
+                        // `keep` is the renderer's fold instruction: it keeps
+                        // the last N non-system messages verbatim and folds the
+                        // rest, so the next turn stops re-sending what the
+                        // summary already covers. Nothing else is appended to
+                        // `messages` before the turn ends, so the tail length IS
+                        // that N.
+                        emit(&AgentEvent::Compact {
+                            content: summary_text,
+                            keep: tail.len(),
+                            usage: out.usage,
+                        });
+                    }
+                    Ok(_) => {
+                        // Nothing foldable — keep the history as it is. Not an
+                        // error: the turn continues either way.
+                        emit(&AgentEvent::CompactFailed {
+                            content: "nothing to compact".into(),
+                        });
+                    }
+                    Err(e) => {
+                        // NOTHING was dropped: the turn continues with the full
+                        // history, and the renderer surfaces a retry banner.
+                        emit(&AgentEvent::CompactFailed { content: e });
+                    }
+                }
+            }
         }
         // stream_chat accumulates text/tool_calls itself; the sink only
         // forwards live text deltas to the SSE stream.
@@ -980,7 +1580,18 @@ pub async fn run_turn(
             .map(|tc| {
                 (
                     tc["id"].as_str().unwrap_or_default().to_string(),
-                    tc["function"]["name"].as_str().unwrap_or_default().to_string(),
+                    // Cross-agent aliases (`read_client`, `read_file`, `shell`,
+                    // `todos`…) are resolved HERE, before the unknown-tool guard,
+                    // so the model gets the tool it meant instead of an error it
+                    // retried 70+ times. Unresolvable names pass through unchanged
+                    // and still hit that guard.
+                    canonical_tool_name(
+                        tc["function"]["name"].as_str().unwrap_or_default(),
+                        &advertised,
+                    )
+                    .unwrap_or_else(|| {
+                        tc["function"]["name"].as_str().unwrap_or_default().to_string()
+                    }),
                     tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
                 )
             })
@@ -1005,6 +1616,30 @@ pub async fn run_turn(
                         title,
                         body,
                     });
+                }
+            }
+            // The model answered without tool calls, but the user steered while
+            // it was answering. Ending the turn here would hand the steer to
+            // `SteerGuard::drop` — it would be silently dropped and only
+            // resurface as a brand-new turn, so the agent appeared to "queue"
+            // the steer until everything had finished. Keep the same turn
+            // running: record this answer FIRST (it was produced before the
+            // steer) so the model can see what it already said, then continue
+            // with the steer appended above it.
+            if !req.chat_id.trim().is_empty() {
+                let pending = steer_inbox()
+                    .lock()
+                    .unwrap()
+                    .get(&req.chat_id)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                if pending {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": if text.is_empty() { Value::Null } else { json!(text) },
+                    }));
+                    deliver_steers(&mut messages, &req.chat_id, emit);
+                    continue;
                 }
             }
             emit(&AgentEvent::Done { aborted: false });
@@ -1157,54 +1792,75 @@ use what it showed, read a DIFFERENT window, or move on"
             // channel to the parent stream so parallel explores stay VISIBLE
             // in the chat while they work; Text/Error stay inside each
             // sub-agent's own report (never surfaced in the chat).
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubMsg>();
             let futures: Vec<_> = explore_batch
                 .iter()
-                .map(|(_id, _name, args, branch)| {
+                .map(|(id, name, args, branch)| {
                     let branch = *branch;
                     let req_c = req.subagent_snapshot();
                     let args_c = args.clone();
+                    let id_c = id.clone();
+                    let name_c = name.clone();
                     let cancel_c = std::sync::Arc::clone(cancel);
                     let tx = tx.clone();
                     Box::pin(async move {
+                        let tx_ev = tx.clone();
                         let mut sink = move |ev: &AgentEvent| {
-                            let _ = tx.send(ev.clone());
+                            let _ = tx_ev.send(SubMsg::Ev(ev.clone()));
                         };
-                        run_subagent(&req_c, &args_c, branch, &mut sink, &cancel_c).await
+                        let (result, ok) =
+                            run_subagent(&req_c, &args_c, branch, &mut sink, &cancel_c).await;
+                        // Each explore posts its OWN end marker, so the parent
+                        // resolves this card the moment it lands — not after
+                        // the slowest sibling in the batch finishes.
+                        let _ = tx.send(SubMsg::Done {
+                            id: id_c,
+                            name: name_c,
+                            args: args_c,
+                            result,
+                            ok,
+                        });
                     })
                 })
                 .collect();
-            // Drop our sender so rx.recv() returns None once every explore
-            // has finished and the forward loop can end.
+            // Drop our sender so rx.recv() returns None once every explore has
+            // finished and its end marker has been drained.
             drop(tx);
             let sub_all = futures_util::future::join_all(futures);
             let forward = async {
-                while let Some(ev) = rx.recv().await {
+                while let Some(msg) = rx.recv().await {
                     // Stop must also abort the concurrent explores: the shared
-                    // cancel flag is checked on every forwarded event.
+                    // cancel flag is checked on every forwarded message.
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    match ev {
-                        AgentEvent::Text { .. } | AgentEvent::Error { .. } => {}
-                        _ => emit(&ev),
+                    match msg {
+                        // The sub-agent's narration and errors stay inside its
+                        // own report — never in the user's chat.
+                        SubMsg::Ev(AgentEvent::Text { .. })
+                        | SubMsg::Ev(AgentEvent::Error { .. }) => {}
+                        SubMsg::Ev(ev) => emit(&ev),
+                        SubMsg::Done {
+                            id,
+                            name,
+                            args,
+                            result,
+                            ok,
+                        } => finish_tool(
+                            &mut messages,
+                            emit,
+                            &trace,
+                            &id,
+                            &name,
+                            &args,
+                            result,
+                            ok,
+                            req.mode == "subagent",
+                        ),
                     }
                 }
             };
-            let (results, _) = tokio::join!(sub_all, forward);
-            for ((id, name, args, _branch), (result, ok)) in explore_batch.into_iter().zip(results) {
-                finish_tool(
-                    &mut messages,
-                    emit,
-                    &trace,
-                    &id,
-                    &name,
-                    &args,
-                    result,
-                    ok,
-                    req.mode == "subagent",
-                );
-            }
+            let (_reports, _) = tokio::join!(sub_all, forward);
         }
         for (id, name, raw_args) in &rest {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1266,6 +1922,94 @@ use what it showed, read a DIFFERENT window, or move on"
                 match crate::mcp::call_tool(&req.mcp_servers, name, &args, &req.chat_id) {
                     Ok(r) => (r, true),
                     Err(e) => (e, false),
+                }
+            } else if name == "update_plan" {
+                // Persist the checklist next to plan.md AND echo it back as the
+                // authoritative list: the renderer replaces its Todos with it,
+                // and the file survives a restart (read back into the prompt by
+                // the SAVED PLAN / CHECKLIST blocks above).
+                let data_root = if req.data_root.trim().is_empty() {
+                    native_data_root()
+                } else {
+                    req.data_root.clone()
+                };
+                let ws = crate::plans::workspace_slug_for_root(&root);
+                crate::plans::save_checklist(&data_root, &ws, &req.chat_id, &args["items"]);
+                let stored = crate::plans::get_checklist(&data_root, &ws, &req.chat_id);
+                emit(&AgentEvent::Plan {
+                    items: stored.clone(),
+                    chat_id: req.chat_id.clone(),
+                });
+                let total = stored.as_array().map(|a| a.len()).unwrap_or(0);
+                let done = stored
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|i| i["status"].as_str() == Some("completed"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                (
+                    format!("Checklist saved: {done}/{total} items completed."),
+                    true,
+                )
+            } else if name == "ask_user" {
+                // Blocking question: emit the popup request, then WAIT (no
+                // deadline — the user may take as long as they need).
+                let gate = next_gate_id();
+                emit(&AgentEvent::Ask {
+                    id: gate.clone(),
+                    question: args["question"].as_str().unwrap_or_default().to_string(),
+                    options: args["options"].clone(),
+                });
+                match await_answer(&gate, cancel).await {
+                    Some(v) => (
+                        format!(
+                            "The user answered: {}",
+                            v["answer"].as_str().unwrap_or_default()
+                        ),
+                        true,
+                    ),
+                    None => (
+                        "The user did not answer (the turn was stopped).".to_string(),
+                        false,
+                    ),
+                }
+            } else if name == "confirm_action" || name == "request_permission" {
+                // Blocking permission gate: the action is NOT performed until
+                // the user approves it in the popup.
+                let gate = next_gate_id();
+                let scope = if name == "confirm_action" {
+                    "confirm"
+                } else {
+                    "permission"
+                };
+                emit(&AgentEvent::Permission {
+                    id: gate.clone(),
+                    action: args["action"]
+                        .as_str()
+                        .or_else(|| args["command"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    path: args["path"].as_str().unwrap_or_default().to_string(),
+                    reason: args["reason"].as_str().unwrap_or_default().to_string(),
+                    scope: scope.to_string(),
+                });
+                match await_answer(&gate, cancel).await {
+                    Some(v) if v["allowed"].as_bool().unwrap_or(false) => (
+                        "The user APPROVED the action — proceed with it.".to_string(),
+                        true,
+                    ),
+                    Some(_) => (
+                        "The user DENIED the action. Do NOT perform it — find another \
+                         approach or ask what to do instead."
+                            .to_string(),
+                        false,
+                    ),
+                    None => (
+                        "The user did not answer (the turn was stopped).".to_string(),
+                        false,
+                    ),
                 }
             } else if name == "web_search" {
                 // Native web search: the engine chain is the user's Settings →
@@ -1452,6 +2196,49 @@ fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>) 
 /// agent's history (user request: explore context/autocompact must be
 /// separate). Mirrors compact.rs but with a smaller budget: the sub-agent
 /// only needs its recent tool results + the report it is building.
+/// Rough token estimate for a slice of wire messages (~4 chars per token, the
+/// same heuristic compact.rs uses). Only `content` is measured: it is the only
+/// field that grows with tool output, which is what overflows the window.
+fn estimate_wire_tokens(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m["content"]
+                .as_str()
+                .map(|c| c.len().div_ceil(4))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Length of the prefix of `history` (messages WITHOUT the system prompt) that a
+/// mid-turn compaction may fold into a summary — 0 when nothing is safely
+/// foldable.
+///
+/// Two rules keep the rebuilt conversation valid for every provider:
+///  - Never fold a trailing user message: it is usually the request this turn is
+///    answering, so folding it would hide the question from the model.
+///  - Always cut at an `assistant` boundary, never at a `tool` boundary: a
+///    `tool` result must stay with the assistant `tool_calls` that produced it,
+///    or the provider rejects the orphaned reply with a 400.
+///
+/// Consequently a turn with a single user prompt and no assistant answer yet
+/// returns 0 — there is genuinely nothing to fold at that point.
+fn fold_prefix_len(history: &[Value]) -> usize {
+    let mut cut = history.len();
+    while cut > 0 && history[cut - 1]["role"].as_str() == Some("user") {
+        cut -= 1;
+    }
+    while cut > 0 && history[cut - 1]["role"].as_str() != Some("assistant") {
+        cut -= 1;
+    }
+    if cut == 0 {
+        0
+    } else {
+        cut - 1
+    }
+}
+
 fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
     // Rough token estimate: ~4 chars per token (same heuristic as compact.rs).
     let est = |m: &Value| -> usize { m["content"].as_str().map(|c| c.len().div_ceil(4)).unwrap_or(0) };
@@ -1725,55 +2512,84 @@ async fn run_subagent(
         // Web search IS research, so the sub-agent inherits the same engine
         // chain the user configured for the parent turn.
         search_plugins: parent.search_plugins.clone(),
+        // A sub-agent never folds its own history mid-turn — it has a separate,
+        // much smaller budget (compact_subagent_messages, before its loop).
+        compact_at_percent: parent.compact_at_percent,
+        fallback_provider: String::new(),
+        fallback_model: String::new(),
+        fallback_base_url: String::new(),
+        fallback_api_key: String::new(),
+        fallback_api_keys: Vec::new(),
     };
 
-    let mut report = String::new();
-    let mut sub_error = String::new();
-    let res = {
-        let mut sink = |ev: &AgentEvent| {
-            fold_subagent_event(&mut report, &mut sub_error, ev);
-            // Forward only structural sub-agent events (status/tool/usage/
-            // thinking) to the parent stream so its tool calls stay visible
-            // in the chat while explore works — the sub-agent's narration
-            // (Text) and errors must never surface in the user's chat: the
-            // report goes to the PARENT agent as the tool result only.
-            match ev {
-                // The sub-run's own Done must not reach the parent stream
-                // (it would read as the PARENT turn finishing).
-                AgentEvent::Text { .. } | AgentEvent::Error { .. } | AgentEvent::Done { .. } => {}
-                // Tool calls are tagged with this explore's branch so they
-                // nest under its card instead of floating in the chat.
-                AgentEvent::ToolStart { .. } | AgentEvent::Tool { .. } => {
-                    emit(&AgentEvent::Branch {
-                        branch,
-                        sub: true,
-                        inner: Box::new(ev.clone()),
-                    })
+    // Attempt ladder. A sub-agent runs INSIDE the parent turn, so the
+    // frontend's reconnect ladder can never see it fail — a provider hiccup
+    // (or a run that returned nothing) used to be final and the user just
+    // watched a dead explore card while the turn stalled. Each attempt is
+    // bounded by the model call itself, never by a wall-clock timer: a slow
+    // but healthy provider is NOT a failure.
+    let mut last: (String, bool) = (String::new(), false);
+    for attempt in 1..=SUBAGENT_MAX_ATTEMPTS {
+        let mut report = String::new();
+        let mut sub_error = String::new();
+        let res = {
+            let mut sink = |ev: &AgentEvent| {
+                fold_subagent_event(&mut report, &mut sub_error, ev);
+                // Forward only structural sub-agent events (status/tool/usage/
+                // thinking) to the parent stream so its tool calls stay visible
+                // in the chat while explore works — the sub-agent's narration
+                // (Text) and errors must never surface in the user's chat: the
+                // report goes to the PARENT agent as the tool result only.
+                match ev {
+                    // The sub-run's own Done must not reach the parent stream
+                    // (it would read as the PARENT turn finishing).
+                    AgentEvent::Text { .. } | AgentEvent::Error { .. } | AgentEvent::Done { .. } => {}
+                    // Tool calls are tagged with this explore's branch so they
+                    // nest under its card instead of floating in the chat.
+                    AgentEvent::ToolStart { .. } | AgentEvent::Tool { .. } => {
+                        emit(&AgentEvent::Branch {
+                            branch,
+                            sub: true,
+                            inner: Box::new(ev.clone()),
+                        })
+                    }
+                    _ => emit(ev),
                 }
-                _ => emit(ev),
-            }
+            };
+            run_turn(&sub_req, &mut sink, cancel).await
         };
-        run_turn(&sub_req, &mut sink, cancel).await
-    };
-    match res {
-        Ok(()) => {
-            if report.trim().is_empty() {
-                // The turn "succeeded" but produced no text — the parent must
-                // not treat an empty report as data. Surface the captured
-                // sub-agent error (or a generic message) so it can retry or
-                // fall back to its own tools.
-                let why = if sub_error.trim().is_empty() {
-                    "the sub-agent produced no output (empty model response)".to_string()
+        let failed: (String, bool) = match res {
+            Ok(()) => {
+                if report.trim().is_empty() {
+                    // The turn "succeeded" but produced no text — the parent must
+                    // not treat an empty report as data. Surface the captured
+                    // sub-agent error (or a generic message) so it can retry or
+                    // fall back to its own tools.
+                    let why = if sub_error.trim().is_empty() {
+                        "the sub-agent produced no output (empty model response)".to_string()
+                    } else {
+                        sub_error
+                    };
+                    (format!("explore returned no findings: {why}"), false)
                 } else {
-                    sub_error
-                };
-                (format!("explore returned no findings: {why}"), false)
-            } else {
-                (report, true)
+                    return (report, true);
+                }
             }
+            Err(e) => (format!("sub-agent failed: {e}"), false),
+        };
+        last = failed;
+        // Stop aborts the ladder too: never spawn another sub-agent after the
+        // user cancelled the turn.
+        if attempt == SUBAGENT_MAX_ATTEMPTS || cancel.load(Ordering::Relaxed) {
+            break;
         }
-        Err(e) => (format!("sub-agent failed: {e}"), false),
+        emit(&AgentEvent::Status {
+            stage: "subagent".into(),
+            content: format!("{description} (retry {attempt}/{})", SUBAGENT_MAX_ATTEMPTS - 1),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(SUBAGENT_RETRY_BACKOFF_MS)).await;
     }
+    last
 }
 
 fn usage_tuple(acc: &StreamAcc) -> (u64, u64) {
@@ -2285,7 +3101,7 @@ mod tests {
 
         // The keywords must reach the catalog, otherwise a Persian request
         // could never match this skill (the catalog is all the model sees).
-        let section = crate::skill_router::build_section(root, &[]);
+        let section = crate::skill_router::build_section("", root, &[]);
         assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
         assert!(section.text.contains("Movie Finder: find movies"), "{}", section.text);
 
@@ -2356,6 +3172,56 @@ mod tests {
         assert!(req.api_keys.is_empty());
     }
 
+    #[test]
+    fn fold_prefix_never_orphans_tool_or_user_tail() {
+        // A turn with no assistant answer yet is not foldable at all.
+        assert_eq!(
+            fold_prefix_len(&[json!({"role": "user", "content": "hi"})]),
+            0
+        );
+        // Last assistant is the boundary: the trailing live user prompt is
+        // never folded, and the tail never starts with a `tool` reply.
+        let hist = vec![
+            json!({"role": "user", "content": "task"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "t1"}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        assert_eq!(fold_prefix_len(&hist), 3);
+        let tail = &hist[fold_prefix_len(&hist)..];
+        assert_eq!(tail[0]["role"].as_str(), Some("assistant"));
+    }
+
+    #[test]
+    fn fold_keeps_every_tool_result_with_its_call() {
+        let hist = vec![
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "t1"}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "t2"}]}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        let cut = fold_prefix_len(&hist);
+        assert_eq!(cut, 3);
+        let tail = &hist[cut..];
+        assert_eq!(tail[0]["role"].as_str(), Some("assistant"));
+        // Providers reject an orphaned tool reply, so every `tool` message kept
+        // verbatim must still sit directly after its assistant call.
+        for (i, m) in tail.iter().enumerate() {
+            if m["role"] == "tool" {
+                assert_eq!(tail[i - 1]["role"].as_str(), Some("assistant"));
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_wire_tokens_reads_content_only() {
+        let msgs = vec![json!({"role": "user", "content": "x".repeat(400)})];
+        assert_eq!(estimate_wire_tokens(&msgs), 100);
+        assert_eq!(estimate_wire_tokens(&[]), 0);
+    }
+
     fn base_req() -> AgentRequest {
         AgentRequest {
             provider: "custom".into(),
@@ -2379,6 +3245,12 @@ mod tests {
             allow_computer: false,
             allow_create: false,
             search_plugins: Vec::new(),
+            compact_at_percent: 80,
+            fallback_provider: String::new(),
+            fallback_model: String::new(),
+            fallback_base_url: String::new(),
+            fallback_api_key: String::new(),
+            fallback_api_keys: Vec::new(),
         }
     }
 

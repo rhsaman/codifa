@@ -17,5 +17,5 @@
     "noUnusedLocals": false,
     "types": ["node", "vite/client"]
   },
-  "include": ["src", "electron"]
+  "include": ["src"]
 }

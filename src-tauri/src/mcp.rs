@@ -164,7 +164,7 @@ fn spawn_session(cfg: &Value) -> Result<Session, String> {
     // stdio connector like `npx @playwright/mcp` could not start at all and
     // silently contributed no tools. Give the child the same login-shell PATH
     // the sidecar spawn uses.
-    cmd.env("PATH", crate::sidecar::shell_path());
+    cmd.env("PATH", crate::shell_env::shell_path());
     // The app bundle exports PYTHONHOME for its own sidecar; an inherited
     // value makes any python-based MCP server exit immediately ("No module
     // named 'encodings'"), which surfaced as "closed the connection".

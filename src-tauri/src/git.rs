@@ -136,6 +136,14 @@ pub fn show(root: &str, rev: &str, path: &str) -> GitResult {
     Ok(truncate(run_git(root, &args)?))
 }
 
+/// Stage every change (`git add -A`). Used by /git/autocommit, which needs the
+/// index populated before it asks the model for a message.
+pub fn stage_all(root: &str) -> GitResult {
+    valid_root(root)?;
+    run_git(root, &["add", "-A"])?;
+    Ok(json!({ "staged": true }))
+}
+
 /// POST /git/commit {root, message, add_all}
 pub fn commit(root: &str, message: &str, add_all: bool) -> GitResult {
     valid_root(root)?;

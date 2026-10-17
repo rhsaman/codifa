@@ -1,0 +1,2 @@
+    Checking codifa v1.8.3 (/Users/saman/Documents/code/codifa/src-tauri)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.37s

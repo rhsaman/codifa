@@ -56,9 +56,12 @@ fn ensure_writer() {
         std::thread::spawn(|| {
             let q = write_queue();
             loop {
-                let mut guard = q.pending.lock().unwrap();
+                let mut guard = q
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 while guard.is_none() {
-                    guard = q.cv.wait(guard).unwrap();
+                    guard = q.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
                 }
                 // Coalesce: a brief wait lets rapid successive sets collapse
                 // into one disk write.
@@ -69,7 +72,7 @@ fn ensure_writer() {
                     // On success the flushed document becomes the cache entry —
                     // the same allocation, never a post-write copy of the doc.
                     if write_document(&path, &map) {
-                        let mut cache = cache_slot().lock().unwrap();
+                        let mut cache = cache_slot().lock().unwrap_or_else(|e| e.into_inner());
                         *cache = Some(DocCache { value: map, at: Instant::now() });
                     }
                 }
@@ -81,7 +84,13 @@ fn ensure_writer() {
 /// Synchronously write any queued document — used on app quit so coalesced
 /// changes are never lost when the process exits.
 pub fn flush_pending(_app: &AppHandle) {
-    let job = write_queue().pending.lock().unwrap().take();
+    // Poison-tolerant: this runs on the QUIT path, where a panic would abort the
+    // close sequence and leave the window stuck open instead of persisting.
+    let job = write_queue()
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some((path, map)) = job {
         let _ = write_document(&path, &map);
     }
@@ -157,6 +166,15 @@ fn write_document(path: &Path, value: &serde_json::Map<String, Value>) -> bool {
         let _ = fs::remove_file(&tmp);
         return false;
     }
+    // Force the bytes to the platter BEFORE the rename publishes them. Without
+    // this the rename only guaranteed "no torn file" — a crash or power loss
+    // right after it could still leave an EMPTY or half-written document, which
+    // is exactly the reported "the app closed suddenly and my new chats were
+    // gone".
+    if writer.into_inner().map(|f| f.sync_all().is_err()).unwrap_or(true) {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
     fs::rename(&tmp, path).is_ok()
 }
 
@@ -174,11 +192,59 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
             // would wipe "chats" and empty the sidebar on every settings change.
             if let Value::Object(incoming) = value {
                 for (k, v) in incoming {
-                    map.insert(k, v);
+                    // Providers are UNIONED by id instead of replaced. The old
+                    // shallow key merge let any settings payload carrying a
+                    // stale or trimmed `providers` array (a partial hydrate, a
+                    // cold-start default snapshot) silently DELETE every row it
+                    // did not list — including rows holding `enc:v1:` API keys.
+                    // Deleting a provider is explicit: the renderer publishes
+                    // the id to the `deleted_providers` tombstone below.
+                    if k == "providers" {
+                        let stored = map.get("providers").cloned().unwrap_or(Value::Null);
+                        let merged = merge_providers([stored, v]);
+                        // Re-apply the tombstones on every settings write: a
+                        // payload that still carries a removed provider row
+                        // (a stale renderer snapshot) must not resurrect it.
+                        let dead = map.get("deleted_providers").cloned().unwrap_or(Value::Null);
+                        map.insert(k, drop_deleted_providers(merged, &dead));
+                    } else {
+                        map.insert(k, v);
+                    }
                 }
             }
         } else {
-            map.insert(key.clone(), value);
+            if key == "deleted_providers" {
+                // A tombstone is authoritative: drop the tombstoned rows in the
+                // same write so the union above can never resurrect them.
+                let stored = map.get("providers").cloned().unwrap_or(Value::Null);
+                map.insert("providers".to_string(), drop_deleted_providers(stored, &value));
+            } else if key == "chats" {
+                // A chats write must MERGE by id, never replace. The renderer's
+                // mid-stream heartbeat (writeChatsNow) persists only the
+                // streaming subset, so replacing the whole array with that
+                // subset deleted every other chat from settings.json — the
+                // "app closed / restarted and my recent chats are gone" data
+                // loss. Merging keeps unmentioned rows and lets listed rows win.
+                let stored = map.get("chats").cloned().unwrap_or(Value::Null);
+                let merged = merge_chat_lists([stored, value.clone()]);
+                // A chat deleted earlier must not come back through the union.
+                let dead = map.get("deleted_chats").cloned().unwrap_or(Value::Null);
+                map.insert("chats".to_string(), drop_deleted_rows(merged, &dead));
+            } else if key == "deleted_chats" {
+                // The tombstone is the explicit delete path: drop those rows in
+                // the same write so the merge above can never resurrect them.
+                let stored = map.get("chats").cloned().unwrap_or(Value::Null);
+                map.insert("chats".to_string(), drop_deleted_rows(stored, &value));
+            }
+            // The tombstone keys themselves are always stored verbatim so the
+            // next write can consult them. `chats`, however, must NOT be
+            // re-inserted raw here: the merge above already produced the
+            // authoritative array, and an unconditional insert re-introduced
+            // the streaming subset, deleting every other chat from
+            // settings.json (the "my recent chats are gone" data loss).
+            if key != "chats" {
+                map.insert(key.clone(), value);
+            }
         }
         // Publish the document ONCE and let the cache and the writer share that
         // single allocation through an `Arc` — the old code kept a private copy
@@ -201,7 +267,7 @@ pub async fn store_set(app: AppHandle, key: String, value: Value) -> bool {
         }
         {
             let q = write_queue();
-            let mut pending = q.pending.lock().unwrap();
+            let mut pending = q.pending.lock().unwrap_or_else(|e| e.into_inner());
             *pending = Some((store_path(&app), shared));
             q.cv.notify_one();
         }
@@ -244,6 +310,11 @@ pub async fn store_get(app: AppHandle, key: String) -> Option<Value> {
                 }
             }
             let merged = merge_chats_from_disk(&app, doc.get("chats"));
+            // Never resurrect a chat the user deleted: its per-chat file under
+            // `chats/` survives a delete, and without this filter the disk merge
+            // above would put the row straight back into the sidebar.
+            let dead = doc.get("deleted_chats").cloned().unwrap_or(Value::Null);
+            let merged = drop_deleted_rows(merged, &dead);
             *chats_cache_slot().lock().unwrap() = Some((merged.clone(), Instant::now()));
             return Some(merged);
         }
@@ -286,6 +357,80 @@ fn merge_chats_from_disk(app: &AppHandle, stored: Option<&Value>) -> Value {
         }
     }
     merge_chat_lists(lists)
+}
+
+/// Merge provider lists by id: the LAST occurrence wins (the renderer's payload
+/// is the source of truth for edits), while rows the payload does not mention
+/// are preserved — a partial settings snapshot must never delete a provider.
+/// Same shape as `merge_chat_lists`, keyed on `id` instead of `updatedAt`.
+fn merge_providers(lists: impl IntoIterator<Item = Value>) -> Value {
+    fn upsert(obj: Value, best: &mut serde_json::Map<String, Value>, order: &mut Vec<String>) {
+        let Some(id) = obj.get("id").and_then(|v| v.as_str().map(String::from)) else {
+            return;
+        };
+        if !best.contains_key(&id) {
+            order.push(id.clone());
+        }
+        best.insert(id, obj);
+    }
+    let mut best = serde_json::Map::new();
+    let mut order: Vec<String> = Vec::new();
+    for list in lists {
+        if let Value::Array(items) = list {
+            for obj in items {
+                upsert(obj, &mut best, &mut order);
+            }
+        }
+    }
+    Value::Array(order.into_iter().filter_map(|id| best.remove(&id)).collect())
+}
+
+/// Remove tombstoned provider ids (`deleted_providers`) from a provider array.
+/// The tombstone is the explicit delete path, so it outranks the union merge.
+fn drop_deleted_providers(providers: Value, tombstones: &Value) -> Value {
+    let Value::Array(rows) = providers else {
+        return providers;
+    };
+    let Value::Array(dead) = tombstones else {
+        return Value::Array(rows);
+    };
+    let dead: Vec<&str> = dead.iter().filter_map(|v| v.as_str()).collect();
+    if dead.is_empty() {
+        return Value::Array(rows);
+    }
+    Value::Array(
+        rows.into_iter()
+            .filter(|row| {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                !dead.contains(&id)
+            })
+            .collect(),
+    )
+}
+
+/// Remove rows whose `id` appears in a tombstone list (`deleted_chats`).
+/// Unlike `drop_deleted_providers` this is generic: chats and providers share
+/// the same `id`-keyed array shape.
+fn drop_deleted_rows(rows: Value, tombstones: &Value) -> Value {
+    let Value::Array(items) = rows else {
+        return rows;
+    };
+    let Value::Array(dead) = tombstones else {
+        return Value::Array(items);
+    };
+    let dead: Vec<&str> = dead.iter().filter_map(|v| v.as_str()).collect();
+    if dead.is_empty() {
+        return Value::Array(items);
+    }
+    Value::Array(
+        items
+            .into_iter()
+            .filter(|row| {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                !dead.contains(&id)
+            })
+            .collect(),
+    )
 }
 
 /// Merge chat lists by id: newest `updatedAt` wins, first-seen order kept —
@@ -355,8 +500,70 @@ mod tests {
         assert_eq!(merged[0]["id"], "x");
     }
 
+    /// A partial settings payload (missing provider rows) must never delete a
+    /// provider — rows absent from the payload are preserved, listed rows win.
+    #[test]
+    fn providers_merge_preserves_unlisted_rows() {
+        let kept = serde_json::json!({"id": "custom-1", "name": "9router"});
+        let edited = serde_json::json!({"id": "openrouter", "name": "Edited"});
+        let merged = merge_providers([
+            serde_json::json!([kept, serde_json::json!({"id": "openrouter", "name": "OpenRouter"})]),
+            serde_json::json!([edited]),
+        ]);
+        let rows = merged.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "custom-1");
+        assert_eq!(rows[1]["name"], "Edited");
+    }
+
+    /// The `deleted_providers` tombstone is the explicit delete path: it outranks
+    /// the union merge so a removed provider cannot be resurrected.
+    #[test]
+    fn providers_tombstone_drops_rows() {
+        let providers = serde_json::json!([{"id": "a"}, {"id": "b"}]);
+        let dropped = drop_deleted_providers(providers, &serde_json::json!(["a"]));
+        let rows = dropped.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "b");
+        // An empty or malformed tombstone is a no-op.
+        let same = drop_deleted_providers(serde_json::json!([{"id": "a"}]), &Value::Null);
+        assert_eq!(same.as_array().unwrap().len(), 1);
+    }
+
     /// The streamed atomic write must round-trip the document and leave no
     /// temp file behind (the store is the app's single source of truth).
+    /// A mid-stream chat heartbeat writes only the streaming SUBSET; the store
+    /// must merge it by id instead of replacing the whole array, or every other
+    /// chat is deleted from settings.json (the "app closed, recent chats gone"
+    /// data loss).
+    #[test]
+    fn chats_write_merges_subset_without_deleting_rows() {
+        let full = serde_json::json!([
+            {"id": "a", "updatedAt": 1.0, "title": "keep me"},
+            {"id": "b", "updatedAt": 1.0, "title": "streaming"},
+        ]);
+        let subset = serde_json::json!([{"id": "b", "updatedAt": 2.0, "title": "streaming"}]);
+        let merged = merge_chat_lists([full, subset]);
+        let rows = merged.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], "keep me");
+        assert_eq!(rows[1]["updatedAt"], 2.0);
+    }
+
+    /// A deleted chat must stay deleted even though its per-chat file and the
+    /// on-disk copy both still exist.
+    #[test]
+    fn deleted_chats_tombstone_drops_rows() {
+        let rows = serde_json::json!([{"id": "a"}, {"id": "b"}]);
+        let dropped = drop_deleted_rows(rows, &serde_json::json!(["a"]));
+        let out = dropped.as_array().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], "b");
+        // An empty or malformed tombstone is a no-op.
+        let same = drop_deleted_rows(serde_json::json!([{"id": "a"}]), &Value::Null);
+        assert_eq!(same.as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn write_document_round_trips_and_cleans_up() {
         let dir = std::env::temp_dir().join(format!(

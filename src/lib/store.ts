@@ -644,8 +644,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -730,7 +730,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -746,7 +746,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, whisperModel, whisperBaseUrl, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -756,6 +756,11 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
   if (del.length) writes.push(api.storeSet('deleted_chats', del))
   const delW = s.deletedWorkspaceRoots
   if (delW.length) writes.push(api.storeSet('deleted_workspaces', delW))
+  // Provider tombstones are the ONLY way to delete a provider now: the Rust
+  // store unions provider rows by id, so a removal must be published here or
+  // the row would come straight back on the next settings write.
+  const delP = s.deletedProviderIds
+  if (delP.length) writes.push(api.storeSet('deleted_providers', delP))
   return Promise.all(writes)
 }
 
@@ -914,6 +919,8 @@ interface State {
   deletedChatIds: string[]
   /** Project roots whose workspace was deleted — their vector store is removed. */
   deletedWorkspaceRoots: string[]
+  /** Provider ids the user removed — an explicit delete the store must honour. */
+  deletedProviderIds: string[]
   activeChatId: string
   /** VSCode-style open chat tabs (editor group left). Subset of chat ids in
    *  open order. Closing a tab does NOT delete the chat (sidebar keeps it).
@@ -1018,10 +1025,7 @@ interface State {
   /** User-level data root (skills/plans/mcp). */
   dataPath: string
   setDataPath: (p: string) => void
-  /** On-device model preferences (Settings → Models). */
-  whisperModel: string
-  whisperBaseUrl: string
-  /** STT source: 'local' = on-device Whisper, otherwise a settings.providers id. */
+  /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions. */
   sttModel: string
@@ -1035,8 +1039,6 @@ interface State {
   ttsVoice: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks: TtsFallback[]
-  setWhisperModel: (m: string) => void
-  setWhisperBaseUrl: (u: string) => void
   setSttProviderId: (id: string) => void
   setSttModel: (m: string) => void
   setSttFallbacks: (f: SttFallback[]) => void
@@ -1372,9 +1374,7 @@ export const useStore = create<State>((set, get) => ({
   dir: 'rtl',
   fontSize: 14,
   webSearchAutoFetch: 3,
-  whisperModel: 'Systran/faster-whisper-medium',
-  whisperBaseUrl: '',
-  sttProviderId: 'local',
+  sttProviderId: '',
   sttModel: 'whisper-1',
   sttFallbacks: [],
   ttsProviderId: '',
@@ -1399,6 +1399,7 @@ export const useStore = create<State>((set, get) => ({
   chats: [],
   deletedChatIds: [],
   deletedWorkspaceRoots: [],
+  deletedProviderIds: [],
   activeChatId: typeof window !== 'undefined' ? loadActiveChat() : '',
   openChatIds: typeof window !== 'undefined' ? loadOpenChats() : [],
   visibleChatIds: typeof window !== 'undefined' ? loadVisibleChats() : [],
@@ -1435,9 +1436,12 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
 
   load: async () => {
-    const [settings, chats] = await Promise.all([
+    const [settings, chats, deletedProviders] = await Promise.all([
       api.storeGet<Settings>('settings'),
       api.storeGet<Chat[]>('chats'),
+      // Provider deletions are tombstoned so the Rust store's id-union (and the
+      // built-in backfill below) cannot resurrect a provider the user removed.
+      api.storeGet<string[]>('deleted_providers'),
     ])
     // True on a genuine first run (no settings file on disk yet) — in that case
     // the store's defaults ARE the correct state and may be persisted. On a cold
@@ -1568,14 +1572,17 @@ export const useStore = create<State>((set, get) => ({
 
     let providers: ProviderConfig[]
     let activeProviderId = ''
+    // Ids the user explicitly removed. They are dropped from the loaded list
+    // (and skipped by the built-in backfill) so a deletion stays deleted.
+    const deadProviders = new Set(Array.isArray(deletedProviders) ? deletedProviders : [])
     if (Array.isArray(raw.providers) && raw.providers.length > 0) {
-      providers = raw.providers.map(normalizeProvider)
+      providers = raw.providers.map(normalizeProvider).filter((p) => !deadProviders.has(p.id))
       // Backfill built-in provider rows that are missing from a settings file
       // saved by an older build (e.g. a google provider added in a newer
       // version), so it appears in Settings without the user re-adding it.
       const present = new Set(providers.map((p) => p.id))
       for (const def of defaultProviders()) {
-        if (!present.has(def.id)) providers.push(def)
+        if (!present.has(def.id) && !deadProviders.has(def.id)) providers.push(def)
       }
       activeProviderId = providers.some((p) => p.id === raw.activeProviderId)
         ? raw.activeProviderId!
@@ -1728,12 +1735,18 @@ export const useStore = create<State>((set, get) => ({
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       fontSize,
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
-      whisperModel: typeof raw.whisperModel === 'string' && raw.whisperModel.trim() ? raw.whisperModel : 'Systran/faster-whisper-medium',
-      whisperBaseUrl: typeof raw.whisperBaseUrl === 'string' ? raw.whisperBaseUrl : '',
-      sttProviderId: typeof raw.sttProviderId === 'string' && raw.sttProviderId.trim() ? raw.sttProviderId : 'local',
+      // No on-device STT anymore: an empty id means "not selected", never a
+      // magic 'local' row (the legacy value is migrated away here).
+      sttProviderId:
+        typeof raw.sttProviderId === 'string' && raw.sttProviderId.trim() && raw.sttProviderId !== 'local'
+          ? raw.sttProviderId
+          : '',
       sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
       sttFallbacks: normalizeSttFallbacks((raw as Record<string, unknown>).sttFallbacks),
-      ttsProviderId: typeof raw.ttsProviderId === 'string' ? raw.ttsProviderId.trim() : '',
+      ttsProviderId:
+        typeof raw.ttsProviderId === 'string' && raw.ttsProviderId.trim() !== 'local'
+          ? raw.ttsProviderId.trim()
+          : '',
       // خالی مجاز است (پروایدرهای 9router بدون مدل/ویس): فقط وقتی فیلد اصلاً
       // رشته نیست (settings قدیمی) پیش‌فرض می‌گذاریم، نه وقتی کاربر پاکش کرده.
       ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
@@ -1876,7 +1889,14 @@ export const useStore = create<State>((set, get) => ({
         s.settings.activeProviderId === id || !out.some((p) => p.id === s.settings.activeProviderId)
           ? out[0].id
           : s.settings.activeProviderId
-      return { settings: { ...s.settings, providers: out, activeProviderId: active } }
+      return {
+        settings: { ...s.settings, providers: out, activeProviderId: active },
+        // Tombstone the id: the store unions providers by id, so without this
+        // the removed row would be restored by the next settings write.
+        deletedProviderIds: s.deletedProviderIds.includes(id)
+          ? s.deletedProviderIds
+          : [...s.deletedProviderIds, id],
+      }
     })
     get().persist()
   },
@@ -2180,16 +2200,10 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  setWhisperModel: (m) => {
-    set({ whisperModel: (m ?? '').trim() || 'Systran/faster-whisper-medium' })
-    get().persist()
-  },
-  setWhisperBaseUrl: (u) => {
-    set({ whisperBaseUrl: (u ?? '').trim() })
-    get().persist()
-  },
   setSttProviderId: (id) => {
-    set({ sttProviderId: (id ?? '').trim() || 'local' })
+    // Empty is allowed (= not selected). The old `|| 'local'` fallback made the
+    // on-device Whisper source impossible to clear.
+    set({ sttProviderId: (id ?? '').trim() })
     get().persist()
   },
   setSttModel: (m) => {

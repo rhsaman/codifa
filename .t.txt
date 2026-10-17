@@ -1,0 +1,17 @@
+   Compiling codifa v1.8.3 (/Users/saman/Documents/code/codifa/src-tauri)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.44s
+     Running unittests src/main.rs (target/debug/deps/codifa-6c1f9243d09f5d4a)
+
+running 9 tests
+test store::tests::deleted_chats_tombstone_drops_rows ... ok
+test store::tests::providers_tombstone_drops_rows ... ok
+test store::tests::chats_write_merges_subset_without_deleting_rows ... ok
+test store::tests::providers_merge_preserves_unlisted_rows ... ok
+test store::tests::chats_merge_keeps_first_seen_order ... ok
+test store::tests::chats_merge_recovers_from_disk_files ... ok
+test store::tests::chats_merge_newest_wins ... ok
+test store::tests::write_document_round_trips_and_cleans_up ... ok
+test appstate::tests::checkpoint_restore_roundtrip ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 0.00s
+

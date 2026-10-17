@@ -237,25 +237,38 @@ pub fn save_state(data_root: &Path, body: StateSaveBody) -> Response {
             // mirror save_settings: None is a no-op
         } else {
             let path = data_root.join("settings.json");
-            if let Ok(existing) = std::fs::read_to_string(&path) {
-                if let Ok(existing_json) = serde_json::from_str::<Value>(&existing) {
+            let existing_json = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            match existing_json {
+                Some(existing_json)
                     if existing_json.as_object().map(|o| !o.is_empty()).unwrap_or(false)
-                        && looks_like_default_skeleton(settings)
-                    {
-                        // Cold-start skeleton racing a real file: keep the real
-                        // one, archive it (mirror of _backup_then_save_settings).
-                        let _ = atomic_write(
-                            &data_root.join("settings.json.bak"),
-                            &serde_json::to_string_pretty(&existing_json).unwrap_or_default(),
-                        );
-                    } else {
-                        let _ = atomic_write_json(&path, settings);
-                    }
-                } else {
-                    let _ = atomic_write_json(&path, settings);
+                        && looks_like_default_skeleton(settings) =>
+                {
+                    // Cold-start skeleton racing a real file: keep the real
+                    // one, archive it (mirror of _backup_then_save_settings).
+                    let _ = atomic_write(
+                        &data_root.join("settings.json.bak"),
+                        &serde_json::to_string_pretty(&existing_json).unwrap_or_default(),
+                    );
                 }
-            } else {
-                let _ = atomic_write_json(&path, settings);
+                other => {
+                    // settings.json is ONE flat document that also holds sibling
+                    // keys the store writes directly ("chats", "deleted_chats",
+                    // tombstones). Replacing the whole file with just the
+                    // `settings` object silently deleted every sibling key —
+                    // including the entire chat list. Merge instead: listed keys
+                    // win, everything else survives.
+                    let mut doc = other
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+                    if let Value::Object(incoming) = settings {
+                        for (k, v) in incoming {
+                            doc.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let _ = atomic_write_json(&path, &Value::Object(doc));
+                }
             }
         }
     }
@@ -757,14 +770,14 @@ mod title_tests {
 }
 
 pub async fn app_state_get(State(st): State<crate::backend_light::AppState>) -> Response {
-    Json(get_state(&st.data_root)).into_response()
+    Json(get_state(&st.root())).into_response()
 }
 
 pub async fn app_state_post(
     State(st): State<crate::backend_light::AppState>,
     Json(body): Json<StateSaveBody>,
 ) -> Response {
-    save_state(&st.data_root, body)
+    save_state(&st.root(), body)
 }
 
 pub async fn system_prompts_get() -> Response {
@@ -775,7 +788,7 @@ pub async fn checkpoints_list(
     State(st): State<crate::backend_light::AppState>,
     AxumPath(chat_id): AxumPath<String>,
 ) -> Response {
-    Json(list_checkpoints(&st.data_root, &chat_id)).into_response()
+    Json(list_checkpoints(&st.root(), &chat_id)).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -789,21 +802,21 @@ pub async fn checkpoints_restore(
     AxumPath((chat_id, seq)): AxumPath<(String, i64)>,
     Json(body): Json<CheckpointRestoreBody>,
 ) -> Response {
-    match restore_checkpoint(&st.data_root, &chat_id, seq, &body.root) {
+    match restore_checkpoint(&st.root(), &chat_id, seq, &body.root) {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
 }
 
 pub async fn schedules_list(State(st): State<crate::backend_light::AppState>) -> Response {
-    Json(json!({ "schedules": list_schedules(&st.data_root) })).into_response()
+    Json(json!({ "schedules": list_schedules(&st.root()) })).into_response()
 }
 
 pub async fn schedules_upsert(
     State(st): State<crate::backend_light::AppState>,
     Json(body): Json<Value>,
 ) -> Response {
-    match save_schedule(&st.data_root, body) {
+    match save_schedule(&st.root(), body) {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -813,7 +826,7 @@ pub async fn schedules_delete(
     State(st): State<crate::backend_light::AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    Json(delete_schedule(&st.data_root, &id)).into_response()
+    Json(delete_schedule(&st.root(), &id)).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -827,32 +840,32 @@ pub async fn schedule_runs_list(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<RunsQuery>,
 ) -> Response {
-    Json(json!({ "runs": list_schedule_runs(&st.data_root, &id, q.limit.unwrap_or(20)) })).into_response()
+    Json(json!({ "runs": list_schedule_runs(&st.root(), &id, q.limit.unwrap_or(20)) })).into_response()
 }
 
 pub async fn schedule_runs_clear(
     State(st): State<crate::backend_light::AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    Json(delete_schedule_runs(&st.data_root, &id)).into_response()
+    Json(delete_schedule_runs(&st.root(), &id)).into_response()
 }
 
 pub async fn all_schedule_runs(
     State(st): State<crate::backend_light::AppState>,
     Query(q): Query<RunsQuery>,
 ) -> Response {
-    Json(json!({ "runs": list_schedule_runs(&st.data_root, "", q.limit.unwrap_or(50)) })).into_response()
+    Json(json!({ "runs": list_schedule_runs(&st.root(), "", q.limit.unwrap_or(50)) })).into_response()
 }
 
 pub async fn schedule_run_delete(
     State(st): State<crate::backend_light::AppState>,
     AxumPath(run_id): AxumPath<String>,
 ) -> Response {
-    Json(delete_schedule_run(&st.data_root, &run_id)).into_response()
+    Json(delete_schedule_run(&st.root(), &run_id)).into_response()
 }
 
 pub async fn orphan_schedule_runs_clear(State(st): State<crate::backend_light::AppState>) -> Response {
-    Json(delete_orphan_schedule_runs(&st.data_root)).into_response()
+    Json(delete_orphan_schedule_runs(&st.root())).into_response()
 }
 
 // --- tests -------------------------------------------------------------------

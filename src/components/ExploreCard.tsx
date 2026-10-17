@@ -1,6 +1,6 @@
 import type { ToolActivity } from "../types";
 import { useViewerTabs } from "../lib/viewerTabs";
-import { toolLabel, useRunningClock } from "./ToolCallView";
+import { StatusIcon, toolLabel, useRunningClock } from "./ToolCallView";
 
 /** Short label of an explore (sub-agent) run: the model's own description when
  *  it supplied one, else the run summary, else a plain "Explore". */
@@ -23,19 +23,24 @@ export interface ExploreToolCount {
  *  sub-agent called and how many times. Drives both the chips on the chat card
  *  and the side panel's header summary, so the two views never disagree. */
 export function exploreToolCounts(activity: ToolActivity): ExploreToolCount[] {
-  const counts = new Map<string, number>();
+  // Keyed by LABEL, not raw tool name: `grep` and `glob` both render as
+  // "Search Files", so keying on the name produced two chips with an identical
+  // label ("Search Files ×2" twice) instead of one tallied chip.
+  const counts = new Map<string, ExploreToolCount>();
   const walk = (list?: ToolActivity[]) => {
     for (const a of list ?? []) {
-      counts.set(a.tool, (counts.get(a.tool) ?? 0) + 1);
+      const label = toolLabel(a.tool);
+      const cur = counts.get(label);
+      if (cur) {
+        cur.count += 1;
+      } else {
+        counts.set(label, { tool: a.tool, label, count: 1 });
+      }
       walk(a.children);
     }
   };
   walk(activity.children);
-  return [...counts.entries()].map(([tool, count]) => ({
-    tool,
-    label: toolLabel(tool),
-    count,
-  }));
+  return [...counts.values()];
 }
 
 /** Total number of tool calls a run made (nested calls included). */
@@ -49,12 +54,21 @@ function fmtMs(ms?: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+/** One-line state word for the status badge's title/aria-label. */
+function statusLabel(status: ToolActivity["status"]): string {
+  if (status === "running") return "Working…";
+  if (status === "error") return "Failed";
+  if (status === "denied") return "Blocked";
+  return "Done";
+}
+
 /** Chat-side card for ONE explore (sub-agent) run.
  *
- *  The card stays a compact summary inside the chat: it names the run and
- *  chips every tool it used with its call count, so the user sees WHAT ran and
- *  HOW MANY times without reading a wall of output. The calls themselves live
- *  in the right-hand panel — clicking the card opens (or retargets) that run's
+ *  The card stays a compact summary inside the chat: a live status badge
+ *  (spinner while the run works, a check once it lands), the run title, and
+ *  one chip per tool with its call count — so the user sees WHAT ran and HOW
+ *  MANY times without reading a wall of output. The calls themselves live in
+ *  the right-hand panel — clicking the card opens (or retargets) that run's
  *  tool group there via `openExplore` (user request). */
 export function ExploreCard({
   activity,
@@ -71,7 +85,8 @@ export function ExploreCard({
     running && activity.startedAt ? now - activity.startedAt : activity.elapsedMs;
   const title = exploreTitle(activity);
   const counts = exploreToolCounts(activity);
-  const total = counts.reduce((n, c) => n + c.count, 0);
+  const total = exploreCallTotal(activity);
+  const state = statusLabel(activity.status);
 
   return (
     <div className={`tool-card explore ${activity.status}${running ? " running" : ""}`}>
@@ -85,24 +100,16 @@ export function ExploreCard({
             useViewerTabs.getState().openExplore(messageId, index, title)
           }
         >
-          <span className="explore-card-icon" aria-hidden="true">
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <circle cx="11" cy="11" r="7" />
-              <path d="m20 20-3.6-3.6" />
-            </svg>
+          <span
+            className={`explore-card-status ${activity.status}`}
+            role="img"
+            title={state}
+            aria-label={state}
+          >
+            <StatusIcon status={activity.status} />
           </span>
           <span className="trace-pill trace-pill-sub">Explore</span>
-          <span className="trace-head-desc" dir="auto">
-            {" · "}
+          <span className="trace-head-desc" dir="auto" title={title}>
             {title}
           </span>
           <span className="trace-head-right">
@@ -115,10 +122,11 @@ export function ExploreCard({
             </span>
           </span>
         </button>
+        {running && <div className="explore-card-progress" aria-hidden="true" />}
         {counts.length > 0 && (
           <div className="explore-tool-chips">
             {counts.map((c) => (
-              <span key={c.tool} className="explore-tool-chip">
+              <span key={c.label} className="explore-tool-chip" title={c.label}>
                 <span className="explore-tool-name">{c.label}</span>
                 <span className="explore-tool-n">{`×${c.count}`}</span>
               </span>

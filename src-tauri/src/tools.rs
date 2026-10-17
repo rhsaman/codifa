@@ -1169,7 +1169,11 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 "name": name,
                 "previous_name": s("previous_name"),
                 "content": content,
-                "description": s("description"),
+                // Pass the raw JSON through (not `s(...)`, which turns a
+                // missing field into ""): `sync_skill` treats null/absent as
+                // "keep whatever the file already has", so a model that omits
+                // fa_keywords on an EDIT no longer wipes the existing ones.
+                "description": args["description"].clone(),
                 "fa_keywords": args["fa_keywords"].clone(),
             });
             if args["delete"].as_bool().unwrap_or(false) {

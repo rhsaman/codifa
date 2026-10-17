@@ -7,7 +7,7 @@
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{Request, Response, StatusCode, Uri};
+use axum::http::{Request, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -18,7 +18,6 @@ use crate::agent;
 use crate::compact;
 use crate::git;
 use crate::llm::{self, LlmConfig};
-use crate::sidecar;
 use crate::skills;
 use crate::state::get_data_root;
 use std::collections::HashMap;
@@ -60,20 +59,29 @@ pub fn serve(app: tauri::AppHandle) -> Result<(), String> {
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Reqwest client for proxying to the Python sidecar.
-    http: reqwest::Client,
     /// Resolved data root (~/.codifa) for the native file-backed endpoints.
+    ///
+    /// Kept in sync with a data-path move: the move command writes the new root
+    /// through `state::set_data_root`, and every handler reads the live value
+    /// via `Self::root()` instead of this snapshot.
     pub data_root: PathBuf,
 }
 
-pub fn new_state(data_root: PathBuf) -> AppState {
-    AppState {
-        http: reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("reqwest client"),
-        data_root,
+impl AppState {
+    /// The CURRENT data root.
+    ///
+    /// The router runs on its own tokio runtime with no `AppHandle`, so it
+    /// cannot ask Tauri for the root. `state::current_data_root()` is the
+    /// process-global mirror the app keeps updated (a Settings → Data path move
+    /// changes it); this snapshot is only the fallback for the window between
+    /// router startup and the first mirror write.
+    pub fn root(&self) -> PathBuf {
+        crate::state::current_data_root().unwrap_or_else(|| self.data_root.clone())
     }
+}
+
+pub fn new_state(data_root: PathBuf) -> AppState {
+    AppState { data_root }
 }
 
 fn bad_request(msg: &str) -> Response<Body> {
@@ -267,6 +275,100 @@ async fn git_commit(Json(body): Json<git::CommitBody>) -> Response<Body> {
     git_response(git::commit(&body.root, &body.message, body.add_all))
 }
 
+// ---------- native /git/autocommit ----------
+
+/// Body of a "commit with an AI-written message" request. The renderer sends
+/// `provider` as the provider KIND (custom/anthropic/openai/…), matching the
+/// other provider-scoped endpoints.
+#[derive(serde::Deserialize)]
+pub struct GitAutoCommitBody {
+    #[serde(default)]
+    pub root: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+}
+
+/// Stage everything, ask the model for a Conventional-Commits message from the
+/// real diff, and commit with it. Runs natively: the renderer's Commit button
+/// called `/git/autocommit`, which had no route after the Python sidecar was
+/// removed, so it always failed.
+async fn git_autocommit(Json(body): Json<GitAutoCommitBody>) -> Response<Body> {
+    let root = body.root.trim().to_string();
+    if root.is_empty() {
+        return bad_request("root is required");
+    }
+    // Stage first so the prompt describes exactly what will be committed.
+    if let Err(git::GitError(msg)) = git::stage_all(&root) {
+        return bad_request(&msg);
+    }
+    let status = match git::status(&root) {
+        Ok(v) => v,
+        Err(git::GitError(msg)) => return bad_request(&msg),
+    };
+    if status["entries"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return bad_request("nothing to commit");
+    }
+    let diff = match git::diff(&root, "", true) {
+        Ok(v) => v["diff"].as_str().unwrap_or("").to_string(),
+        Err(git::GitError(msg)) => return bad_request(&msg),
+    };
+    let mut keys = body.api_keys.clone();
+    if keys.is_empty() && !body.api_key.trim().is_empty() {
+        keys.push(body.api_key.clone());
+    }
+    let cfg = LlmConfig {
+        provider: body.provider.clone(),
+        model: body.model.clone(),
+        base_url: body.base_url.clone(),
+        api_keys: keys,
+        temperature: Some(0.2),
+        max_tokens: Some(512),
+        // A commit message is a short one-shot; a real budget is fine here
+        // (this is not the chat stream, which has no timeout on purpose).
+        timeout_secs: 120,
+    };
+    const SYSTEM: &str = "You write git commit messages. Reply with ONLY the commit message: \
+a Conventional-Commits subject line (type(scope): summary), at most 72 characters, \
+then an optional blank line and 1-4 bullet points. Describe what the diff ACTUALLY does. \
+No code fences, no quotes, no preamble, no trailing explanation.";
+    let client = llm::http_client();
+    let user = format!(
+        "Staged changes (git status --porcelain):\n{status}\n\nDiff:\n{diff}",
+        status = serde_json::to_string(&status["entries"]).unwrap_or_default()
+    );
+    let summary = match llm::complete(&client, &cfg, SYSTEM, &user).await {
+        Ok(r) if !r.text.trim().is_empty() => r.text.trim().to_string(),
+        Ok(_) => return bad_request("the model returned an empty commit message"),
+        Err(e) => return bad_request(&e),
+    };
+    // Strip a code fence if the model wrapped the message anyway.
+    let message = summary
+        .trim()
+        .trim_start_matches("```")
+        .trim_start_matches(|c: char| c.is_alphabetic())
+        .trim()
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+    let message = if message.is_empty() { summary } else { message };
+    match git::commit(&root, &message, false) {
+        Ok(v) => {
+            let mut out = v;
+            out["message"] = json!(message);
+            Json(out).into_response()
+        }
+        Err(git::GitError(msg)) => bad_request(&msg),
+    }
+}
+
 async fn git_discard(Json(body): Json<git::CommitBody>) -> Response<Body> {
     let _ = body.message;
     git_response(git::discard(&body.root))
@@ -287,7 +389,7 @@ async fn git_push(Json(body): Json<git::PushBody>) -> Response<Body> {
 // ---------- skills / mcp (native) + system-prompts (native appstate) ----------
 
 async fn skills_list(State(st): State<AppState>) -> Response<Body> {
-    Json(skills::list_skills(&st.data_root)).into_response()
+    Json(skills::list_skills(&st.root())).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -297,32 +399,32 @@ struct SkillFileQuery {
 }
 
 async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>) -> Response<Body> {
-    match skills::read_skill_file(&st.data_root, &q.name, &q.file) {
+    match skills::read_skill_file(&st.root(), &q.name, &q.file) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
     }
 }
 
 async fn skills_sync(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::sync_skill(&st.data_root, &body) {
+    match skills::sync_skill(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
 }
 
 async fn mcp_list(State(st): State<AppState>) -> Response<Body> {
-    Json(skills::list_mcp(&st.data_root)).into_response()
+    Json(skills::list_mcp(&st.root())).into_response()
 }
 
 async fn mcp_save(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::save_mcp(&st.data_root, &body) {
+    match skills::save_mcp(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
 }
 
 async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::delete_mcp(&st.data_root, &body) {
+    match skills::delete_mcp(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
@@ -560,6 +662,31 @@ async fn chat_stream_entry(
     chat_stream_native(body, st.data_root).await
 }
 
+/// POST /chat/steer — deliver a message to a running turn for this chat.
+/// Body: `{chat_id, id, prompt, ...}`. Answers `{ok: true}` when the message was
+/// queued (a turn is running) and `{ok: false}` when nothing was running, so the
+/// renderer re-sends it as the next turn instead of losing it.
+async fn chat_steer(Json(body): Json<Value>) -> Response<Body> {
+    let chat_id = body.get("chat_id").and_then(Value::as_str).unwrap_or_default().trim();
+    let id = body.get("id").and_then(Value::as_str).unwrap_or_default().trim();
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or_default().trim();
+    if chat_id.is_empty() || id.is_empty() || prompt.is_empty() {
+        return Json(json!({"ok": false})).into_response();
+    }
+    let ok = agent::push_steer(chat_id, id, prompt);
+    Json(json!({"ok": ok})).into_response()
+}
+
+/// POST /chat/steer/cancel — drop a queued steer the user deleted first.
+async fn chat_steer_cancel(Json(body): Json<Value>) -> Response<Body> {
+    let chat_id = body.get("chat_id").and_then(Value::as_str).unwrap_or_default().trim();
+    let id = body.get("id").and_then(Value::as_str).unwrap_or_default().trim();
+    if !chat_id.is_empty() && !id.is_empty() {
+        agent::cancel_steer(chat_id, id);
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
 /// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
 /// the same event protocol the Python sidecar emits.
 async fn chat_stream_native(body: Value, data_root: PathBuf) -> Response<Body> {
@@ -690,7 +817,7 @@ struct PlanSaveBody {
 
 async fn plan_get(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
     let ws = crate::plans::workspace_slug_for_root(&q.root);
-    match crate::plans::get_plan(&st.data_root.to_string_lossy(), &ws, &q.chat_id) {
+    match crate::plans::get_plan(&st.root().to_string_lossy(), &ws, &q.chat_id) {
         Some(p) => Json(p).into_response(),
         None => (StatusCode::NOT_FOUND, "no plan").into_response(),
     }
@@ -702,7 +829,7 @@ async fn plan_save(State(st): State<AppState>, Json(body): Json<PlanSaveBody>) -
     }
     let ws = crate::plans::workspace_slug_for_root(&body.root);
     match crate::plans::save_plan(
-        &st.data_root.to_string_lossy(),
+        &st.root().to_string_lossy(),
         &ws,
         &body.title,
         &body.content,
@@ -715,14 +842,14 @@ async fn plan_save(State(st): State<AppState>, Json(body): Json<PlanSaveBody>) -
 
 async fn plan_delete(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
     let ws = crate::plans::workspace_slug_for_root(&q.root);
-    let removed = crate::plans::delete_plan(&st.data_root.to_string_lossy(), &ws, &q.chat_id);
+    let removed = crate::plans::delete_plan(&st.root().to_string_lossy(), &ws, &q.chat_id);
     Json(json!({"ok": true, "removed": removed})).into_response()
 }
 
 async fn plan_checklist_get(State(st): State<AppState>, Query(q): Query<PlanQuery>) -> Response<Body> {
     let ws = crate::plans::workspace_slug_for_root(&q.root);
     Json(json!({
-        "items": crate::plans::get_checklist(&st.data_root.to_string_lossy(), &ws, &q.chat_id)
+        "items": crate::plans::get_checklist(&st.root().to_string_lossy(), &ws, &q.chat_id)
     }))
     .into_response()
 }
@@ -736,12 +863,42 @@ async fn plan_checklist_save(
     }
     let ws = crate::plans::workspace_slug_for_root(&body.root);
     crate::plans::save_checklist(
-        &st.data_root.to_string_lossy(),
+        &st.root().to_string_lossy(),
         &ws,
         &body.chat_id,
         &body.items,
     );
     Json(json!({"ok": true})).into_response()
+}
+
+/// POST /ask/respond — answer a pending `ask_user` gate.
+///
+/// The agent turn is parked on a oneshot inside `agent::await_answer`; this
+/// resolves it and lets the turn continue. `answer` may be a chosen option or
+/// free text. Every failure mode is a plain `{"ok": false}` — a stale or
+/// duplicate answer must never break the renderer.
+async fn ask_respond(Json(body): Json<Value>) -> Response<Body> {
+    let id = body["id"].as_str().unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return bad_request("id is required");
+    }
+    let answer = body["answer"].as_str().unwrap_or("").trim().to_string();
+    let ok = crate::agent::deliver_answer(&id, json!({ "answer": answer }));
+    Json(json!({ "ok": ok })).into_response()
+}
+
+/// POST /permission/respond — approve/deny a pending confirm_action gate.
+///
+/// The action is NOT performed by the tool until `allowed` is true, so a denied
+/// request returns a "do not do it" tool result to the model instead.
+async fn permission_respond(Json(body): Json<Value>) -> Response<Body> {
+    let id = body["id"].as_str().unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return bad_request("id is required");
+    }
+    let allowed = body["allowed"].as_bool().unwrap_or(false);
+    let ok = crate::agent::deliver_answer(&id, json!({ "allowed": allowed }));
+    Json(json!({ "ok": ok })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -760,56 +917,8 @@ struct PlanChecklistBody {
     items: Value,
 }
 
-// ---------- proxy plumbing ----------
+// ---------- (proxy removed: the Python sidecar is gone) ----------
 
-async fn sidecar_base() -> Option<String> {
-    // The sidecar state lives in Tauri's managed state; the router runs on a
-    // plain tokio runtime, so read it through the global accessor.
-    sidecar::current_url().map(|u| u.trim_end_matches('/').to_string())
-}
-
-async fn proxy_all(st: AppState, req: Request<Body>, path: &str) -> Response<Body> {
-    let Some(base) = sidecar_base().await else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "sidecar not ready").into_response();
-    };
-    let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return bad_request(&format!("body read failed: {e}")),
-    };
-    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::POST);
-    let mut out = st.http.request(method, format!("{base}{path}"));
-    for (k, v) in parts.headers.iter() {
-        if k.as_str() != "host" {
-            out = out.header(k.as_str(), v.to_str().unwrap_or_default());
-        }
-    }
-    match out.body(bytes.to_vec()).send().await {
-        Ok(res) => convert_response(res).await,
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("proxy error: {e}")).into_response(),
-    }
-}
-
-async fn convert_response(res: reqwest::Response) -> Response<Body> {
-    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let headers = res.headers().clone();
-    let mut builder = Response::builder().status(status);
-    for (k, v) in headers.iter() {
-        if matches!(k.as_str(), "content-type" | "content-disposition" | "cache-control") {
-            builder = builder.header(k, v);
-        }
-    }
-    // Stream the sidecar body through instead of buffering it: SSE endpoints
-    // (/chat/stream) must deliver deltas incrementally — buffering holds every
-    // event until the whole turn finishes, the frontend watchdog sees a silent
-    // stream and reconnects ("Connection lost").
-    builder
-        .body(Body::from_stream(res.bytes_stream()))
-        .unwrap_or_else(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response()
-        })
-}
 
 /// Permissive CORS for the webview: the renderer origin (vite dev server or
 /// tauri://localhost) is cross-origin to this loopback port and WKWebView
@@ -852,6 +961,19 @@ fn add_cors_headers(res: &mut Response<Body>) {
 
 async fn health() -> Response<Body> {
     Json(json!({"status": "ok", "version": "1.0.0"})).into_response()
+}
+
+/// POST /doc/read — extract text or render styled HTML for the file viewer.
+/// Ported from `backend/doc_tools.py`: the Python sidecar is no longer
+/// involved in reading documents.
+async fn doc_read(Json(body): Json<crate::docs::DocReadBody>) -> Response<Body> {
+    // Parsing a PDF or a large spreadsheet is CPU-bound and can take seconds:
+    // run it on the blocking pool so one big document never stalls the other
+    // loopback requests (chat stream, settings, ...).
+    match tokio::task::spawn_blocking(move || crate::docs::handle_doc_read(body)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Json(json!({ "error": format!("document read failed: {e}") })).into_response(),
+    }
 }
 
 // ---------- /browser/* (native in-app browser) ----------
@@ -952,11 +1074,21 @@ async fn browser_close(Json(body): Json<Value>) -> Response<Body> {
     Json(crate::browser::close(&chat)).into_response()
 }
 
-/// Catch-all: every non-native path is proxied to the Python sidecar.
-async fn proxy_fallback(st: State<AppState>, req: Request<Body>) -> Response<Body> {
-    let uri: &Uri = req.uri();
-    let path = uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_default();
-    proxy_all(st.0, req, &path).await
+/// Catch-all: no Python sidecar exists any more, so an unknown path is a real
+/// 404. Naming the path (and pointing at the log) makes a stale renderer call
+/// diagnosable instead of looking like a network failure.
+async fn not_found(req: Request<Body>) -> Response<Body> {
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    eprintln!("[router] no route for {path}");
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("no such endpoint: {path}") })),
+    )
+        .into_response()
 }
 
 pub fn router(state: AppState) -> Router {
@@ -966,13 +1098,25 @@ pub fn router(state: AppState) -> Router {
         .route("/git/log", get(git_log))
         .route("/git/show", get(git_show))
         .route("/git/commit", post(git_commit))
+        // AI-written commit message for the renderer's Commit button.
+        .route("/git/autocommit", post(git_autocommit))
         .route("/git/discard", post(git_discard))
         .route("/git/branches", get(git_branches))
         .route("/git/checkout", post(git_checkout))
         .route("/git/push", post(git_push))
         .route("/system-prompts", get(crate::appstate::system_prompts_get))
+        .route("/models", get(crate::models::list_models))
         .route("/models/test", post(models_test))
         .route("/models/test-batch", post(models_test_batch))
+        // Provider account endpoints (migrated from the Python sidecar's
+        // providers.py): plain HTTP + JSON, so the renderer no longer wakes
+        // Python for a balance line or a realtime token.
+        .route("/credits", get(crate::providers::credits))
+        .route("/realtime/session", post(crate::providers::realtime_session))
+        // Media (phase 5): STT/TTS are native now — the on-device sources are
+        // gone, so both are plain forwards to the configured provider.
+        .route("/transcribe", post(crate::media::transcribe))
+        .route("/tts", post(crate::media::tts))
         .route("/skills", get(skills_list))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
@@ -980,6 +1124,16 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp/delete", post(mcp_delete))
         .route("/chat/compact", post(chat_compact))
         .route("/chat/stream", post(chat_stream_entry))
+        // Mid-turn steer: inject a message into the RUNNING turn of a chat.
+        .route("/chat/steer", post(chat_steer))
+        .route("/chat/steer/cancel", post(chat_steer_cancel))
+        // User answers to a blocking agent gate. The turn is parked on a
+        // oneshot inside agent.rs (`await_answer`); these two routes resolve it
+        // and let the turn continue. They MUST be native: the sidecar no longer
+        // registers them, so the renderer's POST used to 404 through the proxy
+        // while the agent stayed blocked forever.
+        .route("/ask/respond", post(ask_respond))
+        .route("/permission/respond", post(permission_respond))
         .route("/chats/:chat_id/traces", get(crate::trace::traces_list))
         .route("/chats/:chat_id/traces", delete(crate::trace::traces_clear))
         .route("/plan", get(plan_get))
@@ -1017,8 +1171,12 @@ pub fn router(state: AppState) -> Router {
         .route("/browser/search", post(browser_search))
         .route("/browser/devtools-url", get(browser_devtools_url))
         .route("/browser/close", post(browser_close))
+        // Native /doc/read (port of backend/doc_tools.py): text extraction and
+        // styled-HTML rendering for the file viewer. Registered natively so the
+        // path no longer needs the Python sidecar.
+        .route("/doc/read", post(doc_read))
         .route("/health", get(health))
-        .fallback(proxy_fallback)
+        .fallback(not_found)
         // The default axum body cap is 2 MB — the compact request carries the
         // FULL chat history (tool outputs included) and /chat/stream carries
         // image attachments, both far past 2 MB. hyper then closes the

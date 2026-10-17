@@ -165,21 +165,16 @@ export interface Settings {
   /** User-level data root: skills/plans/mcp files live under this folder.
    *  Default: ~/.codifa. */
   dataPath?: string
-  /** On-device Whisper (voice) model: HuggingFace repo id + optional mirror. */
-  whisperModel?: string
-  whisperBaseUrl?: string
-  /** STT source: 'local' = on-device Whisper, otherwise a settings.providers id. */
+  /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId?: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */
   sttModel?: string
   /** Ordered STT fallback targets, tried after the primary STT source fails. */
   sttFallbacks?: SttFallback[]
-  /** TTS source: 'local' = on-device Piper fa, otherwise a settings.providers id. */
+  /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
   ttsProviderId?: string
-  /** TTS model: Piper voice id when local (default fa_IR-amir-medium), remote model id otherwise. */
+  /** TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
   ttsModel?: string
-  /** Optional mirror base URL for downloading the local Piper voice model. */
-  ttsBaseUrl?: string
   /** Remote TTS voice id sent to {base_url}/audio/speech (e.g. alloy). */
   ttsVoice?: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */

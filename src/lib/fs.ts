@@ -38,6 +38,7 @@ export const api = {
   searchContent: (root: string, query: string): Promise<SearchMatch[]> =>
     window.coder.searchContent(root, query),
   readImage: (absPath: string): Promise<string | null> => window.coder.readImage(absPath),
+  readPdfBase64: (absPath: string): Promise<string | null> => window.coder.readPdfBase64(absPath),
   normalizeImage: (absPath: string): Promise<{ path: string; dataUrl: string } | null> =>
     window.coder.normalizeImage(absPath),
   captureScreen: (): Promise<{ path: string; dataUrl: string } | null> => window.coder.captureScreen(),

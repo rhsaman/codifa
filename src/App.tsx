@@ -43,8 +43,6 @@ export default function App() {
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
   )
   const activeChatId = useStore((s) => s.activeChatId)
-  const openChatIds = useStore((s) => s.openChatIds)
-  const visibleChatIds = useStore((s) => s.visibleChatIds)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   const viewerTabs = useViewerTabs((s) => s.tabs)
@@ -165,34 +163,6 @@ export default function App() {
       if (timer) clearTimeout(timer)
     }
   }, [])
-
-  // Report open chats so idle eviction never closes an open chat's browser.
-  // Closing the Browser panel alone must not trigger eviction: exemption is
-  // driven only by the open chat tabs, not by panel visibility.
-  useEffect(() => {
-    let cancelled = false
-    const ids = Array.from(
-      new Set([...(openChatIds ?? []), ...(visibleChatIds ?? []), activeChatId].filter(Boolean)),
-    )
-    const report = async () => {
-      try {
-        const { ensureSidecar } = await import('./lib/api')
-        const url = await ensureSidecar()
-        if (!url || cancelled) return
-        await fetch(`${url}/browser/open-chats`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_ids: ids }),
-        }).catch(() => {})
-      } catch {
-        /* best-effort only — eviction stays safe when the sidecar is down */
-      }
-    }
-    void report()
-    return () => {
-      cancelled = true
-    }
-  }, [openChatIds, visibleChatIds, activeChatId])
 
   // One-time startup model refresh: for every configured provider, ask the
   // sidecar `/models` endpoint and persist the result (model ids, context

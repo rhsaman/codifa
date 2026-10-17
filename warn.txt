@@ -1,0 +1,45 @@
+warning: unused import: `env_key`
+  --> src/models.rs:31:24
+   |
+31 | use crate::providers::{env_key, resolve_keys, UA_LADDER};
+   |                        ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/media.rs:158:9
+    |
+158 |     let mut out_form = reqwest::multipart::Form::new().part("file", part).text("model", model);
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/models.rs:660:9
+    |
+660 |     let mut headers = auth_headers(&keys[0]);
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `id_prefix` is never read
+  --> src/models.rs:71:5
+   |
+61 | struct Meta {
+   |        ---- field in this struct
+...
+71 |     id_prefix: &'static str,
+   |     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `ModelEntry` is never constructed
+   --> src/models.rs:565:8
+    |
+565 | struct ModelEntry {
+    |        ^^^^^^^^^^
+
+warning: `codifa` (bin "codifa") generated 5 warnings (run `cargo fix --bin "codifa" -p codifa` to apply 3 suggestions)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.41s

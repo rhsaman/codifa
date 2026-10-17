@@ -110,9 +110,21 @@ fn skill_dir(root: &Path, slug: &str) -> PathBuf {
     skills_dir(root).join(safe_file(slug, "skill"))
 }
 
+/// Drop a leading `---…---` frontmatter block. `sync_skill` re-adds its own, so
+/// a caller that passes a whole skill.md (the settings editor does) must not
+/// have its copy embedded in the body.
+fn strip_frontmatter(raw: &str) -> String {
+    if !raw.starts_with("---") {
+        return raw.to_string();
+    }
+    match raw.find("\n---") {
+        Some(i) => raw[i + 4..].trim_start_matches('\n').to_string(),
+        None => raw.to_string(),
+    }
+}
+
 /// Parse `name`, `slug`, `description`, `fa_keywords` from skill.md frontmatter.
-fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {
-    let mut name = String::new();
+fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    let mut name = String::new();
     let mut slug = String::new();
     let mut description = String::new();
     let mut fa_keywords: Vec<String> = Vec::new();
@@ -299,12 +311,20 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         return Ok(json!({ "ok": true, "name": name, "note": "deleted" }));
     }
 
-    let content = body["content"].as_str().unwrap_or("").trim().to_string();
+    let raw_content = body["content"].as_str().unwrap_or("").trim().to_string();
+    // A caller may hand us the WHOLE skill.md (frontmatter included): the
+    // settings editor sends `---\nname: …\n---` + body, and the Python twin's
+    // save_skill stripped that before writing. Without stripping it here the
+    // stored file embedded a SECOND frontmatter block inside the body — it
+    // rendered as literal `---`/`name:` text, and every later save nested
+    // another one.
+    let content = strip_frontmatter(&raw_content).trim().to_string();
+    let content = strip_heading(&content, &name).trim().to_string();
     if content.is_empty() {
         return Err("skill content is required".into());
     }
-    let description = body["description"].as_str().unwrap_or("").trim().to_string();
-    let fa_keywords: Vec<String> = match &body["fa_keywords"] {
+    let mut description = body["description"].as_str().unwrap_or("").trim().to_string();
+    let mut fa_keywords: Vec<String> = match &body["fa_keywords"] {
         Value::String(s) => s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
         Value::Array(a) => a
             .iter()
@@ -328,6 +348,28 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         }
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // PRESERVE an omitted field instead of erasing it. The editor's draft body
+    // carries no frontmatter, so a save used to arrive with an empty
+    // `description` and no `fa_keywords` at all — `sync_skill` then rewrote the
+    // file with `description:` blank and DROPPED the `fa_keywords:` line, so the
+    // skill lost its catalog description and became unfindable from Persian
+    // (the reported "fa_keywords/description get wiped on save" bug).
+    // An omitted (or empty) value now means "keep what the file already has".
+    let existing_raw = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
+    let (_, _, existing_desc, existing_fa) = parse_frontmatter(&existing_raw);
+    if description.is_empty() {
+        description = existing_desc;
+    }
+    if fa_keywords.is_empty() {
+        fa_keywords = existing_fa;
+    }
+    // Dedupe case-insensitively, keeping the author's order: a repeated phrase
+    // only bloats the catalog line the model has to read.
+    {
+        let mut seen_kw: std::collections::HashSet<String> = std::collections::HashSet::new();
+        fa_keywords.retain(|k| seen_kw.insert(k.to_lowercase()));
+    }
 
     let mut markdown = format!(
         "---\nname: {name}\ndescription: {description}\n"
@@ -402,7 +444,32 @@ fn strip_heading(s: &str, name: &str) -> String {
     s.to_string()
 }
 
-/// Seed/re-sync the shipped built-in skills from `backend/skills/*.md`.
+/// Locate the shipped built-in skills directory (the `*.md` files that ship
+/// with the app). They live in `src-tauri/skills` in the repo and are bundled
+/// as the `skills/` resource in a packaged build, so they no longer depend on
+/// the Python backend at all.
+pub fn shipped_skills_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    // Dev: prefer the repo checkout so editing a shipped skill takes effect on
+    // the next launch. Release: the bundled resource dir wins.
+    let cwd = std::env::current_dir().ok();
+    let dev = [
+        cwd.as_ref().map(|d| d.join("skills")),
+        cwd.as_ref().map(|d| d.join("src-tauri").join("skills")),
+    ];
+    let packaged = app.path().resource_dir().ok().map(|res| res.join("skills"));
+    let mut candidates: Vec<Option<PathBuf>> = Vec::new();
+    if cfg!(debug_assertions) {
+        candidates.extend(dev);
+        candidates.push(packaged);
+    } else {
+        candidates.push(packaged);
+        candidates.extend(dev);
+    }
+    candidates.into_iter().flatten().find(|p| p.is_dir())
+}
+
+/// Seed/re-sync the shipped built-in skills from `skills/*.md`.
 ///
 /// Mirrors the Python sidecar's `sync_builtin_skills` (which lived in the now
 /// dead tools.py): a shipped skill that is missing from the user's store is

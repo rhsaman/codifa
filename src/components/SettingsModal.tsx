@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
 import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
-import { cancelModelDownload, downloadModel, getModelsStatus, getSkillFile, listSkills, pauseModelDownload, removeModel, resumeModelDownload, syncSkill, type ManagedModelKind, type ModelKindStatus, type ModelRunState, type ModelsStatus } from '../lib/api'
+import { getSkillFile, listSkills, syncSkill } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
@@ -535,8 +535,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setFontSize = useStore((s) => s.setFontSize)
   const dataPath = useStore((s) => s.dataPath)
   const setDataPath = useStore((s) => s.setDataPath)
-  const whisperModel = useStore((s) => s.whisperModel)
-  const setWhisperModel = useStore((s) => s.setWhisperModel)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -640,9 +638,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  // ---- Managed on-device models (Settings → Models) ----
-  const [mStatus, setMStatus] = useState<ModelsStatus | null>(null)
-  const [modelsMsg, setModelsMsg] = useState('')
   // ---- Data path (Settings → Memory) ----
   const [dataMsg, setDataMsg] = useState('')
   const [migrating, setMigrating] = useState(false)
@@ -684,104 +679,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setCacheTtlInput(String(cacheTtlMinutes))
   }, [cacheTtlMinutes])
 
-  const refreshModels = useCallback(async () => {
-    setMStatus(await getModelsStatus())
-  }, [])
-
-  // Poll while the modal is open so download progress / completion shows live.
-  // 1s cadence while a download is in flight (speed + percent feel live);
-  // 2.5s otherwise to avoid needless traffic.
-  useEffect(() => {
-    void refreshModels()
-    const id = setInterval(
-      () => void refreshModels(),
-      mStatus?.whisper?.running || mStatus?.piper?.state === 'downloading' ? 1000 : 2500,
-    )
-    return () => clearInterval(id)
-  }, [refreshModels, mStatus?.whisper?.running, mStatus?.piper?.state])
-
-  const piperRunState = (): ModelRunState | undefined => {
-    const p = mStatus?.piper
-    if (!p) return undefined
-    if (p.state === 'downloading')
-      return { state: 'downloading', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', percent: (p.progress ?? 0) * 100, downloaded_bytes: p.downloaded_bytes ?? 0, total_bytes: p.total_bytes ?? 0, speed_bps: p.speed_bps ?? 0 }
-    if (p.state === 'paused')
-      return { state: 'paused', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', percent: (p.progress ?? 0) * 100, downloaded_bytes: p.downloaded_bytes ?? 0, total_bytes: p.total_bytes ?? 0, speed_bps: p.speed_bps ?? 0 }
-    if (p.state === 'error')
-      return { state: 'error', repo: p.model || 'mehdi-hf/pocket-tts-farsi-v2', error: p.error }
-    return undefined
-  }
-
-  const isRunning = (kind: 'whisper' | 'piper') => {
-    if (kind === 'piper') return mStatus?.piper?.state === 'downloading'
-    return mStatus?.whisper?.running?.state === 'downloading'
-  }
-
-  const runState = (kind: ManagedModelKind): ModelRunState | undefined => {
-    if (kind === 'piper') return piperRunState()
-    return mStatus?.whisper?.running
-  }
-
-  const actDownload = async (kind: 'whisper' | 'piper') => {
-    const pocketDefault = 'mehdi-hf/pocket-tts-farsi-v2'
-    const rawTts = (ttsModel ?? '').trim()
-    const pocketRepo = rawTts.includes('/') ? rawTts : pocketDefault
-    const repo = kind === 'whisper' ? whisperModel : pocketRepo
-    const base = kind === 'piper' ? ((settings as { ttsBaseUrl?: string }).ttsBaseUrl ?? '') : ''
-    setModelsMsg('')
-    try {
-      await downloadModel(kind, repo, base)
-      setModelsMsg(`Downloading ${repo}… (status below updates automatically)`)
-      void refreshModels()
-    } catch (err) {
-      setModelsMsg(`Download failed: ${(err as Error).message}`)
-    }
-  }
-
-  const actPause = async (kind: ManagedModelKind) => {
-    setModelsMsg('')
-    try {
-      await pauseModelDownload(kind)
-      void refreshModels()
-    } catch (err) {
-      setModelsMsg(`Pause failed: ${(err as Error).message}`)
-    }
-  }
-
-  const actResume = async (kind: ManagedModelKind) => {
-    setModelsMsg('')
-    try {
-      await resumeModelDownload(kind)
-      void refreshModels()
-    } catch (err) {
-      setModelsMsg(`Resume failed: ${(err as Error).message}`)
-    }
-  }
-
-  const actCancel = async (kind: ManagedModelKind) => {
-    setModelsMsg('')
-    try {
-      await cancelModelDownload(kind)
-      setModelsMsg('Download stopped. Partial files are kept for later resume.')
-      void refreshModels()
-      // Refresh once more after a beat so the cleared state is visible
-      // even if the first poll raced the background thread.
-      setTimeout(() => void refreshModels(), 800)
-    } catch (err) {
-      setModelsMsg(`Stop failed: ${(err as Error).message}`)
-    }
-  }
-
-  const actRemove = async (kind: 'whisper' | 'piper', repo: string) => {
-    setModelsMsg('')
-    try {
-      await removeModel(kind, repo)
-      void refreshModels()
-    } catch (err) {
-      setModelsMsg(`Remove failed: ${(err as Error).message}`)
-    }
-  }
-
   const modes = allModes(settings)
 
   // ---- Skills & MCP tab state ----
@@ -789,9 +686,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
-  const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string; files: string[] }>>([])
+  const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string; files: string[]; description: string; faKeywords: string[] }>>([])
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
   const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
+  // Frontmatter fields of the skill being edited, keyed like skillDrafts.
+  //
+  // These are kept SEPARATE from the draft body on purpose. The draft is the
+  // body WITHOUT frontmatter (`listSkills` strips it), so a save that only sent
+  // the body used to wipe `description` and `fa_keywords` on every edit from
+  // settings — the agent's catalog then showed a skill with no description and
+  // no Persian keywords, i.e. it silently became unreachable for Persian asks.
+  const [skillDescriptions, setSkillDescriptions] = useState<Record<string, string>>({})
+  const [skillKeywords, setSkillKeywords] = useState<Record<string, string>>({})
   // Extra (Codex-style) files per skill key: filename -> content to upsert.
   const [skillExtraFiles, setSkillExtraFiles] = useState<Record<string, Record<string, string>>>({})
   // Extra files marked for deletion per skill key.
@@ -808,7 +714,17 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
   const reloadSkills = useCallback(async (preferName?: string) => {
     const rows = await listSkills()
-    const found = rows.map((r) => ({ name: r.name, path: r.path, raw: r.content, files: r.files ?? [] }))
+    const found = rows.map((r) => ({
+      name: r.name,
+      path: r.path,
+      raw: r.content,
+      files: r.files ?? [],
+      // Carried through so a save can send them back: `content` is the
+      // frontmatter-stripped body, so without these the backend would rewrite
+      // `description:`/`fa_keywords:` as empty (see sync_skill).
+      description: r.description ?? '',
+      faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
+    }))
     setSkills(found)
     setSkillDrafts((prev) => {
       const names = new Set(found.map((f) => f.name))
@@ -841,6 +757,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       if (prev[name] !== undefined) return prev
       return { ...prev, [name]: skills.find((x) => x.name === name)?.raw ?? '' }
     })
+    // Seed the frontmatter inputs from the list row, once per open. The draft
+    // body has no frontmatter, so these values are the ONLY copy of the skill's
+    // description/fa_keywords the editor holds.
+    const row = skills.find((x) => x.name === name)
+    setSkillDescriptions((prev) =>
+      prev[name] !== undefined ? prev : { ...prev, [name]: row?.description ?? '' },
+    )
+    setSkillKeywords((prev) =>
+      prev[name] !== undefined ? prev : { ...prev, [name]: (row?.faKeywords ?? []).join(', ') },
+    )
     setSkillsMsg('')
   }
 
@@ -877,10 +803,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     const extra = skillExtraFiles[name] ?? {}
     const extraNames = Object.keys(extra)
     const deleted = (skillDeletedFiles[name] ?? []).filter((f) => !extraNames.includes(f))
+    // Description and Persian keywords live in the frontmatter, which the draft
+    // body does NOT carry — send them explicitly, or the backend rewrites the
+    // file with an empty `description:` and no `fa_keywords:` at all.
+    const row = skills.find((s) => s.name === name)
+    const description = (skillDescriptions[name] ?? row?.description ?? '').trim()
+    const keywords = (skillKeywords[name] ?? (row?.faKeywords ?? []).join(', ')).trim()
     const res = await syncSkill({
       name: newName,
       previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
       content: normalized,
+      description,
+      faKeywords: keywords,
       ...(extraNames.length > 0 ? { files: extra } : {}),
       ...(deleted.length > 0 ? { deletedFiles: deleted } : {}),
     })
@@ -892,6 +826,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         const next = { ...prev }
         if (renamed) delete next[name]
         next[savedName] = normalized
+        return next
+      })
+      // Carry the frontmatter inputs over to the saved (possibly renamed) key.
+      setSkillDescriptions((prev) => {
+        const next = { ...prev }
+        if (renamed) delete next[name]
+        next[savedName] = description
+        return next
+      })
+      setSkillKeywords((prev) => {
+        const next = { ...prev }
+        if (renamed) delete next[name]
+        next[savedName] = keywords
         return next
       })
       setExpandedSkills((prev) => {
@@ -1054,6 +1001,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       [NEW_SKILL_KEY]:
         '---\nname: new-skill\ndescription: One-line English summary of when to use this skill\nfa_keywords: \n---\n\n# New skill\n\nStep-by-step instructions the agent follows when this skill matches.\n',
     }))
+    // Seed the two frontmatter inputs (the draft body above has no frontmatter,
+    // so these are the values that actually get saved).
+    setSkillDescriptions((prev) => ({ ...prev, [NEW_SKILL_KEY]: '' }))
+    setSkillKeywords((prev) => ({ ...prev, [NEW_SKILL_KEY]: '' }))
     setSkillsMsg('Editing a new skill — fill in the details, then press Save skill. Add a one-line English `description:` and fill `fa_keywords:` (comma-separated phrases you would say, e.g. ترجمه کن, translate this) so it is matched automatically.')
     // The "New skill" editor renders at the TOP of the list; if the user had
     // scrolled down, scroll the list back to the top so it's immediately visible.
@@ -1251,7 +1202,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     },
     {
       id: 'plugins',
-      label: 'Plugins',
+      label: 'Web Providers',
       group: 'Agent',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1326,7 +1277,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     },
     {
       id: 'models',
-      label: 'Models',
+      label: 'Media Providers',
       group: 'App',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -2060,6 +2011,49 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         dir="ltr"
                         spellCheck={false}
                       />
+                      {/* Same frontmatter inputs as the per-skill pane: the body
+                          textarea holds no frontmatter, so without these a new
+                          skill would be saved with an empty English description
+                          and no Persian keywords — i.e. unreachable from a
+                          Persian request. `newSkill()` seeds both states and
+                          `saveSkill()` already reads them for NEW_SKILL_KEY. */}
+                      <div className="skill-meta-row">
+                        <label className="skill-meta-label">
+                          Description (English, one line)
+                          <input
+                            value={skillDescriptions[NEW_SKILL_KEY] ?? ''}
+                            onChange={(e) =>
+                              setSkillDescriptions((prev) => ({
+                                ...prev,
+                                [NEW_SKILL_KEY]: e.target.value,
+                              }))
+                            }
+                            placeholder="One-line English summary of when to use this skill"
+                            dir="ltr"
+                            spellCheck={false}
+                          />
+                        </label>
+                        <label className="skill-meta-label">
+                          Persian keywords (fa_keywords)
+                          <input
+                            value={skillKeywords[NEW_SKILL_KEY] ?? ''}
+                            onChange={(e) =>
+                              setSkillKeywords((prev) => ({
+                                ...prev,
+                                [NEW_SKILL_KEY]: e.target.value,
+                              }))
+                            }
+                            placeholder="ترجمه کن, ترجمه, translate this"
+                            dir="auto"
+                            spellCheck={false}
+                          />
+                        </label>
+                        <span className="hint">
+                          Comma-separated phrases you would actually say. The skill
+                          catalog shows them, so a Persian request matches this skill
+                          without any embedding.
+                        </span>
+                      </div>
                       <SkillFilesEditor
                         serverFiles={[]}
                         extraFiles={skillExtraFiles[NEW_SKILL_KEY] ?? {}}
@@ -2123,6 +2117,43 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                               dir="ltr"
                               spellCheck={false}
                             />
+                            <div className="skill-meta-row">
+                              <label className="skill-meta-label">
+                                Description (English, one line)
+                                <input
+                                  value={skillDescriptions[s.name] ?? s.description ?? ''}
+                                  onChange={(e) =>
+                                    setSkillDescriptions((prev) => ({
+                                      ...prev,
+                                      [s.name]: e.target.value,
+                                    }))
+                                  }
+                                  placeholder="One-line English summary of when to use this skill"
+                                  dir="ltr"
+                                  spellCheck={false}
+                                />
+                              </label>
+                              <label className="skill-meta-label">
+                                Persian keywords (fa_keywords)
+                                <input
+                                  value={skillKeywords[s.name] ?? (s.faKeywords ?? []).join(', ')}
+                                  onChange={(e) =>
+                                    setSkillKeywords((prev) => ({
+                                      ...prev,
+                                      [s.name]: e.target.value,
+                                    }))
+                                  }
+                                  placeholder="ترجمه کن, ترجمه, translate this"
+                                  dir="auto"
+                                  spellCheck={false}
+                                />
+                              </label>
+                              <span className="hint">
+                                Comma-separated phrases you would actually say. The skill
+                                catalog shows them, so a Persian request matches this skill
+                                without any embedding.
+                              </span>
+                            </div>
                             <SkillFilesEditor
                               serverFiles={s.files ?? []}
                               extraFiles={skillExtraFiles[s.name] ?? {}}
@@ -2364,61 +2395,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         <>
             <div className="field models-tab">
               <div className="field-head">
-                <label>On-device Models</label>
+                <label>Media Providers</label>
               </div>
               <div className="hint models-intro">
-                These models run fully offline on your device. Status and progress refresh
-                automatically.
-              </div>
-              {modelsMsg && <div className="hint models-msg">{modelsMsg}</div>}
-
-              <div className="model-card">
-                <div className="model-card-head">
-                  <div className="model-card-titles">
-                    <span className="model-card-title">Speech to Text (STT)</span>
-                    <span className="model-card-desc">Offline voice input, speech to text</span>
-                  </div>
-                  <ModelBadge status={mStatus?.whisper} />
-                </div>
-                <div className="model-card-body">
-                  <label className="field-label">Model (HF repo id)</label>
-                  <input value={whisperModel} onChange={(e) => setWhisperModel(e.target.value)} dir="ltr" placeholder="Systran/faster-whisper-medium" />
-                  <ModelProgress running={runState('whisper')} />
-                  <ModelStatusLine status={mStatus?.whisper} running={isRunning('whisper')} onRemove={() => actRemove('whisper', whisperModel)} />
-                  <ModelControls
-                    running={runState('whisper')}
-                    canDownload={(mStatus?.whisper?.dirs ?? []).length === 0}
-                    onDownload={() => actDownload('whisper')}
-                    onPause={() => actPause('whisper')}
-                    onResume={() => actResume('whisper')}
-                    onCancel={() => actCancel('whisper')}
-                  />
-                </div>
-              </div>
-
-              <div className="model-card model-card-voice">
-                <div className="model-card-head">
-                  <div className="model-card-titles">
-                    <span className="model-card-title">Text to Speech (Pocket Farsi v2)</span>
-                    <span className="model-card-desc">Offline Persian voice for reading answers aloud</span>
-                  </div>
-                  <ModelBadge status={{ dirs: mStatus?.piper?.state === 'done' ? [{ repo: mStatus.piper.model || 'mehdi-hf/pocket-tts-farsi-v2', dir: '', size: mStatus?.piper?.size ?? 0, ready: true }] : [], running: runState('piper') }} />
-                </div>
-                <div className="model-card-body">
-                  <label className="field-label">Voice id (Pocket Farsi v2)</label>
-                  <input value={(() => { const v = (ttsModel ?? '').trim(); if (!v || v.includes('/') || v.includes('\\') || v.toLowerCase() === 'local' || v === 'tts-1' || v === 'tts-1-hd' || v.startsWith('fa_IR') || v.endsWith('.onnx') || v.endsWith('.onnx.json')) return 'default'; return v })()} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="default" />
-                  <ModelProgress running={runState('piper')} />
-                  <ModelStatusLine status={{ dirs: mStatus?.piper?.state === 'done' ? [{ repo: mStatus.piper.model || 'mehdi-hf/pocket-tts-farsi-v2', dir: '', size: mStatus?.piper?.size ?? 0, ready: true }] : [], running: runState('piper') }} running={isRunning('piper')} onRemove={() => actRemove('piper', ((ttsModel ?? '').trim() && (ttsModel ?? '').includes('/') ? (ttsModel ?? '').trim() : 'mehdi-hf/pocket-tts-farsi-v2'))} />
-                  <ModelControls
-                    running={runState('piper')}
-                    canDownload={mStatus?.piper?.state !== 'done' && mStatus?.piper?.state !== 'downloading'}
-                    onDownload={() => actDownload('piper')}
-                    onPause={() => actPause('piper')}
-                    onResume={() => actResume('piper')}
-                    onCancel={() => actCancel('piper')}
-                  />
-
-                </div>
+                Speech uses your configured providers — no models run on-device.
+                STT posts audio to {'<base_url>/audio/transcriptions'} and TTS to
+                {' '}{'<base_url>/audio/speech'}.
               </div>
 
               <div className="model-card model-card-voice">
@@ -2427,47 +2409,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     <span className="model-card-title">Speech to Text (STT)</span>
                     <span className="model-card-desc">Voice input transcription</span>
                   </div>
-                  <div className="voice-switch-wrap">
-                    <span className={`voice-status ${sttProviderId === 'local' ? 'on' : 'off'}`}>{sttProviderId === 'local' ? 'Local ON' : 'Local OFF'}</span>
-                  <label className="plugin-switch voice-switch" title={sttProviderId === 'local' ? 'Disable local STT' : 'Enable local STT'}>
-                    <input
-                      type="checkbox"
-                      checked={sttProviderId === 'local'}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          try { if (sttProviderId && sttProviderId !== 'local') localStorage.setItem('codifa.lastRemoteStt', sttProviderId) } catch { /* storage is best-effort */ }
-                          setSttProviderId('local')
-                        } else {
-                          let saved = ''
-                          try { saved = localStorage.getItem('codifa.lastRemoteStt') ?? '' } catch { saved = '' }
-                          const next = saved && providers.some((p) => p.id === saved) ? saved : (providers[0]?.id ?? '')
-                          setSttProviderId(next)
-                        }
-                      }}
-                    />
-                    <span className="plugin-switch-track" />
-                  </label>
-                  </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="hint">
-                    {sttProviderId === 'local'
-                      ? 'Local STT is ON — on-device Whisper is used. Turn the switch off to use the remote provider below.'
-                      : 'Local STT is OFF — the remote provider below is used. Turn the switch on for fully offline Whisper.'}
-                  </div>
                   <div className="voice-section">
                     <div className="voice-field">
                       <label className="field-label">STT provider</label>
-                    <select value={sttProviderId === 'local' ? (() => { try { const s = localStorage.getItem('codifa.lastRemoteStt') ?? ''; return s && providers.some((p) => p.id === s) ? s : (providers[0]?.id ?? '') } catch { return providers[0]?.id ?? '' } })() : sttProviderId} onChange={(e) => {
-                      // While local is ON the dropdown edits the remembered remote
-                      // provider so the external config is never wiped.
-                      if (sttProviderId === 'local') {
-                        try { localStorage.setItem('codifa.lastRemoteStt', e.target.value) } catch { /* best-effort */ }
-                        return
-                      }
-                      setSttProviderId(e.target.value)
-                    }} dir="ltr" disabled={sttProviderId === 'local'}>
-                      {providers.map((p) => (
+                    <select value={sttProviderId} onChange={(e) => setSttProviderId(e.target.value)} dir="ltr">
+                      <option value="">Not selected</option>
+                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
                         </option>
@@ -2476,10 +2425,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                     <div className="voice-field">
                       <label className="field-label">STT model</label>
-                    <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" disabled={sttProviderId === 'local'} />
+                    <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
                     </div>
                   </div>
-                  {sttProviderId !== 'local' && (
                   <div className="voice-fallbacks">
                   <label className="field-label">STT fallbacks</label>
                   <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
@@ -2490,24 +2438,22 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         next[i] = { ...next[i], providerId: e.target.value }
                         setSttFallbacks(next)
                       }} dir="ltr">
-                        {providers.map((p) => (
+                        {providers.filter((p) => p.kind !== 'ollama').map((p) => (
                           <option key={p.id} value={p.id}>
                             {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
                           </option>
                         ))}
                       </select>
-                      {fb.providerId !== 'local' && (
-                        <input value={fb.model} onChange={(e) => {
-                          const next = [...sttFallbacks]
-                          next[i] = { ...next[i], model: e.target.value }
-                          setSttFallbacks(next)
-                        }} dir="ltr" placeholder="whisper-1" />
-                      )}
+                      <input value={fb.model} onChange={(e) => {
+                        const next = [...sttFallbacks]
+                        next[i] = { ...next[i], model: e.target.value }
+                        setSttFallbacks(next)
+                      }} dir="ltr" placeholder="whisper-1" />
                       <button type="button" className="btn tiny secondary voice-remove-btn" onClick={() => setSttFallbacks(sttFallbacks.filter((_, j) => j !== i))}>Remove</button>
                     </div>
                   ))}
                   <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setSttFallbacks([...sttFallbacks, { providerId: providers[0]?.id ?? '', model: '' }])}>+ Add STT fallback</button>
-                  </div>)}
+                  </div>
                 </div>
               </div>
 
@@ -2517,48 +2463,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     <span className="model-card-title">Text to Speech (TTS)</span>
                     <span className="model-card-desc">Voice output synthesis</span>
                   </div>
-                  <div className="voice-switch-wrap">
-                    <span className={`voice-status ${ttsProviderId === 'local' ? 'on' : 'off'}`}>{ttsProviderId === 'local' ? 'Local ON' : 'Local OFF'}</span>
-                  <label className="plugin-switch voice-switch" title={ttsProviderId === 'local' ? 'Disable local TTS' : 'Enable local TTS'}>
-                    <input
-                      type="checkbox"
-                      checked={ttsProviderId === 'local'}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          try { if (ttsProviderId && ttsProviderId !== 'local') localStorage.setItem('codifa.lastRemoteTts', ttsProviderId) } catch { /* storage is best-effort */ }
-                          setTtsProviderId('local')
-                        } else {
-                          let saved = ''
-                          try { saved = localStorage.getItem('codifa.lastRemoteTts') ?? '' } catch { saved = '' }
-                          const next = saved && providers.some((p) => p.id === saved) ? saved : ''
-                          setTtsProviderId(next)
-                        }
-                      }}
-                    />
-                    <span className="plugin-switch-track" />
-                  </label>
-                  </div>
                 </div>
                 <div className="model-card-body">
-                  <div className="hint">
-                    {ttsProviderId === 'local'
-                      ? 'Local TTS is ON — on-device Persian voice is used. Turn the switch off to use the remote provider below.'
-                      : 'Local TTS is OFF — the remote provider below is used. Turn the switch on for fully offline voice.'}
-                  </div>
                   <div className="voice-section">
                     <div className="voice-field">
                       <label className="field-label">TTS provider</label>
-                    <select value={ttsProviderId === 'local' ? (() => { try { const s = localStorage.getItem('codifa.lastRemoteTts') ?? ''; return s && providers.some((p) => p.id === s) ? s : '' } catch { return '' } })() : ttsProviderId} onChange={(e) => {
-                      // While local is ON the dropdown edits the remembered remote
-                      // provider so the external config is never wiped.
-                      if (ttsProviderId === 'local') {
-                        try { localStorage.setItem('codifa.lastRemoteTts', e.target.value) } catch { /* best-effort */ }
-                        return
-                      }
-                      setTtsProviderId(e.target.value)
-                    }} dir="ltr" disabled={ttsProviderId === 'local'}>
+                    <select value={ttsProviderId} onChange={(e) => setTtsProviderId(e.target.value)} dir="ltr">
                       <option value="">Not selected</option>
-                      {providers.map((p) => (
+                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
                         </option>
@@ -2567,15 +2479,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                     <div className="voice-field">
                       <label className="field-label">TTS model</label>
-                    <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" disabled={ttsProviderId === 'local'} />
+                    <input value={ttsModel} onChange={(e) => setTtsModel(e.target.value)} dir="ltr" placeholder="tts-1" />
                     </div>
                     <div className="voice-field">
                       <label className="field-label">TTS voice</label>
-                    <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" disabled={ttsProviderId === 'local'} />
+                    <input value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)} dir="ltr" placeholder="alloy" />
                     </div>
                   </div>
 
-                  {ttsProviderId !== 'local' && (
                   <div className="voice-fallbacks">
                   <label className="field-label">TTS fallbacks</label>
                   <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
@@ -2587,7 +2498,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                         setTtsFallbacks(next)
                       }} dir="ltr">
                         <option value="">Not selected</option>
-                        {providers.map((p) => (
+                        {providers.filter((p) => p.kind !== 'ollama').map((p) => (
                           <option key={p.id} value={p.id}>
                             {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
                           </option>
@@ -2607,7 +2518,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                   ))}
                   <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>+ Add TTS fallback</button>
-                  </div>)}
+                  </div>
                 </div>
               </div>
             </div>
@@ -2687,151 +2598,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           )}
         </div>
       </div>
-    </div>
-  )
-}
-
-function fmtBytes(n: number): string {
-  if (!n || n <= 0) return '0 MB'
-  const mb = n / (1024 * 1024)
-  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`
-}
-
-/** Readable speed: B/s → KB/s → MB/s. */
-function fmtSpeed(bps?: number): string {
-  const v = bps ?? 0
-  if (!v || v <= 0) return '—'
-  if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB/s`
-  if (v >= 1024) return `${Math.round(v / 1024)} KB/s`
-  return `${Math.round(v)} B/s`
-}
-
-/** Card status badge: Not downloaded · Downloading · Paused · Error · Ready. */
-function ModelBadge({ status }: { status?: ModelKindStatus }) {
-  const run = status?.running
-  const ready = (status?.dirs ?? []).some((d) => d.ready)
-  if (run?.state === 'downloading')
-    return <span className="model-badge downloading">Downloading</span>
-  if (run?.state === 'paused')
-    return <span className="model-badge paused">Paused</span>
-  if (run?.state === 'error')
-    return <span className="model-badge error">Error</span>
-  if (ready) return <span className="model-badge ready">Ready</span>
-  return <span className="model-badge idle">Not downloaded</span>
-}
-
-/** Live progress bar: percent, downloaded/total and speed. */
-function ModelProgress({ running }: { running?: ModelRunState }) {
-  if (!running || (running.state !== 'downloading' && running.state !== 'paused')) return null
-  const pct = Math.max(0, Math.min(100, running.percent ?? 0))
-  const total = running.total_bytes ?? 0
-  const done = running.downloaded_bytes ?? 0
-  const speed = running.speed_bps ?? 0
-  // Stalled = actively downloading but no bytes for a while (e.g. retry
-  // backoff on a filtered network). Nudge toward a mirror instead of
-  // looking frozen.
-  const stalled = running.state === 'downloading' && total > 0 && speed <= 0 && done < total
-  return (
-    <div className={`model-progress${running.state === 'paused' ? ' paused' : ''}`}>
-      <div className="model-progress-top">
-        <span className="model-progress-pct">{total > 0 ? `${pct.toFixed(1)}%` : '…'}</span>
-        <span className="model-progress-meta">
-          {total > 0 ? `${fmtBytes(done)} of ${fmtBytes(total)}` : fmtBytes(done)} · {fmtSpeed(speed)}
-        </span>
-      </div>
-      <div
-        className="model-progress-track"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={Math.round(pct)}
-      >
-        <div className="model-progress-fill" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="hint model-progress-repo" dir="ltr">{running.repo}</div>
-      {stalled && (
-        <div className="hint">Connection is slow or stalled — try a mirror base URL (e.g. https://hf-mirror.com), then Resume.</div>
-      )}
-    </div>
-  )
-}
-
-/** Download controls: Download / Pause / Resume / Stop. */
-function ModelControls({
-  running,
-  canDownload,
-  onDownload,
-  onPause,
-  onResume,
-  onCancel,
-}: {
-  running?: ModelRunState
-  canDownload: boolean
-  onDownload: () => void
-  onPause: () => void
-  onResume: () => void
-  onCancel: () => void
-}) {
-  const state = running?.state
-  if (state === 'downloading') {
-    return (
-      <div className="skill-actions model-controls">
-        <button className="btn tiny secondary" onClick={onPause}>Pause</button>
-        <button className="btn tiny danger" onClick={onCancel}>Stop</button>
-      </div>
-    )
-  }
-  if (state === 'paused') {
-    return (
-      <div className="skill-actions model-controls">
-        <button className="btn tiny" onClick={onResume}>Resume</button>
-        <button className="btn tiny danger" onClick={onCancel}>Stop</button>
-      </div>
-    )
-  }
-  if (state === 'error') {
-    return (
-      <div className="skill-actions model-controls">
-        {canDownload && <button className="btn tiny" onClick={onDownload}>Retry</button>}
-        <button className="btn tiny danger" onClick={onCancel}>Clear error</button>
-      </div>
-    )
-  }
-  if (!canDownload) return null
-  return (
-    <div className="skill-actions model-controls">
-      <button className="btn tiny" onClick={onDownload}>Download</button>
-    </div>
-  )
-}
-
-/** Whisper card status line: paused → error → downloaded (single dir) → empty. */
-function ModelStatusLine({
-  status,
-  running,
-  onRemove,
-}: {
-  status?: import('../lib/api').ModelKindStatus
-  running: boolean
-  onRemove: () => void
-}) {
-  if (status?.running?.state === 'paused')
-    return <div className="hint">Paused — Resume continues from where it stopped.</div>
-  if (running) return null
-  if (status?.running?.state === 'error')
-    return (
-      <div className="hint" style={{ color: 'var(--danger)' }}>
-        Download failed: {status.running.error}
-      </div>
-    )
-  const dirs = status?.dirs ?? []
-  if (dirs.length === 0) return <div className="hint">Not downloaded.</div>
-  return (
-    <div className="skill-actions">
-      <span className="hint">Downloaded · {fmtBytes(dirs[0].size)}</span>
-      <button className="btn tiny danger" onClick={onRemove}>
-        Remove
-      </button>
     </div>
   )
 }

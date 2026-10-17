@@ -17,14 +17,19 @@ mod memory;
 mod backend_light;
 mod commands;
 mod compact;
+mod docs;
 mod websearch;
 mod git;
 mod llm;
+mod media;
+mod models;
+mod oauth;
 mod plans;
+mod providers;
 mod appstate;
 mod pty;
 mod secrets;
-mod sidecar;
+mod shell_env;
 mod skills;
 mod skill_router;
 mod state;
@@ -86,7 +91,6 @@ fn main() {
         // the Electron build's saveWindowState).
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(state::DataRoot::new())
-        .manage(sidecar::SidecarState::new())
         .manage(pty::TerminalState::new())
         .manage(pty::TerminalMasters::new())
         .manage(Quitting(std::sync::atomic::AtomicBool::new(false)))
@@ -108,6 +112,7 @@ fn main() {
             commands::fs_delete,
             commands::search_content,
             commands::read_image,
+            commands::read_pdf_base64,
             commands::normalize_image,
             // data-root files
             commands::coder_list,
@@ -125,7 +130,7 @@ fn main() {
             commands::get_data_path,
             commands::has_settings_file,
             commands::move_data_path,
-            // sidecar
+            // local backend endpoint (native router port)
             commands::sidecar_url,
             commands::sidecar_probe,
             // secrets
@@ -175,9 +180,10 @@ fn main() {
                 }
                 // Seed/re-sync the shipped built-in skills (migrated from the
                 // Python sidecar's sync_builtin_skills). The shipped markdown
-                // lives in the backend checkout / bundled resource dir.
-                if let Some(backend) = sidecar::find_backend_dir(app.handle()) {
-                    let seeded = skills::seed_builtin_skills(&root, &backend.join("skills"));
+                // lives with the Rust app now (src-tauri/skills, bundled as the
+                // `skills/` resource) — it is NOT part of the Python backend.
+                if let Some(shipped) = skills::shipped_skills_dir(app.handle()) {
+                    let seeded = skills::seed_builtin_skills(&root, &shipped);
                     if !seeded.is_empty() {
                         println!("[skills] seeded builtin skills: {}", seeded.join(", "));
                     }
@@ -187,19 +193,10 @@ fn main() {
                     println!("[{summary}]");
                 });
             }
-            // Start the Python sidecar in the background so the window paints
-            // immediately; the renderer polls sidecar_url until it is ready.
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = sidecar::start_sidecar(&handle) {
-                    eprintln!("[sidecar] startup failed: {e}");
-                    let _ = handle.emit("sidecar:dead", ());
-                }
-            });
-            // Phase 2: native HTTP router on the public port. Light endpoints
-            // (git, skills, mcp, system-prompts) are served in Rust; the rest
-            // proxies to the Python sidecar. The renderer's sidecar_url now
-            // returns THIS port.
+            // Native HTTP router on the public port — the app's only backend
+            // now (the Python sidecar is gone). Light endpoints (git, skills,
+            // mcp, docs, oauth, system-prompts) and the agent loop are served
+            // here; the renderer's sidecar_url returns THIS port.
             let router_handle = app.handle().clone();
             std::thread::spawn(move || {
                 if let Err(e) = backend_light::serve(router_handle) {
@@ -237,10 +234,9 @@ fn main() {
                     let _ = rx.recv_timeout(Duration::from_secs(5));
                     // Persist any coalesced store write before teardown.
                     store::flush_pending(&app);
-                    // Stop sidecar + terminals, then close for real. The flag
-                    // lets the re-entrant CloseRequested through, and the
-                    // native close path saves the window state.
-                    sidecar::stop_sidecar(&app, 5000);
+                    // Stop terminals, then close for real. The flag lets the
+                    // re-entrant CloseRequested through, and the native close
+                    // path saves the window state.
                     pty::kill_all_terminal_sessions(&app);
                     // Chromium sessions are per-chat and outlive the panel, so
                     // they must be reaped here or every visited chat leaves a
@@ -253,6 +249,20 @@ fn main() {
                 });
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // RunEvent fires on EVERY shutdown path — Cmd-Q, `app.exit()` and an
+            // OS terminate. Those bypass WindowEvent::CloseRequested entirely, so
+            // the quit-flush handshake never ran and the last coalesced store
+            // write (the chat the user had just sent) was lost: "the app closed
+            // suddenly and my new chats were gone". Flushing here closes that gap
+            // for every exit route, not just the titlebar close button.
+            match event {
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    store::flush_pending(app);
+                }
+                _ => {}
+            }
+        });
 }

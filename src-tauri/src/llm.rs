@@ -27,6 +27,27 @@ pub struct LlmResult {
     pub usage: Option<Value>,
 }
 
+/// Sentinel meaning "no practical timeout" for `LlmConfig::timeout_secs`.
+/// reqwest requires a concrete duration, so this is 24 hours — long enough
+/// that a chat turn is never cut off while the provider is still answering,
+/// however slow it is (the user's explicit requirement).
+pub const NO_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Wait this long for the provider to start answering (response headers).
+/// A user-visible error after N seconds is NEVER wanted: some providers and
+/// large reasoning models legitimately take many minutes — even half an hour —
+/// before the first byte, and cutting that off surfaced as a bogus "provider
+/// did not respond" error while the model was still thinking. This budget is
+/// 24 hours precisely so it never fires in practice; a genuinely dead
+/// connection still aborts through the transport's own TCP errors, and the
+/// user can always hit Stop (the cancel flag is checked every step).
+pub const HEADER_TIMEOUT_SECS_DEFAULT: u64 = 24 * 60 * 60;
+
+/// Abort a stream only after this much TOTAL silence. Same reasoning as the
+/// header budget above: a long thinking pause is not a failure, so the only
+/// second-based caps left are effectively unreachable.
+pub const IDLE_TIMEOUT_SECS_DEFAULT: u64 = 24 * 60 * 60;
+
 /// Build a plain HTTP client for provider calls (no proxy, like the sidecar).
 pub fn http_client() -> Client {
     Client::builder()
@@ -147,28 +168,17 @@ async fn complete_with_key(
 
     let mut req = client
         .post(&url)
-        .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
         .header(header_name, header_value)
         .json(&body);
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    // Header timeout (same rationale as stream_with_key below).
-    const HEADER_TIMEOUT_SECS: u64 = 60;
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(HEADER_TIMEOUT_SECS),
-        req.send(),
-    )
-    .await
-    {
-        Ok(r) => r.map_err(|e| (0u16, e.to_string()))?,
-        Err(_) => {
-            return Err((
-                0u16,
-                format!("provider did not respond (no headers for {HEADER_TIMEOUT_SECS}s)"),
-            ))
-        }
-    };
+    // No header deadline: a slow provider or a large reasoning model may
+    // legitimately take minutes — even half an hour — to emit response headers,
+    // and a second-based error there was bogus while the model was still
+    // working. A dead connection still fails through the transport's own TCP
+    // error, and Stop aborts instantly via the cancel flag.
+    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
     let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| (status, e.to_string()))?;
     if !(200..300).contains(&status) {
@@ -391,30 +401,14 @@ async fn stream_with_key(
 
     let mut req = client
         .post(&url)
-        .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
         .header(header_name, header_value)
         .json(&body);
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    // Header timeout: if the provider never answers (connection accepted
-    // but no response headers), abort with a clear error instead of
-    // hanging the turn until the request-wide 600s cap.
-    const HEADER_TIMEOUT_SECS: u64 = 60;
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(HEADER_TIMEOUT_SECS),
-        req.send(),
-    )
-    .await
-    {
-        Ok(r) => r.map_err(|e| (0u16, e.to_string()))?,
-        Err(_) => {
-            return Err((
-                0u16,
-                format!("provider did not respond (no headers for {HEADER_TIMEOUT_SECS}s)"),
-            ))
-        }
-    };
+    // No header deadline — see the one-shot path above. The transport reports a
+    // genuinely dead connection (TCP error) immediately; the clock never does.
+    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
@@ -426,9 +420,14 @@ async fn stream_with_key(
     let mut buf = String::new();
     use futures_util::StreamExt;
     // Idle timeout: a stalled provider stream (no bytes for this long) must
-    // abort the turn with a clear error instead of hanging it forever (the
-    // user saw "waiting for model (59s)" stretch into minutes).
-    const IDLE_TIMEOUT_SECS: u64 = 90;
+    // abort the turn with a clear error instead of hanging it forever.
+    // Deliberately generous: some providers stay silent for many minutes while
+    // a large model thinks before the first token, and cutting that off looked
+    // like "the model errored after 60 seconds".
+    // No idle deadline either. Reading the stream directly means an aborted
+    // connection surfaces as a transport `Err` (the real, instant signal),
+    // while a provider that is merely THINKING stays connected and is never cut
+    // off — however long it takes.
     loop {
         // Stop button: the cancel flag is checked on every chunk read, so a
         // running stream (including one inside an explore sub-agent) aborts
@@ -438,20 +437,9 @@ async fn stream_with_key(
                 return Err((0u16, "aborted by user".into()));
             }
         }
-        let chunk = match tokio::time::timeout(
-            std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
-            stream.next(),
-        )
-        .await
-        {
-            Ok(Some(chunk)) => chunk.map_err(|e| (0u16, e.to_string()))?,
-            Ok(None) => break,
-            Err(_) => {
-                return Err((
-                    0u16,
-                    format!("provider stream stalled (no data for {IDLE_TIMEOUT_SECS}s)"),
-                ))
-            }
+        let chunk = match stream.next().await {
+            Some(chunk) => chunk.map_err(|e| (0u16, e.to_string()))?,
+            None => break,
         };
         buf.push_str(&String::from_utf8_lossy(&chunk));
         // SSE frames are separated by a blank line.

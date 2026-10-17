@@ -1,7 +1,7 @@
 /**
  * Bottom-docked terminal panel (Cmd/Ctrl+J).
  *
- * Each tab owns one node-pty session living in the Electron main process;
+ * Each tab owns one pty session living in the Rust shell (src-tauri/src/pty.rs);
  * this component only renders xterm.js screens and shuttles I/O over IPC.
  * Sessions outlive the panel being hidden (like VSCode) — the panel merely
  * toggles `display`, and the last tab closing hides the whole panel.
@@ -15,6 +15,7 @@ import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
 import { focusChatInput } from '../lib/chatFocus'
 import { isApplePlatform } from '../lib/shortcuts'
+import { WebKitDeadKeyAddon } from '../lib/webkitDeadKey'
 
 interface TerminalTab {
   id: string
@@ -31,6 +32,11 @@ interface XtermEntry {
 const HEIGHT_KEY = 'coder:terminalHeight'
 const MIN_HEIGHT = 140
 const DEFAULT_HEIGHT = 300
+
+/** Cmd/Ctrl + one of these is an APP chord, never shell input (J = panel,
+ *  W = close tab, M = fullscreen, X = prefix). Checked on `keypress` too —
+ *  see the custom key handler in attachScreen. */
+const RESERVED_TERMINAL_CHORDS = ['j', 'w', 'm', 'x']
 
 function loadTerminalHeight(): number {
   try {
@@ -375,6 +381,15 @@ export function TerminalPanel() {
       term.loadAddon(fit)
       term.loadAddon(new WebLinksAddon())
       term.open(el)
+      // WKWebView dead-key repair (see src/lib/webkitDeadKey.ts): inside the
+      // Tauri webview a dead key duplicates the committed char and swallows
+      // the next key, which reads as "extra characters appearing by
+      // themselves". Loaded AFTER open() because it binds to the hidden
+      // textarea xterm creates there; term.dispose() tears it down again.
+      const deadKey = new WebKitDeadKeyAddon((data) => {
+        void window.coder.terminalWrite(tab.id, data)
+      })
+      term.loadAddon(deadKey)
       term.onData((data) => {
         void window.coder.terminalWrite(tab.id, data)
       })
@@ -394,22 +409,35 @@ export function TerminalPanel() {
       // shell nor eats them: Cmd/Ctrl+J toggles the panel, Cmd/Ctrl+W closes
       // the active terminal tab (Cmd on Apple platforms, Ctrl elsewhere).
       term.attachCustomKeyEventHandler((ev) => {
-        if (ev.type !== 'keydown' || ev.altKey || ev.shiftKey) return true
+        // `keyup` only clears xterm's own `_keyDownSeen`/`_keyPressHandled`
+        // bookkeeping — never suppress it here.
+        if (ev.type === 'keyup') return true
+        // WebKit dead-key repair FIRST: it has to see `keypress` as well (that
+        // is where xterm re-emits the committed dead char), and the chord
+        // guard below would skip those events. Returning false suppresses
+        // xterm for this event; the rescued character was already sent.
+        if (deadKey.repair.handle(ev)) return false
+        if (ev.altKey || ev.shiftKey) return true
+        const chord = (ev.metaKey && !ev.ctrlKey) || (ev.ctrlKey && !ev.metaKey)
+        if (!chord) return true
         // Reserve BOTH Cmd and Ctrl (each without the other) for the app's
         // chords on EVERY platform: Ctrl+M/Ctrl+J typed into the shell sent
         // ^M (Enter — ran the half-typed line!) and ^J, which read as "extra
         // characters while typing". They must bubble to the window-level
         // handler instead. Ctrl+X arms the app's prefix chord (X then J
         // toggles the panel) instead of sending ^X to the shell.
-        const chord = (ev.metaKey && !ev.ctrlKey) || (ev.ctrlKey && !ev.metaKey)
-        if (
-          chord &&
-          (ev.key === 'j' || ev.code === 'KeyJ' ||
-            ev.key === 'w' || ev.code === 'KeyW' ||
-            ev.key === 'm' || ev.code === 'KeyM' ||
-            ev.key === 'x' || ev.code === 'KeyX')
-        ) return false
-        return true
+        //
+        // This covers `keypress` as well as `keydown`: xterm's `_keyPress`
+        // emits the chord character from `charCode` on its own, so gating on
+        // keydown alone still leaked ^J/^M/^X into the shell. `code` is
+        // checked too so the chords survive non-Latin layouts.
+        const physical = (ev.code || '').replace(/^Key/, '').toLowerCase()
+        const pressed = (ev.key || '').toLowerCase()
+        if (!RESERVED_TERMINAL_CHORDS.some((k) => pressed === k || physical === k)) {
+          return true
+        }
+        ev.preventDefault()
+        return false
       })
       entries.current.set(tab.id, { term, fit, el })
       scheduleFit()
@@ -507,7 +535,7 @@ export function TerminalPanel() {
       <div className="terminal-body" ref={bodyRef}>
         {!supported ? (
           <div className="terminal-unsupported">
-            The terminal panel needs the desktop app (Electron). In the browser build, use your
+            The terminal panel needs the desktop app. In the browser build, use your
             system terminal instead.
           </div>
         ) : (

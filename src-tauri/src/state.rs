@@ -22,6 +22,28 @@ impl DataRoot {
     }
 }
 
+/// Process-global mirror of the active data root.
+///
+/// The axum router runs on a tokio runtime with no `AppHandle`, and several
+/// agent helpers run on threads that have no handle either — yet all of them
+/// must see a Settings → Data path move. `get_data_root`/`set_data_root`
+/// (which do have a handle) write this mirror, and everything else reads it.
+static CURRENT_DATA_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The active data root without an `AppHandle`, if it has been resolved yet.
+pub fn current_data_root() -> Option<PathBuf> {
+    CURRENT_DATA_ROOT
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+fn set_current_data_root(root: &Path) {
+    if let Ok(mut g) = CURRENT_DATA_ROOT.lock() {
+        *g = Some(root.to_path_buf());
+    }
+}
+
 fn pointer_file(app: &tauri::AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()
@@ -39,6 +61,8 @@ pub fn get_data_root(app: &tauri::AppHandle) -> PathBuf {
     let root = resolve(app);
     let _ = fs::create_dir_all(&root);
     *cached = Some(root.clone());
+    // Mirror for the components without an AppHandle (router, agent threads).
+    set_current_data_root(&root);
     root
 }
 
@@ -92,6 +116,9 @@ pub fn set_data_root(app: &tauri::AppHandle, root: &Path) -> PathBuf {
     let abs = root.to_path_buf();
     let _ = fs::create_dir_all(&abs);
     *app.state::<DataRoot>().0.lock().unwrap() = Some(abs.clone());
+    // Keep the handle-less readers (router handlers, agent helpers) on the new
+    // root — a data-path move must not leave them writing to the old folder.
+    set_current_data_root(&abs);
     if let Ok(dir) = app.path().app_data_dir() {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(

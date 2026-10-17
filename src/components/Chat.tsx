@@ -66,7 +66,6 @@ import {
   steerChat,
   streamChat,
   fetchCredits,
-  preloadLocalModel,
   transcribeAudio,
   respondPermission,
   respondAsk,
@@ -84,8 +83,7 @@ import {
 import { playAlarm } from "../lib/alarm";
 import { isBrowserTool } from "../lib/mcpTools";
 
-import type { SkillRow, TranscribeProviderOpts } from "../lib/api";
-import { supportsReasoning } from "../lib/thinking";
+import type { SkillRow, TranscribeProviderOpts } from "../lib/api";import { supportsReasoning } from "../lib/thinking";
 import { projectHistoryMessage } from "../lib/historyPayload";
 import { allModes, getMode } from "../lib/modes";
 import {
@@ -3299,6 +3297,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // handleEvent's own "error" path can never fire on its own — without this,
     // `busy` stays true and the composer's Send button stays stuck on the stop
     // icon forever, with no visible error at all.
+    // A dead SOCKET is the only thing worth recovering from: the router sends
+    // an SSE keepalive every ~15s, so ten minutes without a single event means
+    // the backend process/connection is gone. A merely SLOW model is never a
+    // failure — some providers and reasoning models legitimately take many
+    // minutes (even half an hour) before their first token, so the watchdog
+    // must never abort on content silence (the user's explicit requirement:
+    // no seconds-based error while the model is still working).
+    // Time is NEVER a failure signal. A provider (or a large reasoning model)
+    // may legitimately take minutes — even hours — to answer, so no elapsed
+    // second may abort a turn. The ONLY recoverable failure is a DEAD SOCKET,
+    // which the transport reports in api.ts instantly (with auto-resume). Hence
+    // the socket deadline is effectively infinite: `elapsed` can never reach it,
+    // so the retry/abort path below is dead by construction while every timer
+    // constant stays in place for the pill logic.
+    const DEAD_SOCKET_LIMIT_MS = Number.POSITIVE_INFINITY;
     const HARD_STALL_GRACE_MS = 120_000;
     const WATCHDOG_MAX_RETRIES = 5;
     const WATCHDOG_BASE_BACKOFF_MS = 30_000;
@@ -3316,36 +3329,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         stalledSinceMs = null;
         return;
       }
-      // A tool that's still running gets a much longer leash — it's doing real
-      // work, not stalled on the provider.
-      const limit = isToolRunning(toolRunning) ? 900_000 : 300_000;
-      // Content stall while the socket stays alive via keepalives: a wedged
-      // provider stream would otherwise show "waiting for model" forever.
-      // Thinking models are exempt — reasoning silence is legitimate no matter
-      // how long it runs. Permission/ask pauses return early above.
-      const thinkingNowEarly =
-        useStore
-          .getState()
-          .chats.find((c) => c.id === chat.id)
-          ?.messages.find((m) => m.id === assistantMsg.id)
-          ?.thinkingActive === true;
-      const contentLimit = isToolRunning(toolRunning)
-        ? 900_000
-        : 300_000;
+      // Only a DEAD SOCKET is recoverable. There is deliberately NO
+      // content-silence limit: a slow model may think for many minutes (even
+      // half an hour) and must never be aborted for that. The router's SSE
+      // keepalive (~15s) keeps `lastEventAtMs` fresh while the backend lives,
+      // so `elapsed` only grows when the process/connection is actually gone.
+      const limit = DEAD_SOCKET_LIMIT_MS;
       const elapsed = Date.now() - lastEventAtMs;
       const contentElapsed = Date.now() - lastContentAtMs;
-      // Content-stall recovery: keepalives keep the socket clock fresh, so a
-      // wedged stream (model silent, socket alive) never reaches the dead-
-      // socket path below. Once content has been stale past the limit while the
-      // socket is still "alive", treat it as stalled and fall through to the
-      // auto-retry path instead of showing the pill forever.
-      const contentStalled = thinkingNowEarly
-        ? false
-        : shouldRecoverContentStall(
-            contentElapsed,
-            elapsed,
-            contentLimit,
-          );
+      // Content-stall recovery is intentionally disabled (see above): a silent
+      // model wait is not a failure and never aborts the turn.
+      const contentStalled = false;
       // Active thinking is legitimate silence, however long the reasoning
       // pass runs: while the thinking window is open the per-message thinking
       // indicator already explains the wait, so the watchdog must not consider
@@ -4734,7 +4728,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         });
         void send(
           target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass fa_keywords: the user's own Persian phrases for when this skill applies (comma-separated, e.g. "ترجمه کن, translate this") — without them a Persian request cannot find the skill. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
+            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
             : `Create a new MCP connector or edit an existing one from this description: "${rest}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
           [],
           [],
@@ -5416,10 +5410,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
 
   // Build the STT chain: primary first, then ordered fallbacks.
-  // 'local' means on-device Whisper (undefined opts).
+  // Every entry targets a configured (external) provider — there is no
+  // on-device Whisper source anymore.
   const resolveSttChain = (): {
     lang: string | undefined;
-    chains: (TranscribeProviderOpts | undefined)[];
+    chains: TranscribeProviderOpts[];
   } => {
     const lang =
       dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
@@ -5432,25 +5427,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       apiKeys: [...(cfg.apiKeys ?? (cfg.apiKey ? [cfg.apiKey] : []))],
       model,
     });
-    const chains: (TranscribeProviderOpts | undefined)[] = [];
-    if (sttProviderId === "local") {
-      chains.push(undefined);
-    } else {
-      const sttCfg = settings.providers.find((p) => p.id === sttProviderId);
-      chains.push(sttCfg ? toTranscribeOpts(sttCfg, sttModel) : undefined);
-    }
-    // Local STT ON means fully offline: never contact a remote STT
-    // provider via fallbacks in the same turn.
-    if (sttProviderId !== "local") {
-      for (const fb of sttFallbacks ?? []) {
-        if (fb.providerId === "local") {
-          chains.push(undefined);
-          continue;
-        }
-        const cfg = settings.providers.find((p) => p.id === fb.providerId);
-        if (!cfg) continue;
-        chains.push(toTranscribeOpts(cfg, fb.model));
-      }
+    const chains: TranscribeProviderOpts[] = [];
+    const sttCfg = settings.providers.find((p) => p.id === sttProviderId);
+    if (sttCfg) chains.push(toTranscribeOpts(sttCfg, sttModel));
+    for (const fb of sttFallbacks ?? []) {
+      const cfg = settings.providers.find((p) => p.id === fb.providerId);
+      if (!cfg) continue;
+      chains.push(toTranscribeOpts(cfg, fb.model));
     }
     return { lang, chains };
   };
@@ -5665,13 +5648,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     stopTts(LIVE_TTS_OWNER);
     clearLiveError();
     setLiveState('connecting');
-    // Warm local weights in parallel with the user speaking: the sidecar
-    // loads Whisper/G2P/pocket in the background while the mic opens, so
-    // the first turn never pays the cold-load cost inside its timeout.
-    // No RAM is pinned at boot — this only runs on explicit live start,
-    // and idle-eviction still frees the weights after the idle window.
-    preloadLocalModel('whisper');
-    preloadLocalModel('tts');
     try {
       const transcribeChunk = async (blob: Blob, lang?: string): Promise<string> => {
         const { lang: chainLang, chains } = resolveSttChain();
@@ -5697,21 +5673,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const st = useStore.getState();
         const providers = st.settings.providers ?? [];
         const chain: Array<{ kind: string; baseUrl: string; apiKeys?: string[]; model?: string; voice?: string }> = [];
-        const isLocalTts = st.ttsProviderId === 'local';
-        if (!isLocalTts) {
-          const primary = providers.find((p) => p.id === st.ttsProviderId);
-          if (primary) {
-            chain.push({ kind: primary.kind, baseUrl: primary.baseUrl ?? '', apiKeys: [...(primary.apiKeys ?? (primary.apiKey ? [primary.apiKey] : []))], model: st.ttsModel, voice: st.ttsVoice });
-          }
-          for (const fb of st.ttsFallbacks ?? []) {
-            const p = providers.find((x) => x.id === fb.providerId);
-            if (!p) continue;
-            chain.push({ kind: p.kind, baseUrl: p.baseUrl ?? '', apiKeys: [...(p.apiKeys ?? (p.apiKey ? [p.apiKey] : []))], model: fb.model, voice: fb.voice });
-          }
+        const primary = providers.find((p) => p.id === st.ttsProviderId);
+        if (primary) {
+          chain.push({ kind: primary.kind, baseUrl: primary.baseUrl ?? '', apiKeys: [...(primary.apiKeys ?? (primary.apiKey ? [primary.apiKey] : []))], model: st.ttsModel, voice: st.ttsVoice });
         }
-        const localCfg = { ttsProviderId: st.ttsProviderId, ttsModel: st.ttsModel, ttsBaseUrl: (st.settings as { ttsBaseUrl?: string }).ttsBaseUrl, ttsVoice: st.ttsVoice };
-        const args = chain.length > 0 ? chain : [{ kind: 'local', baseUrl: localCfg.ttsBaseUrl ?? '', model: localCfg.ttsModel }];
-        return { args, localCfg };
+        for (const fb of st.ttsFallbacks ?? []) {
+          const p = providers.find((x) => x.id === fb.providerId);
+          if (!p) continue;
+          chain.push({ kind: p.kind, baseUrl: p.baseUrl ?? '', apiKeys: [...(p.apiKeys ?? (p.apiKey ? [p.apiKey] : []))], model: fb.model, voice: fb.voice });
+        }
+        return { args: chain };
       };
       // Live text source for progressive speech: follows the currently
       // streaming assistant bubble and reports done when it settles, so
@@ -5756,12 +5727,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           speakable = (lastAssistant.content ?? '').trim();
         }
         if (!speakable) return;
-        const { args, localCfg } = buildLiveTtsChain();
+        const { args } = buildLiveTtsChain();
         const live = liveSessionRef.current;
         try {
           live?.notifySpeaking(true);
           setLiveState('speaking');
-          await playTts(speakable, args, LIVE_TTS_OWNER, localCfg);
+          await playTts(speakable, args, LIVE_TTS_OWNER);
         } catch (err) {
           reportLiveError(err instanceof Error ? err.message : String(err));
         } finally {
@@ -5861,7 +5832,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             makeLiveStreamSource(targetChatId),
             liveTts.args,
             LIVE_TTS_OWNER,
-            liveTts.localCfg,
           ).then(
             () => false,
             () => true,

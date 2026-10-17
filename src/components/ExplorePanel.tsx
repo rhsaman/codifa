@@ -3,6 +3,7 @@ import type { ToolActivity } from "../types";
 import { useStore } from "../lib/store";
 import { terminalOutputText } from "../lib/toolActivity";
 import { exploreTitle, exploreToolCounts } from "./ExploreCard";
+import { StatusIcon } from "./ToolCallView";
 
 /** One argument line ("path: src/a.ts") for a call row's body. */
 function argsText(activity: ToolActivity): string {
@@ -118,6 +119,13 @@ export function ExplorePanel({
   return (
     <div className="explore-panel">
       <div className="explore-panel-head">
+        <span
+          className={`explore-card-status ${activity.status}`}
+          role="img"
+          aria-label={`Explore run: ${activity.status}`}
+        >
+          <StatusIcon status={activity.status} />
+        </span>
         <span className="trace-pill trace-pill-sub">Explore</span>
         <span className="explore-panel-title" dir="auto">
           {exploreTitle(activity)}
@@ -127,7 +135,11 @@ export function ExplorePanel({
       {counts.length > 0 && (
         <div className="explore-tool-chips">
           {counts.map((c) => (
-            <span key={c.tool} className="explore-tool-chip">
+            // Keyed by LABEL (`exploreToolCounts` tallies by label), not the raw
+            // tool name: `read` and an alias like `read_client` share one label,
+            // so a name-based key emitted two identical chips ("Read File ×4"
+            // next to "read_client ×2") instead of one merged tally.
+            <span key={c.label} className="explore-tool-chip">
               <span className="explore-tool-name">{c.label}</span>
               <span className="explore-tool-n">{`×${c.count}`}</span>
             </span>
@@ -135,8 +147,11 @@ export function ExplorePanel({
         </div>
       )}
       {activity.status === "running" && (
+        <div className="explore-card-progress" aria-hidden="true" />
+      )}
+      {activity.status === "running" && (
         <div className="explore-panel-running">
-          <span className="spinner" /> running…
+          <span className="spinner" /> Working…
         </div>
       )}
       {kids.length === 0 ? (

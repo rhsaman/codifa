@@ -84,6 +84,9 @@ export interface CoderApi {
   copyText(text: string): Promise<boolean>
   searchContent(root: string, query: string): Promise<SearchMatch[]>
   readImage(absPath: string): Promise<string | null>
+  /** Raw base64 of a PDF (no data-URL prefix), for the viewer's native PDF
+   *  pane. Null when the file is missing or larger than the 64 MB cap. */
+  readPdfBase64(absPath: string): Promise<string | null>
   normalizeImage(absPath: string): Promise<{ path: string; dataUrl: string } | null>
   captureScreen(): Promise<{ path: string; dataUrl: string } | null>
   captureRegion(): Promise<{ path: string; dataUrl: string } | null>

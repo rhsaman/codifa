@@ -118,7 +118,7 @@ export interface TranscribeProviderOpts {
   model?: string
 }
 
-/** TTS provider details forwarded to POST /tts. kind 'local' = on-device Piper. */
+/** TTS provider details forwarded to POST /tts. */
 export interface SpeakProviderOpts {
   kind: string
   baseUrl: string
@@ -136,7 +136,7 @@ export async function createRealtimeSession(
   opts: RealtimeSessionRequest,
 ): Promise<RealtimeSessionResponse> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   const body: Record<string, string> = {
     provider: opts.kind,
     base_url: opts.baseUrl,
@@ -214,19 +214,14 @@ export async function speakTextStream(
   callerSignal?: AbortSignal,
 ): Promise<Blob> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
-  // Local Piper TTS (kind 'local'): send provider 'local' with the Piper
-  // voice id in model (default fa_IR-amir-medium); remote path unchanged.
-  const isLocalTts = opts.kind === 'local'
+  if (!url) throw new Error('the local backend is not ready')
+  // Speech always goes to a configured provider: the on-device sources were
+  // removed, so `kind` is the provider kind and `base_url` its endpoint.
   const body: Record<string, string> = {
     text,
-    provider: isLocalTts ? 'local' : opts.kind,
+    provider: opts.kind,
   }
-  if (isLocalTts) {
-    body.model = (opts.model ?? '').trim() || 'default'
-    if ((opts.baseUrl ?? '').trim()) body.base_url = (opts.baseUrl ?? '').trim()
-    if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
-  } else {
+  {
     body.base_url = opts.baseUrl
     if ((opts.model ?? '').trim()) body.model = (opts.model ?? '').trim()
     if ((opts.voice ?? '').trim()) body.voice = (opts.voice ?? '').trim()
@@ -358,7 +353,7 @@ export async function transcribeAudio(
   opts?: TranscribeProviderOpts,
 ): Promise<string> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   const form = new FormData()
   form.append('audio', blob, 'clip.wav')
   if (lang) form.append('lang', lang)
@@ -425,32 +420,9 @@ export async function transcribeAudio(
   }
 }
 
-/**
- * Fire-and-forget warm of a local model (whisper / local TTS) in the
- * sidecar. Called when live voice starts so weights load in parallel with
- * the user speaking instead of inside the first request timeout. Never
- * blocks: failures are swallowed (the real request loads lazily anyway).
- */
-export function preloadLocalModel(kind: 'whisper' | 'tts'): void {
-  void (async () => {
-    try {
-      const url = await ensureSidecar()
-      if (!url) return
-      await fetch(`${url}/models/preload`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind }),
-        signal: AbortSignal.timeout(10_000),
-      }).catch(() => null)
-    } catch {
-      // Preload is best-effort only.
-    }
-  })()
-}
-
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   // Dedupe concurrent calls for the SAME provider config. React StrictMode
   // mounts every effect twice in dev, and ProviderModelSelect + Chat.tsx both
   // fire on chat switch — without this cache, a single chat switch produced
@@ -511,7 +483,7 @@ export interface ModelTestResult { ok: boolean; reply: string }
  *  the server's `detail` on failure so the UI can show the real error. */
 export async function testModel(cfg: ProviderConfig, model: string): Promise<ModelTestResult> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   const body: Record<string, unknown> = {
     provider: cfg.kind,
     provider_id: cfg.id ?? '',
@@ -545,7 +517,7 @@ export interface ModelTestBatchItem {
  *  as single test per model, so 402/insufficient-quota marks that model failed. */
 export async function testModelsBatch(cfg: ProviderConfig, models: string[]): Promise<ModelTestBatchItem[]> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   const uniq = [...new Set(models.filter((m) => typeof m === 'string' && m.trim() !== ''))].slice(0, 100)
   if (uniq.length === 0) return []
   const res = await fetch(`${url}/models/test-batch`, {
@@ -709,7 +681,7 @@ export async function streamChat(
   onEvent: (event: SidecarEvent) => void,
 ): Promise<void> {
   let url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
 
   // Self-healing reconnect: if the network drops mid-stream (a fetch/reader
   // error that is NOT a manual abort and NOT an HTTP error from the backend),
@@ -781,7 +753,7 @@ export async function streamChat(
     // extra health probe per turn).
     if (attempt > 0) {
       url = await ensureSidecar()
-      if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+      if (!url) throw new Error('the local backend is not ready')
     }
 
     // Phase 1: connect. A network failure to even reach the sidecar is
@@ -900,11 +872,12 @@ export async function streamChat(
       // exactly the unwanted "Provider hiccup during idle" behavior. Instead,
       // throw so the UI shows a Retry banner; clicking it resumes the backend from
       // the LangGraph checkpoint.
-      if (gotAnyEvent) {
-        throw new Error(
-          'Connection lost mid-turn — the turn was interrupted. Click Retry to resume from the last checkpoint.',
-        )
-      }
+      // A transport drop is auto-resumed even MID-TURN: the request body is
+      // re-sent unchanged, so `/chat/stream` continues from the interrupted
+      // turn's checkpoint instead of restarting it. Only a TERMINAL `error`
+      // event (the turn really died) stops recovery. No timer is involved — the
+      // socket closing IS the signal, so detection is instant.
+      if (gotAnyEvent && gotTerminalError) throw err
       // Surface the self-heal so the user isn't left wondering why the turn
       // restarted on its own (the "interrupted itself" confusion).
       wrappedOnEvent({
@@ -1000,7 +973,7 @@ export async function triggerCompact(params: {
   signal?: AbortSignal
 }): Promise<CompactResult> {
   const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  if (!url) throw new Error('the local backend is not ready')
   const res = await fetch(`${url}/chat/compact`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1154,7 +1127,7 @@ export async function readDocumentText(
   opts?: { sheet?: string; pages?: string },
 ): Promise<{ content?: string; html?: string; pages?: string[]; error?: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: 'agent backend is not running' }
+  if (!url) return { error: 'the local backend is not running' }
   try {
     const res = await fetch(`${url}/doc/read`, {
       method: 'POST',
@@ -1235,147 +1208,6 @@ export async function respondAsk(id: string, answer: string): Promise<void> {
   }
 }
 
-// ---- Managed on-device models (whisper / embedding / local TTS) -- //
-// Local TTS kind stays "piper" for backend API compat; it now serves
-// pocket-tts-farsi-v2 with a bundled default voice.
-
-export type ManagedModelKind = "whisper" | "piper"
-
-export interface PiperStatus {
-  state: string
-  model: string
-  progress: number
-  error?: string
-  size?: number
-  downloaded_bytes?: number
-  total_bytes?: number
-  speed_bps?: number
-}
-
-export interface ModelDirInfo {
-  repo: string
-  dir: string
-  size: number
-  ready: boolean
-}
-
-export interface ModelRunState {
-  state: "downloading" | "paused" | "error"
-  repo: string
-  error?: string
-  /** Downloaded bytes so far (cumulative across all files). */
-  downloaded_bytes?: number
-  /** Estimated total size (bytes); zero means still unknown. */
-  total_bytes?: number
-  /** Percent 0–100 (one decimal). */
-  percent?: number
-  /** Live speed (bytes/sec, 5s rolling average). */
-  speed_bps?: number
-}
-
-export interface ModelKindStatus {
-  dirs: ModelDirInfo[]
-  running?: ModelRunState
-}
-
-export interface ModelsStatus {
-  whisper: ModelKindStatus
-  piper?: PiperStatus
-}
-
-/** Kick off a background model download (Settings → Models). */
-export async function downloadModel(
-  kind: ManagedModelKind,
-  model: string,
-  baseUrl = "",
-): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  await fetch(`${url}/models/download`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind, model, base_url: baseUrl }),
-  })
-}
-
-/** Poll the current download state + on-disk model dirs. */
-export async function getModelsStatus(): Promise<ModelsStatus> {
-  const url = await ensureSidecar()
-  if (!url) return { whisper: { dirs: [] } }
-  const res = await fetch(`${url}/models/status`)
-  if (!res.ok) return { whisper: { dirs: [] } }
-  const data = (await res.json()) as ModelsStatus
-  return {
-    whisper: data.whisper ?? { dirs: [] },
-    piper: data.piper,
-  }
-}
-
-/** Delete a downloaded model folder. */
-export async function removeModel(
-  kind: ManagedModelKind,
-  model: string,
-): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  await fetch(`${url}/models/remove`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind, model }),
-  })
-}
-
-/** Pause a running download (downloaded bytes are kept). */
-export async function pauseModelDownload(kind: ManagedModelKind): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  const res = await fetch(`${url}/models/pause`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind }),
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(
-      (data as { detail?: string }).detail || `pause failed (${res.status})`,
-    )
-  }
-}
-
-/** Resume a paused download from where it stopped. */
-export async function resumeModelDownload(kind: ManagedModelKind): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  const res = await fetch(`${url}/models/resume`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind }),
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(
-      (data as { detail?: string }).detail || `resume failed (${res.status})`,
-    )
-  }
-}
-
-/** Stop an in-flight download; partial files stay for later resume. */
-export async function cancelModelDownload(kind: ManagedModelKind): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  const res = await fetch(`${url}/models/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind }),
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(
-      (data as { detail?: string }).detail || `stop failed (${res.status})`,
-    )
-  }
-}
-
 // ---- Skills & MCP connectors (file-based in the app's user data folder) ---- //
 
 export interface SkillRow {
@@ -1384,6 +1216,8 @@ export interface SkillRow {
   description: string
   path: string
   content: string
+  /** Persian phrases that should trigger this skill (matches a Persian ask). */
+  fa_keywords?: string[]
   files?: string[]
 }
 
@@ -1480,7 +1314,7 @@ export async function syncSkill(params: {
   deletedFiles?: string[]
 }): Promise<SkillSyncResult> {
   const url = await ensureSidecar()
-  if (!url) return { ok: false, note: "Python agent not ready" }
+  if (!url) return { ok: false, note: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/skills/sync`, {
       method: "POST",
@@ -1602,7 +1436,7 @@ export async function restoreCheckpoint(
   root: string,
 ): Promise<{ ok: true; result: CheckpointRestoreResult } | { ok: false; error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { ok: false, error: "Python agent not ready" }
+  if (!url) return { ok: false, error: "the local backend is not ready" }
   try {
     const res = await fetch(
       `${url}/checkpoints/${encodeURIComponent(chatId)}/${seq}/restore`,
@@ -1661,7 +1495,7 @@ export interface GitCommitResult {
 
 async function sidecarGet<T>(path: string): Promise<T | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}${path}`)
     if (!res.ok) {
@@ -1712,7 +1546,7 @@ export async function gitCommit(
   addAll = false,
 ): Promise<GitCommitResult | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/git/commit`, {
       method: "POST",
@@ -1736,7 +1570,7 @@ export async function gitDiscard(
   root: string,
 ): Promise<GitDiscardResult | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/git/discard`, {
       method: "POST",
@@ -1769,7 +1603,7 @@ export async function gitCheckout(
   create = false,
 ): Promise<{ current: string } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/git/checkout`, {
       method: "POST",
@@ -1796,7 +1630,7 @@ export async function gitPush(
   root: string,
 ): Promise<GitPushResult | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/git/push`, {
       method: "POST",
@@ -1825,7 +1659,7 @@ export async function gitAutoCommit(
   provider: { kind: string; model: string; baseUrl: string; apiKeys: string[]; id?: string },
 ): Promise<GitAutoCommitResult | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/git/autocommit`, {
       method: "POST",
@@ -1873,7 +1707,7 @@ export async function saveSchedule(
   task: ScheduleUpsert,
 ): Promise<ScheduledTask | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedules`, {
       method: "POST",
@@ -1894,7 +1728,7 @@ export async function saveSchedule(
 /** حذف تسک زمان‌بندی (تاریخچه اجراها نگه داشته می‌شود). */
 export async function deleteSchedule(id: string): Promise<{ ok: true } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}`, { method: "DELETE" })
     if (!res.ok) {
@@ -1910,7 +1744,7 @@ export async function deleteSchedule(id: string): Promise<{ ok: true } | { error
 /** اجرای دستی یک تسک (بدون انتظار برای سررسید). شناسه‌ی ران را برمی‌گرداند تا پولینگ دقیق همان اجرا ممکن شود. */
 export async function runScheduleNow(id: string): Promise<{ ok: true; run_id?: string } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}/run`, { method: "POST" })
     if (!res.ok) {
@@ -1941,7 +1775,7 @@ export async function clearScheduleRuns(
   id: string,
 ): Promise<{ ok: true; removed: number } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}/runs`, { method: "DELETE" })
     if (!res.ok) {
@@ -1958,7 +1792,7 @@ export async function clearScheduleRuns(
 /** حذف همه ران‌های یتیم (ران تسک‌های حذف‌شده). */
 export async function clearOrphanScheduleRuns(): Promise<{ ok: true; removed: number } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedule-runs/orphans`, { method: "DELETE" })
     if (!res.ok) {
@@ -1977,7 +1811,7 @@ export async function deleteScheduleRun(
   runId: string,
 ): Promise<{ ok: true } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url) return { error: "Python agent not ready" }
+  if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}/schedule-runs/${encodeURIComponent(runId)}`, { method: "DELETE" })
     if (!res.ok) {
@@ -2011,7 +1845,7 @@ export async function getChatTraces(
 /** پاک‌کردن لاگ چت جاری. */
 export async function clearChatTraces(chatId: string): Promise<{ ok: true; removed: number } | { error: string }> {
   const url = await ensureSidecar()
-  if (!url || !chatId) return { error: 'Python agent not ready' }
+  if (!url || !chatId) return { error: 'the local backend is not ready' }
   try {
     const res = await fetch(`${url}/chats/${encodeURIComponent(chatId)}/traces`, { method: 'DELETE' })
     if (!res.ok) {

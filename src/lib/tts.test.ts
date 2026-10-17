@@ -206,18 +206,18 @@ console.log('۳) نتیجه fetch کهنه پخش نمی‌شود:')
   stopTts()
 }
 
-console.log('۴) local per-sentence queue + natural gap + progressive stream:')
+console.log('۴) per-sentence queue + natural gap + progressive stream:')
 {
-  // Local sentences are NOT merged into batches anymore: the Persian G2P
-  // strips punctuation, so merged batches hid sentence boundaries and the
-  // backend pacing landed mid-sentence. Each sentence is its own request.
+  // Sentences are NOT merged into batches: the Persian G2P strips punctuation,
+  // so merged batches hid sentence boundaries and the backend pacing landed
+  // mid-sentence. Each sentence is its own request.
   MockAudio.instances = []
   seenTexts.length = 0
   ttsCall = 0
   const longFa = 'جمله اول برای تست سرعت شروع پخش است. جمله دوم هم به همین اندازه طولانی است تا بچ دوم ساخته شود. جمله سوم مکث طبیعی بین جمله‌ها را بررسی می‌کند.'
-  await playTts(longFa, opts, 40, { ttsProviderId: 'local', ttsModel: 'default' })
-  check('local requests stay per-sentence (no merged batches)', seenTexts.length === 3, seenTexts)
-  check('first local request is one sentence (fast first audio)', (seenTexts[0] ?? '').length <= 130, seenTexts[0])
+  await playTts(longFa, opts, 40)
+  check('requests stay per-sentence (no merged batches)', seenTexts.length === 3, seenTexts)
+  check('first request is one sentence (fast first audio)', (seenTexts[0] ?? '').length <= 130, seenTexts[0])
   const gap = MockAudio.instances.length >= 2 ? MockAudio.instances[1].playedAt - MockAudio.instances[0].playedAt : -1
   check('natural pause between sentences', gap >= 300, gap)
   stopTts()

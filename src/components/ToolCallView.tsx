@@ -99,6 +99,63 @@ const TOOL_LABEL: Record<string, string> = {
   search_console: "Search Console",
 };
 
+/** Foreign names for a tool we DO have, mapped to the canonical name.
+ *
+ *  Models are trained on other agents' vocabularies (`read_client`, `read_file`,
+ *  `view_file`, `shell`, `todos`…), so a run can contain calls under a name that
+ *  is not ours. `toolLabel` falls back to the RAW name for anything missing from
+ *  TOOL_LABEL, which rendered a second, duplicate-looking chip ("Read File ×4"
+ *  beside "read_client ×2"). Normalizing here merges old AND new history into
+ *  one chip — the backend resolves the same aliases before dispatch. */
+export const TOOL_ALIAS: Record<string, string> = {
+  read_client: "read",
+  read_file: "read",
+  readfile: "read",
+  view_file: "read",
+  read_text_file: "read",
+  get_file: "read",
+  search_files: "grep",
+  search_content: "grep",
+  ripgrep: "grep",
+  find_files: "glob",
+  list_dir: "glob",
+  ls: "glob",
+  list_directory: "glob",
+  shell: "run_terminal",
+  bash: "run_terminal",
+  sh: "run_terminal",
+  run_command: "run_terminal",
+  execute_command: "run_terminal",
+  search_web: "web_search",
+  websearch: "web_search",
+  skill: "load_skill",
+  create_file: "write_file",
+  writefile: "write_file",
+  str_replace: "edit_file",
+  replace_in_file: "edit_file",
+  todos: "update_plan",
+  todo_write: "update_plan",
+  write_todos: "update_plan",
+  update_todos: "update_plan",
+  ask: "ask_user",
+  ask_question: "ask_user",
+  permission: "confirm_action",
+  request_permission: "confirm_action",
+};
+
+/** Canonical tool name for a raw one (case / dash / underscore-insensitive). */
+export function canonicalTool(tool: string): string {
+  const aliased =
+    TOOL_ALIAS[tool] ??
+    TOOL_ALIAS[tool.trim().toLowerCase().replace(/[-\s]/g, "_")] ??
+    tool;
+  // Case-only variants of a REAL name (`Read`, `read_File`) still normalize.
+  const direct = Object.keys(TOOL_LABEL).find(
+    (k) => k.toLowerCase() === aliased.trim().toLowerCase(),
+  );
+  return direct ?? aliased;
+}
+
 /** Small glyph per tool category, shown at the head of each collapsed-group
  *  timeline row — lets the eye scan a run of calls without reading every
  *  label (mirrors Claude-app's trace icons). */
@@ -140,7 +197,8 @@ function toolIcon(tool: string): string {
 export function toolLabel(tool: string): string {
   const server = mcpServerOf(tool);
   if (server) return `${bareToolName(tool)} · ${server}`;
-  return TOOL_LABEL[tool] ?? tool;
+  const canonical = canonicalTool(tool);
+  return TOOL_LABEL[canonical] ?? canonical;
 }
 
 /** Natural-language piece per tool category for the group header sentence
@@ -437,7 +495,9 @@ function IconX({ className }: { className?: string }) {
   );
 }
 
-function StatusIcon({ status }: { status: ToolActivity["status"] }) {
+/** Running → spinner, done → check, error → ✗, denied → ⏹. Exported so the
+ *  explore/sub-agent card shows the exact same glyphs as every tool row. */
+export function StatusIcon({ status }: { status: ToolActivity["status"] }) {
   if (status === "running") return <span className="spinner" />;
   if (status === "error") return <IconX className="status-err" />;
   if (status === "denied") return <span className="status-denied">⏹</span>;

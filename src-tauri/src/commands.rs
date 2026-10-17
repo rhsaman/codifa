@@ -11,7 +11,6 @@ use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
-use crate::sidecar;
 use crate::state;
 
 // --- shared types -----------------------------------------------------------
@@ -585,6 +584,29 @@ pub fn read_image(abs_path: String) -> Option<String> {
     ))
 }
 
+/// Raw base64 of a PDF file, for the viewer's native PDF pane.
+///
+/// The renderer builds a `Blob` from this and hands the object URL to an
+/// `<iframe>`: WKWebView renders PDFs itself, so no PDF rasterizer (pdfium/
+/// mupdf, tens of MB of native code) has to be bundled just to show a page.
+/// Capped so a huge PDF cannot balloon the JS heap — the file viewer shows an
+/// error instead of hanging.
+#[tauri::command]
+pub fn read_pdf_base64(abs_path: String) -> Option<String> {
+    const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
+    let p = PathBuf::from(&abs_path);
+    let ext = p.extension()?.to_string_lossy().to_lowercase();
+    if ext != "pdf" {
+        return None;
+    }
+    let meta = std::fs::metadata(&p).ok()?;
+    if meta.len() > MAX_PDF_BYTES {
+        return None;
+    }
+    let data = std::fs::read(&p).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(data))
+}
+
 /// Normalize any attached image to a temp PNG (like screenshots), so formats
 /// such as HEIC or oversized files reach the model regardless of source.
 #[tauri::command]
@@ -831,37 +853,28 @@ pub fn move_data_path(
         let _ = app.emit("migrate:progress", serde_json::json!({ "label": label, "pct": pct }));
     })
     .map_err(|e| e.to_string())?;
-    // Restart the sidecar against the new root and tell the renderer.
-    sidecar::stop_sidecar(&app, 5000);
-    sidecar::start_sidecar(&app).map_err(|e| format!("sidecar restart after data move failed: {e}"))?;
+    // The renderer is pointed at the native router, which resolves the data
+    // root through `state::current_data_root()` on every request — so the move
+    // is picked up with no restart. Tell the renderer so it can re-read paths.
     let _ = app.emit("sidecar:changed", ());
     Ok(moved.to_string_lossy().into_owned())
 }
 
-// --- sidecar ----------------------------------------------------------------
+// --- local backend endpoint (native router) ---------------------------------
 
 #[tauri::command]
-pub fn sidecar_url(app: AppHandle) -> Option<String> {
-    // The renderer always talks to the PUBLIC router port (phase 2): native
-    // light endpoints are served there and everything else is proxied to the
-    // Python sidecar on its private port.
-    if let Some(public) = crate::backend_light::public_url() {
-        return Some(public);
-    }
-    match sidecar::start_sidecar(&app) {
-        Ok(_private_url) => crate::backend_light::public_url(),
-        // Surface the failure on the app log — swallowing it here made
-        // "Python agent not ready" undiagnosable in packaged builds.
-        Err(e) => {
-            eprintln!("[sidecar] sidecar_url failed: {e}");
-            None
-        }
-    }
+pub fn sidecar_url(_app: AppHandle) -> Option<String> {
+    // Kept under its historical name for the renderer's `window.coder` surface:
+    // it returns the native router's loopback URL (there is no Python sidecar
+    // any more). `None` while the router is still binding, which the renderer
+    // treats as "not ready yet".
+    crate::backend_light::public_url()
 }
 
 #[tauri::command]
-pub fn sidecar_probe(app: AppHandle) -> bool {
-    sidecar::probe_sidecar(&app)
+pub fn sidecar_probe(_app: AppHandle) -> bool {
+    // Same probe surface as before, now answered by the native router.
+    crate::backend_light::public_url().is_some()
 }
 
 // --- secrets ----------------------------------------------------------------
@@ -1236,88 +1249,18 @@ pub fn open_workspace_terminal(dir: String) -> OpResult {
     }
 }
 
-// --- Google OAuth (sidecar-backed, mirrors electron/main.ts oauth:google) ---
+// --- Google OAuth (native: loopback callback + token exchange in Rust) ------
 
 #[tauri::command]
 pub async fn google_sign_in(
-    app: AppHandle,
+    _app: AppHandle,
     client_id: String,
     client_secret: String,
     scope: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let cid = client_id.trim().to_string();
-    if cid.is_empty() {
-        return Err("missing Google OAuth client id".into());
-    }
-    let sidecar_url = match sidecar::start_sidecar(&app) {
-        Ok(url) => url,
-        Err(_) => return Err("Python agent not ready — run `npm run setup`".into()),
-    };
-    let client = reqwest::Client::new();
-    let start = client
-        .post(format!("{sidecar_url}/oauth/google/start"))
-        .json(&serde_json::json!({
-            "client_id": cid,
-            "client_secret": client_secret.trim(),
-            "scope": scope.unwrap_or_default().trim().to_string(),
-        }))
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !start.status().is_success() {
-        let body: serde_json::Value = start.json().await.unwrap_or_default();
-        return Err(body
-            .get("detail")
-            .and_then(|d| d.as_str())
-            .unwrap_or("oauth start failed")
-            .to_string());
-    }
-    let start_body: serde_json::Value = start.json().await.map_err(|e| e.to_string())?;
-    let consent_url = start_body
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or("oauth start returned no url")?;
-    let state_token = start_body
-        .get("state")
-        .and_then(|s| s.as_str())
-        .ok_or("oauth start returned no state")?;
-    let _ = open::that_detached(consent_url);
-
-    // Poll the sidecar for the completed exchange (5 min budget).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        let res = client
-            .get(format!(
-                "{sidecar_url}/oauth/google/result?state={}",
-                percent_encoding::utf8_percent_encode(state_token, percent_encoding::NON_ALPHANUMERIC)
-            ))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .ok();
-        let Some(res) = res else { continue };
-        let status = res.status();
-        let data: serde_json::Value = res.json().await.unwrap_or_default();
-        if data.get("status").and_then(|s| s.as_str()) == Some("pending") {
-            continue;
-        }
-        if !status.is_success() || data.get("status").and_then(|s| s.as_str()) == Some("error") {
-            return Err(data
-                .get("detail")
-                .or_else(|| data.get("message"))
-                .and_then(|d| d.as_str())
-                .unwrap_or("Google sign-in failed")
-                .to_string());
-        }
-        return Ok(serde_json::json!({
-            "refreshToken": data.get("refresh_token").and_then(|v| v.as_str()).unwrap_or(""),
-            "accessToken": data.get("access_token").and_then(|v| v.as_str()).unwrap_or(""),
-            "expiresIn": data.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600),
-        }));
-    }
-    Err("Google sign-in timed out".into())
+    // Fully native now: no Python sidecar, no polling endpoint. The loopback
+    // callback listener and the token exchange both live in `oauth.rs`.
+    crate::oauth::sign_in(&client_id, &client_secret, scope).await
 }
 
 // --- dialogs (tauri-plugin-dialog) ------------------------------------------

@@ -7779,6 +7779,35 @@ body.coder-dragging .chat-split-child {
   gap: 6px;
 }
 
+/* Native PDF pane in the file viewer: the webview renders the PDF itself, so
+   the iframe must fill the viewer body (the file's own viewer provides the
+   toolbar). */
+.file-viewer-pdf {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: none;
+  background: var(--bg);
+}
+
+/* Skill frontmatter inputs (English description + Persian fa_keywords) in the
+   New-skill and existing-skill editor panes. The inputs themselves inherit the
+   generic `.field input` well; these rules only lay the caption above each
+   input and stack the two rows. */
+.skill-meta-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.skill-meta-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
 /* Settings → Auth: Google Cloud setup guide. */
 .guided-steps {
   margin: 8px 0 12px;
@@ -23130,49 +23159,211 @@ tr[data-search-current] .fv-mark,
 }
 
 /* --- explore (sub-agent run): chat card + side panel ----------------------
-   The chat card stays a compact summary: run title + one chip per tool with
-   its call count. The calls themselves live in the right-hand panel. */
+   The chat card stays a compact summary: a live status badge (spinner while
+   the run is working, a check the moment it lands), the run title, and one
+   chip per tool with its call count. The calls themselves live in the
+   right-hand panel. */
 .tool-card.explore {
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 14px;
   background: color-mix(in srgb, var(--accent) 5%, transparent);
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+
+/* A live run reads as "working": a stronger accent edge plus a soft breathing
+   halo, so the state is obvious at a glance even before the first call lands. */
+.tool-card.explore.running {
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  animation: explore-breathe 2.2s ease-in-out infinite;
+}
+
+.tool-card.explore.done {
+  border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.tool-card.explore.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.tool-card.explore.denied {
+  border-color: color-mix(in srgb, var(--thinking) 45%, transparent);
+}
+
+@keyframes explore-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
 }
 
 .explore-card-open {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   background: none;
   border: 0;
-  padding: 8px 10px;
+  padding: 9px 12px;
   color: inherit;
   font: inherit;
   cursor: pointer;
   text-align: start;
+  border-radius: 14px 14px 0 0;
+  transition: background 0.14s ease;
 }
 
-.explore-card-icon {
-  display: inline-flex;
+.explore-card-open:hover {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.explore-card-open:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  outline-offset: -2px;
+}
+
+/* Status badge: the same glyphs as every other tool row (spinner → check), so
+   the chat card and the side panel never disagree about a run's state. */
+.explore-card-status {
   flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.explore-card-status .spinner {
+  width: 10px;
+  height: 10px;
+  border-width: 1.6px;
+}
+
+/* The check pops in when the run lands — the "done" beat of the loading. */
+.explore-card-status svg {
+  animation: explore-check-pop 0.28s ease-out both;
+}
+
+/* The explore card's tick is a THEME-tinted glyph, not a semantic green.
+   `.status-ok` (below in this file) sets `color: var(--success, …)`, which on
+   most themes is a green — so a finished explore read as a green light that
+   clashed with the card's accent palette. Keep the glyph and the badge on the
+   same accent the running state uses; only the fill marks the state change. */
+.explore-card-status .status-ok,
+.explore-panel .explore-card-status .status-ok {
   color: var(--accent);
 }
 
+@keyframes explore-check-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.explore-card-status.done {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+.explore-card-status.error {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+.explore-card-status.denied {
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--thinking) 30%, transparent);
+}
+
+/* Run title: takes the free width on ONE line with a real ellipsis. */
+.trace-head-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.82;
+}
+
 .explore-card-count {
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
   opacity: 0.75;
   white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
 }
 
 .explore-card-arrow {
   font-size: 11px;
-  opacity: 0.7;
+  opacity: 0.55;
+  transition:
+    transform 0.16s ease,
+    opacity 0.16s ease;
+}
+
+.explore-card-open:hover .explore-card-arrow {
+  opacity: 1;
+  transform: translate(1px, -1px);
+}
+
+/* Working state: an indeterminate shimmer rail under the head, so the card
+   still shows motion when no call has landed yet. */
+.explore-card-progress {
+  position: relative;
+  height: 2px;
+  margin: 0 12px 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.explore-card-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: explore-progress 1.35s ease-in-out infinite;
+}
+
+@keyframes explore-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
 }
 
 .explore-tool-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 0 10px 9px 12px;
+  padding: 2px 12px 10px;
 }
 
 .explore-tool-chip {
@@ -23181,16 +23372,52 @@ tr[data-search-current] .fv-mark,
   gap: 5px;
   padding: 2px 8px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-  background: color-mix(in srgb, currentColor 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text-dim);
   font-size: 11px;
   line-height: 1.6;
+  animation: explore-chip-in 0.22s ease-out both;
+}
+
+.explore-tool-chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text);
+}
+
+@keyframes explore-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.explore-tool-name {
+  font-weight: 500;
 }
 
 .explore-tool-n {
   font-family: var(--font-mono);
   font-size: 10px;
   opacity: 0.8;
+}
+
+/* Motion is decoration here: state is still carried by color and glyphs. */
+@media (prefers-reduced-motion: reduce) {
+  .tool-card.explore.running,
+  .explore-card-status svg,
+  .explore-tool-chip {
+    animation: none;
+  }
+  .explore-card-progress::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.4;
+  }
 }
 
 /* Side panel: ONE explore run's tool group (calls, not the report). */
@@ -23241,9 +23468,31 @@ tr[data-search-current] .fv-mark,
 }
 
 .explore-call {
-  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
   border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
   overflow: hidden;
+  transition:
+    border-color 0.14s ease,
+    background 0.14s ease;
+}
+
+.explore-call:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* A failed or blocked call keeps its own edge, so it reads at a glance inside
+   a long run of otherwise identical rows. */
+.explore-call.running {
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.explore-call.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+.explore-call.denied {
+  border-color: color-mix(in srgb, var(--thinking) 40%, transparent);
 }
 
 .explore-call-head {
@@ -23261,6 +23510,15 @@ tr[data-search-current] .fv-mark,
   text-align: start;
 }
 
+.explore-call-head:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.explore-call-head:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -2px;
+}
+
 .explore-call-head:disabled {
   cursor: default;
   opacity: 0.75;
@@ -23276,18 +23534,46 @@ tr[data-search-current] .fv-mark,
 }
 
 .explore-call-dot.done {
-  background: #3fb950;
+  background: var(--success);
   opacity: 1;
 }
 
 .explore-call-dot.running {
   background: var(--accent);
   opacity: 1;
+  animation: explore-dot-pulse 1.4s ease-in-out infinite;
 }
 
-.explore-call-dot.failed {
-  background: #f85149;
+@keyframes explore-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ToolActivity statuses are running|done|error|denied: style each one. The
+   generic `.failed` rule is kept as an alias so nothing regresses. */
+.explore-call-dot.failed,
+.explore-call-dot.error {
+  background: var(--danger);
   opacity: 1;
+}
+
+.explore-call-dot.denied {
+  background: var(--thinking);
+  opacity: 1;
+}
+
+.explore-call-tool {
+  font-weight: 600;
+}
+
+/* The panel reuses the chat card's loading rail, flush with its own padding. */
+.explore-panel .explore-card-progress {
+  margin: 0;
 }
 
 .explore-call-tool {

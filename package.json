@@ -29,14 +29,12 @@
   "homepage": "https://github.com/rhsaman/codifa",
   "type": "module",
   "scripts": {
-    "setup": "uv sync --project backend",
     "dev": "vite",
     "dev:web": "vite --mode webonly",
     "dev:agent": "vite --mode webonly --port 5174 --strictPort",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",
-    "test:backend": "cd backend && .venv/bin/python -m pytest tests/ -q",
     "test:frontend": "bash tests/run-frontend.sh",
     "clean": "node -e \"import('fs').then(f=>f.rmSync('release',{recursive:true,force:true}))\"",
     "dist": "npm run tauri build",
@@ -73,7 +71,6 @@
     "vite": "^5.4.8"
   },
   "allowScripts": {
-    "electron@31.7.7": true,
     "esbuild@0.28.2": true,
     "esbuild@0.21.5": true,
     "fsevents@2.3.3": true,

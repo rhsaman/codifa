@@ -23128,3 +23128,193 @@ tr[data-search-current] .fv-mark,
 .viewer-pane-body .viewer-pane-head .tab-bar.viewer-tabs {
   -webkit-app-region: no-drag;
 }
+
+/* --- explore (sub-agent run): chat card + side panel ----------------------
+   The chat card stays a compact summary: run title + one chip per tool with
+   its call count. The calls themselves live in the right-hand panel. */
+.tool-card.explore {
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.explore-card-open {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 8px 10px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: start;
+}
+
+.explore-card-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.explore-card-count {
+  font-size: 11px;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.explore-card-arrow {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.explore-tool-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px 9px 12px;
+}
+
+.explore-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.explore-tool-n {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+/* Side panel: ONE explore run's tool group (calls, not the report). */
+.explore-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.explore-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.explore-panel-title {
+  font-weight: 600;
+  font-size: 12.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explore-panel-count {
+  font-size: 11px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.explore-panel-running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.explore-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.explore-call {
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.explore-call-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 6px 9px;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: start;
+}
+
+.explore-call-head:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.explore-call-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+.explore-call-dot.done {
+  background: #3fb950;
+  opacity: 1;
+}
+
+.explore-call-dot.running {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.explore-call-dot.failed {
+  background: #f85149;
+  opacity: 1;
+}
+
+.explore-call-tool {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.explore-call-detail {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+  direction: ltr;
+}
+
+.explore-call-chev {
+  flex: 0 0 auto;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.explore-call-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 9px 8px;
+}

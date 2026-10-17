@@ -892,6 +892,16 @@ pub async fn run_turn(
     if req.allow_computer && req.mode != "subagent" {
         schemas.push(crate::computer::schema());
     }
+    // The exact tool names this run advertised. A call to any other name is a
+    // hallucination (a traced explore called a non-existent `read_client` 75
+    // times, every one failing) — the error lists the real names so the model
+    // self-corrects instead of retrying the same bad name.
+    let mut advertised: Vec<String> = schemas
+        .iter()
+        .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+        .collect();
+    advertised.sort();
+    advertised.dedup();
 
     let max_steps = if req.mode == "subagent" {
         SUBAGENT_MAX_STEPS
@@ -1227,7 +1237,17 @@ use what it showed, read a DIFFERENT window, or move on"
             } else {
                 None
             };
-            let (result, ok) = if name == "run_terminal"
+            let (result, ok) = if !name.starts_with(crate::mcp::TOOL_PREFIX)
+                && !advertised.iter().any(|n| n == name)
+            {
+                (
+                    format!(
+                        "unknown tool {name:?}: no such tool exists. Call one of exactly these names: {}",
+                        advertised.join(", ")
+                    ),
+                    false,
+                )
+            } else if name == "run_terminal"
                 && req.mode != "subagent"
                 && is_file_search_command(args["command"].as_str().unwrap_or_default())
             {

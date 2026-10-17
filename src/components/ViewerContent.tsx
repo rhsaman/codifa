@@ -7,6 +7,7 @@ import { PlanPanel } from "./PlanPanel";
 import { BrowserPanel } from "./BrowserPanel";
 import { FileViewerPanel } from "./FileViewerPanel";
 import { TextViewerPanel } from "./TextViewerPanel";
+import { ExplorePanel } from "./ExplorePanel";
 import { ScheduleSection } from "./SchedulePanel";
 import { TodosSection } from "./TodosPanel";
 
@@ -82,6 +83,18 @@ export function ViewerContent() {
         fileLine={active.fileLine}
         fileRoot={active.fileRoot}
         chatId={active.chatId ?? activeChatId}
+      />
+    );
+  }
+
+  if (active.kind === "explore") {
+    // One explore run's tool group — the calls, not the report.
+    return (
+      <ExplorePanel
+        key={active.id}
+        chatId={active.chatId ?? activeChatId}
+        messageId={active.exploreMessageId ?? ""}
+        index={active.exploreIndex ?? 0}
       />
     );
   }

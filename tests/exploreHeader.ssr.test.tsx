@@ -63,18 +63,23 @@ console.log('1) دو explore موازی → دو کارت مستقل، هر کد
   const text = plain.replace(/<[^>]*>/g, '')
   check('پیل ساب‌ایجنت رندر شد', html.includes('trace-pill-sub'))
   check(
-    'هر explore کارت تول‌گروپ مستقل خودش را دارد',
-    (html.match(/class="tool-group/g) || []).length === 2,
-    (html.match(/class="tool-group/g) || []).length,
+    'هر explore کارت مستقل خودش را دارد',
+    (html.match(/tool-card explore/g) || []).length === 2,
+    (html.match(/tool-card explore/g) || []).length,
   )
   check(
-    'هدر کارت اول «Explore · توضیح» است',
-    text.includes('Explore · Find the auth flow'),
+    'هر کارت به openExplore وصل است (دکمهٔ بومی)',
+    (html.match(/explore-card-open/g) || []).length === 2,
+    (html.match(/explore-card-open/g) || []).length,
+  )
+  check(
+    'هدر کارت اول توضیح خودش را دارد',
+    text.includes('Find the auth flow'),
     text.slice(0, 300),
   )
   check(
     'هدر کارت دوم توضیح خودش را دارد',
-    text.includes('Explore · Map the settings store'),
+    text.includes('Map the settings store'),
     text.slice(0, 300),
   )
   check(

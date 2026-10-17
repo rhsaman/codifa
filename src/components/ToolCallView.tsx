@@ -189,6 +189,7 @@ function groupSummary(activities: ToolActivity[]): string {
 export const isSubagentCard = (a: ToolActivity) =>
   (a.tool === "task" &&
     (a.args?.subagent_type === "subagent" ||
+      a.args?.subagent_type === "explore" ||
       a.args?.subagent_type === "general")) ||
   a.tool === "explore";
 

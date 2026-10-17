@@ -1,9 +1,9 @@
-// SSR test: long tool output stays INSIDE the chat.
+// SSR test: a long tool result never AUTO-opens the right-hand panel.
 //
-// Auto-opening the right-hand panel from a long tool result was removed — long
-// output is now collapsed into a scrollable block in the chat, and the panel
-// only opens from an explicit user click (row/button). These checks pin the
-// rendered contract: collapsed by default, body reachable, panel untouched.
+// The panel opens only from an explicit user click (row head → text tab for
+// long output, the "more" button, openText). Rendering must not touch it, and
+// no nested <details> block is involved — an expanded row scrolls its long
+// body (trace-expand-pre has max-height + overflow). These checks pin that.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -57,7 +57,7 @@ function resetViewer() {
   useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as never)
 }
 
-console.log('1) خروجی بلند ترمینال داخل چت کالپس می‌شود و پنل راست باز نمی‌شود:')
+console.log('1) خروجی بلند ترمینال به‌صورت خودکار پنل راست را باز نمی‌کند:')
 {
   resetViewer()
   const msg = makeMessage([
@@ -68,15 +68,11 @@ console.log('1) خروجی بلند ترمینال داخل چت کالپس می
   const vt = useViewerTabs.getState()
   check('پنل راست باز نشد', vt.paneOpen === false, vt.paneOpen)
   check('هیچ تب متنی ساخته نشد', vt.tabs.length === 0, vt.tabs.map((t) => t.id))
-  check('خروجی بلند در چت هست', html.includes(LONG_TAIL))
-  check('بلوک کالپس‌شدنی رندر شد', html.includes('tool-out-collapse'))
-  check(
-    'بلوک به‌صورت پیش‌فرض بسته است',
-    /<details[^>]*class="[^"]*tool-out-collapse[^"]*"[^>]*>/.test(html.replace(/<!--.*?-->/g, '')) &&
-      !/<details[^>]*\bopen\b[^>]*class="[^"]*tool-out-collapse/.test(html),
-    html.slice(0, 400),
-  )
-  check('خروجی بلند اسکرول عمودی دارد', html.includes('trace-expand-pre'))
+  check('خروجی بلند به‌صورت پیش‌فرض باز نیست', !html.includes(LONG_TAIL))
+  check('بدون بلوک details تودرتو', !html.includes('tool-out-collapse'))
+  // read-only rows collapse into ONE closed tool group — the long output stays
+  // inside it until the user opens the group or clicks the row (text tab).
+  check('ردیف‌ها در گروه ابزار جمع شدند', html.includes('tool-group'), html.slice(0, 300))
 }
 
 console.log('2) خروجی کوتاه بدون بلوک اضافی رندر می‌شود:')
@@ -94,22 +90,21 @@ console.log('2) خروجی کوتاه بدون بلوک اضافی رندر می
 console.log('3) راه دستی باز کردن خروجی در پنل حفظ شده است:')
 {
   resetViewer()
-  const msg = makeMessage([
-    {
-      tool: 'grep',
-      status: 'done',
-      args: { pattern: 'x' },
-      items: [
+  // The "more" affordance lives in FileResultLinks (shown once a row/group is
+  // expanded): more results than the visible cap → button that opens the panel.
+  const { FileResultLinks } = await import('../src/components/ToolCallView')
+  const listHtml = renderToString(
+    <FileResultLinks
+      tool="grep"
+      items={[
         { file: 'a.ts', line: 1, text: 'x' },
         { file: 'b.ts', line: 2, text: 'x' },
         { file: 'c.ts', line: 3, text: 'x' },
         { file: 'd.ts', line: 4, text: 'x' },
-      ],
-    },
-    { tool: 'read', status: 'done', args: { filePath: 'a.ts' }, summary: '1 file' },
-  ])
-  const html = renderToString(<ChatMessageView message={msg} />)
-  check('دکمهٔ «بیشتر» برای باز کردن در پنل هست', html.includes('file-result-more-btn'))
+      ] as never}
+    />,
+  )
+  check('دکمهٔ «بیشتر» برای باز کردن در پنل هست', listHtml.includes('file-result-more-btn'))
   resetViewer()
   useViewerTabs.getState().openText('grep results', 'body', 'md')
   check('openText دستی پنل را باز می‌کند', useViewerTabs.getState().paneOpen === true)

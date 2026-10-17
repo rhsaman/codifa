@@ -1,0 +1,46 @@
+=== candidate JSON documents ===
+Sat Oct 17 18:23:25 2026  size=  4074277  providers=  7 (custom=1, enc_keys=1)  /Users/saman/.codifa/settings.json
+    ids: openrouter, local, google, nvidia, cloudflare, tokenrouter, custom-mvchoxmp
+    chats in file: 1
+Wed Oct 14 15:13:56 2026  size=  3287397  providers= 15 (custom=9, enc_keys=18)  /Users/saman/.codifa/app-state-cache.json
+    ids: openrouter, local, google, nvidia, cloudflare, tokenrouter, custom-muiw3uo6, custom-mulsq1hz, custom-muo5047u, custom-muq1q4lq, custom-mur2vynf, custom-muse5rdp, custom-musoboye, custom-muvrk0v8, custom-mv6u6vzr
+    chats in file: 1
+(missing root) /Users/saman/.coder
+
+=== secrets key files ===
+/Users/saman/Library/Application Support/com.codifa.app/secrets.key: present
+/Users/saman/Library/Application Support/codifa/secrets.key: present
+
+=== userData listings ===
+-- /Users/saman/Library/Application Support/codifa
+   .DS_Store  (6148)
+   Cache  (96)
+   Code Cache  (128)
+   Cookies  (20480)
+   Cookies-journal  (0)
+   DIPS  (36864)
+   DawnGraphiteCache  (224)
+   DawnWebGPUCache  (224)
+   DevToolsActivePort  (59)
+   GPUCache  (224)
+   Local State  (57)
+   Local Storage  (96)
+   Network Persistent State  (1327)
+   Preferences  (76858)
+   Session Storage  (288)
+   Shared Dictionary  (160)
+   SharedStorage  (4096)
+   TransportSecurity  (1357)
+   Trust Tokens  (36864)
+   Trust Tokens-journal  (0)
+   VideoDecodeStats  (128)
+   WebStorage  (128)
+   blob_storage  (96)
+   declarative_performance_observer.db  (32768)
+   declarative_performance_observer.db-journal  (0)
+   secrets.key  (48)
+   shared_proto_db  (256)
+   window-state.json  (59)
+-- /Users/saman/Library/Application Support/com.codifa.app
+   .window-state.json  (212)
+   secrets.key  (48)

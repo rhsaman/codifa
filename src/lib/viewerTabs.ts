@@ -5,12 +5,12 @@ import { useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text' | 'explore'
 
 /** Kinds that belong to ONE chat. File tabs are chat-scoped too
  *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
  *  live edits only refresh the owning chat. Inbox stays global. */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file'])
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore'])
 
 export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): string {
   if (kind === 'file') {
@@ -31,13 +31,15 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   // Unused: file tabs keep their per-path title (the file name).
   file: 'File',
   text: 'Text',
+  // Unused: explore tabs keep their own title ("Explore · <description>").
+  explore: 'Explore',
 }
 
 /** Display title for a viewer tab. File/text tabs and sub-agent trace tabs
  *  keep their own title so a sub-agent trace never looks like the main chat
  *  trace; every other kind shows the shared kind label. Pure, for tests. */
 export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId'>): string {
-  if (t.kind === 'file' || t.kind === 'text') return t.title
+  if (t.kind === 'file' || t.kind === 'text' || t.kind === 'explore') return t.title
   if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return t.title
   return VIEWER_KIND_LABEL[t.kind] ?? t.title
 }

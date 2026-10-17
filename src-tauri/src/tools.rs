@@ -579,11 +579,9 @@ pub fn grep_scope(
                 out.push_str(":\n");
                 for (is_match, line_no, text) in &pending {
                     let marker = if *is_match { ">" } else { " " };
-                    let body = if text.len() > MAX_LINE_LENGTH {
-                        format!("{} …[truncated]", &text[..MAX_LINE_LENGTH])
-                    } else {
-                        text.clone()
-                    };
+                    // Char-boundary-safe: a raw byte slice panics (and with
+                    // panic=abort kills the app) on a multi-byte Persian char.
+                    let body = truncated_line(text);
                     out.push_str(&format!("{marker}{line_no}: {body}\n"));
                 }
                 pending.clear();
@@ -917,7 +915,12 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
     let status = child.wait().map_err(|e| e.to_string())?;
     let mut text = String::from_utf8_lossy(&output).to_string();
     if text.len() > MAX_TERMINAL_OUTPUT {
-        let cut = text.len() - MAX_TERMINAL_OUTPUT;
+        let mut cut = text.len() - MAX_TERMINAL_OUTPUT;
+        // Move forward to a char boundary — slicing mid-char panics on
+        // Persian / emoji / U+FFFD output.
+        while cut < text.len() && !text.is_char_boundary(cut) {
+            cut += 1;
+        }
         text = format!("…[head truncated]\n{}", &text[cut..]);
     }
     if !status.success() {

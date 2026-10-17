@@ -63,6 +63,16 @@ function BrowserIcon() {
   );
 }
 
+/** Magnifier: an explore tab shows one sub-agent run's tool group. */
+function ExploreIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.6-3.6" />
+    </svg>
+  );
+}
+
 const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   review: ReviewIcon,
   trace: TraceIcon,
@@ -73,6 +83,7 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   // placeholder only satisfies the Record type.
   file: () => <ReviewIcon />,
   text: PlanIcon,
+  explore: ExploreIcon,
 };
 
 /** "+" button in the side pane header: dropdown that opens any pane tab

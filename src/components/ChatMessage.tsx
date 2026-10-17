@@ -41,6 +41,7 @@ import {
   isEditActivity,
   isSubagentCard,
 } from "./ToolCallView";
+import { ExploreCard } from "./ExploreCard";
 import { ReadingMode } from "./ReadingMode";
 import { Mermaid } from "./Mermaid";
 import { MessageImages } from "./MessageImages";
@@ -2029,15 +2030,25 @@ export function renderSegments(
       pendingEdit.push({ activity, index: seg.index });
       return;
     }
-    // The explore parent card joins the read-only run instead of rendering as
-    // its own always-visible card: ToolGroupView turns every sub-agent call
-    // into a pill carrying its short description, so several PARALLEL explores
-    // stay distinguishable in the group header while their forwarded
-    // read/grep calls collapse into the same group. "task" keeps the full card.
-    if (
-      ALWAYS_VISIBLE_TOOLS.has(activity.tool) ||
-      (isSubagentCard(activity) && activity.tool !== "explore")
-    ) {
+    // Explore/sub-agent runs never expand inside the chat: each one renders as
+    // the compact ExploreCard (run title + one chip per tool with its call
+    // count); clicking it opens that run's tool group in the right-hand panel
+    // (user request — parallel runs each get their own independent card).
+    if (isSubagentCard(activity)) {
+      flush();
+      wrapTrace();
+      flushEdits();
+      nodes.push(
+        <ExploreCard
+          key={`exp-${seg.index}`}
+          activity={activity}
+          messageId={message.id}
+          index={seg.index}
+        />,
+      );
+      return;
+    }
+    if (ALWAYS_VISIBLE_TOOLS.has(activity.tool)) {
       flush();
       wrapTrace();
       flushEdits();

@@ -39,7 +39,47 @@ use tauri::{Emitter, Listener, Manager};
 /// allowed through (the native close then persists the window state).
 struct Quitting(std::sync::atomic::AtomicBool);
 
+/// A Finder-launched .app has no usable stdout/stderr, so every `println!` /
+/// `eprintln!` (router, sidecar, mcp, …) was lost. Point both at
+/// ~/.codifa/rust.log (rotated at 5 MB). Release builds only: `tauri dev`
+/// keeps printing to the terminal.
+#[cfg(unix)]
+fn redirect_logs_to_file() {
+    use std::os::unix::io::AsRawFd;
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else { return };
+    let dir = home.join(".codifa");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("rust.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("rust.log.1"));
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 1);
+            libc::dup2(f.as_raw_fd(), 2);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    redirect_logs_to_file();
+    // The release profile uses panic=abort and is stripped, so a panic used to
+    // kill the app with no message. Record file:line + message before the abort.
+    std::panic::set_hook(Box::new(|info| {
+        let line = format!("[panic] {info}\n");
+        eprint!("{line}");
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".codifa").join("panic.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         // Persist window size/position/fullscreen across restarts (parity with

@@ -39,7 +39,7 @@ console.log("۲) کارت task با children running → هم والد و هم �
 {
   const acts: ToolActivity[] = [
     {
-      tool: "task",
+      tool: "explore",
       status: "running",
       startedAt: NOW - 10000,
       branch: 0,
@@ -63,7 +63,7 @@ console.log("۳) کارت task با children mixed → فقط runningها done �
 {
   const acts: ToolActivity[] = [
     {
-      tool: "task",
+      tool: "explore",
       status: "running",
       startedAt: NOW - 10000,
       branch: 0,
@@ -108,13 +108,13 @@ console.log("۶) فرزند nested عمیق → همه سطوح done می‌شو
 {
   const acts: ToolActivity[] = [
     {
-      tool: "task",
+      tool: "explore",
       status: "running",
       startedAt: NOW - 20000,
       branch: 0,
       children: [
         {
-          tool: "task",
+          tool: "explore",
           status: "running",
           startedAt: NOW - 15000,
           branch: 1,
@@ -140,7 +140,7 @@ console.log("۷) والد done ولی فرزند orphan → فقط فرزند do
 {
   const acts: ToolActivity[] = [
     {
-      tool: "task",
+      tool: "explore",
       status: "done",
       startedAt: NOW - 10000,
       elapsedMs: 10000,

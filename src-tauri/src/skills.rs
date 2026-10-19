@@ -140,11 +140,20 @@ fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    le
                     "slug" => slug = val,
                     "description" => description = val,
                     "fa_keywords" => {
+                        // Split on the ASCII comma AND the Persian one (U+060C):
+                        // a list typed as `فیلم، سریال` used to collapse into a
+                        // single garbled keyword that could never match a real
+                        // request. A YAML-style `- item` entry is tolerated too.
                         fa_keywords = val
-                            .split(',')
-                            .map(|k| k.trim().to_string())
+                            .split([',', '،'])
+                            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
                             .filter(|k| !k.is_empty())
                             .collect();
+                        // Dedupe case-insensitively, first occurrence wins, so a
+                        // repeated phrase cannot bloat the catalog line.
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        fa_keywords.retain(|k| seen.insert(k.to_lowercase()));
                     }
                     _ => {}
                 }
@@ -594,25 +603,64 @@ pub fn list_mcp(root: &Path) -> Value {
     }
     json!({
         "mcpServers": Value::Object(servers),
-        "builtins": ["docker", "playwright"],
+        "builtins": ["docker"],
     })
 }
 
 /// Built-in MCP connectors installed on first run (mirrors the Python
 /// sidecar's `_BUILTIN_MCP_SERVERS`). They are seeded by NAME: an entry the
-/// user already edited is never overwritten, and a builtin added later (e.g.
-/// playwright after docker) is still seeded on the next start.
+/// user already edited is never overwritten, and a builtin added later is still
+/// seeded on the next start.
+///
+/// The browser is NOT a connector any more: `browser_driver` ships the same
+/// tools natively, so seeding `npx @playwright/mcp` would spawn a Node sidecar
+/// whose entire tool list is then discarded by the native-wins filter — a live
+/// process and a startup round-trip per turn for zero usable tools.
 pub fn builtin_mcp_servers() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "docker",
-            json!({"command": "docker", "args": ["mcp", "gateway", "run"]}),
-        ),
-        (
-            "playwright",
-            json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
-        ),
-    ]
+    vec![(
+        "docker",
+        json!({"command": "docker", "args": ["mcp", "gateway", "run"]}),
+    )]
+}
+
+/// The connector config that used to be seeded for the browser, kept here only
+/// so an install that already has it can be cleaned up (see
+/// [`retire_builtin_mcp`]).
+const RETIRED_BROWSER_MCP: (&str, &str, &[&str]) =
+    ("playwright", "npx", &["-y", "@playwright/mcp@latest"]);
+
+/// Remove the retired browser connector from an install that was seeded before
+/// the native driver replaced it.
+///
+/// Seeding is name-only and never overwrites, so deleting the entry from
+/// [`builtin_mcp_servers`] does NOT remove the file already on disk — every
+/// existing install would keep a connector that spawns `npx` and contributes
+/// nothing. The file is deleted ONLY while its config still matches the shipped
+/// default; a connector the user edited (a pinned version, their own endpoint)
+/// is left exactly as it is. Returns the names that were retired.
+pub fn retire_builtin_mcp(root: &Path) -> Vec<String> {
+    let (name, command, args) = RETIRED_BROWSER_MCP;
+    let path = root
+        .join("mcp")
+        .join(format!("{}.json", safe_file(name, "server")));
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(record) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let untouched = record["config"]["command"].as_str() == Some(command)
+        && record["config"]["args"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).eq(args.iter().copied()))
+            .unwrap_or(false);
+    if !untouched {
+        return Vec::new();
+    }
+    if fs::remove_file(&path).is_ok() {
+        return vec![name.to_string()];
+    }
+    Vec::new()
 }
 
 /// Install the built-in MCP connectors that are missing. Returns the names
@@ -709,6 +757,68 @@ mod tests {
         assert_eq!(sanitize_extra_filename("../evil"), None);
         assert_eq!(sanitize_extra_filename(".hidden"), None);
         assert_eq!(sanitize_extra_filename("no space.txt"), None);
+    }
+
+    #[test]
+    fn seed_builtin_mcp_no_longer_installs_a_browser_connector() {
+        let tmp = std::env::temp_dir().join(format!("codifa-mcp-seed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("store");
+        fs::create_dir_all(&root).unwrap();
+
+        // The browser ships as native tools (`browser_driver`), so no connector
+        // seeding an `npx` sidecar should appear on a fresh install.
+        let seeded = seed_builtin_mcp(&root);
+        assert!(
+            !seeded.iter().any(|n| n == "playwright"),
+            "the retired browser connector was seeded again: {seeded:?}"
+        );
+        let installed = list_mcp(&root);
+        assert!(
+            installed["mcpServers"].get("playwright").is_none(),
+            "{installed}"
+        );
+        // ...and it is not listed as a builtin any more, so the user can remove
+        // it from Settings if some other install left one behind.
+        let builtins = installed["builtins"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !builtins.iter().any(|b| b.as_str() == Some("playwright")),
+            "{installed}"
+        );
+    }
+
+    /// An install seeded before the native driver replaced the browser keeps a
+    /// connector that spawns `npx` for zero usable tools. Seeding never
+    /// overwrites, so it has to be retired explicitly — but ONLY while it still
+    /// matches the shipped default.
+    #[test]
+    fn retire_builtin_mcp_drops_only_the_untouched_default() {
+        let tmp = std::env::temp_dir().join(format!("codifa-mcp-retire-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("store");
+        let mcp_dir = root.join("mcp");
+        fs::create_dir_all(&mcp_dir).unwrap();
+
+        // 1. Untouched default -> retired, file gone.
+        save_mcp(
+            &root,
+            &json!({"name": "playwright", "cfg": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}),
+        )
+        .unwrap();
+        assert_eq!(retire_builtin_mcp(&root), vec!["playwright".to_string()]);
+        assert!(!mcp_dir.join("playwright.json").exists());
+        // Idempotent: a second run finds nothing and reports nothing.
+        assert!(retire_builtin_mcp(&root).is_empty());
+
+        // 2. A config the user edited (a pinned version) is LEFT ALONE.
+        save_mcp(
+            &root,
+            &json!({"name": "playwright", "cfg": {"command": "npx", "args": ["-y", "@playwright/mcp@1.2.3"]}}),
+        )
+        .unwrap();
+        assert!(retire_builtin_mcp(&root).is_empty());
+        assert!(mcp_dir.join("playwright.json").exists());
+        assert!(list_mcp(&root)["mcpServers"].get("playwright").is_some());
     }
 
     #[test]

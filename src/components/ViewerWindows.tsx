@@ -125,7 +125,13 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
     return <PlanPanel key={tab.id} chatId={tab.chatId} />;
   }
   if (tab.kind === "browser") {
-    return <BrowserPanel key={tab.id} chatId={tab.chatId ?? ""} />;
+    return (
+      <BrowserPanel
+        key={tab.id}
+        chatId={tab.chatId ?? ""}
+        initialUrl={tab.browserUrl ?? ""}
+      />
+    );
   }
   return (
     <ScheduleInboxDocked

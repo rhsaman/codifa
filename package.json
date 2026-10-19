@@ -1,6 +1,6 @@
 {
   "name": "codifa",
-  "version": "1.8.3",
+  "version": "1.8.4",
   "description": "Offline-first AI coding assistant for your own machine — a real agent (Ask/Plan/Coder), voice input and RAG memory. Bring your own model: OpenRouter, OpenAI-compatible APIs or local LLMs.",
   "author": {
     "name": "rhsaman",
@@ -36,7 +36,7 @@
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",
     "test:frontend": "bash tests/run-frontend.sh",
-    "clean": "node -e \"import('fs').then(f=>f.rmSync('release',{recursive:true,force:true}))\"",
+    "clean": "node -e \"import('fs').then(f=>f.rmSync('src-tauri/target',{recursive:true,force:true}))\"",
     "dist": "npm run tauri build",
     "dist:mac": "npm run tauri build -- --target aarch64-apple-darwin",
     "dist:win": "npm run tauri build -- --target x86_64-pc-windows-msvc",
@@ -44,17 +44,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@monaco-editor/react": "^4.6.0",
     "@tauri-apps/api": "^2.12.3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
     "mermaid": "^11.17.0",
-    "monaco-editor": "^0.52.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-markdown": "^9.0.1",
-    "rehype-highlight": "^7.0.1",
     "remark-gfm": "^4.0.0",
     "zustand": "^4.5.5"
   },

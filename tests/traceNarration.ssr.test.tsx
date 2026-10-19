@@ -243,7 +243,7 @@ console.log('8) مدت زمان: بیش از ۶۰ ثانیه → دقیقه + ث
   // ۹۰ دقیقه‌ای هم نباید «5400s» شود:
   const msg2 = makeMessage(
     [{ kind: 'tool', index: 0 }],
-    [{ tool: 'task', elapsedMs: 5400000 }],
+    [{ tool: 'explore', elapsedMs: 5400000 }],
   )
   const html2 = renderToString(<ChatMessageView message={msg2} />)
   check('۹۰ دقیقه به «90m» تبدیل شد', html2.includes('90m'))

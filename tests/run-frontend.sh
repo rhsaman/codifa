@@ -139,6 +139,7 @@ providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --pac
 settingsNoFetch|tests/settingsNoFetch.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --external:electron
 manualContext|tests/manualContext.test.ts|--packages=external --external:electron
+gitApiError|tests/gitApiError.test.ts|--packages=external --external:electron
 reviewDiff|tests/reviewDiff.test.ts|--packages=external --external:electron
 reviewStats|src/lib/reviewStats.test.ts|--packages=external --external:electron
 reviewAccordion|tests/reviewAccordion.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -164,7 +165,13 @@ workspacePath|tests/workspacePath.test.ts|
 cmuxNvim|tests/cmuxNvim.test.ts|-
 historySubmit|tests/historySubmit.test.ts|-
 historyPayload|tests/historyPayload.test.ts|-
+historyWindow|src/lib/historyWindow.test.ts|
 viewerTabRail|tests/viewerTabRail.ssr.test.tsx|--jsx=automatic --loader:.mp3=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+retryCadence|tests/retryCadence.test.ts|--packages=external --external:electron
+undoRedo|tests/undoRedo.test.ts|--packages=external --external:electron
+inputSuppress|src/lib/inputSuppress.test.ts|
+settingsSuggestions|tests/settingsSuggestions.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+xtermTheme|tests/xtermTheme.test.ts|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

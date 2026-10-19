@@ -113,16 +113,40 @@ fn plan_dir(data_root: &str, workspace: &str, chat_id: &str) -> PathBuf {
         .join(safe_file(chat_id, "default"))
 }
 
+/// Monotonic counter so two writers in the SAME process never pick the same
+/// temp path. A pid-only suffix made a parallel sub-agent and its parent —
+/// which share the chat's plan directory — collide on one temp file, so
+/// whichever renamed second failed and that save was lost silently.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn atomic_write(path: &PathBuf, text: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp{}",
-        std::process::id()
-    ));
-    fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
+    // Durability: write, fsync, THEN rename. Renaming without an fsync can
+    // leave a zero-length plan.md after a crash or power loss — the file
+    // exists, so the reader reports "no plan" instead of the previous one.
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        // Never leave the half-written temp behind on a failed rename.
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })?;
+    // Make the rename itself durable (directory metadata). Best effort: a
+    // directory handle is not openable on every platform.
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Upsert the plan for a workspace+chat (mirrors state_db.save_plan).
@@ -147,13 +171,14 @@ pub fn save_plan(
     )
 }
 
-/// Return `{"workspace", "chat_id", "title", "content"}` or None (mirrors
-/// state_db.get_plan: with an empty chat_id returns None — never falls back
-/// to another chat's plan).
+/// Return `{"workspace", "chat_id", "title", "content"}` or None.
+///
+/// An empty `chat_id` resolves to the same `default/` folder `save_plan`
+/// writes to, instead of refusing to read. Previously the writer happily
+/// created `plan/<ws>/default/plan.md` for a turn without a chat id while the
+/// reader returned None for it — a save that existed on disk and was still
+/// invisible.
 pub fn get_plan(data_root: &str, workspace: &str, chat_id: &str) -> Option<Value> {
-    if chat_id.trim().is_empty() {
-        return None;
-    }
     let d = plan_dir(data_root, workspace, chat_id);
     let content = fs::read_to_string(d.join("plan.md")).ok()?;
     if content.trim().is_empty() {

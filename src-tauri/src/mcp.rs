@@ -38,6 +38,16 @@ struct Session {
     next_id: i64,
 }
 
+impl Drop for Session {
+    /// Never leave a stdio connector process behind. Without this, dropping a
+    /// session (a config edit, a failed round-trip) closed our pipe handles but
+    /// left the child running — one zombie per edit for the life of the app.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Session {
     /// One JSON-RPC round-trip. The read runs on a helper thread so a wedged
     /// server cannot block the turn forever: on timeout the child is killed
@@ -139,6 +149,21 @@ fn with_session<T>(
     let k = key(server, cfg);
     let mut guard = sessions().lock().map_err(|_| "mcp session lock poisoned")?;
     if !guard.contains_key(&k) {
+        // The cache key includes the config, so editing a connector produces a
+        // NEW key. Retire every older session of this same server first —
+        // otherwise each config edit leaked a live child process (and its
+        // tools) until the app quit. The prefix `server\u{1}` is exactly the
+        // `key()` format above, so it can never match another server's key.
+        let prefix = format!("{server}\u{1}");
+        let stale: Vec<String> = guard
+            .keys()
+            .filter(|existing| existing.starts_with(&prefix) && **existing != k)
+            .cloned()
+            .collect();
+        for old in stale {
+            // Removing drops the Session, which kills and reaps the child.
+            guard.remove(&old);
+        }
         guard.insert(k.clone(), spawn_session(cfg)?);
     }
     let session = guard.get_mut(&k).ok_or("mcp session missing")?;
@@ -161,7 +186,7 @@ fn spawn_session(cfg: &Value) -> Result<Session, String> {
         cmd.args(args.iter().filter_map(Value::as_str));
     }
     // A GUI-launched app inherits a minimal PATH (no npx/node/uvx), so a
-    // stdio connector like `npx @playwright/mcp` could not start at all and
+    // stdio connector like `npx some-mcp-server` could not start at all and
     // silently contributed no tools. Give the child the same login-shell PATH
     // the sidecar spawn uses.
     cmd.env("PATH", crate::shell_env::shell_path());
@@ -253,92 +278,25 @@ fn http_request_blocking(cfg: &Value, method: &str, params: Value) -> Result<Val
     Ok(body.get("result").cloned().unwrap_or(Value::Null))
 }
 
-/// True when this connector spawns Playwright MCP.
-fn is_playwright_cfg(cfg: &Value) -> bool {
-    cfg["args"]
-        .as_array()
-        .map(|args| {
-            args.iter()
-                .filter_map(Value::as_str)
-                .any(|a| a.contains("playwright/mcp"))
-        })
-        .unwrap_or(false)
-}
-
-/// Ask the native browser session for this chat's CDP endpoint. The Rust
-/// router owns the headless Chromium the right-side Browser panel mirrors, so
-/// pointing Playwright MCP at that endpoint keeps the agent and the panel on
-/// the SAME browser — nothing opens outside the app. Returns None when the
-/// session cannot start (the caller then falls back to --headless).
-fn in_app_cdp_endpoint(chat_id: &str) -> Option<String> {
-    let endpoint = crate::browser::cdp_endpoint(chat_id)?;
-    // The endpoint is only useful when the browser is ACTUALLY listening.
-    // Playwright MCP exits immediately on an unreachable --cdp-endpoint, which
-    // surfaced to the user as "the browser tool is unavailable" — worse than
-    // the old behaviour of opening its own window. Probe the port first and
-    // let the caller fall back to --headless.
-    let addr = endpoint.strip_prefix("http://")?;
-    let addr: std::net::SocketAddr = addr.parse().ok()?;
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
-    Some(endpoint)
-}
-
-/// The config to actually connect with. `@playwright/mcp` normally launches a
-/// visible browser window of its own; pointing it at the chat's in-app CDP
-/// endpoint makes it attach to the panel's Chromium instead. When the in-app
-/// session cannot start we force `--headless` rather than let a window pop up
-/// outside the app. Every other connector's config is returned unchanged.
-fn effective_cfg(cfg: &Value, chat_id: &str) -> Value {
-    if !is_playwright_cfg(cfg) {
-        return cfg.clone();
-    }
-    let mut args: Vec<String> = cfg["args"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if args
-        .iter()
-        .any(|a| a.starts_with("--cdp-endpoint") || a.starts_with("--endpoint"))
-    {
-        return cfg.clone(); // the user pinned their own endpoint — respect it
-    }
-    match in_app_cdp_endpoint(chat_id) {
-        Some(endpoint) => {
-            args.push("--cdp-endpoint".into());
-            args.push(endpoint);
-        }
-        None => args.push("--headless".into()),
-    }
-    let mut out = cfg.clone();
-    out["args"] = json!(args);
-    out
-}
-
 /// Tool list for one connector. The failure is returned rather than swallowed:
 /// a connector that cannot start used to contribute nothing silently, which is
 /// exactly why MCP tools "never worked" with no clue in the UI.
-fn list_tools(server: &str, cfg: &Value, chat_id: &str) -> Result<Vec<Value>, String> {
-    let cfg = effective_cfg(cfg, chat_id);
-    let result = if is_http(&cfg) {
-        http_request(&cfg, "tools/list", json!({}))
+fn list_tools(server: &str, cfg: &Value) -> Result<Vec<Value>, String> {
+    let result = if is_http(cfg) {
+        http_request(cfg, "tools/list", json!({}))
     } else {
-        with_session(server, &cfg, |s| s.request("tools/list", json!({})))
+        with_session(server, cfg, |s| s.request("tools/list", json!({})))
     }?;
     Ok(result["tools"].as_array().cloned().unwrap_or_default())
 }
 
 /// Agent tool schemas for every enabled connector. A tool name that is UNIQUE
-/// across the enabled connectors is exposed BARE (`browser_navigate`) so the
-/// model sees short readable names instead of `mcp__playwright__browser_navigate`;
+/// across the enabled connectors is exposed BARE (`list_containers`) so the
+/// model sees short readable names instead of `mcp__docker__list_containers`;
 /// a name two connectors both expose stays qualified to remain unambiguous.
 /// The second element carries one message per connector that could not be
 /// reached, so the agent loop can warn the user instead of failing silently.
-pub fn tool_schemas(servers: &Value, chat_id: &str) -> (Vec<Value>, Vec<String>) {
+pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
     let Some(map) = servers.as_object() else {
         return (Vec::new(), Vec::new());
     };
@@ -347,7 +305,7 @@ pub fn tool_schemas(servers: &Value, chat_id: &str) -> (Vec<Value>, Vec<String>)
     // the whole picture (a name is only short when nothing else claims it).
     let mut found: Vec<(String, Vec<Value>)> = Vec::new();
     for (server, cfg) in map {
-        match list_tools(server, cfg, chat_id) {
+        match list_tools(server, cfg) {
             Ok(tools) => found.push((server.clone(), tools)),
             Err(e) => failures.push(format!(
                 "MCP connector {server:?} is unavailable this turn: {e}"
@@ -431,7 +389,7 @@ fn flatten_content(result: &Value) -> String {
 /// carries its server; a BARE name (the short form `tool_schemas` hands the
 /// model) is looked up in the enabled connectors — the same list the schemas
 /// came from, so any user-added MCP resolves too.
-fn resolve(servers: &Value, name: &str, chat_id: &str) -> Result<(String, String), String> {
+fn resolve(servers: &Value, name: &str) -> Result<(String, String), String> {
     if name.starts_with(TOOL_PREFIX) {
         let (server, tool) = split_name(name)?;
         return Ok((server.to_string(), tool.to_string()));
@@ -440,7 +398,7 @@ fn resolve(servers: &Value, name: &str, chat_id: &str) -> Result<(String, String
         .as_object()
         .ok_or_else(|| format!("mcp tool {name:?} is not enabled for this turn"))?;
     for (server, cfg) in map {
-        if let Ok(tools) = list_tools(server, cfg, chat_id) {
+        if let Ok(tools) = list_tools(server, cfg) {
             if tools.iter().any(|t| t["name"].as_str() == Some(name)) {
                 return Ok((server.clone(), name.to_string()));
             }
@@ -449,19 +407,13 @@ fn resolve(servers: &Value, name: &str, chat_id: &str) -> Result<(String, String
     Err(format!("mcp tool {name:?} is not enabled for this turn"))
 }
 
-/// Execute one MCP tool call, by bare (`browser_navigate`) or qualified
-/// (`mcp__playwright__browser_navigate`) name.
-pub fn call_tool(
-    servers: &Value,
-    name: &str,
-    args: &Value,
-    chat_id: &str,
-) -> Result<String, String> {
-    let (server, tool) = resolve(servers, name, chat_id)?;
+/// Execute one MCP tool call, by bare (`list_containers`) or qualified
+/// (`mcp__docker__list_containers`) name.
+pub fn call_tool(servers: &Value, name: &str, args: &Value) -> Result<String, String> {
+    let (server, tool) = resolve(servers, name)?;
     let cfg = servers
         .get(&server)
         .ok_or_else(|| format!("mcp connector {server:?} is not enabled for this turn"))?;
-    let cfg = effective_cfg(cfg, chat_id);
     let params = json!({"name": tool, "arguments": args});
     let result = if is_http(&cfg) {
         http_request(&cfg, "tools/call", params)?
@@ -494,8 +446,8 @@ mod tests {
 
     #[test]
     fn tool_schemas_is_empty_without_connectors() {
-        assert!(tool_schemas(&Value::Null, "").0.is_empty());
-        assert!(tool_schemas(&json!({}), "").0.is_empty());
+        assert!(tool_schemas(&Value::Null).0.is_empty());
+        assert!(tool_schemas(&json!({})).0.is_empty());
     }
 
     /// A connector that cannot start must be REPORTED, not silently dropped:
@@ -504,21 +456,21 @@ mod tests {
     #[test]
     fn tool_schemas_reports_a_connector_that_cannot_start() {
         let servers = json!({ "broken": {"command": "codifa-no-such-binary-xyz"} });
-        let (schemas, failures) = tool_schemas(&servers, "");
+        let (schemas, failures) = tool_schemas(&servers);
         assert!(schemas.is_empty(), "{schemas:?}");
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("broken"), "{failures:?}");
     }
 
     /// A GUI-launched app inherits a minimal PATH (no npx/node/uvx), so a
-    /// stdio connector like `npx @playwright/mcp` could not start at all. The
+    /// stdio connector like `npx some-mcp-server` could not start at all. The
     /// child must get the same login-shell PATH the sidecar spawn uses.
     #[test]
     fn stdio_session_inherits_the_login_shell_path() {
         // The child must see a PATH that resolves ordinary tools: a
         // GUI-launched app's minimal PATH (no /usr/bin) is exactly what made
-        // `npx @playwright/mcp` fail to start, silently disabling the browser
-        // tools. The fake server reports whether /usr/bin is on its PATH.
+        // `npx`-based connectors fail to start, silently disabling their tools.
+        // The fake server reports whether /usr/bin is on its PATH.
         let script = r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -535,18 +487,18 @@ while IFS= read -r line; do
 done
 "#;
         let servers = json!({ "pathtest": {"command": "sh", "args": ["-c", script]} });
-        let out = call_tool(&servers, "mcp__pathtest__path", &json!({}), "").unwrap();
+        let out = call_tool(&servers, "mcp__pathtest__path", &json!({})).unwrap();
         assert_eq!(out.trim(), "has-usr-bin");
     }
 
     #[test]
     fn call_tool_rejects_a_disabled_connector() {
-        let err = call_tool(&json!({}), "mcp__docker__ps", &json!({}), "").unwrap_err();
+        let err = call_tool(&json!({}), "mcp__docker__ps", &json!({})).unwrap_err();
         assert!(err.contains("not enabled"), "{err}");
     }
 
     /// A tool name unique across the enabled connectors is exposed BARE, so the
-    /// model sees `browser_navigate` instead of `mcp__playwright__browser_navigate`
+    /// model sees `browser_navigate` instead of `mcp__web__browser_navigate`
     /// — and a bare call must still route back to its connector.
     #[test]
     fn unique_tool_names_are_exposed_bare_and_still_resolve() {
@@ -560,11 +512,11 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        let servers = json!({ "playwright": {"command": "sh", "args": ["-c", script]} });
-        let (schemas, failures) = tool_schemas(&servers, "");
+        let servers = json!({ "web": {"command": "sh", "args": ["-c", script]} });
+        let (schemas, failures) = tool_schemas(&servers);
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(schemas[0]["function"]["name"], "browser_navigate");
-        let out = call_tool(&servers, "browser_navigate", &json!({}), "").unwrap();
+        let out = call_tool(&servers, "browser_navigate", &json!({})).unwrap();
         assert_eq!(out, "navigated");
     }
 
@@ -585,7 +537,7 @@ done
             "a": {"command": "sh", "args": ["-c", script]},
             "b": {"command": "sh", "args": ["-c", script]},
         });
-        let (schemas, _) = tool_schemas(&servers, "");
+        let (schemas, _) = tool_schemas(&servers);
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
@@ -613,7 +565,7 @@ done
         let cfg = json!({"command": "sh", "args": ["-c", script]});
         let servers = json!({ "fake": cfg });
 
-        let (schemas, failures) = tool_schemas(&servers, "");
+        let (schemas, failures) = tool_schemas(&servers);
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(schemas.len(), 1, "{schemas:?}");
         // Unique across the enabled connectors, so it is exposed bare.
@@ -623,10 +575,10 @@ done
             .unwrap()
             .contains("Echo text"));
 
-        let out = call_tool(&servers, "echo", &json!({"text": "ping"}), "").unwrap();
+        let out = call_tool(&servers, "echo", &json!({"text": "ping"})).unwrap();
         assert_eq!(out, "pong");
         // The qualified form keeps working (older transcripts / pinned names).
-        let out = call_tool(&servers, "mcp__fake__echo", &json!({"text": "ping"}), "").unwrap();
+        let out = call_tool(&servers, "mcp__fake__echo", &json!({"text": "ping"})).unwrap();
         assert_eq!(out, "pong");
     }
 }

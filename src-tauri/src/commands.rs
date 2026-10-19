@@ -1,7 +1,8 @@
 //! Tauri commands mirroring the Electron preload API (window.coder).
 //!
-//! Each command maps 1:1 to an ipcMain.handle channel in electron/main.ts so
-//! the renderer's tauriBridge shim can expose the exact same surface.
+//! Each command maps 1:1 to an ipcMain.handle channel the old Electron main
+//! process exposed, so the renderer's tauriBridge shim can keep the exact
+//! same surface.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -181,7 +182,7 @@ fn resolve_coder_safe(app: &AppHandle, rel: &str) -> Result<PathBuf, String> {
 pub fn skip_dirs() -> HashSet<&'static str> {
     HashSet::from([
         "node_modules", ".git", ".venv", "venv", "__pycache__", ".next",
-        ".nuxt", "dist", "dist-electron", "release", "build", "coverage",
+        ".nuxt", "dist", "release", "build", "coverage",
         ".cache", ".idea", ".vscode", ".DS_Store", "target", "vendor",
         ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".github",
         ".playwright", ".playwright-mcp", "out", "bin", "obj",
@@ -190,6 +191,12 @@ pub fn skip_dirs() -> HashSet<&'static str> {
 
 #[tauri::command]
 pub fn fs_list(root: String, rel: String) -> Vec<FileEntry> {
+    // The renderer lists a workspace's files as soon as a chat/folder is opened
+    // — the earliest point the backend learns which project is active. Starting
+    // the language servers here moves the cold start (spawn + `initialize` +
+    // crate-graph load) into the user's typing time instead of the first tool
+    // call, which is what makes `lsp_*` fast instead of perpetually cold.
+    crate::lsp::prewarm(&root);
     let root = PathBuf::from(&root);
     if !root.exists() {
         return vec![];
@@ -238,6 +245,7 @@ const MAX_WALK_FILES: usize = 50_000;
 
 #[tauri::command]
 pub fn fs_walk(root: String) -> Vec<FileEntry> {
+    crate::lsp::prewarm(&root);
     let root = PathBuf::from(&root);
     if !root.exists() {
         return vec![];
@@ -571,7 +579,16 @@ fn image_mime(ext: &str) -> Option<&'static str> {
 
 #[tauri::command]
 pub fn read_image(abs_path: String) -> Option<String> {
-    let p = PathBuf::from(&abs_path);
+    image_data_url(&abs_path)
+}
+
+/// Read an image file and return it as a `data:<mime>;base64,…` URL.
+///
+/// Shared by the `read_image` Tauri command and the agent's image deserializer
+/// (which turns a bare path from the renderer into bytes for the model). Mime
+/// comes from the extension; unknown extensions and oversized files fail.
+pub fn image_data_url(abs_path: &str) -> Option<String> {
+    let p = PathBuf::from(abs_path);
     let ext = p.extension()?.to_string_lossy().to_lowercase();
     let mime = image_mime(&ext)?;
     let data = std::fs::read(&p).ok()?;

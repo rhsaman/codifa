@@ -9,6 +9,8 @@
 
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 
 /// Resolved per-call LLM configuration (mirrors llm.py's build_chat_model args).
 #[derive(Debug, Clone)]
@@ -20,6 +22,435 @@ pub struct LlmConfig {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
     pub timeout_secs: u64,
+    /// Reasoning-effort level chosen for this call ("none" / "low" /
+    /// "medium" / "high" / "xhigh" / "max"). `""` means "provider default"
+    /// and sends no reasoning parameter. Mirrors the old Python
+    /// `_THINKING_LEVELS` mapping that was lost in the Rust migration.
+    pub reasoning_level: String,
+    /// Whether the selected model is known to be reasoning-capable (the
+    /// provider's `/models` `reasoning` flag, or the user's manual override).
+    /// A local/custom provider without the cloud `auto_think` flag still gets
+    /// a reasoning effort when this is true (e.g. ollama `deepseek-r1`).
+    pub model_reasoning: bool,
+    /// True for cloud gateway kinds that auto-route to reasoning-capable
+    /// models (openrouter / nvidia / cloudflare / tokenrouter).
+    /// Gates the reasoning param the same way the Python `auto_think` did.
+    pub auto_think: bool,
+}
+
+/// Resolve the reasoning trio (`reasoning_level`, `model_reasoning`,
+/// `auto_think`) for a call. `level` is the UI thinking level for this slot —
+/// empty means "inherit the main model's level", in which case the caller
+/// passes the main level instead. `auto_think` is derived from the provider
+/// KIND so no caller has to remember the gateway list.
+///
+/// Returns `(reasoning_level, model_reasoning, auto_think)` ready to spread
+/// into an `LlmConfig` literal.
+pub fn reasoning_fields(
+    provider_kind: &str,
+    level: &str,
+    model_reasoning: bool,
+) -> (String, bool, bool) {
+    (
+        level.trim().to_string(),
+        model_reasoning,
+        crate::models::auto_think_for(provider_kind),
+    )
+}
+
+/// Map a UI thinking level to the OpenAI-standard `reasoning_effort` token.
+/// Returns None when reasoning is off or the level is unknown.
+/// Note: `xhigh` / `max` are UI-only levels — OpenAI-family endpoints 400 on
+/// them, so they are mapped to the strongest accepted token ("high").
+pub fn reasoning_effort_for(level: &str) -> Option<&'static str> {
+    match level.trim() {
+        "none" => None,
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        // UI-only levels collapse to the strongest token the API accepts.
+        "xhigh" | "max" => Some("high"),
+        // "minimal" is a valid OpenAI token but not exposed in the UI today.
+        _ => None,
+    }
+}
+
+/// Like `reasoning_effort_for`, but the top UI level is passed through
+/// verbatim for the kinds whose endpoints accept it, and collapsed to `high`
+/// for the OpenAI-family kinds that reject it with 400.
+///
+/// The UI exposes ONE top option ("Max", stored as `xhigh`); the legacy `max`
+/// value is an exact alias, so BOTH fold to the same token per kind — a stored
+/// `max` and a stored `xhigh` must never produce different requests.
+/// - OpenRouter / TokenRouter / Nvidia / Cloudflare forward the token to the
+///   upstream model and accept `xhigh`.
+/// - OpenAI itself (`gpt-5`, `o*`) accepts only low/medium/high/minimal, so
+///   both top values collapse to "high" (the strongest defined token).
+/// - Anthropic and Google use budget mappings (see `thinking_budget_for`),
+///   where xhigh/max already map to the same budget.
+pub fn reasoning_effort_for_kind(kind: &str, level: &str) -> Option<&'static str> {
+    let level = level.trim();
+    // UI merge: 'max' and 'xhigh' are the same level.
+    let level = if level == "max" { "xhigh" } else { level };
+    match kind {
+        // Token-budget providers: no `reasoning_effort` token is sent at all.
+        "anthropic" | "google" => None,
+        // Gateways that forward the effort string upstream accept `xhigh`.
+        "openrouter" | "tokenrouter" | "nvidia" | "cloudflare" => match level {
+            "xhigh" => Some("xhigh"),
+            _ => reasoning_effort_for(level),
+        },
+        // OpenAI-family and everything else: top UI levels collapse to "high".
+        _ => reasoning_effort_for(level),
+    }
+}
+
+/// Map a UI thinking level to a Google Gemini `thinkingBudget` (in tokens).
+/// Returns None when reasoning is off. Mirrors the Python `google_thinking`
+/// table (low=4096, medium=12288, high=32768) plus the UI-only top levels.
+pub fn thinking_budget_for(level: &str) -> Option<u32> {
+    match level.trim() {
+        "minimal" => Some(1024),
+        "low" => Some(4096),
+        "medium" => Some(12288),
+        "high" => Some(32768),
+        "xhigh" | "max" => Some(32768),
+        _ => None,
+    }
+}
+
+/// Anthropic's own thinking-budget table, in tokens.
+///
+/// Anthropic requires `max_tokens` to stay strictly ABOVE `budget_tokens`,
+/// which is why this table is smaller than Google's — and why the old flat
+/// `budget.min(2048)` was a bug: it collapsed Low / Medium / High / Max onto
+/// the exact same request, so the slider changed nothing on the wire.
+pub fn anthropic_budget_for(level: &str) -> Option<u32> {
+    match level.trim() {
+        "minimal" => Some(1024),
+        "low" => Some(2048),
+        "medium" => Some(4096),
+        "high" => Some(8192),
+        "xhigh" | "max" => Some(16384),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal (images)
+// ---------------------------------------------------------------------------
+
+/// Neutral image block the agent attaches to a message:
+/// `{"type":"image","data_url":"data:image/png;base64,..."}`.
+///
+/// The agent never picks a provider shape: the three endpoints disagree about
+/// how an inline image looks, so the translation lives here, right before the
+/// bytes go on the wire.
+pub const IMAGE_BLOCK_TYPE: &str = "image";
+
+/// Split `data:<mime>;base64,<payload>` into `(mime, payload)`.
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime, payload) = rest.split_once(";base64,")?;
+    if mime.is_empty() || payload.is_empty() {
+        return None;
+    }
+    Some((mime, payload))
+}
+
+/// Provider-specific wire shape of one inline image.
+fn image_part(kind: &str, data_url: &str) -> Option<Value> {
+    // A malformed / truncated data URL is dropped instead of poisoning the
+    // whole request: the text of the turn still gets through.
+    let (mime, payload) = split_data_url(data_url).or_else(|| {
+        // Bare base64 (a caller that already stripped the prefix).
+        if data_url.starts_with("data:") || data_url.len() < 32 {
+            None
+        } else {
+            Some(("image/png", data_url))
+        }
+    })?;
+    Some(match kind {
+        // Anthropic takes raw base64 + a media type, never a data URL.
+        "anthropic" => json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": mime, "data": payload },
+        }),
+        // Gemini inlines the bytes under `inlineData` (camelCase, like the
+        // `generationConfig` / `thinkingBudget` keys this file already writes).
+        "google" => json!({ "inlineData": { "mimeType": mime, "data": payload } }),
+        // OpenAI-compatible endpoints take the data URL verbatim.
+        _ => json!({ "type": "image_url", "image_url": { "url": data_url } }),
+    })
+}
+
+/// Rewrite one message's content for `kind`. String content passes through
+/// untouched (the common case); an array of neutral blocks keeps its text
+/// blocks and has its image blocks translated.
+fn map_content(kind: &str, content: &Value) -> Value {
+    let Value::Array(blocks) = content else {
+        return content.clone();
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some(IMAGE_BLOCK_TYPE) => {
+                if let Some(part) = b
+                    .get("data_url")
+                    .and_then(Value::as_str)
+                    .and_then(|u| image_part(kind, u))
+                {
+                    out.push(part);
+                }
+            }
+            _ => out.push(b.clone()),
+        }
+    }
+    Value::Array(out)
+}
+
+/// Map every message of a request body to the provider's own content shape.
+fn map_messages(kind: &str, messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            m["content"] = map_content(kind, &m["content"]);
+            m
+        })
+        .collect()
+}
+
+/// Convert OpenAI-style messages into Gemini `contents` (+ an optional
+/// `systemInstruction`).
+///
+/// Gemini names the assistant role `model` and needs every message shaped as
+/// `{role, parts:[{text|inlineData}]}`. The old code dumped OpenAI messages
+/// straight into `contents`, so ANY google call was malformed — images or not.
+fn google_contents(messages: &[Value]) -> (Value, Option<Value>) {
+    let mut contents: Vec<Value> = Vec::new();
+    let mut sys_parts: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        let parts: Vec<Value> = match m.get("content") {
+            Some(Value::String(text)) => vec![json!({ "text": text })],
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                    Some(IMAGE_BLOCK_TYPE) => b
+                        .get("data_url")
+                        .and_then(Value::as_str)
+                        .and_then(|u| image_part("google", u)),
+                    // Gemini parts are bare `{text}` objects — the neutral
+                    // `{type:"text",text}` block is NOT a valid part.
+                    Some("text") => b.get("text").map(|t| json!({ "text": t })),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        if role == "system" {
+            sys_parts.extend(parts);
+            continue;
+        }
+        contents.push(json!({
+            "role": if role == "assistant" { "model" } else { "user" },
+            "parts": parts,
+        }));
+    }
+    let sys = if sys_parts.is_empty() {
+        None
+    } else {
+        Some(json!({ "parts": sys_parts }))
+    };
+    (Value::Array(contents), sys)
+}
+
+/// Whether a reasoning param should be sent at all: the model must be
+/// explicitly reasoning-capable OR the gateway kind auto-thinks, and the
+/// level must map to something (i.e. not empty / "none"). Mirrors the old
+/// Python `_thinking_kwargs` gate. Kind-aware so gateways that accept
+/// `xhigh` keep it while OpenAI-family endpoints get the collapsed token.
+fn reasoning_active(cfg: &LlmConfig) -> Option<&'static str> {
+    if !(cfg.auto_think || cfg.model_reasoning) {
+        return None;
+    }
+    reasoning_effort_for_kind(&cfg.provider, &cfg.reasoning_level)
+}
+
+/// Inject the reasoning parameter into a request body: `reasoning_effort`
+/// for OpenAI-compatible kinds, `generationConfig.thinkingBudget` for Google
+/// and `thinking.budget_tokens` for Anthropic. No-op when reasoning is off or
+/// the model/gateway isn't reasoning-capable.
+fn apply_reasoning(cfg: &LlmConfig, body: &mut Value) {
+    if !(cfg.auto_think || cfg.model_reasoning) {
+        return;
+    }
+    match cfg.provider.as_str() {
+        "anthropic" => {
+            // Anthropic needs `max_tokens` strictly ABOVE `budget_tokens`, so
+            // the budget comes from Anthropic's own table and the cap is only
+            // ever RAISED to fit it. Capping the budget instead (the old
+            // `budget.min(2048)`) made every level above Low identical.
+            if let Some(budget) = anthropic_budget_for(&cfg.reasoning_level) {
+                let max_tokens = cfg.max_tokens.unwrap_or(4096).max(budget + 1024);
+                body["max_tokens"] = json!(max_tokens);
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            }
+        }
+        "google" => {
+            if let Some(budget) = thinking_budget_for(&cfg.reasoning_level) {
+                // Preserve any generationConfig already set (e.g. maxOutputTokens).
+                match body.get_mut("generationConfig").and_then(Value::as_object_mut) {
+                    Some(obj) => {
+                        obj.insert(
+                            "thinkingConfig".into(),
+                            json!({ "thinkingBudget": budget }),
+                        );
+                    }
+                    None => {
+                        body["generationConfig"] =
+                            json!({ "thinkingConfig": { "thinkingBudget": budget } });
+                    }
+                }
+            }
+        }
+        _ => {
+            if let Some(effort) = reasoning_active(cfg) {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
+    }
+}
+
+/// Build the wire body for a streaming chat call. A free function on purpose:
+/// the four `serde_json` shapes below are the one place where a provider-facing
+/// mistake is silent (the provider just returns 400), so they have to be unit
+/// testable — the async `stream_with_key` around them is not.
+fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value]>) -> Value {
+    let mut body = json!({});
+    match cfg.provider.as_str() {
+        "anthropic" => {
+            let system: Vec<&str> = messages
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .filter_map(|m| m["content"].as_str())
+                .collect();
+            body["model"] = json!(cfg.model);
+            body["max_tokens"] = json!(cfg.max_tokens.unwrap_or(4096));
+            if !system.is_empty() {
+                body["system"] = json!(system.join("\n\n"));
+            }
+            body["messages"] = json!(messages
+                .iter()
+                .filter(|m| m["role"] != "system")
+                .map(|m| {
+                    let mut m = m.clone();
+                    m["content"] = map_content("anthropic", &m["content"]);
+                    m
+                })
+                .collect::<Vec<_>>());
+            body["stream"] = json!(true);
+        }
+        "google" => {
+            let (contents, sys) = google_contents(messages);
+            if let Some(sys) = sys {
+                body["systemInstruction"] = sys;
+            }
+            body["contents"] = contents;
+        }
+        _ => {
+            body["model"] = json!(cfg.model);
+            body["stream"] = json!(true);
+            body["messages"] = json!(map_messages(cfg.provider.as_str(), messages));
+            if let Some(t) = cfg.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(mt) = cfg.max_tokens {
+                body["max_tokens"] = json!(mt);
+            }
+            if let Some(t) = tools {
+                body["tools"] = json!(t);
+            }
+        }
+    }
+    apply_prompt_cache(cfg, &mut body);
+    apply_reasoning(cfg, &mut body);
+    body
+}
+
+/// Anthropic explicit prompt caching.
+///
+/// Every round-trip of a turn resends the SAME system prompt and the same tool
+/// array, and each round only appends a few messages to the end. Without a
+/// cache marker the provider re-bills that whole prefix on every call: a 20-step
+/// turn pays for the ~2-8 KB system prompt and the ~5 KB tool array twenty
+/// times. Marking the stable prefix `ephemeral` lets the provider reuse it and
+/// bill only the delta.
+///
+/// Only the `anthropic` arm takes `cache_control` — the OpenAI-compatible and
+/// Google arms either cache their prefix automatically or would reject an
+/// unknown field, so this is a strict no-op for them.
+fn apply_prompt_cache(cfg: &LlmConfig, body: &mut Value) {
+    if cfg.provider != "anthropic" {
+        return;
+    }
+    const EPHEMERAL: &str = "ephemeral";
+    // 1) The system prompt: the most stable and highest-value block. Anthropic
+    //    takes it as a plain string, which cannot carry a marker — wrap it in a
+    //    one-block array (the array form is what the API accepts markers on).
+    if let Some(sys) = body.get("system").and_then(Value::as_str) {
+        let sys = sys.to_string();
+        body["system"] = json!([{
+            "type": "text",
+            "text": sys,
+            "cache_control": { "type": EPHEMERAL },
+        }]);
+    }
+    // 2) The tool array (absent on this arm today, but kept correct so a future
+    //    Anthropic tool conversion gets the cache for free).
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({ "type": EPHEMERAL });
+        }
+    }
+    // 3) The last message: everything up to and including it is the prefix the
+    //    NEXT round-trip will resend, so this is what makes the cache grow with
+    //    the turn instead of being re-bought each round.
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        if let Some(last) = msgs.last_mut() {
+            cache_last_content(last);
+        }
+    }
+}
+
+/// Attach `cache_control` to a message's trailing content. A string content is
+/// promoted to a one-block array, because only blocks can carry the marker.
+/// Returns without touching anything when the content is neither a string nor
+/// an array (a tool-call-only message), which is not a cache-able prefix anyway.
+fn cache_last_content(msg: &mut Value) {
+    let marked = match msg.get("content") {
+        Some(Value::String(text)) => json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" },
+        }]),
+        Some(Value::Array(blocks)) => {
+            let mut blocks = blocks.clone();
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            Value::Array(blocks)
+        }
+        _ => return,
+    };
+    msg["content"] = marked;
 }
 
 pub struct LlmResult {
@@ -53,6 +484,12 @@ pub fn http_client() -> Client {
     Client::builder()
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(15))
+        // TCP keepalive is NOT a deadline on the model: a slow-but-connected
+        // provider keeps answering the probes and is never cut off. It only lets
+        // the OS notice a half-open connection (VPN/proxy switch, a gateway that
+        // died without a FIN) and surface a transport error, which the retry
+        // path then handles. Without it such a socket stayed silent forever.
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
         .build()
         .expect("reqwest client")
 }
@@ -110,12 +547,24 @@ fn is_key_error(status: u16, body: &str) -> bool {
 /// One-shot completion. Tries each API key in order on key errors
 /// (llm.py's resolve_keys + _is_key_error fallback chain).
 pub async fn complete(client: &Client, cfg: &LlmConfig, system: &str, user: &str) -> Result<LlmResult, String> {
+    complete_with_images(client, cfg, system, user, &[]).await
+}
+
+/// One-shot completion that ALSO sends inline images (data URLs) with the
+/// user message. Used by the vision pass; `complete` is the text-only alias.
+pub async fn complete_with_images(
+    client: &Client,
+    cfg: &LlmConfig,
+    system: &str,
+    user: &str,
+    images: &[String],
+) -> Result<LlmResult, String> {
     if cfg.api_keys.is_empty() {
         return Err("no api key configured".into());
     }
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match complete_with_key(client, cfg, key, system, user).await {
+        match complete_with_key(client, cfg, key, system, user, images).await {
             Ok(res) => return Ok(res),
             Err((status, body)) if is_key_error(status, &body) => {
                 last_err = format!("key rejected ({status}): {body}");
@@ -133,19 +582,43 @@ async fn complete_with_key(
     _key: &str,
     system: &str,
     user: &str,
+    images: &[String],
 ) -> Result<LlmResult, (u16, String)> {
     let (url, header_name, header_value) = endpoint_and_auth(cfg);
     let mut body = json!({});
+    // The user message as neutral blocks: text + one block per image, each
+    // translated to the provider's own shape just before it goes on the wire.
+    let mut user_blocks: Vec<Value> = vec![json!({ "type": "text", "text": user })];
+    for data_url in images {
+        user_blocks.push(json!({ "type": IMAGE_BLOCK_TYPE, "data_url": data_url }));
+    }
+    // Text-only calls keep the exact plain-string shape they always had; only a
+    // call that actually carries images switches to the block array.
+    let content_for = |kind: &str| {
+        if images.is_empty() {
+            json!(user)
+        } else {
+            map_content(kind, &Value::Array(user_blocks.clone()))
+        }
+    };
     match cfg.provider.as_str() {
         "anthropic" => {
             body["model"] = json!(cfg.model);
             body["max_tokens"] = json!(cfg.max_tokens.unwrap_or(4096));
             body["system"] = json!(system);
-            body["messages"] = json!([{ "role": "user", "content": user }]);
+            body["messages"] = json!([{
+                "role": "user",
+                "content": content_for("anthropic"),
+            }]);
         }
         "google" => {
             body["systemInstruction"] = json!({ "parts": [{ "text": system }] });
-            body["contents"] = json!([{ "role": "user", "parts": [{ "text": user }] }]);
+            let parts = if images.is_empty() {
+                json!([{ "text": user }])
+            } else {
+                map_content("google", &Value::Array(user_blocks.clone()))
+            };
+            body["contents"] = json!([{ "role": "user", "parts": parts }]);
             if let Some(mt) = cfg.max_tokens {
                 body["generationConfig"] = json!({ "maxOutputTokens": mt });
             }
@@ -153,10 +626,9 @@ async fn complete_with_key(
         _ => {
             body["model"] = json!(cfg.model);
             body["stream"] = json!(false);
-            body["messages"] = json!([
-                { "role": "system", "content": system },
-                { "role": "user", "content": user },
-            ]);
+            let mut wire = vec![json!({ "role": "system", "content": system })];
+            wire.push(json!({ "role": "user", "content": content_for(cfg.provider.as_str()) }));
+            body["messages"] = json!(wire);
             if let Some(t) = cfg.temperature {
                 body["temperature"] = json!(t);
             }
@@ -165,6 +637,7 @@ async fn complete_with_key(
             }
         }
     }
+    apply_reasoning(cfg, &mut body);
 
     let mut req = client
         .post(&url)
@@ -200,10 +673,110 @@ pub struct StreamAcc {
     pub tool_calls: Vec<Value>,
     pub finish_reason: String,
     pub usage: Option<Value>,
+    /// Bytes of REASONING ("thinking") content seen so far. The reasoning text
+    /// itself is deliberately never streamed — rendering it token by token made
+    /// the UI crawl — but its arrival has to be observable, otherwise the pill
+    /// can only ever say "Working" while the model is clearly thinking. Counting
+    /// it here lets the read loop detect a reasoning-only payload without
+    /// sniffing the raw JSON.
+    pub reasoning_len: usize,
+    /// Raise counter of the interrupt signal when this stream started reading.
+    /// The stream treats the signal as "mine" ONLY when its generation is now
+    /// greater than this stamp, so a raise meant for an earlier window (already
+    /// consumed, or landing before this request) can never cancel a request the
+    /// user never steered. Together with `interrupted` this is what makes a
+    /// mid-turn steer deterministic instead of a coin flip.
+    pub interrupt_base: u64,
+    /// True when the stream was dropped early because a mid-turn steer landed.
+    /// The agent loop then re-issues the same step with the steer appended
+    /// instead of waiting for a model answer the user already superseded.
+    pub interrupted: bool,
 }
 
-/// Callback fired for every text delta (the agent loop forwards these live).
-pub type DeltaSink<'a> = &'a mut (dyn FnMut(&str) + Send + 'a);
+/// One live signal from a streaming model call.
+///
+/// Text and the reasoning state travel through ONE callback on purpose: the
+/// agent loop hands `stream_chat` a single closure, because two closures would
+/// both need a mutable borrow of its event emitter at the same time.
+pub enum StreamSignal<'a> {
+    /// A text delta to append to the assistant bubble.
+    Text(&'a str),
+    /// The model started (`true`) or stopped (`false`) producing reasoning
+    /// content. Only the state change is reported, never the reasoning text.
+    Thinking(bool),
+}
+
+/// Callback fired for every live stream signal.
+pub type SignalSink<'a> = &'a mut (dyn FnMut(StreamSignal<'_>) + Send + 'a);
+
+/// Event-driven "drop this stream now" signal for mid-turn steers.
+///
+/// The steer inbox is only read BETWEEN model calls, so a steer typed while a
+/// request was already streaming had to wait for that whole request to finish —
+/// exactly the reported "steer behaves like a queued message". `push_steer`
+/// raises this signal and the read loop below selects on it, so the in-flight
+/// request is dropped at once and re-issued with the steer appended.
+///
+/// There is deliberately no timer anywhere in this path: a raise is an event, so
+/// detection is instant, and a merely slow model is never mistaken for failure.
+#[derive(Debug, Default)]
+pub struct InterruptSignal {
+    /// Monotonic raise counter.
+    ///
+    /// A plain bool is NOT enough here. A stream only learns about a raise when
+    /// its read loop is parked on `wait()`, so a raise that lands while no
+    /// stream is parked (the moment between two model calls, when the agent is
+    /// executing a tool, or in the gap right after the previous stream was
+    /// dropped) used to be either swallowed by `reset()` or consumed by the
+    /// WRONG iteration — the reported "sometimes the steer goes through, and
+    /// sometimes it just waits for the whole turn". Counting raises lets each
+    /// stream spot exactly the raises that happened AFTER it started, so a raise
+    /// is never lost and never mis-attributed.
+    generation: AtomicU64,
+    notify: Notify,
+}
+
+impl InterruptSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raise the signal and wake an in-flight stream waiting on it.
+    /// Returns the new generation (the stamp a consuming stream compares to).
+    pub fn raise(&self) -> u64 {
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.notify.notify_waiters();
+        gen
+    }
+
+    /// The raise counter as it stands now. A stream captures this BEFORE it
+    /// starts reading and treats any larger value as "a steer landed on me".
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// True when a raise happened after `since`.
+    pub fn interrupted_since(&self, since: u64) -> bool {
+        self.generation() > since
+    }
+
+    /// Resolve once the counter is greater than `since` (immediately when it
+    /// already is), then return the value it reached.
+    pub async fn wait_for(&self, since: u64) -> u64 {
+        loop {
+            // Register interest BEFORE re-checking the counter: a raise landing
+            // between the check and the wait would otherwise be lost forever.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let now = self.generation();
+            if now > since {
+                return now;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Parse one SSE `data:` payload into accumulator updates, forwarding text
 /// deltas to `on_delta` as they arrive. Returns true when the payload was a
@@ -225,7 +798,13 @@ fn apply_sse_payload(
         "anthropic" => {
             match v["type"].as_str() {
                 Some("content_block_delta") => {
-                    if let Some(t) = v["delta"]["text"].as_str() {
+                    if v["delta"]["type"].as_str() == Some("thinking_delta") {
+                        // Extended thinking: the reasoning text is measured, not
+                        // streamed — the UI only needs to know it is happening.
+                        if let Some(t) = v["delta"]["thinking"].as_str() {
+                            acc.reasoning_len += t.len();
+                        }
+                    } else if let Some(t) = v["delta"]["text"].as_str() {
                         acc.text.push_str(t);
                         on_delta(t);
                     }
@@ -258,7 +837,13 @@ fn apply_sse_payload(
             }
         }
         "google" => {
-            if let Some(t) = v["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+            // Gemini reports reasoning as a part flagged `thought: true`.
+            let part = &v["candidates"][0]["content"]["parts"][0];
+            if part["thought"].as_bool() == Some(true) {
+                if let Some(t) = part["text"].as_str() {
+                    acc.reasoning_len += t.len();
+                }
+            } else if let Some(t) = part["text"].as_str() {
                 acc.text.push_str(t);
                 on_delta(t);
             }
@@ -274,22 +859,66 @@ fn apply_sse_payload(
         }
         _ => {
             let choice = &v["choices"][0];
+            // Reasoning deltas: providers name them differently (OpenRouter and
+            // DeepSeek: `reasoning`; several gateways: `reasoning_content`;
+            // Anthropic-compatible shims: `thinking`). They are measured, never
+            // streamed: forwarding the reasoning text token by token slowed the
+            // UI to a crawl, so only the arrival of reasoning is signalled.
+            if let Some(r) = choice["delta"]["reasoning"]
+                .as_str()
+                .or_else(|| choice["delta"]["reasoning_content"].as_str())
+                .or_else(|| choice["delta"]["thinking"].as_str())
+            {
+                acc.reasoning_len += r.len();
+            }
             if let Some(t) = choice["delta"]["content"].as_str() {
                 acc.text.push_str(t);
                 on_delta(t);
             }
             if let Some(tcs) = choice["delta"]["tool_calls"].as_array() {
                 for tc in tcs {
-                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                    if acc.tool_calls.len() <= idx {
-                        acc.tool_calls.resize_with(idx + 1, || json!({}));
+                    // Deterministic slot target. OpenAI always sends `index`;
+                    // when a provider omits it, a delta that OPENS a call (it
+                    // carries an id or a name) gets its own slot instead of
+                    // being merged into slot 0 — the old `unwrap_or(0)` folded
+                    // every streamed call into the first one and left the rest
+                    // nameless, which surfaced as `unknown tool ""`.
+                    let idx = match tc["index"].as_u64() {
+                        Some(i) => i as usize,
+                        None => {
+                            let opens_new = tc["id"].as_str().is_some()
+                                || tc["function"]["name"]
+                                    .as_str()
+                                    .map(|n| !n.is_empty())
+                                    .unwrap_or(false);
+                            if opens_new || acc.tool_calls.is_empty() {
+                                acc.tool_calls.len()
+                            } else {
+                                acc.tool_calls.len() - 1
+                            }
+                        }
+                    };
+                    // Every slot is a structurally complete call, never a bare
+                    // `{}`: reading `tc["function"]["name"]` off an empty object
+                    // produced `""`, which the dispatch guard reported as
+                    // `unknown tool ""` and burned a whole round-trip.
+                    while acc.tool_calls.len() <= idx {
+                        acc.tool_calls
+                            .push(json!({"function": {"name": "", "arguments": ""}}));
                     }
                     let slot = &mut acc.tool_calls[idx];
                     if let Some(id) = tc["id"].as_str() {
                         slot["id"] = json!(id);
                     }
+                    // Never let an EMPTY name overwrite a good one. Some
+                    // providers stream the name once and then send `"name":""`
+                    // on every following delta; the blind overwrite erased it,
+                    // so the call reached the dispatch guard as `unknown tool ""`
+                    // and burned a whole round-trip re-issuing it.
                     if let Some(name) = tc["function"]["name"].as_str() {
-                        slot["function"]["name"] = json!(name);
+                        if !name.is_empty() {
+                            slot["function"]["name"] = json!(name);
+                        }
                     }
                     if let Some(args) = tc["function"]["arguments"].as_str() {
                         let cur = slot["function"]["arguments"].as_str().unwrap_or_default();
@@ -308,6 +937,23 @@ fn apply_sse_payload(
     false
 }
 
+/// Resolves once the Stop flag is raised; never resolves when there is no flag.
+///
+/// This is a poll of the user's own cancel request, not a deadline on the
+/// model: it lets Stop win while the request is parked waiting for response
+/// headers or for the next chunk (the plain flag check below only runs AFTER a
+/// chunk arrives, so a silent provider made Stop a no-op).
+async fn wait_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) {
+    match cancel {
+        Some(c) => {
+            while !c.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Stream one chat completion, invoking `on_delta` for every text chunk.
 /// Returns the accumulated result (text, tool_calls, finish_reason, usage).
 pub async fn stream_chat(
@@ -315,15 +961,18 @@ pub async fn stream_chat(
     cfg: &LlmConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    on_delta: DeltaSink<'_>,
+    on_event: SignalSink<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    steer_interrupt: Option<&InterruptSignal>,
 ) -> Result<StreamAcc, (u16, String)> {
     if cfg.api_keys.is_empty() {
         return Err((0, "no api key configured".into()));
     }
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match stream_with_key(client, cfg, key, messages, tools, on_delta, cancel).await {
+        match stream_with_key(client, cfg, key, messages, tools, on_event, cancel, steer_interrupt)
+            .await
+        {
             Ok(acc) => return Ok(acc),
             Err((status, body)) if is_key_error(status, &body) => {
                 last_err = format!("key rejected ({status}): {body}");
@@ -341,8 +990,9 @@ async fn stream_with_key(
     key: &str,
     messages: &[Value],
     tools: Option<&[Value]>,
-    on_delta: DeltaSink<'_>,
+    on_event: SignalSink<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    steer_interrupt: Option<&InterruptSignal>,
 ) -> Result<StreamAcc, (u16, String)> {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
     let (url, header_name, header_value) = match cfg.provider.as_str() {
@@ -355,49 +1005,7 @@ async fn stream_with_key(
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
 
-    let mut body = json!({});
-    match cfg.provider.as_str() {
-        "anthropic" => {
-            let system: Vec<&str> = messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .filter_map(|m| m["content"].as_str())
-                .collect();
-            body["model"] = json!(cfg.model);
-            body["max_tokens"] = json!(cfg.max_tokens.unwrap_or(4096));
-            if !system.is_empty() {
-                body["system"] = json!(system.join("\n\n"));
-            }
-            body["messages"] = json!(messages
-                .iter()
-                .filter(|m| m["role"] != "system")
-                .collect::<Vec<_>>());
-            body["stream"] = json!(true);
-        }
-        "google" => {
-            if let Some(sys) = messages.iter().find(|m| m["role"] == "system") {
-                body["systemInstruction"] = json!({ "parts": [{ "text": sys["content"] }] });
-            }
-            body["contents"] = json!(messages
-                .iter()
-                .filter(|m| m["role"] != "system")
-                .collect::<Vec<_>>());
-        }
-        _ => {
-            body["model"] = json!(cfg.model);
-            body["stream"] = json!(true);
-            body["messages"] = json!(messages);
-            if let Some(t) = cfg.temperature {
-                body["temperature"] = json!(t);
-            }
-            if let Some(mt) = cfg.max_tokens {
-                body["max_tokens"] = json!(mt);
-            }
-            if let Some(t) = tools {
-                body["tools"] = json!(t);
-            }
-        }
-    }
+    let body = build_request_body(cfg, messages, tools);
 
     let mut req = client
         .post(&url)
@@ -408,7 +1016,11 @@ async fn stream_with_key(
     }
     // No header deadline — see the one-shot path above. The transport reports a
     // genuinely dead connection (TCP error) immediately; the clock never does.
-    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
+    let resp = tokio::select! {
+        biased;
+        _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
+        r = req.send() => r.map_err(|e| (0u16, e.to_string()))?,
+    };
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
@@ -416,8 +1028,19 @@ async fn stream_with_key(
     }
 
     let mut acc = StreamAcc::default();
+    // Stamp this request with the signal's current generation: only a raise that
+    // happens AFTER this point is meant for THIS stream. Without the stamp a
+    // raise landing between two requests was consumed by the next one (or lost),
+    // which is why a mid-turn steer only went through sometimes.
+    if let Some(sig) = steer_interrupt {
+        acc.interrupt_base = sig.generation();
+    }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
+    // Live thinking state, reported only on a REAL transition: a payload that
+    // carries neither reasoning nor text (usage / role deltas) must not flicker
+    // the pill off and on.
+    let mut thinking_on = false;
     use futures_util::StreamExt;
     // Idle timeout: a stalled provider stream (no bytes for this long) must
     // abort the turn with a clear error instead of hanging it forever.
@@ -437,21 +1060,54 @@ async fn stream_with_key(
                 return Err((0u16, "aborted by user".into()));
             }
         }
-        let chunk = match stream.next().await {
+        // A mid-turn steer drops this request instantly instead of letting the
+        // model finish an answer the user already superseded. `biased` makes the
+        // interrupt win every tie, so a steer is never delayed by a ready chunk.
+        // Stop and a mid-turn steer are both EVENTS raced against the next chunk,
+        // so neither waits for a silent provider to speak first.
+        let chunk = tokio::select! {
+            biased;
+            _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
+            _ = async {
+                match steer_interrupt {
+                    Some(sig) => sig.wait_for(acc.interrupt_base).await,
+                    None => std::future::pending::<u64>().await,
+                }
+            } => {
+                acc.interrupted = true;
+                return Ok(acc);
+            }
+            next = stream.next() => next,
+        };
+        let chunk = match chunk {
             Some(chunk) => chunk.map_err(|e| (0u16, e.to_string()))?,
             None => break,
         };
+        let before_text = acc.text.len();
+        let before_reasoning = acc.reasoning_len;
         buf.push_str(&String::from_utf8_lossy(&chunk));
         // SSE frames are separated by a blank line.
         while let Some(pos) = buf.find("\n\n") {
             let frame: String = buf.drain(..pos + 2).collect();
             for line in frame.lines() {
                 if let Some(payload) = line.strip_prefix("data: ") {
-                    if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut *on_delta) {
+                    // The parser keeps its text-only sink; this thin adapter is
+                    // what lets the caller receive BOTH kinds of signal from one
+                    // closure (and keeps the parser's unit tests untouched).
+                    let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
+                    if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
                         return Ok(acc);
                     }
                 }
             }
+        }
+        if acc.reasoning_len > before_reasoning && !thinking_on {
+            thinking_on = true;
+            on_event(StreamSignal::Thinking(true));
+        }
+        if acc.text.len() > before_text && thinking_on {
+            thinking_on = false;
+            on_event(StreamSignal::Thinking(false));
         }
     }
     Ok(acc)
@@ -500,6 +1156,9 @@ mod tests {
             temperature: None,
             max_tokens: None,
             timeout_secs: 30,
+            reasoning_level: String::new(),
+            model_reasoning: false,
+            auto_think: false,
         }
     }
 
@@ -509,6 +1168,65 @@ mod tests {
         assert_eq!(normalize_base("ollama", "http://localhost:11434"), "http://localhost:11434/v1");
         assert_eq!(normalize_base("ollama", "http://localhost:11434/v1"), "http://localhost:11434/v1");
         assert_eq!(normalize_base("custom", "https://x.example/v1/"), "https://x.example/v1");
+    }
+
+    #[test]
+    fn anthropic_body_caches_the_stable_prefix() {
+        let mut c = cfg("anthropic", "https://api.anthropic.com", &["k"]);
+        c.max_tokens = Some(8192);
+        c.temperature = Some(0.5);
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["stream"], true);
+        // The system prompt is promoted to ONE cached text block (a bare string
+        // cannot carry a cache marker).
+        assert_eq!(body["system"][0]["text"], "SYS");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // The last message is the prefix the NEXT round-trip resends.
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hi");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        // System is lifted out of `messages` and no OpenAI-only key leaks in.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn openai_compatible_body_keeps_tools_and_has_no_cache_control() {
+        let c = cfg("custom", "http://localhost:20128/v1", &["k"]);
+        let tools = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let body = build_request_body(&c, &msgs, Some(&tools));
+        // The tool array IS sent on this arm, untouched and unmarked — an
+        // OpenAI-compatible gateway caches its own prefix and an unknown field
+        // would be rejected.
+        assert_eq!(body["tools"][0]["function"]["name"], "grep");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn google_body_uses_contents_and_has_no_cache_control() {
+        let c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
+        assert!(body["contents"].is_array());
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -599,6 +1317,41 @@ mod tests {
     }
 
     #[test]
+    fn empty_streamed_name_never_wipes_a_good_one() {
+        // Some providers send the tool NAME in the first delta and then
+        // `"name":""` on every later delta. The accumulator used to overwrite
+        // blindly, erasing the good name: the call then reached the dispatch
+        // guard as `unknown tool ""` and burned a whole round-trip.
+        let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"grep","arguments":"{\"pat"}}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        // Args-only delta: no `name` key at all — must keep the good name.
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"x\"}"}}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        // Explicit empty name — must STILL keep the good name.
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":""}}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(acc.tool_calls[0]["function"]["name"], "grep");
+        assert_eq!(
+            acc.tool_calls[0]["function"]["arguments"].as_str().unwrap(),
+            r#"{"pattern":"x"}"#
+        );
+    }
+
+    #[test]
     fn sse_payloads_accumulate_anthropic_deltas() {
         let mut acc = StreamAcc::default();
         let mut sink = |_: &str| {};
@@ -627,11 +1380,367 @@ mod tests {
         assert_eq!(usage["output_tokens"], 3);
     }
 
+    #[test]
+    fn missing_index_opens_new_slots_and_slots_are_well_formed() {
+        // A provider that omits `index` used to fold EVERY streamed call into
+        // slot 0 (the `unwrap_or(0)`), leaving the following calls nameless —
+        // which the dispatch guard reported as `unknown tool ""`. Each
+        // id/name-bearing delta must open its own slot instead.
+        let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"c2","function":{"name":"grep","arguments":"{}"}}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(acc.tool_calls.len(), 2);
+        assert_eq!(acc.tool_calls[0]["function"]["name"], "read");
+        assert_eq!(acc.tool_calls[1]["function"]["name"], "grep");
+
+        // A slot created by an out-of-order index is structurally complete
+        // (`function.name`/`arguments` exist), never a bare `{}` — so a reader
+        // can never hit `unknown tool ""` from a missing key.
+        let mut acc2 = StreamAcc::default();
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+            &mut acc2,
+            &mut sink
+        ));
+        assert_eq!(acc2.tool_calls.len(), 3);
+        assert!(acc2.tool_calls[0]["function"]["name"].is_string());
+        assert!(acc2.tool_calls[1]["function"]["name"].is_string());
+        assert_eq!(acc2.tool_calls[2]["function"]["name"], "glob");
+    }
+
+    #[test]
+    fn reasoning_effort_for_kind_merges_max_into_xhigh() {
+        // The UI exposes ONE top option (stored as `xhigh`); a legacy stored
+        // `max` must produce the EXACT same token for every kind — otherwise
+        // the same visible "Max" level sends different requests.
+        for kind in ["openrouter", "tokenrouter", "nvidia", "cloudflare", "custom", "ollama", "openai"] {
+            assert_eq!(
+                reasoning_effort_for_kind(kind, "xhigh"),
+                reasoning_effort_for_kind(kind, "max"),
+                "xhigh and max must map identically for kind {kind}"
+            );
+        }
+        // Gateways that forward the token send the strongest verbatim.
+        assert_eq!(reasoning_effort_for_kind("openrouter", "xhigh"), Some("xhigh"));
+        // OpenAI-family collapses both to the strongest defined token.
+        assert_eq!(reasoning_effort_for_kind("custom", "max"), Some("high"));
+        // Budget providers carry no effort token at all.
+        assert_eq!(reasoning_effort_for_kind("anthropic", "xhigh"), None);
+        assert_eq!(reasoning_effort_for_kind("google", "max"), None);
+        // Budgets for the two spellings are identical too.
+        assert_eq!(thinking_budget_for("xhigh"), thinking_budget_for("max"));
+    }
+
+    #[test]
+    fn reasoning_deltas_are_measured_not_streamed() {
+        // A reasoning model emits its "thinking" tokens before the answer does.
+        // They must NOT be forwarded as visible text (that is what crawled the
+        // UI), but their ARRIVAL has to be observable — otherwise the pill can
+        // only ever say "Working" while the model is plainly thinking.
+        let mut acc = StreamAcc::default();
+        let mut streamed: Vec<String> = Vec::new();
+        {
+            let mut sink = |d: &str| streamed.push(d.to_string());
+            // OpenRouter / DeepSeek family name it `reasoning`.
+            assert!(!apply_sse_payload(
+                "custom",
+                r#"{"choices":[{"delta":{"reasoning":"let me think"}}]}"#,
+                &mut acc,
+                &mut sink
+            ));
+            assert_eq!(acc.reasoning_len, "let me think".len());
+            // Several gateways use `reasoning_content`.
+            assert!(!apply_sse_payload(
+                "custom",
+                r#"{"choices":[{"delta":{"reasoning_content":"more"}}]}"#,
+                &mut acc,
+                &mut sink
+            ));
+            assert_eq!(acc.reasoning_len, "let me thinkmore".len());
+            // The real answer still streams normally.
+            assert!(!apply_sse_payload(
+                "custom",
+                r#"{"choices":[{"delta":{"content":"done"}}]}"#,
+                &mut acc,
+                &mut sink
+            ));
+            // A payload with neither (usage / role) must not change the count,
+            // so the pill cannot be flickered off by them.
+            let before = acc.reasoning_len;
+            assert!(!apply_sse_payload(
+                "custom",
+                r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+                &mut acc,
+                &mut sink
+            ));
+            assert_eq!(acc.reasoning_len, before);
+        }
+        assert_eq!(acc.text, "done");
+        assert_eq!(acc.reasoning_len, "let me thinkmore".len());
+        // Nothing but the real answer ever reached the delta sink: reasoning is
+        // measured for the pill, never rendered as visible text.
+        assert_eq!(streamed, vec!["done".to_string()]);
+    }
+
+    #[test]
+    fn anthropic_thinking_deltas_are_measured_not_streamed() {
+        let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
+        assert!(!apply_sse_payload(
+            "anthropic",
+            r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(acc.reasoning_len, 3);
+        assert!(acc.text.is_empty());
+    }
+
+    #[test]
+    fn interrupt_signal_wakes_a_parked_waiter_and_stamps_generations() {
+        // Mid-turn steer: the stream read loop selects on this signal, so a raise
+        // must wake a waiter that is ALREADY parked (a lost wakeup would put the
+        // steer back to "waits for the whole model reply" — the reported bug).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sig = InterruptSignal::new();
+            let base = sig.generation();
+            assert!(!sig.interrupted_since(base));
+            let waiter = async {
+                sig.wait_for(base).await;
+                true
+            };
+            let raiser = async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                sig.raise();
+            };
+            let (woke, _) = tokio::join!(waiter, raiser);
+            assert!(woke, "a parked waiter must be woken by raise()");
+            assert!(sig.interrupted_since(base));
+        });
+    }
+
+    #[test]
+    fn a_raise_from_an_earlier_window_never_cancels_a_new_request() {
+        // The bug behind "sometimes the steer works, sometimes it waits": a raise
+        // that landed while NO stream was parked used to leak into the next
+        // request (or be wiped by reset()). The generation stamp makes each
+        // stream see only raises that happened AFTER it started.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sig = InterruptSignal::new();
+            // A steer lands while the agent is between model calls.
+            sig.raise();
+            // The NEXT request starts: it stamps the current generation, so that
+            // older raise is NOT its own — it must not be interrupted.
+            let base = sig.generation();
+            assert!(!sig.interrupted_since(base));
+            // A second steer lands while this request is live: that one IS its
+            // own and must fire immediately.
+            sig.raise();
+            assert!(sig.interrupted_since(base));
+            // wait_for resolves without parking (counter already ahead).
+            let gen = sig.wait_for(base).await;
+            assert_eq!(gen, base + 1);
+        });
+    }
+
     fn tokio_test_block(client: &Client, c: &LlmConfig) -> String {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async { complete(client, c, "s", "u").await.err().unwrap() })
+    }
+
+    /// A tiny valid inline image: the mime prefix is what the per-provider
+    /// translation switches on, the payload is opaque.
+    const PNG_URL: &str = "data:image/png;base64,AAAA";
+
+    #[test]
+    fn anthropic_thinking_budget_distinguishes_every_level() {
+        // Every slider step must change the wire request. The old flat
+        // `budget.min(2048)` collapsed Low..Max onto the same body, so the
+        // slider was cosmetic on Anthropic.
+        let low = anthropic_budget_for("low").unwrap();
+        let medium = anthropic_budget_for("medium").unwrap();
+        let high = anthropic_budget_for("high").unwrap();
+        let top = anthropic_budget_for("xhigh").unwrap();
+        assert!(
+            low < medium && medium < high && high < top,
+            "budgets must grow with the level: {low} {medium} {high} {top}"
+        );
+        // `max` is an exact alias of `xhigh` — one UI option, one request.
+        assert_eq!(anthropic_budget_for("max"), Some(top));
+        assert_eq!(anthropic_budget_for("none"), None);
+        assert_eq!(anthropic_budget_for(""), None);
+    }
+
+    #[test]
+    fn anthropic_body_carries_the_budget_and_raises_max_tokens() {
+        let mut c = cfg("anthropic", "https://api.anthropic.com", &["k"]);
+        c.model_reasoning = true;
+        c.reasoning_level = "high".into();
+        c.max_tokens = Some(4096);
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_request_body(&c, &msgs, None);
+        let budget = anthropic_budget_for("high").unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], budget);
+        // Anthropic rejects the call unless max_tokens > budget_tokens, so the
+        // cap must be RAISED to fit the budget instead of the budget lowered.
+        assert!(
+            body["max_tokens"].as_u64().unwrap() > budget as u64,
+            "max_tokens must exceed the thinking budget: {body}"
+        );
+    }
+
+    #[test]
+    fn reasoning_is_gated_by_the_model_capability_flag() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        // A level alone is not enough: a model that is not flagged
+        // reasoning-capable gets NO parameter (the same gate the Python
+        // sidecar had).
+        let mut c = cfg("custom", "https://x.example/v1", &["k"]);
+        c.reasoning_level = "high".into();
+        assert!(build_request_body(&c, &msgs, None)
+            .get("reasoning_effort")
+            .is_none());
+        c.model_reasoning = true;
+        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "high");
+        // The top UI level is UI-only for the OpenAI family: it collapses to
+        // the strongest token those endpoints accept.
+        c.reasoning_level = "xhigh".into();
+        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "high");
+        // Gateways that FORWARD the effort string keep it verbatim.
+        let mut g = cfg("openrouter", "https://openrouter.ai/api/v1", &["k"]);
+        g.auto_think = true;
+        g.reasoning_level = "xhigh".into();
+        assert_eq!(build_request_body(&g, &msgs, None)["reasoning_effort"], "xhigh");
+        // None / empty send nothing at all.
+        g.reasoning_level = "none".into();
+        assert!(build_request_body(&g, &msgs, None)
+            .get("reasoning_effort")
+            .is_none());
+        g.reasoning_level = String::new();
+        assert!(build_request_body(&g, &msgs, None)
+            .get("reasoning_effort")
+            .is_none());
+    }
+
+    #[test]
+    fn google_body_gets_a_thinking_budget() {
+        let mut c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
+        c.model_reasoning = true;
+        c.reasoning_level = "medium".into();
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            thinking_budget_for("medium").unwrap()
+        );
+        // A budget provider must never ALSO send the OpenAI-only token.
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn an_image_block_renders_in_each_provider_shape() {
+        // The agent emits ONE neutral block shape; the three endpoints each get
+        // their own wire shape from here.
+        let blocks = json!([
+            { "type": "text", "text": "what is this" },
+            { "type": IMAGE_BLOCK_TYPE, "data_url": PNG_URL },
+        ]);
+        // OpenAI-compatible: the data URL rides verbatim.
+        let openai = map_content("custom", &blocks);
+        assert_eq!(openai[1]["type"], "image_url");
+        assert_eq!(openai[1]["image_url"]["url"], PNG_URL);
+        // Anthropic: raw base64 plus a media type, never a data URL.
+        let anthropic = map_content("anthropic", &blocks);
+        assert_eq!(anthropic[1]["type"], "image");
+        assert_eq!(anthropic[1]["source"]["type"], "base64");
+        assert_eq!(anthropic[1]["source"]["media_type"], "image/png");
+        assert_eq!(anthropic[1]["source"]["data"], "AAAA");
+        // Gemini: inlineData.
+        let google = map_content("google", &blocks);
+        assert_eq!(google[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(google[1]["inlineData"]["data"], "AAAA");
+        // A malformed / truncated data URL is DROPPED (the turn's text still
+        // gets through) instead of poisoning the whole request with a 400.
+        for bad in ["data:image/png;base64,", "data:;base64,AAAA", "not-an-image"] {
+            let blocks = json!([{ "type": IMAGE_BLOCK_TYPE, "data_url": bad }]);
+            assert!(
+                map_content("custom", &blocks).as_array().unwrap().is_empty(),
+                "a malformed data URL must be dropped, got {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_only_turn_keeps_the_plain_string_content_shape() {
+        // Regression guard: the multimodal translation must not touch a
+        // text-only conversation — every provider path is byte-compared.
+        let c = cfg("custom", "https://x.example/v1", &["k"]);
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(body["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn google_contents_translate_blocks_into_parts() {
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": [
+                { "type": "text", "text": "what is this" },
+                { "type": IMAGE_BLOCK_TYPE, "data_url": PNG_URL },
+            ]}),
+            json!({"role": "assistant", "content": "a button"}),
+        ];
+        let (contents, sys) = google_contents(&msgs);
+        // Gemini spells the assistant role "model" and takes bare {text} parts
+        // (the neutral {type:"text"} block is not a valid part).
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[0]["parts"][0]["text"], "what is this");
+        assert_eq!(contents[0]["parts"][1]["inlineData"]["data"], "AAAA");
+        assert_eq!(contents[1]["parts"][0]["text"], "a button");
+        // The system prompt becomes systemInstruction, never a content turn.
+        assert_eq!(sys.unwrap()["parts"][0]["text"], "SYS");
+    }
+
+    #[test]
+    fn google_body_switches_to_contents_for_images() {
+        let c = cfg("google", "https://generativelanguage.googleapis.com", &["k"]);
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": [
+                { "type": "text", "text": "describe" },
+                { "type": IMAGE_BLOCK_TYPE, "data_url": PNG_URL },
+            ]}),
+        ];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(body["contents"][0]["parts"][1]["inlineData"]["data"], "AAAA");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
     }
 }

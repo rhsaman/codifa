@@ -2,9 +2,15 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { injectThemeStyles } from './lib/themes'
 import { installTauriBridge, recordDroppedPaths } from './lib/tauriBridge'
+import { installInputSuppression } from './lib/inputSuppress'
 import './styles/global.css'
 
 injectThemeStyles()
+
+// Stop macOS/WebKit autocomplete, autocorrect, inline predictions and
+// spell-check from rewriting what is typed into the app (Settings → General →
+// Keyboard suggestions drives the actual on/off sweep).
+installInputSuppression()
 
 // macOS frameless window: the traffic lights overlay the sidebar, so CSS
 // needs a platform hook to reserve their drag strip (`.mac` selectors).

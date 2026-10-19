@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, TraceEntry, TraceKind } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
 
@@ -10,6 +10,9 @@ let sidecarUrl: string | null = null
 // this, a single chat switch produced 3× /health (one per ensureSidecar
 // invocation × 2 in StrictMode).
 let sidecarInFlight: Promise<string | null> | null = null
+
+/** How long `ensureSidecar` waits for the sidecar URL before giving up. */
+const SIDECAR_RESOLVE_TIMEOUT_MS = 10_000
 
 api.onSidecarChanged(() => {
   sidecarUrl = null
@@ -55,9 +58,24 @@ export async function ensureSidecar(): Promise<string | null> {
       if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
       sidecarUrl = null
     }
-    const url = await api.getSidecarUrl()
-    if (url) sidecarUrl = url
-    return sidecarUrl
+    // Bound the IPC: if the sidecar never comes up, every caller must still
+    // settle. An unsettled promise here left `streamChat` pending forever, so
+    // the only `isStreaming` reset never ran — the Stop button stayed on with
+    // no error banner and no way to recover.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const url = await Promise.race([
+        api.getSidecarUrl(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), SIDECAR_RESOLVE_TIMEOUT_MS)
+        }),
+      ])
+      if (url) sidecarUrl = url
+      return sidecarUrl
+    } finally {
+      // Never leave the timer behind: it would keep a test/CLI process alive.
+      clearTimeout(timer)
+    }
   })()
   sidecarInFlight = p
   // After the resolution settles, clear the in-flight slot so subsequent
@@ -66,7 +84,15 @@ export async function ensureSidecar(): Promise<string | null> {
   // probe was still in-flight already share `p` and will get the same
   // result without an extra /health call. The slot is also reset by
   // onSidecarChanged / onSidecarDead for the explicit crash scenario.
-  p.finally(() => { sidecarInFlight = null })
+  //
+  // Identity check: onSidecarChanged/onSidecarDead (and invalidateSidecarCache)
+  // null the slot while `p` may still be pending. An unconditional clear here
+  // would then wipe a NEWER resolution started in between, so the next caller
+  // starts a third one — three concurrent /health probes and duplicate
+  // getSidecarUrl IPCs. Only clear the slot if it is still THIS promise.
+  p.finally(() => {
+    if (sidecarInFlight === p) sidecarInFlight = null
+  })
   return p
 }
 
@@ -640,6 +666,10 @@ export interface StreamParams {
   /** Web-search engines from Settings → Plugins, in priority order: the top
    *  engine is the primary and the ones below are fallbacks tried in order. */
   searchPlugins?: SearchPluginConfig[]
+  /** ONE number for `web_search` (Settings → Web Providers): how many results it
+   *  returns AND how many of them get their REAL page content fetched before
+   *  the distiller reads them. 0 = snippets only. */
+  webSearchAutoFetch?: number
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
   /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
@@ -654,8 +684,14 @@ export interface StreamParams {
   /** User pre-approved desktop-app control (the `computer` tool's mutating
    *  actions) for this session/workspace — set by "Always allow". */
   allowComputer?: boolean
+  /** The composer's Browser switch: when off the agent's `browser_*` tools are
+   *  not bound and no browser is launched. The Browser panel is unaffected. */
+  allowBrowser?: boolean
   /** Per-subagent model overrides (explore, vision, compact). */
   subagentModels?: Record<string, string>
+  /** Per-tool reasoning-effort overrides, keyed by the same slot names as
+   *  `subagentModels`. A missing key means "inherit the main model's level". */
+  subagentThinking?: Record<string, string>
   /** Full provider configs keyed by provider id, so a "providerId/model"
    *  subagent entry is routed to that provider's own base URL / key. */
   providers?: Record<string, ProviderConfig>
@@ -689,8 +725,35 @@ export async function streamChat(
   // "Still waiting" state. HTTP errors (5xx, etc.) are NOT retried here — the
   // backend already runs its own retry loop, and a non-2xx is a deliberate
   // response, not a dropped connection.
-  const MAX_RECONNECT_ATTEMPTS = 5
-  const BASE_BACKOFF_MS = 1000
+  const MAX_RECONNECT_ATTEMPTS = 10
+  // Fixed 10s cadence — deliberately NOT exponential: the resend schedule is
+  // predictable, and the ATTEMPT COUNT (not a clock) is what ends the ladder.
+  // There is still no time-based failure anywhere: only the socket actually
+  // closing/erroring reaches this path, so a model that is merely slow is
+  // never a "drop" and is never retried or cut off.
+  const RECONNECT_DELAY_MS = 10_000
+
+  // Abort-aware sleep: a Stop during the reconnect backoff used to leave an
+  // uncancellable 10s timer behind (the loop-top abort check only ran before
+  // the NEXT fetch), so pressing Stop felt dead for up to 10 seconds.
+  const sleepUnlessAborted = (ms: number, signal?: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'))
+        return
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = () => {
+        if (timer) clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }
+      timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort)
+    })
 
   // A healthy turn ALWAYS ends with a terminal `done` event (the server emits it
   // in its finally block). If the stream closes WITHOUT one, the sidecar died
@@ -756,6 +819,16 @@ export async function streamChat(
       if (!url) throw new Error('the local backend is not ready')
     }
 
+    // Reset the stream-progress flags for THIS attempt. They were declared once
+    // outside the loop, so a `done`/`error` seen on a previous attempt (or even
+    // a keepalive, which used to flip gotAnyEvent) leaked into the next one and
+    // made the gates below read stale state — e.g. the end-of-stream check
+    // believed a dead attempt had already received `done` and returned a
+    // half-turn as "clean completion". A fresh attempt must start clean.
+    gotDone = false
+    gotTerminalError = false
+    gotAnyEvent = false
+
     // Phase 1: connect. A network failure to even reach the sidecar is
     // retryable; an HTTP error response is not.
     let res: Response
@@ -787,13 +860,16 @@ export async function streamChat(
           model_reasoning: params.modelReasoning ?? false,
           mcp_servers: params.mcpServers ?? {},
           search_plugins: params.searchPlugins ?? [],
+          web_search_auto_fetch: params.webSearchAutoFetch ?? 5,
           skills: params.skills ?? [],
           allow_create: params.allowCreate ?? false,
           cap: params.cap ?? {},
           allow_outside: params.allowOutside ?? false,
           allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
+          allow_browser: params.allowBrowser ?? false,
           subagent_models: params.subagentModels ?? {},
+          subagent_thinking: params.subagentThinking ?? {},
           providers: params.providers ?? {},
           // Single auto-compaction threshold as a percentage of the raw window.
           compact_at_percent: params.compactAtPercent ?? 80,
@@ -816,8 +892,10 @@ export async function streamChat(
         reconnecting: true,
       } as SidecarEvent)
       attempt++
-      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
-      await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))
+      // `attempt` counts RETRIES, so the ladder ends after exactly
+      // MAX_RECONNECT_ATTEMPTS of them (an `>` test here would allow one extra).
+      if (attempt >= MAX_RECONNECT_ATTEMPTS) throw err
+      await sleepUnlessAborted(RECONNECT_DELAY_MS, params.signal)
       continue
     }
 
@@ -877,7 +955,12 @@ export async function streamChat(
       // turn's checkpoint instead of restarting it. Only a TERMINAL `error`
       // event (the turn really died) stops recovery. No timer is involved — the
       // socket closing IS the signal, so detection is instant.
-      if (gotAnyEvent && gotTerminalError) throw err
+      // A terminal `error` event already ended the turn: re-sending it would
+      // stack "Connection lost mid-turn" on top of the real provider error.
+      // The test is on `gotTerminalError` ALONE — gating it on `gotAnyEvent`
+      // meant a single keepalive heartbeat was enough to suppress the
+      // self-healing resume of a stream that really did drop.
+      if (gotTerminalError) throw err
       // Surface the self-heal so the user isn't left wondering why the turn
       // restarted on its own (the "interrupted itself" confusion).
       wrappedOnEvent({
@@ -888,8 +971,10 @@ export async function streamChat(
         reconnecting: true,
       } as SidecarEvent)
       attempt++
-      if (attempt > MAX_RECONNECT_ATTEMPTS) throw err
-      await new Promise((r) => setTimeout(r, BASE_BACKOFF_MS * 2 ** (attempt - 1)))
+      // `attempt` counts RETRIES, so the ladder ends after exactly
+      // MAX_RECONNECT_ATTEMPTS of them (an `>` test here would allow one extra).
+      if (attempt >= MAX_RECONNECT_ATTEMPTS) throw err
+      await sleepUnlessAborted(RECONNECT_DELAY_MS, params.signal)
       continue
     }
   }
@@ -970,6 +1055,11 @@ export async function triggerCompact(params: {
   }>
   contextWindow?: number
   compactAtPercent?: number
+  /** Per-tool reasoning overrides so the compact slot can carry its own
+   *  effort; the main level is the fallback for the slot and the primary. */
+  subagentThinking?: Record<string, string>
+  thinkingLevel?: string
+  modelReasoning?: boolean
   signal?: AbortSignal
 }): Promise<CompactResult> {
   const url = await ensureSidecar()
@@ -989,6 +1079,9 @@ export async function triggerCompact(params: {
       fallback_base_url: params.fallback.baseUrl,
       fallback_api_keys: params.fallback.apiKeys,
       fallback_provider_id: params.fallback.id ?? '',
+      subagent_thinking: params.subagentThinking ?? {},
+      thinking_level: params.thinkingLevel ?? '',
+      model_reasoning: params.modelReasoning ?? false,
       history: params.history,
       context_window: params.contextWindow ?? 0,
       compact_at_percent: params.compactAtPercent ?? 80,
@@ -1051,6 +1144,28 @@ export async function cancelSteer(chatId: string, id: string): Promise<void> {
   }
 }
 
+/** Force a running explore retry ladder to retry immediately (banner Retry).
+ *  Needed because the sub-agent retries INSIDE the still-streaming parent turn,
+ *  where re-sending the turn is swallowed by `send()`'s single-flight guard —
+ *  so the banner's Retry button had no effect at all. Returns false when the
+ *  sidecar is unreachable or no sub-agent retry is in flight. */
+export async function retrySubagentNow(chatId: string): Promise<boolean> {
+  const url = await ensureSidecar()
+  if (!url) return false
+  try {
+    const res = await fetch(`${url}/chat/retry_now`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId }),
+    })
+    if (!res.ok) return false
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
+    return body.ok !== false
+  } catch {
+    return false
+  }
+}
+
 /** Token usage of a title call, billed under the provider/model that ran it. */
 export interface ChatTitleUsage {
   input_tokens?: number
@@ -1069,7 +1184,11 @@ export interface ChatTitleUsage {
 export async function requestChatTitle(params: {
   provider: ProviderConfig
   subagentModels?: Record<string, string>
+  subagentThinking?: Record<string, string>
   providers?: Record<string, ProviderConfig>
+  /** Whether the chat's main model is reasoning-capable. Gates the title
+   *  slot's reasoning parameter the same way the main call gates it. */
+  modelReasoning?: boolean
   text: string
   chatId?: string
 }): Promise<{ title: string | null; usage: ChatTitleUsage | null }> {
@@ -1090,7 +1209,9 @@ export async function requestChatTitle(params: {
         base_url: params.provider.baseUrl,
         model: params.provider.model,
         subagent_models: params.subagentModels ?? {},
+        subagent_thinking: params.subagentThinking ?? {},
         providers: params.providers ?? {},
+        model_reasoning: params.modelReasoning ?? false,
         text: params.text,
         chat_id: params.chatId ?? '',
       }),
@@ -1179,32 +1300,39 @@ export interface SubagentJob {
 export async function respondPermission(
   id: string,
   allowed: boolean,
-): Promise<void> {
-  const url = await ensureSidecar()
-  if (!url) return
-  try {
-    await fetch(`${url}/permission/respond`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, allowed }),
-    })
-  } catch {
-    /* best effort */
-  }
+): Promise<boolean> {
+  return postAnswer('/permission/respond', { id, allowed })
 }
 
 /** Answer a pending ask_user question (multiple-choice or free-text) from the agent. */
-export async function respondAsk(id: string, answer: string): Promise<void> {
+export async function respondAsk(id: string, answer: string): Promise<boolean> {
+  return postAnswer('/ask/respond', { id, answer })
+}
+
+/**
+ * Deliver one fire-and-forget answer to the agent with a hard timeout.
+ *
+ * The ask/permission cards used to clear themselves the moment the user
+ * clicked, while the delivery promise was discarded (`void`): a rejected or
+ * hanging request left the turn waiting for an answer that never arrived, with
+ * no card left to answer from. Returning a boolean — always settled thanks to
+ * the timeout — lets the UI keep the card on screen until the answer really
+ * landed.
+ */
+async function postAnswer(path: string, body: unknown): Promise<boolean> {
   const url = await ensureSidecar()
-  if (!url) return
+  if (!url) return false
   try {
-    await fetch(`${url}/ask/respond`, {
+    const res = await fetch(`${url}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, answer }),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     })
+    return res.ok
   } catch {
-    /* best effort */
+    /* best effort — the caller decides what to do with the failure */
+    return false
   }
 }
 
@@ -1493,14 +1621,31 @@ export interface GitCommitResult {
   summary: string
 }
 
+/** Extract the human message from a non-ok native response.
+ *  Native routes answer JSON `{"detail": …}`, but a few legacy paths (and
+ *  axum's own extractor rejections, e.g. a malformed body) send plain text.
+ *  Reading only `detail` replaced those with a generic "<op> failed (400)" and
+ *  hid the real cause from the user, so fall back to the raw body text. */
+async function readApiError(res: Response, fallback: string): Promise<string> {
+  const text = await res.text().catch(() => "")
+  if (!text.trim()) return fallback
+  try {
+    const parsed = JSON.parse(text) as { detail?: string; error?: string }
+    const msg = parsed?.detail || parsed?.error
+    if (msg) return msg
+  } catch {
+    // Not JSON at all — the plain body IS the message.
+  }
+  return text
+}
+
 async function sidecarGet<T>(path: string): Promise<T | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: "the local backend is not ready" }
   try {
     const res = await fetch(`${url}${path}`)
     if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { detail?: string }
-      return { error: body.detail || `request failed (${res.status})` }
+      return { error: await readApiError(res, `request failed (${res.status})`) }
     }
     return (await res.json()) as T
   } catch (err) {
@@ -1553,8 +1698,10 @@ export async function gitCommit(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root, message, add_all: addAll }),
     })
+    if (!res.ok) {
+      return { error: await readApiError(res, `commit failed (${res.status})`) }
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, string>
-    if (!res.ok) return { error: body.detail || `commit failed (${res.status})` }
     return body as unknown as GitCommitResult
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
@@ -1577,9 +1724,10 @@ export async function gitDiscard(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root }),
     })
+    if (!res.ok) {
+      return { error: await readApiError(res, `discard failed (${res.status})`) }
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
-    if (!res.ok)
-      return { error: (body.detail as string) || `discard failed (${res.status})` }
     return body as unknown as GitDiscardResult
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
@@ -1610,8 +1758,10 @@ export async function gitCheckout(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root, branch, create }),
     })
+    if (!res.ok) {
+      return { error: await readApiError(res, `checkout failed (${res.status})`) }
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
-    if (!res.ok) return { error: (body.detail as string) || `checkout failed (${res.status})` }
     return body as unknown as { current: string }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
@@ -1637,8 +1787,10 @@ export async function gitPush(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root }),
     })
+    if (!res.ok) {
+      return { error: await readApiError(res, `push failed (${res.status})`) }
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
-    if (!res.ok) return { error: (body.detail as string) || `push failed (${res.status})` }
     return body as unknown as GitPushResult
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
@@ -1656,7 +1808,16 @@ export interface GitAutoCommitResult {
 /** Generate a commit message with one LLM call and commit, without touching chat. */
 export async function gitAutoCommit(
   root: string,
-  provider: { kind: string; model: string; baseUrl: string; apiKeys: string[]; id?: string },
+  provider: {
+    kind: string
+    model: string
+    baseUrl: string
+    apiKeys: string[]
+    id?: string
+    /** Main-model reasoning effort + capability flag for the message call. */
+    thinkingLevel?: string
+    modelReasoning?: boolean
+  },
 ): Promise<GitAutoCommitResult | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: "the local backend is not ready" }
@@ -1671,10 +1832,14 @@ export async function gitAutoCommit(
         base_url: provider.baseUrl,
         api_keys: provider.apiKeys,
         provider_id: provider.id ?? "",
+        thinking_level: provider.thinkingLevel ?? "",
+        model_reasoning: provider.modelReasoning ?? false,
       }),
     })
+    if (!res.ok) {
+      return { error: await readApiError(res, `autocommit failed (${res.status})`) }
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
-    if (!res.ok) return { error: (body.detail as string) || `autocommit failed (${res.status})` }
     return body as unknown as GitAutoCommitResult
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
@@ -1824,22 +1989,48 @@ export async function deleteScheduleRun(
   }
 }
 
-/** لاگ‌های چت جاری برای پنل Trace (لایا / LLM / پرامپت) با فیلتر اختیاری نوع و ساب‌ایجنت. */
+/** لاگ‌های چت جاری برای پنل Trace (لایا / LLM / پرامپت) — صفحه‌به‌صفحه.
+ *
+ *  The log of a long chat reaches several MB (the system prompt is re-logged on
+ *  every LLM call), so the panel asks for one page instead of the whole file and
+ *  walks backwards with `before` as the user scrolls up. `counts` describes the
+ *  WHOLE log so the tab badges stay honest with only a page in memory.
+ */
 export async function getChatTraces(
   chatId: string,
   kind?: TraceKind,
   taskId?: string,
-): Promise<TraceEntry[] | { error: string }> {
-  if (!chatId) return []
+  page?: { limit?: number; before?: number; sub?: boolean },
+): Promise<TracePage | { error: string }> {
+  if (!chatId) return { traces: [], total: 0, counts: { all: 0, llm: 0, prompt: 0, tool: 0 } }
   const params = new URLSearchParams()
   if (kind) params.set('kind', kind)
   if (taskId) params.set('task_id', taskId)
+  if (page?.limit != null) params.set('limit', String(page.limit))
+  if (page?.before != null) params.set('before', String(page.before))
+  // A sub-agent trace view wants its own nested calls; the top-level Tools tab
+  // mirrors the chat's cards, which nest them under the parent.
+  if (page?.sub) params.set('sub', 'true')
   const qs = params.toString()
-  const out = await sidecarGet<{ traces: TraceEntry[] }>(
-    `/chats/${encodeURIComponent(chatId)}/traces${qs ? `?${qs}` : ''}`,
-  )
+  const out = await sidecarGet<{
+    traces: TraceEntry[]
+    total?: number
+    counts?: Record<string, number>
+  }>(`/chats/${encodeURIComponent(chatId)}/traces${qs ? `?${qs}` : ''}`)
   if ('error' in out) return out
-  return out.traces ?? []
+  const traces = out.traces ?? []
+  return {
+    traces,
+    // An older backend (or a cached response) omits the totals: fall back to
+    // what this page can prove, so "load older" still works honestly.
+    total: typeof out.total === 'number' ? out.total : traces.length,
+    counts: {
+      all: out.counts?.all ?? traces.length,
+      llm: out.counts?.llm ?? 0,
+      prompt: out.counts?.prompt ?? 0,
+      tool: out.counts?.tool ?? 0,
+    },
+  }
 }
 
 /** پاک‌کردن لاگ چت جاری. */

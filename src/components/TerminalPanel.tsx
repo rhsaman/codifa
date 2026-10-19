@@ -15,6 +15,7 @@ import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
 import { focusChatInput } from '../lib/chatFocus'
 import { isApplePlatform } from '../lib/shortcuts'
+import { suppressField } from '../lib/inputSuppress'
 import { WebKitDeadKeyAddon } from '../lib/webkitDeadKey'
 
 interface TerminalTab {
@@ -66,17 +67,61 @@ function cwdBasename(cwd: string): string {
 
 /** Map the app's active theme CSS variables onto the xterm palette so the
  *  terminal never looks bolted-on. Falls back to the Rose Pine defaults
- *  (DEFAULT_THEME) for the pre-hydration paint. */
-function xtermTheme(): ITheme {
+ *  (DEFAULT_THEME) for the pre-hydration paint.
+ *
+ *  The ANSI slots below are deliberately spelled out instead of left to xterm:
+ *  any slot the caller omits falls back to xterm's built-in Tango palette, whose
+ *  greys are GREEN-TINTED (`#2e3436` for `black`, `#555753` for `brightBlack`).
+ *  Both zsh-autosuggestions and zsh-syntax-highlighting paint their overlay text
+ *  with `fg=8` (brightBlack), so an unset slot made every shell suggestion read
+ *  as green instead of muted grey on these dark themes. Deriving the greys from
+ *  the theme (`--bg-alt` / `--text-dim` / `--text`) fixes that, and mapping red /
+ *  green / yellow onto `--danger` / `--success` / `--thinking` makes the
+ *  terminal's git + ls output match the diff colours the app paints elsewhere. */
+export function xtermTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement)
   const v = (name: string, fallback: string): string => cs.getPropertyValue(name).trim() || fallback
+  const bg = v('--bg-alt', '#21202e')
+  const fg = v('--text', '#e0def4')
   return {
-    background: v('--bg-alt', '#21202e'),
-    foreground: v('--text', '#e0def4'),
-    cursor: v('--text', '#e0def4'),
-    cursorAccent: v('--bg-alt', '#21202e'),
+    background: bg,
+    foreground: fg,
+    cursor: fg,
+    cursorAccent: bg,
     selectionBackground: v('--accent-dim', '#403d52'),
-    selectionForeground: v('--text', '#e0def4'),
+    selectionForeground: fg,
+    // The whole 16-slot ANSI palette, every slot derived from the app theme, so
+    // no xterm default leaks through and shell output matches the UI. Leaving a
+    // slot out is not neutral: xterm falls back to its own GitHub-ish default
+    // for that slot alone.
+    //
+    // `brightBlack` (slot 8) is the one that matters most here — it is what
+    // zsh-autosuggestions asks for by default (`ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE
+    // ='fg=8'`), so the inline suggestion renders as muted theme text rather
+    // than the bright default grey. It only gets used this way once the pty has
+    // a real TERM (see shell env in src-tauri/src/pty.rs); before that the shell
+    // could not even resolve slot 8.
+    black: bg,
+    brightBlack: v('--text-dim', '#6e6a86'),
+    red: v('--danger', '#eb6f92'),
+    brightRed: v('--danger', '#eb6f92'),
+    green: v('--success', '#3fb950'),
+    brightGreen: v('--success', '#3fb950'),
+    yellow: v('--thinking', '#f6c177'),
+    brightYellow: v('--thinking', '#f6c177'),
+    // Directories and prompt paths are the most common blue output; the app
+    // already has a blue for links/paths, so reuse it instead of xterm's dull
+    // `#3465a4`.
+    blue: v('--link', '#4a9bc0'),
+    brightBlue: v('--link', '#4a9bc0'),
+    magenta: v('--accent', '#ebbcba'),
+    brightMagenta: v('--accent', '#ebbcba'),
+    // The app palette has no separate cyan tone, so cyan shares the success
+    // colour rather than falling back to an unrelated xterm default.
+    cyan: v('--success', '#3fb950'),
+    brightCyan: v('--success', '#3fb950'),
+    white: fg,
+    brightWhite: fg,
   }
 }
 
@@ -381,6 +426,11 @@ export function TerminalPanel() {
       term.loadAddon(fit)
       term.loadAddon(new WebLinksAddon())
       term.open(el)
+      // xterm's hidden input ships `autocorrect`/`autocapitalize`/`spellcheck`
+      // off but NOT `autocomplete`, so macOS still offers autofill and inline
+      // predictions over the terminal. Stamp it like every other text field
+      // (no-op while the setting is switched off in Settings → General).
+      suppressField(term.textarea)
       // WKWebView dead-key repair (see src/lib/webkitDeadKey.ts): inside the
       // Tauri webview a dead key duplicates the committed char and swallows
       // the next key, which reads as "extra characters appearing by

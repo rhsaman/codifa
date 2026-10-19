@@ -1,7 +1,7 @@
 // Phase 3-2: native core file tools mirroring backend/tools.py semantics —
 // resolve_safe sandboxing, read (windows/batch), grep, glob, write, edit.
-// LSP-backed features (symbols=, symbol fast paths) stay on the Python
-// sidecar until phase 4; the agent loop falls back to grep for names.
+//! LSP-backed features (symbols=, symbol fast paths) run natively; the agent
+//! loop falls back to grep for names the language server cannot resolve.
 
 // Phase 3-2 WIP: native core tools are only called from agent.rs, which is
 // not wired to a route yet. Silence dead-code until the route lands.
@@ -15,6 +15,10 @@ pub const MAX_READ_BYTES: usize = 2_000_000;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const MAX_FILES: usize = 10_000;
 pub const MAX_TERMINAL_OUTPUT: usize = 10_000;
+/// Hard depth cap for filesystem walks (`collect_files`) — a second belt next
+/// to the canonical-path visited set, so a pathological tree cannot blow the
+/// stack.
+const MAX_WALK_DEPTH: usize = 64;
 const MAX_GREP_ALTERNATIVES: usize = 3;
 const MAX_LINE_LENGTH: usize = 2000;
 
@@ -68,8 +72,14 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
     if target_canon != root_real && !target_canon.starts_with(&root_real) {
         if allow_coder {
             if let Some(coder) = coder_dir() {
-                if target == coder || target.starts_with(&coder) {
-                    return Ok(target);
+                // Compare (and return) the CANONICAL path. The check that sent
+                // us here already compared `target_canon`, so testing the
+                // lexical `target` was a symlink escape: a link created inside
+                // ~/.codifa (which the agent itself can write) made
+                // `~/.codifa/evil/etc/passwd` pass lexically while the real
+                // file is /etc/passwd.
+                if target_canon == coder || target_canon.starts_with(&coder) {
+                    return Ok(target_canon);
                 }
             }
         }
@@ -83,19 +93,19 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
         for tmp in tmp_roots {
             let Ok(tmp) = tmp.canonicalize() else { continue };
             if target_canon == tmp || target_canon.starts_with(&tmp) {
-                return Ok(target);
+                return Ok(target_canon);
             }
         }
         if let Some(permit) = permit {
             if permit["outside"].as_bool().unwrap_or(false) {
-                return Ok(target);
+                return Ok(target_canon);
             }
             if let Some(folders) = permit["folders"].as_array() {
                 for f in folders {
                     if let Some(fstr) = f.as_str() {
                         if let Ok(freal) = fs::canonicalize(fstr) {
                             if target_canon == freal || target_canon.starts_with(&freal) {
-                                return Ok(target);
+                                return Ok(target_canon);
                             }
                         }
                     }
@@ -359,13 +369,32 @@ pub fn count_grep_alternatives(pattern: &str) -> usize {
 /// Walk a scope directory collecting candidate files (hidden dirs and
 /// SKIP_DIRS pruned, depth-first).
 fn collect_files(scope: &Path, out: &mut Vec<PathBuf>) {
-    if out.len() >= MAX_FILES {
+    // Canonicalized ancestors, so a symlinked cycle (`ln -s .. up`) can never
+    // recurse forever — `path.is_dir()` follows symlinks, and the MAX_FILES
+    // bound never triggers on a cycle that adds no files.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    collect_files_inner(scope, out, &mut seen, 0);
+}
+
+fn collect_files_inner(
+    scope: &Path,
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    depth: usize,
+) {
+    if out.len() >= MAX_FILES || depth > MAX_WALK_DEPTH {
+        return;
+    }
+    let real = fs::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
+    if !seen.insert(real) {
         return;
     }
     let Ok(entries) = fs::read_dir(scope) else { return };
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
+    // Skip individual unreadable entries (a broken symlink, a permission-denied
+    // file) but never fail the whole walk for them — this is a best-effort scan.
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if entry.path().is_dir() {
             if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
@@ -377,7 +406,7 @@ fn collect_files(scope: &Path, out: &mut Vec<PathBuf>) {
     }
     out.extend(files);
     for dir in dirs {
-        collect_files(&dir, out);
+        collect_files_inner(&dir, out, seen, depth + 1);
         if out.len() >= MAX_FILES {
             return;
         }
@@ -470,13 +499,16 @@ fn rg_binary() -> String {
 /// No fallback (per user request): rg must be on PATH; a missing binary
 /// surfaces as a clear error instead of silently degrading to the walker.
 /// Output mirrors the walker's format: `rel:\n` headers, `>` marker on
-/// the match line, ±3 context lines, long lines truncated.
+/// the match line, ±`context` context lines (callers pass it; the sub-agent
+/// default is 1), long lines truncated.
 pub fn grep_scope(
     root: &Path,
     scope: &str,
     pattern: &str,
     include: &str,
     max_results: usize,
+    context: usize,
+    ignore_case: bool,
 ) -> Result<String, String> {
     // Enforcement lives here (not just in dispatch) so direct callers get the
     // same guard: unscoped multi-alternative patterns are refused.
@@ -511,16 +543,25 @@ pub fn grep_scope(
     };
 
     let cap = max_results.min(MAX_SEARCH_RESULTS);
+    // Context is a cost multiplier per hit: 3 was hardcoded, so every match
+    // cost 7 lines of output — the single biggest source of grep tokens.
+    // Callers now ask for what they need (the explore default is 1).
+    let ctx = context.min(5);
     let mut cmd = std::process::Command::new(rg_binary());
     cmd.current_dir(&search_dir)
         .arg("--json")
         .arg("--line-number")
         .arg("--max-count")
         .arg(cap.to_string())
-        .arg("--context")
-        .arg("3")
-        .arg("--ignore-case")
         .arg("--no-messages");
+    if ctx > 0 {
+        cmd.arg("--context").arg(ctx.to_string());
+    }
+    // Case-insensitive matching was forced ON, which inflates the match set
+    // (and the output) for searches whose casing is already known. Opt in.
+    if ignore_case {
+        cmd.arg("--ignore-case");
+    }
     if !include.is_empty() {
         cmd.arg("--glob").arg(include);
     }
@@ -538,6 +579,12 @@ pub fn grep_scope(
     let mut hits = 0usize;
     let mut current_file = String::new();
     let mut pending: Vec<(bool, u64, String)> = Vec::new(); // (is_match, line_no, text)
+    // Index in `pending` of the first match dropped because the cap was reached.
+    // Everything from there on belongs to that dropped match (its before/after
+    // context), so the block is cut at that index. `--max-count` is per FILE,
+    // so later files kept emitting context after the global cap was hit and the
+    // output ended with blocks that had NO match in them — pure waste.
+    let mut drop_from: Option<usize> = None;
     for line in String::from_utf8_lossy(&raw.stdout).lines() {
         let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
         let kind = ev["type"].as_str().unwrap_or_default();
@@ -556,6 +603,7 @@ pub fn grep_scope(
                 .unwrap_or(&abs)
                 .to_string_lossy()
                 .to_string();
+            drop_from = None;
         } else if kind == "match" || kind == "context" {
             let text = ev["data"]["lines"]["text"]
                 .as_str()
@@ -565,13 +613,23 @@ pub fn grep_scope(
             let line_no = ev["data"]["line_number"].as_u64().unwrap_or(0);
             if kind == "match" {
                 if hits >= cap {
+                    if drop_from.is_none() {
+                        drop_from = Some(pending.len());
+                    }
                     continue;
                 }
                 hits += 1;
             }
             pending.push((kind == "match", line_no, text));
         } else if kind == "end" {
-            if !pending.is_empty() && !current_file.is_empty() {
+            if let Some(cut) = drop_from {
+                pending.truncate(cut);
+            }
+            // A block is worth printing only while it still CONTAINS a match:
+            // context lines of a dropped match carry no information the model
+            // can act on and cost tokens on every later step of the turn.
+            let has_match = pending.iter().any(|(is_match, _, _)| *is_match);
+            if has_match && !current_file.is_empty() {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -854,6 +912,8 @@ pub fn edit_file(
 pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
@@ -867,52 +927,101 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
         .map_err(|e| format!("cannot spawn: {e}"))?;
 
     let deadline = Duration::from_secs(timeout_secs);
-    let mut output = Vec::new();
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let mut buf = [0u8; 8192];
-    loop {
-        if start.elapsed() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(format!(
-                "ERROR: command timed out after {timeout_secs}s\n{}",
-                String::from_utf8_lossy(&output)
-            ));
-        }
-        let mut read_any = false;
-        if let Some(s) = stdout.as_mut() {
-            match s.read(&mut buf) {
-                Ok(0) => {}
-                Ok(n) => {
-                    read_any = true;
-                    output.extend_from_slice(&buf[..n]);
-                    if output.len() > MAX_TERMINAL_OUTPUT * 2 {
-                        break;
+    let cap = MAX_TERMINAL_OUTPUT * 2;
+    let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let drained = Arc::new(AtomicUsize::new(0));
+    let mut readers = 0usize;
+
+    // Drain both pipes on their own threads. A blocking `read` on the child's
+    // stdout used to keep the timeout check below unreachable: a command that
+    // writes nothing (`sleep 100000`, a prompt waiting on stdin) never returned
+    // from `read`, so `timeout_secs` was dead code and the turn hung forever
+    // (blocking a tokio worker with it, since this runs inline in the agent
+    // loop). The single shared cap covers BOTH streams — the stderr side
+    // previously had no cap at all, so a noisy child grew this buffer without
+    // bound until the timeout.
+    if let Some(mut s) = child.stdout.take() {
+        let sink = output.clone();
+        let done = drained.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.len() >= cap {
+                            break;
+                        }
+                        guard.extend_from_slice(&buf[..n]);
                     }
                 }
-                Err(_) => {}
             }
-        }
-        if let Some(s) = stderr.as_mut() {
-            match s.read(&mut buf) {
-                Ok(0) => {}
-                Ok(n) => {
-                    read_any = true;
-                    output.extend_from_slice(&buf[..n]);
+            done.fetch_add(1, Ordering::Relaxed);
+        });
+        readers += 1;
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let sink = output.clone();
+        let done = drained.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.len() >= cap {
+                            break;
+                        }
+                        guard.extend_from_slice(&buf[..n]);
+                    }
                 }
-                Err(_) => {}
             }
+            done.fetch_add(1, Ordering::Relaxed);
+        });
+        readers += 1;
+    }
+
+    let mut overflowed = false;
+    let timed_out = loop {
+        if start.elapsed() > deadline {
+            break true;
         }
-        if !read_any {
-            // Both pipes closed (or absent) — the child is done producing.
-            if child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            // Still running (or the wait itself failed) — keep polling.
+            Ok(None) | Err(_) => {}
         }
+        // Once either stream filled the cap there is nothing left to gain by
+        // waiting: the child is killed below, which also closes the pipes.
+        let full = output.lock().map(|o| o.len() >= cap).unwrap_or(false);
+        if full {
+            overflowed = true;
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    if timed_out || overflowed {
+        // Kill on BOTH exits. The old code broke out of the read loop without
+        // killing, then blocked in `wait()` on a child that could never exit
+        // because nobody was draining its full pipe — a permanent hang plus an
+        // orphaned `sh`/`yes`.
+        let _ = child.kill();
     }
     let status = child.wait().map_err(|e| e.to_string())?;
+
+    // Let the readers flush the tail, but never wait on them indefinitely: a
+    // background grandchild (`sleep 100 &`) keeps the pipe open after `sh`
+    // died, so a blocking join would reintroduce the hang. Detached reader
+    // threads parked on such a pipe are bounded and harmless.
+    let flush_deadline = Instant::now() + Duration::from_millis(300);
+    while drained.load(Ordering::Relaxed) < readers && Instant::now() < flush_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut text = String::from_utf8_lossy(&output).to_string();
     if text.len() > MAX_TERMINAL_OUTPUT {
         let mut cut = text.len() - MAX_TERMINAL_OUTPUT;
@@ -922,6 +1031,21 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
             cut += 1;
         }
         text = format!("…[head truncated]\n{}", &text[cut..]);
+    }
+    if timed_out {
+        // In-band timeout (Ok), exactly like before the fix, so the model can
+        // react to it instead of seeing a tool error.
+        return Ok(format!(
+            "ERROR: command timed out after {timeout_secs}s\n{text}"
+        ));
+    }
+    if overflowed {
+        // The old code `break`ed out of the read loop without killing the child
+        // and then parked in `wait()` on a child whose full pipe nobody was
+        // draining — a permanent deadlock plus a leaked process.
+        return Ok(format!(
+            "ERROR: command output exceeded the {cap} byte limit and was killed\n{text}"
+        ));
     }
     if !status.success() {
         return Ok(format!("EXIT CODE: {}\n{text}", status.code().unwrap_or(-1)));
@@ -934,10 +1058,38 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
 // ---------------------------------------------------------------------------
 
 /// Execute one tool call by name with JSON args; returns the ToolMessage text.
-/// LSP-backed tools (lsp_*) and MCP stay proxied to the Python sidecar in
-/// phase 3-2; the agent loop routes unknown names there.
+/// LSP-backed tools (lsp_*) and MCP connector tools are routed by the agent
+/// loop before this dispatcher; unknown names reaching here are a real error.
 pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) -> Result<String, String> {
+    dispatch_with_data_root(root, name, args, permit, None)
+}
+
+/// Same as [`dispatch`], but the skill and connector tools resolve their store
+/// against `data_root` instead of the workspace root.
+///
+/// Both stores live in the DATA root (`~/.codifa/skills`, `~/.codifa/mcp`),
+/// never in the workspace. The system-prompt catalog is built from the data
+/// root, so resolving `load_skill` against the workspace listed an EMPTY store:
+/// every on-demand load answered `skill not found: X. Available: (none)` even
+/// though the catalog just above it advertised that very skill (found in a real
+/// trace). The same root mismatch made `create_mcp` write connectors into
+/// `<workspace>/mcp` where nothing reads them. `None` keeps the previous
+/// behaviour, which the tool tests rely on (they build the store inside their
+/// own temp root).
+pub fn dispatch_with_data_root(
+    root: &str,
+    name: &str,
+    args: &Value,
+    permit: Option<&Value>,
+    data_root: Option<&str>,
+) -> Result<String, String> {
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
+    // Where the skill/connector store lives for THIS call: the data root when
+    // the caller knows it, else the workspace root.
+    let store_base = match data_root {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => root,
+    };
     match name {
         "read" => {
             let path = {
@@ -1001,7 +1153,20 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 ));
             }
             let max = args["max_results"].as_u64().unwrap_or(50) as usize;
-            grep_scope(Path::new(root), &s("path"), &joined, &s("include"), max)
+            // Context lines per hit (default 1 — 3 was hardcoded and tripled the
+            // output) and case sensitivity (case-SENSITIVE by default; opt in to
+            // ignore_case). These two are grep's biggest token levers.
+            let context = args["context"].as_u64().unwrap_or(1).min(5) as usize;
+            let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
+            grep_scope(
+                Path::new(root),
+                &s("path"),
+                &joined,
+                &s("include"),
+                max,
+                context,
+                ignore_case,
+            )
         }
         "find_symbol" => find_symbol(Path::new(root), &s("symbol"), &s("path"), &s("include")),
         "glob" => {
@@ -1039,6 +1204,15 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                     return Err("edits must be a non-empty list".into());
                 }
                 let target = resolve_safe(root, &path, false, permit)?;
+                // Same size guard as the single-edit path below. Without it the
+                // batch form read (and then copied 1-2 more times via
+                // replace/replacen) an arbitrarily large file — a multi-GB
+                // allocation that froze the UI, while the single-edit form
+                // correctly refused with "file too large to edit safely".
+                let meta = fs::metadata(&target).map_err(|e| e.to_string())?;
+                if meta.len() as usize > MAX_READ_BYTES {
+                    return Err("file too large to edit safely".into());
+                }
                 let mut content =
                     fs::read_to_string(&target).map_err(|_| "binary file (edit skipped)".to_string())?;
                 for (idx, item) in edits.iter().enumerate() {
@@ -1150,8 +1324,6 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
             }
         }
-        // Load one stored skill's body on demand (the auto-matcher inlines the
-        // obvious picks; anything else costs one tool call instead of a
         // Create or update a skill from a command (the Codex/Claude
         // `create_skill` flow). `fa_keywords` is what makes the skill findable
         // from a Persian request: the catalog line carries them, so the model
@@ -1182,7 +1354,7 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             if let Some(extra) = args["extra_files"].as_object() {
                 body["extra_files"] = json!(extra);
             }
-            let res = crate::skills::sync_skill(Path::new(root), &body)?;
+            let res = crate::skills::sync_skill(Path::new(store_base), &body)?;
             Ok(format!(
                 "Skill saved: {}\nThe catalog in the system prompt now lists it, so it can be \
                  loaded on demand in later turns.",
@@ -1218,10 +1390,10 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             }
             let prev = s("previous_name");
             if !prev.is_empty() && prev != name {
-                let _ = crate::skills::delete_mcp(Path::new(root), &json!({"name": prev}));
+                let _ = crate::skills::delete_mcp(Path::new(store_base), &json!({"name": prev}));
             }
             let res = crate::skills::save_mcp(
-                Path::new(root),
+                Path::new(store_base),
                 &json!({"name": name, "cfg": Value::Object(cfg)}),
             )?;
             Ok(format!(
@@ -1229,6 +1401,8 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 res["name"].as_str().unwrap_or(&name)
             ))
         }
+        // Load one stored skill's body on demand (the auto-matcher inlines the
+        // obvious picks; anything else costs one tool call instead of a
         // prompt-sized body). `file` reads an extra file of that skill.
         "load_skill" => {
             let name = s("name");
@@ -1237,10 +1411,10 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
             }
             let file = s("file");
             if !file.trim().is_empty() {
-                let v = crate::skills::read_skill_file(std::path::Path::new(root), &name, &file)?;
+                let v = crate::skills::read_skill_file(Path::new(store_base), &name, &file)?;
                 return Ok(v["content"].as_str().unwrap_or_default().to_string());
             }
-            let all = crate::skills::list_skills(std::path::Path::new(root));
+            let all = crate::skills::list_skills(Path::new(store_base));
             let wanted = name.trim().to_lowercase();
             let hit = all["skills"].as_array().and_then(|list| {
                 list.iter().find(|sk| {
@@ -1281,7 +1455,7 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
                 }
             }
         }
-        _ => Err(format!("tool {name:?} is not available natively (proxied to the sidecar)")),
+        _ => Err(format!("tool {name:?} is not available")),
     }
 }
 
@@ -1354,8 +1528,17 @@ fn rg_rows(
     let out = cmd
         .output()
         .map_err(|e| format!("ripgrep (rg) is required but could not be run: {e}"))?;
-    if out.status.code() == Some(2) && out.stdout.is_empty() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    // Any exit code 2 from ripgrep means a real failure (bad regex, unreadable
+    // path). The main `grep_scope` tool already errors unconditionally on 2; this
+    // variant used to swallow it whenever stdout had partial rows, so a broken
+    // pattern silently looked like "no definition found".
+    if out.status.code() == Some(2) {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "ripgrep failed (exit code 2)".to_string()
+        } else {
+            err
+        });
     }
     let mut rows = Vec::new();
     for l in String::from_utf8_lossy(&out.stdout).lines() {
@@ -1801,15 +1984,47 @@ mod tests {
     }
 
     #[test]
+    fn grep_scope_drops_context_past_the_cap() {
+        // rg's --max-count is per FILE while the cap counts every match, so
+        // later files kept emitting context lines after the cap was already
+        // hit: the output ended with blocks that had no match marker at all.
+        let tmp = std::env::temp_dir().join("codifa-grep-cap-test");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("a.rs"),
+            "hit one\nalpha\nhit two\nbeta\nhit three\ngamma\n",
+        )
+        .unwrap();
+        fs::write(tmp.join("b.rs"), "hit four\ndelta\nhit five\nepsilon\n").unwrap();
+        let out = grep_scope(&tmp, "", "hit", "", 3, 1, false).unwrap();
+        for block in out.split("\n\n") {
+            let body: Vec<&str> = block.lines().skip(1).collect();
+            assert!(
+                body.is_empty() || body.iter().any(|l| l.starts_with('>')),
+                "a context-only block leaked past the cap:\n{out}"
+            );
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn grep_scope_finds_matches_with_context() {
-        let tmp = std::env::temp_dir().join("codifa-grep-test");
+        // pid-unique + recreated: the fixture lives in the shared OS temp root,
+        // which ripgrep's ignore/`--max-count` walker inspects — a leftover dir
+        // from an interrupted run or a concurrent `cargo test` process sharing
+        // the fixed name used to make this test flaky (rg reported no matches).
+        let tmp = std::env::temp_dir().join(format!("codifa-grep-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("sub")).unwrap();
         fs::write(tmp.join("sub/a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
-        let out = grep_scope(&tmp, "sub", "alpha", "", 10).unwrap();
+        let out = grep_scope(&tmp, "sub", "alpha", "", 10, 1, false).unwrap();
         assert!(out.contains("a.rs"));
         assert!(out.contains(">1: fn alpha"));
         assert!(out.contains("2: fn beta"));
-        assert_eq!(grep_scope(&tmp, "sub", "zzz_nothing", "", 10).unwrap(), "no matches");
+        assert_eq!(
+            grep_scope(&tmp, "sub", "zzz_nothing", "", 10, 1, false).unwrap(),
+            "no matches"
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1822,7 +2037,7 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("one.rs"), "fn alpha() {}\n").unwrap();
         let file_scope = tmp.join("one.rs").to_string_lossy().into_owned();
-        let out = grep_scope(&tmp, &file_scope, "alpha", "", 10).unwrap();
+        let out = grep_scope(&tmp, &file_scope, "alpha", "", 10, 1, false).unwrap();
         assert!(out.contains("alpha"), "file-scope grep failed: {out}");
         fs::remove_dir_all(&tmp).ok();
     }

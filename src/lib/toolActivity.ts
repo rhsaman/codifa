@@ -44,16 +44,35 @@ export function aggregateTurnStats(activities: ToolActivity[]): DiffStats {
  * timeline. Kept free of React/store state so they can be unit-tested in
  * isolation (see tests/toolNesting.test.ts).
  *
- * Sub-agent (explore/task) events carry a `branch` id and must nest under that
+ * Sub-agent (explore) events carry a `branch` id and must nest under that
  * branch's OWN card. A sub-event must resolve/attach based on `branch` (and its
- * per-call `call_id`) EVEN WHEN the parent task card is already `"done"` — see
+ * per-call `call_id`) EVEN WHEN the parent card is already `"done"` — see
  * `resolveToolResult` below.
  */
+
+/** Canonical tool name for one card. The explore sub-agent used to be recorded
+ *  under the name `task` (and `subagent`); both are folded into `explore` so
+ *  every `tool ===` comparison, the label/icon maps and the backend history
+ *  payload see ONE name. Applied at the two ingest points: `makeToolActivity`
+ *  (live stream) and the store's load migration (pre-rename transcripts). */
+export function normalizeToolName(tool?: string): string {
+  const t = tool ?? "tool";
+  return t === "task" || t === "subagent" ? "explore" : t;
+}
+
+/** Recursively normalize a card and its nested children (one-time, on load). */
+export function normalizeToolActivity(acts: ToolActivity[]): ToolActivity[] {
+  return acts.map((a) => {
+    const out: ToolActivity = a.tool === "explore" ? a : { ...a, tool: normalizeToolName(a.tool) };
+    if (Array.isArray(out.children)) out.children = normalizeToolActivity(out.children);
+    return out;
+  });
+}
 
 /** Build a fresh "running" tool card from a `tool` event. */
 export function makeToolActivity(event: SidecarEvent): ToolActivity {
   return {
-    tool: event.tool ?? "tool",
+    tool: normalizeToolName(event.tool),
     args: event.args,
     // Some backends put the change on the tool event itself (the tool callback
     // can arrive before the dedicated `diff` event), so carry it over here
@@ -74,6 +93,13 @@ export function makeToolActivity(event: SidecarEvent): ToolActivity {
     sub: event.sub,
     branch: typeof event.branch === "number" ? event.branch : undefined,
     model: event.model || undefined,
+    // The backend ships the structured web rows (`results`) on the tool_result
+    // event. Carrying them over at creation time means a card that is created
+    // from a finished event (replayed transcript, or a provider that emits the
+    // rows on the start event) never loses its render payload.
+    results: asResultRows(event.results as unknown as SearchResultItem[]),
+    engine: event.engine,
+    resultText: typeof event.result === "string" ? event.result : undefined,
   };
 }
 
@@ -92,6 +118,12 @@ function mergeReEmit(existing: ToolActivity, incoming: ToolActivity): ToolActivi
     diff: incoming.diff ?? existing.diff,
     diffStats: incoming.diffStats ?? existing.diffStats,
     checkpoint: incoming.checkpoint ?? existing.checkpoint,
+    // A re-emitted start event must not wipe the rows a previous result event
+    // already produced — the model still needs the links on screen.
+    items: incoming.items ?? existing.items,
+    results: incoming.results ?? existing.results,
+    resultText: incoming.resultText ?? existing.resultText,
+    engine: incoming.engine ?? existing.engine,
     // The stream-part re-emit of a sub-agent card carries NO branch id (only
     // the backend's Branch-wrapped ToolStart does). Dropping the stored branch
     // here orphaned every later sub-event: they matched no card, got promoted
@@ -133,21 +165,18 @@ export function applyToolEvent(
   if (event.sub) {
     const branch = typeof event.branch === "number" ? event.branch : undefined;
     let matched = false;
-    // Legacy events without a branch id belong to the most recent task card
-    // only — nesting them into EVERY task card duplicated the same sub-tool
-    // across parallel explores.
+    // Legacy events without a branch id belong to the most recent sub-agent
+    // card only — nesting them into EVERY such card duplicated the same
+    // sub-tool across parallel explores.
     let lastTaskIdx = -1;
     if (branch === undefined) {
       for (let i = 0; i < activities.length; i++) {
-        if (activities[i].tool === "task" || activities[i].tool === "explore") lastTaskIdx = i;
+        if (activities[i].tool === "explore") lastTaskIdx = i;
       }
     }
     const next = activities.map((a, idx) => {
-      if (a.tool === "task" || a.tool === "explore") {
-        // Parallel fan-out: nest each branch's sub-events under ITS OWN task
-        // card. Legacy single-branch events (no branch id) nest into the task
-        // card. Match regardless of status so a done parent still receives its
-        // late children.
+      if (a.tool === "explore") {
+        // Parallel fan-out: nest each branch's sub-events under ITS OWN card.
         if (branch !== undefined) {
           if (a.branch !== branch) return a;
         } else if (idx !== lastTaskIdx) {
@@ -206,7 +235,7 @@ export function applyToolEvent(
  * branch card itself: resolving a sub-result there would flip a still-running
  * branch card to `"done"` on its FIRST sub-search (the "parallel explores
  * freeze / only one comes" bug). Sub-results only ever attach to nested
- * children, matched by `branch` (now without requiring `act.tool === "task"`,
+ * children, matched by `branch` (now without requiring a sub-agent tool name,
  * so grep/glob/read children resolve too).
  */
 export function resolveToolResult(
@@ -248,7 +277,9 @@ export function resolveToolResult(
       (typeof event.id === "string" &&
         event.id !== "" &&
         act.callId === event.id) ||
-      (gotId && (sub || act.status === "running") && act.callId === event.call_id);
+      (gotId &&
+        (sub || act.status === "running" || WEB_TOOLS.has(act.tool)) &&
+        act.callId === event.call_id);
     // Sub-results attach regardless of status; top-level results keep requiring
     // a still-running target (existing behaviour).
     const target = idMatch;
@@ -263,7 +294,7 @@ export function resolveToolResult(
       !gotBranch &&
       typeof event.id !== "string" &&
       act.tool === event.tool &&
-      (sub || act.status === "running");
+      (sub || act.status === "running" || WEB_TOOLS.has(act.tool));
 
     if (target || branchMatch || fallback) {
       return {
@@ -282,10 +313,24 @@ export function resolveToolResult(
           // path — event.results must not override them with unresolvable
           // names ("No file exists at this path" on click). Python-sidecar
           // events have no result string and fall through to event.results.
+          // EXCEPTION: for the web tools the backend already sends the REAL
+          // rows (search hits / the fetched page) in `event.results`, and the
+          // result text is a DISTILLED answer with no links in it — so the
+          // JSON payload wins and the filename scan is skipped entirely.
+          // An older backend sent a single OBJECT for `fetch_url`; wrap it so a
+          // stale/replayed transcript can never hand the renderer a non-array.
+          (WEB_TOOLS.has(act.tool) ? asResultRows(event.results) : undefined) ??
           (typeof event.result === "string"
             ? (filesFromNativeResult(act.tool, event.result, act.args ?? event.args) as
                 unknown as SearchResultItem[] | undefined)
-            : undefined) ?? event.results,
+            : undefined) ??
+          asResultRows(event.results) ??
+          // A repeated/late result event (a retry, or `resolveStuckActivities`
+          // resolving the card a second time) carries no rows of its own — the
+          // already-rendered links must survive instead of being replaced by
+          // `undefined`, which made the results vanish from the card.
+          act.items ??
+          act.results,
         model: event.model || act.model,
         elapsedMs: now - (act.startedAt ?? now),
         // Text-output tools (LSP lookups, memory search) return prose with no
@@ -310,10 +355,10 @@ export function resolveToolResult(
 }
 
 /** Tools whose native result is plain prose with no file paths (LSP lookups,
- *  memory search, explore/task reports). `filesFromNativeResult` returns null
+ *  memory search, explore reports). `filesFromNativeResult` returns null
  *  for them, so their text is kept verbatim in `ToolActivity.resultText` and
  *  rendered as-is — without this the whole result was dropped and the card
- *  showed no output at all. For explore/task this text is also the ONLY record
+ *  showed no output at all. For explore this text is also the ONLY record
  *  of the findings: the backend's history recap reads `resultText` to tell the
  *  next turn what was already researched (see history_recap in agent.rs), so
  *  dropping it made the main agent re-delegate the same question. */
@@ -327,8 +372,30 @@ export const TEXT_RESULT_TOOLS = new Set([
   "search_memory",
   "save_memory",
   "explore",
-  "task",
 ]);
+
+/** Tools whose result rows come from the BACKEND as structured JSON
+ *  (`event.results`) rather than from a filename scan of the result text. A
+ *  `web_search` answer is DISTILLED prose with no links in it, so the scan
+ *  would find nothing and the card would lose its result list. */
+export const WEB_TOOLS = new Set(["web_search", "fetch_url"]);
+
+/** Normalise a web tool's structured rows to an ARRAY.
+ *
+ *  `web_search` sends an array of hits; an earlier `fetch_url` sent a single
+ *  object for the one fetched page, which made the shared `WebResultLinks`
+ *  renderer (a `.map` over the rows) show nothing and left a latent
+ *  `items.map is not a function` for any future unguarded consumer. Old
+ *  transcripts are replayed through here too, so the renderer can rely on the
+ *  array shape unconditionally. */
+function asResultRows(
+  results: SearchResultItem[] | Record<string, unknown> | undefined,
+): SearchResultItem[] | undefined {
+  if (!results) return undefined;
+  if (Array.isArray(results)) return results;
+  if (typeof results === "object") return [results as unknown as SearchResultItem];
+  return undefined;
+}
 
 /** Extract file rows from a native (Rust) tool's plain-text result so the UI
  *  renders clickable file chips (icon + basename) instead of a raw text dump.
@@ -359,7 +426,6 @@ export function filesFromNativeResult(
   if (
     tool === "run_terminal" ||
     tool === "explore" ||
-    tool === "task" ||
     tool === "search_memory" ||
     tool === "save_memory"
   )

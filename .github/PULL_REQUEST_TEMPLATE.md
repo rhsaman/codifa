@@ -9,6 +9,6 @@
 ## Checklist
 
 - [ ] `npm run typecheck` passes
-- [ ] `npm run test:backend` passes
 - [ ] `npm run test:frontend` passes
+- [ ] `cd src-tauri && cargo test` passes
 - [ ] README updated if user-facing behavior changed (both English and Persian sections)

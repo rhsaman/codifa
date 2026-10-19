@@ -5090,18 +5090,12 @@ body.coder-dragging .chat-split-child {
 }
 
 /* Keep every icon vertically centered: drop the 2px lift used in the
-   two-row layout and the extra gap between the plus button and ring. */
+   two-row layout. */
 .composer-input-row.compact .icon-btn.plus-btn {
   margin-bottom: 0;
   align-self: center;
 }
 
-.composer-input-row.compact .ctx-ring-wrap {
-  margin-inline-start: 0;
-  align-self: center;
-}
-
-.composer-input-row.compact .ctx-ring-btn,
 .composer-input-row.compact .composer-right-actions .icon-btn {
   align-self: center;
 }
@@ -5360,6 +5354,14 @@ body.coder-dragging .chat-split-child {
   align-items: center;
   gap: 3px;
   font-family: var(--font-mono);
+}
+
+/* Context meter hanging off the end of the footer cluster. The ring keeps its
+   own 28px box (it is taller than the 22px pills beside it) and the footer's
+   align-items:center keeps the row visually level instead of growing. */
+.composer-footer .ctx-ring-wrap {
+  margin-inline-start: 0;
+  align-self: center;
 }
 
 .composer-left {
@@ -5878,7 +5880,10 @@ body.coder-dragging .chat-split-child {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 220px;
+  /* Wide enough that a FULL "provider/model" id renders untruncated in the
+     Settings → Tools rows (the picker sits at the row end; the flex row
+     absorbs the width). */
+  max-width: 340px;
   height: 22px;
   padding: 0 8px;
   border: 1px solid var(--hairline, rgba(255, 255, 255, 0.06));
@@ -5903,6 +5908,43 @@ body.coder-dragging .chat-split-child {
 .pm-select-label {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- composer-footer variant: small, but still identifiable ----
+   The footer has to fit the mode pill, the thinking level, a provider + model
+   pair and the context ring inside 760px, so the picker is capped and a long
+   id truncates. The provider name is dimmed and pinned (it answers "which
+   provider"), the model id absorbs the truncation, and the FULL
+   "provider/model" string always stays available in the button tooltip. */
+.composer-footer .pm-select-btn {
+  max-width: 220px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 10.5px;
+}
+
+.composer-footer .pm-select-label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.pm-select-provider {
+  flex: 0 0 auto;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.pm-select-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pm-menu {
@@ -5917,6 +5959,36 @@ body.coder-dragging .chat-split-child {
   transform-origin: bottom right;
   min-width: 280px;
   overflow: hidden;
+  /* The component measures the real clip window (viewport ∩ scroll/clip
+     ancestors) at open time and feeds the result here, so in a short window
+     the menu SCROLLS INTERNALLY instead of spilling past a clipped ancestor. */
+  max-height: var(--pm-max-h, 320px); /* was: 320 fixed; --pm-max-h clamped */
+}
+
+/* Ctrl'd pickers (Settings → Tools) sit near the TOP of .settings-content,
+   whose scroll origin clips anything rendered ABOVE the button — so where the
+   open-measure found room underneath, the menu opens DOWNWARD from under the
+   button (the component adds `.pm-below`). */
+.pm-menu.pm-below {
+  top: calc(100% + 6px);
+  bottom: auto;
+  transform-origin: top right;
+}
+
+/* Portalled variant: the menu is mounted under <body> and positioned with
+   viewport coordinates (inline style), so the Settings modal's scrollers
+   (`overflow: auto/hidden` on .settings-content / .settings-body /
+   .settings-modal) can no longer clip it or let the tabs column paint over it.
+   Above the tab buttons (which sit inside .modal-overlay z-index 100) but
+   still below the modal's own overlay. */
+.pm-menu.pm-fixed {
+  z-index: 120;
+}
+
+/* A below-anchored portalled menu pins its TOP edge, an above-anchored one its
+   BOTTOM edge; both edge values come from the inline anchor measurement. */
+.pm-menu.pm-fixed.pm-below {
+  top: auto;
 }
 
 .pm-menu .pm-search {
@@ -5927,8 +5999,13 @@ body.coder-dragging .chat-split-child {
 
 .pm-scroll {
   overflow-y: auto;
-  max-height: 272px;
+  /* The menu box itself is capped by --pm-max-h (popup max-height); scroll
+     steals the remainder from whatever the cap leaves after the search input. */
+  max-height: calc(var(--pm-max-h, 320px) - 56px);
   min-height: 0;
+  /* The portalled menu is viewport-fixed; without an explicit width the
+     `min-width` below is all it gets and long model rows cannot use the box. */
+  width: 100%;
 }
 
 .pm-recents {
@@ -6396,6 +6473,151 @@ body.coder-dragging .chat-split-child {
   min-width: 260px;
 }
 
+/* ---- per-tool reasoning-effort progress bar (Settings → Tools) ---- */
+/* Codex-style: a horizontal, slider-like track that fills up to the chosen
+   effort level. Discrete pips mark each level; click/drag the track to pick
+   one. Replaces the popup menu the rows used to open. */
+.thinking-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 8px;
+}
+
+.thinking-bar-track {
+  position: relative;
+  flex: 1;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  outline: none;
+  /* Generous vertical hit area without a visible box. */
+  padding: 4px 0;
+}
+
+.thinking-bar-track::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.thinking-bar-track:focus-visible::before {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.thinking-bar-fill {
+  position: absolute;
+  left: 0;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  pointer-events: none;
+  transition: width 0.12s ease;
+}
+
+.thinking-bar-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: left 0.12s ease;
+}
+
+.thinking-bar-pips {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.thinking-bar-pip {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.5;
+  transform: translate(-50%, -50%);
+}
+
+.thinking-bar-pip.filled {
+  opacity: 0;
+}
+
+.thinking-bar-label {
+  flex: 0 0 auto;
+  min-width: 52px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+
+.thinking-bar[data-level='default'] .thinking-bar-label {
+  color: var(--text-dim);
+}
+
+/* Keep the effort slider and the model picker on ONE row inside a tool-slot:
+   header + hint stay full-width rows, the bar takes the remaining space and
+   the picker sits fixed at the end of the same line. */
+.field.tool-slot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  /* Keep this row from gluing to the intro hint / previous row above it. */
+  margin-top: 12px;
+}
+
+.field.tool-slot .tool-slot-head,
+.field.tool-slot .hint {
+  width: 100%;
+}
+
+.field.tool-slot .thinking-bar {
+  flex: 1;
+  /* 132px fits the 6-step track + label even in a narrow modal, so the bar
+     and the picker stay on ONE row at any settings-modal width. */
+  min-width: 132px;
+  margin: 0;
+}
+
+.field.tool-slot .pm-select {
+  flex: 0 0 auto;
+}
+
+/* Tool-row titles are section headings inside the Tools tab, not field
+   captions: bigger and brighter than the plain `.field label` (12px/dim) so
+   each tool is scannable at a glance. The "model" suffix was dropped from the
+   title text itself — the picker below obviously selects a model. */
+.field.tool-slot .tool-slot-head label {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+/* Note under a slider whose effective model does not advertise reasoning. */
+.field.tool-slot .thinking-bar-note {
+  width: 100%;
+  margin-top: 0;
+  opacity: 0.6;
+}
+
 /* ---- tool activity ---- */
 .tool-activity {
   display: flex;
@@ -6737,7 +6959,7 @@ body.coder-dragging .chat-split-child {
 .code-block .hljs-code,
 .code-block .hljs-comment,
 .code-block .hljs-formula {
-  color: #8b949e;
+  color: var(--text-dim);
 }
 
 .code-block .hljs-name,
@@ -9427,9 +9649,11 @@ body.coder-dragging .chat-split-child {
 .ctx-ring-wrap {
   position: relative;
   display: inline-flex;
-  /* Sits right after the "+" button now (the old `auto` pushed it right). */
-  margin-inline-start: 6px;
+  /* Lives in the composer footer next to the mode pill and the model picker,
+     so it only needs a hair of gap and never stretches. */
+  margin-inline-start: 2px;
   margin-inline-end: 0;
+  flex: 0 0 auto;
 }
 
 .ctx-ring-btn {
@@ -12380,7 +12604,6 @@ body.coder-dragging .chat-split-child {
 .trace-row.edit-file .trace-expand-diff :global(.diff-add),
 .trace-row.edit-file .trace-expand-diff-add {
   color: #4ade80;
-  background: color-mix(in srgb, #4ade80 8%, transparent);
   border-radius: 3px;
   padding: 0 3px;
 }
@@ -12388,7 +12611,6 @@ body.coder-dragging .chat-split-child {
 .trace-row.edit-file .trace-expand-diff :global(.diff-del),
 .trace-row.edit-file .trace-expand-diff-del {
   color: #f87171;
-  background: color-mix(in srgb, #f87171 8%, transparent);
   text-decoration: line-through;
   border-radius: 3px;
   padding: 0 3px;
@@ -12590,14 +12812,27 @@ body.coder-dragging .chat-split-child {
   min-width: 0;
 }
 
+/* No red/green band behind the code: the tinted row made the source hard to
+   read. The cue is the 3px bare + the −/+ sign on the gutter (rules below). */
 .diff-line-del {
-  background: rgba(248, 81, 73, 0.12);
+  background: transparent;
   color: var(--text);
 }
 
 .diff-line-add {
-  background: rgba(46, 160, 67, 0.15);
+  background: transparent;
   color: var(--text);
+}
+
+/* Side-by-side cells get the same −/+ marker as the unified rows. */
+.diff-line-del .diff-u-gutter {
+  color: #f85149;
+  border-left-color: #f85149;
+}
+
+.diff-line-add .diff-u-gutter {
+  color: #3fb950;
+  border-left-color: #3fb950;
 }
 
 /* ——— Diff stats badge (header) ——— */
@@ -12847,6 +13082,21 @@ body.coder-dragging .chat-split-child {
   margin-top: 4px;
 }
 
+/* CODEX-style inline web results: the hits of a `web_search` / `fetch_url` row
+   stay visible right under the row, without expanding it and without the side
+   panel detour — the payload of a search IS those links. Aligned to the head's
+   12px gutter (.trace-row-head / .trace-row-expand) so the list reads as part
+   of the row instead of floating. */
+.trace-row-inline-results {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 12px 6px;
+}
+
+.trace-row-inline-results .web-results {
+  margin: 0;
+}
+
 .web-result {
   overflow: hidden;
 }
@@ -13053,7 +13303,7 @@ body.coder-dragging .chat-split-child {
 }
 
 .diff-view .diff-add {
-  background: color-mix(in srgb, var(--bg-raised) 86%, var(--success) 14%);
+  background: transparent;
   color: var(--success);
   padding: 0 10px;
   white-space: pre;
@@ -13061,7 +13311,7 @@ body.coder-dragging .chat-split-child {
 }
 
 .diff-view .diff-del {
-  background: color-mix(in srgb, var(--bg-raised) 86%, var(--danger) 14%);
+  background: transparent;
   color: var(--danger);
   padding: 0 10px;
   white-space: pre;
@@ -17497,8 +17747,12 @@ body.coder-dragging .chat-split-child {
   white-space: pre;
 }
 
-.diff-u-row.diff-u-add { background: rgba(46, 160, 67, 0.15); }
-.diff-u-row.diff-u-del { background: rgba(248, 81, 73, 0.12); }
+/* Full-row tint removed for readability: add/del rows keep the theme
+   background and are marked only by the gutter bar + −/+ sign below. */
+.diff-u-row.diff-u-add,
+.diff-u-row.diff-u-del {
+  background: transparent;
+}
 
 /* گاتر علامت +/− با نوار رنگی کناری */
 .diff-u-gutter {
@@ -17542,7 +17796,18 @@ body.coder-dragging .chat-split-child {
 .toml-eq { color: var(--text-dim); }
 .toml-string { color: #a5d6a7; }
 .toml-value { color: #79c0ff; }
-.toml-comment { color: #8b949e; font-style: italic; }
+.toml-comment { color: var(--text-dim); font-style: italic; }
+
+/* Comments inside a diff line: dimmed so annotation never reads as code.
+   Applied per line by DiffLineText (src/components/ToolCallView.tsx), which
+   splits code from comment using the language's marker. `opacity` is a second
+   dim on top of --text-dim because a few themes have a dim colour that is only
+   a hair darker than the body text. */
+.diff-comment {
+  color: var(--text-dim);
+  font-style: italic;
+  opacity: 0.85;
+}
 
 /* ---- نوار تغییرات بالای کامپوزر (سبک کدکس) ---- */
 .composer-diff-bar {
@@ -21451,6 +21716,77 @@ mark.trace-hit-active {
   text-align: center;
 }
 
+/* Install notice: shown in the stage while no automation browser exists yet.
+   Centred, narrow measure, copy then action then progress. */
+.browser-install {
+  max-width: 380px;
+  margin: auto;
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.browser-install-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #e0def4);
+}
+
+.browser-install-body {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim, #b0abc8);
+}
+
+.browser-install-btn {
+  padding: 7px 16px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  border-radius: 8px;
+  background: var(--bg-panel, rgba(255, 255, 255, 0.04));
+  color: var(--text, #e0def4);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.browser-install-btn:hover:not(:disabled) {
+  border-color: var(--accent, #ebbcba);
+}
+
+.browser-install-btn:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.browser-install-bar {
+  width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--hairline, rgba(255, 255, 255, 0.09));
+}
+
+.browser-install-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent, #ebbcba);
+  transition: width 0.3s ease;
+}
+
+.browser-install-error {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--danger, #e5484d);
+  word-break: break-word;
+}
+
 /* ── File-type icons & clickable file chips ────────────────────────────────
    Every file name in the UI (chat inline code, code-block heads, tool rows,
    viewer tabs, diff list) renders a small tinted squircle tile
@@ -23228,18 +23564,19 @@ tr[data-search-current] .fv-mark,
 }
 
 /* Status badge: the same glyphs as every other tool row (spinner → check), so
-   the chat card and the side panel never disagree about a run's state. */
+   the chat card and the side panel never disagree about a run's state.
+   No ring and no disc: the tick reads as a bare glyph. The old 1px inset ring
+   plus the tinted fill drew a box around the check that competed with the card
+   for attention, so state is carried by the glyph itself (spinner / ✓ / ✗ / ⏹)
+   and by its colour. */
 .explore-card-status {
   flex: 0 0 auto;
   width: 18px;
   height: 18px;
-  border-radius: 50%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 .explore-card-status .spinner {
@@ -23278,20 +23615,9 @@ tr[data-search-current] .fv-mark,
   }
 }
 
-.explore-card-status.done {
-  background: color-mix(in srgb, var(--success) 14%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 30%, transparent);
-}
-
-.explore-card-status.error {
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent);
-}
-
-.explore-card-status.denied {
-  background: color-mix(in srgb, var(--thinking) 14%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--thinking) 30%, transparent);
-}
+/* No per-state disc any more: the glyph already differs per state (✓ / ✗ / ⏹)
+   and is tinted by `.status-ok` / `.status-err` / `.status-denied` below, so the
+   background ring was pure decoration around a mark that was already distinct. */
 
 /* Run title: takes the free width on ONE line with a real ellipsis. */
 .trace-head-desc {

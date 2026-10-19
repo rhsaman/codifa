@@ -85,6 +85,22 @@ pub fn terminal_create(app: AppHandle, cwd: &str) -> Result<TerminalSessionInfo,
     let mut cmd = CommandBuilder::new(&file);
     cmd.args(&args);
     cmd.cwd(&cwd);
+    // The shell must be told what emulator sits on the other end. A GUI-launched
+    // app inherits (at best) a near-empty environment — a Finder-launched macOS
+    // bundle has no TERM at all — and portable-pty passes the parent env
+    // straight through. Without TERM, zsh's terminfo has no cursor-movement
+    // capabilities, so zle's incremental redraw paints each keystroke OVER the
+    // previous render instead of overwriting it: typing "ls" showed as "llls"
+    // until a space forced a full-line redraw. TERM also decides how colours
+    // are encoded: `fg=8` (the zsh-autosuggestions highlight slot) degrades to
+    // an incomplete SGR that xterm ignores, so the inline suggestion inherited
+    // whatever colour preceded it and rendered green.
+    //
+    // Forced rather than defaulted: the emulator here is always xterm.js, no
+    // matter which terminal the GUI happened to be launched from, so an
+    // inherited value ("dumb", or another terminal's id) would be wrong.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -104,6 +120,29 @@ pub fn terminal_create(app: AppHandle, cwd: &str) -> Result<TerminalSessionInfo,
             .unwrap_or_else(|| file.clone()),
         cwd: cwd.to_string_lossy().into_owned(),
     };
+
+    // Register the session BEFORE the reader thread exists. The reader removes
+    // the session when the child exits, so spawning it first let a fast-dying
+    // child remove nothing and then have this insert add an ALREADY-DEAD
+    // session — a phantom tab in `terminal_list` reporting exit code 0.
+    app.state::<TerminalState>()
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id.clone(),
+            TerminalSession {
+                writer,
+                child,
+                info: info.clone(),
+            },
+        );
+    // Keep the master handle for later resize calls.
+    app.state::<TerminalMasters>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), pair.master);
 
     // Reader thread: pty output -> terminal:data events. The buffer is a
     // growing UTF-8 accumulator: a multi-byte char split across two reads must
@@ -153,7 +192,7 @@ pub fn terminal_create(app: AppHandle, cwd: &str) -> Result<TerminalSessionInfo,
             .state::<TerminalState>()
             .sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&reader_id)
             .and_then(|mut s| s.child.wait().ok())
             .map(|st| st.exit_code())
@@ -163,24 +202,6 @@ pub fn terminal_create(app: AppHandle, cwd: &str) -> Result<TerminalSessionInfo,
         let _ = reader_app.emit("terminal:exit", (reader_id, code));
     });
 
-    app.state::<TerminalState>()
-        .sessions
-        .lock()
-        .unwrap()
-        .insert(
-            id.clone(),
-            TerminalSession {
-                writer,
-                child,
-                info: info.clone(),
-            },
-        );
-    // Keep the master handle for later resize calls.
-    app.state::<TerminalMasters>()
-        .0
-        .lock()
-        .unwrap()
-        .insert(id, pair.master);
     Ok(info)
 }
 
@@ -189,7 +210,7 @@ pub fn terminal_list(app: AppHandle) -> Vec<TerminalSessionInfo> {
     app.state::<TerminalState>()
         .sessions
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
         .map(|s| s.info.clone())
         .collect()
@@ -198,7 +219,7 @@ pub fn terminal_list(app: AppHandle) -> Vec<TerminalSessionInfo> {
 #[tauri::command]
 pub fn terminal_write(app: AppHandle, id: &str, data: &str) -> bool {
     let sessions = app.state::<TerminalState>();
-    let mut sessions = sessions.sessions.lock().unwrap();
+    let mut sessions = sessions.sessions.lock().unwrap_or_else(|e| e.into_inner());
     match sessions.get_mut(id) {
         Some(s) => s.writer.write_all(data.as_bytes()).is_ok(),
         None => false,
@@ -208,7 +229,7 @@ pub fn terminal_write(app: AppHandle, id: &str, data: &str) -> bool {
 #[tauri::command]
 pub fn terminal_resize(app: AppHandle, id: &str, cols: u16, rows: u16) -> bool {
     let state = app.state::<TerminalState>();
-    let sessions = state.sessions.lock().unwrap();
+    let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
     // The master handle is not stored per session (portable-pty master is not
     // Sync-shareable); resize is applied through the stored master registry.
     if !sessions.contains_key(id) {
@@ -216,7 +237,7 @@ pub fn terminal_resize(app: AppHandle, id: &str, cols: u16, rows: u16) -> bool {
     }
     drop(sessions);
     if let Some(masters) = app.try_state::<TerminalMasters>() {
-        let masters = masters.0.lock().unwrap();
+        let masters = masters.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(master) = masters.get(id) {
             let c = cols.clamp(2, 500);
             let r = rows.clamp(2, 200);
@@ -236,13 +257,19 @@ pub fn terminal_resize(app: AppHandle, id: &str, cols: u16, rows: u16) -> bool {
 #[tauri::command]
 pub fn terminal_kill(app: AppHandle, id: &str) -> bool {
     let state = app.state::<TerminalState>();
-    let mut sessions = state.sessions.lock().unwrap();
-    if sessions.remove(id).is_none() {
+    let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut session) = sessions.remove(id) else {
         return false;
-    }
+    };
+    // Kill explicitly: removing the entry used to drop the `Child` handle while
+    // the shell kept running, and the reader thread could no longer reap it
+    // (its `remove` returned `None`), leaving a defunct process until the app
+    // exited.
+    let _ = session.child.kill();
+    drop(session);
     drop(sessions);
     if let Some(masters) = app.try_state::<TerminalMasters>() {
-        if let Some(master) = masters.0.lock().unwrap().remove(id) {
+        if let Some(master) = masters.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id) {
             let _ = master.take_writer(); // drop the writer to signal EOF
         }
     }
@@ -262,8 +289,11 @@ impl TerminalMasters {
 /// are left behind.
 pub fn kill_all_terminal_sessions(app: &AppHandle) {
     let state = app.state::<TerminalState>();
-    let mut sessions = state.sessions.lock().unwrap();
+    let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
     for (_, mut s) in sessions.drain() {
         let _ = s.child.kill();
+        // Reap it too: killing without waiting leaves the shell defunct while
+        // the app is still shutting down.
+        let _ = s.child.wait();
     }
 }

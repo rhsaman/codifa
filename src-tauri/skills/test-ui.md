@@ -1,13 +1,13 @@
 ---
 name: Test UI
-description: Live-test codifa's own renderer UI in a browser — mounts the real ChatPanel with a stubbed backend, seeds store scenarios, simulates events and takes screenshots via the playwright browser tools.
+description: Live-test codifa's own renderer UI in a browser — mounts the real ChatPanel with a stubbed backend, seeds store scenarios, simulates events and takes screenshots via the browser tools.
 fa_keywords: تست رابط کاربری, تست UI, live test UI
 ---
 
 # Test UI (live renderer harness)
 
 Drive codifa's real UI in a plain browser and verify behavior visually and via
-the DOM — without the desktop shell or the Python sidecar. Use this whenever
+the DOM — without the desktop shell. Use this whenever
 the task is to verify or debug a frontend change (composer behavior, message
 bubbles, panels, CSS/layout) on the actual rendered component tree.
 
@@ -15,9 +15,10 @@ bubbles, panels, CSS/layout) on the actual rendered component tree.
 
 - `npm run dev:web` starts vite in web-only mode (`--mode webonly`): the
   renderer is served on http://localhost:5173 (or the next free port — read the
-  printed URL) WITHOUT building/launching the Electron app.
-- `tests/ui/harness.html` stubs `window.coder` (the Electron preload bridge)
-  before any module loads, so the real React app boots in the browser. Every
+  printed URL) WITHOUT building/launching the Tauri app.
+- `tests/ui/harness.html` stubs `window.coder` (the Tauri bridge,
+  `src/lib/tauriBridge.ts`) before any module loads, so the real React app
+  boots in the browser. Every
   unknown coder method resolves to `null`; backend-dependent flows (real
   streaming, file reads) are out of scope.
 - `tests/ui/harness.tsx` mounts the real `ChatPanel` and seeds the zustand

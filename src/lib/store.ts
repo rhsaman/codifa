@@ -43,6 +43,9 @@ import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry, normalizeUsageModel } from './usage'
+import { modelReasoning } from './context'
+import { supportsReasoning } from './thinking'
+import { normalizeToolActivity } from './toolActivity'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
 import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
 
@@ -117,11 +120,29 @@ export function lspStatusFromEvent(ev: {
 // Chats with zero messages are dropped entirely: a fresh "new chat" tab only
 // becomes real (sidebar row + file on disk) once the first message is sent.
 export function sanitizeChats(chats: Chat[]): Chat[] {
-  return chats.filter((c) => (c.messages?.length ?? 0) > 0).map((c) => {
+  const out: Chat[] = []
+  for (const c of chats) {
+    const hasBody = Array.isArray(c.messages) && c.messages.length > 0
+    // INDEX ROW (the transcript lives in its own file and is not in memory):
+    // persist the metadata verbatim, with `messages` REMOVED. This is the
+    // structural safety net for the split-storage layout — an unhydrated chat
+    // NEVER produces a body write, so a stray mutation on a chat whose body was
+    // never loaded cannot overwrite the real transcript file with a fragment.
+    if (c.hydrated === false) {
+      const { messages: _omitted, hydrated: _h, ...meta } = c as Chat & {
+        messages?: ChatMessage[]
+        hydrated?: boolean
+      }
+      out.push(meta as Chat)
+      continue
+    }
+    // A chat with no messages at all is in-memory only (a fresh tab): never a
+    // sidebar row, never a file on disk.
+    if (!hasBody) continue
     const clean = { ...c }
     delete clean.pendingAsk
     delete clean.pendingPermission
-    return {
+    out.push({
       ...clean,
       messages: capCompactedMessages(c.messages.map((m) => {
         const msg = { ...m } as Record<string, unknown>
@@ -147,8 +168,9 @@ export function sanitizeChats(chats: Chat[]): Chat[] {
         }
         return msg as unknown as ChatMessage
       })),
-    }
-  })
+    })
+  }
+  return out
 }
 
 // ── Mid-stream persistence (heartbeat) ────────────────────────────────────────
@@ -630,8 +652,15 @@ function persistPanelsSoon(): void {
 // the main process. The backend upserts chat files, so a subset write is safe;
 // the next full persist rewrites everything.
 function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
-  const streaming = s.chats.filter((c) => c.messages.some((m) => m.streaming))
-  const subset = streaming.length > 0 ? streaming : s.chats.filter((c) => c.id === s.activeChatId)
+  // Only chats whose body is in memory can be written: an index-only row is
+  // not a snapshot of the transcript and must never be sent as one.
+  const streaming = s.chats.filter(
+    (c) => c.hydrated !== false && c.messages.some((m) => m.streaming),
+  )
+  const subset =
+    streaming.length > 0
+      ? streaming
+      : s.chats.filter((c) => c.id === s.activeChatId && c.hydrated !== false)
   if (subset.length === 0) return
   void api.storeSet('chats', sanitizeChats(subset))
 }
@@ -644,8 +673,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -730,7 +759,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -746,7 +775,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -774,6 +803,37 @@ function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][
     historyStacks.set(chatId, st)
   }
   return st
+}
+
+/** Abort a chat's in-flight turn, tolerating a missing/already-aborted
+ *  controller (Stop, watchdog and stream end all race here). */
+function abortChatStream(abort: AbortController | null | undefined): void {
+  try {
+    if (abort && !abort.signal.aborted) abort.abort()
+  } catch {
+    /* already aborted */
+  }
+}
+
+/**
+ * Chat-deletion hooks. Other stores (viewerTabs) register here so a deleted
+ * chat's side resources are released WITHOUT store.ts importing them — that
+ * would be a circular import (viewerTabs already imports this module).
+ */
+const chatDeleteHooks: Array<(chatId: string) => void> = []
+export function registerChatDeleteHook(fn: (chatId: string) => void): void {
+  chatDeleteHooks.push(fn)
+}
+function runChatDeleteHooks(chatIds: string[]): void {
+  for (const id of chatIds) {
+    for (const fn of chatDeleteHooks) {
+      try {
+        fn(id)
+      } catch {
+        /* a hook must never break the delete itself */
+      }
+    }
+  }
 }
 
 export const PROVIDER_NAMES: Record<ProviderKind, string> = Object.fromEntries(
@@ -959,6 +1019,12 @@ interface State {
    *  prompt asks for it. When ON, per-action runtime permission prompting
    *  still applies until "Always allow". */
   computerUse: boolean
+  /** Persisted "page browsing enabled" hard switch (composer → MCP tools →
+   *  Browser). Like an MCP connector: when OFF the agent's `browser_*` tools
+   *  are never bound and no Chromium is ever launched, even if the prompt asks
+   *  the agent to browse. The Browser panel keeps working either way — this
+   *  gates the agent's tools, not the user's own browsing. */
+  browserUse: boolean
   /** Global "Ctrl+X prefix armed" hint. The prefix is app-wide (managed in
    *  App.tsx), so this lives at the store root, not per-chat. */
   prefixNotice: string | null
@@ -993,6 +1059,10 @@ interface State {
   setSystemPrompt: (mode: AgentMode, text: string) => void
   /** Auto-compaction threshold as a percentage of the raw context window. */
   setCompactAtPercent: (percent: number) => void
+  /** Suppress OS/browser keyboard suggestions (autocomplete, autocorrect,
+   *  inline predictions, spell-check) in every text field — applied at the DOM
+   *  level by `src/lib/inputSuppress.ts`. Default: true (suggestions OFF). */
+  setDisableTextSuggestions: (on: boolean) => void
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
@@ -1019,7 +1089,9 @@ interface State {
   fontSize: number
   setFontSize: (n: number) => void
   /** Directory for the per-workspace RAG vector store; "" = default. */
-  /** How many top web_search results are auto-fetched for real page content (0 = off, snippet-only). */
+  /** ONE number for `web_search`: how many results it returns AND how many of
+   *  them get their real page content fetched before the distiller reads them
+   *  (Settings → Web Providers). 0 = no page fetch, snippet-only results. */
   webSearchAutoFetch: number
   setWebSearchAutoFetch: (n: number) => void
   /** User-level data root (skills/plans/mcp). */
@@ -1049,6 +1121,10 @@ interface State {
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
+  /** Per-tool reasoning-effort override, keyed by the same slot names as
+   *  `subagentModels`. Empty/missing = inherit the main model's level. */
+  subagentThinking: Record<string, ThinkingLevel>
+  setSubagentThinking: (agent: string, level: ThinkingLevel) => void
   /** Tool result cache TTL (minutes). */
   cacheTtlMinutes: number
   setMemoryTtlConfig: (c: { cache?: number }) => void
@@ -1165,6 +1241,7 @@ interface State {
   setChatLiveError: (id: string, error: string | null) => void
   setChatTtsError: (id: string, error: string | null) => void
   setChatSkillNotice: (id: string, notice: string | null) => void
+  setChatUndoNotice: (id: string, notice: string | null) => void
   /** Revision counter per ABSOLUTE file path, bumped whenever the agent
    *  writes that file (write_document tool_result / write_file+edit_file
    *  diff events). The file viewer subscribes to its own path's counter and
@@ -1250,6 +1327,7 @@ interface State {
    *  permission dialog). Idempotent; session-scoped like outsideAllowed. */
   addOutsideFolder: (folder: string) => void
   setComputerUse: (v: boolean) => void
+  setBrowserUse: (v: boolean) => void
   /** Whether any chat currently has a streaming assistant message (persist gate
    *  and multi-chat "busy" indication). */
   anyStreaming: () => boolean
@@ -1312,6 +1390,144 @@ export function selectLoadedChats(
   return { chats: fresh, kept: false, emptyMiss: false }
 }
 
+// ---------------------------------------------------------------------------
+// Lazy chat bodies
+//
+// settings.json carries chat INDEX rows only (title/dates/root/dir/
+// messageCount). A transcript lives in its own file and is fetched with
+// `chatGet` the moment the user opens the chat; bodies of chats the user has
+// since closed are dropped again, so a session with hundreds of chats never
+// holds more than a handful of transcripts in memory.
+// ---------------------------------------------------------------------------
+
+/** How many hydrated chat bodies stay resident (most-recently-open first). */
+const HYDRATED_CHAT_CAP = 10
+
+/** In-flight body fetches, keyed by chat id (single-flight). */
+const hydratePromises = new Map<string, Promise<void>>()
+
+/**
+ * Apply one loaded body onto the matching chat.
+ *
+ * The body file owns the transcript, but the transient per-chat flags
+ * (pendingAsk/pendingPermission/draft/scrollPos) exist ONLY in memory and must
+ * not be clobbered by a stale copy from disk.
+ */
+function applyChatBody(body: Chat): void {
+  const src = body as Chat & { messages?: ChatMessage[] }
+  useStore.setState((s) => {
+    let changed = false
+    const chats = s.chats.map((c) => {
+      if (c.id !== body.id) return c
+      changed = true
+      const messages = Array.isArray(src.messages) ? src.messages : []
+      return {
+        ...body,
+        mode: src.mode ? normalizeMode(src.mode) : c.mode,
+        messages,
+        messageCount: messages.length,
+        hydrated: true,
+        pendingAsk: c.pendingAsk ?? null,
+        pendingPermission: c.pendingPermission ?? null,
+        draft: c.draft,
+        scrollPos: c.scrollPos ?? body.scrollPos ?? null,
+        updatedAt: Math.max(c.updatedAt ?? 0, body.updatedAt ?? 0),
+      }
+    })
+    return changed ? { chats } : {}
+  })
+}
+
+/**
+ * Drop the bodies of hydrated chats that are neither open nor visible, newest
+ * first, until at most `HYDRATED_CHAT_CAP` bodies remain.
+ */
+function evictChatBodies(): void {
+  const s = useStore.getState()
+  // A body carrying an unwritten edit must never be dropped. Persisting is
+  // debounced (PERSIST_DEBOUNCE_MS) and the flush reads the store at flush
+  // time, so zeroing `messages` here would publish an index row for a chat
+  // whose latest edit was never written — the edit would vanish from disk.
+  // Let the pending flush land first; eviction happens on the next hydrate.
+  if (persistTimer) return
+  const keep = new Set<string>([s.activeChatId, ...s.openChatIds, ...s.visibleChatIds])
+  const candidates = s.chats.filter((c) => c.hydrated === true && !keep.has(c.id))
+  if (candidates.length <= HYDRATED_CHAT_CAP) return
+  const drop = new Set(
+    candidates
+      .slice()
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      .slice(HYDRATED_CHAT_CAP)
+      .map((c) => c.id),
+  )
+  useStore.setState((st) => ({
+    chats: st.chats.map((c) =>
+      drop.has(c.id)
+        ? ({
+            ...c,
+            messages: [],
+            messageCount: c.messageCount ?? 0,
+            hydrated: false,
+          } as Chat)
+        : c,
+    ),
+  }))
+}
+
+/** True when `id`'s transcript is in memory and safe to mutate/persist.
+ *
+ * A brand-new chat returns true (it simply has no body yet); only an index row
+ * whose body has not been fetched reports false. */
+export function isChatBodyReady(id: string): boolean {
+  const c = useStore.getState().chats.find((x) => x.id === id)
+  return !!c && c.hydrated !== false
+}
+
+/**
+ * Make sure `id`'s message body is in memory (single-flight).
+ *
+ * Resolves immediately when the chat is already hydrated (or does not exist).
+ * Callers that need `messages` — sending a turn, undo/redo, branching — must
+ * await this first: an unhydrated chat has an EMPTY `messages` array, and
+ * building a request from it would silently drop the whole conversation.
+ */
+export function ensureChatHydrated(id: string): Promise<void> {
+  const chat = useStore.getState().chats.find((c) => c.id === id)
+  if (!chat) return Promise.resolve()
+  if (chat.hydrated !== false) {
+    evictChatBodies()
+    return Promise.resolve()
+  }
+  const inflight = hydratePromises.get(id)
+  if (inflight) return inflight
+  const p = (async () => {
+    try {
+      const body = await api.chatGet<Chat>(id)
+      if (body && typeof body === 'object' && !Array.isArray(body)) {
+        applyChatBody(body)
+      } else {
+        // No body and no index row (a brand-new chat, or the file was removed
+        // outside the app): mark it hydrated-and-empty so the panel renders an
+        // empty composer instead of spinning. This state is never persisted
+        // (sanitizeChats drops message-less chats).
+        useStore.setState((s) => ({
+          chats: s.chats.map((c) =>
+            c.id === id ? { ...c, messages: [], hydrated: true, messageCount: 0 } : c,
+          ),
+        }))
+      }
+    } catch {
+      /* Leave it unhydrated: the panel keeps showing the loader and a send
+         reports the failure instead of sending a context-free turn. */
+    } finally {
+      hydratePromises.delete(id)
+      evictChatBodies()
+    }
+  })()
+  hydratePromises.set(id, p)
+  return p
+}
+
 function makeChat(mode: AgentMode = 'ask'): Chat {
   const now = Date.now()
   const s = useStore.getState()
@@ -1337,7 +1553,11 @@ function makeChat(mode: AgentMode = 'ask'): Chat {
     id,
     title: 'New chat',
     mode,
-    thinkingLevel: 'medium',
+    // A new chat starts at the strongest reasoning level. Users who want a
+    // cheaper/faster turn can drop it with the composer pill, and the choice is
+    // remembered per chat — so the default only decides where a fresh chat
+    // starts, never overrides an explicit pick.
+    thinkingLevel: 'xhigh',
     providerId,
     model,
     messages: [],
@@ -1367,13 +1587,13 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'openrouter', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80 },
+  settings: { providers: defaultProviders(), activeProviderId: 'openrouter', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80, disableTextSuggestions: true },
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
   dir: 'rtl',
   fontSize: 14,
-  webSearchAutoFetch: 3,
+  webSearchAutoFetch: 5,
   sttProviderId: '',
   sttModel: 'whisper-1',
   sttFallbacks: [],
@@ -1383,6 +1603,7 @@ export const useStore = create<State>((set, get) => ({
   ttsFallbacks: [],
   recentModels: [],
   subagentModels: {},
+  subagentThinking: {},
   cacheTtlMinutes: 60,
   historyLimit: 0,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
@@ -1431,6 +1652,7 @@ export const useStore = create<State>((set, get) => ({
   outsideAllowed: false,
   outsideFolders: [],
   computerUse: false,
+  browserUse: false,
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
@@ -1495,6 +1717,7 @@ export const useStore = create<State>((set, get) => ({
       delete clean.compactError
       delete clean.cmdError
       delete clean.skillNotice
+      delete clean.undoNotice
       delete clean.stalled
       // Migrate legacy keyed usage → explicit (providerId, model) entries once,
       // on load. New usage is written directly as entries, so the live path
@@ -1505,6 +1728,24 @@ export const useStore = create<State>((set, get) => ({
         providerIds,
       )
       const next = migrated ? { ...clean, usage: migrated } : clean
+      // One-time tool-name migration: transcripts saved before the rename
+      // recorded the explore sub-agent as `task` (or `subagent`). Fold them into
+      // `explore` on load so every `tool ===` comparison, label/icon map and the
+      // backend history payload sees ONE name — the same one-shot pattern as the
+      // `subagentModels` migration below. Without this, old chats would render
+      // generic cards and their reports would be dropped from the history recap.
+      if (Array.isArray(next.messages) && next.messages.length > 0) {
+        let touched = false
+        const messages = next.messages.map((m) => {
+          const acts = m.toolActivity
+          if (!Array.isArray(acts) || acts.length === 0) return m
+          const ren = acts.some((a) => a && (a.tool === 'task' || a.tool === 'subagent'))
+          if (!ren) return m
+          touched = true
+          return { ...m, toolActivity: normalizeToolActivity(acts) }
+        })
+        if (touched) next.messages = messages
+      }
       // Codex-style: a reload never auto-continues a goal loop. Nothing is
       // running after a restart, so park every loaded goal in `stopped` — the
       // user resumes explicitly with the goal bar play button. Prevents the
@@ -1512,7 +1753,16 @@ export const useStore = create<State>((set, get) => ({
       if (next.goal?.active && !next.goal.paused) {
         next.goal = { ...next.goal, stopped: true }
       }
-      return next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
+      // Index rows carry no `messages` at all: they stay UNHYDRATED and their
+      // transcript is fetched when the user opens the chat. A body may still be
+      // present here from a pre-migration settings.json — then `hydrated` is
+      // true and nothing needs fetching.
+      const withMode = next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
+      return {
+        ...withMode,
+        messages: Array.isArray(withMode.messages) ? withMode.messages : [],
+        hydrated: Array.isArray(next.messages),
+      }
     }) as Chat[]
     const prevActiveId = get().activeChatId
     const memOpen = get().openChatIds
@@ -1643,6 +1893,10 @@ export const useStore = create<State>((set, get) => ({
         raw.compactAtPercent <= 99
           ? Math.round(raw.compactAtPercent)
           : 80,
+      // Nested settings keys are NOT carried over from disk automatically —
+      // only the ones listed in this literal survive a restart.
+      disableTextSuggestions:
+        typeof raw.disableTextSuggestions === 'boolean' ? raw.disableTextSuggestions : true,
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
@@ -1686,7 +1940,29 @@ export const useStore = create<State>((set, get) => ({
     // also holds agent-created connectors not in the persisted settings).
     const root = typeof raw.root === 'string' ? raw.root : ''
     const dbMcp = await listMcp()
-    const mergedMcp = { ...(loadedSettings.mcpServers ?? {}), ...(dbMcp.mcpServers ?? {}) }
+    const mergedMcp: Record<string, McpServerConfig> = {
+      ...(loadedSettings.mcpServers ?? {}),
+      ...(dbMcp.mcpServers ?? {}),
+    }
+    // Retire the old Playwright connector. The native `browser_*` driver
+    // replaced it, so an install that still carries it would keep a connector
+    // that spawns `npx` and contributes nothing — and whose OFF toggle looks
+    // like it controls browsing while the agent's own browser tools are a
+    // separate switch. Only the shipped default is dropped; a connector the
+    // user edited (a pinned version, their own endpoint) is left alone, the
+    // same rule the Rust-side `retire_builtin_mcp` applies to the folder file.
+    const retired = mergedMcp.playwright as
+      | { command?: unknown; args?: unknown }
+      | undefined
+    if (
+      retired?.command === 'npx' &&
+      Array.isArray(retired.args) &&
+      retired.args.length === 2 &&
+      retired.args[0] === '-y' &&
+      retired.args[1] === '@playwright/mcp@latest'
+    ) {
+      delete mergedMcp.playwright
+    }
     loadedSettings.mcpServers = mergedMcp
     const builtins = (dbMcp.builtins ?? []).filter((n) => mergedMcp[n])
 
@@ -1754,16 +2030,20 @@ export const useStore = create<State>((set, get) => ({
       ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
       subagentModels: (() => {
         if (typeof raw.subagentModels !== 'object' || raw.subagentModels === null) return {};
-        const m = { ...(raw.subagentModels as Record<string, string>) };
-        // One-time migration: the pre-rename "subagent" slot moves to "explore"
-        // (the key the native loop and the renamed Settings slot resolve). The
-        // legacy value is the user's latest explicit choice, so it wins over a
-        // stale "explore" entry left by an older build.
-        const legacy = (m.subagent ?? '').trim();
-        if (legacy) {
-          m.explore = legacy;
-          delete m.subagent;
+        return { ...(raw.subagentModels as Record<string, string>) };
+      })(),
+      subagentThinking: (() => {
+        // Absent (fresh install / never saved) → seed the first-boot defaults:
+        // the explore researcher gets a LIGHT effort, every other tool slot
+        // stays OFF. A saved object (even {}) means the user has explicit
+        // choices — never overwrite them.
+        if (raw.subagentThinking === undefined || raw.subagentThinking === null) {
+          return { explore: 'low' } as Record<string, ThinkingLevel>;
         }
+        if (typeof raw.subagentThinking !== 'object') return {};
+        const m = { ...(raw.subagentThinking as Record<string, ThinkingLevel>) };
+        // Legacy 'max' folds onto the single "Max" option ('xhigh').
+        for (const k of Object.keys(m)) m[k] === 'max' && (m[k] = 'xhigh');
         return m;
       })(),
       // Coerce numbers defensively: settings.json may round-trip numbers
@@ -1773,10 +2053,13 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
-      // 0 is a valid, deliberate value (auto-fetch disabled) — keep it.
-      webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 3, 0, 10),
+      // 0 is a valid, deliberate value (page fetch disabled) — keep it.
+      webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 5, 0, 10),
       // Hard desktop-control switch: absent/false in old settings files = OFF.
       computerUse: (raw as { computerUse?: unknown }).computerUse === true,
+      // Hard browsing switch: absent/false in old settings files = OFF, which is
+      // also what stops the agent from opening a browser window on its own.
+      browserUse: (raw as { browserUse?: unknown }).browserUse === true,
       // Rows for removed engines (e.g. Google Custom Search, sunset by Google)
       // are dropped here so they disappear from Settings → Plugins on reload.
       searchPlugins: searchPlugins.length > 0
@@ -1805,10 +2088,26 @@ export const useStore = create<State>((set, get) => ({
       deletedChatIds: [
         ...new Set([
           ...get().deletedChatIds,
-          ...loadedChats.filter((c) => (c.messages?.length ?? 0) === 0).map((c) => c.id),
+          // Self-clean stale empty chats left on disk by older builds (a fresh
+          // tab used to persist immediately). Only chats whose BODY is really
+          // in memory and empty qualify — an index-only row must never be
+          // queued for deletion, or the migration's own rows would wipe the
+          // sidebar on the first load.
+          ...loadedChats
+            .filter((c) => c.hydrated === true && (c.messages?.length ?? 0) === 0)
+            .map((c) => c.id),
         ]),
       ],
     })
+    // Pull in the bodies of the chats that are on screen right now (the active
+    // tab, every open tab and every visible window). Everything else stays an
+    // index row until the user opens it.
+    {
+      const wanted = new Set<string>(
+        [activeId, ...openChatIds, ...visibleChatIds].filter(Boolean) as string[],
+      )
+      for (const id of wanted) void ensureChatHydrated(id)
+    }
   },
 
   persist: () => {
@@ -2240,7 +2539,7 @@ export const useStore = create<State>((set, get) => ({
     // setters above, we can't fall back with `|| default` since that would
     // silently turn 0 back into the default.
     const r = Math.round(n)
-    set({ webSearchAutoFetch: Number.isFinite(r) ? Math.max(0, Math.min(10, r)) : 3 })
+    set({ webSearchAutoFetch: Number.isFinite(r) ? Math.max(0, Math.min(10, r)) : 5 })
     get().persist()
   },
 
@@ -2250,6 +2549,17 @@ export const useStore = create<State>((set, get) => ({
       if (model) subagentModels[agent] = model
       else delete subagentModels[agent]
       return { subagentModels }
+    })
+    get().persist()
+  },
+  setSubagentThinking: (agent, level) => {
+    set((s) => {
+      const subagentThinking = { ...s.subagentThinking }
+      // Empty level = inherit the main model's level, so drop the key
+      // entirely instead of storing an empty string.
+      if (level) subagentThinking[agent] = level
+      else delete subagentThinking[agent]
+      return { subagentThinking }
     })
     get().persist()
   },
@@ -2465,6 +2775,14 @@ export const useStore = create<State>((set, get) => ({
   },
 
   deleteChat: (id) => {
+    // Abort any in-flight turn FIRST: the panel that would have cleared it is
+    // being removed, so the backend kept streaming (tokens + tool work) with no
+    // UI left to show or stop it.
+    abortChatStream(get().chatAborts[id])
+    // Release the per-chat undo stacks: they hold complete `ChatMessage` copies
+    // and were never freed, so every deleted chat stayed in memory for the rest
+    // of the session.
+    historyStacks.delete(id)
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const openChatIds = s.openChatIds.filter((cid) => cid !== id)
@@ -2485,6 +2803,8 @@ export const useStore = create<State>((set, get) => ({
       const mirrors = persistTreeMirrors(chatTree, s.chatLayout)
       const visibleChatIds = mirrors.visibleChatIds.length > 0 ? mirrors.visibleChatIds : fallbackVisible
       const chatWindowSizes = mirrors.chatWindowSizes
+      const chatAborts = { ...s.chatAborts }
+      delete chatAborts[id]
       return {
         chats,
         activeChatId,
@@ -2492,15 +2812,26 @@ export const useStore = create<State>((set, get) => ({
         visibleChatIds,
         chatWindowSizes,
         chatTree,
+        chatAborts,
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
       }
     })
     get().persist()
+    // Let side stores (viewer tabs) drop the deleted chat's resources too.
+    runChatDeleteHooks([id])
   },
 
   deleteWorkspace: (key) => {
+    // Same lifecycle cleanup as deleteChat, for every chat of the workspace.
+    const doomed = get()
+      .chats.filter((c) => workspaceKey(c.root ?? '') === key)
+      .map((c) => c.id)
+    for (const id of doomed) {
+      abortChatStream(get().chatAborts[id])
+      historyStacks.delete(id)
+    }
     set((s) => {
       const chats = s.chats.filter((c) => workspaceKey(c.root ?? '') !== key)
       const workspaces = s.workspaces.filter((w) => w.key !== key)
@@ -2526,6 +2857,8 @@ export const useStore = create<State>((set, get) => ({
       const chatTreeWs = normalizedWs ?? (fallbackWs.length > 0 ? buildFromList(fallbackWs, treeDirFromLayout(s.chatLayout)) : null)
       const mirrorsWs = persistTreeMirrors(chatTreeWs, s.chatLayout)
       const visibleChatIds = mirrorsWs.visibleChatIds.length > 0 ? mirrorsWs.visibleChatIds : fallbackWs
+      const chatAborts = { ...s.chatAborts }
+      for (const id of doomed) delete chatAborts[id]
       return {
         chats,
         workspaces,
@@ -2537,6 +2870,7 @@ export const useStore = create<State>((set, get) => ({
         chatTree: chatTreeWs,
         chatWindowSizes: mirrorsWs.chatWindowSizes,
         chatLayout: mirrorsWs.chatLayout,
+        chatAborts,
         unreadChats: s.unreadChats.filter((cid) => !doomedIds.has(cid)),
         deletedChatIds: [
           ...s.deletedChatIds,
@@ -2549,6 +2883,8 @@ export const useStore = create<State>((set, get) => ({
       }
     })
     get().persist()
+    // Release the deleted chats' viewer tabs / stacks in side stores.
+    runChatDeleteHooks(doomed)
   },
 
   setWorkspaceColor: (key, color) => {
@@ -3130,6 +3466,9 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setChatMode: (id, mode) => {
+    // Never append a mode-switch notice to a transcript that is not in memory:
+    // the note would land on an empty array and vanish on the next hydration.
+    if (!isChatBodyReady(id)) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== id) return c
@@ -3151,6 +3490,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   setChatModeQuiet: (id, mode) => {
+    if (!isChatBodyReady(id)) return
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, mode, updatedAt: Date.now() } : c)),
     }))
@@ -3341,6 +3681,13 @@ export const useStore = create<State>((set, get) => ({
   },
 
   addMessage: (chatId, message) => {
+    // The transcript must be in memory first. Appending to an unhydrated chat
+    // would build the message on an empty array — and the hydration landing
+    // right after would replace it, silently dropping what the user just sent.
+    // Callers with a queue fallback (file comments) already catch this.
+    if (!isChatBodyReady(chatId)) {
+      throw new Error('chat body not hydrated')
+    }
     const id = uid()
     const full: ChatMessage = { ...message, id, createdAt: Date.now() }
     // Title-generator trigger: first user message of a fresh chat still
@@ -3402,9 +3749,15 @@ export const useStore = create<State>((set, get) => ({
           const res = await requestChatTitle({
             provider,
             subagentModels: st.subagentModels ?? {},
+            subagentThinking: st.subagentThinking ?? {},
             providers: Object.fromEntries(
               (st.settings.providers ?? []).map((p) => [p.id, p]),
             ),
+            // Mirror the main call's gate: a model that is not known to reason
+            // must not have a reasoning parameter forced onto it.
+            modelReasoning:
+              modelReasoning(provider, provider.model) ??
+              supportsReasoning(provider.model, provider.kind),
             text: message.content.slice(0, 1000),
             chatId,
           })
@@ -3473,6 +3826,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   removeMessage: (chatId, id) => {
+    if (!isChatBodyReady(chatId)) return
     set((s) => ({
       chats: s.chats.map((c) =>
         c.id === chatId
@@ -3716,6 +4070,12 @@ export const useStore = create<State>((set, get) => ({
     }))
   },
 
+  setChatUndoNotice: (id, undoNotice) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, undoNotice } : c)),
+    }))
+  },
+
   docRev: {},
 
   bumpDocRev: (absPath) => {
@@ -3784,6 +4144,14 @@ export const useStore = create<State>((set, get) => ({
   },
 
   clearChat: (id) => {
+    // Clearing is only meaningful once the transcript is in memory; on an index
+    // row there is nothing to clear and the on-disk body must stay untouched.
+    if (!isChatBodyReady(id)) return
+    // A cleared chat has no history left to undo back into: keeping the stacks
+    // would let /redo restore messages into an emptied chat. The stream is
+    // aborted too, otherwise the live reply repopulates the "cleared" chat.
+    abortChatStream(get().chatAborts[id])
+    historyStacks.delete(id)
     set((s) => ({
       chats: s.chats.map((c) =>
         c.id === id ? { ...c, messages: [], usage: undefined, updatedAt: Date.now() } : c,
@@ -3815,6 +4183,9 @@ export const useStore = create<State>((set, get) => ({
   },
 
   compactChat: (id, summary, keep = 0) => {
+    // Folding an unloaded transcript would compact an empty message list and
+    // write that emptiness back over the real body file.
+    if (!isChatBodyReady(id)) return
     set((s) => ({
       chats: s.chats.map((c) => {
         if (c.id !== id) return c
@@ -3911,6 +4282,17 @@ export const useStore = create<State>((set, get) => ({
     const s = get()
     const chat = s.chats.find((c) => c.id === s.activeChatId)
     if (!chat || chat.messages.length === 0) return false
+    // Never rewrite history while this chat is mid-turn: the live reply would
+    // keep appending to the truncated list and resurrect the removed exchange.
+    // The caller (the /undo command) aborts the stream first; this is the
+    // authoritative guard for any other entry point.
+    if (chat.messages.some((m) => m.streaming)) {
+      abortChatStream(s.chatAborts[chat.id])
+      return false
+    }
+    // Find the last user message, but skip transient system-style replies that
+    // belong to no exchange (e.g. a command's own ack) so a second /undo does
+    // not swallow them instead of a real exchange.
     let idx = -1
     for (let i = chat.messages.length - 1; i >= 0; i--) {
       if (chat.messages[i].role === 'user') {
@@ -3921,8 +4303,11 @@ export const useStore = create<State>((set, get) => ({
     if (idx === -1) return false
     const removed = chat.messages.slice(idx)
     const st = stackFor(chat.id)
-    st.undo.push(removed)
-    st.redo = []
+    // Move the exchange onto the redo stack rather than a separate undo list:
+    // redo must be able to replay exactly what this undo removed. Any earlier
+    // redo entries were taken from a different history state, so they are
+    // dropped (only the newest removed exchange is replayable).
+    st.redo.push(removed)
     set((stt) => ({
       chats: stt.chats.map((c) =>
         c.id === chat.id ? { ...c, messages: c.messages.slice(0, idx), updatedAt: Date.now() } : c,
@@ -3936,10 +4321,12 @@ export const useStore = create<State>((set, get) => ({
     const s = get()
     const chat = s.chats.find((c) => c.id === s.activeChatId)
     if (!chat) return false
+    if (chat.messages.some((m) => m.streaming)) return false
     const st = stackFor(chat.id)
-    const exchange = st.undo.pop()
+    // Redo replays only what a preceding undo removed; the undo stack is not
+    // consulted, so an exchange invalidated by a later user turn stays gone.
+    const exchange = st.redo.pop()
     if (!exchange) return false
-    st.redo.push(exchange)
     set((stt) => ({
       chats: stt.chats.map((c) =>
         c.id === chat.id ? { ...c, messages: [...c.messages, ...exchange], updatedAt: Date.now() } : c,
@@ -3969,10 +4356,17 @@ export const useStore = create<State>((set, get) => ({
 
   setComputerUse: (v) => set({ computerUse: v }),
 
+  setBrowserUse: (v) => set({ browserUse: v }),
+
   anyStreaming: () => get().chats.some((c) => c.messages.some((m) => m.streaming)),
 
   setCompactAtPercent: (percent: number) => {
     set((s) => ({ settings: { ...s.settings, compactAtPercent: percent } }))
+    get().persist()
+  },
+
+  setDisableTextSuggestions: (on: boolean) => {
+    set((s) => ({ settings: { ...s.settings, disableTextSuggestions: on } }))
     get().persist()
   },
 }))

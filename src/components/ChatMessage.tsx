@@ -10,7 +10,161 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import hljs from "highlight.js";
+// highlight.js CORE + only the languages a code fence realistically carries.
+//
+// The default `highlight.js` entry registers ~190 grammars, and this file is in
+// the main chunk (App → ChatWindows → Chat → ChatMessage), so every one of those
+// grammars was parsed at launch and kept in the renderer heap — for chats that
+// mostly show JS/TS/Python/JSON. `lib/core` ships none; each grammar is loaded
+// explicitly below.
+import hljs from "highlight.js/lib/core";
+import bash from "highlight.js/lib/languages/bash";
+import c from "highlight.js/lib/languages/c";
+import cpp from "highlight.js/lib/languages/cpp";
+import csharp from "highlight.js/lib/languages/csharp";
+import css from "highlight.js/lib/languages/css";
+import diff from "highlight.js/lib/languages/diff";
+import dockerfile from "highlight.js/lib/languages/dockerfile";
+import go from "highlight.js/lib/languages/go";
+import graphql from "highlight.js/lib/languages/graphql";
+import ini from "highlight.js/lib/languages/ini";
+import java from "highlight.js/lib/languages/java";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import kotlin from "highlight.js/lib/languages/kotlin";
+import less from "highlight.js/lib/languages/less";
+import lua from "highlight.js/lib/languages/lua";
+import makefile from "highlight.js/lib/languages/makefile";
+import markdown from "highlight.js/lib/languages/markdown";
+import nginx from "highlight.js/lib/languages/nginx";
+import objectivec from "highlight.js/lib/languages/objectivec";
+import perl from "highlight.js/lib/languages/perl";
+import php from "highlight.js/lib/languages/php";
+import plaintext from "highlight.js/lib/languages/plaintext";
+import python from "highlight.js/lib/languages/python";
+import ruby from "highlight.js/lib/languages/ruby";
+import rust from "highlight.js/lib/languages/rust";
+import scss from "highlight.js/lib/languages/scss";
+import shell from "highlight.js/lib/languages/shell";
+import sql from "highlight.js/lib/languages/sql";
+import swift from "highlight.js/lib/languages/swift";
+import typescript from "highlight.js/lib/languages/typescript";
+import xml from "highlight.js/lib/languages/xml";
+import yaml from "highlight.js/lib/languages/yaml";
+
+/** Languages the app highlights — the fence languages that actually appear in
+ *  agent output plus the file extensions the viewer opens. */
+const HLJS_LANGUAGES: Array<[string, unknown]> = [
+  ["bash", bash],
+  ["c", c],
+  ["cpp", cpp],
+  ["csharp", csharp],
+  ["css", css],
+  ["diff", diff],
+  ["dockerfile", dockerfile],
+  ["go", go],
+  ["graphql", graphql],
+  ["ini", ini],
+  ["java", java],
+  ["javascript", javascript],
+  ["json", json],
+  ["kotlin", kotlin],
+  ["less", less],
+  ["lua", lua],
+  ["makefile", makefile],
+  ["markdown", markdown],
+  ["nginx", nginx],
+  ["objectivec", objectivec],
+  ["perl", perl],
+  ["php", php],
+  ["plaintext", plaintext],
+  ["python", python],
+  ["ruby", ruby],
+  ["rust", rust],
+  ["scss", scss],
+  ["shell", shell],
+  ["sql", sql],
+  ["swift", swift],
+  ["typescript", typescript],
+  ["xml", xml],
+  ["yaml", yaml],
+];
+
+/** Aliases the model (and file extensions) actually emit, mapped onto the
+ *  grammars registered above. Without these, `bash`/`sh`/`zsh` etc. would fall
+ *  through to auto-detection and lose their highlighting. */
+const HLJS_ALIASES: Record<string, string> = {
+  sh: "bash",
+  zsh: "bash",
+  ksh: "bash",
+  console: "bash",
+  shellscript: "shell",
+  py: "python",
+  python3: "python",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  node: "javascript",
+  ts: "typescript",
+  tsx: "typescript",
+  rs: "rust",
+  golang: "go",
+  yml: "yaml",
+  jsonc: "json",
+  json5: "json",
+  html: "xml",
+  htm: "xml",
+  svg: "xml",
+  vue: "xml",
+  "c++": "cpp",
+  cc: "cpp",
+  hpp: "cpp",
+  hxx: "cpp",
+  h: "c",
+  cs: "csharp",
+  "c#": "csharp",
+  rb: "ruby",
+  objc: "objectivec",
+  "objective-c": "objectivec",
+  md: "markdown",
+  patch: "diff",
+  docker: "dockerfile",
+  make: "makefile",
+  postgres: "sql",
+  postgresql: "sql",
+  mysql: "sql",
+  text: "plaintext",
+  txt: "plaintext",
+  log: "plaintext",
+  toml: "ini",
+  cfg: "ini",
+  conf: "ini",
+  env: "ini",
+  properties: "ini",
+  sass: "scss",
+};
+
+let hljsReady = false;
+/** Grammar for each base language name — needed for aliases, because
+ *  `hljs.getLanguage()` returns a registered Language OBJECT, not the grammar
+ *  function `registerLanguage` expects. */
+const HLJS_BY_NAME: Record<string, unknown> = Object.fromEntries(HLJS_LANGUAGES);
+/** Register every grammar once per webview, on the first highlight. */
+function ensureHljsLanguages(): void {
+  if (hljsReady) return;
+  for (const [name, grammar] of HLJS_LANGUAGES) {
+    hljs.registerLanguage(name, grammar as never);
+  }
+  for (const [alias, target] of Object.entries(HLJS_ALIASES)) {
+    const grammar = HLJS_BY_NAME[target];
+    if (grammar) hljs.registerLanguage(alias, grammar as never);
+  }
+  // Only after BOTH loops succeeded: a throw mid-way must not leave the module
+  // believing it is registered (every later highlight would then silently
+  // fall back to unhighlighted code).
+  hljsReady = true;
+}
 import type { ChatMessage, ToolActivity } from "../types";
 import {
   detectDir,
@@ -160,6 +314,12 @@ function cachedPrepareText(text: string, dir?: "rtl" | "ltr"): string {
 function useCapped(id: string, text: string, live: boolean) {
   const over = !live && text.length > RENDER_CAP;
   const [showAll, setShowAll] = useState(false);
+  // Reset the expansion when the hook is reused for a different message
+  // (virtualized bubbles recycle the component). Without this, switching chats
+  // while one bubble was expanded left the NEXT message fully expanded too.
+  useEffect(() => {
+    setShowAll(false);
+  }, [id]);
   const shown = over && !showAll ? text.slice(0, RENDER_CAP) : text;
   return { shown, over, cut: text.length - shown.length, showAll, setShowAll };
 }
@@ -433,6 +593,10 @@ export function getHighlightedLines(whole: string, lang: string): string[] {
   const key = `${lang}\n${whole}`;
   const hit = highlightCache.get(key);
   if (hit) return hit;
+  // Grammars are registered lazily on the first highlight: `lib/core` ships
+  // none, so without this the block would fall through to `highlightAuto`
+  // (which also has nothing to detect) and render unhighlighted.
+  ensureHljsLanguages();
   let lines: string[];
   try {
     const html =
@@ -898,6 +1062,9 @@ export function ThinkingBlock({ text }: { text: string }) {
   const textRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const drag = useRef<{ startY: number; startH: number } | null>(null);
+  /** Removers for an in-flight height drag; run on unmount (the agent may
+   *  re-render/replace this block mid-drag) so the window listeners never leak. */
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
   const empty = text.trim().length === 0;
   // While collapsed, show the latest streamed line (truncated to one line)
   // instead of a word count, so the user sees live reasoning progress.
@@ -919,6 +1086,9 @@ export function ThinkingBlock({ text }: { text: string }) {
     if (!el || !open || empty || !stickToBottom.current) return;
     el.scrollTop = el.scrollHeight;
   }, [text, open, empty]);
+  // Detach an interrupted height-drag's window listeners when this block
+  // unmounts (the agent can replace it mid-drag while streaming).
+  useEffect(() => () => resizeCleanupRef.current?.(), []);
 
   const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -937,6 +1107,12 @@ export function ThinkingBlock({ text }: { text: string }) {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    // Stash the removers so an unmount mid-drag can detach them.
+    resizeCleanupRef.current = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
   };
 
   return (
@@ -1000,6 +1176,7 @@ export function RetryBanner({
   watchdog,
   model,
   agent,
+  tool,
   fallback,
   stalled,
   startedAt,
@@ -1014,6 +1191,9 @@ export function RetryBanner({
   watchdog?: boolean;
   model?: string;
   agent?: string;
+  /** The tool that owns this retry (e.g. "explore"), when it is a sub-agent
+   *  retry — lets the banner name the tool, not just the agent. */
+  tool?: string;
   fallback?: boolean;
   stalled?: boolean;
   startedAt?: number;
@@ -1060,11 +1240,17 @@ export function RetryBanner({
         ? ` — retry in ${left}s`
         : " — retrying…"
       : " — retrying…";
+  // The tool that owns the retry (e.g. "explore") + the agent label, joined so
+  // the user can tell a main-agent retry from a specific tool's at a glance.
+  const tags = [...(tool ? [`tool: ${tool}`] : []), ...(agent ? [agent] : [])];
   const who = model
-    ? ` — ${model}${agent ? ` (${agent})` : ""}`
-    : agent
-      ? ` — ${agent}`
+    ? ` — ${model}${tags.length ? ` (${tags.join(", ")})` : ""}`
+    : tags.length
+      ? ` — ${tags.join(", ")}`
       : "";
+  // A sub-agent (explore/task/…) retry: it runs INSIDE the parent turn, so
+  // calling it a "provider" hiccup would be misleading — the wording names it.
+  const subAgent = !!agent && !fallback;
   // A sub-agent model hard-failed and the tool fell back to the MAIN model.
   // Distinct banner: no spinner, no retry button — the fallback already ran.
   if (fallback) {
@@ -1103,7 +1289,9 @@ export function RetryBanner({
       ? "Provider rate limit"
       : unlimited
         ? "Provider rate limit"
-        : "Provider hiccup";
+        : subAgent
+          ? "Sub-agent retrying"
+          : "Provider hiccup";
   const suffix = gaveUp
     ? watchdog
       ? ""
@@ -2312,7 +2500,10 @@ export const ChatMessageView = memo(
           <ul className="plan-list">
             {message.plan.map((item, i) => (
               <li
-                key={i}
+                // Content is the only stable field (the backend stores no item
+                // id), so an index key repainted the wrong row as done/running
+                // whenever the agent reordered or appended plan items.
+                key={item.id ?? item.content}
                 className={`plan-item ${item.status === "completed" ? "done" : item.status === "in_progress" ? "running" : ""}`}
               >
                 <span className="plan-item-mark">
@@ -2486,7 +2677,7 @@ export const ChatMessageView = memo(
             <span
               className="attachment-chip"
               key={`autoskill-${sk}`}
-              title="Auto-loaded skill — picked by the decision model for this turn"
+              title="Auto-loaded skill — matched from your request and inlined into this turn's instructions"
             >
               ⚡ {sk}
             </span>

@@ -67,6 +67,11 @@ console.log("۳) DiffView اجباری دوستونی:");
   check("گپ unmodified lines دارد", html.includes("unmodified lines"));
   check("تک‌ستونی رندر نشد", !html.includes("diff-unified"));
   check("data-layout دوستونی", html.includes('data-layout="side-by-side"'));
+  // نوار کناری ± در نمای دوستونی: قبلاً هیچ گاتر/علامتی نداشت و ستون هیچ سرنخی
+  // برای خط اضافه/حذف‌شده نمی‌داد (پس‌زمینه طبق طراحی شفاف است).
+  check("گاتر دوستونی دارد", (html.match(/diff-u-gutter/g) || []).length > 0);
+  check("علامت منفی در ستون قبل است", html.includes(">-</span>"));
+  check("علامت مثبت در ستون بعد است", html.includes(">+</span>"));
 }
 
 console.log("۴) ReviewFileAccordion با wide:");
@@ -86,6 +91,48 @@ console.log("۴) ReviewFileAccordion با wide:");
     />,
   );
   check("wide دوستونی", wideHtml.includes("diff-columns"));
+}
+
+console.log("۵) کامنت داخل دیف کم‌رنگ می‌شود:");
+{
+  const withComments = [
+    "--- a/x.ts",
+    "+++ b/x.ts",
+    "@@ -1,2 +1,3 @@",
+    "+const a = 1 // توضیح فارسی",
+    "+const url = \"http://x\" // not a comment",
+    "+const b = 2",
+  ].join("\n");
+  const html = renderToString(
+    <DiffView diff={withComments} path="x.ts" layout="unified" />,
+  );
+  check("کامنت کلاس diff-comment گرفت", html.includes("diff-comment"));
+  check("متن کامنت حفظ شد", html.includes("توضیح فارسی"));
+  check("مارکر کامنت در تکهٔ کم‌رنگ است", html.includes(">// توضیح فارسی<"));
+
+  // رشته‌ای که «//» دارد کامنت نیست: نباید هیچ diff-comment بسازد.
+  const stringOnly = [
+    "--- a/y.ts",
+    "+++ b/y.ts",
+    "@@ -1,1 +1,1 @@",
+    '+const url = "http://example.com"',
+  ].join("\n");
+  const html2 = renderToString(
+    <DiffView diff={stringOnly} path="y.ts" layout="unified" />,
+  );
+  check("اسلش داخل رشته کامنت شمرده نشد", !html2.includes("diff-comment"));
+
+  // زبان بدون کامنت خطی (css) → هیچ کم‌رنگی اعمال نمی‌شود.
+  const cssDiff = [
+    "--- a/z.css",
+    "+++ b/z.css",
+    "@@ -1,1 +1,1 @@",
+    "+body { color: red; }",
+  ].join("\n");
+  const html3 = renderToString(
+    <DiffView diff={cssDiff} path="z.css" layout="unified" />,
+  );
+  check("css بدون کامنت خطی کم‌رنگ نشد", !html3.includes("diff-comment"));
 }
 
 if (failed > 0) {

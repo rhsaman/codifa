@@ -83,7 +83,6 @@ const TOOL_LABEL: Record<string, string> = {
   memory: "Memory",
   ask_user: "Ask User",
   fetch_url: "Fetch URL",
-  task: "Task",
   explore: "Explore",
   vision: "Vision",
   create_skill: "Create Skill",
@@ -172,7 +171,6 @@ const TOOL_ICON: Record<string, string> = {
   search_memory: "🧠",
   memory: "🧠",
   ask_user: "❓",
-  task: "🧩",
   explore: "🔍",
   vision: "🖼",
   create_skill: "⚙",
@@ -217,7 +215,6 @@ const TOOL_NOUN: Record<string, [string, string]> = {
   search_memory: ["memory search", "memory searches"],
   memory: ["note", "notes"],
   ask_user: ["question", "questions"],
-  task: ["sub-agent call", "sub-agent calls"],
   explore: ["explore run", "explore runs"],
   vision: ["image lookup", "image lookups"],
   create_skill: ["skill saved", "skills saved"],
@@ -242,14 +239,13 @@ function groupSummary(activities: ToolActivity[]): string {
     .join(", ");
 }
 
-/** A sub-agent card (task/explore) — renders with the dedicated sub-agent
- *  card layout and its "explore" CSS class, exactly as before the rename. */
-export const isSubagentCard = (a: ToolActivity) =>
-  (a.tool === "task" &&
-    (a.args?.subagent_type === "subagent" ||
-      a.args?.subagent_type === "explore" ||
-      a.args?.subagent_type === "general")) ||
-  a.tool === "explore";
+/** A sub-agent card (explore) — renders with the dedicated sub-agent card
+ *  layout and its "explore" CSS class. There is ONE sub-agent tool name:
+ *  pre-rename transcripts that recorded the old `task`/`subagent` names are
+ *  folded into `explore` at BOTH ingest points (normalizeToolName in
+ *  makeToolActivity for the live stream, normalizeToolActivity for the store's
+ *  load migration), so a card reaching this predicate always says `explore`. */
+export const isSubagentCard = (a: ToolActivity) => a.tool === "explore";
 
 /** Legacy alias kept for existing tests/callers. */
 export const isExploreCard = isSubagentCard;
@@ -322,7 +318,7 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
       if (!entry.activity.diff) return;
       const path = reviewPathOf(entry.activity);
       if (!path) return;
-      const { content: current } = await api.fsRead(root, path);
+      const { content: current } = (await api.fsRead(root, path)) ?? {};
       const oldContent = applyReverseDiff(entry.activity.diff, current ?? "");
       const ok = await api.fsWrite(root, path, oldContent);
       if (ok) onReverted?.(entry.index);
@@ -538,6 +534,32 @@ function hostOf(url?: string): string {
   }
 }
 
+/** Tools whose rows are web hits/fetched pages rather than files. */
+function isWebRow(activity: ToolActivity): boolean {
+  return activity.tool === "web_search" || activity.tool === "fetch_url";
+}
+
+/** CODEX-style inline web results: the hits ARE the payload of a search row,
+ *  so they render directly under it and stay visible without expanding.
+ *
+ *  Previously the rows only existed inside the `expanded` body, and the head
+ *  click opened a side text panel instead of expanding whenever the output was
+ *  longer than TRACE_TEXT_PANEL_MIN — so a real `web_search` (whose distilled
+ *  answer exceeds 600 chars) never showed a single link. */
+const InlineWebResults = memo(function InlineWebResults({
+  activity,
+}: {
+  activity: ToolActivity;
+}) {
+  const rows = activity.items ?? activity.results;
+  if (!isWebRow(activity) || !rows || rows.length === 0) return null;
+  return (
+    <div className="trace-row-inline-results">
+      <WebResultLinks items={rows} />
+    </div>
+  );
+});
+
 /** Shared, beautifully-styled list of web_search result links. Rendered in
  *  EVERY tool view (full card, single row, timeline row) so the links the
  *  model found are always visible — not just in the expanded card. Pure
@@ -733,7 +755,6 @@ const HEADER_SHOWN_KEYS = new Set([
   "end",
   "query",
   "pattern",
-  "task",
   "description",
   "subagent_type",
   "prompt",
@@ -796,6 +817,104 @@ function TomlLine({ text }: { text: string }) {
   );
 }
 
+/** Comment markers for a file, chosen from its extension.
+ *  Only used to dim the comment part of a diff line, so an annotation never
+ *  reads as code. Unknown extensions return nothing (no dimming). */
+function commentMarkers(path?: string): string[] {
+  if (!path) return [];
+  const ext = path.split("?")[0].toLowerCase().split(".").pop() ?? "";
+  switch (ext) {
+    case "ts":
+    case "tsx":
+    case "js":
+    case "jsx":
+    case "mjs":
+    case "cjs":
+    case "rs":
+    case "go":
+    case "java":
+    case "c":
+    case "h":
+    case "cc":
+    case "cpp":
+    case "hpp":
+    case "cs":
+    case "kt":
+    case "swift":
+    case "scss":
+    case "less":
+    case "php":
+    case "mm":
+    case "dart":
+    case "zig":
+    case "jsonc":
+    case "proto":
+    case "groovy":
+      return ["//"];
+    case "py":
+    case "rb":
+    case "sh":
+    case "bash":
+    case "zsh":
+    case "fish":
+    case "yml":
+    case "yaml":
+    case "ini":
+    case "cfg":
+    case "conf":
+    case "pl":
+    case "jl":
+    case "nim":
+    case "tf":
+    case "hcl":
+    case "dockerfile":
+    case "makefile":
+    case "mk":
+      return ["#"];
+    case "sql":
+    case "lua":
+    case "hs":
+    case "elm":
+      return ["--"];
+    case "css":
+    case "html":
+    case "htm":
+    case "xml":
+    case "svg":
+    case "vue":
+    case "svelte":
+      return ["/*"];
+    default:
+      return [];
+  }
+}
+
+/** Index where a trailing comment starts in `text`, or -1.
+ *  Quotes are respected, so a marker inside a string literal stays code. */
+function commentIndex(text: string, markers: string[]): number {
+  if (markers.length === 0) return -1;
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    for (const m of markers) {
+      if (text.startsWith(m, i)) return i;
+    }
+  }
+  return -1;
+}
+
 /** متن یک خط دیف: برای toml هایلایت‌دار، بقیه ساده.
  *  وقتی کوئری جست‌وجو فعال است، رخدادها با <mark> هایلایت می‌شوند؛
  *  رخداد فعال (`activeHit`) کلاس متمایز می‌گیرد تا با دکمه‌های عقب/جلو دیده شود. */
@@ -821,6 +940,17 @@ function DiffLineText({
     );
   if (path && path.split("?")[0].toLowerCase().endsWith(".toml")) {
     return <TomlLine text={text} />;
+  }
+  // Dim a trailing comment so annotation never reads as code. Only the part
+  // after the marker is wrapped: the code keeps the theme's normal text colour.
+  const ci = commentIndex(text, commentMarkers(path));
+  if (ci >= 0) {
+    return (
+      <>
+        <span>{text.slice(0, ci)}</span>
+        <span className="diff-comment">{text.slice(ci)}</span>
+      </>
+    );
   }
   return <>{text}</>;
 }
@@ -1157,8 +1287,15 @@ export function DiffView({
     const q = (query ?? "").trim();
     const base = hitCursor;
     if (q && !empty) hitCursor += countOccurrences(text, q);
+    // Side-by-side cells carry the same −/+ marker + coloured left bar as the
+    // unified rows. The `.diff-line-del/-add .diff-u-gutter` rules depend on
+    // this span existing — without it the column had no add/remove cue at all
+    // (the row background is transparent by design).
+    const marker =
+      cls === "diff-line-del" ? "-" : cls === "diff-line-add" ? "+" : " ";
     return (
       <span key={key} className={`diff-line ${cls}`}>
+        <span className="diff-u-gutter">{empty ? "" : marker}</span>
         <span className="diff-u-num">{!empty && lineNo >= 0 ? lineNo : ""}</span>
         <span className="diff-u-text">
           {!empty ? (
@@ -1462,7 +1599,7 @@ export const ToolGroupView = memo(function ToolGroupView({
   // "Search Files", so counting by raw tool name produced TWO identical
   // "Search Files" pills side by side (one with ×N, one without) instead of
   // a single merged "Search Files ×N".
-  // Sub-agent cards (explore/task) are NOT counted into the label pills:
+  // Sub-agent cards (explore) are NOT counted into the label pills:
   // each one gets its own pill carrying the short description of what it is
   // looking for, so two parallel explores are distinguishable at a glance
   // instead of collapsing into a single "Explore ×2".
@@ -1540,6 +1677,19 @@ export const ToolGroupView = memo(function ToolGroupView({
           <IconChevron open={open} className="trace-chev" />
         </span>
       </button>
+      {/* CODEX-style: the hits of a search ARE the payload of the run, so they
+          stay visible under the collapsed group head. The child TraceRows are
+          not even mounted while the group is collapsed, so relying on them
+          alone hid every web link until a second click. */}
+      {!open &&
+        activities.map(({ activity, index }) =>
+          isWebRow(activity) ? (
+            <InlineWebResults
+              key={`grp-web-${index}`}
+              activity={activity}
+            />
+          ) : null,
+        )}
       {open && (
         <div className="trace-list">
           {activities.map(({ activity, index }, i) => (
@@ -1561,7 +1711,7 @@ export const ToolGroupView = memo(function ToolGroupView({
 /** Compact one-line detail for a collapsed tool row. Mirrors the chips the
  *  full card head shows (command/path/pattern/description/memory text/url…),
  *  so a collapsed preview never shows an empty row for tools whose args the
- *  old path-only summary missed (run_terminal, memory, fetch_url, task…). */
+ *  old path-only summary missed (run_terminal, memory, fetch_url…). */
 /** Cap a raw arg string for sub-row display: merged grep regexes and shell
  *  commands otherwise dump a wall of `|`-joined noise into every row. The
  *  full text stays in the row's title tooltip. */
@@ -1624,7 +1774,7 @@ function subArgSummary(activity: ToolActivity): string {
   const pattern = String(args.pattern ?? args.query ?? "");
   if (pattern) parts.push(shortArg(pattern, 48));
 
-  // task: the short description (the full card shows it as the task chip)
+  // explore: the short description (the full card shows it as the task chip)
   const description = String(args.description ?? "");
   if (description) parts.push(shortArg(description, 60));
 
@@ -1879,6 +2029,7 @@ const TraceRow = memo(function TraceRow({
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
       </button>
+      <InlineWebResults activity={activity} />
       {expanded && (
         <div className="trace-row-expand">
           {ms ? (
@@ -1992,14 +2143,15 @@ const ToolTimelineRow = memo(function ToolTimelineRow({
       )}
       <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
-      {activity.items &&
-        activity.items.length > 0 &&
+      {(activity.items ?? activity.results) &&
+        (activity.items ?? activity.results)!.length > 0 &&
         (activity.tool === "web_search" || activity.tool === "fetch_url" ? (
-          <WebResultLinks items={activity.items} />
+          <WebResultLinks items={activity.items ?? activity.results!} />
         ) : (
           <FileResultLinks
             tool={activity.tool}
-            items={activity.items as unknown as Array<Record<string, unknown>>}
+            items={(activity.items ??
+              activity.results) as unknown as Array<Record<string, unknown>>}
           />
         ))}
     </div>
@@ -2152,7 +2304,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
       if (messageId) openReview(messageId, reviewPathOf(activity));
       return;
     }
-    // Sub-agent (explore/task) cards: the report IS the payload, so clicking
+    // Sub-agent (explore) cards: the report IS the payload, so clicking
     // the card opens it in the side panel instead of expanding a cramped
     // inline body (user request).
     if (isSubagentCard(activity) && outputText.trim()) {
@@ -2218,6 +2370,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
       </button>
+      <InlineWebResults activity={activity} />
       {expanded ? (
         <div className="trace-row-expand">
           {ms ? (
@@ -2344,12 +2497,11 @@ export const ToolCallView = memo(function ToolCallView({
   const root = useStore((s) => s.root);
   // چت فعال از store — fallback وقتی caller (ChatMessage) chatId را پاس نمی‌دهد.
   const activeChatId = useStore((s) => s.activeChatId);
-  // Task cards (background sub-agents) are collapsible and start
-  // collapsed: the nested read/grep/glob sub-list is noisy, so it stays
-  // hidden until clicked.
+  // Sub-agent (explore) cards are collapsible and start collapsed: the nested
+  // read/grep/glob sub-list is noisy, so it stays hidden until clicked.
   const [collapsed, setCollapsed] = useState(isSubagentCard(activity));
   const collapsible =
-    (activity.tool === "task" || activity.tool === "explore") &&
+    activity.tool === "explore" &&
     ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary));
 
   const toolRunning = activity.status === "running" || (activity.children?.some((c) => c.status === "running") ?? false);
@@ -2388,7 +2540,7 @@ export const ToolCallView = memo(function ToolCallView({
       }
       if (!activity.diff) return;
       const path = String(activity.args?.path ?? activity.args?.filePath ?? "");
-      const { content: current } = await api.fsRead(root, path);
+      const { content: current } = (await api.fsRead(root, path)) ?? {};
       const oldContent = applyReverseDiff(activity.diff, current ?? "");
       const ok = await api.fsWrite(root, path, oldContent);
       if (ok) onReverted?.();
@@ -2445,21 +2597,10 @@ export const ToolCallView = memo(function ToolCallView({
                 </span>
               </span>
             </>
-          ) : isSubagentCard(activity) ? (
-            activity.tool === "explore" ? (
-              toolLabel(activity.tool)
-            ) : (
-              "sub-agent"
-            )
           ) : (
             toolLabel(activity.tool)
           )}
         </span>
-        {activity.tool === "task" && !!activity.args?.subagent_type && (
-          <span className="tool-badge">
-            {String(activity.args.subagent_type)}
-          </span>
-        )}
         {activity.tool === "web_search" && activity.engine && (
           <span className="tool-badge tool-engine-badge">
             {activity.engine}
@@ -2512,7 +2653,7 @@ export const ToolCallView = memo(function ToolCallView({
             )}
           </span>
         )}
-        {(activity.tool === "task" || activity.tool === "explore") &&
+        {activity.tool === "explore" &&
           activity.children &&
           activity.children.length > 0 && (
             <span className="tool-badge tool-sub-count">
@@ -2582,7 +2723,7 @@ export const ToolCallView = memo(function ToolCallView({
       </div>
 
       {collapsed &&
-        (activity.tool === "task" || activity.tool === "explore") &&
+        activity.tool === "explore" &&
         activity.children &&
         activity.children.length > 0 && (
           <ToolCascade activities={activity.children} />
@@ -2594,7 +2735,7 @@ export const ToolCallView = memo(function ToolCallView({
           {activity.summary && !isWrite && (
             <div className="tool-summary">{fixZwsp(activity.summary)}</div>
           )}
-          {(activity.tool === "task" || activity.tool === "explore") &&
+          {activity.tool === "explore" &&
             activity.children &&
             activity.children.length > 0 && (
               <div className="tool-sub-list">
@@ -2606,7 +2747,7 @@ export const ToolCallView = memo(function ToolCallView({
                 ))}
               </div>
             )}
-          {activity.tool === "web_search" &&
+          {(activity.tool === "web_search" || activity.tool === "fetch_url") &&
             (activity.items ?? activity.results) &&
             (activity.items ?? activity.results)!.length > 0 && (
               <WebResultLinks items={(activity.items ?? activity.results)!} />

@@ -1,12 +1,8 @@
 # ============================================================
 # Node.js / npm / yarn / pnpm / bun
 # ============================================================
-# Tauri shell IS tracked (Rust sources, config, icons) — only its build
+# The Tauri shell IS tracked (Rust sources, config, icons) — only its build
 # output and generated artifacts are ignored below.
-src-tauri/target/
-src-tauri/gen/schemas/
-.zcode/
-.zcodeignore
 node_modules/
 bower_components/
 npm-debug.log*
@@ -24,74 +20,63 @@ yarn-error.log*
 bun.lockb.meta
 .bun-cache/
 
-# Downloaded on-device ML models (Settings → Models; fetched at runtime, not committed):
-backend/whisper/
-backend/models--*/
+# Downloaded on-device ML models (fetched at runtime, not committed):
 models--*/
 MEMORY.md
 
 # ============================================================
-# Build output (renderer, main, packaged apps)
+# Build output (renderer + Tauri bundle)
 # ============================================================
 dist/
-dist-electron/
 release/
-.tauri-backend/
 out/
 .vite/
-*.asar
+src-tauri/target/
+src-tauri/gen/schemas/
 *.blockmap
 
 # ============================================================
-# Electron
+# Test temp artifacts (real test files ARE tracked — see tests/)
 # ============================================================
-*.dmg
-*.zip
-*.exe
-*.msi
-*.AppImage
-*.snap
-*.deb
-*.rpm
-*.pkg
-
-# Test temp artifacts (real test files ARE tracked — see test/ and backend/tests/)
-backend/tests/_tmp_*/
-backend/tests/pytest-of-*/
-backend/tests/coder-test-*/
 pytest_full_result.txt
 tests/.tmp-*
 tests/.fe-run.*
 tests/dump-ssr.out.mjs
 .tmp-*.mjs
 # Throwaway live-probe scripts (scratch harnesses for manual verification —
-# never part of the suite; they were committed by accident twice).
+# never part of the suite).
 .probe-*.py
 .probe-*.mjs
 .probe-*.ts
 .probe-*.sh
 
-# Playwright MCP temp files (logs, snapshots)
-backend/.playwright-mcp/
-
-# Literal ~ directory (artifact from shell misparse)
-backend/\~/
+# Browser-automation temp files (logs, snapshots)
+.playwright-mcp/
 
 # ============================================================
-# Python / uv
+# Rust / Cargo
 # ============================================================
-backend/.venv/
+target/
+# Cargo.lock IS tracked: this is an application, not a library.
+
+# ============================================================
+# Python bytecode (legacy tooling only — no Python app code remains)
+# ============================================================
 .venv/
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-*.egg
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+*.cover
+*.lcov
+lcov.info
+.nyc_output/
 build/
 dist-python/
 
@@ -104,6 +89,18 @@ dist-python/
 *.pem
 *.key
 *.p12
+*.crt
+*.cer
+*.der
+*.pfx
+*.p8
+*.jks
+*.keystore
+secrets/
+.secrets/
+.aws/
+*.token
+*.vault
 
 # ============================================================
 # IDE / editor
@@ -116,6 +113,9 @@ dist-python/
 *.sublime-workspace
 *.iml
 *.code-workspace
+*.user
+*.suo
+.history/
 
 # ============================================================
 # OS files
@@ -125,10 +125,27 @@ dist-python/
 ._*
 .Spotlight-V100
 .Trashes
+.fseventsd
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+Icon?
+.AppleDouble
+.LSOverride
+.DocumentRevisions-V100
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
+.swx
 
 # ============================================================
 # Logs
@@ -160,15 +177,8 @@ vitest.config.*.timestamp-*
 vite.config.*.timestamp-*
 
 # ============================================================
-# Test results / coverage (real test files ARE tracked — see test/ and backend/tests/)
+# Test results / coverage reports
 # ============================================================
-coverage/
-.coverage.*
-coverage.xml
-*.cover
-*.lcov
-lcov.info
-.nyc_output/
 nosetests.xml
 pytest.xml
 test-results.xml
@@ -185,7 +195,7 @@ e2e/.auth/
 .auth/
 
 # ============================================================
-# Framework / deploy outputs
+# Framework / deploy outputs (shared repos)
 # ============================================================
 .next/
 .nuxt/
@@ -211,67 +221,10 @@ docs/_build/
 site/
 
 # ============================================================
-# Electron builder / updater (besides release/ above)
-# ============================================================
-*.node
-app-update.yml
-latest*.yml
-shipit*.json
-*.blockmap
-!electron-builder.yml
-!electron-builder.*.js
-
-# ============================================================
-# Python extras
-# ============================================================
-.tox/
-.nox/
-.hypothesis/
-pytestdebug.log
-.coverage.*
-coverage.xml
-*.cover
-*.pyo
-*.pyd
-*.so
-*.whl
-*.egg-link
-.eggs/
-.installed.cfg
-pip-log.txt
-pip-delete-this-directory.txt
-__pypackages__/
-.uv/
-.uv-cache/
-.ipynb_checkpoints/
-.python_history
-dmypy.json
-.dmypy.json
-pyrightconfig.json.bak
-
-# ============================================================
-# Secrets extras
-# ============================================================
-.env.local
-.env.*.local
-.env.vault
-.env.me
-*.crt
-*.cer
-*.der
-*.pfx
-*.p8
-*.jks
-*.keystore
-secrets/
-.secrets/
-.aws/
-*.token
-*.vault
-
-# ============================================================
 # AI agent / assistant local files (never commit)
 # ============================================================
+.zcode/
+.zcodeignore
 .claude/
 .codex/
 .opencode/
@@ -285,10 +238,7 @@ secrets/
 .claude/settings.local.json
 .codex/auth.json
 .vs/
-*.user
-*.suo
-*.sln.docstates
-.history/
+.sln.docstates
 .vscode-test/
 .ionide/
 .vim/
@@ -296,7 +246,7 @@ secrets/
 *.elc
 
 # ============================================================
-# Temp / backup
+# Temp / backup / migration scratch
 # ============================================================
 *.tmp
 *.temp
@@ -312,6 +262,8 @@ secrets/
 tmp/
 temp/
 .tox-tmp/
+# Electron→Tauri migration scratch copies (one-off, never committed).
+.review-migration-backup/
 
 # ============================================================
 # Local runtime data / databases
@@ -325,25 +277,3 @@ dump.rdb
 .data/
 .local-data/
 app-data/
-
-# ============================================================
-# OS extras
-# ============================================================
-Icon?
-.AppleDouble
-.LSOverride
-.DocumentRevisions-V100
-.fseventsd
-.VolumeIcon.icns
-.com.apple.timemachine.donotpresent
-.AppleDB
-.AppleDesktop
-Network Trash Folder
-Temporary Items
-.apdisk
-.directory
-.Trash-*
-.nfs*
-.fuse_hidden*
-.swx
-.nfs*

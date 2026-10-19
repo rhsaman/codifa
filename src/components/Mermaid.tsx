@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import mermaid from 'mermaid'
 import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
@@ -81,9 +81,63 @@ function sanitizeChart(text: string): string {
   return text.replace(BIDI_CONTROL_RE, '')
 }
 
+/**
+ * Belt-and-braces pass over the rendered SVG before it is injected.
+ *
+ * Mermaid already renders with `securityLevel: 'strict'` and
+ * `applyRtlToSvgText` only adds `dir="auto"`, but the chart source comes from
+ * the model, so the result is never trusted blindly. This walk removes exactly
+ * what can execute — `<script>` nodes, `on*` handler attributes and
+ * `javascript:` / inline-HTML URLs — and leaves every element, class and styling
+ * attribute untouched, so the diagram renders identically. Browser-only: without
+ * a DOMParser (SSR) the input is returned unchanged.
+ */
+function hardenSvg(svg: string | null): string | null {
+  if (!svg || typeof DOMParser === 'undefined') return svg
+  try {
+    const doc = new DOMParser().parseFromString(svg, 'text/html')
+    const root = doc.querySelector('svg')
+    if (!root) return svg
+    root.querySelectorAll('script').forEach((s) => s.remove())
+    root.querySelectorAll('*').forEach((el) => {
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase()
+        const value = attr.value.replace(/\s/g, '').toLowerCase()
+        const isUrl = name === 'href' || name === 'xlink:href' || name === 'src'
+        const dangerous =
+          value.startsWith('javascript:') || value.startsWith('data:text/html')
+        // `on*` handlers always go. Dangerous URL schemes go anywhere they
+        // could be dereferenced — and also from `title` / `aria-label`
+        // (mermaid emits the chart's `click` URL into a node `title`), where
+        // they are inert but must never survive into the injected DOM.
+        const isLabelish = name === 'title' || name.startsWith('aria-')
+        if (name.startsWith('on') || (dangerous && (isUrl || isLabelish))) {
+          el.removeAttribute(attr.name)
+        }
+      }
+    })
+    return root.outerHTML
+  } catch {
+    return svg
+  }
+}
+
 export function Mermaid({ chart, embedded = false }: { chart: string; embedded?: boolean }) {
   const [svg, setSvg] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
+  // Render generation + mount flag: an out-of-order (or post-unmount) mermaid
+  // resolve used to paint the PREVIOUS chart into this block and leak its
+  // temporary node, because nothing invalidated an in-flight render.
+  const renderTokenRef = useRef(0)
+  const mountedRef = useRef(false)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      // Bump the token so an in-flight render can no longer commit.
+      mountedRef.current = false
+      renderTokenRef.current += 1
+    }
+  }, [])
   const myKey = useId()
   const activeKey = useFullscreen((s) => s.activeKey)
   const openFs = useFullscreen((s) => s.open)
@@ -91,6 +145,8 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
   const expanded = activeKey === myKey
 
   const renderDiagram = () => {
+    const token = ++renderTokenRef.current
+    const commit = () => mountedRef.current && token === renderTokenRef.current
     setFailed(false)
     const id = `mmd-${Math.random().toString(36).slice(2)}`
     const cleanChart = sanitizeChart(chart)
@@ -111,7 +167,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
     mermaid
       .render(id, cleanChart, container)
       .then((r) => {
-        setSvg(applyRtlToSvgText(r.svg))
+        if (commit()) setSvg(applyRtlToSvgText(r.svg))
         return r
       })
       .catch((err) => {
@@ -124,11 +180,11 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
         return mermaid.render(`${id}-retry`, cleanChart, container)
       })
       .then((r) => {
-        if (r) setSvg(applyRtlToSvgText(r.svg))
+        if (r && commit()) setSvg(applyRtlToSvgText(r.svg))
       })
       .catch((err) => {
         console.error('[Mermaid] retry also failed, showing fallback:', err)
-        setFailed(true)
+        if (commit()) setFailed(true)
       })
       .finally(cleanup)
   }
@@ -164,14 +220,10 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
     )
   }
 
-  // Sanitize the mermaid SVG before injecting it. mermaid's renderer is
-  // historically XSS-shaped (CVE-2023-20052 and several follow-up bypasses
-  // targeted at <foreignObject> and the "click" handler it can emit), and
-  // the chart source comes from the model — so we never trust the rendered
-  // output as-is. The sanitizer keeps the SVG nodes + their safe attributes
-  // (fill/stroke/transform/...) and drops anything else (event handlers,
-  // <script>, javascript: URLs, etc.).
-  const safeSvg = svg
+  // Mermaid output is hardened for the model-controlled chart source (no
+  // `<script>`, `on*` handlers or `javascript:` URLs survive). Memoized so the
+  // DOM walk runs once per rendered SVG instead of on every re-render.
+  const safeSvg = useMemo(() => hardenSvg(svg), [svg])
 
   const diagram = (
     <div

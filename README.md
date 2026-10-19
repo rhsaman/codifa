@@ -8,22 +8,21 @@ Codifa is a desktop IDE-style workspace — file explorer, Monaco editor and a
 streaming AI chat — powered by a real **agent** that reads, searches and edits
 your code _itself_, confined to the folder you choose. Bring your own model:
 OpenRouter, any OpenAI-compatible API, or a fully local endpoint. Type, or just
-talk (local Whisper). Nothing leaves your machine unless you want it to.
+talk. Nothing leaves your machine unless you want it to.
 
 کدیفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری تمام‌عیار با کاوشگر فایل،
 ویرایشگر کد و چتِ هوش مصنوعیِ زنده. در قلب آن یک **عامل واقعی** نشسته که
 فایل‌های شما را خودش می‌خواند، جستجو و ویرایش می‌کند — و همه‌چیز فقط در همان
 پوشه‌ای که انتخاب کرده‌اید. مدل‌تان را خودتان بیاورید: OpenRouter، هر API سازگار
-با OpenAI یا یک مدل کاملاً محلی. تایپ کنید یا حرف بزنید (Whisper محلی). مگر
+با OpenAI یا یک مدل کاملاً محلی. تایپ کنید یا حرف بزنید. مگر
 اینکه خودتان بخواهید، هیچ‌چیز از دستگاه شما بیرون نمی‌رود.
 
 [English](#english-english) · [فارسی](#persian-فارسی)
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Electron](https://img.shields.io/badge/Electron-31-47848F?logo=electron&logoColor=white)
+![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![LangGraph](https://img.shields.io/badge/LangGraph-Latest-1C3C3C?logo=langchain&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-1.77+-000000?logo=rust&logoColor=white)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 ![GitHub stars](https://img.shields.io/github/stars/rhsaman/codifa?style=social)
 ![GitHub downloads](https://img.shields.io/github/downloads/rhsaman/codifa/total)
@@ -50,8 +49,8 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 | 🔌  | **Bring your own model**            | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI.                                                                                                                                            |
 | 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Cycle with `Cmd/Ctrl+M`.                                                                                           |
 | 🛠️  | **Tool-based agent**                | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
-| 🎤  | **Voice input**                     | Hold the mic, speak in Persian or English, get text. Transcription runs on a fully local, offline Whisper model (installed from **Settings → Models**); a live "wave" equalizer animates while recording.                                                                                       |
-| 🧠  | **On-device models**                | Manage downloadable models from the UI: Whisper for voice and an embedding model for RAG memory — fully offline.                                                                                                                                                                                |
+| 🎤  | **Voice input**                     | Hold the mic, speak in Persian or English, get text. Speech is sent to the speech (STT) provider you configure in **Settings → Media Providers** — pick any OpenAI-compatible endpoint that serves `/audio/transcriptions`. A live "wave" equalizer animates while recording.                                                                                       |
+| 🧠  | **Memory**                          | Notes you ask the agent to remember are embedded and searchable per project — stored locally in your data folder.                                                                                                                                                                                |
 | 📊  | **Live context meter**              | The context-usage bar updates in real time using the provider's exact per-request token counts, not an estimate.                                                                                                                                                                                |
 | 🛟  | **Graceful small-context handling** | Works smoothly even on small 8K local models — history is compacted automatically before context runs out, so the agent keeps going instead of crashing.                                                                                                                                        |
 | 🖥️  | **Full IDE UI**                     | Resizable file explorer (left), Monaco editor (center), streaming markdown chat with syntax highlighting (right), dark/light theme.                                                                                                                                                             |
@@ -64,18 +63,16 @@ talk (local Whisper). Nothing leaves your machine unless you want it to.
 ### 📦 Requirements
 
 - Node.js ≥ 20 and npm
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- Python ≥ 3.10 (managed by uv)
+- [Rust](https://rustup.rs/) (stable) and the Tauri prerequisites for your OS
 
 ### 🚀 Setup
 
 ```bash
 npm install       # JavaScript dependencies
-npm run setup     # creates backend/.venv and installs langgraph, fastapi, uvicorn
 ```
 
-Voice and RAG-memory models are optional. Install them from the app's
-**Settings → Models** tab (fully offline once downloaded).
+There is no backend to install: the agent, tools, MCP client, skills, document
+readers and providers all run inside the Rust shell.
 
 ### 🧑‍💻 Development
 
@@ -83,22 +80,23 @@ Voice and RAG-memory models are optional. Install them from the app's
 npm run dev
 ```
 
-Opens the Electron window with a hot-reloading renderer. The Python sidecar
-(FastAPI + LangGraph) is auto-spawned on an ephemeral localhost port. When
-launched from the packaged `.app`, Codifa also merges the GUI PATH with your
-login-shell path so tools like `docker` (used by MCP stdio connectors) are found.
+Opens the Tauri window with a hot-reloading renderer. The Rust side owns the
+agent loop and serves the renderer's local HTTP API (`/chat/stream`, `/skills`,
+`/mcp`, `/doc/read`, …). When launched from the packaged `.app`, Codifa merges
+the GUI PATH with your login-shell path so tools like `docker` (used by MCP
+stdio connectors) are found.
 
 ### 🏗️ Building / packaging
 
 ```bash
-npm run build       # typecheck + build renderer, main and preload
+npm run build       # typecheck + build renderer
 npm run dist        # package for the current OS
-npm run dist:mac    # only macOS (dmg / zip)
+npm run dist:mac    # only macOS (app / dmg)
 npm run dist:win    # only Windows (NSIS)
 npm run dist:linux  # only Linux (AppImage)
 ```
 
-Output lands in `release/`.
+Output lands in `src-tauri/target/release/bundle/`.
 
 > **macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
 > notarized), so the first launch from Finder may show _"Codifa has been blocked
@@ -150,23 +148,24 @@ Output lands in `release/`.
 ### 🏛️ Architecture
 
 ```
-┌──────────────────────────── Electron ────────────────────────────┐
-│ main.ts      window, sidecar spawn, fs IPC,                       │
-│              config + chat persistence (SQLite)                   │
-│ preload.ts   contextBridge (whitelisted API)                      │
-│ renderer     React + Monaco + chat (SSE)                          │
-└──────────────┬─────────────────────────▲──────────────────────────┘
-               │ spawn / stdio           │ HTTP + SSE (127.0.0.1)
-┌──────────────▼─────────────────────────┴──────────────────────────┐
-│ Python sidecar  (uv-managed .venv)                                │
-│ server.py      FastAPI  /health  /models                          │
-│                /chat/stream (SSE)  /fs  /transcribe (Whisper)     │
-│                /app/state (SQLite settings + chats)               │
-│ providers.py   → LangChain ChatModel                            │
-│ tools.py       sandboxed fs tools + memory + MCP                  │
-│ agents.py      Ask / Plan / Coder agents                          │
-│                (live usage + compact + RAG memory)                │
-└───────────────────────────────────────────────────────────────────┘
+┌───────────────────────────── Tauri v2 ─────────────────────────────┐
+│ Rust shell (src-tauri/src)                                         │
+│   agent.rs       agent loop: stream, tools, compact, steer         │
+│   backend_light  the renderer's whole HTTP API (loopback)          │
+│   tools.rs       fs / search / edit / terminal, sandboxed to root  │
+│   skills.rs      built-in + user skills (~/.codifa/skills)         │
+│   mcp.rs  lsp.rs  docs.rs  media.rs  git.rs  plans.rs  …           │
+│   pty.rs         real terminal sessions                            │
+│   store.rs       settings + chats, atomic writes                   │
+└──────────────┬───────────────────────────────▲─────────────────────┘
+               │ IPC (invoke/listen)           │ HTTP + SSE (127.0.0.1)
+┌──────────────▼───────────────────────────────┴─────────────────────┐
+│ Renderer (src) — React + Monaco + xterm                            │
+│   chat (SSE) · file explorer · editor · terminal · viewers         │
+└────────────────────────────────────────────────────────────────────┘
+
+Providers (bring your own): OpenRouter · OpenAI-compatible · local endpoint
+Data lives in ~/.codifa — settings, chats, skills, MCP, plans, traces.
 ```
 
 </details>
@@ -187,8 +186,8 @@ Output lands in `release/`.
 | 🔌  | **مدل‌تان را خودتان بیاورید**  | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است.                                                                                                                        |
 | 🤖  | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Cmd/Ctrl+M` میان‌شان بچرخید.                                                                      |
 | 🛠️  | **عاملِ ابزارمحور**            | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
-| 🎤  | **ورودی صوتی**                 | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا با مدلِ کاملاً محلی و آفلاینِ Whisper به متن تبدیل می‌شود (از تب **تنظیمات ← مدل‌ها** نصب می‌شود). هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود.                                                                 |
-| 🧠  | **مدل‌های روی دستگاه**         | مدل‌های قابل دانلود از خودِ رابط کاربری مدیریت می‌شوند: Whisper برای صدا و یک مدل جاساز (embedding) برای حافظهٔ RAG — کاملاً آفلاین.                                                                                                                                                         |
+| 🎤  | **ورودی صوتی**                 | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا به همان فراهم‌کنندهٔ گفتار (STT) که در **تنظیمات ← فراهم‌کننده‌های رسانه** پیکربندی کرده‌اید فرستاده می‌شود. هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود.                                                                 |
+| 🧠  | **حافظه**                      | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد، برای هر پروژه جاساز و قابل جستجو می‌شوند — به‌صورت محلی در پوشهٔ دادهٔ شما.                                                                                                                                                                  |
 | 📊  | **نوار استفادهٔ بافتِ زنده**   | نوار مصرف بافت در لحظه و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز می‌شود، نه برآورد.                                                                                                                                                                                     |
 | 🛟  | **مدیریت هوشمند بافتِ کم**     | حتی با مدل‌های کوچک محلی (مثلاً ۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن بافت، تاریخچه به‌طور خودکار فشرده می‌شود تا به‌جای توقف، کار پیش برود.                                                                                                                                     |
 | 🖥️  | **رابطی به بلندِ یک IDE**      | کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco (وسط) و چتِ مارک‌داون با هایلایت سینتکس (راست)، به‌همراه تم تیره و روشن.                                                                                                                                                             |
@@ -201,18 +200,16 @@ Output lands in `release/`.
 ### 📦 پیش‌نیازها
 
 - Node.js نسخهٔ ۲۰ به بالا و npm
-- [uv](https://docs.astral.sh/uv/) (مدیر بسته‌های پایتون)
-- پایتون نسخهٔ ۳.۱۰ به بالا (که خود uv آن را مدیریت می‌کند)
+- [Rust](https://rustup.rs/) (پایدار) و پیش‌نیازهای Tauri برای سیستم‌عامل شما
 
 ### 🚀 نصب
 
 ```bash
 npm install       # نصب وابستگی‌های جاوااسکریپت
-npm run setup     # ساخت backend/.venv و نصب langgraph، fastapi و uvicorn
 ```
 
-مدل‌های صوتی و حافظهٔ RAG اختیاری‌اند و از تب **تنظیمات ← مدل‌ها** نصب
-می‌شوند (پس از دانلود، کاملاً آفلاین کار می‌کنند).
+هیچ بک‌اندی برای نصب نیست: عامل، ابزارها، کلاینت MCP، مهارت‌ها، خوانندهٔ
+سند‌ها و فراهم‌کننده‌ها همه داخل پوستهٔ Rust اجرا می‌شوند.
 
 ### 🧑‍💻 توسعه
 
@@ -220,22 +217,23 @@ npm run setup     # ساخت backend/.venv و نصب langgraph، fastapi و uvic
 npm run dev
 ```
 
-پنجرهٔ Electron با رابطِ گرم (hot-reload) باز می‌شود. sidecar پایتونی
-(FastAPI + LangGraph) به‌صورت خودکار روی یک پورت محلیِ موقت اجرا می‌شود. در
-نسخهٔ بسته‌بندی‌شده نیز PATH رابط گرافیکی با PATH شلِ ورود ترکیب می‌شود تا
-ابزارهایی مانند `docker` (موردنیاز اتصال‌های MCP) پیدا شوند.
+پنجرهٔ Tauri با رابطِ گرم (hot-reload) باز می‌شود. سمت Rust حلقهٔ عامل را
+در اختیار دارد و API محلیِ رابط کاربری را سرو می‌کند (`/chat/stream`،
+`/skills`، `/mcp`، `/doc/read`، …). در نسخهٔ بسته‌بندی‌شده نیز PATH رابط
+گرافیکی با PATH شلِ ورود ترکیب می‌شود تا ابزارهایی مانند `docker`
+(موردنیاز اتصال‌های MCP) پیدا شوند.
 
 ### 🏗️ ساخت و بسته‌بندی
 
 ```bash
-npm run build       # typecheck + ساخت renderer، main و preload
+npm run build       # typecheck + ساخت renderer
 npm run dist        # بسته‌بندی برای سیستم‌عاملِ فعلی
-npm run dist:mac    # فقط مک (dmg / zip)
+npm run dist:mac    # فقط مک (app / dmg)
 npm run dist:win    # فقط ویندوز (NSIS)
 npm run dist:linux  # فقط لینوکس (AppImage)
 ```
 
-خروجی در پوشهٔ `release/` قرار می‌گیرد.
+خروجی در `src-tauri/target/release/bundle/` قرار می‌گیرد.
 
 > **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
 > (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«Codifa به
@@ -292,23 +290,24 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 ### 🏛️ معماری
 
 ```
-┌───────────────────────────── Electron ─────────────────────────────┐
-│ main.ts       پنجره، راه‌اندازی sidecar، IPC فایل،                    │
-│               پیکربندی و گفتگوها (SQLite)                            │
-│ preload.ts    contextBridge (دسترسی‌های کنترل‌شده)                    │
-│ renderer      React + Monaco + گفتگو (SSE)                          │
-└──────────────┬───────────────────────────▲──────────────────────────┘
-               │ spawn / stdio             │ HTTP + SSE (127.0.0.1)
-┌──────────────▼───────────────────────────┴──────────────────────────┐
-│ ساید‌کار پایتون  (uv .venv)                                         │
-│ server.py      FastAPI  /health  /models                            │
-│                /chat/stream (SSE)  /fs  /transcribe (Whisper)       │
-│                /app/state (SQLite تنظیمات و گفتگوها)                 │
-│ providers.py   → LangChain ChatModel                              │
-│ tools.py       ابزارهای امنِ فایل + memory + MCP                    │
-│ agents.py      عامل پرسش / برنامه / نویسندهٔ کد                      │
-│                (مصرف زندهٔ بافت + فشرده‌سازی + حافظهٔ RAG)           │
-└──────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────── Tauri v2 ─────────────────────────────┐
+│ پوستهٔ Rust (src-tauri/src)                                         │
+│   agent.rs       حلقهٔ عامل: استریم، ابزارها، فشرده‌سازی، steer       │
+│   backend_light  کلِ API محلیِ رابط کاربری (loopback)                │
+│   tools.rs       فایل/جستجو/ویرایش/ترمینال، محدود به ریشهٔ پروژه     │
+│   skills.rs      مهارت‌های داخلی + کاربری (~/.codifa/skills)          │
+│   mcp.rs  lsp.rs  docs.rs  media.rs  git.rs  plans.rs  …            │
+│   pty.rs         نشست‌های واقعی ترمینال                              │
+│   store.rs       تنظیمات + گفتگوها، نوشتن اتمیک                      │
+└──────────────┬───────────────────────────────▲─────────────────────┘
+               │ IPC (invoke/listen)           │ HTTP + SSE (127.0.0.1)
+┌──────────────▼───────────────────────────────┴─────────────────────┐
+│ رابط کاربری (src) — React + Monaco + xterm                          │
+│   چت (SSE) · کاوشگر فایل · ویرایشگر · ترمینال · نمایشگرها            │
+└────────────────────────────────────────────────────────────────────┘
+
+فراهم‌کننده‌ها (مدل خودتان): OpenRouter · سازگار با OpenAI · سرور محلی
+داده‌ها در ~/.codifa است — تنظیمات، گفتگوها، مهارت‌ها، MCP، پلن‌ها، trace.
 ```
 
 </div>

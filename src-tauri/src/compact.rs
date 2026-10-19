@@ -383,6 +383,9 @@ mod tests {
             temperature: None,
             max_tokens: None,
             timeout_secs: 1,
+            reasoning_level: String::new(),
+            model_reasoning: false,
+            auto_think: false,
         };
         let hist: Vec<Value> = (0..3).map(|i| msg("user", &format!("m{i}"))).collect();
         let out = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()

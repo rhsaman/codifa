@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { getActiveProvider, getChatProvider, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
+import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
 import { AutoRetryScheduler, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
@@ -74,6 +74,7 @@ import {
   listMcp,
   triggerCompact,
   gitAutoCommit,
+  retrySubagentNow,
   gitDiscard,
   gitPush,
   type CompactResult,
@@ -84,7 +85,13 @@ import { playAlarm } from "../lib/alarm";
 import { isBrowserTool } from "../lib/mcpTools";
 
 import type { SkillRow, TranscribeProviderOpts } from "../lib/api";import { supportsReasoning } from "../lib/thinking";
+import {
+  THINKING_OPTIONS,
+  THINKING_LABELS,
+  THINKING_DESCS,
+} from "../lib/thinking-options";
 import { projectHistoryMessage } from "../lib/historyPayload";
+import { applyHistoryLimit } from "../lib/historyWindow";
 import { allModes, getMode } from "../lib/modes";
 import {
   extractMentionSkills,
@@ -175,34 +182,17 @@ const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 
-const THINKING_OPTIONS: Array<[ThinkingLevel, string]> = [
-  ["none", "None"],
-  ["low", "Low"],
-  ["medium", "Medium"],
-  ["high", "High"],
-  ["xhigh", "XHigh"],
-];
-const THINKING_LABELS = Object.fromEntries(THINKING_OPTIONS) as Record<
-  ThinkingLevel,
-  string
->;
-const THINKING_DESCS: Record<ThinkingLevel, string> = {
-  "": "Default reasoning",
-  none: "No reasoning — fastest replies",
-  low: "Light reasoning — faster replies",
-  medium: "Balanced reasoning — default",
-  high: "Deep reasoning — better answers",
-  xhigh: "Extra-deep reasoning — strongest answers",
-  max: "Maximum reasoning — strongest answers",
-};
+// THINKING_OPTIONS / THINKING_LABELS / THINKING_DESCS live in the shared
+// src/lib/thinking-options.ts module so Settings → Tools rows can render the
+// exact same picker (imported below next to the other lib imports).
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "help", hint: "List all commands" },
   { name: "compact", hint: "Summarize & compact the chat context" },
-  { name: "clear", hint: "Clear all messages in this chat" },
+  { name: "clear", hint: "Clear all messages in this chat (stops a running turn)" },
   { name: "new", hint: "Start a new chat" },
   { name: "plan", hint: "Switch this chat to Plan mode (describe the work after the command to plan it)" },
-  { name: "undo", hint: "Undo the last user/assistant exchange" },
+  { name: "undo", hint: "Undo the last exchange (stops a running turn first)" },
   { name: "redo", hint: "Redo the last undone exchange" },
   {
     name: "create-skill",
@@ -341,6 +331,19 @@ function ContextRing({ pct }: { pct: number | null }) {
   );
 }
 
+/** Shown while a chat's transcript is still being fetched (index-only row).
+ *  The body lives in its own file on disk now, so a freshly opened chat has a
+ *  short window where only its metadata is in memory — rendering the empty
+ *  state there would read as "this chat lost all its messages". */
+function ChatLoader() {
+  return (
+    <div className="chat-loader" data-testid="chat-hydrating">
+      <span className="spinner" />
+      <span>Loading conversation…</span>
+    </div>
+  );
+}
+
 export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Multi-window: each stacked window mounts its own ChatPanel with an
   // explicit chatId. Single-window callers omit it and follow the focused
@@ -358,6 +361,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     for (const c of s.chats) if (c.id === id) return c;
     return null;
   });
+  // Fetch this chat's transcript the moment the panel shows it. Every panel
+  // (including hidden multi-window ones) runs this, so a window the user is
+  // about to look at is already loaded; `ensureChatHydrated` is single-flight
+  // and a no-op once the body is in memory.
+  useEffect(() => {
+    if (activeChatId) void ensureChatHydrated(activeChatId);
+  }, [activeChatId]);
   const provider = useStore((s) => {
     // Per-chat provider override: a chat that picked its own provider/model in
     // the composer runs on that, falling back to the global active provider.
@@ -450,6 +460,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const dir = useStore((s) => s.dir);
   const workspaces = useStore((s) => s.workspaces);
   const settings = useStore((s) => s.settings);
+  // History turn limit (Settings → General). 0 = send the full history.
+  const historyLimit = useStore((s) => s.historyLimit ?? 0);
   const modes = useMemo(() => allModes(settings), [settings]);
   const wroot = chat?.root || root;
   const userSystemPrompt = useStore((s) =>
@@ -957,18 +969,70 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Selected row on the plan-approval card (index into its options; 0 = the
   // pre-highlighted "Approve" option). Reset whenever a new ask lands.
   const [planApprovalSel, setPlanApprovalSel] = useState(0);
+
+  /**
+   * Deliver an ask/permission answer and only clear its card once the backend
+   * has accepted it. The old code cleared the card immediately and discarded the
+   * delivery promise (`void`): when the POST failed or hung, the answer was lost
+   * for good — the card vanished, the agent kept waiting and the user had no way
+   * to answer again. The ref guards a double click (Enter + click) from sending
+   * two answers for the same request.
+   */
+  const answerSendingRef = useRef(false);
+  const answerAsk = async (id: string, answer: string, chatId: string) => {
+    if (answerSendingRef.current) return;
+    answerSendingRef.current = true;
+    try {
+      if (await respondAsk(id, answer)) {
+        useStore.getState().setChatPendingAsk(chatId, null);
+      }
+    } catch {
+      /* keep the card so the answer can be retried */
+    } finally {
+      answerSendingRef.current = false;
+    }
+  };
+  const answerPermission = async (
+    id: string,
+    allowed: boolean,
+    chatId: string,
+  ) => {
+    if (answerSendingRef.current) return;
+    answerSendingRef.current = true;
+    try {
+      if (await respondPermission(id, allowed)) {
+        useStore.getState().setChatPendingPermission(chatId, null);
+      }
+    } catch {
+      /* keep the card so the answer can be retried */
+    } finally {
+      answerSendingRef.current = false;
+    }
+  };
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
   const setMcpEnabled = useStore((s) => s.setMcpEnabled);
   const computerUse = useStore((s) => s.computerUse);
   const setComputerUse = useStore((s) => s.setComputerUse);
+  const browserUse = useStore((s) => s.browserUse);
+  const setBrowserUse = useStore((s) => s.setBrowserUse);
   const skillQ = skillQuery.trim().toLowerCase();
-  // The composer's connector grid = the built-in Computer Use card (same
-  // hard on/off switch as an MCP connector: OFF means the `computer` tool is
-  // never bound) + every user MCP connector, toggleable per turn.
-  const mcpCards: Array<{ name: string; label: string; builtin?: boolean }> = [
-    { name: "computer", label: "Computer Use", builtin: true },
-    ...Object.keys(mcpConnectors).map((name) => ({ name, label: name })),
+  // The composer's connector grid = the two built-in cards (Computer Use, and
+  // the agent's Browser) plus every user MCP connector. All three are the same
+  // hard on/off switch: OFF means the matching tool is never bound, so the agent
+  // cannot launch Chromium or control the desktop behind the user's back.
+  const mcpCards: Array<{
+    name: string;
+    label: string;
+    kind: "computer" | "browser" | "mcp";
+  }> = [
+    { name: "computer", label: "Computer Use", kind: "computer" },
+    { name: "browser", label: "Browser", kind: "browser" },
+    ...Object.keys(mcpConnectors).map((name) => ({
+      name,
+      label: name,
+      kind: "mcp" as const,
+    })),
   ];
   const filteredMcpCards = mcpCards.filter(
     (c) =>
@@ -976,10 +1040,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       c.label.toLowerCase().includes(skillQ) ||
       c.name.toLowerCase().includes(skillQ),
   );
-  const skillOptions = filteredMcpCards.map((c) => ({
-    kind: (c.builtin ? "builtin" : "mcp") as "builtin" | "mcp",
-    name: c.name,
-  }));
+  const skillOptions = filteredMcpCards.map((c) => ({ kind: c.kind, name: c.name }));
   const atQuery = skillMentionQuery.trim().toLowerCase();
   const filteredSkills = bottomAnchoredByUsage(
     skillsList.filter(
@@ -1093,6 +1154,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // (watchdog stall retry, post-turn drain) is armed through these, so an
   // explicit Stop bumps the epoch and a timer firing afterwards is dropped
   // instead of restarting the turn and bringing the retry banner back.
+  // Auto-retry ladder for a turn that failed OUTRIGHT: the backend reported an
+  // error event, so the turn really died. Same cadence as the transport
+  // reconnect in api.ts — every 10s, at most 10 attempts. Model ERROR is
+  // retried; model SILENCE never is (a slow model must not be cut off, and the
+  // backend's only time-based cap is 24h precisely so it never fires).
+  const CHAT_ERROR_MAX_RETRIES = 10;
+  const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
   const autoRetryMapRef = useRef<Map<string, AutoRetryScheduler>>(new Map());
   const autoRetryFor = (chatId: string): AutoRetryScheduler => {
     let sched = autoRetryMapRef.current.get(chatId);
@@ -1224,16 +1292,41 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const compacting = chat?.compacting ?? false;
   const cmdError = chat?.cmdError ?? null;
   const skillNotice = chat?.skillNotice ?? null;
+  const undoNotice = chat?.undoNotice ?? null;
   const stalled = chat?.stalled ?? false;
   /** The Ctrl+X prefix is app-wide (managed in App.tsx), so its hint lives at
    *  the store root — it survives chat switches too. Rendered only in the
    *  focused panel so one Ctrl+X does not banner every visible window. */
   const rawPrefixNotice = useStore((s) => s.prefixNotice ?? null);
   const prefixNotice = rawPrefixNotice && isActive ? rawPrefixNotice : null;
-  const thinkingLevel = chat?.thinkingLevel ?? "medium";
+  const thinkingLevel = chat?.thinkingLevel ?? "xhigh";
   const setThinkingLevel = (lv: ThinkingLevel) => {
     if (chat) useStore.getState().setChatThinkingLevel(chat.id, lv);
   };
+
+  /** Abort a chat's in-flight turn (both the local mirror and the store's
+   *  authoritative controller). Used by /undo, /redo, /clear and /new so the
+   *  removed/emptied history can never be repopulated by a live reply. */
+  const stopChatStream = useCallback((id: string) => {
+    try {
+      abortMapRef.current.get(id)?.abort();
+    } catch {
+      /* already aborted */
+    }
+    const s = useStore.getState();
+    try {
+      s.chatAborts[id]?.abort();
+    } catch {
+      /* already aborted */
+    }
+  }, []);
+
+  /** Show a transient notice banner on this chat (auto-dismissed by the
+   *  undoNotice effect below) instead of posting a permanent assistant turn. */
+  const setNotice = useCallback((text: string) => {
+    const id = chatIdRef.current;
+    if (id) useStore.getState().setChatUndoNotice(id, text);
+  }, []);
 
   // Reasoning-effort popup (replaces the native <select>): open state + close
   // on outside click / Escape.
@@ -1308,6 +1401,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
     };
   }, [chat?.id, chat?.compactNotice]);
+
+  // Same auto-dismiss for the /undo and /redo feedback: show it ~4.5s, fade out
+  // over 0.5s, then drop it from the store. Kept separate from the compact
+  // notice so a running compaction never swallows the undo ack.
+  const [undoNoticeLeaving, setUndoNoticeLeaving] = useState(false);
+  const undoNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!chat?.undoNotice) {
+      setUndoNoticeLeaving(false);
+      return;
+    }
+    setUndoNoticeLeaving(false);
+    undoNoticeTimerRef.current = setTimeout(() => {
+      setUndoNoticeLeaving(true);
+      undoNoticeTimerRef.current = setTimeout(() => {
+        useStore.getState().setChatUndoNotice(chat.id, null);
+      }, 500);
+    }, 4500);
+    return () => {
+      if (undoNoticeTimerRef.current) clearTimeout(undoNoticeTimerRef.current);
+    };
+  }, [chat?.id, chat?.undoNotice]);
 
   // Switch the CURRENT chat's mode. No UI toast — the agent knows which mode the
   // next message runs in; the user doesn't need a visible confirmation.
@@ -1455,7 +1570,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         .fsRead(wroot, a)
         .then((r) => {
           if (cancelled) return;
-          total += r.content.length;
+          // fsRead returns null for a missing/unreadable file — never let the
+          // attachment-size sweep throw on it.
+          total += r?.content?.length ?? 0;
           setAttLen(total);
         })
         .catch(() => undefined);
@@ -1854,7 +1971,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // as the browser actually renders the content around the anchor, until the
     // position stabilizes or the user scrolls away.
     restoreTargetRef.current = { id: anchorId, offset: pos.offset };
-  }, [restoreTick, msgLimit, chat]);
+  }, [restoreTick, msgLimit, chat?.hydrated, chat?.messages?.length]);
 
   // Flush the saved scroll position on unmount (chat switch) and on app close
   // (pagehide/beforeunload) so the last viewport is never lost. The store write
@@ -2064,8 +2181,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // opencode's `overflow.ts` accounting. opencode shows 0% until the first real
   // usage event arrives — no estimate fallback — so a brand-new chat reads empty.
   const contextUsed = useMemo(
-    () => computeContextUsed(chat, systemPrompt, ctxWindow ?? undefined),
-    [chat, systemPrompt, ctxWindow],
+    () =>
+      computeContextUsed(
+        chat,
+        systemPrompt,
+        ctxWindow ?? undefined,
+        historyLimit,
+      ),
+    [chat, systemPrompt, ctxWindow, historyLimit],
   );
 
   // Warn (yellow) when used context reaches the auto-compaction threshold
@@ -2117,8 +2240,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     );
   };
   const openCtxPopover = () => {
-    // The ring lives inside the "+" menu's ref container now, so its own
-    // pointer-down no longer counts as "outside" — close that menu here.
+    // The ring moved to the composer footer, but only one composer popover
+    // should ever be open: dismiss the "+" menu explicitly.
     setPlusMenuOpen(false);
     cancelCtxPopoverClose();
     // The mount-time fetch can race the sidecar (empty result) or the backend
@@ -2800,6 +2923,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         skillsChars: real.skillsChars,
         mcpChars: real.mcpChars,
         systemToolsChars: real.systemToolsChars,
+        historyLimit,
       });
     }
     // Fallback estimate (before the first turn reports): the AVAILABLE
@@ -2825,6 +2949,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return buildContextBreakdown(chat, systemPrompt, usable ?? ctxWindow, {
       skillsChars,
       mcpChars,
+      historyLimit,
     });
   }, [
     ctxPopoverOpen,
@@ -2836,6 +2961,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     skillsList,
     mcpEnabled,
     settings.mcpServers,
+    historyLimit,
   ]);
 
   // This chat's CUMULATIVE token usage & cost per model (main + explore /
@@ -2914,8 +3040,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // would read `chatIdRef.current` (the viewed chat) and inject A's turn
     // into B — the cross-chat contamination reported by users.
     const chatId = forChatId ?? chatIdRef.current;
-    const chat = s.chats.find((c) => c.id === chatId) ?? null;
+    let chat = s.chats.find((c) => c.id === chatId) ?? null;
     if (!chat) return;
+    // The transcript may still be on disk (index-only row). Fetch it BEFORE
+    // building the request, otherwise `history` would be built from an empty
+    // message array and the turn would reach the model with no context at all —
+    // exactly the "it forgot everything" failure the lazy-body layout must
+    // never cause.
+    if (chat.hydrated === false) {
+      await ensureChatHydrated(chatId);
+      const fresh = useStore.getState().chats.find((c) => c.id === chatId) ?? null;
+      if (!fresh || fresh.hydrated === false) return;
+      chat = fresh;
+    }
+    // Single-flight per chat. The automatic re-entry paths (watchdog retry,
+    // backend-error retry, queued/steer drains, live voice) used to be able to
+    // start a SECOND turn while one was still streaming into the same chat:
+    // `abortMapRef` was overwritten (the first controller became unreachable and
+    // was never aborted) and the same tool work ran twice. Only the keyboard
+    // path guarded against this. A controller that is already aborted belongs to
+    // a dead turn (Stop / watchdog), so it never blocks the retry.
+    const inFlight = abortMapRef.current.get(chatId);
+    if (inFlight && !inFlight.signal.aborted) return;
     // Persistent goal: when active and not paused, the condition rides along
     // with every model prompt (the visible bubble stays clean). `stopped`
     // does NOT detach the goal — a manual send after Stop still pursues it.
@@ -3170,7 +3316,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // re-serialized and re-parsed them (the long-chat memory spike).
       // See src/lib/historyPayload.ts.
       .map(projectHistoryMessage);
-    const history = allHistory as StreamParams["history"];
+    // History turn limit (Settings → General): keep only the last N turns on
+    // the wire. Slicing is always on a `user` boundary, so a tool call and its
+    // result are never orphaned, and compacted summaries always survive
+    // (applyHistoryLimit) — so an auto-compact checkpoint still reaches the
+    // model. 0 (the default) sends the full history, unchanged.
+    const history = applyHistoryLimit(
+      allHistory as StreamParams["history"],
+      historyLimit,
+    );
 
     const abort = new AbortController();
     abortMapRef.current.set(chat.id, abort);
@@ -3230,7 +3384,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       useStore.getState().updateMessage(assistantMsg.id, {
         content: prev + clean,
         segments: appendTextSegment(cur?.segments, clean),
-        ...(cur?.retry?.fallback === true ? {} : { retry: null }),
+        ...(cur?.retry?.fallback === true || !!cur?.retry?.agent
+          ? {}
+          : { retry: null }),
         thinkingActive: false,
         statusText: undefined,
         lspStatus: undefined,
@@ -3554,7 +3710,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           !r ||
           r.gaveUp === true ||
           r.watchdog === true ||
-          r.fallback === true
+          r.fallback === true ||
+          // A sub-agent retry is INFORMATIONAL: the parent turn keeps streaming
+          // its own tool events while explore retries, so those events must not
+          // wipe the banner — only the sub-agent's own progress should.
+          !!r.agent
         )
           return;
         store.updateMessage(assistantMsg.id, { retry: null });
@@ -3586,7 +3746,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // retry resumed into a long thinking pass before the first text/tool
           // chunk arrives), clear it now — the model is clearly working again.
           // Sub-agent fallback notice survives: it explains which model to fix.
-          ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
+          ...(findMsg()?.retry?.fallback === true || !!findMsg()?.retry?.agent
+            ? {}
+            : { retry: null }),
           ...(event.active ? { statusText: undefined } : {}),
         });
       } else if (event.kind === "skill") {
@@ -3622,43 +3784,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const targetId = p.chat_id || chat?.id || "";
         if (!targetId) return;
         setCtxPartsByChat((prev) => ({ ...prev, [targetId]: p }));
-      } else if (event.kind === "subagent_models") {
-        // Debug-only routing info. Deliberately NOT rendered into the chat —
-        // the user asked for subagent model lists to stay out of the message.
-        //
-        // It IS used for one thing: registering each subagent's ACTUAL model
-        // into recentModels, mirroring the addRecentModel call the parent
-        // turn makes above. Sidebar's "Model usage" panel groups usage by
-        // provider using recentModels as its STRONGEST signal — without
-        // this, a subagent running a different model than the parent's
-        // configured one (explore auto-picks a cheaper model; a manually
-        // configured subagent can route through an entirely different
-        // provider) has nothing but a weak bare-name match to go on, and can
-        // land under the WRONG provider's group whenever two providers
-        // happen to list a model with the same last path segment (e.g. the
-        // opencode gateway mirrors nearly every model).
-        const models = event.models ?? {};
-        for (const [agent, ranModel] of Object.entries(models)) {
-          // A failed subagent build is reported as "entry ⚠ build failed →
-          // parent" (see agents.py:_routing_label) — not a real model id.
-          if (!ranModel || ranModel.includes("⚠")) continue;
-          const entry = (store.subagentModels?.[agent] || "").trim();
-          // A subagent entry may be "providerId/model", routing it through a
-          // DIFFERENT provider than the parent (mirrors the backend's own
-          // _resolve_subagent parsing). A bare entry — or no entry at all,
-          // i.e. explore's auto-pick — runs on the parent's own provider.
-          const slash = entry.indexOf("/");
-          const prefix = slash > 0 ? entry.slice(0, slash) : "";
-          const explicitProvider = prefix
-            ? store.settings.providers.find(
-              (p) => p.id === prefix || p.kind === prefix,
-            )
-            : undefined;
-          store.addRecentModel(
-            ranModel,
-            explicitProvider?.id ?? activeProvider.id,
-          );
-        }
       } else if (event.kind === "tool") {
         bumpToolRunning(toolRunning);
         clearTransientRetry();
@@ -3668,13 +3793,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         if (event.tool === "create_mcp") mcpChanged = true;
         // Codex-style: the first browser tool call of a turn docks the Browser
         // viewer tab on the right so the user watches the shared session live.
-        // MCP tools arrive either bare (`browser_navigate`) or qualified
-        // (`mcp__playwright__browser_navigate`) — both must dock the panel,
-        // otherwise the agent's browser work stays invisible in the app.
+        // The tools are native now, but a user-added MCP connector could still
+        // claim the same name and arrive qualified
+        // (`mcp__some-server__browser_navigate`) — both forms must dock the
+        // panel, otherwise the agent's browser work stays invisible in the app.
         if (isBrowserTool(event.tool ?? "")) {
           const browserVt = useViewerTabs.getState();
-          if (!browserVt.tabs.some((t) => t.kind === "browser" && t.chatId === chat.id))
-            browserVt.openBrowser(chat.id);
+          // The tool's own `url` arg is the page the agent is opening: hand it
+          // to the panel so the tab lands THERE. Reading only the tool NAME
+          // docked an about:blank browser while the agent worked on a real
+          // page, so the panel never showed what the agent actually saw.
+          const rawUrl = event.args?.url;
+          const pageUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
+          const hasTab = browserVt.tabs.some(
+            (t) => t.kind === "browser" && t.chatId === chat.id,
+          );
+          if (!hasTab) browserVt.openBrowser(chat.id, pageUrl);
+          else if (pageUrl && pageUrl !== "about:blank")
+            browserVt.setBrowserUrl(chat.id, pageUrl);
         }
         // Sub-agent tool calls (task/explore's internal read/grep/glob, or a
         // general sub-agent reusing the parent's tools) render NESTED inside
@@ -3715,7 +3851,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             const toolIndex = current.length;
             store.updateMessage(assistantMsg.id, {
               toolActivity: next,
-              ...(findMsg()?.retry?.fallback === true ? {} : { retry: null }),
+              ...(findMsg()?.retry?.fallback === true || !!findMsg()?.retry?.agent
+                ? {}
+                : { retry: null }),
               statusText: undefined,
             });
             // Atomic segment append so a concurrent steer_applied cannot be
@@ -3739,6 +3877,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           reason: event.reason ?? "",
           model: event.model ?? "",
           agent: event.agent ?? "",
+          tool: event.tool ?? "",
           fallback: event.fallback,
           reconnecting: event.reconnecting,
           startedAt: Date.now(),
@@ -3750,7 +3889,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // (the turn is still alive); once the model resumes (thinking /
           // text / tool events), the banner is cleared automatically via
           // retry:null in those handlers.
-          resolveStuckCards();
+          //
+          // EXCEPT for a sub-agent retry: its explore card is genuinely still
+          // working (it will run again after the delay), so closing its
+          // running tool cards here would show a dead card during the retry.
+          if (!event.agent) resolveStuckCards();
           store.updateMessage(assistantMsg.id, { retry: info });
         } else {
           const cur = findMsg();
@@ -3782,6 +3925,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             gaveUp: true,
             model: event.model ?? "",
             agent: event.agent ?? "",
+            tool: event.tool ?? "",
             fallback: event.fallback,
           },
         });
@@ -3926,7 +4070,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const incoming = event.items ?? [];
         store.updateMessage(assistantMsg.id, {
           plan: incoming,
-          retry: null,
+          // A sub-agent retry banner is informational and the parent is still
+          // alive (update_plan is the parent's own tool call) — keep it.
+          ...(findMsg()?.retry?.agent ? {} : { retry: null }),
         });
         // The right panel never opens automatically, even with a fresh todo;
         // only the user opens it via button/shortcut.
@@ -4043,6 +4189,44 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // Fold the completed tool calls into content too — the backend fatal
         // arrives as an inline event, not a throw, so the catch path won't run.
         preserveToolActivity();
+        // Recover from a transient provider failure WITHOUT making the user
+        // click Retry: re-send the last user turn on a fixed 10s ladder, at most
+        // 10 times, resuming into this same assistant bubble so the partial
+        // reply and the completed tool calls are kept (restart=false → the
+        // backend continues from its checkpoint instead of redoing the work).
+        // Once the ladder is exhausted the static banner above stays, so there
+        // is always a one-click manual path left.
+        const liveChat = useStore.getState().chats.find((c) => c.id === chat.id);
+        const liveMsgs = liveChat?.messages ?? [];
+        const lastUserMsg = [...liveMsgs].reverse().find((m) => m.role === "user");
+        const seenAttempts =
+          liveMsgs.find((m) => m.id === assistantMsg.id)?.retry?.attempt ?? 1;
+        if (lastUserMsg && seenAttempts < CHAT_ERROR_MAX_RETRIES) {
+          useStore.getState().updateMessage(assistantMsg.id, {
+            retry: {
+              attempt: seenAttempts + 1,
+              maxAttempts: CHAT_ERROR_MAX_RETRIES,
+              delay: CHAT_ERROR_RETRY_DELAY_MS / 1000,
+              reason: event.content ?? "The backend returned an error.",
+              reconnecting: true,
+            },
+          });
+          const originId = chat.id;
+          const continueId = assistantMsg.id;
+          autoRetryFor(originId).schedule(CHAT_ERROR_RETRY_DELAY_MS, () =>
+            send(
+              lastUserMsg.content,
+              lastUserMsg.attachments ?? [],
+              lastUserMsg.images ?? [],
+              false,
+              lastUserMsg.id,
+              continueId,
+              false,
+              undefined,
+              originId,
+            ),
+          );
+        }
       } else if (event.kind === "steer_applied") {
         // The running agent consumed these steer messages (injected into a tool
         // result). Move each one inline: hide its own bottom bubble and append
@@ -4093,6 +4277,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             steerPending: true,
             steerInterleaved: false,
           });
+        }
+      } else if (event.kind === "steer_interrupt") {
+        // The backend DROPPED the in-flight model reply to take this steer right
+        // away instead of letting the answer finish first — that wait was the
+        // "steer behaves like a queued message" report. Nothing needs to be
+        // re-sent from here: the steer is still in the backend's inbox and the
+        // re-issued step picks it up, then confirms with `steer_applied`. Keep
+        // the bubble pending meanwhile so it never looks lost, and do not touch
+        // `steerInterleaved` — an earlier tool result may already own a segment
+        // for this id.
+        const ids = Array.isArray(event.ids) ? event.ids : [];
+        for (const id of ids) {
+          useStore.getState().updateMessage(id, { steerPending: true });
         }
       } else if (event.kind === "status") {
         // Staged progress before first token (preparing context, contacting
@@ -4223,6 +4420,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           const r = curMsg.retry;
           const isTerminal = r.gaveUp === true || r.watchdog === true || r.fallback === true;
           const isFailedTurn = curMsg.error === true;
+          // A live sub-agent retry banner is transient: the turn is over, so it
+          // retires like any other in-progress retry. If the sub-agent really
+          // gave up, its own `retry_giveup` arrived first and left a terminal
+          // `gaveUp` banner, which `isTerminal` protects.
           if (!isTerminal && !isFailedTurn) {
             useStore.getState().updateMessage(assistantMsg.id, { retry: null });
           }
@@ -4281,13 +4482,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // Settings → Plugins order decides the web_search engine chain
           // (top = primary, below = fallbacks tried in order).
           searchPlugins: s.searchPlugins,
+          // Settings → Web Providers: how many results a web_search returns and
+          // how many of them get their real page content fetched (0 = snippets only).
+          webSearchAutoFetch: s.webSearchAutoFetch,
           skills: effectiveSkills,
           allowCreate,
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerUse,
+          allowBrowser: s.browserUse,
           subagentModels: s.subagentModels,
+          subagentThinking: s.subagentThinking,
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
@@ -4402,9 +4608,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (chat.id) {
       const st = useStore.getState();
       const cNow = st.chats.find((c) => c.id === chat.id);
-      // Drain undelivered steers first (they are real user messages already in
-      // the transcript, reused as the next turn), then queued items.
-      if (cNow) {
+      // A failed turn has ALREADY armed its own 10s retry on this very
+      // scheduler. Draining here would call `schedule()` again, and that method
+      // clears the pending timer first — silently cancelling the error retry
+      // (and leaving its banner counting down to nothing). The retry owns the
+      // next turn, so the drain must stand down and let it fire.
+      const retryArmed =
+        cNow?.messages.some((m) => m.error && m.retry && m.retry.gaveUp !== true) === true;
+      if (cNow && !retryArmed) {
+        // Drain undelivered steers first (they are real user messages already in
+        // the transcript, reused as the next turn), then queued items.
         const pendingSteer = cNow.messages.find(
           (m) => m.role === "user" && m.steerPending,
         );
@@ -4545,13 +4758,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     let result: CompactResult | null = null;
     let errMsg = "";
     try {
-      result = await triggerCompact({
+      // Per-tool reasoning: the compact slot's own level wins; empty inherits
+    // the origin chat's level. A model that cannot reason sends "".
+    const compactSlotThinking = (s.subagentThinking?.compact || "") as typeof thinkingLevel;
+    const compactThinkingLevel =
+      compactSlotThinking ||
+      ((useStore.getState().chats.find((c) => c.id === chatId)?.thinkingLevel ??
+        thinkingLevel) as typeof thinkingLevel);
+    const compactLevelSupported = supportsReasoning(
+      compactProvider.model,
+      compactProvider.kind,
+      modelReasoning(compactProvider, compactProvider.model),
+    );
+    result = await triggerCompact({
         provider: compactProvider,
         fallback: activeProvider,
         history,
         contextWindow:
           modelContextWindow(activeProvider, activeProvider.model) ?? 0,
         compactAtPercent: useStore.getState().settings.compactAtPercent ?? 80,
+        subagentThinking: s.subagentThinking,
+        thinkingLevel: compactLevelSupported ? compactThinkingLevel : "",
+        modelReasoning:
+          modelReasoning(compactProvider, compactProvider.model) ??
+          compactLevelSupported,
         signal: ctr.signal,
       });
     } catch (err) {
@@ -4596,12 +4826,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         cu.provider ||
         compactProvider.id ||
         activeProvider.id;
-      s.accrueChatUsage(ch.id, pid, cu.model || compactProvider.model, {
-        input: cu.input_tokens ?? 0,
-        output: cu.output_tokens ?? 0,
-        cacheRead: cu.cache_read_tokens ?? 0,
-        cacheWrite: cu.cache_write_tokens ?? 0,
-      });
+      s.accrueChatUsage(
+        ch.id,
+        pid,
+        normalizeUsageModel(pid, cu.model || compactProvider.model),
+        {
+          input: cu.input_tokens ?? 0,
+          output: cu.output_tokens ?? 0,
+          cacheRead: cu.cache_read_tokens ?? 0,
+          cacheWrite: cu.cache_write_tokens ?? 0,
+        },
+      );
     }
     useStore
       .getState()
@@ -4635,57 +4870,77 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     switch (word) {
       case "/compact":
+        // Guard re-entrancy at the call site: compactContext only waits for a
+        // live stream, it does not check the `compacting` flag it sets itself,
+        // so two fast submissions would run two summarizers and fold the
+        // history in interleaved order. The palette button is disabled while
+        // compacting; the typed command must be too.
+        if (ch?.compacting) {
+          setNotice("A compaction is already running…");
+          break;
+        }
         await compactContext();
         break;
       case "/clear":
-        if (ch) s.clearChat(ch.id);
+        // Emptying the chat must not race a live reply: abort this chat's turn
+        // first, then clear (the store drops the chat's undo/redo stacks too).
+        if (ch) {
+          stopChatStream(ch.id);
+          s.clearChat(ch.id);
+        }
         break;
       case "/new":
+        // Same for /new: the old chat keeps streaming in the background
+        // otherwise, writing tokens into a chat the user just left.
+        if (ch) stopChatStream(ch.id);
         s.newChat(ch?.mode);
         break;
       case "/plan": {
         // Codex-style entry to Plan mode: switch the chat, then either wait
         // for the request (`/plan` alone) or plan the given text right away.
-        if (ch) s.setChatMode(ch.id, "plan");
+        if (!ch) break;
+        s.setChatMode(ch.id, "plan");
         const rest = v.slice("/plan".length).trim();
         if (!rest) {
-          s.addMessage(ch?.id ?? "", {
+          s.addMessage(ch.id, {
             role: "assistant",
             content:
               "Plan mode selected — describe what to plan. I will scout the code and lay out the steps without changing anything.",
           });
           break;
         }
-        const created = s.addMessage(ch?.id ?? "", {
+        const created = s.addMessage(ch.id, {
           role: "user",
           content: rest,
-          ...(ch ? { mode: "plan" as AgentMode } : {}),
+          mode: "plan" as AgentMode,
         });
-        void send(rest, [], [], false, created.id);
+        // Target THIS chat explicitly and let send() queue behind any live
+        // turn instead of dropping the bubble it just created.
+        void send(rest, [], [], false, created.id, undefined, false, undefined, ch.id);
         break;
       }
       case "/undo":
-        if (ch && s.undoMessage()) {
-          s.addMessage(ch.id, { role: "assistant", content: "↩ Undone." });
+        // Abort this chat's in-flight turn first: undoing under a live stream
+        // leaves the reply appending to the truncated history. The store also
+        // refuses while a message is still streaming.
+        if (ch) stopChatStream(ch.id);
+        if (s.undoMessage()) {
+          setNotice("↩ Undid the last exchange.");
         } else {
-          s.addMessage(ch?.id ?? "", {
-            role: "assistant",
-            content: "Nothing to undo.",
-          });
+          setNotice("Nothing to undo.");
         }
         break;
       case "/redo":
-        if (ch && s.redoMessage()) {
-          s.addMessage(ch.id, { role: "assistant", content: "↪ Redone." });
+        if (ch) stopChatStream(ch.id);
+        if (s.redoMessage()) {
+          setNotice("↪ Restored the last exchange.");
         } else {
-          s.addMessage(ch?.id ?? "", {
-            role: "assistant",
-            content: "Nothing to redo.",
-          });
+          setNotice("Nothing to redo.");
         }
         break;
       case "/help":
-        s.addMessage(ch?.id ?? "", {
+        if (!ch) break;
+        s.addMessage(ch.id, {
           role: "assistant",
           content:
             "**Modes**\n\n" +
@@ -4706,11 +4961,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         break;
       case "/create-skill":
       case "/create-mcp": {
+        if (!ch) break;
         const target =
           word === "/create-skill" ? "skill" : "MCP connector";
         const rest = v.slice(word.length).trim();
         if (!rest) {
-          s.addMessage(ch?.id ?? "", {
+          s.addMessage(ch.id, {
             role: "assistant",
             content:
               word === "/create-skill"
@@ -4721,10 +4977,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         // Store the pretty label (no leading slash) as the visible bubble;
         // send() reuses this bubble but posts the full prompt to the model.
-        const created = s.addMessage(ch?.id ?? "", {
+        const created = s.addMessage(ch.id, {
           role: "user",
           content: prettySlashLabel(v),
-          ...(ch?.mode ? { mode: ch.mode } : {}),
+          ...(ch.mode ? { mode: ch.mode } : {}),
         });
         void send(
           target === "skill"
@@ -4734,6 +4990,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           [],
           true,
           created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
         );
         break;
       }
@@ -4773,16 +5033,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           [],
           false,
           created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
         );
         break;
       }
       default:
-        useStore
-          .getState()
-          .setChatCmdError(
-            ch?.id ?? "",
-            `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
-          );
+        // With no chat there is nowhere to render the banner (setChatCmdError
+        // only patches an existing chat), so surface it as a transient notice
+        // instead of silently swallowing the typo.
+        if (ch) {
+          useStore
+            .getState()
+            .setChatCmdError(
+              ch.id,
+              `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
+            );
+        } else {
+          setNotice(`Unknown command \`${word}\`. Type \`/help\` to see available commands.`);
+        }
     }
   };
 
@@ -5545,7 +5816,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           const friendly =
             `Voice transcription failed: ${msg}\n` +
             (msg.includes("Failed to fetch")
-              ? "The local Python server is likely down — restart the app."
+              ? "The speech provider is unreachable — check the STT provider in Settings → Media Providers."
               : "Please try again or check your microphone connection.");
           try {
             const bannerId = chatIdRef.current;
@@ -6632,6 +6903,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }}
       >
         <div className="chat-messages" data-dir={dir}>
+          {chat.hydrated === false ? (
+            <ChatLoader />
+          ) : (
+            <>
           {chat.messages.length === 0 && (
             <div className="empty-state">
               <div className="empty-modes">
@@ -6859,10 +7134,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 watchdog={effectiveRetry.watchdog}
                 model={effectiveRetry.model}
                 agent={effectiveRetry.agent}
+                tool={effectiveRetry.tool}
                 fallback={effectiveRetry.fallback}
                 stalled={stalled}
                 startedAt={effectiveRetry.startedAt}
                 onRetry={() => {
+                  // A LIVE sub-agent retry (no gaveUp): the parent turn is STILL
+                  // streaming, so re-sending the turn is swallowed by send()'s
+                  // own single-flight guard (`abortMapRef` still holds this
+                  // chat's controller) and the button appeared DEAD. The right
+                  // action here is not to reboot the turn but to stop waiting:
+                  // ask the backend to skip the ladder's backoff so the next
+                  // explore attempt runs immediately.
+                  if (effectiveRetry.agent && !effectiveRetry.gaveUp) {
+                    const originId = chat?.id;
+                    if (originId) void retrySubagentNow(originId);
+                    return;
+                  }
                   // Resume-only (banner semantics via planRetry): re-send the last
                   // user turn WITHOUT deleting anything, reusing the user bubble
                   // and continuing the failed assistant bubble so completed tools,
@@ -6897,6 +7185,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             compactError ||
             compactNotice ||
             skillNotice ||
+            undoNotice ||
             liveError ||
             chat?.liveError ||
             chat?.ttsError ||
@@ -7004,6 +7293,39 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     </button>
                   </div>
                 )}
+                {undoNotice && (
+                  <div
+                    className={`notice-banner notice-info${undoNoticeLeaving ? " notice-leaving" : ""}`}
+                    dir="ltr"
+                  >
+                    <span className="notice-icon">
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    </span>
+                    <span className="notice-text">{undoNotice}</span>
+                    <button
+                      type="button"
+                      className="notice-dismiss"
+                      onClick={() =>
+                        useStore.getState().setChatUndoNotice(chat.id, null)
+                      }
+                      title="Dismiss"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
                 {(liveError || chat?.liveError) && (
                   <div className="notice-banner notice-error" dir="ltr">
                     <span className="notice-icon">⚠</span>
@@ -7045,6 +7367,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 )}
               </div>
             )}
+            </>
+          )}
         </div>
         </div>
 
@@ -7090,21 +7414,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           (() => {
             const options = askReq.options;
             const sel = Math.min(planApprovalSel, Math.max(0, options.length - 1));
+            // Dismissing = delivering the dismiss sentinel; the card is only
+            // cleared once the backend accepted it.
             const clearReq = () =>
-              useStore.getState().setChatPendingAsk(chatIdRef.current, null);
+              answerAsk(askReq.id, PLAN_DISMISS_TOKEN, chatIdRef.current);
             // Option 0 is the Approve option (backend guarantees the order);
             // its answer is the sentinel, never the visible label.
             const answerOption = (i: number) => {
-              void respondAsk(
+              void answerAsk(
                 askReq.id,
                 i === 0 ? PLAN_APPROVE_TOKEN : (options[i] ?? ""),
+                chatIdRef.current,
               );
-              clearReq();
             };
             const submitFreeText = () => {
               if (!askFreeText.trim()) return;
-              void respondAsk(askReq.id, askFreeText.trim());
-              clearReq();
+              void answerAsk(askReq.id, askFreeText.trim(), chatIdRef.current);
             };
             const splitOption = (opt: string) => {
               const dash = opt.indexOf("—");
@@ -7206,8 +7531,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     type="button"
                     className="btn plan-approval-dismiss"
                     onClick={() => {
-                      void respondAsk(askReq.id, PLAN_DISMISS_TOKEN);
-                      clearReq();
+                      void clearReq();
                     }}
                   >
                     Dismiss
@@ -7264,10 +7588,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         type="button"
                         className="ask-option"
                         onClick={() => {
-                          void respondAsk(askReq.id, opt);
-                          useStore
-                            .getState()
-                            .setChatPendingAsk(chatIdRef.current, null);
+                          // Answer through the shared helper: the card is only
+                          // cleared once the backend has accepted the answer,
+                          // so a failed delivery stays visible and re-answerable
+                          // instead of stranding the turn forever.
+                          void answerAsk(askReq.id, opt, chatIdRef.current);
                         }}
                       >
                         <span className="ask-option-mark">
@@ -7309,10 +7634,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         askFreeText.trim()
                       ) {
                         e.preventDefault();
-                        void respondAsk(askReq.id, askFreeText.trim());
-                        useStore
-                          .getState()
-                          .setChatPendingAsk(chatIdRef.current, null);
+                        void answerAsk(
+                          askReq.id,
+                          askFreeText.trim(),
+                          chatIdRef.current,
+                        );
                       }
                     }}
                   />
@@ -7322,10 +7648,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       className="btn ask-send"
                       disabled={!askFreeText.trim()}
                       onClick={() => {
-                        void respondAsk(askReq.id, askFreeText.trim());
-                        useStore
-                          .getState()
-                          .setChatPendingAsk(chatIdRef.current, null);
+                        void answerAsk(
+                          askReq.id,
+                          askFreeText.trim(),
+                          chatIdRef.current,
+                        );
                       }}
                     >
                       {fa ? "ارسال" : "Send"}
@@ -7411,10 +7738,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     type="button"
                     className="btn perm-deny"
                     onClick={() => {
-                      void respondPermission(permissionReq.id, false);
-                      useStore
-                        .getState()
-                        .setChatPendingPermission(chatIdRef.current, null);
+                      void answerPermission(
+                        permissionReq.id,
+                        false,
+                        chatIdRef.current,
+                      );
                     }}
                   >
                     {denyLabel}
@@ -7424,10 +7752,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       type="button"
                       className="btn perm-allow"
                       onClick={() => {
-                        void respondPermission(permissionReq.id, true);
-                        useStore
-                          .getState()
-                          .setChatPendingPermission(chatIdRef.current, null);
+                        void answerPermission(
+                          permissionReq.id,
+                          true,
+                          chatIdRef.current,
+                        );
                       }}
                     >
                       {fa ? "تأیید" : "Confirm"}
@@ -7438,10 +7767,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         type="button"
                         className="btn perm-allow"
                         onClick={() => {
-                          void respondPermission(permissionReq.id, true);
-                          useStore
-                            .getState()
-                            .setChatPendingPermission(chatIdRef.current, null);
+                          void answerPermission(
+                            permissionReq.id,
+                            true,
+                            chatIdRef.current,
+                          );
                         }}
                       >
                         {fa ? "اجازه موقت" : "Allow once"}
@@ -7450,7 +7780,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         type="button"
                         className="btn perm-allow-always"
                         onClick={() => {
-                          void respondPermission(permissionReq.id, true);
                           // scope-aware: "Always allow" persists the grant matching
                           // the dialog's scope — computer vs outside-workspace.
                           if (permissionReq.scope === "computer") {
@@ -7466,9 +7795,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           } else {
                             useStore.getState().setOutsideAllowed(true);
                           }
-                          useStore
-                            .getState()
-                            .setChatPendingPermission(chatIdRef.current, null);
+                          void answerPermission(
+                            permissionReq.id,
+                            true,
+                            chatIdRef.current,
+                          );
                         }}
                       >
                         {fa ? "همیشه اجازه بده" : "Always allow"}
@@ -7526,6 +7857,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   baseUrl: commitProvider.baseUrl,
                   apiKeys: providerApiKeys(commitProvider),
                   id: commitProvider.id,
+                  // The commit message is a main-model-quality call, so it uses
+                  // the chat's own level (the compact SLOT level does not apply).
+                  thinkingLevel: supportsReasoning(
+                    commitModel,
+                    commitProvider.kind,
+                    modelReasoning(commitProvider, commitModel),
+                  )
+                    ? chat.thinkingLevel ?? thinkingLevel
+                    : "",
+                  modelReasoning:
+                    modelReasoning(commitProvider, commitModel) ??
+                    supportsReasoning(
+                      commitModel,
+                      commitProvider.kind,
+                      modelReasoning(commitProvider, commitModel),
+                    ),
                 });
                 if ("error" in res) {
                   useStore.getState().setChatCmdError(chatId, res.error);
@@ -7545,7 +7892,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   useStore.getState().accrueChatUsage(
                     chatId,
                     pid,
-                    cu.model || commitModel,
+                    normalizeUsageModel(pid, cu.model || commitModel),
                     {
                       input: cu.input_tokens ?? 0,
                       output: cu.output_tokens ?? 0,
@@ -7802,8 +8149,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     if (e.key === "Enter") {
                       e.preventDefault();
                       const opt = skillOptions[skillIdx];
-                      if (opt?.kind === "builtin")
-                        setComputerUse(!computerUse);
+                      if (opt?.kind === "computer") setComputerUse(!computerUse);
+                      else if (opt?.kind === "browser") setBrowserUse(!browserUse);
                       else if (opt)
                         setMcpEnabled(opt.name, !mcpEnabled.includes(opt.name));
                       return;
@@ -7830,11 +8177,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 {filteredMcpCards.length > 0 && (
                   <div className="mcp-grid">
                     {filteredMcpCards.map((c, i) => {
-                      const on = c.builtin
-                        ? computerUse
-                        : mcpEnabled.includes(c.name);
+                      const on =
+                        c.kind === "computer"
+                          ? computerUse
+                          : c.kind === "browser"
+                            ? browserUse
+                            : mcpEnabled.includes(c.name);
                       const toggle = () => {
-                        if (c.builtin) setComputerUse(!on);
+                        if (c.kind === "computer") setComputerUse(!on);
+                        else if (c.kind === "browser") setBrowserUse(!on);
                         else setMcpEnabled(c.name, !on);
                       };
                       return (
@@ -7842,9 +8193,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           key={c.name}
                           className={`mention-item mcp-toggle${on ? " on" : ""} ${i === skillIdx ? "kbd" : ""}`}
                           title={
-                            c.builtin
+                            c.kind === "computer"
                               ? "Desktop control — when off, the agent never gets the computer tool"
-                              : undefined
+                              : c.kind === "browser"
+                                ? "Agent browsing — when off, no browser tool is bound and no browser window is opened"
+                                : undefined
                           }
                           onMouseEnter={() => setSkillIdx(i)}
                           onMouseDown={(e) => {
@@ -8145,38 +8498,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           <path d="M12 17v5" />
                         </svg>
                         <span>MCP connectors</span>
-                        {mcpEnabled.length > 0 && (
+                        {mcpEnabled.length +
+                          (computerUse ? 1 : 0) +
+                          (browserUse ? 1 : 0) >
+                          0 && (
                           <span className="plus-menu-badge">
-                            {mcpEnabled.length}
+                            {mcpEnabled.length +
+                              (computerUse ? 1 : 0) +
+                              (browserUse ? 1 : 0)}
                           </span>
                         )}
                       </button>
                     </div>
                   )}
-                  <div
-                    className="ctx-ring-wrap"
-                    ref={ctxRingWrapRef}
-                    onMouseEnter={openCtxPopover}
-                    onMouseLeave={scheduleCtxPopoverClose}
-                  >
-                    <button
-                      type="button"
-                      className={`ctx-ring-btn${contextWarn(contextUsed, usable) ? " warn" : ""}`}
-                      aria-label="Context windows"
-                      aria-haspopup="dialog"
-                      aria-expanded={ctxPopoverOpen}
-                      onClick={() =>
-                        ctxPopoverOpen
-                          ? setCtxPopoverChatId(null)
-                          : openCtxPopover()
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape") setCtxPopoverChatId(null);
-                      }}
-                    >
-                      <ContextRing pct={ctxPct} />
-                    </button>
-                  </div>
                 </div>
                 <div className="composer-right-actions" ref={composerRightRef}>
                   {showLiveActive && (
@@ -8623,7 +8957,37 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </span>
                 )}
             </span>
-            <ProviderModelSelect chatId={chat?.id ?? activeChatId} />
+            <ProviderModelSelect chatId={chat?.id ?? activeChatId} compact />
+            {/* Context meter: sits in the footer cluster next to the mode pill,
+                the thinking level and the model picker instead of inside the
+                input row. It reports conversation state, not an input action,
+                so it belongs with the other status controls — and the input
+                row is the tightest space in the composer. The breakdown
+                popover still anchors to this element's viewport rect. */}
+            <div
+              className="ctx-ring-wrap"
+              ref={ctxRingWrapRef}
+              onMouseEnter={openCtxPopover}
+              onMouseLeave={scheduleCtxPopoverClose}
+            >
+              <button
+                type="button"
+                className={`ctx-ring-btn${contextWarn(contextUsed, usable) ? " warn" : ""}`}
+                aria-label="Context windows"
+                aria-haspopup="dialog"
+                aria-expanded={ctxPopoverOpen}
+                onClick={() =>
+                  ctxPopoverOpen
+                    ? setCtxPopoverChatId(null)
+                    : openCtxPopover()
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setCtxPopoverChatId(null);
+                }}
+              >
+                <ContextRing pct={ctxPct} />
+              </button>
+            </div>
           </span>
         </div>
       </div>

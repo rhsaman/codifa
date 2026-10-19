@@ -7,9 +7,9 @@
 //! than from processes: N open chats cost one Chromium instead of N, while
 //! cookies/logins stay shared. The right-side Browser panel polls
 //! `/browser/screenshot` for JPEG frames and posts its clicks/keys back through
-//! `/browser/*`, while the agent's Playwright MCP connector attaches to the SAME
-//! browser via `--cdp-endpoint` — so both sides drive one page and nothing ever
-//! opens outside the app.
+//! `/browser/*`. The agent drives the SAME tab through `browser_driver`, a
+//! long-lived CDP session on the same browser — so both sides drive one page and
+//! nothing ever opens outside the app.
 //!
 //! The user's real mouse and keyboard are never touched: every input goes
 //! through CDP. All entry points are safe to call while the session is down —
@@ -101,61 +101,192 @@ fn profile_dir() -> PathBuf {
     data_root().join("browser-profile")
 }
 
-/// Resolve an executable on PATH (a GUI-launched app has a minimal PATH, so
-/// the login-shell PATH is merged in first — same helper the sidecar uses).
-fn which(name: &str) -> Option<PathBuf> {
-    let path = crate::shell_env::shell_path();
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+/// The directories the app may keep its OWN automation browser in, newest
+/// scheme first. The app data dir is preferred because it is where the
+/// one-click install (see `install`) unpacks into, and it always has a usable
+/// binary shape; the Playwright cache is honoured second so an existing
+/// `npx playwright install chromium` keeps working.
+fn browser_roots() -> Vec<PathBuf> {
+    let mut out = vec![data_root().join("browser")];
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join("Library/Caches/ms-playwright"));
     }
-    None
+    out
 }
 
-/// Chromium binaries to try, in order: Playwright's bundled build first (it is
-/// already on disk for most installs), then the system browsers.
+/// Layouts a Chromium build may use under a root: [dir-fragment, binary].
+///
+/// Chrome-for-Testing names its macOS binary `Google Chrome for Testing` inside
+/// `Google Chrome for Testing.app`; a Playwright Chromium uses `Chromium`; the
+/// headless shell ships a loose `chrome-headless-shell`. Every fragment is
+/// tried under each matching build dir, so one list covers all of them.
+const BROWSER_LAYOUTS: &[(&str, &str)] = &[
+    ("chrome-mac-arm64", "Google Chrome for Testing"),
+    ("chrome-mac-x64", "Google Chrome for Testing"),
+    ("chrome-mac", "Chromium"),
+    ("chrome-headless-shell-mac-arm64", "chrome-headless-shell"),
+    ("chrome-headless-shell-mac-x64", "chrome-headless-shell"),
+];
+
+/// Directories that look like an installed Chromium under `root`, best first.
+///
+/// Sorted by the build number embedded in the name (`chromium-1223`,
+/// `chrome-headless-shell-140.0.7339.82`) rather than lexicographically, so
+/// "newest first" survives the three-digit → four-digit rollover that made the
+/// old `sort().reverse()` pick an older build.
+fn candidate_dirs(root: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("chromium")
+                            || n.starts_with("chrome-headless-shell")
+                            || n.starts_with("chrome-for-testing")
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort_by(|a, b| build_rank(a).cmp(&build_rank(b)));
+    dirs.reverse();
+    dirs
+}
+
+/// The FIRST numeric component of a build directory name, for newest-first
+/// ordering (`chrome-headless-shell-140.0.7339.82` → 140, `chromium-1223` →
+/// 1223). The leading number is the build's own revision/major, which is the
+/// only component that orders builds; the trailing ones are build metadata (the
+/// patch component of two different majors says nothing). Names without a
+/// number rank lowest so they never win.
+fn build_rank(dir: &std::path::Path) -> u64 {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .split(['-', '.'])
+        .find_map(|part| part.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Every bundled-Chromium binary the app may use, newest build first.
+///
+/// Deliberately EXCLUDES the system browsers. Running the automation browser
+/// out of `/Applications/Google Chrome.app` gave the headless instance the same
+/// bundle id (`com.google.Chrome`) as the user's real Chrome: it registered
+/// with LaunchServices, spawned Chrome's own crashpad handler and GoogleUpdater
+/// against the user's profile, and fought the real Chrome over the display
+/// (`CVDisplayLinkCreateWithCGDisplay failed` on repeat). The user's everyday
+/// browser froze while the app was open. So: either the app has its own
+/// Chromium build (bundled here, or installed by the one-click flow), or the
+/// browser feature reports itself as unavailable — it never hijacks the user's
+/// browser. Installing Chromium is a deliberate, one-click action instead.
 fn chromium_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        let cache = home.join("Library/Caches/ms-playwright");
-        if let Ok(entries) = std::fs::read_dir(&cache) {
-            let mut dirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().starts_with("chromium"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            dirs.sort();
-            dirs.reverse(); // newest build first
-            for d in dirs {
-                out.push(d.join("chrome-mac/Chromium.app/Contents/MacOS/Chromium"));
+    for root in browser_roots() {
+        for dir in candidate_dirs(&root) {
+            // Every layout is probed under every build dir; `find_chromium`
+            // picks the first that is really a file, so a layout that does not
+            // apply to this build costs one failed `is_file()`.
+            for (fragment, binary) in BROWSER_LAYOUTS {
+                out.push(
+                    dir.join(fragment)
+                        .join(format!("{binary}.app/Contents/MacOS/{binary}")),
+                );
+                out.push(dir.join(fragment).join(binary));
             }
-        }
-    }
-    for p in [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    ] {
-        out.push(PathBuf::from(p));
-    }
-    for name in ["chromium", "google-chrome", "chrome", "chromium-browser"] {
-        if let Some(p) = which(name) {
-            out.push(p);
+            // A flat unpack (the installer's own layout): <dir>/<binary>.
+            for (_, binary) in BROWSER_LAYOUTS {
+                out.push(dir.join(binary));
+            }
         }
     }
     out
 }
 
-/// First Chromium that actually exists on disk.
+/// First bundled Chromium that actually exists on disk.
 fn find_chromium() -> Option<PathBuf> {
     chromium_candidates().into_iter().find(|p| p.is_file())
+}
+
+/// True when no usable automation browser is installed. Kept as its own
+/// function so the sidecar can offer the one-click install instead of failing
+/// with an error the user cannot act on.
+pub fn is_available() -> bool {
+    find_chromium().is_some()
+}
+
+/// Does this command line belong to the browser THIS app launched?
+///
+/// Used by the startup orphan sweep, which must never touch a browser the user
+/// started themselves. Both markers are required: our own profile directory
+/// (nobody else points a browser at `~/.codifa/browser-profile`) and a
+/// remote-debugging port (only an automation instance has one).
+fn is_our_driver(args: &str, profile: &std::path::Path) -> bool {
+    args.contains(profile.to_string_lossy().as_ref())
+        && args.contains("--remote-debugging-port=")
+        && !args.contains("--type=")
+}
+
+/// Launch flags for `bin` on `port` against `profile`.
+///
+/// Split out from the spawn so the flag set is unit-testable: the flags carry
+/// real decisions (see the comments), and a wrong one either loses the frame
+/// or drags the user's own Chrome settings into the automation session.
+fn launch_args(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={port}"),
+        format!(
+            "--remote-allow-origins=http://127.0.0.1:{port},https://chrome-devtools-frontend.appspot.com"
+        ),
+        // The frames are captured over CDP, so the window is never shown. Plain
+        // `--headless` IS the new headless mode on Chrome 112+; the
+        // `--headless=new` spelling was dropped in later releases and made
+        // Chromium exit before opening the debugging port.
+        "--headless".to_string(),
+        // A dedicated profile keeps this browser completely separate from the
+        // user's own Chrome (cookies, extensions, crashpad database).
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--window-size=1280,800".to_string(),
+    ];
+    // `--disable-gpu` is only needed by the desktop builds, which rasterize on
+    // the GPU. The headless shell has no GPU stack at all, and passing the flag
+    // there made startup dump `CVDisplayLinkCreateWithCGDisplay failed` into the
+    // log on every frame — noise that buried the real errors.
+    if !is_headless_shell(bin) {
+        args.push("--disable-gpu".to_string());
+        // Keep SOLO automation out of the user's browser: each of these would
+        // otherwise start a Google background service against the user's own
+        // profile / crashpad database, exactly what made the system Chrome look
+        // hung while the app was open.
+        for flag in [
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-features=MediaRouter,OptimizationHints,Translate",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-crash-reporter",
+        ] {
+            args.push(flag.to_string());
+        }
+    }
+    args
+}
+
+/// True for the Chrome-for-Testing headless shell, which lacks the flags and
+/// background services only a full browser build has.
+fn is_headless_shell(bin: &std::path::Path) -> bool {
+    bin.file_name()
+        .map(|n| n.to_string_lossy().contains("chrome-headless-shell"))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +589,97 @@ fn forget_all_tabs() {
     }
 }
 
+/// How often the background reaper checks the idle policy.
+const REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Kill the shared browser when nothing has touched it for `IDLE_REAP`.
+///
+/// `alive_port` already reaps LAZILY, but only on the next request — and with
+/// nobody asking (panel closed, chat switched away) no request ever comes, so
+/// the Chromium lived until the app quit. That is how a stray headless browser
+/// outlived its window and made the machine look permanently short of memory.
+fn reap_if_idle() {
+    let reap = match BROWSER.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(|b| should_reap(b.last_used.elapsed(), IDLE_REAP))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if reap {
+        kill_running_browser();
+    }
+}
+
+/// Take the browser out of the registry and kill its process.
+fn kill_running_browser() {
+    let taken = BROWSER.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(mut proc) = taken {
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+        forget_all_tabs();
+    }
+}
+
+/// Kill a browser process left behind by a PREVIOUS run of this app.
+///
+/// A crash, a `SIGKILL`, a Cmd-Q that skips the window event or an OS-forced
+/// quit all bypass the shutdown hook, and the headless Chromium then holds its
+/// process and helper tree indefinitely. The next launch sweeps for any process
+/// carrying BOTH this app's own profile directory and a debugging-port flag
+/// before starting a fresh one. The match is deliberately narrow: a browser the
+/// user started themselves has neither marker, so it can never be a target.
+///
+/// Returns how many processes were signalled, so the caller can log it.
+pub fn reap_orphans() -> usize {
+    let profile = profile_dir();
+    let Ok(out) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,args="])
+        .output()
+    else {
+        return 0;
+    };
+    if !out.status.success() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let me = std::process::id();
+    let mut killed = 0;
+    for line in text.lines() {
+        let Some((pid, args)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        // Never signal ourselves, and only ever a process that is ours.
+        if pid == me || !is_our_driver(args, &profile) {
+            continue;
+        }
+        if Command::new("/bin/kill").arg(pid.to_string()).status().is_ok() {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// Sweep orphans once at startup, then reap the idle browser on a timer.
+///
+/// The sweep covers the previous run; the timer covers THIS one, so a session
+/// left open for days does not keep a Chromium alive after its last tab closed.
+/// The thread is detached and owns no app handle, so it never blocks or
+/// outlives the quit path.
+pub fn start_idle_reaper() {
+    let swept = reap_orphans();
+    if swept > 0 {
+        println!("[browser] reaped {swept} orphaned browser process(es) from a previous run");
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(REAPER_INTERVAL);
+        reap_if_idle();
+    });
+}
+
 /// Pick a free ephemeral port for Chromium's debugging endpoint.
 fn pick_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -512,20 +734,7 @@ fn try_launch(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Re
     let err_file = std::fs::File::create(profile.join("chromium-stderr.log"))
         .map_err(|e| format!("cannot open chromium log: {e}"))?;
     Command::new(bin)
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg(format!(
-            "--remote-allow-origins=http://127.0.0.1:{port},https://chrome-devtools-frontend.appspot.com"
-        ))
-        // Plain `--headless` IS the new headless mode on Chrome 112+; the
-        // `--headless=new` spelling was dropped in later releases and made
-        // Chromium exit before opening the debugging port.
-        .arg("--headless")
-        .arg("--disable-gpu")
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .arg("--window-size=1280,800")
+        .args(launch_args(bin, port, profile))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(err_file))
@@ -559,8 +768,12 @@ fn wait_for_port(child: &mut Child, port: u16, profile: &std::path::Path) -> Res
 
 /// Start the shared Chromium (once) and wait until its debugging port answers.
 fn spawn_browser() -> Result<u16, String> {
+    // A browser left by a previous run (crash, forced quit) still holds the
+    // profile and lock files; clear it before starting ours.
+    reap_orphans();
     let bin = find_chromium().ok_or_else(|| {
-        "no Chromium available — install Google Chrome or run `npx playwright install chromium`"
+        "no automation browser installed — install the built-in one from the \
+         Browser panel (or run `npx playwright install chromium`)"
             .to_string()
     })?;
     let port = pick_port()?;
@@ -656,6 +869,114 @@ fn ensure_tab(chat: &str) -> Result<Tab, String> {
     block_on(async move { ensure_tab_async(&chat).await })
 }
 
+/// True when a target's URL is not a real page yet (nothing for the panel to
+/// show). Used to decide whether the chat's own tab is worth keeping.
+fn is_blank_page_url(url: &str) -> bool {
+    let u = url.trim();
+    u.is_empty() || u == "about:blank" || u.starts_with("devtools://")
+}
+
+/// Every PAGE target in the shared browser as `(target_id, url)`.
+///
+/// `Target.getTargets` is a browser-level call (no `sessionId` needed), so it
+/// runs on the same plain connection `tab_usable` uses. An error or a dead
+/// browser yields an empty list rather than failing the caller.
+async fn page_targets() -> Vec<(String, String)> {
+    let Some(port) = alive_port() else {
+        return Vec::new();
+    };
+    let Ok(mut cdp) = Cdp::connect(port).await else {
+        return Vec::new();
+    };
+    let Ok(res) = cdp.send("Target.getTargets", json!({})).await else {
+        return Vec::new();
+    };
+    res["targetInfos"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    if t["type"].as_str() != Some("page") {
+                        return None;
+                    }
+                    let id = t["targetId"].as_str()?.to_string();
+                    let url = t["url"].as_str().unwrap_or_default().to_string();
+                    Some((id, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The chat's tab, ADOPTING a page another CDP client opened when the chat has
+/// nothing real to show.
+///
+/// The panel and the agent's driver share ONE browser but not one tab list: a
+/// client can open its own page through the browser-level endpoint, so the
+/// chat's registered target could sit on `about:blank` while the agent browsed a
+/// real page — the panel then showed an empty Browser with no URL at all.
+/// Adopting registers that page as the chat's tab, so every later
+/// screenshot/input follows the page the agent is actually driving instead of a
+/// blank one.
+async fn adopt_async(chat: &str) -> Option<Tab> {
+    let registered = existing_tab(chat);
+    let targets = page_targets().await;
+    if targets.is_empty() {
+        // Browser down (or a unit-test registry): nothing to adopt.
+        return registered;
+    }
+    // The chat's own tab already shows a real page — the common case, and the
+    // one that must stay cheap.
+    if let Some(tab) = &registered {
+        let real = targets
+            .iter()
+            .find(|(id, _)| id == &tab.target_id)
+            .map(|(_, url)| !is_blank_page_url(url))
+            .unwrap_or(false);
+        if real {
+            return registered;
+        }
+    }
+    let claimed: Vec<String> = TABS
+        .lock()
+        .ok()
+        .map(|t| t.iter().map(|(_, x)| x.target_id.clone()).collect())
+        .unwrap_or_default();
+    let Some(target_id) = targets
+        .iter()
+        .find(|(id, url)| !is_blank_page_url(url) && !claimed.contains(id))
+        .map(|(id, _)| id.clone())
+    else {
+        return registered;
+    };
+    let viewport = registered
+        .as_ref()
+        .map(|t| t.viewport)
+        .unwrap_or(DEFAULT_VIEWPORT);
+    let tab = Tab { target_id, viewport };
+    if let Ok(mut tabs) = TABS.lock() {
+        tabs.retain(|(k, _)| k != chat);
+        tabs.push((chat.to_string(), tab.clone()));
+    }
+    Some(tab)
+}
+
+/// Sync wrapper around [`adopt_async`] for the panel-facing entry points.
+///
+/// Deliberately used ONLY by `launch`/`status`/`screenshot`: those three run on
+/// the panel's polling path, so when one of them adopts a foreign page it is
+/// registered for the chat and every other `/browser/*` call follows it
+/// automatically — no other call site needs to know about adoption.
+fn active_tab(chat: &str) -> Option<Tab> {
+    let chat = chat.to_string();
+    // `block_on` is typed for the CDP helpers that return `Result`; adopting
+    // never fails (it falls back to the registered tab), so the `Ok` wrapper is
+    // just to reuse the same runtime-spawning helper.
+    block_on(async move { Ok(adopt_async(&chat).await) })
+        .ok()
+        .flatten()
+}
+
 /// The chat's registered tab without creating one.
 fn existing_tab(chat: &str) -> Option<Tab> {
     TABS
@@ -697,17 +1018,308 @@ fn close_tab(chat: &str) -> bool {
 /// no orphaned browser keeps holding memory after the window is gone.
 pub fn kill_all_sessions() -> usize {
     let tabs = TABS.lock().ok().map(|t| t.len()).unwrap_or(0);
-    let mut guard = match BROWSER.lock() {
-        Ok(g) => g,
-        Err(_) => return 0,
-    };
-    match guard.take() {
-        Some(mut proc) => {
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-            tabs.max(1)
+    let had_browser = BROWSER.lock().map(|g| g.is_some()).unwrap_or(false);
+    kill_running_browser();
+    if had_browser {
+        tabs.max(1)
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-click automation browser install
+// ---------------------------------------------------------------------------
+
+/// Chrome-for-Testing publishes every build it has ever made, with a per-platform
+/// download index. Reading that index (instead of hard-coding a version) means
+/// the install cannot rot when a build is rotated out of the bucket.
+const CFT_INDEX: &str =
+    "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
+
+/// Progress of a running install, polled by the Browser panel.
+///
+/// `Mutex<Install>` (not a lazy cell) so the static stays `const`-constructible.
+struct Install {
+    running: bool,
+    percent: u32,
+    /// `downloading` | `extracting` | `done` | `failed` | empty when idle.
+    phase: String,
+    error: String,
+}
+
+static INSTALL: Mutex<Install> = Mutex::new(Install {
+    running: false,
+    percent: 0,
+    phase: String::new(),
+    error: String::new(),
+});
+
+/// The Chrome-for-Testing platform key for this machine.
+fn cft_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "mac-arm64"
+        } else {
+            "mac-x64"
         }
-        None => 0,
+    } else if cfg!(target_os = "windows") {
+        "win64"
+    } else if cfg!(target_arch = "aarch64") {
+        "linux-arm64"
+    } else {
+        "linux64"
+    }
+}
+
+/// The headless-shell download URL for this platform.
+///
+/// The headless shell is the right artifact here: it is a purpose-built
+/// automation build with no window, no updater and no background services, so it
+/// can never register with LaunchServices or touch the user's own Chrome
+/// profile the way a `/Applications` fallback did.
+fn cft_shell_url() -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let index: Value = client
+        .get(CFT_INDEX)
+        .send()
+        .map_err(|e| format!("cannot read the browser index: {e}"))?
+        .json()
+        .map_err(|e| format!("browser index is not json: {e}"))?;
+    let want = cft_platform();
+    index["channels"]["Stable"]["downloads"]["chrome-headless-shell"]
+        .as_array()
+        .and_then(|list| {
+            list.iter()
+                .find(|d| d["platform"].as_str() == Some(want))
+                .and_then(|d| d["url"].as_str())
+        })
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!("chrome-for-testing has no headless-shell build for {want}")
+        })
+}
+
+fn set_progress(phase: &str, percent: u32) {
+    if let Ok(mut st) = INSTALL.lock() {
+        st.phase = phase.to_string();
+        st.percent = percent;
+    }
+}
+
+/// Start the install in the background. Idempotent: a second call while one is
+/// running is a no-op, so a double click cannot download the archive twice.
+pub fn install() {
+    {
+        let Ok(mut st) = INSTALL.lock() else {
+            return;
+        };
+        if st.running {
+            return;
+        }
+        st.running = true;
+        st.percent = 0;
+        st.error.clear();
+        st.phase = "downloading".to_string();
+    }
+    // `reqwest::blocking` builds its own runtime and panics when called from
+    // inside an async context, and the HTTP route that starts this is async — so
+    // the whole install runs on a plain thread (same rule as `mcp.rs`).
+    std::thread::spawn(|| {
+        let result = install_blocking();
+        if let Ok(mut st) = INSTALL.lock() {
+            st.running = false;
+            match result {
+                Ok(()) => {
+                    st.phase = "done".to_string();
+                    st.percent = 100;
+                }
+                Err(e) => {
+                    st.phase = "failed".to_string();
+                    st.error = e;
+                }
+            }
+        }
+    });
+}
+
+/// The install status the panel polls.
+pub fn install_status() -> Value {
+    let (running, percent, phase, error) = match INSTALL.lock() {
+        Ok(st) => (
+            st.running,
+            st.percent,
+            st.phase.clone(),
+            st.error.clone(),
+        ),
+        Err(_) => (false, 0, String::new(), "install lock poisoned".to_string()),
+    };
+    json!({
+        "ok": true,
+        "available": is_available(),
+        "installing": running,
+        "percent": percent,
+        "phase": phase,
+        "error": error,
+    })
+}
+
+fn install_blocking() -> Result<(), String> {
+    let url = cft_shell_url()?;
+    let root = data_root().join("browser");
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    let pid = std::process::id();
+    let zip_path = std::env::temp_dir().join(format!("codifa-browser-{pid}.zip"));
+    let staging = std::env::temp_dir().join(format!("codifa-browser-unpack-{pid}"));
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let result = (|| -> Result<(), String> {
+        download_to(&url, &zip_path)?;
+        set_progress("extracting", 92);
+        std::fs::create_dir_all(&staging).map_err(|e| format!("cannot stage: {e}"))?;
+        extract_zip(&zip_path, &staging)?;
+        let unpacked = single_child_dir(&staging)?;
+        let name = unpacked
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| "unexpected archive layout".to_string())?;
+        // Swap into place: the archive's own top-level name is kept, because
+        // that is the shape `candidate_dirs` looks for.
+        let dest = root.join(&name);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::rename(&unpacked, &dest).map_err(|e| {
+            format!("cannot move the browser into {}: {e}", dest.display())
+        })?;
+        make_executable(&dest);
+        if find_chromium().is_none() {
+            return Err("the browser was unpacked but its binary was not found".to_string());
+        }
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Stream `url` to `dest`, reporting progress over the first 90% so the
+/// extraction phase has its own visible slice.
+fn download_to(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30 * 60))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut res = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("download failed (HTTP {})", res.status().as_u16()));
+    }
+    let total = res.content_length().unwrap_or(0);
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    let mut last = u32::MAX;
+    loop {
+        let n = res.read(&mut buf).map_err(|e| format!("download failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("cannot write the download: {e}"))?;
+        written += n as u64;
+        if total > 0 {
+            let pct = ((written as f64 / total as f64) * 90.0) as u32;
+            if pct != last {
+                last = pct;
+                set_progress("downloading", pct);
+            }
+        }
+    }
+    file.sync_all().map_err(|e| format!("cannot flush: {e}"))?;
+    if total > 0 && written != total {
+        return Err(format!(
+            "download incomplete: got {written} of {total} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// Unpack every entry of `archive` under `dest`.
+///
+/// `enclosed_name()` rejects entries that try to escape the target directory
+/// (`../`), so a hostile archive cannot write outside `dest`.
+fn extract_zip(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive)
+        .map_err(|e| format!("cannot open the download: {e}"))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("the download is not a zip: {e}"))?;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("cannot read the archive: {e}"))?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut writer = std::fs::File::create(&out)
+            .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        std::io::copy(&mut entry, &mut writer)
+            .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    }
+    Ok(())
+}
+
+/// The single directory an archive unpacks into (both the app's own download
+/// and every Chrome-for-Testing zip use exactly one).
+fn single_child_dir(root: &std::path::Path) -> Result<PathBuf, String> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+        .map_err(|e| format!("cannot read the unpacked archive: {e}"))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    if dirs.len() == 1 {
+        return Ok(dirs.remove(0));
+    }
+    Err("the archive did not unpack into a single directory".to_string())
+}
+
+/// ZIP archives do not always carry the executable bit through, and a browser
+/// binary without it fails with a bare permission error.
+fn make_executable(dir: &std::path::Path) {
+    let Some(bin) = find_chromium() else {
+        return;
+    };
+    if !bin.starts_with(dir) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&bin) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&bin, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
     }
 }
 
@@ -738,7 +1350,7 @@ fn current_url(tab: &Tab) -> String {
 /// The `status` payload the panel polls (same keys as the Python sidecar).
 pub fn status(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = active_tab(&chat) else {
         return json!({
             "ok": true,
             "active": false,
@@ -761,19 +1373,7 @@ pub fn status(chat_id: &str) -> Value {
     })
 }
 
-/// CDP endpoint of the shared browser, starting it when needed. Used by the MCP
-/// connector so Playwright attaches to the panel's Chromium. The endpoint is
-/// browser-level, so Playwright MCP drives the same tabs the panel does.
-pub fn cdp_endpoint(chat_id: &str) -> Option<String> {
-    let chat = normalize_chat(chat_id);
-    // The MCP connector needs the chat's tab to exist so the agent and the
-    // panel stay on one page; `ensure_tab` starts the browser when needed.
-    ensure_tab(&chat).ok()?;
-    let port = alive_port()?;
-    Some(format!("http://127.0.0.1:{port}"))
-}
-
-/// Navigate a tab (idempotent: an existing tab is reused).
+/// Navigate a tab, idempotently (an existing tab is reused).
 async fn navigate(tab: &Tab, url: &str) -> Result<(), String> {
     let tab = tab.clone();
     let url = url.to_string();
@@ -817,7 +1417,7 @@ pub fn navigate_to(url: &str, chat_id: &str) -> Value {
 pub fn launch(url: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
     let target = url.trim();
-    let tab = match existing_tab(&chat) {
+    let tab = match active_tab(&chat) {
         Some(t) => t,
         None => match ensure_tab(&chat) {
             Ok(t) => t,
@@ -852,7 +1452,7 @@ pub fn launch(url: &str, chat_id: &str) -> Value {
 /// an earlier /browser/viewport call would be gone by the time we capture.
 pub fn screenshot(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
-    let Some(tab) = existing_tab(&chat) else {
+    let Some(tab) = active_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let (w, h) = tab.viewport;
@@ -1187,6 +1787,51 @@ pub fn close(chat_id: &str) -> Value {
     json!({"ok": true, "closed": removed})
 }
 
+// ---------------------------------------------------------------------------
+// Driver façade
+// ---------------------------------------------------------------------------
+
+/// Everything the native CDP driver (`browser_driver.rs`) needs from this
+/// module, so the process/tab registry stays private to the file that owns it.
+///
+/// The driver is a SEPARATE module rather than more code in this one because it
+/// needs something this file deliberately does not have: a long-lived WebSocket
+/// whose reader and writer run concurrently. Everything here is request/reply on
+/// a socket that is opened and dropped per call.
+pub(crate) mod driver_hooks {
+    /// Normalized chat key.
+    pub(crate) fn chat_key(chat: &str) -> String {
+        super::normalize_chat(chat)
+    }
+
+    /// Port of the live shared browser (refreshes its idle timer).
+    pub(crate) fn port() -> Option<u16> {
+        super::alive_port()
+    }
+
+    /// WebSocket URL of the browser-level endpoint.
+    pub(crate) fn ws_url(port: u16) -> Result<String, String> {
+        super::browser_ws_url(port)
+    }
+
+    /// Target id of the chat's tab, starting the browser AND the tab when
+    /// needed. This is the same tab the right-side panel polls, so the agent
+    /// and the user always look at one page.
+    pub(crate) fn ensure_target(chat: &str) -> Result<String, String> {
+        super::ensure_tab(chat).map(|t| t.target_id)
+    }
+
+    /// Point the chat's registered tab at `target` (the panel and the driver
+    /// must never disagree about which page the chat is on).
+    pub(crate) fn set_target(chat: &str, target: &str) {
+        if let Ok(mut tabs) = super::TABS.lock() {
+            if let Some((_, tab)) = tabs.iter_mut().find(|(k, _)| k == chat) {
+                tab.target_id = target.to_string();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,5 +2014,107 @@ mod tests {
         assert!(existing_tab("chat-a").is_none());
         assert!(existing_tab("chat-b").is_some());
         assert!(close_tab("chat-b"));
+    }
+
+    #[test]
+    fn browser_never_falls_back_to_a_system_browser() {
+        // The freeze: the automation browser ran out of /Applications/Google
+        // Chrome.app, so the headless instance shared its bundle id
+        // (com.google.Chrome) with the user's real Chrome — registering with
+        // LaunchServices, spawning Chrome's own crashpad handler and
+        // GoogleUpdater against the user's profile, and fighting the real
+        // browser over the display. The candidate list must therefore never
+        // contain a system browser, whatever is installed on this machine.
+        for path in chromium_candidates() {
+            let p = path.to_string_lossy();
+            assert!(
+                !p.starts_with("/Applications") && !p.starts_with("/usr/bin"),
+                "system browser {p} must never be used as the automation browser"
+            );
+            assert!(
+                !p.contains("Google Chrome.app")
+                    && !p.contains("Microsoft Edge.app")
+                    && !p.contains("Brave Browser.app"),
+                "a user-facing browser must never be picked: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_dirs_order_newest_build_first() {
+        // `sort().reverse()` put chromium-999 AFTER chromium-1000 (string
+        // order), so an older build won as soon as a version crossed a digit
+        // boundary. The rank must be numeric.
+        let rank = |n: &str| build_rank(std::path::Path::new(n));
+        // String order put "chromium-999" AFTER "chromium-1000"; the rank must
+        // be numeric.
+        assert!(rank("chromium-1000") > rank("chromium-999"));
+        // Builds are ordered by their LEADING number (the revision/major), not
+        // by a trailing patch component, which says nothing across majors.
+        assert!(rank("chrome-headless-shell-141.0.7339.82") > rank("chrome-headless-shell-140.0.7339.82"));
+        assert_eq!(rank("chrome-headless-shell-140.0.7339.82"), 140);
+        assert_eq!(rank("chromium"), 0);
+    }
+
+    #[test]
+    fn orphan_matcher_targets_only_our_own_headless_browser() {
+        let profile = std::path::Path::new("/Users/x/.codifa/browser-profile");
+        // Ours: our own profile directory plus a debugging port.
+        let ours = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "--remote-debugging-port=61995",
+            "--headless",
+            "--user-data-dir=/Users/x/.codifa/browser-profile",
+        ]
+        .join(" ");
+        assert!(is_our_driver(&ours, profile));
+        // A browser the user started themselves: no debugging port, no profile.
+        assert!(!is_our_driver(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            profile
+        ));
+        // A renderer child of OUR browser must not be signalled directly: the
+        // parent's death takes the whole helper tree with it.
+        let renderer = [
+            "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper",
+            "--type=renderer",
+            "--user-data-dir=/Users/x/.codifa/browser-profile",
+            "--remote-debugging-port=61995",
+        ]
+        .join(" ");
+        assert!(!is_our_driver(&renderer, profile));
+        // Another program's headless browser (not our profile) is left alone.
+        let other = [
+            "chromium",
+            "--headless",
+            "--remote-debugging-port=9222",
+            "--user-data-dir=/tmp/other-profile",
+        ]
+        .join(" ");
+        assert!(!is_our_driver(&other, profile));
+    }
+
+    #[test]
+    fn launch_args_keep_the_browser_off_the_users_chrome() {
+        let bin = std::path::Path::new(
+            "/opt/chromium-1223/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        );
+        let profile = std::path::Path::new("/Users/x/.codifa/browser-profile");
+        let args = launch_args(bin, 61995, profile).join(" ");
+        // Headless + our own profile: never the user's Chrome profile.
+        assert!(args.contains("--headless"));
+        assert!(args.contains("--user-data-dir=/Users/x/.codifa/browser-profile"));
+        assert!(args.contains("--remote-debugging-port=61995"));
+        // The Google background services that reached into the user's own
+        // profile / crashpad database.
+        assert!(args.contains("--disable-crash-reporter"));
+        assert!(args.contains("--disable-background-networking"));
+        assert!(args.contains("--no-service-autorun"));
+        // A full build needs the GPU off; the shell must not be told to.
+        assert!(args.contains("--disable-gpu"));
+        let shell = std::path::Path::new("/opt/browser/chrome-headless-shell");
+        let shell_args = launch_args(shell, 61995, profile).join(" ");
+        assert!(!shell_args.contains("--disable-gpu"));
+        assert!(shell_args.contains("--headless"));
     }
 }

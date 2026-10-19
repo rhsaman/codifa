@@ -1,13 +1,13 @@
 /**
  * MCP tool-name helpers.
  *
- * The native agent exposes an MCP tool BARE (`browser_navigate`) when its name
- * is unique across the enabled connectors, and qualified
- * (`mcp__playwright__browser_navigate`) only when two connectors both claim it.
+ * The native agent exposes an MCP tool BARE (`list_containers`) when its name is
+ * unique across the enabled connectors, and qualified
+ * (`mcp__docker__list_containers`) only when two connectors both claim it.
  * Both forms must behave identically in the UI, so every consumer goes through
  * these helpers instead of matching the raw string — a `startsWith("browser_")`
- * check silently missed every MCP browser call and the right-side Browser panel
- * never docked.
+ * check silently missed every qualified browser call and the right-side Browser
+ * panel never docked.
  */
 
 /** The tool name without its `mcp__<server>__` prefix (unchanged when bare). */

@@ -25,7 +25,7 @@ export const api = {
   importFile: (absPath: string): Promise<string | null> => window.coder.importFile(absPath),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => window.coder.fsList(root, rel),
   fsWalk: (root: string): Promise<WorkspaceFile[]> => window.coder.fsWalk(root),
-  fsRead: (root: string, rel: string): Promise<{ content: string }> => window.coder.fsRead(root, rel),
+  fsRead: (root: string, rel: string): Promise<{ content: string } | null> => window.coder.fsRead(root, rel),
   fsWrite: (root: string, rel: string, content: string): Promise<boolean> =>
     window.coder.fsWrite(root, rel, content),
   fsDelete: (root: string, rel: string): Promise<boolean> =>
@@ -46,6 +46,7 @@ export const api = {
   getPathForFile: (file: File): string => window.coder.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => window.coder.storeGet<T>(key),
   storeSet: (key: string, value: unknown): Promise<boolean> => window.coder.storeSet(key, value),
+  chatGet: <T>(id: string): Promise<T | null> => window.coder.chatGet<T>(id),
   getDataPath: (): Promise<string> => window.coder.getDataPath(),
   hasSettingsFile: (): Promise<boolean> => window.coder.hasSettingsFile(),
   moveDataPath: (p: string): Promise<string> => window.coder.moveDataPath(p),
@@ -62,7 +63,7 @@ export const api = {
     try {
       const fn = (window as unknown as { coder?: { openFileExternal?: unknown } }).coder?.openFileExternal
       if (typeof fn !== 'function') {
-        return { ok: false, error: 'External open is unavailable (preload outdated — rebuild the app).' }
+        return { ok: false, error: 'External open is unavailable (the desktop bridge is outdated — rebuild the app).' }
       }
       const res = await (fn as (a: string, e: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, absPath, editor)
       if (res && typeof res.ok === 'boolean') return res
@@ -75,7 +76,7 @@ export const api = {
     try {
       const fn = (window as unknown as { coder?: { openWorkspaceFolder?: unknown } }).coder?.openWorkspaceFolder
       if (typeof fn !== 'function') {
-        return { ok: false, error: 'Reveal in file manager is unavailable (preload outdated — rebuild the app).' }
+        return { ok: false, error: 'Reveal in file manager is unavailable (the desktop bridge is outdated — rebuild the app).' }
       }
       const res = await (fn as (d: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, dir)
       if (res && typeof res.ok === 'boolean') return res
@@ -88,7 +89,7 @@ export const api = {
     try {
       const fn = (window as unknown as { coder?: { openWorkspaceTerminal?: unknown } }).coder?.openWorkspaceTerminal
       if (typeof fn !== 'function') {
-        return { ok: false, error: 'Terminal open is unavailable (preload outdated — rebuild the app).' }
+        return { ok: false, error: 'Terminal open is unavailable (the desktop bridge is outdated — rebuild the app).' }
       }
       const res = await (fn as (d: string) => Promise<{ ok: boolean; error?: string } | null>).call(window.coder, dir)
       if (res && typeof res.ok === 'boolean') return res
@@ -100,7 +101,7 @@ export const api = {
 }
 
 const SKIP_DIRS = new Set([
-  'node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'dist-electron',
+  'node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist',
   'release', 'build', 'coverage', '.idea', '.vscode', '.next', 'out', 'target',
   'node_modules/.cache', 'vendor', '.ruff_cache', '.github', '.playwright', '.playwright-mcp',
 ])

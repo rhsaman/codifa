@@ -74,7 +74,7 @@ export interface CoderApi {
   importFile(absPath: string): Promise<string | null>
   fsList(root: string, rel: string): Promise<FileEntry[]>
   fsWalk(root: string): Promise<{ rel: string; name: string }[]>
-  fsRead(root: string, rel: string): Promise<{ content: string }>
+  fsRead(root: string, rel: string): Promise<{ content: string } | null>
   fsWrite(root: string, rel: string, content: string): Promise<boolean>
   fsDelete(root: string, rel: string): Promise<boolean>
   coderList(rel: string): Promise<FileEntry[]>
@@ -95,6 +95,9 @@ export interface CoderApi {
   getPathForFile(file: File): string
   storeGet<T>(key: string): Promise<T | null>
   storeSet(key: string, value: unknown): Promise<boolean>
+  /** Fetch ONE chat's message body. The chat list in `settings.json` holds
+   *  index rows, so a transcript is pulled in only when the user opens it. */
+  chatGet<T>(id: string): Promise<T | null>
   getDataPath(): Promise<string>
   hasSettingsFile(): Promise<boolean>
   openExternal(url: string): Promise<void>

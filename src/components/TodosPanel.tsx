@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useStore } from "../lib/store";
+import { ensureChatHydrated, useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
 import { ScheduleSection } from "./SchedulePanel";
@@ -109,13 +109,19 @@ export function heightForChat(
  *  کاملاً داینامیک از روی محتواست (بدون height ثابت؛ لیست خودش به‌اندازهٔ
  *  متن‌ها بلند می‌شود و فقط سقف max-height دارد تا اسکرول بیاید). */
 export function TodosSection() {
-  const chats = useStore((s) => s.chats);
+  const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
   const activeChatId = useStore((s) => s.activeChatId);
   const dir = useStore((s) => s.dir);
 
-  const todos = latestTodos(
-    chats.find((c) => c.id === activeChatId)?.messages ?? [],
-  );
+  // `messages` is empty while the transcript is still on disk; the todos appear
+  // as soon as the body is hydrated (the panel re-renders on that update).
+  // This panel also triggers the fetch, so opening the right panel on a chat
+  // whose body is not in memory never shows an empty todo list by accident.
+  const needsBody = chat?.hydrated === false;
+  useEffect(() => {
+    if (activeChatId && needsBody) void ensureChatHydrated(activeChatId);
+  }, [activeChatId, needsBody]);
+  const todos = latestTodos(needsBody ? [] : chat?.messages ?? []);
 
   const [ui] = useState(loadTodoPanelUi);
   const [collapsed, setCollapsed] = useState(ui.collapsed ?? false);
@@ -216,9 +222,13 @@ export function TodosSection() {
             <div className="sidebar-todos-progress-fill" style={{ width: `${pct}%` }} />
           </div>
           <ul className="sidebar-todos-list">
-            {todos.map((t, i) => (
+            {todos.map((t) => (
               <li
-                key={i}
+                // Key on the content: the backend never writes an item id
+                // (plans.rs strips it), and the list is rewritten as work
+                // progresses — an index key moved the done/running class onto
+                // whatever row happened to land on the old index.
+                key={t.content}
                 className={`sidebar-todo-item ${t.status === "completed" ? "done" : t.status === "in_progress" ? "running" : ""}`}
               >
                 <span className="sidebar-todo-mark">

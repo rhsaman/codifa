@@ -53,6 +53,9 @@ function chatTitleOf(id: string): string {
   const c = st.chats.find((x) => x.id === id);
   if (!c) return "Chat";
   if (c.title && c.title !== "New chat") return c.title;
+  // Index rows carry the first-user preview, so the window title is correct
+  // even before the transcript is fetched.
+  if (c.firstUser) return c.firstUser.slice(0, 40) || "New chat";
   const first = c.messages.find((m) => m.role === "user");
   return first ? first.content.slice(0, 40) || "New chat" : "New chat";
 }
@@ -759,6 +762,9 @@ export function ChatWindows() {
   // unchanged positions so idle hovering never re-renders either.
   const dropRafRef = useRef<number>(0);
   const pendingDropRef = useRef<DropMark | ((prev: DropMark) => DropMark) | null>(null);
+  /** Removers for an in-flight split-drag; run on unmount so an interrupted
+   *  drag never leaves window listeners behind. */
+  const treeResizeCleanupRef = useRef<(() => void) | null>(null);
 
   const treeLeaves = chatTree ? leafCount(chatTree) : 0;
   const multi = treeLeaves > 1 || (!chatTree && visibleChatIds.length > 1);
@@ -884,7 +890,7 @@ export function ChatWindows() {
       const next = cleaned.length > 0 ? cleaned : st.activeChatId ? [st.activeChatId] : [];
       if (next.length > 0) useStore.setState({ visibleChatIds: next });
     }
-  }, [visibleChatIds.length, treeLeaves, layout]);
+  }, [visibleChatIds.length, treeLeaves, layout, chatTree]);
 
   const startTreeResize = useCallback(
     (
@@ -958,6 +964,14 @@ export function ChatWindows() {
       };
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
+      // A drag interrupted by an unmount (window closed / layout normalized)
+      // used to leave both listeners attached forever, holding the closed-over
+      // store and resizing a detached tree. Hand the removers to the shared
+      // cleanup effect below.
+      treeResizeCleanupRef.current = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
     },
     [],
   );
@@ -1094,6 +1108,10 @@ export function ChatWindows() {
   // Drop any pending preview frame on unmount (no setState after unmount).
   useEffect(() => () => {
     if (dropRafRef.current) cancelAnimationFrame(dropRafRef.current);
+    // A split-drag interrupted by unmount: detach the window listeners the
+    // pointer-down handler installed (see startTreeResize).
+    treeResizeCleanupRef.current?.();
+    treeResizeCleanupRef.current = null;
   }, []);
 
   // Fullscreen keeps every ChatPanel mounted: non-fullscreen windows hide

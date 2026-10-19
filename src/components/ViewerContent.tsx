@@ -143,7 +143,13 @@ export function ViewerContent() {
   }
 
   if (active.kind === "browser") {
-    return <BrowserPanel key={active.id} chatId={active.chatId ?? ""} />;
+    return (
+      <BrowserPanel
+        key={active.id}
+        chatId={active.chatId ?? ""}
+        initialUrl={active.browserUrl ?? ""}
+      />
+    );
   }
 
   return (

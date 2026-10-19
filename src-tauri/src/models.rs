@@ -92,6 +92,14 @@ impl Default for Meta {
     }
 }
 
+/// Whether a provider KIND negotiates a reasoning effort for its models
+/// (cloud gateways whose catalog mixes reasoning-capable models in). Exposed
+/// for the LLM request layer, which gates the reasoning parameter on it
+/// exactly like the old Python `auto_think` did.
+pub fn auto_think_for(provider: &str) -> bool {
+    meta(provider).auto_think
+}
+
 fn meta(provider: &str) -> Meta {
     match provider {
         "google" => Meta {

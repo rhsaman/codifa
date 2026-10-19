@@ -1,9 +1,9 @@
-//! Phase 2 native HTTP router.
+//! The app's native HTTP API.
 //!
-//! Owns the public loopback port the renderer talks to. Light endpoints
-//! (git, skills, mcp, system-prompts) are served natively; everything else
-//! is transparently proxied to the Python sidecar on its private port, so
-//! the frontend keeps a single base URL and unchanged HTTP semantics.
+//! Owns the loopback port the renderer talks to. Every endpoint is served by
+//! Rust — there is no sidecar and no proxy: git, skills, mcp, chat streaming,
+//! docs, media, plans, schedules, the browser session and the agent loop all
+//! live in this process.
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, State};
@@ -84,8 +84,13 @@ pub fn new_state(data_root: PathBuf) -> AppState {
     AppState { data_root }
 }
 
+/// Native error body: JSON `{"detail": …}`, the shape the renderer reads
+/// (`body.detail`). A plain-text body made the renderer fall back to a generic
+/// "<op> failed (400)" and swallowed the real reason — e.g. the commit button
+/// showed "autocommit failed (400)" instead of "nothing to commit" or the
+/// provider's own rejection, so the cause was invisible to the user.
 fn bad_request(msg: &str) -> Response<Body> {
-    (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({ "detail": msg }))).into_response()
 }
 
 // --- model probe (native; replaces the sidecar's /models/test) --------------
@@ -130,6 +135,7 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
         // sidecar sent an empty key rather than refusing the probe.
         keys.push(String::new());
     }
+    let (r_level, r_model, r_auto) = crate::llm::reasoning_fields(&body.provider, "", false);
     let cfg = LlmConfig {
         provider: body.provider.clone(),
         model: model.to_string(),
@@ -138,6 +144,9 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
         temperature: None,
         max_tokens: Some(MODEL_TEST_MAX_TOKENS),
         timeout_secs: MODEL_TEST_CLIENT_TIMEOUT_SECS,
+        reasoning_level: r_level,
+        model_reasoning: r_model,
+        auto_think: r_auto,
     };
     let client = llm::http_client();
     let res = tokio::time::timeout(
@@ -256,14 +265,27 @@ fn default_rev() -> String {
 }
 
 async fn git_status(Query(q): Query<RootQuery>) -> Response<Body> {
+    // The renderer hits this route the moment a chat is opened (and on every
+    // workspace switch), long before the first tool call. Starting the language
+    // servers here moves the whole cold start — spawn + `initialize` + crate
+    // graph load, minutes on a large workspace — into the user's own typing
+    // time, so the first `lsp_*` call of the turn usually finds a warm server.
+    // Pre-warming at turn start was too late to ever be warm. Cheap no-op after
+    // the first call per project (see `lsp::prewarm`).
+    crate::lsp::prewarm(&q.root);
     git_response(git::status(&q.root))
 }
 
 async fn git_diff(Query(q): Query<DiffQuery>) -> Response<Body> {
+    // Same early trigger as `/git/status`: the renderer calls this on every chat
+    // switch, so the language servers start loading before the turn does.
+    crate::lsp::prewarm(&q.root);
     git_response(git::diff(&q.root, &q.path, q.staged))
 }
 
 async fn git_log(Query(q): Query<LogQuery>) -> Response<Body> {
+    // Early trigger too — the renderer opens the log panel on a chat switch.
+    crate::lsp::prewarm(&q.root);
     git_response(git::log(&q.root, q.limit))
 }
 
@@ -287,6 +309,8 @@ pub struct GitAutoCommitBody {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub base_url: String,
@@ -294,6 +318,12 @@ pub struct GitAutoCommitBody {
     pub api_key: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// Main-model reasoning effort + capability flag (the commit message is a
+    /// main-model-quality call, so it uses the chat's level, not a slot's).
+    #[serde(default)]
+    pub thinking_level: String,
+    #[serde(default)]
+    pub model_reasoning: bool,
 }
 
 /// Stage everything, ask the model for a Conventional-Commits message from the
@@ -320,20 +350,38 @@ async fn git_autocommit(Json(body): Json<GitAutoCommitBody>) -> Response<Body> {
         Ok(v) => v["diff"].as_str().unwrap_or("").to_string(),
         Err(git::GitError(msg)) => return bad_request(&msg),
     };
+    if body.model.trim().is_empty() {
+        return bad_request(
+            "no model selected for the commit message (Settings → Tools → Compact model)",
+        );
+    }
     let mut keys = body.api_keys.clone();
     if keys.is_empty() && !body.api_key.trim().is_empty() {
         keys.push(body.api_key.clone());
     }
+    // Mirror the CHAT path exactly: no temperature, no max_tokens. Sending
+    // `temperature: 0.2` + `max_tokens: 512` here was the reason the Commit
+    // button returned 400 while chatting worked fine — a reasoning model
+    // rejects a non-default temperature, and with a 512-token cap it spends
+    // the whole budget on its thinking block and returns EMPTY content, which
+    // this handler then reports as "the model returned an empty commit
+    // message". The chat path passes both as None (see agent.rs's LlmConfig),
+    // so the provider's own defaults apply.
+    let (r_level, r_model, r_auto) =
+        crate::llm::reasoning_fields(&body.provider, body.thinking_level.trim(), body.model_reasoning);
     let cfg = LlmConfig {
         provider: body.provider.clone(),
         model: body.model.clone(),
         base_url: body.base_url.clone(),
         api_keys: keys,
-        temperature: Some(0.2),
-        max_tokens: Some(512),
-        // A commit message is a short one-shot; a real budget is fine here
-        // (this is not the chat stream, which has no timeout on purpose).
-        timeout_secs: 120,
+        temperature: None,
+        max_tokens: None,
+        // Inert today (llm.rs applies no request timeout on purpose); kept so
+        // the struct stays fully populated.
+        timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+        reasoning_level: r_level,
+        model_reasoning: r_model,
+        auto_think: r_auto,
     };
     const SYSTEM: &str = "You write git commit messages. Reply with ONLY the commit message: \
 a Conventional-Commits subject line (type(scope): summary), at most 72 characters, \
@@ -344,11 +392,24 @@ No code fences, no quotes, no preamble, no trailing explanation.";
         "Staged changes (git status --porcelain):\n{status}\n\nDiff:\n{diff}",
         status = serde_json::to_string(&status["entries"]).unwrap_or_default()
     );
-    let summary = match llm::complete(&client, &cfg, SYSTEM, &user).await {
-        Ok(r) if !r.text.trim().is_empty() => r.text.trim().to_string(),
-        Ok(_) => return bad_request("the model returned an empty commit message"),
-        Err(e) => return bad_request(&e),
+    let mut summary = match llm::complete(&client, &cfg, SYSTEM, &user).await {
+        Ok(r) if !r.text.trim().is_empty() => r,
+        Ok(_) => {
+            // Reasoning models can burn the whole budget on the thinking block
+            // and return empty content; log it so rust.log shows the cause.
+            eprintln!(
+                "[git] empty commit message from {}/{}",
+                cfg.provider, cfg.model
+            );
+            return bad_request("the model returned an empty commit message");
+        }
+        Err(e) => {
+            eprintln!("[git] commit message failed ({}/{}): {e}", cfg.provider, cfg.model);
+            return bad_request(&e);
+        }
     };
+    let usage = normalize_compact_usage(summary.usage.take(), &cfg.model, &body.provider_id);
+    let summary = summary.text.trim().to_string();
     // Strip a code fence if the model wrapped the message anyway.
     let message = summary
         .trim()
@@ -363,6 +424,9 @@ No code fences, no quotes, no preamble, no trailing explanation.";
         Ok(v) => {
             let mut out = v;
             out["message"] = json!(message);
+            // Token usage of the message call, so the renderer's usage accrual
+            // (sidebar → Model usage) sees it, exactly like /chat/compact.
+            out["usage"] = usage.unwrap_or(Value::Null);
             Json(out).into_response()
         }
         Err(git::GitError(msg)) => bad_request(&msg),
@@ -401,7 +465,9 @@ struct SkillFileQuery {
 async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>) -> Response<Body> {
     match skills::read_skill_file(&st.root(), &q.name, &q.file) {
         Ok(v) => Json(v).into_response(),
-        Err(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        // JSON `detail` like every other native error: the renderer reads that
+        // key, so a plain-text body would be replaced by a generic message.
+        Err(msg) => (StatusCode::NOT_FOUND, Json(json!({ "detail": msg }))).into_response(),
     }
 }
 
@@ -452,6 +518,18 @@ struct CompactBody {
     fallback_base_url: String,
     #[serde(default)]
     fallback_api_key: String,
+    /// Effective provider id of the chat's own provider — the 4th element of
+    /// a resolved slot, so cross-provider usage is attributed correctly.
+    #[serde(default)]
+    provider_id: String,
+    /// Main-model reasoning effort + capability flag, and the per-slot
+    /// overrides (the "compact" entry wins when present).
+    #[serde(default)]
+    thinking_level: String,
+    #[serde(default)]
+    model_reasoning: bool,
+    #[serde(default)]
+    subagent_thinking: std::collections::HashMap<String, String>,
     #[serde(default)]
     history: Vec<Value>,
     #[serde(default)]
@@ -472,25 +550,38 @@ fn default_provider() -> String {
 }
 
 /// Resolve a Tool Models slot entry ("providerId/model" | bare model | "")
-/// to (model, base_url, api_keys) — shared by the compact and sub-agent
-/// slots; mirrors graph.py resolve_subagent_model.
+/// to (model, base_url, api_keys, provider_id) — shared by the compact and
+/// sub-agent slots; mirrors graph.py resolve_subagent_model. The returned
+/// provider id is the EFFECTIVE one (the provider actually called), so usage
+/// events and the Model-usage panel attribute tokens to the right provider.
 pub fn resolve_slot_target(
     entry: &str,
     parent_model: &str,
     parent_base: &str,
     parent_keys: &[String],
+    parent_provider_id: &str,
     providers: &std::collections::HashMap<String, Value>,
-) -> (String, String, Vec<String>) {
+) -> (String, String, Vec<String>, String) {
     let entry = entry.trim();
     if entry.is_empty() || entry == "main" || entry == "main_model" || entry == "main model" {
-        return (parent_model.to_string(), parent_base.to_string(), parent_keys.to_vec());
+        return (
+            parent_model.to_string(),
+            parent_base.to_string(),
+            parent_keys.to_vec(),
+            parent_provider_id.to_string(),
+        );
     }
     let (provider_id, model) = match entry.split_once('/') {
         Some((pid, m)) => (pid.trim(), m.trim()),
         None => ("", entry),
     };
     if provider_id.is_empty() {
-        return (model.to_string(), parent_base.to_string(), parent_keys.to_vec());
+        return (
+            model.to_string(),
+            parent_base.to_string(),
+            parent_keys.to_vec(),
+            parent_provider_id.to_string(),
+        );
     }
     match providers.get(provider_id) {
         Some(cfg) => {
@@ -519,9 +610,14 @@ pub fn resolve_slot_target(
             if keys.is_empty() {
                 keys = parent_keys.to_vec();
             }
-            (model.to_string(), base, keys)
+            (model.to_string(), base, keys, provider_id.to_string())
         }
-        None => (model.to_string(), parent_base.to_string(), parent_keys.to_vec()),
+        None => (
+            model.to_string(),
+            parent_base.to_string(),
+            parent_keys.to_vec(),
+            parent_provider_id.to_string(),
+        ),
     }
 }
 
@@ -562,7 +658,11 @@ pub fn resolve_slot_kind(
 /// promptTokenCount / candidatesTokenCount) — the frontend reads
 /// input_tokens/output_tokens, so unmapped keys accrued as 0/0 and the
 /// Model usage panel showed nothing after a compact.
-fn normalize_compact_usage(raw: Option<Value>, model: &str) -> Option<Value> {
+fn normalize_compact_usage(
+    raw: Option<Value>,
+    model: &str,
+    provider_id: &str,
+) -> Option<Value> {
     let obj = raw?.as_object()?.clone();
     let num = |k: &str| obj.get(k).and_then(|v| v.as_u64());
     let input = num("input_tokens")
@@ -584,8 +684,13 @@ fn normalize_compact_usage(raw: Option<Value>, model: &str) -> Option<Value> {
         norm.insert("cache_write_tokens".into(), json!(v));
     }
     // The model that ACTUALLY ran the summarizer (the compact slot may
-    // route cross-provider) — the frontend groups usage under it.
+    // route cross-provider) — the frontend groups usage under it. The
+    // effective provider id rides along so the panel does not fall back to
+    // the parent's chat provider for a cross-provider compact.
     norm.insert("model".into(), json!(model));
+    if !provider_id.is_empty() {
+        norm.insert("provider_id".into(), json!(provider_id));
+    }
     Some(Value::Object(norm))
 }
 
@@ -597,7 +702,7 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     let client = llm::http_client();
     // The "compact" Tool Models slot overrides the summarizer model
     // ("providerId/model" routes cross-provider; empty = the chat model).
-    let (model_name, base_url, api_keys) = resolve_slot_target(
+    let (model_name, base_url, api_keys, slot_provider_id) = resolve_slot_target(
         body.subagent_models.get("compact").map(|s| s.as_str()).unwrap_or(""),
         &body.model,
         &body.base_url,
@@ -608,35 +713,77 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
             }
             k
         },
+        &body.provider_id,
         &body.providers,
     );
+    // The compact slot may carry its own reasoning level; an empty entry
+    // inherits the main model's. The finding is derived from the slot's OWN
+    // provider kind, so a cross-provider summarizer is invoked like a native
+    // call to that provider would be.
+    let compact_entry = body
+        .subagent_models
+        .get("compact")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let slot_kind = resolve_slot_kind(compact_entry, &body.provider, &body.providers);
+    let compact_level = body
+        .subagent_thinking
+        .get("compact")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let level = if compact_level.is_empty() {
+        // Missing/empty slot level = OFF (send no reasoning param). Tool slots
+        // do NOT inherit the main model's level — their default is none.
+        "none"
+    } else {
+        compact_level
+    };
+    let (r_level, r_model, r_auto) =
+        crate::llm::reasoning_fields(&slot_kind, level, body.model_reasoning);
     let model = LlmConfig {
-        provider: body.provider.clone(),
+        provider: slot_kind,
         model: model_name.clone(),
         base_url,
         api_keys,
         temperature: Some(0.2),
         max_tokens: Some(4096),
         timeout_secs: 300,
+        reasoning_level: r_level.clone(),
+        model_reasoning: r_model,
+        auto_think: r_auto,
     };
     let fallback = if body.fallback_model.is_empty() {
         None
     } else {
+        let fb_kind = if body.fallback_provider.is_empty() {
+            body.provider.clone()
+        } else {
+            body.fallback_provider.clone()
+        };
+        let (fb_level, fb_model, fb_auto) =
+            crate::llm::reasoning_fields(&fb_kind, body.thinking_level.trim(), body.model_reasoning);
         Some(LlmConfig {
-            provider: if body.fallback_provider.is_empty() { body.provider.clone() } else { body.fallback_provider.clone() },
+            provider: fb_kind,
             model: body.fallback_model.clone(),
             base_url: if body.fallback_base_url.is_empty() { body.base_url.clone() } else { body.fallback_base_url.clone() },
             api_keys: if body.fallback_api_key.is_empty() { model.api_keys.clone() } else { vec![body.fallback_api_key.clone()] },
             temperature: Some(0.2),
             max_tokens: Some(4096),
             timeout_secs: 300,
+            // The fallback usually shares the primary's kind; when it does not,
+            // derive the gate from its own kind so a cloud auto-think provider
+            // is still invoked the same way as a primary call would be.
+            reasoning_level: fb_level,
+            model_reasoning: fb_model,
+            auto_think: fb_auto,
         })
     };
     match compact::compact_history(&client, &model, fallback.as_ref(), &body.history, body.context_window, body.max_output, true).await {
         Ok(Some(out)) => Json(json!({
             "summary": out.summary,
             "keep": out.keep,
-            "usage": normalize_compact_usage(out.usage, &model_name),
+            "usage": normalize_compact_usage(out.usage, &model_name, &slot_provider_id),
         }))
         .into_response(),
         Ok(None) => Json(json!({ "summary": Value::Null, "keep": 0, "error": "nothing to compact" })).into_response(),
@@ -684,6 +831,23 @@ async fn chat_steer_cancel(Json(body): Json<Value>) -> Response<Body> {
     if !chat_id.is_empty() && !id.is_empty() {
         agent::cancel_steer(chat_id, id);
     }
+    Json(json!({"ok": true})).into_response()
+}
+
+/// POST /chat/retry_now — force the running explore retry ladder to retry NOW.
+///
+/// The banner's Retry button used to be a no-op on a LIVE sub-agent retry: the
+/// parent turn is still streaming, so the renderer's `send()` is swallowed by
+/// its own single-flight guard and the whole last user turn could never be
+/// re-sent. Rebooting the turn is the wrong fix anyway — what the user wants is
+/// "stop waiting and try that sub-agent call again". This skips the ladder's
+/// backoff so the very next attempt runs immediately.
+async fn chat_retry_now(Json(body): Json<Value>) -> Response<Body> {
+    let chat_id = body.get("chat_id").and_then(Value::as_str).unwrap_or_default().trim();
+    if chat_id.is_empty() {
+        return bad_request("chat_id is required");
+    }
+    agent::nudge_subagent_retry();
     Json(json!({"ok": true})).into_response()
 }
 
@@ -994,8 +1158,23 @@ async fn browser_status(Query(q): Query<HashMap<String, String>>) -> Response<Bo
     Json(crate::browser::status(&chat)).into_response()
 }
 
-async fn browser_launch(Json(body): Json<Value>) -> Response<Body> {
-    let url = body["url"].as_str().unwrap_or("about:blank");
+/// Start the one-click download of the app's own automation browser.
+///
+/// Returns immediately: the download and unpack run on a plain thread (see
+/// `browser::install`), and the panel follows `/browser/install/status`.
+async fn browser_install() -> Response<Body> {
+    crate::browser::install();
+    Json(crate::browser::install_status()).into_response()
+}
+
+/// Progress of the automation-browser install, plus whether the browser is
+/// usable right now (the panel uses `available` to decide between the browser
+/// UI and the install affordance only while there is no running session).
+async fn browser_install_status() -> Response<Body> {
+    Json(crate::browser::install_status()).into_response()
+}
+
+async fn browser_launch(Json(body): Json<Value>) -> Response<Body> {    let url = body["url"].as_str().unwrap_or("about:blank");
     let chat = chat_id_of(&body, &HashMap::new());
     Json(crate::browser::launch(url, &chat)).into_response()
 }
@@ -1013,10 +1192,51 @@ async fn browser_screenshot(Query(q): Query<HashMap<String, String>>) -> Respons
 }
 
 async fn browser_click(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    // A ref (or a selector) means the panel/agent is asking for a real element
+    // click: run it through the native driver, which resolves and scrolls the
+    // element. Raw x/y stays on the arm's coordinate path.
+    if body.get("ref").is_some() || body.get("selector").is_some() {
+        return Json(driver_json("click", &body, &chat)).into_response();
+    }
     let x = body["x"].as_i64().unwrap_or_default();
     let y = body["y"].as_i64().unwrap_or_default();
-    let chat = chat_id_of(&body, &HashMap::new());
     Json(crate::browser::click(x, y, &chat)).into_response()
+}
+
+/// Run one `browser_driver` action and render it as the `{ok, text}` /
+/// `{ok, error}` envelope the renderer already understands.
+fn driver_json(action: &str, body: &Value, chat: &str) -> Value {
+    match crate::browser_driver::run(action, body, chat) {
+        Ok(text) => json!({"ok": true, "text": text}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+async fn browser_type(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    if body.get("ref").is_some() || body.get("selector").is_some() {
+        return Json(driver_json("type", &body, &chat)).into_response();
+    }
+    let text = body["text"].as_str().unwrap_or_default();
+    Json(crate::browser::type_text(text, &chat)).into_response()
+}
+
+async fn browser_scroll(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    if body.get("ref").is_some() || body.get("selector").is_some() {
+        return Json(driver_json("scroll", &body, &chat)).into_response();
+    }
+    let dx = body["dx"].as_i64().unwrap_or_default();
+    let dy = body["dy"].as_i64().unwrap_or_default();
+    Json(crate::browser::scroll(dx, dy, &chat)).into_response()
+}
+
+/// `browser_snapshot` for the panel: the same ref list the agent sees, so a
+/// user-driven click can be expressed as a ref instead of a pixel.
+async fn browser_snapshot(Json(body): Json<Value>) -> Response<Body> {
+    let chat = chat_id_of(&body, &HashMap::new());
+    Json(driver_json("snapshot", &body, &chat)).into_response()
 }
 
 async fn browser_move(Json(body): Json<Value>) -> Response<Body> {
@@ -1026,23 +1246,10 @@ async fn browser_move(Json(body): Json<Value>) -> Response<Body> {
     Json(crate::browser::move_mouse(x, y, &chat)).into_response()
 }
 
-async fn browser_type(Json(body): Json<Value>) -> Response<Body> {
-    let text = body["text"].as_str().unwrap_or_default();
-    let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::type_text(text, &chat)).into_response()
-}
-
 async fn browser_key(Json(body): Json<Value>) -> Response<Body> {
     let key = body["key"].as_str().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
     Json(crate::browser::press_key(key, &chat)).into_response()
-}
-
-async fn browser_scroll(Json(body): Json<Value>) -> Response<Body> {
-    let dx = body["dx"].as_i64().unwrap_or_default();
-    let dy = body["dy"].as_i64().unwrap_or_default();
-    let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::scroll(dx, dy, &chat)).into_response()
 }
 
 async fn browser_viewport(Json(body): Json<Value>) -> Response<Body> {
@@ -1127,6 +1334,9 @@ pub fn router(state: AppState) -> Router {
         // Mid-turn steer: inject a message into the RUNNING turn of a chat.
         .route("/chat/steer", post(chat_steer))
         .route("/chat/steer/cancel", post(chat_steer_cancel))
+        // Banner Retry on a LIVE sub-agent retry: skip the ladder's backoff and
+        // run the next attempt immediately (see `chat_retry_now`).
+        .route("/chat/retry_now", post(chat_retry_now))
         // User answers to a blocking agent gate. The turn is parked on a
         // oneshot inside agent.rs (`await_answer`); these two routes resolve it
         // and let the turn continue. They MUST be native: the sidecar no longer
@@ -1155,9 +1365,11 @@ pub fn router(state: AppState) -> Router {
         .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
         .route("/chats/title", post(crate::appstate::chat_title))
         // In-app browser (migrated from the Python sidecar's browser_session):
-        // the right-side panel polls frames and posts input here, and the
-        // agent's Playwright MCP attaches to the same Chromium via /browser/cdp.
+        // the right-side panel polls frames and posts input here, while the
+        // agent drives the same Chromium through the native `browser_driver`.
         .route("/browser/status", get(browser_status))
+        .route("/browser/install", post(browser_install))
+        .route("/browser/install/status", get(browser_install_status))
         .route("/browser/launch", post(browser_launch))
         .route("/browser/navigate", post(browser_navigate))
         .route("/browser/screenshot", get(browser_screenshot))
@@ -1166,6 +1378,7 @@ pub fn router(state: AppState) -> Router {
         .route("/browser/type", post(browser_type))
         .route("/browser/key", post(browser_key))
         .route("/browser/scroll", post(browser_scroll))
+        .route("/browser/snapshot", post(browser_snapshot))
         .route("/browser/viewport", post(browser_viewport))
         .route("/browser/history", post(browser_history))
         .route("/browser/search", post(browser_search))
@@ -1191,6 +1404,10 @@ mod tests {
     use super::*;
     use tower::util::ServiceExt;
 
+    /// Model id the live tests assert on: distinctive enough that a bug which
+    /// sends the chat's model instead of the slot's can never pass by luck.
+    const MOCK_MODEL: &str = "slot-mock/sentinel-model";
+
     #[test]
     fn slot_target_reads_the_renderer_camel_case_provider_config() {
         // The renderer sends provider configs as camelCase (`apiKeys`,
@@ -1206,11 +1423,13 @@ mod tests {
                 "apiKeys": ["sk-camel"],
             }),
         );
-        let (model, base, keys) =
-            resolve_slot_target("p1/gpt-x", "parent", "http://parent/v1", &[], &providers);
+        let (model, base, keys, pid) =
+            resolve_slot_target("p1/gpt-x", "parent", "http://parent/v1", &[], "parent-id", &providers);
         assert_eq!(model, "gpt-x");
         assert_eq!(base, "http://camel/v1");
         assert_eq!(keys, vec!["sk-camel".to_string()]);
+        // The effective provider id rides along for usage attribution.
+        assert_eq!(pid, "p1");
 
         // The sidecar's own snake_case contract keeps working.
         let mut snake = std::collections::HashMap::new();
@@ -1218,8 +1437,8 @@ mod tests {
             "p2".to_string(),
             serde_json::json!({"base_url": "http://snake/v1", "api_keys": ["sk-snake"]}),
         );
-        let (_, base2, keys2) =
-            resolve_slot_target("p2/m", "parent", "http://parent/v1", &[], &snake);
+        let (_, base2, keys2, _) =
+            resolve_slot_target("p2/m", "parent", "http://parent/v1", &[], "parent-id", &snake);
         assert_eq!(base2, "http://snake/v1");
         assert_eq!(keys2, vec!["sk-snake".to_string()]);
 
@@ -1227,14 +1446,16 @@ mod tests {
         // to the parent's base + keys instead of losing them.
         let mut single = std::collections::HashMap::new();
         single.insert("p3".to_string(), serde_json::json!({"apiKey": "sk-one"}));
-        let (_, base3, keys3) =
-            resolve_slot_target("p3/m", "parent", "http://parent/v1", &["sk-parent".into()], &single);
+        let (_, base3, keys3, _) =
+            resolve_slot_target("p3/m", "parent", "http://parent/v1", &["sk-parent".into()], "parent-id", &single);
         assert_eq!(base3, "http://parent/v1");
         assert_eq!(keys3, vec!["sk-one".to_string()]);
-        let (_, base4, keys4) =
-            resolve_slot_target("ghost/m", "parent", "http://parent/v1", &["sk-parent".into()], &single);
+        let (_, base4, keys4, pid4) =
+            resolve_slot_target("ghost/m", "parent", "http://parent/v1", &["sk-parent".into()], "parent-id", &single);
         assert_eq!(base4, "http://parent/v1");
         assert_eq!(keys4, vec!["sk-parent".to_string()]);
+        // Unknown provider: falls back to the parent, id included.
+        assert_eq!(pid4, "parent-id");
     }
 
     #[test]
@@ -1305,6 +1526,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn native_errors_are_json_detail_not_plain_text() {
+        // The renderer reads `body.detail` on a non-ok response. A plain-text
+        // body was swallowed into a generic "<op> failed (400)" — the reason
+        // for a failed Commit stayed invisible. Every native error must carry
+        // the message under `detail`.
+        let app = router(new_state(std::env::temp_dir()));
+
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/git/status?root=/nonexistent-xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["detail"], "invalid project root");
+
+        // A missing repo must never be answered with an empty body either.
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/skills/file?name=nope&file=skill.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["detail"].is_string(), "missing detail: {body}");
     }
 
     #[tokio::test]
@@ -1452,30 +1712,36 @@ mod tests {
         let u = normalize_compact_usage(
             Some(json!({ "prompt_tokens": 120, "completion_tokens": 45 })),
             "zai-org/GLM-5.3-Flash",
+            "river",
         )
         .unwrap();
         assert_eq!(u["input_tokens"], 120);
         assert_eq!(u["output_tokens"], 45);
         assert_eq!(u["model"], "zai-org/GLM-5.3-Flash");
+        assert_eq!(u["provider_id"], "river");
 
         // Anthropic keys pass through; Gemini camelCase maps too.
         let u = normalize_compact_usage(
             Some(json!({ "input_tokens": 7, "output_tokens": 3 })),
             "m",
+            "p",
         )
         .unwrap();
         assert_eq!(u["input_tokens"], 7);
         let u = normalize_compact_usage(
             Some(json!({ "promptTokenCount": 9, "candidatesTokenCount": 2 })),
             "m",
+            "",
         )
         .unwrap();
         assert_eq!(u["input_tokens"], 9);
         assert_eq!(u["output_tokens"], 2);
+        // An empty provider id is omitted, never stored as "".
+        assert!(u.get("provider_id").is_none());
 
         // Missing/empty usage -> None (frontend skips accrual entirely).
-        assert!(normalize_compact_usage(None, "m").is_none());
-        assert!(normalize_compact_usage(Some(json!(null)), "m").is_none());
+        assert!(normalize_compact_usage(None, "m", "p").is_none());
+        assert!(normalize_compact_usage(Some(json!(null)), "m", "p").is_none());
     }
 
     #[tokio::test]
@@ -1511,6 +1777,55 @@ mod tests {
         assert_eq!(res.status(), 400);
     }
 
+    /// One live OpenAI-compatible upstream on 127.0.0.1: records every
+    /// request body and answers a fixed completion + usage. Returns the base
+    /// URL and a channel of the bodies it received.
+    async fn spawn_mock_upstream() -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = serde_json::from_slice(&buf[head_end + 4..]).unwrap_or(Value::Null);
+                    let _ = tx.send(body);
+                    let resp = concat!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n",
+                        "content-length: 96\r\nconnection: close\r\n\r\n",
+                        "{\"choices\":[{\"message\":{\"content\":\"ok summary\"}}]",
+                        ",\"usage\":{\"input_tokens\":21,\"output_tokens\":7}}"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
     #[tokio::test]
     async fn model_probe_reports_a_failure_per_model_without_failing_the_batch() {
         // An unreachable provider must mark that model failed (no green tick)
@@ -1539,5 +1854,133 @@ mod tests {
             item["error"].as_str().is_some_and(|e| !e.is_empty()),
             "a failed probe must carry the reason: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_live_uses_the_slot_model_provider_and_reasoning() {
+        // A cross-provider compact slot must: (1) hit THAT provider's base URL
+        // with the slot's model id, (2) apply the slot's own reasoning effort
+        // (max), and (3) attribute the usage to the slot's provider id.
+        let (mock_base, mut rx) = spawn_mock_upstream().await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "openrouter",
+            "provider_id": "chat-provider",
+            "model": "main/m-main",
+            "base_url": "http://chat-provider.example/v1",
+            "api_key": "sk-chat",
+            "api_keys": ["sk-chat"],
+            "subagent_models": { "compact": format!("slot-prov/{MOCK_MODEL}") },
+            "subagent_thinking": { "compact": "max" },
+            "model_reasoning": true,
+            "providers": {
+                "slot-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-slot"] }
+            },
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let sent = rx.recv().await.expect("mock upstream saw no request");
+        assert_eq!(sent["model"], MOCK_MODEL, "the slot model must be sent, got {sent}");
+        assert_eq!(sent["reasoning_effort"], "high", "slot thinking=max must map to the strongest accepted token, got {sent}");
+        let usage = &out["usage"];
+        assert_eq!(usage["model"], MOCK_MODEL);
+        assert_eq!(usage["provider_id"], "slot-prov", "usage must be attributed to the effective provider, got {usage}");
+        assert_eq!(usage["input_tokens"], 21);
+        assert_eq!(out["summary"], "ok summary");
+    }
+
+    #[tokio::test]
+    async fn compact_live_without_a_slot_uses_the_chat_model_and_provider() {
+        // Empty slot = the chat's own model/provider, attributed to the chat's id.
+        let (mock_base, mut rx) = spawn_mock_upstream().await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": MOCK_MODEL,
+            "base_url": format!("{mock_base}/v1"),
+            "api_key": "sk-chat",
+            "api_keys": ["sk-chat"],
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let sent = rx.recv().await.expect("mock upstream saw no request");
+        let usage = &out["usage"];
+        assert_eq!(sent["model"], MOCK_MODEL);
+        assert_eq!(usage["provider_id"], "chat-provider");
+    }
+
+    #[tokio::test]
+    async fn title_live_uses_the_title_slot_model_and_provider() {
+        // The title slot routes cross-provider: the request must go to THAT
+        // provider and the reported usage must carry ITS id.
+        let (mock_base, mut rx) = spawn_mock_upstream().await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "openrouter",
+            "provider_id": "chat-provider",
+            "model": "main/m-main",
+            "base_url": "http://chat-provider.example/v1",
+            "api_key": "sk-chat",
+            "api_keys": ["sk-chat"],
+            "subagent_models": { "title": format!("title-prov/{MOCK_MODEL}") },
+            "providers": {
+                "title-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-title"] }
+            },
+            "text": "hello world this is the first message"
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chats/title")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let sent = rx.recv().await.expect("mock upstream saw no request");
+        assert_eq!(sent["model"], MOCK_MODEL, "title must run on the slot model, got {sent}");
+        let usage = &out["usage"];
+        assert_eq!(usage["provider_id"], "title-prov", "title usage must be attributed to the slot provider, got {usage}");
+        assert_eq!(usage["model"], MOCK_MODEL);
+        assert!(out["title"].as_str().is_some_and(|t| !t.is_empty()), "a title must come back: {out}");
     }
 }

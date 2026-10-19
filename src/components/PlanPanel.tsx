@@ -17,17 +17,19 @@ import { mdComponents } from "./ChatMessage";
 export function PlanPanel({ chatId }: { chatId?: string } = {}) {
   const storeActiveChatId = useStore((s) => s.activeChatId);
   const activeChatId = chatId ?? storeActiveChatId;
-  const chats = useStore((s) => s.chats);
+  // Subscribe to just the active chat's record instead of the whole `chats`
+  // array: that array now holds lightweight index rows, and every rename or
+  // unread tick used to rebuild this panel.
+  const chat = useStore((s) => s.chats.find((c) => c.id === activeChatId) ?? null);
   // The panel CHROME stays LTR (same docked layout as Git/Trace); only the
   // plan TEXT follows the app's direction + bidi handling.
   const dir = useStore((s) => s.dir);
   const [copied, setCopied] = useState(false);
 
   const planDoc = useMemo(
-    () => latestPlanDoc(chats, activeChatId),
-    [chats, activeChatId],
+    () => latestPlanDoc(chat ? [chat] : [], activeChatId),
+    [chat, activeChatId],
   );
-  const chat = chats.find((c) => c.id === activeChatId);
   // Disk fallback: the plan persists at <data>/plan/<ws>/<chat>/plan.md, so a
   // restart (or a chat whose plan message was deleted) still shows the plan.
   const [diskPlan, setDiskPlan] = useState<{ title: string; body: string } | null>(null);

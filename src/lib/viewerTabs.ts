@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
-import { useStore } from './store'
+import { registerChatDeleteHook, useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
@@ -97,6 +97,10 @@ export interface ViewerTab {
    *  and "text" keeps it verbatim in a pre. The header toggle can always
    *  switch views. */
   textFormat?: 'md' | 'text'
+  /** Browser tab: the page the agent's browser tool asked to open (its `url`
+   *  arg). Without it the panel always launched about:blank, so the user
+   *  watched an empty browser while the agent worked on a real page. */
+  browserUrl?: string
   createdAt: number
 }
 
@@ -116,8 +120,13 @@ interface ViewerTabsState {
   /** Open the implementation-plan document of a chat (Plan card's
    *  "View full plan"). Defaults to the active chat. */
   openPlan: (chatId?: string) => void
-  /** Open the in-app virtual browser tab of a chat (shared Playwright session). */
-  openBrowser: (chatId?: string) => void
+  /** Open the in-app virtual browser tab of a chat (the shared in-app browser).
+   *  `url` is the page the agent's browser tool asked for, so the panel opens
+   *  on that page instead of a blank tab. */
+  openBrowser: (chatId?: string, url?: string) => void
+  /** Point an ALREADY-open browser tab at a new page (the agent navigated
+   *  again after the tab was docked). No-op when the chat has no browser tab. */
+  setBrowserUrl: (chatId: string, url: string) => void
   /** Open a workspace file in its own viewer tab, scoped to ONE chat
    *  (id `file:<chatId>:<path>`, one tab per file per chat). Reopening the
    *  same path in the same chat focuses the tab and updates the target line.
@@ -592,9 +601,20 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openBrowser: (chatId) =>
+  setBrowserUrl: (chatId, url) =>
     set((s) => {
-      // One browser tab per chat; the panel shows the shared Playwright session.
+      const id = viewerTabId('browser', chatId)
+      if (!s.tabs.some((t) => t.id === id)) return s
+      const tabs = s.tabs.map((t) =>
+        t.id === id ? { ...t, browserUrl: url } : t,
+      )
+      persist(tabs, s.activeId)
+      return { tabs }
+    }),
+
+  openBrowser: (chatId, url) =>
+    set((s) => {
+      // One browser tab per chat; the panel shows the shared in-app browser.
       const cid = chatId ?? currentChatId()
       const id = viewerTabId('browser', cid)
       const entry: ViewerTab = {
@@ -602,6 +622,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         kind: 'browser',
         chatId: cid,
         title: 'Browser',
+        // The agent's browser tool hands its `url` here (see Chat.tsx): the
+        // panel then launches on the page the agent is really working with.
+        ...(url && url !== 'about:blank' ? { browserUrl: url } : {}),
         createdAt: Date.now(),
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
@@ -984,3 +1007,12 @@ export function clampSplitWidth(w: number, vw?: number): number {
   const max = Math.min(width / 2, width - 320)
   return Math.max(320, Math.min(max, w))
 }
+
+// A deleted chat must not keep its viewer tabs (nor the `lastActiveByChat`
+// entries behind them) alive for the rest of the session. Registered through
+// the store's delete hook instead of importing the store from here in the other
+// direction — this module already imports ./store, so an import back would be a
+// circular import.
+registerChatDeleteHook((chatId) => {
+  useViewerTabs.getState().closeAllViewers(chatId)
+})

@@ -29,8 +29,111 @@ pub const REF_CAP: usize = 40;
 pub const REF_INLINE_CAP: usize = 25;
 pub const REF_INLINE_MAX_CHARS: usize = 160;
 pub const SYMBOLS_CAP: usize = 400;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a request may wait for its response.
+///
+/// Deliberately generous, and NOT a wedge detector: exceeding it no longer kills
+/// the server (see `request`). rust-analyzer answers a `definition` only once it
+/// has loaded the crate graph, and the first request against a cold server is
+/// the one that pays for it — aborting that threw away every second of indexing
+/// already done, so the next call started over from zero and LSP never became
+/// warm.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for the `initialize` handshake of a COLD server.
+///
+/// rust-analyzer runs `cargo metadata` and starts loading the project before it
+/// answers; on a Tauri-sized workspace that is minutes, not seconds. A server
+/// that is still loading is NOT broken, so this just has to outlast a normal
+/// cold start.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long `diagnostics` drains pushed `publishDiagnostics` notifications.
+///
+/// A soft window: diagnostics are a bonus, and this call must never wedge the
+/// turn — it triggers a pull without waiting for the response (`request_nowait`)
+/// and then only listens for as long as this.
+const DIAGNOSTICS_WINDOW: Duration = Duration::from_secs(3);
 const MAX_OPEN_DOCS: usize = 30;
+/// How many unread server messages are buffered before advisory notifications
+/// are dropped.
+///
+/// A language server broadcasts progress and diagnostics while it indexes, and
+/// nothing consumes them between tool calls — an unbounded queue grew with every
+/// message rust-analyzer produced (hundreds of MB over a long indexing session).
+/// The bound keeps memory flat. Messages carrying an `id` (the responses a call
+/// is waiting for, and server->client requests we must answer) are NEVER dropped;
+/// only advisory notifications are.
+const NOTIFY_QUEUE: usize = 1024;
+/// How long an UNUSED language server is kept before it is reaped.
+///
+/// A server holds the project index in memory (rust-analyzer: hundreds of MB to
+/// a couple of GB), so one per project ever opened grows without bound over a
+/// long session. Ten minutes is long enough that switching back and forth
+/// between two projects keeps both warm, and short enough that abandoned
+/// projects do not pile up. Reaping happens on a workspace switch (`prune_idle`).
+const LSP_IDLE_TTL: Duration = Duration::from_secs(600);
+/// How long a call may wait for exclusive use of a root+language server.
+///
+/// `Mutex::lock` waits FOREVER, and dropping an abandoned attempt does not stop
+/// it: `spawn_blocking` cannot be cancelled, so the thread that is inside the
+/// LSP call keeps running and keeps this mutex. The next attempt then parked
+/// behind it and attempts stacked up — one wedged call could stall a turn for
+/// half an hour, and nothing ever released the lock.
+///
+/// A HEALTHY holder releases far sooner: `request` itself gives up at
+/// `REQUEST_TIMEOUT` (60s), so 120s only expires for a genuinely stuck server.
+/// Even then the server is KEPT (see `lock_server`): the holder is almost always
+/// a healthy call still working on a cold index, and throwing the server away
+/// there is exactly what kept LSP from ever getting warm. The caller gets a
+/// clear "still busy, retry" error instead of a silently restarted server.
+const SERVER_LOCK_WAIT: Duration = Duration::from_secs(120);
+/// How long `server_for`'s liveness probe may wait for a server's lock before
+/// concluding "busy, therefore alive".
+///
+/// The probe must never block: a wedged thread can hold that lock indefinitely
+/// (`spawn_blocking` LSP calls cannot be cancelled), and waiting on it is
+/// precisely how attempts piled up. Handing the server back lets `lock_server`
+/// do the bounded wait — and replace it if it truly never releases.
+const SERVER_PROBE_WAIT: Duration = Duration::from_secs(2);
+/// How often a bounded wait reports liveness.
+///
+/// Every wait is served in slices this long and each slice refreshes a global
+/// heartbeat, so the agent's idle guard can tell "the language server is still
+/// loading" (real progress — a cold rust-analyzer says nothing for minutes)
+/// from "the turn is wedged". Without it the guard would abort a healthy cold
+/// start, and with a shorter request budget the server would be killed and
+/// re-cold-started forever.
+const LSP_PULSE_SLICE: Duration = Duration::from_secs(5);
+
+/// Global "the LSP layer is alive and working" counter — see `LSP_PULSE_SLICE`.
+static LSP_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// True on a BACKGROUND pre-warm thread.
+    ///
+    /// A pre-warm loads language servers for the whole workspace on its own
+    /// thread, and loading a cold server means minutes of `next_message` /
+    /// `lock_bounded` waits — each of which refreshes the global counter. Fed
+    /// into the agent's idle guard, that background work looked like the CURRENT
+    /// attempt making progress, so a genuinely hung provider was never detected.
+    /// Only LSP work caused by the attempt itself may count as its liveness.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark LSP progress so the agent's idle guard does not mistake a cold server
+/// for a hung turn.
+///
+/// A background pre-warm (`QUIET`) is deliberately excluded: it is not the
+/// agent's attempt, so it must never keep a hung attempt alive.
+fn touch() {
+    if QUIET.with(std::cell::Cell::get) {
+        return;
+    }
+    LSP_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Current LSP activity counter (the agent's idle guard polls this).
+pub fn activity() -> u64 {
+    LSP_ACTIVITY.load(Ordering::Relaxed)
+}
 
 // --- registry tables (parity with lsp_manager.py) ---------------------------
 
@@ -219,10 +322,37 @@ fn resolve_binary(cmd0: &str, path_env: &std::ffi::OsStr) -> PathBuf {
 struct Server {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Messages parsed by a background reader thread that OWNS the server's
+    /// stdout.
+    ///
+    /// Reading the pipe inline cannot be bounded (a blocking `read_line` ignores
+    /// any deadline checked between messages), so a server that accepted the
+    /// request and then went silent — rust-analyzer still indexing a large
+    /// repo, for one — froze the whole agent turn FOREVER, with no error and no
+    /// retry hook. Inside an explore that surfaced as "hangs after a tool call".
+    /// A channel lets every wait below carry a real deadline, and a dead server
+    /// disconnects it instead of blocking.
+    rx: std::sync::mpsc::Receiver<Value>,
+    /// Set by the reader thread the moment it stops (the server closed stdout or
+    /// the process died).
+    ///
+    /// Used as the registry's reuse probe. A channel can be probed for
+    /// disconnection only with `try_recv`, which would SWALLOW a pending
+    /// message — this flag cannot.
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     initialized: bool,
+    /// Whether the `initialize` request has been WRITTEN yet.
+    ///
+    /// A cold start on a big workspace can outlast its budget; the retry then
+    /// resumes draining for the answer to the request already in flight instead
+    /// of restarting the handshake (servers ignore a second `initialize`).
+    initialize_sent: bool,
     /// Open documents (uri -> version) to keep didOpen/didChange bookkeeping.
     open_docs: HashMap<String, u64>,
+    /// When a call last used this server. Drives idle eviction so a long session
+    /// that opens many projects does not keep a language-server process — with
+    /// its whole project index in memory — alive for every one of them.
+    last_used: Instant,
 }
 
 impl Server {
@@ -247,13 +377,154 @@ impl Server {
             })?;
         let stdin = process.stdin.take().ok_or("no stdin")?;
         let stdout = process.stdout.take().ok_or("no stdout")?;
+        // The reader thread owns stdout and pushes parsed messages. When the
+        // server dies or closes its stream the channel disconnects, so every
+        // wait below reports a closed stream instead of hanging on a pipe.
+        //
+        // BOUNDED on purpose — see NOTIFY_QUEUE: an unbounded queue grew with
+        // every notification the server produced while nobody was listening.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(NOTIFY_QUEUE);
+        let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead_reader = std::sync::Arc::clone(&dead);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(msg) = read_message(&mut reader) {
+                // A message carrying an `id` is something a call is WAITING for
+                // (a response) or something the server WAITS on us for (a
+                // server->client request): sent with a blocking send so it is
+                // never dropped. Everything else is advisory (progress,
+                // diagnostics, logMessage) — if the queue is full nobody is
+                // listening, so dropping it is exactly the intent of the bound.
+                let needed = msg.get("id").is_some();
+                let keep_reading = if needed {
+                    tx.send(msg).is_ok()
+                } else {
+                    match tx.try_send(msg) {
+                        Ok(()) => true,
+                        // Full: nobody is reading right now — drop this one.
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                    }
+                };
+                if !keep_reading {
+                    break;
+                }
+            }
+            // The stream ended: the registry must stop handing this server out.
+            dead_reader.store(true, Ordering::Relaxed);
+        });
         Ok(Server {
             child: process,
             stdin,
-            stdout: BufReader::new(stdout),
+            rx,
+            dead,
             initialized: false,
+            initialize_sent: false,
             open_docs: HashMap::new(),
+            last_used: Instant::now(),
         })
+    }
+
+    /// Wait up to `timeout` for the next message from the server.
+    ///
+    /// Bounded on purpose — see the `rx` field. `"timed out"` means the server
+    /// stayed silent for the whole window; `"server closed the stream"` means
+    /// the reader thread ended (the process died or closed stdout).
+    fn next_message(&self, timeout: Duration) -> Result<Value, String> {
+        // Served in small slices that each refresh the global heartbeat: a cold
+        // server legitimately answers nothing for minutes, and without the
+        // heartbeat the agent's idle guard would read that as a wedged turn.
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out".to_string());
+            }
+            touch();
+            match self.rx.recv_timeout(remaining.min(LSP_PULSE_SLICE)) {
+                Ok(msg) => return Ok(msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("server closed the stream".into())
+                }
+            }
+        }
+    }
+
+    /// Whether this server can no longer answer AT ALL.
+    ///
+    /// A server that is merely SLOW is not dead and must be kept: it is still
+    /// building its index, and discarding it means paying the whole cold start
+    /// again on the next call — the reason LSP never became fast.
+    fn is_dead(&mut self) -> bool {
+        if self.dead.load(Ordering::Relaxed) {
+            return true;
+        }
+        // Err = we cannot tell; assume alive so a transient probe failure never
+        // throws away a warm server.
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Answer a server->client request so the server is never left waiting on
+    /// us.
+    ///
+    /// rust-analyzer sends `workspace/configuration`,
+    /// `client/registerCapability` and `window/workDoneProgress/create` while it
+    /// loads. Unanswered, IT blocks — which the user sees as OUR request being
+    /// slow, with no error anywhere.
+    fn answer_server_request(&mut self, msg: &Value) {
+        let Some(rid) = msg.get("id") else { return };
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+        let result = if method == "workspace/configuration" {
+            // One null per requested section: the server then falls back to its
+            // own defaults instead of waiting for answers that never come.
+            let n = msg
+                .pointer("/params/items")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Value::Array(vec![Value::Null; n])
+        } else {
+            Value::Null
+        };
+        let _ = write_message(
+            &mut self.stdin,
+            &json!({"jsonrpc": "2.0", "id": rid, "result": result}),
+        );
+    }
+
+    /// Send a request and return its id WITHOUT waiting for the response.
+    ///
+    /// Used by `diagnostics`, which only wants to trigger the server and then
+    /// listen for a short window; waiting for the response would make that
+    /// best-effort call block for the full request budget against a server that
+    /// may not implement pull diagnostics at all.
+    fn request_nowait(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        let id = next_id();
+        write_message(
+            &mut self.stdin,
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )?;
+        Ok(id)
+    }
+
+    /// Consume whatever has ALREADY arrived, without ever blocking.
+    ///
+    /// Called before writing a request (which can be large — `didOpen` sends the
+    /// whole file). Because the queue is bounded, a full one leaves the reader
+    /// thread parked on its send; draining here lets it resume reading stdout, so
+    /// the server cannot end up blocked on its own output while we are blocked
+    /// writing to its stdin — the classic pipe deadlock. Server->client requests
+    /// seen here are answered like anywhere else, so nothing is lost by draining.
+    fn drain_pending(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            if msg.get("method").is_some() && msg.get("id").is_some() {
+                self.answer_server_request(&msg);
+            }
+        }
     }
 
     fn initialize(&mut self, root: &Path) -> Result<(), String> {
@@ -272,18 +543,40 @@ impl Server {
                 }
             },
         });
-        write_message(&mut self.stdin, &json!({"jsonrpc": "2.0", "id": next_id(), "method": "initialize", "params": params}))?;
-        // Drain responses until the matching initialize result arrives.
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        // Send the handshake request only ONCE per process: a later retry must
+        // keep draining for the answer to the request already in flight rather
+        // than restart the handshake (servers ignore a second `initialize`).
+        if !self.initialize_sent {
+            write_message(&mut self.stdin, &json!({"jsonrpc": "2.0", "id": next_id(), "method": "initialize", "params": params}))?;
+            self.initialize_sent = true;
+        }
+        // Drain responses until the matching initialize result arrives. A cold
+        // rust-analyzer runs `cargo metadata` first and legitimately says
+        // nothing for minutes — it is loading, not stuck — so this waits on its
+        // own budget and never kills the process (doing so threw away the load
+        // that had already happened).
+        let deadline = Instant::now() + INITIALIZE_TIMEOUT;
         loop {
-            if Instant::now() > deadline {
-                return Err("initialize timed out".into());
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("LSP server did not finish starting (initialize timed out) — it may still be indexing; retry, or use grep + read for now".into());
             }
-            let msg = read_message(&mut self.stdout)?;
+            let msg = self.next_message(remaining).map_err(|e| {
+                if e == "timed out" {
+                    "LSP server did not finish starting (initialize timed out) — it may still be indexing; retry, or use grep + read for now".to_string()
+                } else {
+                    e
+                }
+            })?;
             // A server->client request also carries an `id` (and a `method`);
             // only a method-less message is the initialize response.
             if msg.get("id").is_some() && msg.get("method").is_none() {
                 break;
+            }
+            // It may ask US something while loading (configuration, capability
+            // registration): unanswered, it waits on us instead of us on it.
+            if msg.get("id").is_some() && msg.get("method").is_some() {
+                self.answer_server_request(&msg);
             }
         }
         write_message(&mut self.stdin, &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}))?;
@@ -292,6 +585,7 @@ impl Server {
     }
 
     fn ensure_open(&mut self, abs: &Path) -> Result<(), String> {
+        self.drain_pending();
         let uri = path_to_uri(abs);
         if self.open_docs.contains_key(&uri) {
             return Ok(());
@@ -325,14 +619,27 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.drain_pending();
         let id = next_id();
         write_message(&mut self.stdin, &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
-            if Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(format!("{method} timed out"));
             }
-            let msg = read_message(&mut self.stdout)?;
+            let msg = self.next_message(remaining).map_err(|e| {
+                if e == "timed out" {
+                    // Do NOT kill the server: a timeout usually means it is still
+                    // loading/building its index, and a fresh process would just
+                    // start that over — which is exactly why LSP never got warm.
+                    // The late response is not a desync risk: every message we
+                    // send carries its own id and unmatched ones are skipped.
+                    format!("{method} timed out after {}s — the language server is still indexing; retry, or use grep + read for now", REQUEST_TIMEOUT.as_secs())
+                } else {
+                    e
+                }
+            })?;
             // Server->client requests (workDoneProgress/create, registerCapability)
             // use their own id counter and can collide with ours: require a
             // method-less message so one is never mistaken for our response.
@@ -341,6 +648,12 @@ impl Server {
                     return Err(format!("server error: {err}"));
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+            }
+            // Anything the server ASKS us (workspace/configuration, capability
+            // registration, work-done progress) must be answered, or the server
+            // blocks waiting for us and every later request looks slow.
+            if msg.get("id").is_some() && msg.get("method").is_some() {
+                self.answer_server_request(&msg);
             }
             // Notifications (publishDiagnostics etc.) are skipped.
         }
@@ -365,30 +678,329 @@ fn path_to_uri(path: &Path) -> String {
 #[derive(Default)]
 pub struct LspRegistry {
     roots: Mutex<HashMap<PathBuf, HashMap<String, Arc<Mutex<Server>>>>>,
+    /// Roots already pre-warmed, so `prewarm` costs one directory walk per
+    /// project instead of one per turn.
+    warmed: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl LspRegistry {
-    fn server_for(&self, root: &Path, language: &str) -> Result<Arc<Mutex<Server>>, String> {
+    /// Acquire exclusive use of a root+language server within `SERVER_LOCK_WAIT`.
+    ///
+    /// A timeout keeps the server: the holder is almost always a HEALTHY call
+    /// still inside a long request on a cold server, and `spawn_blocking` calls
+    /// cannot be cancelled, so that thread finishes and releases on its own.
+    /// Discarding the server here was the reason LSP never got warm — the next
+    /// call spawned a fresh process and paid the whole cold start again, and
+    /// every attempt after that stacked behind the same abandoned thread. Only a
+    /// genuinely DEAD server is dropped, so a warm index is never thrown away.
+    fn lock_server<'a>(
+        &self,
+        root: &Path,
+        language: &str,
+        srv: &'a Arc<Mutex<Server>>,
+    ) -> Result<std::sync::MutexGuard<'a, Server>, String> {
+        if let Some(mut guard) = lock_bounded(srv, SERVER_LOCK_WAIT) {
+            // Refresh the idle clock: this is what tells the eviction pass
+            // (`prune_idle`) that the project is in active use and must stay warm.
+            guard.last_used = Instant::now();
+            return Ok(guard);
+        }
+        // Never BLOCK on the probe: a held lock means "busy", and busy means
+        // alive — which is exactly the server we want to keep warm.
+        let dead = match srv.try_lock() {
+            Ok(mut guard) => guard.is_dead(),
+            Err(std::sync::TryLockError::Poisoned(_)) => true,
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        };
+        if !dead {
+            return Err(format!(
+                "the language server is still busy with an earlier request (it may be indexing the project) — retry this call; it will be much faster once the index is ready"
+            ));
+        }
         let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let mut roots = self.roots.lock().unwrap();
-        let langs = roots.entry(key).or_default();
-        if let Some(srv) = langs.get(language) {
-            // Reuse unless the process died.
-            let alive = srv.lock().unwrap().child.try_wait().map_or(true, |s| s.is_none());
-            if alive {
-                return Ok(srv.clone());
+        if let Some(langs) = self.roots.lock().unwrap().get_mut(&key) {
+            // Only drop it if it is still the exact server we failed to lock:
+            // another thread may already have replaced the entry.
+            let stale = langs
+                .get(language)
+                .is_some_and(|cur| Arc::ptr_eq(cur, srv));
+            if stale {
+                langs.remove(language);
             }
         }
+        Err(format!(
+            "the language server died while loading the project and was replaced — retry this call"
+        ))
+    }
+
+    /// Drop servers that have been UNUSED for `LSP_IDLE_TTL`.
+    ///
+    /// Called on a workspace switch. Every server holds its project's index in
+    /// memory (rust-analyzer: hundreds of MB to a couple of GB), so without this
+    /// a long session that opens many projects keeps one process per project
+    /// forever — the memory leak that made the agent's footprint grow all day.
+    /// The TTL keeps the projects you actually switch between warm; only
+    /// abandoned ones are released, and a released project cold-starts again on
+    /// the next call.
+    pub fn prune_idle(&self) {
+        let now = Instant::now();
+        let mut evicted: Vec<PathBuf> = Vec::new();
+        {
+            let mut roots = self.roots.lock().unwrap();
+            for (key, langs) in roots.iter_mut() {
+                langs.retain(|_, srv| match srv.try_lock() {
+                    Ok(mut guard) => {
+                        !guard.is_dead() && now.duration_since(guard.last_used) < LSP_IDLE_TTL
+                    }
+                    // Could not lock it: it is BUSY, so it is in use — keep it.
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    // A POISONED mutex means a panicking LSP call left the server
+                    // unusable — it can never serve again, so evict it (the same
+                    // call `lock_server` makes).
+                    Err(std::sync::TryLockError::Poisoned(_)) => false,
+                });
+                if langs.is_empty() {
+                    evicted.push(key.clone());
+                }
+            }
+            roots.retain(|_, langs| !langs.is_empty());
+        }
+        // Forget the pre-warmed marker too, or reopening an evicted project would
+        // be deduped into a no-op and never re-warm.
+        if !evicted.is_empty() {
+            let mut warmed = self.warmed.lock().unwrap();
+            for key in evicted {
+                warmed.remove(&key);
+            }
+        }
+    }
+
+    fn server_for(&self, root: &Path, language: &str) -> Result<Arc<Mutex<Server>>, String> {
+        let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        // Fast path: hand back an existing live server and release the registry
+        // lock immediately. A cold start in another thread (the pre-warm) must
+        // never block this call — that would put the whole cold-start cost back
+        // in the caller's path, which is the thing pre-warming exists to avoid.
+        let existing = {
+            let roots = self.roots.lock().unwrap();
+            roots
+                .get(&key)
+                .and_then(|langs| langs.get(language))
+                .cloned()
+        };
+        if let Some(existing) = existing {
+            // Never BLOCK here — see SERVER_PROBE_WAIT. The handshake is finished
+            // while we ALREADY hold the lock: re-locking afterwards would be one
+            // more unbounded wait.
+            let usable = match lock_bounded(&existing, SERVER_PROBE_WAIT) {
+                Some(mut guard) => {
+                    // A slow server is still a WARM server: killing it on a
+                    // timeout meant every later call paid the cold start again,
+                    // so only a genuinely dead one (process gone, stdout
+                    // closed) is replaced.
+                    if guard.is_dead() {
+                        false
+                    } else {
+                        // Registered by a call whose handshake is still in
+                        // flight: finish THAT handshake instead of spawning a
+                        // second process. `initialize_sent` makes this a pure
+                        // drain, so the loading already done is not thrown away.
+                        // An error here leaves the server registered, so the
+                        // next call resumes the same handshake.
+                        if !guard.initialized {
+                            guard.initialize(root)?;
+                        }
+                        // Refresh the idle clock. This is the COMMON path for an
+                        // already-warm server, and without it an actively used
+                        // server could be reaped as idle by `prune_idle`.
+                        guard.last_used = Instant::now();
+                        true
+                    }
+                }
+                // Could not lock it quickly: a BUSY server is a live one, almost
+                // certainly running its own handshake right now. Hand it back;
+                // `lock_server`'s bounded wait covers it.
+                None => true,
+            };
+            if usable {
+                return Ok(existing);
+            }
+        }
+        // Slow path: spawn + initialize WITHOUT holding the registry lock. A
+        // cold rust-analyzer takes minutes to answer `initialize`, and holding
+        // the lock across it would freeze every other call on this registry.
         let srv = Arc::new(Mutex::new(Server::spawn(root, language)?));
-        srv.lock().unwrap().initialize(root)?;
-        langs.insert(language.to_string(), srv.clone());
+        // Register BEFORE the handshake. A cold start on a large workspace can
+        // outlast even a generous budget, and dropping the server there threw
+        // away every second of loading already done — the next call then paid
+        // the whole cold start again, which is what kept LSP from ever getting
+        // warm. Registered, the retry resumes draining the handshake already in
+        // flight (see `initialize_sent`).
+        {
+            let mut roots = self.roots.lock().unwrap();
+            roots
+                .entry(key)
+                .or_default()
+                .insert(language.to_string(), srv.clone());
+        }
+        // BOUNDED lock, like every other per-server wait: an unbounded `.lock()`
+        // here could block a turn forever (and panic on a poisoned mutex). A
+        // failed handshake leaves the server registered, so the next call resumes
+        // it instead of paying the cold start again.
+        {
+            let mut guard = lock_bounded(&srv, SERVER_LOCK_WAIT).ok_or_else(|| {
+                "the language server is still busy starting up — retry this call".to_string()
+            })?;
+            guard.initialize(root)?;
+            guard.last_used = Instant::now();
+        }
         Ok(srv)
+    }
+}
+
+/// Poll for `srv`'s lock until `budget` expires, refreshing the LSP heartbeat.
+///
+/// The heartbeat matters as much as the budget: a cold language server is SLOW
+/// but HEALTHY (it says nothing for minutes while loading), and without it the
+/// agent's idle guard would abort a perfectly good cold start. Waiting is
+/// progress, so it counts as activity.
+fn lock_bounded<'a>(
+    srv: &'a Arc<Mutex<Server>>,
+    budget: Duration,
+) -> Option<std::sync::MutexGuard<'a, Server>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Ok(guard) = srv.try_lock() {
+            return Some(guard);
+        }
+        touch();
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // Short sleeps so a release is noticed promptly; `try_lock` is the only
+        // way to give up on a `std::sync::Mutex`.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn registry() -> &'static LspRegistry {
     static REG: std::sync::OnceLock<LspRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(LspRegistry::default)
+}
+
+/// Release language servers that have not been used for a while.
+///
+/// Called whenever a workspace is (re)opened, so switching projects gives back
+/// the memory held by the ones you left. See `LspRegistry::prune_idle`.
+pub fn prune_idle() {
+    registry().prune_idle();
+}
+
+/// Start the background idle reaper for language servers.
+///
+/// `prune_idle` used to run ONLY on a workspace switch, so a session that
+/// simply stops using a project (the user moves on to another app, or just
+/// stops making LSP calls) kept every language server — with each project's
+/// full index in memory — alive until one of those rare events happened. This
+/// sweeps on a timer instead, so the memory comes back on its own.
+///
+/// Idempotent: the spawned-once guard means repeated calls are a no-op.
+pub fn start_idle_reaper() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    const SWEEP: Duration = Duration::from_secs(60);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(SWEEP);
+        // A panicking prune must never kill the reaper for the rest of the
+        // process — language servers would then never be released again.
+        let _ = std::panic::catch_unwind(|| registry().prune_idle());
+    });
+}
+
+/// Start a workspace's language servers in the BACKGROUND.
+///
+/// The first `lsp_*` call in a project otherwise pays the whole cold start:
+/// process spawn, `initialize` (rust-analyzer runs `cargo metadata` and loads
+/// the crate graph before it answers) and the first `didOpen`. Pre-warming moves
+/// that cost into the model's own thinking time, so the first LSP call of a turn
+/// usually finds an already-loaded server.
+///
+/// Best-effort by design: a missing binary or a failed start is ignored here —
+/// the tool call itself still reports the real error. One walk per project per
+/// process.
+pub fn prewarm(root: &str) {
+    // Every workspace switch is the natural moment to give back the memory of
+    // projects that are no longer in use — that is where the footprint of a long
+    // session used to grow without bound.
+    prune_idle();
+    let root_path = PathBuf::from(root);
+    if !root_path.is_dir() {
+        return;
+    }
+    let key = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.clone());
+    {
+        let mut warmed = registry().warmed.lock().unwrap();
+        if !warmed.insert(key) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        // Background thread: its LSP waits are NOT the agent's attempt making
+        // progress, so they must not refresh the activity the idle guard polls.
+        QUIET.with(|q| q.set(true));
+        let mut langs: Vec<&'static str> = Vec::new();
+        collect_languages(&root_path, 0, &mut langs);
+        for language in langs {
+            // `server_for` spawns AND initializes; the registry then keeps that
+            // server warm for every later call in this process.
+            let _ = registry().server_for(&root_path, language);
+        }
+    });
+}
+
+/// Languages present in a shallow, dependency-skipping walk of `dir`.
+///
+/// Ordered by discovery and capped: each language is a real process to start,
+/// so a project with a stray `.rb` in a fixture must not pay for a Ruby server.
+fn collect_languages(dir: &Path, depth: usize, out: &mut Vec<&'static str>) {
+    const MAX_SERVERS: usize = 3;
+    const MAX_DEPTH: usize = 3;
+    const SKIP_DIRS: [&str; 7] = [
+        "node_modules", "target", ".git", "dist", "build", ".venv", "vendor",
+    ];
+    // Config/markup servers are cheap to start on demand and otherwise just
+    // consume a process; pre-warm the languages that actually have to index.
+    const SKIP_LANGS: [&str; 6] = ["json", "yaml", "toml", "markdown", "html", "css"];
+    if depth > MAX_DEPTH || out.len() >= MAX_SERVERS {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_SERVERS {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            collect_languages(&path, depth + 1, out);
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if let Some(language) = language_for_suffix(&format!(".{ext}")) {
+                if !out.contains(&language) && !SKIP_LANGS.contains(&language) {
+                    out.push(language);
+                }
+            }
+        }
+    }
 }
 
 // --- shared helpers -----------------------------------------------------------
@@ -502,7 +1114,7 @@ pub fn definition(root: &str, file_path: &str, line: i64, character: i64) -> Res
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;
-    let mut srv = srv.lock().unwrap();
+    let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;
     let result = srv.request(
         "textDocument/definition",
@@ -537,8 +1149,9 @@ pub fn definition(root: &str, file_path: &str, line: i64, character: i64) -> Res
 pub fn references(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
     let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
     let language = detect_language(&abs)?;
-    let srv = registry().server_for(&PathBuf::from(root), language)?;
-    let mut srv = srv.lock().unwrap();
+    let root_path = PathBuf::from(root);
+    let srv = registry().server_for(&root_path, language)?;
+    let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;
     let result = srv.request(
         "textDocument/references",
@@ -578,8 +1191,9 @@ pub fn references(root: &str, file_path: &str, line: i64, character: i64) -> Res
 pub fn hover(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
     let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
     let language = detect_language(&abs)?;
-    let srv = registry().server_for(&PathBuf::from(root), language)?;
-    let mut srv = srv.lock().unwrap();
+    let root_path = PathBuf::from(root);
+    let srv = registry().server_for(&root_path, language)?;
+    let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;
     let result = srv.request(
         "textDocument/hover",
@@ -603,8 +1217,9 @@ pub fn hover(root: &str, file_path: &str, line: i64, character: i64) -> Result<S
 pub fn symbols(root: &str, file_path: &str, query: &str) -> Result<String, String> {
     let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
     let language = detect_language(&abs)?;
-    let srv = registry().server_for(&PathBuf::from(root), language)?;
-    let mut srv = srv.lock().unwrap();
+    let root_path = PathBuf::from(root);
+    let srv = registry().server_for(&root_path, language)?;
+    let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;
     let result = srv.request(
         "textDocument/documentSymbol",
@@ -674,20 +1289,32 @@ fn symbol_kind_name(kind: u64) -> String {
 pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
     let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
     let language = detect_language(&abs)?;
-    let srv = registry().server_for(&PathBuf::from(root), language)?;
-    let mut srv = srv.lock().unwrap();
+    let root_path = PathBuf::from(root);
+    let srv = registry().server_for(&root_path, language)?;
+    let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;
     let uri = path_to_uri(&abs);
-    // Trigger a pull, then drain notifications for a short window.
-    let _ = srv.request("textDocument/diagnostic", json!({"textDocument": {"uri": uri}}));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Trigger a pull WITHOUT waiting for its response, then drain notifications
+    // for a short window. Waiting for the response here would make this
+    // best-effort call block for the full request budget on servers that do not
+    // implement pull diagnostics at all.
+    let _ = srv.request_nowait("textDocument/diagnostic", json!({"textDocument": {"uri": uri}}));
+    let deadline = Instant::now() + DIAGNOSTICS_WINDOW;
     let mut diags: Vec<Value> = Vec::new();
     loop {
-        if Instant::now() > deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
         }
-        match read_message(&mut srv.stdout) {
+        match srv.next_message(remaining) {
             Ok(msg) => {
+                // A server->client request seen here must be ANSWERED, not
+                // discarded: an unanswered one leaves the server waiting on us
+                // (and is the same reason `initialize`/`request` answer them).
+                if msg.get("method").is_some() && msg.get("id").is_some() {
+                    srv.answer_server_request(&msg);
+                    continue;
+                }
                 if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
                     let d_uri = msg.pointer("/params/uri").and_then(Value::as_str).unwrap_or("");
                     if d_uri == uri {

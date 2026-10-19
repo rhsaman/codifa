@@ -59,7 +59,7 @@ const bridge: CoderApi = {
     invoke<{ path: string; name: string }[]>('fs_walk', { root }).then((entries) =>
       entries.map((e) => ({ rel: e.path, name: e.name })),
     ),
-  fsRead: (root, rel) => invoke<{ content: string }>('fs_read', { root, rel }),
+  fsRead: (root, rel) => invoke<{ content: string } | null>('fs_read', { root, rel }),
   fsWrite: (root, rel, content) => invoke<boolean>('fs_write', { root, rel, content }),
   fsDelete: (root, rel) => invoke<boolean>('fs_delete', { root, rel }),
   coderList: (rel) => invoke<FileEntry[]>('coder_list', { rel }),
@@ -85,6 +85,7 @@ const bridge: CoderApi = {
   getPathForFile: (file: File) => droppedPaths.get(file.name) ?? '',
   storeGet: <T>(key: string) => invoke<T | null>('store_get', { key }),
   storeSet: (key, value) => invoke<boolean>('store_set', { key, value }),
+  chatGet: <T>(id: string) => invoke<T | null>('chat_get', { id }),
   getDataPath: () => invoke<string>('get_data_path'),
   hasSettingsFile: () => invoke<boolean>('has_settings_file'),
   openExternal: (url) => invoke<void>('open_external', { url }),

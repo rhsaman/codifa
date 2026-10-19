@@ -3,7 +3,7 @@
 // no polling) — Chat.tsx already drains queued messages into the agent turn.
 import { sendQueuedNext } from "./chatSends";
 import { steerChat } from "./api";
-import { useStore } from "./store";
+import { ensureChatHydrated, useStore } from "./store";
 
 export interface FileComment {
   id: string;
@@ -178,6 +178,32 @@ export function commentFileSelection(
   const text = formatFileComment(path, comment.quote);
   const store = useStore.getState();
   const chat = store.chats.find((c) => c.id === chatId);
+  // The transcript may still be on disk (index-only row): `messages` is empty
+  // then, so the idle/streaming decision below cannot be trusted — an empty
+  // array reads as "idle" and would start a context-free turn. Queue the
+  // comment, hydrate, and only then re-route. Queuing first keeps the comment
+  // safe AND in order (it drains after the current turn if the agent was busy).
+  if (chat && chat.hydrated === false) {
+    store.queueMessage(chatId, { id: comment.id, text, kind: "queue" });
+    void ensureChatHydrated(chatId).then(() => {
+      const fresh = useStore.getState().chats.find((c) => c.id === chatId);
+      if (!fresh || fresh.hydrated === false) return;
+      const busy = fresh.messages.some(
+        (m) => m.streaming || m.retry?.reconnecting === true,
+      );
+      // Streaming: leave it queued — the composer's queue semantics are exactly
+      // what a mid-run comment should get (delivered after the current turn).
+      if (busy) return;
+      // Idle: drain now as a normal turn. The send path re-checks hydration
+      // before building the request, so the model still gets the full context.
+      try {
+        sendQueuedNext(chatId);
+      } catch {
+        /* stays queued until the next turn */
+      }
+    });
+    return comment;
+  }
   const compacting = chat?.compacting ?? false;
   const streaming = chat?.messages.some((m) => m.streaming) ?? false;
   const reconnecting =

@@ -188,11 +188,33 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// Read a `{ key: "string" }` map out of the settings document.
+///
+/// The renderer always writes strings, but a hand-edited settings.json must
+/// never make a scheduled run panic, so non-string values are skipped.
+fn string_map(settings: &Value, key: &str) -> std::collections::HashMap<String, String> {
+    settings
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn atomic_write_json(path: &Path, v: &Value) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Unique per write: a fixed `<pid>`-only name let two writers truncate the
+    // same temp file and rename torn JSON into place.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), unique));
     std::fs::write(&tmp, serde_json::to_string_pretty(v).unwrap_or_default())
         .map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
@@ -225,14 +247,40 @@ fn list_schedules(data_root: &Path) -> Vec<Value> {
 
 fn save_schedule(data_root: &Path, task: Value) {
     if let Some(id) = task.get("id").and_then(Value::as_str) {
-        let re = regex::Regex::new(r"[^A-Za-z0-9._-]+").expect("static regex");
-        let safe = re.replace_all(id.trim(), "-");
-        let name = if safe.trim_matches(['.', '-']).is_empty() {
-            "schedule".to_string()
-        } else {
-            safe.trim_matches(['.', '-']).to_string()
-        };
-        let _ = atomic_write_json(&schedules_dir(data_root).join(format!("{name}.json")), &task);
+        let _ = atomic_write_json(&schedule_path(data_root, id), &task);
+    }
+}
+
+/// Path of one schedule document (shared by save/load so the two agree).
+fn schedule_path(data_root: &Path, id: &str) -> PathBuf {
+    let re = regex::Regex::new(r"[^A-Za-z0-9._-]+").expect("static regex");
+    let safe = re.replace_all(id.trim(), "-");
+    let name = if safe.trim_matches(['.', '-']).is_empty() {
+        "schedule".to_string()
+    } else {
+        safe.trim_matches(['.', '-']).to_string()
+    };
+    schedules_dir(data_root).join(format!("{name}.json"))
+}
+
+/// Read ONE schedule back from disk — the inverse of `save_schedule`.
+fn load_schedule(data_root: &Path, id: &str) -> Option<Value> {
+    read_json(&schedule_path(data_root, id))
+}
+
+/// Sort key for a run file: `(has_timestamp, timestamp, name)`.
+fn run_name_key(path: &Path) -> (u8, u64, String) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stamp = name
+        .strip_prefix("run-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|seg| seg.parse::<u64>().ok());
+    match stamp {
+        Some(ts) => (1, ts, name),
+        None => (0, 0, name),
     }
 }
 
@@ -261,8 +309,13 @@ fn list_runs(data_root: &Path, schedule_id: &str, limit: usize) -> Vec<Value> {
                 .map(|e| e.path())
                 .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
                 .collect();
-            v.sort();
-            v.reverse();
+            // Newest first by the timestamp embedded in the run file name
+            // (`run-<unix-secs>-<uuid>.json`). The old plain name sort was
+            // unrelated to recency — run ids were random UUIDs — so listings
+            // returned arbitrary old runs and the truncation below could hide
+            // the newest "running" record. Legacy `run-<uuid>` names carry no
+            // timestamp and sort last, so they never displace recent runs.
+            v.sort_by(|a, b| run_name_key(b).cmp(&run_name_key(a)));
             v
         })
         .unwrap_or_default();
@@ -289,7 +342,11 @@ fn list_runs(data_root: &Path, schedule_id: &str, limit: usize) -> Vec<Value> {
 
 /// True when a fresh "running" run for this task exists on disk.
 fn has_recent_running(data_root: &Path, schedule_id: &str, now: f64) -> bool {
-    list_runs(data_root, schedule_id, 5).iter().any(|r| {
+    // 200 (not 5): `list_runs` truncates its file window BEFORE filtering by
+    // schedule, so a small number let the in-flight "running" record fall
+    // outside the window whenever other tasks had newer runs — and a second
+    // copy of the same task then started in parallel.
+    list_runs(data_root, schedule_id, 200).iter().any(|r| {
         r.get("status").and_then(Value::as_str) == Some("running")
             && {
                 let started = r.get("started_at").and_then(Value::as_f64).unwrap_or(0.0);
@@ -367,7 +424,15 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         return;
     }
     let started_at = now_secs();
-    let run_id = format!("run-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    // The run id becomes the run's FILE NAME, and listings sort/truncate by
+    // file name — so the timestamp goes first. With the old random-uuid name
+    // the order was unrelated to recency: finished runs looked missing and
+    // `has_recent_running` could miss the in-flight one and start it twice.
+    let run_id = format!(
+        "run-{}-{}",
+        started_at as u64,
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
     save_run(
         data_root,
         &json!({
@@ -387,37 +452,104 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         );
         return;
     };
-    let model = task
+    let base_model = task
         .get("model")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(String::from)
         .or_else(|| provider.get("model").and_then(Value::as_str).map(String::from))
         .unwrap_or_default();
+    let base_url = provider
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let api_key = provider
         .get("apiKey")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let base_kind = provider
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("custom")
+        .to_string();
+    let base_provider_id = provider
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // The per-slot model/reasoning choices live in settings.json, not in the
+    // schedule file. A scheduled run is a headless `run_turn`, so without this
+    // the Settings → Tools "Schedule" row was written by the UI and read by
+    // nobody: every run silently took the task's provider defaults instead.
+    let settings = read_json(&data_root.join("settings.json")).unwrap_or(json!({}));
+    let subagent_models = string_map(&settings, "subagentModels");
+    let subagent_thinking = string_map(&settings, "subagentThinking");
+    let providers_map = settings
+        .get("providers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    p.get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| (id.to_string(), p.clone()))
+                })
+                .collect::<std::collections::HashMap<String, Value>>()
+        })
+        .unwrap_or_default();
+
+    // The "Schedule" row routes EVERY scheduled run (cross-provider aware, the
+    // same slot resolution the other tools use). An empty row keeps the model
+    // saved on the task, or the provider's own default.
+    let slot_entry = subagent_models
+        .get("schedule")
+        .map(String::as_str)
+        .unwrap_or("");
+    let (model, base_url, api_keys, provider_id, provider_kind) =
+        if slot_entry.trim().is_empty() {
+            (
+                base_model,
+                base_url,
+                vec![api_key.clone()],
+                base_provider_id,
+                base_kind,
+            )
+        } else {
+            let (m, b, keys, pid) = crate::backend_light::resolve_slot_target(
+                slot_entry,
+                &base_model,
+                &base_url,
+                &[api_key.clone()],
+                &base_provider_id,
+                &providers_map,
+            );
+            let kind =
+                crate::backend_light::resolve_slot_kind(slot_entry, &base_kind, &providers_map);
+            (m, b, keys, pid, kind)
+        };
+    // A slot with no explicit level sends no reasoning parameter (the provider
+    // default); the capability flag gates it exactly like every other call.
+    let thinking_level = subagent_thinking
+        .get("schedule")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let model_reasoning =
+        crate::agent::provider_model_reasoning(&providers_map, &provider_id, &model);
     let req = crate::agent::AgentRequest {
-        provider: provider
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("custom")
-            .to_string(),
-        provider_id: provider
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        provider: provider_kind,
+        provider_id,
         model,
-        base_url: provider
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        api_key,
-        api_keys: vec![],
+        base_url,
+        // `api_keys` carries the full chain; `run_turn` only prepends `api_key`
+        // when it is non-empty, so an empty one here avoids sending the same
+        // key twice.
+        api_key: String::new(),
+        api_keys,
         root,
         mode: task
             .get("mode")
@@ -431,11 +563,13 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         context_window: 0,
         chat_id: format!("schedule-{sid}"),
         mcp_servers: Value::Null,
-        subagent_models: std::collections::HashMap::new(),
-        providers: std::collections::HashMap::new(),
-        data_root: String::new(),
+        subagent_models,
+        providers: providers_map,
+        data_root: data_root.to_string_lossy().to_string(),
         // Headless scheduled runs never touch the desktop.
         allow_computer: false,
+        // Nor the browser: nobody is watching a window a schedule opens.
+        allow_browser: false,
         // Nor do they author skills/connectors: a schedule has no user turn
         // asking for it, so the authoring tools stay unbound.
         allow_create: false,
@@ -451,6 +585,15 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         fallback_base_url: String::new(),
         fallback_api_key: String::new(),
         fallback_api_keys: Vec::new(),
+        // The reasoning level comes from the Tools "Schedule" row (empty = no
+        // explicit effort, i.e. the provider's own default).
+        thinking_level,
+        model_reasoning,
+        subagent_thinking,
+        images: Vec::new(),
+        // A headless run has no UI, so it reads no Storage setting: it uses the
+        // same default auto-fetch count the UI starts at.
+        web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
     };
 
     let mut final_text = String::new();
@@ -498,8 +641,11 @@ async fn execute_schedule(data_root: &Path, task: Value) {
             "finished_at": finished,
         }),
     );
-    // Update the task's last_run / run_count / next_run.
-    let mut fresh = task.clone();
+    // Update the task's last_run / run_count / next_run. Re-read the task from
+    // disk first: writing back the pre-run snapshot silently reverted any edit
+    // (prompt/name/enabled/cron/model) the user made while the run was still
+    // in flight.
+    let mut fresh = load_schedule(data_root, &sid).unwrap_or_else(|| task.clone());
     let next = compute_next_run(&fresh, finished);
     if let Some(obj) = fresh.as_object_mut() {
         obj.insert("last_run".into(), json!(finished));

@@ -26,7 +26,7 @@ console.log('1) missing bridge reports a clear error instead of throwing:')
 {
   const r1 = await api.openFileExternal('/tmp/a.ts', 'nvim')
   check('openFileExternal ok:false', r1.ok === false, r1)
-  check('mentions preload', String(r1.error).includes('preload'), r1.error)
+  check('mentions unavailable', String(r1.error).includes('unavailable'), r1.error)
   const r2 = await api.openWorkspaceFolder('/tmp')
   check('openWorkspaceFolder ok:false', r2.ok === false, r2)
   const r3 = await api.openWorkspaceTerminal('/tmp')

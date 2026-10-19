@@ -1,12 +1,13 @@
 //! Codifa — Tauri v2 shell.
 //!
-//! Replaces the Electron main process: spawns the Python sidecar, owns PTY
-//! terminal sessions, and exposes the window.coder command surface.
+//! Replaces the Electron main process: owns PTY terminal sessions, the native
+//! HTTP router (backend_light), and the window.coder command surface.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
 mod browser;
+mod browser_driver;
 mod computer;
 mod trace;
 mod retention;
@@ -98,6 +99,7 @@ fn main() {
             // store
             store::store_get,
             store::store_set,
+            store::chat_get,
             // dialogs
             commands::select_folder,
             commands::select_file,
@@ -163,20 +165,39 @@ fn main() {
             pty::terminal_kill,
         ])
         .setup(|app| {
-            // Retention sweep: delete stale traces/checkpoints/uploads once
-            // at startup (background thread — never blocks boot).
+            // One-shot storage migration (idempotent, guarded by schemaVersion):
+            // move every chat body out of settings.json into its own file and
+            // leave only an index row behind. Must run BEFORE any route or
+            // command serves the store, and before the window loads, so the
+            // renderer only ever sees the split layout.
+            store::migrate_to_index(app.handle());
+            // Language servers hold their project's whole index in memory, so
+            // release the ones that go unused on a timer (not only on a
+            // workspace switch). Never blocks boot: it sweeps in the background.
+            lsp::start_idle_reaper();
+            // Retention janitor: delete stale traces/checkpoints/uploads (TTL)
+            // and trim oversized trace logs, once now and then every few hours.
+            // A desktop app is often left open for days, so a startup-only
+            // sweep never fires for that user — which is how the trace dir grows
+            // until the disk fills. Owns its thread, so boot is never blocked.
             {
                 let root = state::get_data_root(app.handle());
                 // Native schedule due-check loop (migrated from the Python
                 // sidecar's _start_schedule_loop): polls every 30s, runs due
                 // tasks headless through the native agent, records runs.
                 scheduler::start_loop(root.clone());
-                // Install the built-in MCP connectors (docker, playwright) that
-                // are missing — migrated from the Python sidecar's
-                // seed_builtin_mcp, which ran on every start.
+                // Install the built-in MCP connector (docker) that is missing
+                // — migrated from the Python sidecar's seed_builtin_mcp, which
+                // ran on every start — then drop the retired browser connector
+                // from installs that were seeded before the native driver
+                // replaced it.
                 let seeded = skills::seed_builtin_mcp(&root);
                 if !seeded.is_empty() {
                     println!("[mcp] seeded builtin connectors: {}", seeded.join(", "));
+                }
+                let retired = skills::retire_builtin_mcp(&root);
+                if !retired.is_empty() {
+                    println!("[mcp] retired builtin connectors: {}", retired.join(", "));
                 }
                 // Seed/re-sync the shipped built-in skills (migrated from the
                 // Python sidecar's sync_builtin_skills). The shipped markdown
@@ -188,11 +209,16 @@ fn main() {
                         println!("[skills] seeded builtin skills: {}", seeded.join(", "));
                     }
                 }
-                std::thread::spawn(move || {
-                    let summary = retention::run_startup_sweep(&root);
-                    println!("[{summary}]");
-                });
+                // Runs a sweep immediately and keeps re-running it while the
+                // app is open (see `start_janitor`), so the TTLs hold for a
+                // session that is never restarted.
+                retention::start_janitor(root);
             }
+            // Kill any headless browser a PREVIOUS run left behind (a crash or
+            // a forced quit skips the shutdown hook), then keep reaping the
+            // idle one on a timer: without it a Chromium outlived its last tab
+            // and its window, which is what made the machine run out of memory.
+            browser::start_idle_reaper();
             // Native HTTP router on the public port — the app's only backend
             // now (the Python sidecar is gone). Light endpoints (git, skills,
             // mcp, docs, oauth, system-prompts) and the agent loop are served
@@ -261,6 +287,10 @@ fn main() {
             match event {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                     store::flush_pending(app);
+                    // Cmd-Q and `app.exit()` also bypass CloseRequested, so the
+                    // Chromium must be reaped here too — otherwise those exits
+                    // left a headless browser running with no window to close.
+                    browser::kill_all_sessions();
                 }
                 _ => {}
             }

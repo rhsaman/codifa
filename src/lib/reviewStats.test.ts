@@ -78,7 +78,7 @@ console.log('۴) aggregateTurnStats فعالیت‌های بدون diff را ن�
 console.log('۵) aggregateTurnStats داخل children را هم می‌خواند:')
 {
   const child: ToolActivity = ({ tool: "write_file", args: { path: "y" }, diff: diffOpenai, status: "done" }) as any
-  const parent: ToolActivity = ({ tool: "task", args: {}, status: "done", children: [child] }) as any
+  const parent: ToolActivity = ({ tool: "explore", args: {}, status: "done", children: [child] }) as any
   const t = aggregateTurnStats([parent])
   check('adds = 4', t.adds === 4, t)
 }

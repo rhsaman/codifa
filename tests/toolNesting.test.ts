@@ -23,8 +23,8 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
 //    bug: the explore card showed nothing but "N chars".
 {
   let acts: ToolActivity[] = []
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 0, call_id: 1 }))
-  acts = resolveToolResult(acts, resultEvent({ tool: 'task', branch: 0, call_id: 1, status: 'done' }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 0, call_id: 1 }))
+  acts = resolveToolResult(acts, resultEvent({ tool: 'explore', branch: 0, call_id: 1, status: 'done' }))
   check('task card resolved to done', acts[0]?.status === 'done', acts[0]?.status)
   acts = applyToolEvent(acts, toolEvent({ tool: 'grep', branch: 0, sub: true, call_id: 2 }))
   check('late sub tool nests under done branch card',
@@ -36,8 +36,8 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
 //    branch card is already done.
 {
   let acts: ToolActivity[] = []
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 0, call_id: 1 }))
-  acts = resolveToolResult(acts, resultEvent({ tool: 'task', branch: 0, call_id: 1, status: 'done' }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 0, call_id: 1 }))
+  acts = resolveToolResult(acts, resultEvent({ tool: 'explore', branch: 0, call_id: 1, status: 'done' }))
   acts = applyToolEvent(acts, toolEvent({ tool: 'grep', branch: 0, sub: true, call_id: 2 }))
   acts = resolveToolResult(acts, resultEvent({ sub: true, branch: 0, call_id: 2, status: 'done' }))
   check('sub result resolves nested child by call_id (parent done)',
@@ -46,11 +46,11 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
 
 // 3) Sub result with ONLY branch (no call_id) resolves the nested child by
 //    branch even when the parent is done. This is the core fix: branchMatch no
-//    longer requires act.tool === "task", so grep/glob/read children resolve.
+//    longer requires a sub-agent tool name, so grep/glob/read children resolve.
 {
   let acts: ToolActivity[] = []
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 0, call_id: 1 }))
-  acts = resolveToolResult(acts, resultEvent({ tool: 'task', branch: 0, call_id: 1, status: 'done' }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 0, call_id: 1 }))
+  acts = resolveToolResult(acts, resultEvent({ tool: 'explore', branch: 0, call_id: 1, status: 'done' }))
   acts = applyToolEvent(acts, toolEvent({ tool: 'grep', branch: 0, sub: true }))
   check('sub grep child stays running before result',
     acts[0]?.children?.[0]?.status === 'running', acts[0]?.children?.[0]?.status)
@@ -62,8 +62,8 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
 // 4) Parallel fan-out: each branch's sub-events nest under ITS OWN task card.
 {
   let acts: ToolActivity[] = []
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 0, call_id: 1 }))
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 1, call_id: 2 }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 0, call_id: 1 }))
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 1, call_id: 2 }))
   acts = applyToolEvent(acts, toolEvent({ tool: 'grep', branch: 0, sub: true, call_id: 3 }))
   acts = applyToolEvent(acts, toolEvent({ tool: 'grep', branch: 1, sub: true, call_id: 4 }))
   check('branch 0 sub nests under branch 0 card',
@@ -77,7 +77,7 @@ const resultEvent = (over: Partial<SidecarEvent>): SidecarEvent =>
 //    first sub-search (the "parallel explores freeze / only one comes" bug).
 {
   let acts: ToolActivity[] = []
-  acts = applyToolEvent(acts, toolEvent({ tool: 'task', branch: 0, call_id: 1 })) // running
+  acts = applyToolEvent(acts, toolEvent({ tool: 'explore', branch: 0, call_id: 1 })) // running
   acts = resolveToolResult(acts, resultEvent({ sub: true, branch: 0, status: 'done' }))
   check('sub result does not prematurely mark running branch card done',
     acts[0]?.status === 'running', acts[0]?.status)

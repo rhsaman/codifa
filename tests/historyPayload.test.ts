@@ -37,7 +37,10 @@ const base = (over: Partial<ChatMessage>): ChatMessage => ({
   })
   const out = projectHistoryMessage(m) as Record<string, unknown>
   check('thinking is dropped', !('thinking' in out))
-  check('inline image data URLs are dropped', !('images' in out))
+  check('inline image data URLs are dropped', !JSON.stringify(out).includes('dataUrl'))
+  // The image itself still travels — as a PATH the backend re-reads, so the
+  // model keeps seeing an older screenshot without re-sending its bytes.
+  check('image paths survive', JSON.stringify(out.images) === '["/shot.png"]')
   check('role survives', out.role === 'assistant')
   check('content survives', out.content === 'hi')
 }
@@ -136,6 +139,7 @@ const base = (over: Partial<ChatMessage>): ChatMessage => ({
   check('no toolActivity key', !('toolActivity' in out))
   check('no plan key', !('plan' in out))
   check('no preservedToolSummary key', !('preservedToolSummary' in out))
+  check('no images key', !('images' in out))
 }
 
 if (failed) {

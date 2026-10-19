@@ -1,5 +1,6 @@
 import type { Chat, TokenUsage } from '../types'
 import { PERSIAN_RANGE } from './bidi'
+import { applyHistoryLimit } from './historyWindow'
 
 export const CHARS_PER_TOKEN = 4
 
@@ -59,6 +60,7 @@ export function estimateContextChars(
   chat: Chat | null,
   systemPrompt: string,
   contextWindow?: number,
+  historyLimit = 0,
 ): number {
   const msgs = chat?.messages ?? []
   let chars = 0
@@ -74,7 +76,9 @@ export function estimateContextChars(
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
-  const { settled, live } = budgetedSettledHistory(talk)
+  const { settled, live } = budgetedSettledHistory(
+    applyHistoryLimit(talk, historyLimit),
+  )
   for (const m of settled) {
     chars += m.content.length
     // Reasoning text is round-tripped to the model as a ThinkingPart on every
@@ -102,8 +106,12 @@ export function estimateContextTokens(
   chat: Chat | null,
   systemPrompt: string,
   contextWindow?: number,
+  historyLimit = 0,
 ): number {
-  return Math.round(estimateContextChars(chat, systemPrompt, contextWindow) / CHARS_PER_TOKEN)
+  return Math.round(
+    estimateContextChars(chat, systemPrompt, contextWindow, historyLimit) /
+      CHARS_PER_TOKEN,
+  )
 }
 
 export function formatTokens(n: number): string {
@@ -179,6 +187,7 @@ export function computeContextUsed(
   chat: Chat | null,
   systemPrompt: string,
   contextWindow?: number,
+  historyLimit = 0,
 ): number {
   const msgs = chat?.messages ?? []
   const active = msgs.filter((m) => !m.compacted)
@@ -206,7 +215,7 @@ export function computeContextUsed(
 
   // No usage yet: the local estimate (system prompt + every non-compacted
   // exchange) approximates the context that will be sent this turn.
-  return estimateContextTokens(chat, systemPrompt, contextWindow)
+  return estimateContextTokens(chat, systemPrompt, contextWindow, historyLimit)
 }
 
 /** Resolve a model's context window from the provider's maps, trying
@@ -485,6 +494,9 @@ export interface BreakdownEstimateOptions {
   mcpChars?: number
   systemToolsChars?: number
   metaChars?: number
+  /** History turn limit (Settings → General): keep the estimate in step with
+   *  the trimmed wire history the send path builds. 0 = full history. */
+  historyLimit?: number
 }
 
 /** Estimate per-part token counts for the breakdown popup.
@@ -513,7 +525,9 @@ export function estimateBreakdownParts(
   const talk = active.filter(
     (m) => m.role === 'user' || m.role === 'assistant' || m.role === 'system',
   )
-  const { settled, live } = budgetedSettledHistory(talk)
+  const { settled, live } = budgetedSettledHistory(
+    applyHistoryLimit(talk, opts.historyLimit ?? 0),
+  )
   for (const m of settled) {
     msgChars += m.content.length
     if (m.thinking) msgChars += m.thinking.length
@@ -582,7 +596,7 @@ export function buildContextBreakdown(
   const parts = estimateBreakdownParts(chat, systemPrompt, opts)
   const actual = Math.max(
     0,
-    computeContextUsed(chat, systemPrompt, window ?? undefined),
+    computeContextUsed(chat, systemPrompt, window ?? undefined, opts.historyLimit ?? 0),
   )
   const known =
     parts.messages +

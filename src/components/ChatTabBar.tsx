@@ -93,7 +93,7 @@ export function ChatTabListButton() {
       id: c.id,
       title: c.title,
       updatedAt: c.updatedAt,
-      firstUser: c.messages.find((m) => m.role === "user")?.content,
+      firstUser: c.firstUser ?? c.messages.find((m) => m.role === "user")?.content,
     })),
   );
   const byId = new Map(chats.map((c) => [c.id, c]));
@@ -163,7 +163,7 @@ export function ChatTabListButton() {
   const visibleChatIds = useStore((s) => s.visibleChatIds);
   const streamingKey = useStore((s) =>
     s.chats
-      .filter((c) => c.messages.some((m) => m.streaming || m.retry?.reconnecting === true))
+      .filter((c) => c.hydrated !== false && c.messages.some((m) => m.streaming || m.retry?.reconnecting === true))
       .map((c) => c.id)
       .sort()
       .join(","),
@@ -196,11 +196,15 @@ export function ChatTabBar() {
     s.chats.map((c) => ({
       id: c.id,
       title: c.title,
-      messages: c.messages
-        .filter((m) => m.role === "user")
-        .slice(0, 1)
-        .map((m) => ({ role: m.role, content: m.content })),
-      streaming: c.messages.some((m) => m.streaming || m.retry?.reconnecting === true),
+      // Prefer the index row's first-user preview: an unhydrated chat has no
+      // messages in memory, and its tab title must still read correctly.
+      messages: c.firstUser
+        ? [{ role: "user", content: c.firstUser }]
+        : c.messages
+            .filter((m) => m.role === "user")
+            .slice(0, 1)
+            .map((m) => ({ role: m.role, content: m.content })),
+      streaming: c.hydrated !== false && c.messages.some((m) => m.streaming || m.retry?.reconnecting === true),
       pendingPermission: c.pendingPermission
         ? {
             action: c.pendingPermission.action,

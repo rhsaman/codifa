@@ -329,6 +329,54 @@ console.log('15) closeAllViewers — closes only the active chat tabs, keeps his
   })())
 }
 
+console.log('16) browser tab carries the url the agent opened (not about:blank):')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+
+  // The agent's `browser_navigate` arg must reach the tab: docking a blank
+  // browser while the agent worked on a real page was the reported bug.
+  vt().openBrowser(c1, 'https://example.com/docs')
+  const tab = vt().tabs.find((t) => t.kind === 'browser')
+  check('browser tab opened', !!tab, vt().tabs.map((t) => t.id))
+  check('tab carries the agent url', tab?.browserUrl === 'https://example.com/docs', tab?.browserUrl)
+
+  // A later navigation in the SAME turn moves the panel to the new page.
+  vt().setBrowserUrl(c1, 'https://example.com/page2')
+  check(
+    'setBrowserUrl moves the panel',
+    vt().tabs.find((t) => t.kind === 'browser')?.browserUrl === 'https://example.com/page2',
+    vt().tabs.find((t) => t.kind === 'browser')?.browserUrl,
+  )
+
+  // about:blank is never stored — the panel launches blank on its own.
+  resetViewer()
+  vt().openBrowser(c1, 'about:blank')
+  check(
+    'about:blank is not stored as a url',
+    vt().tabs.find((t) => t.kind === 'browser')?.browserUrl === undefined,
+    vt().tabs.find((t) => t.kind === 'browser')?.browserUrl,
+  )
+
+  // setBrowserUrl on a chat with no browser tab must not create one.
+  resetViewer()
+  vt().setBrowserUrl(c1, 'https://example.com/ghost')
+  check('setBrowserUrl never opens a tab', vt().tabs.length === 0, vt().tabs.length)
+
+  // The url survives a persist/load round-trip (tab restore after restart).
+  resetViewer()
+  vt().openBrowser(c1, 'https://example.com/kept')
+  const stored = JSON.parse(memStore.get('coder:viewerTabs') ?? '{}') as {
+    tabs?: Array<Record<string, unknown>>
+  }
+  check(
+    'url survives persistence',
+    stored.tabs?.some((t) => t.browserUrl === 'https://example.com/kept') === true,
+    stored.tabs,
+  )
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)

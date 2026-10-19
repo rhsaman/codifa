@@ -14,7 +14,7 @@
  *              steer bubbles; folding/clamping tests.
  *   empty    — no active chat; shell/empty-state tests.
  *
- * Exposed on `window.__ui` for browser drivers (playwright MCP tools, etc.):
+ * Exposed on `window.__ui` for browser drivers (the app's browser tools, etc.):
  *   __ui.store               zustand store — .getState() / .setState(patch)
  *   __ui.dispatchPaste(text) dispatch a ClipboardEvent paste on .composer-input
  *   __ui.longText            N-line sample text for fold/clamp cases
@@ -226,6 +226,122 @@ function initialState(scenario: string | null) {
           }),
         ],
       };
+    case "retry":
+      // A sub-agent (explore) retry banner mid-turn, plus a completed tool
+      // card above it. Drives the "Sub-agent retrying (attempt N/10)" banner
+      // and proves the parent's own tool events keep it alive.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "user",
+                content: "explore the retry logic",
+                createdAt: now,
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                createdAt: now,
+                content: "",
+                toolActivity: [
+                  {
+                    tool: "explore",
+                    status: "running",
+                    args: {
+                      description: "Map the retry ladder",
+                      prompt: "where is the retry ladder defined",
+                    },
+                  },
+                ],
+                retry: {
+                  attempt: 3,
+                  maxAttempts: 10,
+                  delay: 10,
+                  reason: "provider returned 429 (rate limit)",
+                  model: "claude-sonnet-4-5",
+                  agent: "explore subagent",
+                  tool: "explore",
+                  reconnecting: true,
+                  startedAt: now,
+                },
+              },
+            ],
+          }),
+        ],
+      };
+    case "retry-main":
+      // The MAIN agent retry banner — the reference the sub-agent must match.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "user",
+                content: "do the thing",
+                createdAt: now,
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                createdAt: now,
+                content: "",
+                retry: {
+                  attempt: 3,
+                  maxAttempts: 10,
+                  delay: 10,
+                  reason: "provider returned 429 (rate limit)",
+                  model: "claude-sonnet-4-5",
+                  agent: "main agent",
+                  reconnecting: true,
+                  startedAt: now,
+                },
+              },
+            ],
+          }),
+        ],
+      };
+    case "retry-giveup":
+      // A sub-agent that exhausted its ladder: the banner must survive the
+      // finished turn (gaveUp) and offer Retry.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "user",
+                content: "explore the retry logic",
+                createdAt: now,
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                createdAt: now,
+                content: "",
+                retry: {
+                  attempt: 10,
+                  maxAttempts: 10,
+                  delay: 0,
+                  reason: "sub-agent failed: provider unreachable",
+                  model: "claude-haiku-4-5",
+                  agent: "explore subagent",
+                  tool: "explore",
+                  gaveUp: true,
+                },
+              },
+            ],
+          }),
+        ],
+      };
     case "composer":
     default:
       return {
@@ -305,7 +421,15 @@ if (params.get("scenario") === "diff") {
     };
   };
   coder.onTerminalExit = () => () => {};
-  (window as any).__term = { resizes, writes };
+  // `emitData` drives the pty -> renderer direction directly: a driver can
+  // replay a REAL captured byte stream (exactly what the Rust pty reader
+  // forwards) into the mounted xterm and inspect how it renders, including
+  // ANSI colours, without a live shell.
+  (window as any).__term = {
+    resizes,
+    writes,
+    emitData: (data: string) => dataCbs.forEach((cb) => cb("t1", data)),
+  };
   const { TerminalPanel } = await import("../../src/components/TerminalPanel");
   root.render(<TerminalPanel />);
 } else if (params.get("scenario") === "diff") {
@@ -349,6 +473,13 @@ if (params.get("scenario") === "diff") {
   const { useViewerTabs } = await import("../../src/lib/viewerTabs");
   root.render(<App />);
   useViewerTabs.getState().openPlan();
+} else if (params.get("scenario") === "settings") {
+  // Standalone Settings modal, so a browser driver can visually check the
+  // grouped tabs and the Tools rows. `?tab=<id>` picks the initial tab.
+  const { SettingsModal } = await import("../../src/components/SettingsModal");
+  root.render(
+    <SettingsModal onClose={() => {}} initialTab={params.get("tab") ?? "tools"} />,
+  );
 } else {
   root.render(<ChatPanel />);
 }

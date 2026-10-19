@@ -45,22 +45,45 @@ export function backendError(body: unknown): string | null {
  *  forwards typing straight to the page — so the panel never shows a second
  *  input box. The virtual cursor is always live on hover, like a real
  *  Chrome window; the user's real mouse and keyboard are never touched. */
-export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
+export function BrowserPanel({
+  chatId = "",
+  initialUrl = "",
+}: {
+  chatId?: string;
+  /** Page the agent's browser tool asked for (the tool's `url` arg). The panel
+   *  launches on it instead of about:blank so the agent's work is visible. */
+  initialUrl?: string;
+}) {
   const [image, setImage] = useState<string>("");
   const [pageUrl, setPageUrl] = useState<string>("");
   const [address, setAddress] = useState<string>("");
+  // Seeded so the follow-tab effect below skips its FIRST run: the mount effect
+  // already attached to the session with this url, and re-issuing it would race
+  // that attach.
+  const initialUrlRef = useRef(initialUrl);
   const [active, setActive] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   // True while a navigation (URL / search / history action) is in flight —
   // drives the toolbar progress line and the spinning reload icon.
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
+  // False when NO automation browser is installed — the panel then offers the
+  // one-click install instead of a dead "Connecting…" stage. Starts true so the
+  // first (uninformed) frame does not flash the install notice; the status poll
+  // corrects it before any session could exist.
+  const [available, setAvailable] = useState<boolean>(true);
+  // Install progress polled from /browser/install/status while it runs.
+  const [installing, setInstalling] = useState<boolean>(false);
+  const [installPct, setInstallPct] = useState<number>(0);
+  const [installPhase, setInstallPhase] = useState<string>("");
   const [viewport, setViewport] = useState<{ w: number; h: number }>({ w: DEFAULT_VIEWPORT_SIZE.width, h: DEFAULT_VIEWPORT_SIZE.height });
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   // Virtual cursor overlay position (percent of the rendered frame).
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const lastMoveAt = useRef(0);
   const lastHoverShotAt = useRef(0);
+  // Interval that follows a running automation-browser install (startInstall).
+  const installTimer = useRef<number | null>(null);
   // Debounced frame refresh after bursts of forwarded keystrokes.
   const keyShotTimer = useRef<number | null>(null);
   // Manual Chrome-style dimensions: numeric width/height inputs plus a
@@ -123,7 +146,7 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
   // so the closure value is stable for the session lifetime.
   async function sidecarFetch(path: string, init?: RequestInit, strict = true): Promise<any> {
     const base = await ensureSidecar();
-    if (!base) throw new Error("sidecar not ready");
+    if (!base) throw new Error("the app's local backend is not ready yet");
     let url = `${base}${path}`;
     let bodyInit: RequestInit | undefined = init;
     if (path.startsWith("/browser/")) {
@@ -159,6 +182,10 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
       const st = await sidecarFetch("/browser/status");
       const isActive = st.active === true;
       setActive(isActive);
+      // The backend reports whether an automation browser exists at all. It was
+      // always in the payload and never read, so a missing browser surfaced as
+      // an eternal "Connecting…" instead of an actionable install button.
+      if (typeof st.available === "boolean") setAvailable(st.available);
       if (typeof st.url === "string") {
         // Never surface about:blank in the omnibox — it sticks and the
         // user has to delete it before typing (Chrome shows an empty box).
@@ -195,7 +222,12 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     try {
       const shot = await sidecarFetch("/browser/screenshot", undefined, false);
       if (typeof shot.image === "string" && shot.image) {
-        setImage(shot.image);
+        // Only hand React a NEW string when the frame really changed. The poll
+        // runs every 1.2s and a fresh (identical) base64 string used to be set
+        // unconditionally, forcing a re-render, an `img.src` swap and a full
+        // re-decode/composite of a large JPEG on every tick — a permanent CPU
+        // tax in the WebView and WindowServer while the app sat idle.
+        if (shot.image !== imageRef.current) setImage(shot.image);
         if (typeof shot.width === "number") {
           const prev = sizeRef.current;
           if (shot.width !== prev.w || shot.height !== prev.h) {
@@ -220,35 +252,63 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
 
   // Ensure the shared session exists on mount (idempotent: a running
   // session is left untouched), then poll frames roughly once a second.
+  // ATTACH to the shared session on mount — never START one. This effect used
+  // to POST /browser/launch unconditionally, which meant a browser tab restored
+  // from the last session spawned a full Chromium the moment the app opened:
+  // no gesture, no agent tool call, just a window nobody asked for (and on this
+  // machine, a frozen desktop). Chromium is now started by exactly two things —
+  // the agent's browser tool, or the user typing a URL in the omnibox below
+  // (see `go()`, which launches when the session is down).
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
-      try {
-        await sidecarFetch("/browser/launch", {
-          method: "POST",
-          body: JSON.stringify({ url: "about:blank" }),
-        });
-      } catch (err) {
-        // Show WHY the session won't start — the status call below only
-        // reports active:false with no reason attached.
-        setError(err instanceof Error ? err.message : String(err));
-      }
-      if (cancelled) return;
       const isActive = await refreshStatus();
-      if (!cancelled && isActive) await refreshShot();
+      if (cancelled) return;
+      if (isActive) {
+        // A live session (started by the agent, or still up from this run) —
+        // point it at the page this tab remembers. `navigate` never starts a
+        // browser, so this stays attachment rather than launch.
+        if (initialUrl.trim()) {
+          await sidecarFetch("/browser/navigate", {
+            method: "POST",
+            body: JSON.stringify({ url: initialUrl.trim() }),
+          }).catch(() => {
+            // A dead session reports as inactive below on the next poll.
+          });
+        }
+        if (!cancelled) await refreshShot();
+      }
       if (!cancelled) setLoading(false);
     })();
     timer.current = setInterval(() => {
+      // A hidden window (or a background tab whose pane is not showing) cannot
+      // display a frame, so capturing one is pure waste: it cost a CDP
+      // round-trip, a JPEG encode and a React render every 1.2s for as long as
+      // the app was open. Poll at the same rate, but do nothing at all while
+      // the document is hidden — the next visible tick resumes.
+      if (typeof document !== "undefined" && document.hidden) return;
       void refreshStatus().then((isActive) => {
         if (isActive) void refreshShot();
       });
     }, 1200);
+    // Coming back to the window must not wait for the next tick to show the
+    // current page, and must never show a stale frame in the meantime.
+    const onVisible = (): void => {
+      if (document.hidden) return;
+      void refreshStatus().then((isActive) => {
+        if (isActive) void refreshShot();
+      });
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       if (timer.current) clearInterval(timer.current);
       timer.current = null;
+      document.removeEventListener("visibilitychange", onVisible);
       if (keyShotTimer.current) window.clearTimeout(keyShotTimer.current);
       keyShotTimer.current = null;
+      if (installTimer.current) window.clearInterval(installTimer.current);
+      installTimer.current = null;
       if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
       rulerTimerRef.current = null;
       if (fitTimer.current) window.clearTimeout(fitTimer.current);
@@ -257,6 +317,24 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The agent kept driving this chat's shared session after the tab was docked
+  // (a later browser_navigate). Follow the new page instead of leaving the
+  // panel on the first URL. This is `navigate`, not `launch`: docking the panel
+  // happens because a browser tool just ran, so the session already exists —
+  // and a tab restored from disk must never start one by itself.
+  useEffect(() => {
+    if (initialUrlRef.current === initialUrl) return;
+    initialUrlRef.current = initialUrl;
+    const target = initialUrl.trim();
+    if (!target || target === "about:blank") return;
+    void sidecarFetch("/browser/navigate", {
+      method: "POST",
+      body: JSON.stringify({ url: target }),
+    }).catch(() => {
+      /* non-critical: the status poll still reflects the live page */
+    });
+  }, [initialUrl]);
 
   async function go(): Promise<void> {
     const raw = address.trim();
@@ -562,6 +640,49 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  // One-click install of the app's OWN automation browser.
+  //
+  // The download and unpack run on a plain Rust thread (no Python, no npx), so
+  // progress is observed by polling /browser/install/status — the same shape as
+  // the app's other long downloads.
+  async function startInstall(): Promise<void> {
+    setError("");
+    setInstalling(true);
+    setInstallPct(0);
+    setInstallPhase("downloading");
+    try {
+      await sidecarFetch("/browser/install", { method: "POST" });
+    } catch (err) {
+      setInstalling(false);
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (installTimer.current) window.clearInterval(installTimer.current);
+    installTimer.current = window.setInterval(async () => {
+      try {
+        const st = await sidecarFetch("/browser/install/status");
+        if (typeof st.percent === "number") setInstallPct(st.percent);
+        if (typeof st.phase === "string") setInstallPhase(st.phase);
+        if (st.available === true) setAvailable(true);
+        if (st.installing) return;
+        // Finished (or failed): stop polling and report either way.
+        if (installTimer.current) window.clearInterval(installTimer.current);
+        installTimer.current = null;
+        setInstalling(false);
+        if (st.phase === "failed" && st.error) {
+          setError(String(st.error));
+        } else {
+          await refreshStatus();
+        }
+      } catch (err) {
+        if (installTimer.current) window.clearInterval(installTimer.current);
+        installTimer.current = null;
+        setInstalling(false);
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    }, 700);
   }
 
   // Close the "..." menu on outside click or Escape.
@@ -870,8 +991,42 @@ export function BrowserPanel({ chatId = "" }: { chatId?: string }) {
         onKeyDown={stageKeyDown}
         onMouseDown={(e) => e.currentTarget.focus()}
       >
-        {loading ? (
-          <div className="viewer-empty">Starting virtual browser…</div>
+        {!available ? (
+          // No automation browser installed. This used to be invisible: the
+          // stage sat on "Connecting…" forever, and the only way out was the
+          // user's own Chrome being used as the driver.
+          <div className="browser-install">
+            <div className="browser-install-title">
+              Automation browser not installed
+            </div>
+            <p className="browser-install-body">
+              Codifa drives its own headless browser, so your everyday browser is
+              never touched. Download it once (~90 MB) and the agent can browse.
+            </p>
+            <button
+              type="button"
+              className="browser-install-btn"
+              onClick={() => void startInstall()}
+              disabled={installing}
+            >
+              {installing
+                ? installPhase === "extracting"
+                  ? `Unpacking… ${installPct}%`
+                  : `Downloading… ${installPct}%`
+                : "Install browser"}
+            </button>
+            {installing && (
+              <div className="browser-install-bar" aria-hidden="true">
+                <div
+                  className="browser-install-fill"
+                  style={{ width: `${Math.max(2, installPct)}%` }}
+                />
+              </div>
+            )}
+            {error && <div className="browser-install-error">{error}</div>}
+          </div>
+        ) : loading ? (
+          <div className="viewer-empty">Connecting to the virtual browser…</div>
         ) : image ? (
           <div className="browser-stage-inner" style={{ width: frameW, height: frameH }}>
             <img

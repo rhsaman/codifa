@@ -45,6 +45,11 @@ export interface HistoryEntry {
   plan?: ChatMessage['plan']
   toolActivity?: HistoryToolEntry[]
   preservedToolSummary?: string
+  /** Filesystem paths (NOT inline data URLs) of the images on this message, so
+   *  the backend can re-read them for the model without the renderer
+   *  re-serializing megabytes of base64 on every turn (the long-chat memory
+   *  spike this projection exists to prevent). */
+  images?: string[]
 }
 
 function cut(v: string, cap: number): string {
@@ -95,5 +100,12 @@ export function projectHistoryMessage(m: ChatMessage): HistoryEntry {
   ) {
     out.preservedToolSummary = m.preservedToolSummary
   }
+  // Image ATTACHMENTS travel as paths only: the payload stays small and the
+  // backend resolves the bytes itself (data URLs were dropped from history
+  // precisely because re-sending them on every turn blew up memory).
+  const imgs = (m.images ?? [])
+    .map((i) => (typeof i === 'string' ? i : i?.path))
+    .filter((p): p is string => typeof p === 'string' && p.length > 0)
+  if (imgs.length > 0) out.images = imgs
   return out
 }

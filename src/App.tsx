@@ -27,6 +27,7 @@ import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePl
 import { resolveChatClose } from './lib/chatClose'
 import { collectChatIds, pickNeighborWindow } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
+import { applyInputSuppression } from './lib/inputSuppress'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
 import { UsageChip } from './components/UsageChip'
@@ -45,6 +46,12 @@ export default function App() {
   const activeChatId = useStore((s) => s.activeChatId)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
+  // Keyboard suggestions follow this setting instead of the platform default
+  // (see src/lib/inputSuppress.ts). `?? true` keeps them suppressed while the
+  // settings payload is still cold-start defaults.
+  const disableTextSuggestions = useStore(
+    (s) => s.settings.disableTextSuggestions ?? true,
+  )
   const viewerTabs = useViewerTabs((s) => s.tabs)
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
@@ -133,6 +140,15 @@ export default function App() {
     useStore.getState().setTheme(saved)
     runLoad()
   }, [load, runLoad])
+
+  // The main.tsx installer only stamps fields on focus; this effect makes the
+  // whole UI consistent as soon as the setting (or the hydrated state) lands,
+  // and undoes it losslessly when the user switches suggestions back on. The
+  // re-run on `loaded` matters: while the store is still loading, App renders
+  // only the loading screen, so the first sweep would miss every real field.
+  useEffect(() => {
+    applyInputSuppression(disableTextSuggestions)
+  }, [disableTextSuggestions, loaded])
 
   // Background sidecar health probe. Fires every 60s while the app is open
   // and pings /health against the cached URL. If the sidecar hung (process

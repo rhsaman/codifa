@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import { useTracePanel, type TraceTab } from "../lib/tracePanel";
@@ -554,6 +554,12 @@ export function TraceTurnGroup({
 }
 
 /** Chat trace panel — overlay over chat, flat trace list with filter tabs. */
+/** How many entries one trace page holds. Sized from the real logs: a typical
+ *  entry is 4-5 KB (worst case ~36 KB for a re-logged system prompt), so a page
+ *  stays well under a megabyte while still filling the panel several times over.
+ *  This mirrors the Rust default in `trace.rs`. */
+const TRACE_PAGE = 200;
+
 export function TracePanel(props?: {
   chatId?: string
   initialTab?: TraceTab
@@ -599,6 +605,23 @@ export function TracePanel(props?: {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  // Pagination: `entries` holds the newest page plus every older page the user
+  // scrolled into. The whole log used to be fetched on every 2s poll — a long
+  // chat's log is several MB (the system prompt is re-logged on every LLM call)
+  // and the panel renders one screenful, so the rest was pure heap.
+  const [olderLoading, setOlderLoading] = useState(false);
+  // Whole-log totals + per-kind counts from the server: the tab badges must not
+  // shrink just because only a page (or two) of entries is in memory.
+  const [serverCounts, setServerCounts] = useState<{
+    all: number;
+    llm: number;
+    prompt: number;
+    tool: number;
+  } | null>(null);
+  // Entries the active filter can still reveal above what is loaded.
+  const [serverTotal, setServerTotal] = useState(0);
+  // True once an older page request came back empty (log start reached).
+  const [reachedStart, setReachedStart] = useState(false);
 
   const dragCleanup = useRef<(() => void) | null>(null);
   useEffect(() => {
@@ -651,39 +674,123 @@ export function TracePanel(props?: {
     dragCleanup.current = onUp;
   };
 
-  // گرفتن همه لاگ‌ها یک‌جا + پولینگ زنده تا لاگ‌های جدید خودکار بیایند.
+  // The newest page + live polling so new entries appear on their own.
+  //
+  // The poll asks only for the newest page and MERGES it by id: replacing the
+  // array would throw away every older page the user scrolled into, and
+  // re-fetching the whole log on a timer is what put the file's full size into
+  // the renderer heap. A log that grew past one page between two polls would
+  // drop the middle, so the page size is the bound on how much can be missed —
+  // 200 entries is minutes of work, and the oldest page boundary is recovered by
+  // scrolling up.
   const fetchSeqRef = useRef(0);
-  const fetchAll = useCallback(async (silent: boolean) => {
-    if (!activeChatId) {
-      setEntries([]);
-      return;
-    }
-    const mySeq = ++fetchSeqRef.current;
-    if (!silent) {
-      setLoading(true);
-      setError(null);
-    }
-    try {
-      const out = await getChatTraces(activeChatId, undefined, taskId || undefined);
-      if (mySeq !== fetchSeqRef.current) return;
-      if (Array.isArray(out)) {
-        setEntries(out);
-        if (!silent) setError(null);
-      } else if (!silent) {
+  const fetchAll = useCallback(
+    async (silent: boolean) => {
+      if (!activeChatId) {
         setEntries([]);
-        setError((out as { error?: string })?.error ?? "trace request failed");
+        setServerCounts(null);
+        setServerTotal(0);
+        setReachedStart(false);
+        return;
       }
-    } catch (e) {
-      if (mySeq !== fetchSeqRef.current) return;
+      const mySeq = ++fetchSeqRef.current;
       if (!silent) {
-        setEntries([]);
-        setError(e instanceof Error ? e.message : String(e));
+        setLoading(true);
+        setError(null);
       }
+      try {
+        const out = await getChatTraces(activeChatId, undefined, taskId || undefined, {
+          limit: TRACE_PAGE,
+          before: 0,
+          sub: Boolean(taskId),
+        });
+        if (mySeq !== fetchSeqRef.current) return;
+        if ("traces" in out) {
+          const page = out.traces;
+          setServerCounts(out.counts);
+          setServerTotal(out.total);
+          setEntries((prev) => {
+            // A fresh chat, or a poll after a clear: nothing to merge into.
+            if (prev.length === 0) return page;
+            const have = new Set(prev.map((e) => e.id));
+            const fresh = page.filter((e) => !have.has(e.id));
+            if (fresh.length === 0) return prev;
+            // Trim from the OLDEST end past two pages: off-screen entries above
+            // the viewport cost DOM and heap for no benefit, and the user can
+            // always scroll back up to re-fetch them.
+            const merged = [...prev, ...fresh];
+            const cap = TRACE_PAGE * 2;
+            return merged.length > cap ? merged.slice(merged.length - cap) : merged;
+          });
+          if (!silent) setError(null);
+        } else if (!silent) {
+          setEntries([]);
+          setServerCounts(null);
+          setServerTotal(0);
+          setError((out as { error?: string })?.error ?? "trace request failed");
+        }
+      } catch (e) {
+        if (mySeq !== fetchSeqRef.current) return;
+        if (!silent) {
+          setEntries([]);
+          setServerCounts(null);
+          setServerTotal(0);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (mySeq !== fetchSeqRef.current) return;
+        if (!silent) setLoading(false);
+      }
+    },
+    [activeChatId, taskId],
+  );
+
+  /** Fetch the page above the oldest entry currently held.
+   *
+   *  `before` counts entries back from the END of the log under the ACTIVE
+   *  filter, so the cursor is simply "how many filtered entries I already
+   *  have" — no ids to track and no way to skip a row.
+   */
+  const loadingOlderRef = useRef(false);
+  const loadOlder = useCallback(async () => {
+    if (!activeChatId || loadingOlderRef.current || reachedStart) return;
+    loadingOlderRef.current = true;
+    setOlderLoading(true);
+    try {
+      const activeFilter = taskId ? undefined : tab === "all" ? undefined : tab;
+      const before = visibleCountRef.current;
+      const out = await getChatTraces(activeChatId, activeFilter, taskId || undefined, {
+        limit: TRACE_PAGE,
+        before,
+        sub: Boolean(taskId),
+      });
+      if ("traces" in out && Array.isArray(out.traces)) {
+        const older = out.traces;
+        setServerCounts(out.counts);
+        setServerTotal(out.total);
+        if (older.length === 0) {
+          setReachedStart(true);
+        } else {
+          setEntries((prev) => {
+            const have = new Set(prev.map((e) => e.id));
+            const fresh = older.filter((e) => !have.has(e.id));
+            if (fresh.length === 0) {
+              // Everything in the page is already loaded: the cursor is past
+              // the start of the log.
+              setReachedStart(true);
+              return prev;
+            }
+            return [...fresh, ...prev];
+          });
+        }
+      }
+    } catch {
+      /* keep what we have; scrolling again retries */
     } finally {
-      if (mySeq !== fetchSeqRef.current) return;
-      if (!silent) setLoading(false);
+      loadingOlderRef.current = false;
+      setOlderLoading(false);
     }
-  }, [activeChatId, taskId]);
+  }, [activeChatId, taskId, tab, reachedStart]);
 
   useEffect(() => {
     if (!activeChatId) {
@@ -706,6 +813,13 @@ export function TracePanel(props?: {
 
   const counts = useMemo(() => getTraceTabCounts(entries, Boolean(taskId)), [entries, taskId]);
 
+  // The tab badges must reflect the WHOLE log, not the pages in memory: once
+  // only a page is loaded, counting `entries` locally would shrink every badge.
+  const badges = useMemo(
+    () => (serverCounts ? serverCounts : counts),
+    [serverCounts, counts],
+  );
+
   const visible = useMemo(() => {
     const subView = Boolean(taskId);
     const byTab =
@@ -717,6 +831,14 @@ export function TracePanel(props?: {
     // Chronological: oldest at top, newest at bottom (scroll up for history).
     return filterTraces(byTab, query);
   }, [entries, tab, query, taskId]);
+
+  // "How many filtered entries do I already hold" — the `before` cursor for the
+  // next older page. Kept in a ref so `loadOlder` never needs `visible` as a
+  // dependency (that would recreate it on every poll-set-entries).
+  const visibleCountRef = useRef(0);
+  useEffect(() => {
+    visibleCountRef.current = visible.length;
+  }, [visible.length]);
 
   const turnGroups = useMemo(() => groupTracesByTurn(visible), [visible]);
 
@@ -759,17 +881,40 @@ export function TracePanel(props?: {
     return m;
   }, [visible, hitCounts]);
 
-  // Stick to bottom on new traces (chronological list); scrolling up pauses it.
+  // Stick to bottom on new traces (chronological list); scrolling up pauses it
+  // and, near the top, pulls in the next older page.
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
   const [stuck, setStuck] = useState(true);
+  // Height of the content above the viewport before an older page is prepended,
+  // used to keep the viewport exactly where the user was (no jump).
+  const prependAnchorRef = useRef<number | null>(null);
   const onListScroll = useCallback(() => {
     const el = listRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
     stickRef.current = nearBottom;
     setStuck(nearBottom);
-  }, []);
+    // Near the top: ask for the previous page. Anchored before the state update
+    // so the layout effect below can restore the scroll offset.
+    if (el.scrollTop < 160) {
+      if (prependAnchorRef.current == null) {
+        prependAnchorRef.current = el.scrollHeight;
+      }
+      void loadOlder();
+    }
+  }, [loadOlder]);
+  // Prepending older entries grows the list above the viewport; shift the scroll
+  // position by exactly that growth so the reading position does not jump.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    const prev = prependAnchorRef.current;
+    if (!el || prev == null) return;
+    if (el.scrollHeight !== prev) {
+      el.scrollTop += el.scrollHeight - prev;
+      prependAnchorRef.current = null;
+    }
+  }, [entries.length]);
   useEffect(() => {
     if (stickRef.current) listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [visible.length, tab, activeChatId]);
@@ -778,6 +923,13 @@ export function TracePanel(props?: {
     setStuck(true);
     listRef.current?.scrollTo({ top: listRef.current?.scrollHeight ?? 0, behavior: "smooth" });
   }, []);
+
+  // A filter/search that starts over must re-arm the "no older page" flag, or a
+  // tab switch would leave the panel convinced it had reached the log start.
+  useEffect(() => {
+    setReachedStart(false);
+    prependAnchorRef.current = null;
+  }, [activeChatId, tab, taskId]);
 
 
   const panel = (
@@ -806,10 +958,10 @@ export function TracePanel(props?: {
                 className={`review-source-btn${tab === key ? " active" : ""}`}
                 onClick={() => setTab(key)}
                 title={key === "all" ? "Show everything" : `Filter: ${label}`}
-                aria-label={`${label}, ${counts[key] ?? 0} items`}
+                aria-label={`${label}, ${badges[key] ?? 0} items`}
               >
                 <span className="trace-tab-label">{label}</span>
-                <span className="trace-tab-count">{counts[key] ?? 0}</span>
+                <span className="trace-tab-count">{badges[key] ?? 0}</span>
               </button>
             ))}
           </span>
@@ -824,6 +976,9 @@ export function TracePanel(props?: {
                 void (async () => {
                   await clearChatTraces(activeChatId);
                   setEntries([]);
+                  setServerCounts(null);
+                  setServerTotal(0);
+                  setReachedStart(false);
                 })();
               }}
             >
@@ -845,7 +1000,10 @@ export function TracePanel(props?: {
         <div className="trace-subheader">
           <span className="trace-subheader-text">
             {taskId ? `Sub-agent ${traceTitle || taskId.slice(0, 8)} · ` : ""}
-            {entries.length} events{totalTokens > 0 ? ` · ${totalTokens} tokens` : ""}
+            {serverCounts
+              ? `${entries.length} of ${serverTotal} events`
+              : `${entries.length} events`}
+            {totalTokens > 0 ? ` · ${totalTokens} tokens` : ""}
           </span>
         </div>
         <div className="review-search-row">
@@ -905,6 +1063,11 @@ export function TracePanel(props?: {
           </div>
         ) : (
           <div className="trace-panel-list" ref={listRef} onScroll={onListScroll}>
+            {(olderLoading || (!reachedStart && serverTotal > visible.length)) && (
+              <div className="trace-load-older">
+                {olderLoading ? "loading older…" : "scroll up for older events"}
+              </div>
+            )}
             {turnGroups.map((g) => (
               <TraceTurnGroup
                 key={g.turn !== null ? `turn-${g.turn}` : `turn-inferred-${g.inferred}`}

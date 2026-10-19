@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import type { ProviderConfig } from "../types";
 import { MAX_PINNED_RECENT_MODELS, sortRecentModels, useStore } from "../lib/store";
 import { isForeignModelId } from "../lib/provider-meta";
@@ -26,7 +28,27 @@ function modelLabel(p: ProviderConfig, m: string): string {
  *  fetchAndPersist. Opening this popup only reads the persisted list, so it
  *  never fires a network request. The last 10 used models appear in a
  *  "Recent" section on top. */
-export function ProviderModelSelect(props?: { chatId?: string }) {
+export function ProviderModelSelect(props?: {
+  chatId?: string;
+  /** Controlled mode: when provided, the picker does NOT touch the active
+   *  chat — it renders this value and reports picks through `onSelect`.
+   *  Used by Settings → Tools rows to reuse the composer picker without
+   *  mutating the currently selected chat. */
+  value?: string;
+  onSelect?: (value: string) => void;
+  /** Controlled mode only: text shown BOTH on the button and on the dropdown
+   *  entry that clears the selection (e.g. "Main model") — the button shows it
+   *  whenever the controlled value is empty, because an empty slot inherits the
+   *  main model. When omitted, the button falls back to the provider name. */
+  noneLabel?: string;
+  /** Composer-footer mode: render the provider name dimmed in front of the
+   *  model id and let CSS clip the model, so a long "provider/model" (e.g.
+   *  "9router/oc/deepseek-v4.1-flash-free") stays compact while still telling
+   *  which provider AND which model are in use. The full string stays in the
+   *  button tooltip. Unused by the Settings → Tools rows. */
+  compact?: boolean;
+}) {
+  const controlled = props?.onSelect != null;
   const providers = useStore((s) => s.settings.providers);
   const activeId = useStore((s) => s.settings.activeProviderId);
   const recents = useStore((s) => s.recentModels);
@@ -49,26 +71,165 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  /** When true the menu opens DOWNWARD (`.pm-below`) instead of upward. */
+  const [below, setBelow] = useState(false);
+  /** Max height (px) the popup may occupy in the chosen direction, fed to CSS
+   *  as `--pm-max-h` so a short window scrolls the menu INTERNALLY instead of
+   *  letting it spill past a clipped ancestor. */
+  const [maxH, setMaxH] = useState<number | null>(null);
+  /** Viewport-fixed anchor of the menu. The menu is PORTALLED to <body> so the
+   *  Settings modal's scrollers (`overflow:auto/hidden` on .settings-content/
+   *  .settings-body/.settings-modal) can no longer clip it — with the portal,
+   *  `left/right` are resolved against the viewport, so the coordinates are
+   *  measured from the button instead of inheriting `.pm-select`'s box. */
+  const [anchor, setAnchor] = useState<{
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+    minWidth: number;
+  } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+      const t = e.target as Node;
+      // The menu lives in a PORTAL (outside this wrapper), so an outside-click
+      // check must look at the menu node too — otherwise clicking any model
+      // row would count as "outside" and close the popup before the pick runs.
+      if (wrapRef.current && !wrapRef.current.contains(t)) {
+        if (menuRef.current && menuRef.current.contains(t)) return;
         setOpen(false);
       }
     }
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
+    // CAPTURE phase on purpose: the Settings modal stops mousedown propagation
+    // at `.settings-modal` (its overlay uses onMouseDown to close), so a
+    // bubble-phase document listener never fires for clicks inside the modal
+    // and the popup could not be dismissed. Capture runs top-down before any
+    // stopPropagation, so it works in both the composer and the modal.
+    document.addEventListener("mousedown", onDocClick, true);
+    return () => document.removeEventListener("mousedown", onDocClick, true);
   }, []);
 
-  // Fresh state each time the menu opens: empty search, all providers collapsed.
-  // No model fetch happens here — the list comes from the persisted store
-  // (populated at startup / on provider add-edit via fetchAndPersist).
+  /** Clip window of an element = its viewport rect ∩ every scrollable /
+   *  overflow-hidden ancestor rect. This — not `window.innerHeight` — is what
+   *  actually clips the popup: inside the Settings modal `.settings-content`
+   *  (overflow-y: auto) cuts anything above its visible top edge, and any
+   *  overflow:hidden wrapper enforces its own box too. */
+  const clipWindow = (start: HTMLElement, up: boolean) => {
+    const MENU_EST = 360; // height estimate before the real height is known
+    const PAD = 12; // breathing room under/over the button
+    let top = 0;
+    let bottom = window.innerHeight;
+    const rects: DOMRect[] = [];
+    for (
+      let el: HTMLElement | null = start;
+      el;
+      el = el.parentElement
+    ) {
+      const cs = window.getComputedStyle(el);
+      const oy = cs.overflowY;
+      if (oy === "visible" || oy === "clip") continue;
+      if (el !== start) rects.push(el.getBoundingClientRect());
+      if (oy === "auto" || oy === "scroll") {
+        // A scroll container clips only its VISIBLE box; contents above the
+        // current scroll position still count as reachable (the menu can be
+        // scrolled to).
+        top = Math.max(top, Math.max(el.getBoundingClientRect().top, 0));
+        bottom = Math.min(bottom, Math.min(el.getBoundingClientRect().bottom, window.innerHeight));
+      } else {
+        const r = el.getBoundingClientRect();
+        top = Math.max(top, Math.max(r.top, 0));
+        bottom = Math.min(bottom, Math.min(r.bottom, window.innerHeight));
+      }
+    }
+    const r = start.getBoundingClientRect();
+    const spaceUp = r.top - top - PAD;
+    const spaceDown = bottom - r.bottom - PAD;
+    const room = up ? spaceUp : spaceDown;
+    return {
+      below: spaceDown >= Math.min(MENU_EST, spaceUp),
+      maxH: Math.max(0, Math.min(MENU_EST, room)),
+    };
+  };
+
+  /** Re-measure AFTER the menu mounts (its real height replaces the 360px
+   *  estimate): clamp to the chosen side's clip window so a short window
+   *  scrolls the menu internally instead of spilling past the clip edge. */
+  useLayoutEffect(() => {
+    if (!open || !wrapRef.current) return;
+    const { maxH } = clipWindow(wrapRef.current, !below);
+    setBelow((b) => {
+      const { below: wantBelow } = clipWindow(wrapRef.current!, !b);
+      return wantBelow;
+    });
+    setMaxH(Math.max(180, maxH));
+    // Keep the portalled menu glued to the button while the modal scrolls or
+    // the window resizes (the button moves, the portal must follow).
+    const el = wrapRef.current;
+    const follow = () => measureAnchor(el);
+    window.addEventListener("scroll", follow, true);
+    window.addEventListener("resize", follow);
+    return () => {
+      window.removeEventListener("scroll", follow, true);
+      window.removeEventListener("resize", follow);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, below, query, expanded]);
+
+  /** Open/close the menu, measuring the REAL clip window (up AND down) at
+   *  open time and opening on the side with room; the layout effect then
+   *  clamps the menu's height with `--pm-max-h`. */
+  /** Viewport-fixed anchor box for the portalled menu: the button's rect, with
+   *  `left/right` pinned so the menu never runs under the Settings tabs column
+   *  — it is clamped to the viewport when the button sits close to an edge. */
+  const measureAnchor = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    const MENU_MIN = 280; // .pm-menu min-width
+    const MARGIN = 10; // keep off the window edges
+    const maxRight = window.innerWidth - MARGIN;
+    // Right-align with the button, but never let the menu overflow the window.
+    const right = Math.max(MARGIN, maxRight - r.right);
+    const left = Math.max(MARGIN, r.left);
+    const width = Math.min(
+      Math.max(MENU_MIN, r.width),
+      Math.max(MENU_MIN, window.innerWidth - MARGIN * 2),
+    );
+    setAnchor({
+      top: r.top,
+      bottom: r.bottom,
+      // Distance from the relevant window edge to the menu's right-aligned box.
+      left: Math.max(MARGIN, Math.min(left, window.innerWidth - width - MARGIN)),
+      right,
+      minWidth: width,
+    });
+  };
+
+  const toggleMenu = () => {
+    setOpen((o) => {
+      if (!o && wrapRef.current) {
+        const m = clipWindow(wrapRef.current, true);
+        setBelow(m.below);
+        setMaxH(m.maxH > 0 ? m.maxH : null);
+        measureAnchor(wrapRef.current);
+      }
+      return !o;
+    });
+  };
+
+  // Fresh state each time the menu opens: empty search; providers stay closed
+  // in the composer. A controlled picker (Settings → Tools) auto-EXPANDS the
+  // group the slot points at — or the active provider while the slot inherits
+  // the main model — so the model list is instantly visible instead of a wall
+  // of collapsed provider names. No model fetch happens here — the list comes
+  // from the persisted store (populated at startup / on provider add-edit).
   useEffect(() => {
     if (open) {
       setQuery("");
-      setExpanded(new Set());
+      const expandPid = controlled ? ctrl?.providerId ?? activeProviderId : "";
+      setExpanded(expandPid ? new Set([expandPid]) : new Set());
       requestAnimationFrame(() => searchRef.current?.focus());
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -81,6 +242,33 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
   const active = providers.find((p) => p.id === activeProviderId) ?? providers[0];
   if (!active) return null;
   const activeModel = chat?.model ?? active.model;
+
+  // In controlled mode the displayed value comes from the parent instead of
+  // the chat: `value` is a "providerId/model" string (bare id = active
+  // provider), exactly what Settings stores for each tool slot.
+  const ctrl = (() => {
+    if (!controlled) return null as null | { providerId: string; model: string };
+    const raw = (props?.value ?? "").trim();
+    if (!raw) return null;
+    const slash = raw.indexOf("/");
+    if (slash > 0) {
+      const pid = raw.slice(0, slash);
+      const model = raw.slice(slash + 1);
+      const p = providers.find((x) => x.id === pid);
+      if (p) return { providerId: p.id, model };
+    }
+    return { providerId: activeProviderId, model: raw };
+  })();
+  // In controlled mode an EMPTY value is meaningful: the slot inherits the
+  // main model. Falling back to the active provider's model there would make an
+  // inherited row look like an explicit pick, so keep the shown model empty and
+  // let the button say "Main model" instead.
+  const inherited = controlled && ctrl == null;
+  const noneText = props?.noneLabel ?? "Main model";
+  const shownProviderId = ctrl?.providerId ?? (controlled ? "" : activeProviderId);
+  const shownModel = ctrl?.model ?? (controlled ? "" : activeModel);
+  const shownProvider =
+    providers.find((p) => p.id === shownProviderId) ?? active;
 
   // Fetched models + the provider's saved list + current model, minus the
   // models the user explicitly removed. Saved entries are filtered by
@@ -194,6 +382,16 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
 
   const pick = (p: ProviderConfig, m: string) => {
     const model = bareModel(p, m);
+    if (controlled) {
+      // Settings → Tools: report "providerId/model" and leave the active chat
+      // (and global default) completely untouched — but DO record the pick in
+      // the shared Recent list, so the popup's Recent section behaves exactly
+      // like the composer's.
+      props?.onSelect?.(`${p.id}/${model}`);
+      addRecentModel(model, p.id);
+      setOpen(false);
+      return;
+    }
     if (chat) {
       // Per-chat: remember THIS chat's provider/model choice only — other
       // chats and the global default stay untouched.
@@ -209,32 +407,80 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
     setOpen(false);
   };
 
-  const label = activeModel ? modelLabel(active, activeModel) : active.name;
+  const label = inherited
+    ? noneText
+    : shownModel
+      ? modelLabel(shownProvider, shownModel)
+      : shownProvider.name;
+  const buttonTitle = inherited
+    ? `${noneText} — follows whatever the composer is using`
+    : `${shownProvider.name} — ${shownModel || "no model"}`;
 
   return (
     <div className={`pm-select${open ? " open" : ""}`} ref={wrapRef}>
       <button
         type="button"
         className="pm-select-btn"
-        onClick={() => setOpen((o) => !o)}
-        title={`${active.name} — ${active.model || "no model"}`}
+        onClick={toggleMenu}
+        title={buttonTitle}
       >
-        <span className="pm-select-label">{label}</span>
+        <span className="pm-select-label">
+          {props?.compact && !inherited && shownModel ? (
+            <>
+              <span className="pm-select-provider">{shownProvider.name}/</span>
+              <span className="pm-select-model">{shownModel}</span>
+            </>
+          ) : (
+            label
+          )}
+        </span>
         <span className="mode-select-caret">{open ? "▲" : "▼"}</span>
       </button>
-      {open && (
-        <div className="mode-menu pm-menu">
-          <input
-            ref={searchRef}
-            className="pm-search"
-            value={query}
-            placeholder="Search models…"
-            onChange={(e) => onSearchChange(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setOpen(false);
-            }}
-          />
-          <div className="pm-scroll">
+      {open &&
+        anchor &&
+        // The menu is PORTALLED to <body> and fixed to the button's viewport
+        // rect: inside the Settings modal its ancestors scroll/clip
+        // (`.settings-content` is `overflow:auto`), which used to cut the menu
+        // off under the tabs column.
+        createPortal(
+          <div
+            ref={menuRef}
+            className={`mode-menu pm-menu pm-fixed${below ? " pm-below" : ""}`}
+            style={
+              {
+                ...(maxH != null ? { "--pm-max-h": `${maxH}px` } : {}),
+                position: "fixed",
+                top: below ? anchor.bottom + 6 : "auto",
+                bottom: below ? "auto" : window.innerHeight - anchor.top + 6,
+                left: "auto",
+                right: anchor.right,
+                minWidth: anchor.minWidth,
+              } as CSSProperties
+            }
+          >
+            <input
+              ref={searchRef}
+              className="pm-search"
+              value={query}
+              placeholder="Search models…"
+              onChange={(e) => onSearchChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setOpen(false);
+              }}
+            />
+            <div className="pm-scroll">
+            {controlled && props?.noneLabel != null && (
+              <button
+                type="button"
+                className={`mode-menu-item pm-model pm-clear${inherited ? " active" : ""}`}
+                onClick={() => {
+                  props?.onSelect?.("");
+                  setOpen(false);
+                }}
+              >
+                <span className="pm-model-name">{props.noneLabel}</span>
+              </button>
+            )}
             {recentsShown.length > 0 && (
               <div className="pm-recents">
                 <div className="pm-recent-header">
@@ -244,7 +490,7 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
                   />
                 </div>
                 {recentsShown.map(({ p, model, pinned }) => {
-                  const isCurrent = p.id === activeProviderId && model === activeModel;
+                  const isCurrent = p.id === shownProviderId && model === shownModel;
                   const pinFull = !pinned && pinnedCount >= MAX_PINNED_RECENT_MODELS;
                   return (
                     <div key={`${p.id}/${model}`} className={`pm-model-row${pinned ? " pinned" : ""}`}>
@@ -311,7 +557,7 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
                   <div className="pm-provider-row">
                     <button
                       type="button"
-                      className={`pm-provider-name ${p.id === activeProviderId ? "active" : ""}`}
+                      className={`pm-provider-name ${p.id === shownProviderId ? "active" : ""}`}
                       onClick={() => toggle(p.id)}
                     >
                       <span className="pm-provider-caret">{isOpen ? "▾" : "▸"}</span>
@@ -323,7 +569,7 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
                   {isOpen && (
                     <div className="pm-models">
                       {models.map((m) => {
-                        const isCurrent = p.id === activeProviderId && m === activeModel;
+                        const isCurrent = p.id === shownProviderId && m === shownModel;
                         return (
                           <div key={m} className="pm-model-row">
                             <button
@@ -348,9 +594,10 @@ export function ProviderModelSelect(props?: { chatId?: string }) {
                 </div>
               );
             })}
-          </div>
-        </div>
-      )}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

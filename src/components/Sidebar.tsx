@@ -176,13 +176,15 @@ function SidebarContent() {
   const chats = useStore((s) =>
     // Empty (message-less) chats are in-memory tabs only until the first
     // message is sent — never sidebar rows, never files on disk.
-    s.chats.filter((c) => (c.messages?.length ?? 0) > 0).map((c) => ({
+    s.chats.filter((c) => (c.messageCount ?? c.messages?.length ?? 0) > 0).map((c) => ({
       id: c.id,
       title: c.title,
       root: c.root ?? "",
       updatedAt: c.updatedAt,
       createdAt: c.createdAt,
-      hasStreaming: c.messages.some(
+      // A chat whose body is not in memory cannot be "streaming": the flag
+      // lives on the message objects, which are still on disk.
+      hasStreaming: c.hydrated === false ? false : c.messages.some(
         (m) => m.streaming || m.retry?.reconnecting === true,
       ),
       pendingPermission: c.pendingPermission
@@ -193,6 +195,9 @@ function SidebarContent() {
         : null,
       pendingAsk: c.pendingAsk ? { question: c.pendingAsk.question } : null,
       firstUser: (() => {
+        // The index row carries the first-user preview (written by the store),
+        // so a title never costs reading the whole transcript.
+        if (typeof c.firstUser === 'string' && c.firstUser) return c.firstUser.slice(0, 48);
         const m = c.messages.find((x) => x.role === "user");
         return m ? m.content.slice(0, 48) : "";
       })(),

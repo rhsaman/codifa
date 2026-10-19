@@ -51,7 +51,16 @@ export function exploreCallTotal(activity: ToolActivity): number {
 function fmtMs(ms?: number): string {
   if (!ms) return "";
   if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  const totalSec = ms / 1000;
+  // An explore run can take many minutes (it runs up to a dozen steps), so a
+  // raw second count reads as noise — "5400.0s" instead of "90m". Same
+  // minute+second shape the tool cards use.
+  if (totalSec >= 60) {
+    const m = Math.floor(totalSec / 60);
+    const s = Math.round(totalSec % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  return `${totalSec.toFixed(1)}s`;
 }
 
 /** One-line state word for the status badge's title/aria-label. */

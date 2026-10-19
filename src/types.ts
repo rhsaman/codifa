@@ -98,6 +98,15 @@ export interface ProviderConfig {
   /** مقادیر دستی reasoning که کاربر برای مدل‌ها وارد کرده؛ بر reasoningMap و
    *  heuristic نام مدل اولویت دارد. */
   manualReasoningMap?: Record<string, boolean>
+  /** Live per-model image-input capability, reported by the provider's
+   *  `/models` payload or the models.dev catalog (`modalities.input` contains
+   *  `image`). Absent means UNKNOWN: the composer sends the images to the main
+   *  model and only falls back to the Vision slot when the provider rejects
+   *  them. */
+  visionMap?: Record<string, boolean>
+  /** مقادیر دستی vision که کاربر برای مدل‌ها وارد کرده؛ بر visionMap اولویت
+   *  دارد. */
+  manualVisionMap?: Record<string, boolean>
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   reasoningMap?: Record<string, boolean>
@@ -154,6 +163,9 @@ export interface Settings {
   /** MCP connector names switched on via the composer popup. Applied to every
    *  message; defaults to none. */
   mcpEnabled?: string[]
+  /** The agent's Browser switch (composer → MCP tools → Browser). Stored like
+   *  `computerUse`: when off, no `browser_*` tool is bound to the model. */
+  browserUse?: boolean
   fontSize?: number
   root?: string
   dir?: 'rtl' | 'ltr'
@@ -183,8 +195,9 @@ export interface Settings {
   liveModel?: string
   /** Live voice id used for the realtime session (e.g. alloy). */
   liveVoice?: string
-  /** How many top web_search results get their page content auto-fetched
-   *  before answering (0 = off, snippet-only). Default: 3. */
+  /** One number for `web_search`: how many results it returns AND how many of
+   *  them get their real page content fetched before answering (Settings →
+   *  Web Providers). 0 = no page fetch, snippet-only. Default: 5. */
   webSearchAutoFetch?: number
   /** Web-search engines for the web_search tool (Settings → Plugins). Order
    *  decides primary vs fallback. Empty = DuckDuckGo only (backward compat). */
@@ -205,6 +218,10 @@ export interface Settings {
    *  Each key maps to a model from the active provider, or empty = use the
    *  parent model. */
   subagentModels?: Record<string, string>
+  /** Per-tool reasoning-effort override, keyed by the same slot names as
+   *  `subagentModels` (compact / explore / web / schedule / title). Empty or
+   *  missing = inherit the main model's thinking level. */
+  subagentThinking?: Record<string, ThinkingLevel>
   /** Single auto-compaction threshold as a percentage of the RAW context window.
    *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`.
    *  The reserved headroom is implicit: `(100 - compactAtPercent)%` of the window
@@ -213,6 +230,14 @@ export interface Settings {
    *  trigger always agree (the bar hits the threshold exactly when compaction
    *  fires). */
   compactAtPercent?: number
+  /** Suppress OS/browser keyboard suggestions — autocomplete, autocorrect,
+   *  inline predictions and spell-check marks — in every text field of the app
+   *  (composer, search boxes, comment boxes and the terminal's hidden input).
+   *  Applied at the DOM level by `src/lib/inputSuppress.ts`, so the terminal
+   *  and every imperatively created field are covered too. Turning it off
+   *  restores each field's original attributes. Default: true (suggestions are
+   *  OFF) — the platform defaults are wrong for a code editor. */
+  disableTextSuggestions?: boolean
   /** History turn limit sent to the model. 0 = full history (default). N > 0 =
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */
@@ -413,7 +438,7 @@ export interface ChatMessage {
   autoSkills?: string[]
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; tool?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -523,6 +548,10 @@ export interface Chat {
    *  'skill' event's `note` field. Per-chat so it survives the ChatPanel
    *  remount on chat switch (same rationale as compactNotice). */
   skillNotice?: string | null
+  /** Transient feedback for /undo and /redo ("Undid the last exchange.").
+   *  Lives on the chat instead of being a permanent assistant turn so the ack
+   *  never becomes part of the history the next undo would swallow. */
+  undoNotice?: string | null
   stalled?: boolean
   /** Persistent goal for this chat (null = none). New goal replaces the old one. */
   goal?: GoalState | null
@@ -531,12 +560,38 @@ export interface Chat {
    *  message's top to the viewport top. `atBottom` means the user was pinned
    *  to the newest messages. Restored on chat switch / app restart. */
   scrollPos?: { id: string; offset: number; atBottom: boolean } | null
+  /** Message count of this chat. The renderer's `chats` array holds INDEX rows
+   *  (metadata only) loaded from settings.json; the message bodies live in a
+   *  per-chat file on disk and are pulled in on demand via `chatGet`. */
+  messageCount?: number
+  /** Preview of the first user message, carried on the index row so the
+   *  sidebar/tab titles never need the message body in memory. */
+  firstUser?: string
+  /** Body file path relative to the data root
+   *  (`chats/<workspace>/<id>.json`), written by the store onto the index row;
+   *  the Rust side resolves the body from it. */
+  dir?: string
+  /** True once `messages` holds the real transcript. `false` means the body has
+   *  not been fetched yet: the transcript shows a loader instead of an empty
+   *  chat, and message-mutating actions refuse to write — a partial in-memory
+   *  transcript would overwrite the real body file on the next persist. */
+  hydrated?: boolean
   createdAt: number
   updatedAt: number
 }
 
 /** یک ورودی لاگ چت جاری برای پنل Trace (لایا / LLM / پرامپت / ابزار) — مثل لنگ‌اسمیت. */
 export type TraceKind = 'llm' | 'prompt' | 'tool'
+
+/** یک صفحه از لاگ Trace + شمارش کل لاگ برای نشان‌های تب‌ها.
+ *
+ *  `total` is the entry count under the ACTIVE filter (so the panel knows
+ *  whether an older page exists); `counts` always describes the whole log. */
+export interface TracePage {
+  traces: TraceEntry[]
+  total: number
+  counts: { all: number; llm: number; prompt: number; tool: number }
+}
 
 export interface TraceEntry {
   id: string
@@ -572,10 +627,12 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'subagent_models' | 'steer_applied' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   content?: string
+  /** Tool name on a tool-card event; on a retry/retry_giveup event it names the
+   *  tool that owns the retry (e.g. "explore"), empty for the main agent. */
   tool?: string
   args?: Record<string, unknown>
   summary?: string
@@ -603,8 +660,6 @@ export interface SidecarEvent {
   reconnecting?: boolean
   /** MCP connector names active for this turn (the 'mcp' event kind). */
   servers?: string[]
-  /** Per-subagent model routing (the 'subagent_models' event kind): which model actually ran for explore/search/web/compact/vision. */
-  models?: Record<string, string>
   /** update_plan items: [{ content, status }] */
   items?: Array<{ id?: string; content: string; status: string }>
   /** Steer messages the running agent consumed (injected into a tool result);

@@ -44,35 +44,34 @@ The more context you give, the faster the bug can be fixed.
 
 ## Setting up the dev environment
 
-**Prerequisites:** Node.js ≥ 20 + npm, [uv](https://docs.astral.sh/uv/) and
-Python ≥ 3.10 (managed by uv).
+**Prerequisites:** Node.js ≥ 20 + npm, [Rust](https://rustup.rs/) (stable) and
+the Tauri prerequisites for your OS.
 
 ```bash
 npm install       # JavaScript dependencies
-npm run setup     # creates backend/.venv and installs langgraph, fastapi, uvicorn
-npm run dev       # opens the Electron window with hot reload
+npm run dev       # opens the Tauri window with hot reload
 ```
 
-Voice and RAG-memory models are optional — install them from the app's
-**Settings → Models** tab (fully offline once downloaded).
+Voice and RAG-memory notes are optional — speech uses the STT/TTS providers you
+configure in **Settings → Media Providers**.
 
 ## Project structure
 
 ```
-electron/   main process — window, sidecar spawn, fs IPC, SQLite persistence
-src/        React renderer — Monaco editor, chat (SSE), file explorer
-backend/    Python sidecar — FastAPI + LangGraph agents, tools, Whisper
-test/       frontend tests
-scripts/    build helpers (ad-hoc signing, after-pack)
-.github/    CI workflow + issue/PR templates
+src/         React renderer — Monaco editor, chat (SSE), file explorer
+src-tauri/   Rust shell — agent loop, HTTP API, tools, MCP, skills, PTY
+  skills/    built-in skills shipped with the app (*.md)
+tests/       frontend tests + the runner
+scripts/     build helpers
+.github/     CI workflow + issue/PR templates
 ```
 
 ## Running tests
 
 ```bash
 npm run typecheck      # TypeScript type checking
-npm run test:backend   # Python tests (pytest, backend/tests)
-npm run test:frontend  # frontend tests (test/run-frontend.sh)
+npm run test:frontend  # frontend tests (tests/run-frontend.sh)
+cd src-tauri && cargo test   # Rust tests
 ```
 
 Please make sure these pass before opening a pull request.
@@ -80,9 +79,9 @@ Please make sure these pass before opening a pull request.
 ## Code style
 
 - **TypeScript:** strict mode is enabled; follow the existing patterns in
-  `src/` and `electron/`.
-- **Python:** follow PEP 8; the backend is managed by uv
-  (`backend/pyproject.toml`).
+  `src/`.
+- **Rust:** run `cargo fmt` and `cargo clippy` in `src-tauri/`. Comments and
+docstrings are English.
 - Keep changes focused and readable — prefer small, reviewable pull requests
   over one giant change.
 
@@ -103,7 +102,7 @@ test: cover small-context compaction
 1. Fork the repo and create a branch:
    `git checkout -b fix/your-fix`.
 2. Make your changes and add tests where appropriate.
-3. Run the checks above (typecheck + backend + frontend tests).
+3. Run the checks above (typecheck + frontend + Rust tests).
 4. If user-facing behavior changed, update `README.md` — it's bilingual, so
    update **both** the English and Persian sections.
 5. Open a pull request against `main` and fill in the PR template.

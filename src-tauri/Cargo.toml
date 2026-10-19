@@ -1,6 +1,6 @@
 [package]
 name = "codifa"
-version = "1.8.3"
+version = "1.8.4"
 description = "Offline-first AI coding assistant"
 authors = ["rhsaman"]
 license = "MIT"
@@ -30,8 +30,7 @@ percent-encoding = "2"
 libc = "0.2"
 # Phase 2: native HTTP router (light endpoints) + proxy to the Python sidecar
 axum = { version = "0.7", features = ["http1", "multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "time"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "time", "sync"] }
 # Phase 3-2: native agent tools (read/grep/glob/write/edit/terminal)
 regex = "1"
 walkdir = "2"

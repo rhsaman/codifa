@@ -513,6 +513,7 @@ function playBlobChunk(blob: Blob, seq: number, controller: AbortController): Pr
         }
         settled = true
         release()
+        controller.signal.removeEventListener('abort', onAbort)
         resolve()
       }, budget)
     }

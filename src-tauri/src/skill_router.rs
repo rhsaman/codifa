@@ -58,12 +58,16 @@ fn words_of(s: &str) -> Vec<String> {
 /// request.
 fn skill_score(s: &Value, hay: &str) -> usize {
     let mut score = 0usize;
+    // Matching is WORD-based, never raw substring: `hay.contains("data")` also
+    // fired inside "metadata"/"database", so unrelated skills were pulled into
+    // prompts that never mentioned them (the "it loads the wrong skill" report).
+    let prompt_words: std::collections::HashSet<String> = words_of(hay).into_iter().collect();
     let name_words = words_of(s["name"].as_str().unwrap_or_default());
     let slug_words = words_of(s["slug"].as_str().unwrap_or_default());
     let name_hits = name_words
         .iter()
         .chain(slug_words.iter())
-        .filter(|w| hay.contains(w.as_str()))
+        .filter(|w| prompt_words.contains(*w))
         .count();
     // Capped so a generic name cannot outrank a real keyword match.
     score += name_hits.min(2);
@@ -82,7 +86,7 @@ fn skill_score(s: &Value, hay: &str) -> usize {
                 // shorter paraphrase ("landing page") word by word.
                 score += words_of(&kw)
                     .iter()
-                    .filter(|w| hay.contains(w.as_str()))
+                    .filter(|w| prompt_words.contains(*w))
                     .count();
             }
         }
@@ -131,8 +135,12 @@ fn format_skill_body(s: &Value) -> String {
 /// whose description is English-only would never be found from a Persian
 /// request. Emitting the user's own keywords keeps matching language-agnostic
 /// without any embedding or classifier.
+/// Bytes reserved so the "list truncated" note always fits inside the cap.
+const CATALOG_TRUNCATE_NOTE_RESERVE: usize = 160;
+
 fn catalog(all: &[Value]) -> String {
     let mut out = String::new();
+    let mut truncated = false;
     for s in all {
         let name = s["name"].as_str().unwrap_or_default().trim();
         if name.is_empty() {
@@ -151,10 +159,19 @@ fn catalog(all: &[Value]) -> String {
             line.push_str(&format!(" [fa: {}]", fa.join(", ")));
         }
         line.push('\n');
-        if out.len() + line.len() > CATALOG_MAX_CHARS {
+        if out.len() + line.len() + CATALOG_TRUNCATE_NOTE_RESERVE > CATALOG_MAX_CHARS {
+            truncated = true;
             break;
         }
         out.push_str(&line);
+    }
+    // Say so instead of silently ending the list: the model then knows a skill
+    // may exist that it cannot see, and can still load one the user names.
+    if truncated {
+        out.push_str(
+            "- …(more skills are installed than fit here — call load_skill with \
+             the name if the user names one)\n",
+        );
     }
     out
 }
@@ -336,6 +353,43 @@ mod tests {
         assert!(skill_score(&s, &normalize_text("a short note")) < MATCH_MIN_SCORE);
         // ...but one complete keyword phrase is decisive.
         assert!(skill_score(&s, &normalize_text("این متن رو خلاصه کن")) >= MATCH_MIN_SCORE);
+    }
+
+    #[test]
+    fn auto_match_ignores_substrings_inside_other_words() {
+        // "read" lives inside "already"/"spread": plain substring matching
+        // pulled the wrong skill into prompts that never mentioned it.
+        let s = skill("Read File", "read a file");
+        assert!(skill_score(&s, &normalize_text("already spread the changes")) < MATCH_MIN_SCORE);
+        // A real mention of the word still scores on the two name signals.
+        assert!(skill_score(&s, &normalize_text("please read the file")) >= MATCH_MIN_SCORE);
+    }
+
+    #[test]
+    fn catalog_splits_persian_comma_keywords() {
+        // A list typed with the Persian comma (`فیلم، سریال`) used to survive as
+        // ONE garbled keyword, so no Persian request could ever match it.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-fa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sdir = dir.join("skills").join("movie-finder");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("skill.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم، سریال, سینما\n---\nBODY\n",
+        )
+        .unwrap();
+        let root = dir.to_str().unwrap();
+
+        let listed = catalog(&load_skills(root));
+        assert!(listed.contains("فیلم, سریال, سینما"), "{listed}");
+        // Each keyword stands alone: mentioning only the second one is enough.
+        let section = build_section("یه سریال خوب معرفی کن", root, &[]);
+        assert!(
+            section.matched.contains(&"Movie Finder".to_string()),
+            "{:?}",
+            section.matched
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

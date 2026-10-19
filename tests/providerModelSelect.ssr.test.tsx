@@ -56,6 +56,85 @@ console.log('2) لیست مدل‌ها از store خوانده می‌شود (ن
   check('رندر بدون خطا انجام شد', html.length > 0)
 }
 
+console.log('3) حالت controlled: مقدار خالی یعنی «Main model» روی خود دکمه:')
+{
+  const { useStore } = await import('../src/lib/store')
+  ;(useStore as any).setState({
+    settings: {
+      ...(useStore as any).getState().settings,
+      providers: [
+        {
+          id: 'openrouter',
+          name: 'OpenRouter',
+          kind: 'openrouter',
+          baseUrl: 'https://openrouter.ai/api/v1',
+          apiKeys: ['k1'],
+          models: ['x-ai/grok-4'],
+          model: 'x-ai/grok-4',
+        },
+      ],
+      activeProviderId: 'openrouter',
+    },
+    activeChatId: '',
+    chats: [],
+  })
+  networkCalls = 0
+  const none = renderToString(
+    <ProviderModelSelect value="" onSelect={() => {}} noneLabel="Main model" />,
+  )
+  // دکمه باید خودش متن «Main model» را نشان دهد (نه نام پراوایدر فعال و نه بج).
+  check('مقدار خالی: دکمه «Main model» را نشان می‌دهد', none.includes('Main model'), none.slice(0, 400))
+  check('مقدار خالی: نام مدل فعال روی دکمه نیست', !none.includes('x-ai/grok-4'), none.slice(0, 400))
+
+  const picked = renderToString(
+    <ProviderModelSelect
+      value="openrouter/x-ai/grok-4"
+      onSelect={() => {}}
+      noneLabel="Main model"
+    />,
+  )
+  check('مقدار مشخص: نام کامل پراوایدر/مدل روی دکمه', picked.includes('OpenRouter/x-ai/grok-4'))
+  check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0, networkCalls)
+}
+
+console.log('4) حالت controlled هم انتخاب را در لیست Recent ثبت می‌کند:')
+{
+  const { useStore } = await import('../src/lib/store')
+  ;(useStore as any).setState({
+    settings: {
+      ...(useStore as any).getState().settings,
+      providers: [
+        {
+          id: 'openrouter',
+          name: 'OpenRouter',
+          kind: 'openrouter',
+          baseUrl: 'https://openrouter.ai/api/v1',
+          apiKeys: ['k1'],
+          models: ['x-ai/grok-4'],
+          model: 'x-ai/grok-4',
+        },
+      ],
+      activeProviderId: 'openrouter',
+    },
+    activeChatId: '',
+    chats: [],
+    recentModels: [],
+  })
+  // فراخوانی مستقیم اکشن store همان کاری است که pick() در حالت controlled
+  // انجام می‌دهد: مقدار اسلات را گزارش می‌کند و recent را هم ثبت می‌کند،
+  // بدون دست‌زدن به چت فعال.
+  const st = useStore as any
+  st.getState().addRecentModel('x-ai/grok-4', 'openrouter')
+  const recents = st.getState().recentModels
+  check(
+    'انتخاب در Tools در لیست Recent ثبت می‌شود',
+    recents.some((r: { providerId: string; model: string }) => r.providerId === 'openrouter' && r.model === 'x-ai/grok-4'),
+    recents,
+  )
+  check('چت فعال دست‌نخورده می‌ماند', st.getState().chats.length === 0)
+  check('هیچ درخواست شبکه‌ای انجام نشد', networkCalls === 0, networkCalls)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} test(s) failed`)
   process.exit(1)

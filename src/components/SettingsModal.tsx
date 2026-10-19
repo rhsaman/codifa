@@ -1,18 +1,24 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind } from '../types'
+import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel } from '../types'
 import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
 import { getSkillFile, listSkills, syncSkill } from '../lib/api'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
-import { PROVIDER_META, providerMeta, isForeignModelId } from '../lib/provider-meta'
+import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
-import { ModelTestButton } from './ModelTestButton'
-import { ProviderTestButton } from './ProviderTestButton'
 import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
+import { ProviderModelSelect } from './ProviderModelSelect'
+import { supportsReasoning } from '../lib/thinking'
+import { modelReasoning } from '../lib/context'
+import {
+  THINKING_OPTIONS,
+  THINKING_LABELS,
+  canonThinkingLevel,
+} from '../lib/thinking-options'
 
 const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .filter((m) => m.builtin)
@@ -23,16 +29,6 @@ const NEW_SKILL_KEY = '__new_skill__'
 function isProviderConfigured(p: ProviderConfig): boolean {
   if (providerMeta(p.kind).local) return true
   return providerApiKeys(p).length > 0
-}
-
-function modelLabelForOpts(providerId: string, m: string): string {
-  return `${providerId}/${m}`
-}
-/** Strip a redundant "providerId/" prefix from a model id (a model can get
- *  persisted with it, e.g. "openrouter/free"), so it is never shown or stored
- *  doubled as "openrouter/openrouter/free". */
-function bareModelFor(p: ProviderConfig, m: string): string {
-  return m.startsWith(`${p.id}/`) ? m.slice(p.id.length + 1) : m
 }
 
 // `current` is stored as "providerId/model" (route through that provider).
@@ -92,249 +88,199 @@ export function toolModelTarget(
   return { providerId: activeProviderId, model: current }
 }
 
-function ToolModelSelect({
-  agent, label, desc, current, onSelect, noneLabel = 'Main model',
+/** The "main model" a Tool slot inherits when it has no explicit override:
+ *  the ACTIVE chat's effective provider/model — exactly what the composer is
+ *  showing. Read reactively so the Settings rows follow a per-chat switch. */
+function useMainModel(): { providerId: string; model: string } {
+  const activeChatId = useStore((s) => s.activeChatId)
+  const chats = useStore((s) => s.chats)
+  const providers = useStore((s) => s.settings.providers)
+  const activeProviderId = useStore((s) => s.settings.activeProviderId)
+  const ch = chats.find((c) => c.id === activeChatId)
+  const p =
+    providers.find((x) => x.id === (ch?.providerId ?? activeProviderId)) ?? providers[0]
+  return { providerId: p?.id ?? '', model: ch?.model ?? p?.model ?? '' }
+}
+
+/** Per-tool Settings row: a title + hint, the composer's own model picker
+ *  (controlled, so it never touches the active chat) and the slot's own
+ *  reasoning-effort slider. */
+function ToolSlotRow({
+  agent,
+  label,
+  desc,
+  model,
+  level,
+  onSelectModel,
+  onSelectLevel,
 }: {
   agent: string
   label: string
   desc: string
-  current: string
-  onSelect: (agent: string, model: string) => void
-  /** Label for the empty-value option (stores ''). Slots where empty means
-   * "disabled" (e.g. step) pass an "Off" label instead of "Main model". */
-  noneLabel?: string
+  model: string
+  level: ThinkingLevel
+  onSelectModel: (agent: string, model: string) => void
+  onSelectLevel: (agent: string, level: ThinkingLevel) => void
 }) {
   const providers = useStore((s) => s.settings.providers)
   const activeProviderId = useStore((s) => s.settings.activeProviderId)
-  const [open, setOpen] = useState(false)
-  const [search, setSearch] = useState('')
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
-  const wrapRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-  const q = search.trim().toLowerCase()
-
-  // Union of the provider's live /models results and its saved list, so the
-  // subagent picker can search & pick any model the provider actually offers
-  // (matching the main composer picker) — not just the ones already saved.
-  // Saved entries are filtered by `removed` too so a model the user removed
-  // (e.g. via Settings → Providers) doesn't sneak back into the picker just
-  // because it's still in `p.models` from an earlier write.
-  //
-  // The foreign-id check runs only on the PERSISTED list (`p.models`,
-  // `p.model`), not on the live fetch — see ProviderModelSelect.allModels
-  // for why: a live fetch is already scoped to this exact provider, and
-  // aggregator kinds (OpenRouter, TokenRouter) legitimately return
-  // vendor-prefixed ids ("google/...", "nvidia/...") that collide with our
-  // own built-in provider kind ids. The check runs on the BARE id `b`
-  // (post-strip), not on the raw `m` — otherwise a doubled-prefix entry
-  // like "local/opencode/big-pickle" would pass the raw check (head ===
-  // p.id) but still render as the wrong model.
-  const modelsFor = (p: ProviderConfig): string[] => {
-    const removed = new Set(p.removedModels ?? [])
-    const out = new Set<string>()
-    for (const m of p.models ?? []) {
-      const b = bareModelFor(p, m)
-      if (isForeignModelId(p, b)) continue
-      if (!removed.has(b)) out.add(b)
-    }
-    if (p.model) {
-      const b = bareModelFor(p, p.model)
-      if (!isForeignModelId(p, b) && !removed.has(b)) out.add(b)
-    }
-    return Array.from(out)
-  }
-
-  // `current` is stored as "providerId/model" — resolve a readable label via
-  // the shared helper (shows the provider's display name, not the raw id/kind).
-  const currentLabel = toolModelLabel(current, providers)
-
-  // The single row the stored value really routes through — drives the active
-  // highlight below (legacy bare ids land on the active provider, matching
-  // the backend resolver).
-  const target = toolModelTarget(current, providers, activeProviderId)
-
-  // Opening the combo box always starts from a clean search box — past
-  // selection stays visible via the "active" checkmark in the list below,
-  // not by pre-filling the input (which would just filter results down to
-  // the current pick instead of showing everything to browse/search).
-  const openMenu = () => {
-    if (open) return
-    setOpen(true)
-    setSearch('')
-  }
-
-  const closeMenu = () => {
-    setOpen(false)
-    setSearch('')
-  }
-
-  useEffect(() => {
-    if (!open) return
-    const onDoc = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        closeMenu()
-      }
-    }
-    // Capture phase: the settings modal root stops mousedown propagation
-    // (onMouseDown={e => e.stopPropagation()}), so a bubble-phase document
-    // listener never fires for clicks inside the modal but outside this
-    // picker — the dropdown would stay open. Capture runs before that stop.
-    document.addEventListener('mousedown', onDoc, true)
-    return () => document.removeEventListener('mousedown', onDoc, true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
-
-  const toggle = (id: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  const pick = (p: ProviderConfig, m: string) => {
-    // Store "providerId/model" so the subagent can route through a DIFFERENT
-    // provider than the active one (e.g. a local llama.cpp instance while the
-    // main model is a cloud gateway). The backend resolves the prefix from the
-    // saved provider config; a bare id (no prefix) still means "use the active
-    // provider". This also preserves which provider a model came from in the
-    // picker UI.
-    onSelect(agent, `${p.id}/${bareModelFor(p, m)}`)
-    closeMenu()
-    inputRef.current?.blur()
-  }
-
-  // Filter providers by name AND narrow the models shown to those matching the
-  // query (exactly like the composer picker), auto-expanding matches while
-  // searching so the result is visible immediately.
-  const visibleProviders = providers.map((p) => {
-    const all = modelsFor(p)
-    // Fuzzy (term-AND) search identical to the main composer picker: split the
-    // query into space-separated terms and require EVERY term to appear in the
-    // provider name OR model label — so any word of a model id (e.g. "deep"
-    // "v4" "flash") finds it, not just the full exact string.
-    const terms = q.split(/\s+/).filter(Boolean)
-    const models = terms.length
-      ? all.filter((m) => {
-          const hay = `${p.name} ${modelLabelForOpts(p.id, m)}`.toLowerCase()
-          return terms.every((t) => hay.includes(t))
-        })
-      : all
-    const nameMatch = terms.length > 0 && p.name.toLowerCase().includes(q)
-    const visible = !terms.length || models.length > 0 || nameMatch
-    return { p, models, visible }
-  }).filter((x) => x.visible)
-
+  const main = useMainModel()
+  const target = toolModelTarget(model, providers, activeProviderId)
+  const targetProvider = target
+    ? providers.find((p) => p.id === target.providerId) ?? null
+    : null
+  // With no explicit model the slot runs the main model; the picker is given
+  // the RAW stored value so an inherited row reads "Main model" on its button
+  // (instead of pretending the main model was picked explicitly). `main` is
+  // still used for the reasoning check below.
+  const effProvider =
+    targetProvider ??
+    providers.find((p) => p.id === (target?.providerId ?? main.providerId)) ??
+    providers.find((p) => p.id === activeProviderId) ??
+    null
+  const effModel = target?.model ?? main.model ?? ''
+  // Only used to annotate the slider — the slider itself is ALWAYS rendered so
+  // a slot's reasoning level is never unreachable behind a detection result.
+  const reasoning = effProvider
+    ? modelReasoning(effProvider, effModel) ?? supportsReasoning(effModel, effProvider.kind)
+    : false
   return (
-    <div className="field">
-      <div className="field-head">
+    <div className="field tool-slot" data-agent={agent}>
+      <div className="field-head tool-slot-head">
         <label>{label}</label>
       </div>
       <div className="hint">{desc}</div>
-      {/* Combo box: the trigger IS the search input — no separate search field
-          appears only after opening. Closed, it shows the current pick as a
-          placeholder (button-like); focusing/clicking it opens the dropdown
-          and immediately accepts typing to filter. */}
-      <div className={`model-select combo${open ? ' open' : ''}`} ref={wrapRef}>
-        <div className="model-select-combo-box">
-          <input
-            ref={inputRef}
-            className="model-select-combo-input"
-            value={search}
-            placeholder={open ? 'Search models…' : (current ? currentLabel : noneLabel)}
-            dir="ltr"
-            onFocus={openMenu}
-            onClick={openMenu}
-            onChange={(e) => {
-              if (!open) setOpen(true)
-              setSearch(e.target.value)
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') { closeMenu(); inputRef.current?.blur() }
-            }}
-          />
-          <span
-            className="model-select-combo-chevron"
-            onMouseDown={(e) => {
-              // The chevron sits inside wrapRef, so the document outside-click
-              // handler ignores it — toggle explicitly so clicking it closes.
-              e.preventDefault()
-              if (open) closeMenu()
-              else openMenu()
-            }}
-          >
-            {open ? '▴' : '▾'}
-          </span>
+      <ProviderModelSelect
+        value={model}
+        onSelect={(v) => onSelectModel(agent, v)}
+        noneLabel="Main model"
+      />
+      {/* Reasoning effort as a Codex-style progress bar: the bar fills up to
+          the chosen level and is click/drag steppable — no popup menu. */}
+      <ThinkingBar
+        label={label}
+        level={level}
+        onSelect={(lv) => onSelectLevel(agent, lv)}
+      />
+      {!reasoning && (
+        <div className="hint thinking-bar-note">
+          This model does not advertise reasoning support; the level is still
+          sent to providers that accept it.
         </div>
-        {open && (
-          <div className="model-select-dropdown combo">
-            <div className="model-select-list">
-              <button
-                className={`model-select-item ${!current ? 'current' : ''}`}
-                onMouseDown={(e) => { e.preventDefault(); onSelect(agent, ''); closeMenu(); inputRef.current?.blur() }}
-                type="button"
-              >
-                {noneLabel}
-              </button>
-              {visibleProviders.map(({ p, models }) => {
-                const isOpen = q ? true : expanded.has(p.id)
-                return (
-                  <div key={p.id} className={`pm-provider${isOpen ? ' open' : ''}`}>
-                    <div className="pm-provider-row">
-                      <button
-                        type="button"
-                        className="pm-provider-name"
-                        onClick={() => toggle(p.id)}
-                      >
-                        <span className="pm-provider-caret">{isOpen ? '▾' : '▸'}</span>
-                        <span className="pm-provider-dot" aria-hidden />
-                        <span className="pm-provider-label">{p.name}</span>
-                        <span className="pm-provider-count">{modelsFor(p).length}</span>
-                      </button>
-                      <ProviderTestButton cfg={p} models={models} />
-                    </div>
-                    {isOpen && (
-                      <div className="pm-models">
-                        {models.map((m) => {
-                          // Highlight ONLY the row the stored value really
-                          // routes through: provider AND model must both match
-                          // (legacy bare ids highlight under the active
-                          // provider) — never same-named models sitting under
-                          // other providers.
-                          const isActive =
-                            target !== null && target.providerId === p.id && target.model === m
-                          return (
-                            <div key={m} className="pm-model-row">
-                              <button
-                                type="button"
-                                className={`mode-menu-item pm-model ${isActive ? 'active' : ''}`}
-                                onMouseDown={(e) => { e.preventDefault(); pick(p, m) }}
-                              >
-                                <span className="pm-model-provider">{p.name}/</span>
-                                <span className="pm-model-name">{m}</span>
-                              </button>
-                              <ModelTestButton cfg={p} model={m} />
-                            </div>
-                          )
-                        })}
-                        {models.length === 0 && (
-                          <div className="pm-hint">No models match “{search.trim()}”.</div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-              {visibleProviders.length === 0 && (
-                <div className="pm-empty">
-                  <span>No models match “{search.trim()}”.</span>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+      )}
+    </div>
+  )
+}
+
+/** Horizontal, slider-like reasoning-effort control. Levels are DISCRETE
+ *  (Default / None / Low / Medium / High / XHigh / Max) so the bar shows one
+ *  pip per level; the fill and the draggable thumb snap to the nearest pip.
+ *  Clicking a pip picks that level, dragging scrubs through them — the
+ *  Codex-style affordance the user asked for instead of a popup menu. */
+function ThinkingBar({
+  label,
+  level,
+  onSelect,
+}: {
+  label: string
+  level: ThinkingLevel
+  onSelect: (level: ThinkingLevel) => void
+}) {
+  // Legacy stored values (e.g. 'max') fold onto the canonical list, and the
+  // bar itself has NO default step: unset exactly equals None.
+  const steps = THINKING_OPTIONS
+  const canonLevel = canonThinkingLevel(level)
+  const idx = Math.max(
+    0,
+    steps.findIndex(([v]) => v === canonLevel),
+  )
+  const max = steps.length - 1
+  const pct = max > 0 ? (idx / max) * 100 : 0
+  const trackRef = useRef<HTMLDivElement>(null)
+  const [dragging, setDragging] = useState(false)
+
+  // Map a client X to the nearest discrete level and report it. Used for both
+  // click and drag so the whole track is a hit target (no tiny pip to hit).
+  const pickAt = (clientX: number) => {
+    const el = trackRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+    const nextIdx = Math.round(ratio * max)
+    const next = steps[nextIdx][0]
+    if (next !== level) onSelect(next)
+  }
+
+  useEffect(() => {
+    if (!dragging) return
+    function onMove(e: MouseEvent) {
+      pickAt(e.clientX)
+    }
+    function onUp() {
+      setDragging(false)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragging, level])
+
+  const stepIdx = (delta: number) => {
+    const next = Math.max(0, Math.min(max, idx + delta))
+    if (next !== idx) onSelect(steps[next][0])
+  }
+
+  return (
+    <div className="thinking-bar" data-level={level || 'default'}>
+      <div
+        className="thinking-bar-track"
+        ref={trackRef}
+        role="slider"
+        tabIndex={0}
+        aria-label={`Reasoning effort for ${label}`}
+        aria-valuemin={0}
+        aria-valuemax={max}
+        aria-valuenow={idx}
+        aria-valuetext={THINKING_LABELS[canonLevel] ?? 'None'}
+        onMouseDown={(e) => {
+          setDragging(true)
+          pickAt(e.clientX)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+            e.preventDefault()
+            stepIdx(1)
+          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+            e.preventDefault()
+            stepIdx(-1)
+          } else if (e.key === 'Home') {
+            e.preventDefault()
+            onSelect(steps[0][0])
+          } else if (e.key === 'End') {
+            e.preventDefault()
+            onSelect(steps[max][0])
+          }
+        }}
+      >
+        <div className="thinking-bar-fill" style={{ width: `${pct}%` }} />
+        <div className="thinking-bar-thumb" style={{ left: `${pct}%` }} />
+        <div className="thinking-bar-pips" aria-hidden="true">
+          {steps.map(([v], i) => (
+            <span
+              key={v || 'default'}
+              className={`thinking-bar-pip${i <= idx ? ' filled' : ''}`}
+              style={{ left: `${max > 0 ? (i / max) * 100 : 0}%` }}
+            />
+          ))}
+        </div>
       </div>
+      <span className="thinking-bar-label">
+        {THINKING_LABELS[canonLevel] ?? 'None'}
+      </span>
     </div>
   )
 }
@@ -348,6 +294,11 @@ const SEARCH_ENGINE_KINDS: Array<{ kind: SearchPluginKind; label: string; needsK
 function PluginEditor() {
   const searchPlugins = useStore((s) => s.searchPlugins)
   const setSearchPlugins = useStore((s) => s.setSearchPlugins)
+  // ONE number drives both halves of a search: how many results come back and
+  // how many of them get their page fetched. Lives here (not Storage) because
+  // it is the cost knob of the web engines listed below.
+  const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 5)
+  const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
 
   const plugins: SearchPluginConfig[] = searchPlugins.length > 0
     ? searchPlugins
@@ -473,6 +424,29 @@ function PluginEditor() {
           under Settings → Auth automatically, and DuckDuckGo needs no key.
         </div>
       </div>
+      <div className="field">
+        <div className="field-head">
+          <label>Results per search</label>
+        </div>
+        <div className="hint">
+          One number for every <b>web_search</b>: how many results it returns, and how many of
+          those top results get their <b>real page content</b> fetched (not just a snippet)
+          before the result distiller reads them. <code>0</code> still returns results but skips
+          the page fetch, so the model only sees snippets. Default: <code>5</code>.
+        </div>
+        <div className="settings-row-control" style={{ marginTop: 10 }}>
+          <input
+            type="number"
+            min={0}
+            max={10}
+            value={webSearchAutoFetch}
+            onChange={(e) => setWebSearchAutoFetch(Number(e.target.value))}
+            dir="ltr"
+            aria-label="Web search results and auto-fetch count"
+          />
+          <span className="field-unit">results</span>
+        </div>
+      </div>
     </>
   )
 }
@@ -551,14 +525,33 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setTtsFallbacks = useStore((s) => s.setTtsFallbacks)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
+  const subagentThinking = useStore((s) => s.subagentThinking)
+  const setSubagentThinking = useStore((s) => s.setSubagentThinking)
+  // The "Other" Tools row drives the small side-task slots together (context
+  // compaction summariser, web-search distiller, chat-title generator): they
+  // are all short, cheap calls where one model choice is what the user wants,
+  // so one row writes/reads all three at once. `web` is consumed in Rust by
+  // `run_web_distill` — it distils the fetched web_search results so the main
+  // agent's context stays lean (with no model set, the raw results are used).
+  const OTHER_SLOTS = ['compact', 'web', 'title'] as const
+  const otherModel =
+    OTHER_SLOTS.map((k) => subagentModels[k] || '').find((v) => v) ?? ''
+  const otherLevel =
+    OTHER_SLOTS.map((k) => subagentThinking[k] || '').find((v) => v) ?? 'none'
+  const setOtherModel = (_agent: string, model: string) => {
+    for (const k of OTHER_SLOTS) setSubagentModel(k, model)
+  }
+  const setOtherLevel = (_agent: string, level: ThinkingLevel) => {
+    for (const k of OTHER_SLOTS) setSubagentThinking(k, level)
+  }
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
   const compactAtPercent = useStore((s) => s.settings.compactAtPercent ?? 80)
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
-  const webSearchAutoFetch = useStore((s) => s.webSearchAutoFetch ?? 3)
-  const setWebSearchAutoFetch = useStore((s) => s.setWebSearchAutoFetch)
+  const disableTextSuggestions = useStore((s) => s.settings.disableTextSuggestions ?? true)
+  const setDisableTextSuggestions = useStore((s) => s.setDisableTextSuggestions)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
 
@@ -1182,7 +1175,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     {
       id: 'providers',
       label: 'Providers',
-      group: 'Connection',
+      group: 'Models',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="2" y="4" width="20" height="7" rx="2" /><rect x="2" y="14" width="20" height="7" rx="2" />
@@ -1193,7 +1186,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     {
       id: 'auth',
       label: 'Auth',
-      group: 'Connection',
+      group: 'Models',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="4" y="10" width="16" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /><circle cx="12" cy="15" r="1.2" />
@@ -1203,10 +1196,32 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     {
       id: 'plugins',
       label: 'Web Providers',
-      group: 'Agent',
+      group: 'Models',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M14 2v6h6M9 7a2 2 0 0 1 2-2h3l5 5v3a2 2 0 0 1-2 2h-1v9l-2 1V15h-3a2 2 0 0 1-2-2v-1H9a2 2 0 0 1-2-2v-1H7a2 2 0 0 1-2-2V7h4z" />
+        </svg>
+      ),
+    },
+    {
+      id: 'models',
+      label: 'Media Providers',
+      group: 'Models',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="7" y="7" width="10" height="10" rx="1.5" />
+          <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5 6.5 6.5M17.5 17.5l2 2M4.5 19.5l2-2M17.5 6.5l2-2" />
+        </svg>
+      ),
+    },
+    {
+      id: 'tools',
+      label: 'Tools',
+      group: 'Models',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="9" cy="8" r="3" /><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6" />
+          <circle cx="18" cy="7" r="2.2" /><path d="M15.2 13a5 5 0 0 1 5.8 4.9" />
         </svg>
       ),
     },
@@ -1219,17 +1234,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           <line x1="4" y1="6" x2="20" y2="6" /><circle cx="9" cy="6" r="2.4" fill="currentColor" stroke="none" />
           <line x1="4" y1="12" x2="20" y2="12" /><circle cx="15" cy="12" r="2.4" fill="currentColor" stroke="none" />
           <line x1="4" y1="18" x2="20" y2="18" /><circle cx="11" cy="18" r="2.4" fill="currentColor" stroke="none" />
-        </svg>
-      ),
-    },
-    {
-      id: 'tools',
-      label: 'Tools',
-      group: 'Agent',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <circle cx="9" cy="8" r="3" /><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6" />
-          <circle cx="18" cy="7" r="2.2" /><path d="M15.2 13a5 5 0 0 1 5.8 4.9" />
         </svg>
       ),
     },
@@ -1272,17 +1276,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 22a10 10 0 1 1 10-10c0 2-1.5 3-3 3h-2a3 3 0 0 0-3 3v1c0 1.5-1 2-2 2Z" />
-        </svg>
-      ),
-    },
-    {
-      id: 'models',
-      label: 'Media Providers',
-      group: 'App',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <rect x="7" y="7" width="10" height="10" rx="1.5" />
-          <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.5 4.5 6.5 6.5M17.5 17.5l2 2M4.5 19.5l2-2M17.5 6.5l2-2" />
         </svg>
       ),
     },
@@ -2208,29 +2201,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
               </div>
             </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <div className="settings-row-title">Auto-fetch top results</div>
-                <div className="settings-row-desc">
-                  How many of <b>web_search</b>'s top results get their real page content fetched
-                  (not just a snippet) before answering. <code>0</code> disables this and falls
-                  back to snippet-only results. Default: <code>3</code>.
-                </div>
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={0}
-                  max={10}
-                  value={webSearchAutoFetch}
-                  onChange={(e) => setWebSearchAutoFetch(Number(e.target.value))}
-                  dir="ltr"
-                  aria-label="Web search auto-fetch top N results"
-                />
-                <span className="field-unit">results</span>
-              </div>
-            </div>
           </div>
 
           {/* ===== Result cache ===== */}
@@ -2338,54 +2308,49 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <label>Tool Models</label>
             </div>
             <div className="hint">
-              Pick separate models for the built-in tools (web, vision,
-              compact, subagent, schedule, title). Leave a field empty to use the main model (the one chosen in the
-              composer), or type "main model" to pin a tool to the main model explicitly.
-              Tools only consume main-model tokens when you set them to the main model or
-              their own model is unavailable.
+              Give a tool its own model, or leave the row on the main model to
+              follow whatever the composer is using. The slider under each row
+              sets that tool's own reasoning effort — None sends no reasoning
+              parameter at all. The {`"Other"`} row drives the small side tasks
+              (context compaction summariser, web-search result distiller and
+              chat-title generator) together.
             </div>
 
-            <ToolModelSelect
-              agent="web"
-              label="Web tool"
-              desc="Model that distills web_search results and summarizes fetched pages. Falls back to the explore model."
-              current={subagentModels.web || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
-              agent="vision"
-              label="Vision model"
-              desc="Image analysis model (handles screenshots, diagrams and photos)."
-              current={subagentModels.vision || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
-              agent="compact"
-              label="Compact model"
-              desc="Conversation summariser — compacts chat history to stay under the context window."
-              current={subagentModels.compact || ''}
-              onSelect={setSubagentModel}
-            />
-            <ToolModelSelect
+            <ToolSlotRow
               agent="explore"
-              label="Explore model"
+              label="Explore"
               desc="Research sub-agent that does ALL file reading, searching and LSP lookups for the main agent and reports the full findings. Falls back to the main model."
-              current={subagentModels.explore || subagentModels.subagent || ''}
-              onSelect={setSubagentModel}
+              model={subagentModels.explore || ''}
+              level={subagentThinking.explore || 'low'}
+              onSelectModel={setSubagentModel}
+              onSelectLevel={setSubagentThinking}
             />
-            <ToolModelSelect
+            <ToolSlotRow
+              agent="vision"
+              label="Vision"
+              desc="Image analysis model (handles screenshots, diagrams and photos)."
+              model={subagentModels.vision || ''}
+              level={subagentThinking.vision || 'none'}
+              onSelectModel={setSubagentModel}
+              onSelectLevel={setSubagentThinking}
+            />
+            <ToolSlotRow
               agent="schedule"
-              label="Schedule model"
+              label="Schedule"
               desc="Model that runs scheduled tasks (cron inbox) in the background. Empty = the provider/model saved on each task, or the main model."
-              current={subagentModels.schedule || ''}
-              onSelect={setSubagentModel}
+              model={subagentModels.schedule || ''}
+              level={subagentThinking.schedule || 'none'}
+              onSelectModel={setSubagentModel}
+              onSelectLevel={setSubagentThinking}
             />
-            <ToolModelSelect
-              agent="title"
-              label="Title generator"
-              desc="Tiny model that names a new chat in the background from the first message. Falls back to the compact model."
-              current={subagentModels.title || ''}
-              onSelect={setSubagentModel}
+            <ToolSlotRow
+              agent="other"
+              label="Other"
+              desc="Small side tasks: the context-compaction summariser, the web-search result distiller and the chat-title generator. One model for all three."
+              model={otherModel}
+              level={otherLevel as ThinkingLevel}
+              onSelectModel={setOtherModel}
+              onSelectLevel={setOtherLevel}
             />
           </div>
         </>
@@ -2562,10 +2527,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="hint">
                 How many recent conversation turns are sent to the model in full each
                 turn. 0 = the entire chat history (default, unchanged behaviour). N &gt; 0
-                = only the last N turns verbatim, plus a compact summary of the earlier
-                turns. The summary is merged by auto-compaction (not re-expanded), so it
-                stays compatible with the context window. Lower = less token usage; higher
-                = more prior context kept. Applies on the next message.
+                = only the last N turns verbatim, plus the compacted summary of the
+                earlier turns (the one auto-compaction produced) — that summary is
+                always kept, never dropped. Applies on the next message.
               </div>
               <div className="font-size-row">
                 <span className="font-size-label">0</span>
@@ -2580,6 +2544,32 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <span className="font-size-label">200</span>
               </div>
               <div className="hint">Default: 0 (full history).</div>
+            </div>
+
+            <div className="field">
+              <div className="field-head">
+                <label>Keyboard suggestions</label>
+                <label
+                  className="plugin-switch"
+                  title={disableTextSuggestions ? 'Suggestions are off' : 'Suggestions are on'}
+                >
+                  <input
+                    type="checkbox"
+                    checked={disableTextSuggestions}
+                    onChange={(e) => setDisableTextSuggestions(e.target.checked)}
+                    aria-label="Suppress keyboard suggestions"
+                  />
+                  <span className="plugin-switch-track" />
+                </label>
+              </div>
+              <div className="hint">
+                Turns off the system's <b>autocomplete</b>, <b>autocorrect</b>,{' '}
+                <b>inline predictions</b> and <b>spell-check</b> marks in every text field —
+                the chat composer, search boxes, comment boxes and the terminal. The platform
+                defaults are wrong for a coding tool: they rewrite identifiers, file paths and
+                commands while you type. Applies immediately, no Save needed. Default: on
+                (suggestions off).
+              </div>
             </div>
         </>
         )}

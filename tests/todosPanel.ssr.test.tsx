@@ -297,15 +297,27 @@ console.log("۲۲) ساب‌ایجنت‌ها — کارت تسک بعد از re
   // NOTE: the background sub-agent PANEL was removed; its pure helpers
   // (subagentAge / subagentStatusLabel, previously exported from TodosPanel)
   // were deleted with it, so there is nothing left to unit-test there. The live
-  // sub-agent surface is the task/explore tool CARD in the transcript, checked
+  // sub-agent surface is the explore tool CARD in the transcript, checked
   // below via isSubagentCard.
-  // rename explore → subagent: کارت‌های تسک با هر دو نام باید کارت ساب‌ایجنت
-  // بمانند (کارتِ با نام جدید قبلاً به کارت عمومی می‌افتاد — باگ).
+  // The legacy `task` name is folded into `explore` at the two ingest points
+  // (normalizeToolName on the live stream, normalizeToolActivity on chat load),
+  // so by the time a card reaches the renderer the name is ALWAYS `explore`.
   const { isSubagentCard } = await import("../src/components/ToolCallView")
-  check("نوع جدید subagent کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "subagent" } } as any))
-  check("نوع legacy explore هم کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "explore" } } as any))
-  check("نوع legacy general هم کارت ساب‌ایجنت است", isSubagentCard({ tool: "task", args: { subagent_type: "general" } } as any))
-  check("ابزار غیر task کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "grep", args: { subagent_type: "subagent" } } as any))
+  const { normalizeToolName, normalizeToolActivity } = await import("../src/lib/toolActivity")
+  check("کارت explore کارت ساب‌ایجنت است", isSubagentCard({ tool: "explore", args: {} } as any))
+  check("ابزار غیر explore کارت ساب‌ایجنت نیست", !isSubagentCard({ tool: "grep", args: { subagent_type: "subagent" } } as any))
+  check("نام قدیمی task به explore تبدیل می‌شود", normalizeToolName("task") === "explore")
+  check("نام قدیمی subagent به explore تبدیل می‌شود", normalizeToolName("subagent") === "explore")
+  check("نام جدید دست‌نخورده می‌ماند", normalizeToolName("explore") === "explore")
+  check("abزار دیگر دست‌نخورده می‌ماند", normalizeToolName("grep") === "grep")
+  check("undefined به tool تبدیل می‌شود", normalizeToolName(undefined) === "tool")
+  const renamed = normalizeToolActivity([
+    { tool: "task", status: "done", children: [{ tool: "grep", status: "done" }] } as any,
+    { tool: "subagent", status: "done" } as any,
+  ])
+  check("مایگریشن کارت قدیمی task", renamed[0].tool === "explore")
+  check("مایگریشن کارت قدیمی subagent", renamed[1].tool === "explore")
+  check("مایگریشن فرزندان هم انجام می‌شود", renamed[0].children?.[0].tool === "grep")
 }
 
 console.log("۲۳) دکمهٔ نمایش پلن در هدر Todos:")

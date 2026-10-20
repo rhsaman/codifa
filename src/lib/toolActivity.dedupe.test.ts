@@ -6,7 +6,7 @@
 //        && node src/lib/.tmp-toolActivity-dedupe.mjs
 
 import type { SidecarEvent, ToolActivity } from "../types"
-import { applyToolEvent, resolveToolResult } from "./toolActivity"
+import { applyToolEvent, resolveToolResult, toolCallBody, pathOnlyItems } from "./toolActivity"
 
 export {}
 
@@ -250,6 +250,28 @@ console.log('۱۱) read بومی: فایل از args استخراج می‌شو�
   const out2 = resolveToolResult(out1, ev2)
   const items = (out2[0].items ?? []) as unknown as Array<Record<string, unknown>>
   check('فایل از args آمد', String(items[0]?.file) === "/w/src/App.tsx", items)
+  // The window itself used to be dropped (only the path chip survived), so the
+  // explore panel's read row expanded to its own filename and nothing else.
+  check('متن پنجرهٔ فایل در resultText نگه داشته شد', out2[0].resultText === "import React from 'react'\n...", out2[0].resultText)
+  check('آیتم‌های فقط-مسیر تشخیص داده می‌شوند', pathOnlyItems(items) === true, items)
+  const body = toolCallBody(out2[0])
+  check('بدنهٔ تماس، مسیر تکراری را چاپ نمی‌کند', body === "import React from 'react'\n...", body)
+}
+
+console.log('۱۱ب) بدنهٔ تماس یک ابزار با خروجی واقعی، هم مسیر و هم خروجی را دارد:')
+{
+  // grep keeps real rows (no resultText) — those must still be rendered.
+  const ev1: SidecarEvent = { kind: "tool", tool: "grep", args: { pattern: "x" }, id: "g1" } as any
+  const ev2: SidecarEvent = {
+    kind: "tool_result",
+    tool: "grep",
+    id: "g1",
+    results: [{ file: "/w/a.ts", line: 3, text: "x here" }],
+  } as any
+  const done = resolveToolResult(applyToolEvent([], ev1), ev2)
+  const body = toolCallBody(done[0])
+  check('خروجی grep در بدنه هست', body.includes("x here"), body)
+  check('grep متن نتیجه ندارد', done[0].resultText === undefined, done[0].resultText)
 }
 
 console.log('۱۲) run_terminal/explore: result متنی به فایل تبدیل نمی‌شود:')

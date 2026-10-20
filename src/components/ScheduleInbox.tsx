@@ -13,7 +13,7 @@ import { playAlarm } from "../lib/alarm";
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
-import { useViewerTabs } from "../lib/viewerTabs";
+import { shownViewerTabId, useViewerTabs } from "../lib/viewerTabs";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -789,18 +789,24 @@ export function ScheduleInboxButton() {
   }, []);
 
   const unseen = unseenRunCount(runs, seen);
-  const hasTab = useViewerTabs((s) => s.tabs.some((t) => t.kind === 'inbox'));
+  // Same toggle contract as the rail's inbox icon: pressed means the pane is
+  // SHOWING the inbox, so an inbox that is open behind another tab re-focuses
+  // on the first press instead of being closed by it.
+  const tabs = useViewerTabs((s) => s.tabs);
+  const activeId = useViewerTabs((s) => s.activeId);
+  const panelMode = useViewerTabs((s) => s.panelMode);
+  const activeChatId = useStore((s) => s.activeChatId);
+  const shown = shownViewerTabId(tabs, activeId, panelMode, activeChatId) === 'inbox';
   return (
     <button
       className="titlebar-icon-btn schedule-inbox-btn"
       title={unseen > 0 ? `${unseen} new schedule runs` : "Schedule inbox"}
       aria-label="Schedule inbox"
-      aria-pressed={hasTab}
+      aria-pressed={shown}
       onClick={() => {
         const vt = useViewerTabs.getState();
-        const existing = vt.tabs.find((t) => t.kind === 'inbox');
-        if (existing) {
-          vt.closeViewer(existing.id);
+        if (shown) {
+          vt.closeViewer('inbox');
           useStore.getState().setScheduleInboxOpen(false);
         } else {
           vt.openInbox();

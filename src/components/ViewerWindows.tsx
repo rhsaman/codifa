@@ -1,19 +1,39 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
 import { useViewerTabs, viewerTabTitle } from "../lib/viewerTabs";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { buildFromList, collectChatIds, findNodeById, leafCount } from "../lib/chatTree";
-import { ReviewPanel } from "./ReviewPanel";
-import { TracePanel } from "./TracePanel";
-import { ScheduleInboxDocked } from "./ScheduleInbox";
-import { PlanPanel } from "./PlanPanel";
-import { BrowserPanel } from "./BrowserPanel";
-import { FileViewerPanel } from "./FileViewerPanel";
-import { TextViewerPanel } from "./TextViewerPanel";
-import { ScheduleSection } from "./SchedulePanel";
-import { TodosSection } from "./TodosPanel";
+import { SchedulePage, TodosPage } from "./ViewerPages";
 import { ViewerContent } from "./ViewerContent";
+
+// Every viewer panel is dispatched by tab kind, so at most ONE of them is ever
+// on screen — yet all of them used to sit in the startup chunk with the viewer
+// shell, because the imports were static. Several pull real weight (highlight.js
+// in the file/text viewers, the diff renderer in ReviewPanel, the file tree in
+// FilesPanel), so each one is split into its own chunk and fetched when its tab
+// is first shown. Repeated opens reuse the loaded chunk via the module cache.
+const ReviewPanel = lazy(() =>
+  import("./ReviewPanel").then((m) => ({ default: m.ReviewPanel })),
+);
+const TracePanel = lazy(() => import("./TracePanel").then((m) => ({ default: m.TracePanel })));
+const ScheduleInboxDocked = lazy(() =>
+  import("./ScheduleInbox").then((m) => ({ default: m.ScheduleInboxDocked })),
+);
+const PlanPanel = lazy(() => import("./PlanPanel").then((m) => ({ default: m.PlanPanel })));
+const BrowserPanel = lazy(() =>
+  import("./BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+);
+const FileViewerPanel = lazy(() =>
+  import("./FileViewerPanel").then((m) => ({ default: m.FileViewerPanel })),
+);
+const TextViewerPanel = lazy(() =>
+  import("./TextViewerPanel").then((m) => ({ default: m.TextViewerPanel })),
+);
+const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
+const ExplorePanel = lazy(() =>
+  import("./ExplorePanel").then((m) => ({ default: m.ExplorePanel })),
+);
 
 /** MIME type for dragging a viewer tab id onto panes to split. */
 export const VIEWER_DRAG_MIME = "application/x-coder-viewer-id";
@@ -132,6 +152,26 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
         initialUrl={tab.browserUrl ?? ""}
       />
     );
+  }
+  if (tab.kind === "files") {
+    return <FilesPanel key={tab.id} chatId={tab.chatId} />;
+  }
+  // Explore was missing from this dispatcher: a split pane holding an explore
+  // tab used to fall through to the schedule inbox. Same panel, this leaf's tab.
+  if (tab.kind === "explore") {
+    return (
+      <ExplorePanel
+        key={tab.id}
+        chatId={tab.chatId ?? ""}
+        messageId={tab.exploreMessageId ?? ""}
+        index={tab.exploreIndex ?? 0}
+      />
+    );
+  }
+  // The schedule page in a split pane. Must sit before the fallback below,
+  // which is the catch-all inbox return of this dispatcher.
+  if (tab.kind === "schedule") {
+    return <SchedulePage key={tab.id} />;
   }
   return (
     <ScheduleInboxDocked
@@ -283,7 +323,9 @@ function ViewerLeafView({
         <ViewerWindowHeader tabId={tabId} focused={focused} multi={multi} onDragState={drag.setDragId} />
       )}
       <div className="viewer-window-body" onClick={() => useViewerTabs.getState().focusViewerWindow(tabId)}>
-        <ViewerLeafBody tabId={tabId} />
+        <Suspense fallback={null}>
+          <ViewerLeafBody tabId={tabId} />
+        </Suspense>
       </div>
       {dropPos && (
         <div className={`viewer-drop-preview preview-${dropPos}`} aria-hidden="true">
@@ -440,25 +482,7 @@ export function ViewerWindows() {
   );
 
   if (panelMode) {
-    return (
-      <div
-        className="panel-pane"
-        style={{
-          flex: "1 1 0",
-          display: "block",
-          boxSizing: "border-box",
-          height: "100%",
-          maxHeight: "100%",
-          minHeight: 0,
-          minWidth: 0,
-          overflowY: "auto",
-          overscrollBehavior: "contain",
-        }}
-      >
-        <ScheduleSection />
-        <TodosSection />
-      </div>
-    );
+    return <TodosPage />;
   }
 
   const leaves = tree ? leafCount(tree) : 0;

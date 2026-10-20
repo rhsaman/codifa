@@ -13,6 +13,7 @@ import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { gitDiff, gitLog, gitShow, gitStatus, type GitCommitInfo } from "../lib/api";
 import { DiffView } from "./ToolCallView";
 import { FileIcon } from "./FileIcon";
+import { splitWorkspaceFiles, toWorkspacePath } from "../lib/fileTree";
 
 /** فایل تغییرکرده با دیف و آمار — برای لیست پنل. */
 export interface ReviewFileItem {
@@ -122,7 +123,9 @@ export function ReviewFileAccordion({
               <span className="review-file-ext">
                 <FileIcon path={f.path} size={20} />
               </span>
-              <span className="review-file-path">{f.path}</span>
+              <span className="review-file-path" title={f.path}>
+                {toWorkspacePath(root, f.path)}
+              </span>
               <span className="review-file-counts">
                 <span className="review-count-add">+{f.adds}</span>
                 <span className="review-count-del">-{f.dels}</span>
@@ -386,7 +389,13 @@ export function ReviewPanel(props?: {
       })) ?? [],
     [turn],
   );
-  const files = source === "turn" ? turnFiles : gitFiles;
+  // فایل‌های بیرونِ ورک‌اسپیس (مثلاً مسیر مطلق داخل پوشهٔ موقت سیستم) در لیست
+  // نمی‌آیند: پنل Review «تغییرات این پروژه» را نشان می‌دهد و اجازهٔ نوشتن در
+  // پوشهٔ موقت برای ابزار هست، ولی آن فایل‌ها بخشی از پروژه نیستند.
+  const { inside: files, outside: outsideFiles } = useMemo(
+    () => splitWorkspaceFiles(source === "turn" ? turnFiles : gitFiles, root),
+    [source, turnFiles, gitFiles, root],
+  );
   const visibleFiles = filterFilesByQuery(files, query);
   // تعداد رخدادهای قابل‌ناوبری هر فایل (فقط داخل دیف — مثل هایلایت `DiffView`).
   const hitCounts = useMemo(
@@ -614,7 +623,11 @@ export function ReviewPanel(props?: {
         !turn ? (
           <div className="review-empty">No changes in this turn.</div>
         ) : visibleFiles.length === 0 ? (
-          <div className="review-empty">No files match “{query.trim()}”.</div>
+          <div className="review-empty">
+            {query.trim()
+              ? `No files match “${query.trim()}”.`
+              : "No files from this turn are inside the workspace."}
+          </div>
         ) : (
           renderFileList(visibleFiles)
         )
@@ -632,6 +645,17 @@ export function ReviewPanel(props?: {
         <div className="review-empty">No files match “{query.trim()}”.</div>
       ) : (
         renderFileList(visibleFiles)
+      )}
+      {outsideFiles.length > 0 && (
+        <div className="review-note" dir="auto">
+          {outsideFiles.length} file{outsideFiles.length === 1 ? "" : "s"} outside
+          this workspace {outsideFiles.length === 1 ? "is" : "are"} hidden —{" "}
+          {outsideFiles
+            .slice(0, 3)
+            .map((f) => toWorkspacePath(root, f.path))
+            .join(", ")}
+          {outsideFiles.length > 3 ? " …" : ""}
+        </div>
       )}
       </aside>
     </div>

@@ -3,6 +3,7 @@ import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
 import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "../lib/tabBar";
+import { previewSlot } from "../lib/tabOrder";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
@@ -232,6 +233,32 @@ export function ChatTabBar() {
     setDropTarget(null);
   };
 
+  // The bar previews the landing slot instead of drawing an insertion line: the
+  // DOM never moves (a mid-drag re-render of the dragged node cancels the native
+  // drag in Chromium), only its CSS `order` does, and the dragged tab is drawn as
+  // a ghost outline so it reads as "this is where you drop".
+  const dragPreview = (() => {
+    if (!dragId || !dropTarget) return null;
+    const slot = previewSlot(openChatIds, dragId, dropTarget.id, dropTarget.after);
+    // The visible last tab follows the PREVIEW, not the DOM: with inline `order`
+    // the last DOM node may no longer be the last one on screen.
+    let tailId: string | null = null;
+    let tailMax = -1;
+    slot.forEach((index, id) => {
+      if (index > tailMax) {
+        tailMax = index;
+        tailId = id;
+      }
+    });
+    return { slot, tailId };
+  })();
+  // With an inline `order` the DOM's last tab is no longer the visible last one,
+  // so the "drop past the end" target has to come from the previewed order.
+  const tailId = dragPreview?.tailId ?? openChatIds[openChatIds.length - 1] ?? null;
+  // The "+" and fullscreen buttons trail the tabs in the DOM, so while a drag is
+  // active they must claim the slot right after the last tab (the previewed one).
+  const tailOrder = dragId ? openChatIds.length : undefined;
+
   if (openChatIds.length === 0) return null;
 
   return (
@@ -249,18 +276,29 @@ export function ChatTabBar() {
         if (!bar) return;
         const delta = edgeScroll(e.clientX, bar.getBoundingClientRect());
         if (delta) bar.scrollLeft += delta;
+        // Empty space past the visible last tab previews a landing at the very end.
+        if (!tailId || tailId === dragId) return;
+        const tailEl = bar.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`);
+        if (!tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
+        setDropTarget((prev) =>
+          prev?.id === tailId && prev.after ? prev : { id: tailId, after: true },
+        );
+      }}
+      onDragLeave={(e) => {
+        if (e.target !== e.currentTarget) return;
+        setDropTarget(null);
       }}
       onDrop={(e) => {
         // Tabs handle their own drop; empty space past the last tab drops at the end.
         if (e.target !== e.currentTarget || !dragId) return;
-        const els = barRef.current?.querySelectorAll<HTMLElement>('[role="tab"]');
-        const lastEl = els && els.length > 0 ? els[els.length - 1] : null;
-        const lastId = openChatIds[openChatIds.length - 1];
-        if (!lastEl || !lastId || e.clientX <= lastEl.getBoundingClientRect().right) return;
+        const tailEl = tailId
+          ? barRef.current?.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`)
+          : null;
+        if (!tailId || !tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
         const from = e.dataTransfer.getData("text/plain") || dragId;
-        if (!from || from === lastId) return;
+        if (!from || from === tailId) return;
         e.preventDefault();
-        useStore.getState().moveChatTab(from, lastId, true);
+        useStore.getState().moveChatTab(from, tailId, true);
         clearDrag();
       }}
     >
@@ -269,16 +307,17 @@ export function ChatTabBar() {
         const rawTitle = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
         const title = prepareContent(rawTitle, dir);
         const active = id === activeChatId;
-        const dropCls =
-          dropTarget?.id === id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
+        const order = dragPreview?.slot.get(id);
         return (
           <div
             key={id}
+            data-tab-id={id}
             role="tab"
             aria-selected={active}
             tabIndex={0}
             draggable={editingId !== id}
-            className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging" : ""}${dropCls}`}
+            className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging drop-preview" : ""}`}
+            style={order === undefined ? undefined : { order }}
             title={title}
             onClick={() => useStore.getState().openChat(id)}
             onKeyDown={(e) => {
@@ -391,6 +430,7 @@ export function ChatTabBar() {
         className="editor-tab-new"
         title="New chat"
         aria-label="New chat"
+        style={tailOrder === undefined ? undefined : { order: tailOrder }}
         onClick={() => useStore.getState().newChat()}
       >
         +
@@ -401,6 +441,7 @@ export function ChatTabBar() {
         title={chatFull ? "Exit fullscreen" : "Fullscreen chat"}
         aria-label={chatFull ? "Exit chat fullscreen" : "Fullscreen chat"}
         aria-pressed={chatFull}
+        style={tailOrder === undefined ? undefined : { order: tailOrder + 1 }}
         onClick={() => {
           const st = useStore.getState();
           const next = !st.chatFullscreen;

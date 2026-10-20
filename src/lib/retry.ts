@@ -228,3 +228,52 @@ export class AutoRetryScheduler {
 export function shouldIgnoreLateRetryEvent(stopped: boolean): boolean {
   return stopped
 }
+
+/**
+ * Whether a LIVE sub-agent retry banner is retired by the stream event that
+ * just arrived.
+ *
+ * A sub-agent retries INSIDE the parent turn, so the parent keeps streaming its
+ * own tool events the whole time explore works — which is why those events must
+ * NOT wipe the banner (`clearTransientRetry` in Chat.tsx skips `retry.agent`).
+ * The one event that proves the retry really is over is the OWNING tool's own
+ * RESULT: the parent only ever receives one per call, and it is emitted exactly
+ * once — after the ladder finally produced a report, or gave up for good.
+ *
+ * Without this the banner never retired on SUCCESS. The ladder emits no event
+ * when an attempt works (it just returns the report), so a recovered sub-agent
+ * left "Provider rate limit (2/10) — retrying…" frozen on screen for the rest
+ * of the turn while the answer streamed underneath it.
+ *
+ * Terminal banners (gaveUp / watchdog / model fallback) deliberately survive:
+ * they carry the Retry button and the "which model to fix" hint.
+ *
+ * Matching on the tool NAME rather than a call id is deliberate: a fan-out
+ * wraps the call in a `branch`, and a batch can retry several explore calls
+ * whose results arrive in any order — every one of them means "that sub-agent
+ * is done retrying".
+ */
+export function retryRetiredByEvent(
+  retry:
+    | {
+        agent?: string
+        tool?: string
+        gaveUp?: boolean
+        watchdog?: boolean
+        fallback?: boolean
+      }
+    | null
+    | undefined,
+  event: { kind?: string; tool?: string; sub?: boolean },
+): boolean {
+  if (!retry || !retry.agent) return false
+  if (retry.gaveUp === true || retry.watchdog === true) return false
+  if (retry.fallback === true) return false
+  if (event.kind !== 'tool_result') return false
+  // Nested events belong to the sub-agent's OWN tools (read/grep/glob), not to
+  // the call being retried — only the parent-level result retires the banner.
+  if (event.sub === true) return false
+  const owner = (retry.tool ?? '').trim()
+  if (!owner) return false
+  return (event.tool ?? '').trim() === owner
+}

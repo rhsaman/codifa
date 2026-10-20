@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { gitBranches, gitCheckout, gitDiff, gitStatus } from "../lib/api";
 import { buildUncommittedFiles, sumDiffStats } from "../lib/uncommitted";
+import { splitWorkspaceFiles } from "../lib/fileTree";
 import { useViewerTabs } from "../lib/viewerTabs";
 
 /** Uncommitted-changes bar above the composer input, Codex style: "N files changed +A -D".
@@ -58,8 +59,11 @@ export function ComposerDiffBar({
           unstagedDiff,
           stagedDiff,
         );
-        const totals = sumDiffStats(list);
-        setFiles(list.length);
+        // فقط فایل‌های داخل ورک‌اسپیس شمرده می‌شوند — همان فیلتری که پنل Review
+        // روی لیست می‌زند، وگرنه نشانِ «تعداد فایل تغییرکرده» با لیست یکی نمی‌شد.
+        const inWorkspace = splitWorkspaceFiles(list, root).inside;
+        const totals = sumDiffStats(inWorkspace);
+        setFiles(inWorkspace.length);
         setAdds(totals.adds);
         setDels(totals.dels);
       } catch {

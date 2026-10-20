@@ -4,9 +4,11 @@
 //! process exposed, so the renderer's tauriBridge shim can keep the exact
 //! same surface.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use serde::Serialize;
@@ -152,6 +154,109 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(abs["content"].as_str(), Some("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn image_data_url_is_cached_and_re_reads_a_changed_file() {
+        let root = temp_root("imgcache");
+        let src = root.join("a.png");
+        std::fs::write(&src, b"\x89PNG-one").unwrap();
+        let path = src.to_string_lossy().into_owned();
+        let first = image_data_url(&path).unwrap();
+        // The agent re-reads the images of every turn's history; the second read
+        // must not touch the disk again at all.
+        assert_eq!(first, image_data_url(&path).unwrap(), "repeat read must hit the cache");
+        // A changed file must never be served the stale entry. A different LENGTH
+        // guarantees a different (mtime, len) key regardless of clock granularity.
+        std::fs::write(&src, b"\x89PNG-two-longer").unwrap();
+        let third = image_data_url(&path).unwrap();
+        assert_ne!(first, third, "a changed file must be re-read");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn normalize_image_passes_a_small_png_through_untouched() {
+        let root = temp_root("passthrough");
+        let src = root.join("small.png");
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([10u8, 20, 30]));
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+        let original = std::fs::read(&src).unwrap();
+        let out = normalize_image(src.to_string_lossy().into_owned()).unwrap();
+        // Nothing to encode: a readable format inside the size cap is copied
+        // byte-for-byte, so re-encoding it only burned CPU for no gain.
+        let path = out["path"].as_str().unwrap();
+        assert_ne!(
+            path,
+            src.to_string_lossy(),
+            "the image must be copied so the history keeps a stable path"
+        );
+        assert!(
+            path.ends_with(".png"),
+            "the copy must keep the original format: {path}"
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            original,
+            "an already-valid small image must not be re-encoded"
+        );
+        let url = out["dataUrl"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(url.split_once(',').unwrap().1)
+            .unwrap();
+        assert_eq!(bytes, original, "the model must receive the ORIGINAL bytes");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn normalize_image_shrinks_to_the_cap_losslessly_and_never_grows() {
+        let root = temp_root("shrink");
+        let src = root.join("big.png");
+        // A solid colour is the clearest losslessness probe: a LOSSY encoder
+        // (JPEG-style) shifts the value, a lossless one returns it exactly.
+        let color = image::Rgb([200u8, 60, 30]);
+        let img = image::RgbImage::from_pixel(4096, 64, color);
+        image::DynamicImage::ImageRgb8(img)
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+
+        let out = normalize_image(src.to_string_lossy().into_owned()).unwrap();
+        let url = out["dataUrl"].as_str().unwrap();
+        assert!(
+            url.starts_with("data:image/webp;base64,") || url.starts_with("data:image/png;base64,"),
+            "unexpected mime in {url}"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(url.split_once(',').unwrap().1)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(decoded.width(), 2048, "must shrink to the largest edge cap");
+        assert_eq!(decoded.height(), 32, "the aspect ratio must be preserved");
+        assert_eq!(
+            decoded.to_rgb8().get_pixel(5, 5),
+            &color,
+            "the encode must be LOSSLESS: the model must see the same pixels"
+        );
+
+        // Independently encoded PNG of the same resized image: the chosen bytes
+        // may never exceed it, so making screenshots smaller can never make any
+        // request bigger.
+        let resized = image::open(&src)
+            .unwrap()
+            .resize(2048, 32, image::imageops::FilterType::Lanczos3);
+        let mut png: Vec<u8> = Vec::new();
+        resized
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            bytes.len() <= png.len(),
+            "the encode must not grow the payload: {} > {}",
+            bytes.len(),
+            png.len()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
@@ -334,8 +439,63 @@ pub fn fs_delete(root: String, rel: String) -> bool {
     }
 }
 
-// --- data-root file access (skills / mcp / plans) ---------------------------
+/// Copy a workspace file or folder to a new path. Used by the explorer's
+/// right-click "Copy" (it pastes with a fresh name in the SAME folder), so a
+/// folder copy must be recursive. Never overwrites: an existing destination is
+/// an error instead of a silent data loss.
+#[tauri::command]
+pub fn fs_copy(root: String, from: String, to: String) -> Result<bool, String> {
+    let src = resolve_safe(Path::new(&root), &from)?;
+    let dst = resolve_safe(Path::new(&root), &to)?;
+    if !src.exists() {
+        return Err("path does not exist".into());
+    }
+    let Ok(root_real) = Path::new(&root).canonicalize() else {
+        return Err("root missing".into());
+    };
+    if dst == root_real || src == dst {
+        return Err("invalid destination".into());
+    }
+    if dst.exists() {
+        return Err("destination already exists".into());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if src.is_dir() {
+        crate::state::copy_tree(&src, &dst).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+    }
+    Ok(true)
+}
 
+/// Rename (or move within the workspace) a file or folder: both paths resolve
+/// through `resolve_safe`, so neither can leave the workspace root.
+#[tauri::command]
+pub fn fs_rename(root: String, from: String, to: String) -> Result<bool, String> {
+    let src = resolve_safe(Path::new(&root), &from)?;
+    let dst = resolve_safe(Path::new(&root), &to)?;
+    if !src.exists() {
+        return Err("path does not exist".into());
+    }
+    let Ok(root_real) = Path::new(&root).canonicalize() else {
+        return Err("root missing".into());
+    };
+    if src == root_real || dst == root_real || src == dst {
+        return Err("invalid destination".into());
+    }
+    if dst.exists() {
+        return Err("destination already exists".into());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+// --- data-root file access (skills / mcp / plans) ---------------------------
 #[tauri::command]
 pub fn coder_list(app: AppHandle, rel: String) -> Vec<FileEntry> {
     let Ok(target) = resolve_coder_safe(&app, &rel) else {
@@ -577,6 +737,23 @@ fn image_mime(ext: &str) -> Option<&'static str> {
     })
 }
 
+/// Cache of encoded image data URLs, keyed by absolute path.
+///
+/// A turn re-reads every image that is still in its history (the renderer sends
+/// bare paths), so the same screenshot file was opened, base64-encoded and
+/// shipped again on EVERY step — the vision pass and the main model both pay
+/// that cost. The entry is validated against `(mtime, len)` so an edited file is
+/// re-read, and the map is bounded so a long-running app cannot grow forever.
+fn image_cache() -> &'static Mutex<HashMap<String, (u64, u64, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (u64, u64, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many encoded data URLs to keep. Each entry is one base64 image, so the
+/// cap is deliberately small: it only has to cover the images of the chat being
+/// worked on.
+const IMAGE_CACHE_MAX: usize = 24;
+
 #[tauri::command]
 pub fn read_image(abs_path: String) -> Option<String> {
     image_data_url(&abs_path)
@@ -587,18 +764,47 @@ pub fn read_image(abs_path: String) -> Option<String> {
 /// Shared by the `read_image` Tauri command and the agent's image deserializer
 /// (which turns a bare path from the renderer into bytes for the model). Mime
 /// comes from the extension; unknown extensions and oversized files fail.
+/// Results are cached by `(mtime, len)` — see `image_cache`.
 pub fn image_data_url(abs_path: &str) -> Option<String> {
     let p = PathBuf::from(abs_path);
     let ext = p.extension()?.to_string_lossy().to_lowercase();
     let mime = image_mime(&ext)?;
+    let meta = std::fs::metadata(&p).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let len = meta.len();
+    if let Some(hit) = image_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(abs_path).cloned())
+    {
+        if hit.0 == mtime && hit.1 == len {
+            return Some(hit.2);
+        }
+    }
     let data = std::fs::read(&p).ok()?;
     if data.len() > 8 * 1024 * 1024 {
         return None;
     }
-    Some(format!(
+    let url = format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(data)
-    ))
+    );
+    if let Ok(mut c) = image_cache().lock() {
+        if c.len() >= IMAGE_CACHE_MAX {
+            // Drop an arbitrary older entry: any eviction is fine, the cache is
+            // purely a round-trip saver and a miss simply re-reads the file.
+            if let Some(k) = c.keys().next().cloned() {
+                c.remove(&k);
+            }
+        }
+        c.insert(abs_path.to_string(), (mtime, len, url.clone()));
+    }
+    Some(url)
 }
 
 /// Raw base64 of a PDF file, for the viewer's native PDF pane.
@@ -624,14 +830,130 @@ pub fn read_pdf_base64(abs_path: String) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(data))
 }
 
-/// Normalize any attached image to a temp PNG (like screenshots), so formats
-/// such as HEIC or oversized files reach the model regardless of source.
+/// Largest edge an attached image is reduced to before it reaches a model.
+/// Covers more than any vision model actually consumes, so this is not the
+/// quality knob — the ENCODER is (see `encode_smallest_lossless`).
+const IMAGE_MAX_DIM: u32 = 2048;
+
+/// Monotonic counter for temp image names (see `temp_image_path`).
+static TEMP_IMAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh path in the temp dir for an image the model will be pointed at.
+///
+/// The counter guarantees uniqueness even for two images attached inside the
+/// same millisecond (the previous name was `now_ms` + pid only, so a batched
+/// multi-image attach could overwrite one file with another).
+fn temp_image_path(ext: &str) -> PathBuf {
+    let n = TEMP_IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "coder-img-{}-{:x}-{n}.{ext}",
+        state::now_ms(),
+        std::process::id()
+    ))
+}
+
+/// Lossless WebP and PNG of the same pixels, whichever is smaller.
+///
+/// Screenshots are what people attach, and PNG puts such a flat, text-heavy
+/// image on the wire at several megabytes of base64 — which the agent then
+/// re-uploads with every step and every history turn. Lossless WebP (VP8L) is
+/// byte-for-byte the same picture and usually 2-5x smaller, so the model sees
+/// identical pixels for a fraction of the request size and upload time.
+///
+/// PNG is kept as the answer whenever it wins (already-small images, some
+/// photographic inputs), so this can never make a request BIGGER.
+fn encode_smallest_lossless(img: &image::DynamicImage) -> (Vec<u8>, &'static str) {
+    let mut png: Vec<u8> = Vec::new();
+    if image::DynamicImage::write_to(
+        img,
+        &mut std::io::Cursor::new(&mut png),
+        image::ImageFormat::Png,
+    )
+    .is_err()
+    {
+        return (png, "image/png");
+    }
+    // The lossless encoder only takes Rgb8 / Rgba8; anything else (16-bit,
+    // greyscale, palette) simply keeps the PNG we already produced.
+    let (buf, width, height, color) = match img {
+        image::DynamicImage::ImageRgba8(b) => {
+            (b.as_raw().clone(), b.width(), b.height(), image::ExtendedColorType::Rgba8)
+        }
+        image::DynamicImage::ImageRgb8(b) => {
+            (b.as_raw().clone(), b.width(), b.height(), image::ExtendedColorType::Rgb8)
+        }
+        _ => {
+            let rgba = img.to_rgba8();
+            (
+                rgba.as_raw().clone(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+        }
+    };
+    let mut webp: Vec<u8> = Vec::new();
+    let encoded = image::codecs::webp::WebPEncoder::new_lossless(std::io::Cursor::new(&mut webp))
+        .encode(&buf, width, height, color)
+        .is_ok();
+    if encoded && !webp.is_empty() && webp.len() < png.len() {
+        (webp, "image/webp")
+    } else {
+        (png, "image/png")
+    }
+}
+
+/// Normalize any attached image to a temp file the model can always read (like
+/// screenshots), so formats such as HEIC or oversized files reach the model
+/// regardless of source, and shrink what does reach it.
+///
+/// An image that is ALREADY a model-readable format within `IMAGE_MAX_DIM` is
+/// passed through byte-for-byte: re-encoding it only burned CPU and changed
+/// nothing the model would see.
 #[tauri::command]
 pub fn normalize_image(abs_path: String) -> Option<serde_json::Value> {
+    let original = std::fs::read(&abs_path).ok()?;
+    let ext = PathBuf::from(&abs_path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    // Formats every supported vision endpoint accepts, plus what the agent's
+    // own deserializer can turn into a mime type.
+    let passthrough = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif"
+    ) && original.len() <= 8 * 1024 * 1024;
+    let dims = if passthrough {
+        image::ImageReader::new(std::io::Cursor::new(&original))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+    } else {
+        None
+    };
+    if let (true, Some((w, h))) = (passthrough, dims) {
+        if w <= IMAGE_MAX_DIM && h <= IMAGE_MAX_DIM {
+            let mime = image_mime(&ext)?;
+            // Copy instead of decode + re-encode: the model receives the
+            // ORIGINAL bytes, so nothing can be lost, for the price of one file
+            // write. The copy also keeps `path` stable when the user later moves
+            // or deletes the original — the agent re-reads this path from the
+            // history on every following turn.
+            let tmp = temp_image_path(&ext);
+            std::fs::write(&tmp, &original).ok()?;
+            return Some(serde_json::json!({
+                "path": tmp.to_string_lossy(),
+                "dataUrl": format!(
+                    "data:{mime};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&original)
+                ),
+            }));
+        }
+    }
+
     let img = image::open(&abs_path).ok()?;
-    let max_dim = 2048u32;
-    let img = if img.width() > max_dim || img.height() > max_dim {
-        let scale = max_dim as f32 / img.width().max(img.height()) as f32;
+    let img = if img.width() > IMAGE_MAX_DIM || img.height() > IMAGE_MAX_DIM {
+        let scale = IMAGE_MAX_DIM as f32 / img.width().max(img.height()) as f32;
         img.resize(
             (img.width() as f32 * scale) as u32,
             (img.height() as f32 * scale) as u32,
@@ -640,18 +962,16 @@ pub fn normalize_image(abs_path: String) -> Option<serde_json::Value> {
     } else {
         img
     };
-    let mut png: Vec<u8> = Vec::new();
-    image::DynamicImage::write_to(&img, &mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .ok()?;
-    let tmp = std::env::temp_dir().join(format!(
-        "coder-img-{}-{:x}.png",
-        state::now_ms(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, &png).ok()?;
+    let (bytes, mime) = encode_smallest_lossless(&img);
+    let literal_ext = if mime == "image/webp" { "webp" } else { "png" };
+    let tmp = temp_image_path(literal_ext);
+    std::fs::write(&tmp, &bytes).ok()?;
     Some(serde_json::json!({
         "path": tmp.to_string_lossy(),
-        "dataUrl": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)),
+        "dataUrl": format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ),
     }))
 }
 

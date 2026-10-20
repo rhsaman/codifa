@@ -16,6 +16,7 @@ const TABS: Array<[TraceTab, string]> = [
   ["llm", "LLM"],
   ["prompt", "Prompts"],
   ["tool", "Tools"],
+  ["fold", "Folds"],
 ];
 
 /** Only top-level tool calls count as tools so the Tools tab matches chat cards. Chat shows one card per tool invocation, while the trace stream holds a separate tool_result entry per call, so tool_result must not be counted or listed in the Tools tab. Sub-agent calls (detail.sub) are nested under the parent card in chat, so they are excluded as well. */
@@ -29,7 +30,7 @@ export function isSubToolTrace(entry: TraceEntry): boolean {
 
 /** Pure tab counts for tests: All counts every entry, Tools counts only top-level tool calls (sub-agent trace views include their own sub tools). */
 export function getTraceTabCounts(entries: TraceEntry[], includeSub = false): Record<string, number> {
-  const c: Record<string, number> = { all: entries.length, llm: 0, prompt: 0, tool: 0 };
+  const c: Record<string, number> = { all: entries.length, llm: 0, prompt: 0, tool: 0, fold: 0 };
   for (const e of entries) {
     const raw = e.kind as string;
     if (raw === "tool") {
@@ -47,6 +48,10 @@ export function traceRowTitle(entry: TraceEntry): string {
   if ((entry.summary || "").trim()) return entry.summary;
   if (entry.kind === "llm") return `${entry.model || "llm"} · ${entry.tokens?.total ?? 0} tokens`;
   if (entry.kind === "prompt") return `prompt · ${(entry.prompt || "").length} chars`;
+  if ((entry.kind as string) === "fold") {
+    const d = (entry.detail as Record<string, unknown> | undefined) || {};
+    return `fold · ${d.folded ?? "?"} result(s), ${d.removed_chars ?? 0} chars out`;
+  }
   if (entry.kind === "tool" || (entry.kind as string) === "tool_result") {
     const name = String((entry.detail as Record<string, unknown> | undefined)?.name || entry.model || "tool");
     return name;
@@ -386,7 +391,10 @@ export function TraceRow({
   const promptCount = q ? countOccurrences(prompt, q) : 0;
   const resultBase = promptBase >= 0 ? promptBase + promptCount : -1;
   const resultCount = q ? countOccurrences(result, q) : 0;
-  const detailText = !prompt && !result ? JSON.stringify(detail, null, 2) : "";
+  const detailText =
+    !prompt && !result && Object.keys(detail).length > 0
+      ? JSON.stringify(detail, null, 2)
+      : "";
   const detailBase = resultBase >= 0 ? resultBase + resultCount : -1;
 
   return (
@@ -425,7 +433,32 @@ export function TraceRow({
                 </span>
               ) : null}
               {typeof detail.step === "number" ? (
-                <span className="trace-meta-chip">step {Number(detail.step)}</span>
+                <span className="trace-meta-chip">
+                  step {Number(detail.step)}
+                  {typeof detail.steps_max === "number" ? `/${Number(detail.steps_max)}` : ""}
+                </span>
+              ) : null}
+              {typeof detail.finish_reason === "string" && detail.finish_reason ? (
+                <span className="trace-meta-chip">{String(detail.finish_reason)}</span>
+              ) : null}
+              {typeof detail.prompt_messages === "number" ? (
+                <span className="trace-meta-chip">{Number(detail.prompt_messages)} msgs in</span>
+              ) : null}
+              {typeof detail.wire_tokens_est === "number" ? (
+                <span className="trace-meta-chip">
+                  ~{Number(detail.wire_tokens_est)} prompt tok
+                </span>
+              ) : null}
+              {typeof detail.reply_chars === "number" && Number(detail.reply_chars) > 0 ? (
+                <span className="trace-meta-chip">{Number(detail.reply_chars)} chars out</span>
+              ) : null}
+              {typeof detail.reasoning_chars === "number" && Number(detail.reasoning_chars) > 0 ? (
+                <span className="trace-meta-chip">{Number(detail.reasoning_chars)} B thinking</span>
+              ) : null}
+              {Array.isArray(detail.tool_calls) && detail.tool_calls.length > 0 ? (
+                <span className="trace-meta-chip">
+                  → {(detail.tool_calls as unknown[]).map(String).join(", ")}
+                </span>
               ) : null}
               {entry.error ? <span className="trace-meta-error">{entry.error}</span> : null}
             </div>
@@ -451,7 +484,13 @@ export function TraceRow({
           ) : null}
           {prompt ? (
             <TextBlock
-              label={entry.kind === "tool" ? "Args (prompt)" : "Prompt"}
+              label={
+                entry.kind === "tool"
+                  ? "Args (prompt)"
+                  : entry.kind === "llm"
+                    ? "Prompt (sent to model)"
+                    : "Prompt"
+              }
               text={prompt}
               query={query}
               kind="prompt"
@@ -471,12 +510,15 @@ export function TraceRow({
               activeRef={activeRef}
             />
           ) : null}
-          {!prompt && !result ? (
+          {!prompt && !result && detailText ? (
             <pre className="trace-detail-json" dir="ltr">
               {query?.trim()
                 ? highlightHits(detailText, query, detailBase, activeHit, activeRef)
                 : detailText}
             </pre>
+          ) : null}
+          {!prompt && !result && !detailText ? (
+            <div className="trace-empty-body">No prompt/response recorded for this entry.</div>
           ) : null}
         </div>
       )}
@@ -617,6 +659,7 @@ export function TracePanel(props?: {
     llm: number;
     prompt: number;
     tool: number;
+    fold: number;
   } | null>(null);
   // Entries the active filter can still reveal above what is loaded.
   const [serverTotal, setServerTotal] = useState(0);

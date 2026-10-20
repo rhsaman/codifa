@@ -1,57 +1,67 @@
+import { Suspense, lazy } from "react";
 import { useViewerTabs, visibleTabs } from "../lib/viewerTabs";
 import { useStore } from "../lib/store";
-import { ReviewPanel } from "./ReviewPanel";
-import { TracePanel } from "./TracePanel";
-import { ScheduleInboxDocked } from "./ScheduleInbox";
-import { PlanPanel } from "./PlanPanel";
-import { BrowserPanel } from "./BrowserPanel";
-import { FileViewerPanel } from "./FileViewerPanel";
-import { TextViewerPanel } from "./TextViewerPanel";
-import { ExplorePanel } from "./ExplorePanel";
-import { ScheduleSection } from "./SchedulePanel";
-import { TodosSection } from "./TodosPanel";
+import { SchedulePage, TodosPage } from "./ViewerPages";
 
-/** Panel mode body: the docked right-panel sections (schedules, background
- *  sub-agents, todos) rendered in place of viewer tab content. */
-function PanelPane() {
-  return (
-    <div
-      className="panel-pane"
-      style={{
-        flex: "1 1 0",
-        display: "block",
-        boxSizing: "border-box",
-        height: "100%",
-        maxHeight: "100%",
-        minHeight: 0,
-        minWidth: 0,
-        overflowY: "auto",
-        overscrollBehavior: "contain",
-      }}
-    >
-      <ScheduleSection />
-      <TodosSection />
-    </div>
-  );
-}
+// The single-pane viewer shows ONE tab at a time, so only that tab's panel is
+// ever mounted — but they were all static imports, i.e. always in the startup
+// chunk together with the viewer shell. Splitting each into its own chunk keeps
+// a session that only chats from parsing the diff viewer, the file tree and the
+// syntax-highlighted file/text viewers at all.
+const ReviewPanel = lazy(() =>
+  import("./ReviewPanel").then((m) => ({ default: m.ReviewPanel })),
+);
+const TracePanel = lazy(() => import("./TracePanel").then((m) => ({ default: m.TracePanel })));
+const ScheduleInboxDocked = lazy(() =>
+  import("./ScheduleInbox").then((m) => ({ default: m.ScheduleInboxDocked })),
+);
+const PlanPanel = lazy(() => import("./PlanPanel").then((m) => ({ default: m.PlanPanel })));
+const BrowserPanel = lazy(() =>
+  import("./BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+);
+const FileViewerPanel = lazy(() =>
+  import("./FileViewerPanel").then((m) => ({ default: m.FileViewerPanel })),
+);
+const TextViewerPanel = lazy(() =>
+  import("./TextViewerPanel").then((m) => ({ default: m.TextViewerPanel })),
+);
+const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
+const ExplorePanel = lazy(() =>
+  import("./ExplorePanel").then((m) => ({ default: m.ExplorePanel })),
+);
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
+  // The panel below is a lazy() import: the fallback is intentionally empty
+  // (the pane background) rather than a spinner, so switching between an
+  // already-cached tab and a fresh one does not flash chrome.
+  return (
+    <Suspense fallback={null}>
+      <ViewerContentInner />
+    </Suspense>
+  );
+}
+
+function ViewerContentInner() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const panelMode = useViewerTabs((s) => s.panelMode);
   const activeChatId = useStore((s) => s.activeChatId);
   // Chat-scoped viewers: only the active chat's tabs (plus global inbox) show.
+  // Same resolution as `shownViewerTabId` in the store — that helper is the
+  // shared spelling of this rule behind the rail icons' pressed state, so keep
+  // the two in step.
   const visible = visibleTabs(tabs, activeChatId);
   const active = visible.find((t) => t.id === activeId) ?? visible[0] ?? null;
 
   // Panel mode replaces ALL viewer tab content; the header's panel toggle
   // flips back to tabs mode.
-  if (panelMode) return <PanelPane />;
+  if (panelMode) return <TodosPage />;
 
-  // Empty pane shows EXACTLY the panel-toggle view (same PanelPane component
-  // the top-right icon opens): Schedules / Sub-agents / Todos, no chooser.
-  if (!active) return <PanelPane />;
+  // Empty pane shows EXACTLY the panel-toggle view (same page the top-right
+  // icon opens): the todos checklist, no chooser. Schedules live on their own
+  // tab now, so they are not stacked here.
+  if (!active) return <TodosPage />;
 
   if (active.kind === "text") {
     const body = active.textBody ?? "";
@@ -97,6 +107,12 @@ export function ViewerContent() {
         index={active.exploreIndex ?? 0}
       />
     );
+  }
+
+  if (active.kind === "files") {
+    // The explorer's root follows this tab's chat, so a split pane showing a
+    // background chat lists THAT chat's workspace.
+    return <FilesPanel key={active.id} chatId={active.chatId ?? activeChatId} />;
   }
 
   if (active.kind === "review") {
@@ -150,6 +166,13 @@ export function ViewerContent() {
         initialUrl={active.browserUrl ?? ""}
       />
     );
+  }
+
+  if (active.kind === "schedule") {
+    // The cron task list as a page of its own (the Todos page no longer
+    // carries it). Handled BEFORE the inbox fallback below, which is the
+    // catch-all return of this dispatcher.
+    return <SchedulePage key={active.id} />;
   }
 
   return (

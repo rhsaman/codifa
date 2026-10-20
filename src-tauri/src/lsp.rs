@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+// `process_group` on `Command` (own process group per language server).
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,6 +64,12 @@ const MAX_OPEN_DOCS: usize = 30;
 /// is waiting for, and server->client requests we must answer) are NEVER dropped;
 /// only advisory notifications are.
 const NOTIFY_QUEUE: usize = 1024;
+/// Serialises the spawn+insert pair in `server_for`.
+///
+/// Without it, two concurrent cold callers for the same (root, language) both
+/// spawn a server and the second insert overwrites (and orphans) the first.
+static LSP_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
 /// How long an UNUSED language server is kept before it is reaped.
 ///
 /// A server holds the project index in memory (rust-analyzer: hundreds of MB to
@@ -70,6 +78,52 @@ const NOTIFY_QUEUE: usize = 1024;
 /// between two projects keeps both warm, and short enough that abandoned
 /// projects do not pile up. Reaping happens on a workspace switch (`prune_idle`).
 const LSP_IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// Language servers whose project index is measured in GIGABYTES.
+///
+/// `rust-analyzer` keeps a whole-crate-graph index and, measured on this
+/// machine, reached **1921 MB of physical footprint** — twice the memory budget
+/// of the entire app, whose shell was 233 MB. It was never reaped either: every
+/// agent turn calls `prewarm`, and `server_for`'s fast path refreshes
+/// `last_used`, so the idle TTL below never expired for it and the process sat
+/// resident for the whole session.
+///
+/// These are therefore NEVER pre-warmed: a pre-warm spawns one per project the
+/// user ever opens, while most sessions never issue a single LSP call. They
+/// start on demand from a real LSP tool call and are reaped far sooner.
+const HEAVY_LANGUAGES: [&str; 8] = [
+    "rust", "c", "cpp", "java", "scala", "haskell", "dart", "csharp",
+];
+
+/// Idle TTL for a HEAVY language server.
+///
+/// Two minutes, not ten: one of these outweighs the rest of the app combined, so
+/// freeing it quickly matters far more than saving a cold start nobody asked
+/// for. A light server (TypeScript, Python) is cheap to keep warm.
+const LSP_HEAVY_IDLE_TTL: Duration = Duration::from_secs(120);
+
+/// Languages worth SPECULATIVELY starting before any LSP call asks for them.
+///
+/// Pre-warming exists for latency: a warm server answers the first tool call in
+/// milliseconds instead of paying a cold start. That trade only pays for a CHEAP
+/// server, and it is decided here against measurement, not intuition:
+///
+///   * `rust` and friends (see `HEAVY_LANGUAGES`): 1921 MB — never.
+///   * `python`: `pylsp` measured **158 MB** of physical footprint for one
+///     workspace (it loads jedi plus every registered plugin), which is more than
+///     the entire app shell. Most sessions never issue an LSP call at all, so
+///     paying that before the user asks is a pure loss; a real `lsp_*` tool call
+///     still starts it on demand.
+///   * TypeScript stays: `typescript-language-server` costs ~27 MB and gives the
+///     best latency win of anything in the walk.
+fn should_prewarm(language: &str) -> bool {
+    !is_heavy_language(language) && !matches!(language, "python")
+}
+
+/// Whether this language's server holds a whole-project index in memory.
+fn is_heavy_language(language: &str) -> bool {
+    HEAVY_LANGUAGES.contains(&language)
+}
 /// How long a call may wait for exclusive use of a root+language server.
 ///
 /// `Mutex::lock` waits FOREVER, and dropping an abandoned attempt does not stop
@@ -182,7 +236,11 @@ fn language_for_suffix(suffix: &str) -> Option<&'static str> {
     Some(match suffix {
         ".py" | ".pyi" => "python",
         ".ts" | ".tsx" | ".mts" | ".cts" => "typescript",
-        ".js" | ".jsx" | ".mjs" | ".cjs" => "javascript",
+        // JavaScript is served by the SAME `typescript-language-server` binary
+        // (see `server_command`), so it maps onto the `typescript` key: one key
+        // per PROCESS is what keeps a repo with .ts AND .js files from starting
+        // two identical servers (and two tsserver children) for one root.
+        ".js" | ".jsx" | ".mjs" | ".cjs" => "typescript",
         ".astro" => "astro",
         ".sh" | ".bash" => "bash",
         ".c" | ".h" => "c",
@@ -223,6 +281,11 @@ fn language_id_for_suffix(suffix: &str) -> &str {
     match suffix {
         ".tsx" => "typescriptreact",
         ".jsx" => "javascriptreact",
+        // `.js`/`.mjs`/`.cjs` map onto the `typescript` PROCESS key (one server
+        // per binary), but the protocol languageId must stay "javascript" —
+        // falling through to `language_for_suffix` would announce a plain .js
+        // file to the server as TypeScript.
+        ".js" | ".mjs" | ".cjs" => "javascript",
         ".sh" | ".bash" => "shellscript",
         ".scss" => "scss",
         ".less" => "less",
@@ -353,6 +416,12 @@ struct Server {
     /// that opens many projects does not keep a language-server process — with
     /// its whole project index in memory — alive for every one of them.
     last_used: Instant,
+    /// The language this server serves.
+    ///
+    /// Needed by `initialize` to pick per-server options (a heavy server is
+    /// configured differently) and by callers that must know whether they are
+    /// talking to a heavyweight index before waiting on it.
+    language: String,
 }
 
 impl Server {
@@ -364,7 +433,19 @@ impl Server {
         let mut process = Command::new(&program)
             .args(&cmd[1..])
             .env("PATH", &path_env)
+            // Cap the cargo/rustc subprocesses a check or build-script run can
+            // start. rust-analyzer spawns them by the dozen on a big workspace
+            // and each one is a full compiler; unbounded, they were the source
+            // of the multi-GB spikes that made this app look like a leak.
+            .env("CARGO_BUILD_JOBS", "2")
             .current_dir(root)
+            // Give the server its OWN process group so it dies with everything it
+            // spawns. A language server is a launcher: `typescript-language-server`
+            // forks `tsserver`, and that child is where the project index lives
+            // (measured ~294 MB for one workspace). Without a group, killing the
+            // launcher orphaned the child, so the memory was never released — and
+            // the orphan kept a whole workspace index resident for good.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -422,6 +503,7 @@ impl Server {
             initialize_sent: false,
             open_docs: HashMap::new(),
             last_used: Instant::now(),
+            language: language.to_string(),
         })
     }
 
@@ -532,9 +614,47 @@ impl Server {
             return Ok(());
         }
         let root_uri = path_to_uri(root);
+        // Per-server initialization options. Servers not listed here get none and
+        // keep their own defaults, exactly as before.
+        //
+        // `rust-analyzer` is the only server that needed this: with no options at
+        // all it primes its caches for the WHOLE dependency graph, which measured
+        // 1921 MB of physical footprint for one workspace — twice this app's
+        // entire memory budget. These three settings cut the index it keeps
+        // resident without changing a single answer it gives:
+        //   * cachePriming.enable — the dependency-graph pre-build (the biggest
+        //     single consumer; on-demand analysis still works without it)
+        //   * checkOnSave off — the `cargo check` diagnostics pass, which loads
+        //     the full crate graph a second time
+        //   * numThreads — bounds the peak allocation of the parallel indexer
+        let initialization_options = if self.language == "rust" {
+            json!({
+                "cachePriming": { "enable": false },
+                // The `cargo check` diagnostics pass is the single biggest
+                // memory consumer after the index itself: it loads the full
+                // crate graph a SECOND time, in a child process. Diagnostics
+                // for a file are still available on demand through
+                // `textDocument/diagnostic`; this only stops the whole-workspace
+                // background pass nobody asked for.
+                "diagnostics": { "enable": false },
+                // Build scripts (Tauri pulls `tauri-build` -> a whole
+                // gtk/glib build-dependency graph) force rust-analyzer to load
+                // and compile the BUILD dependency graph on top of the normal
+                // one. Disabling it keeps user-code analysis intact and drops
+                // the largest remaining block of resident memory.
+                "cargo": { "buildScripts": { "enable": false } },
+                // 128 syntax trees retained is a lot of parsed source; halving
+                // it costs a re-parse and saves tens of MB.
+                "lruCapacity": 64,
+                "numThreads": 2,
+            })
+        } else {
+            Value::Null
+        };
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "initializationOptions": initialization_options,
             // Without hierarchicalDocumentSymbolSupport servers answer
             // documentSymbol with flat SymbolInformation (handled in `symbols`).
             "capabilities": {
@@ -662,6 +782,24 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Signal the whole process GROUP, not just the direct child.
+        //
+        // `typescript-language-server` is a thin Node wrapper that spawns a
+        // `tsserver` child — and the CHILD is the one holding the project index
+        // (hundreds of MB). `Child::kill()` signals only the wrapper, so the real
+        // memory holder was left running as an orphan: measured on macOS, killing
+        // the wrapper released ~15 MB and leaked ~450 MB across two orphaned
+        // tsservers. The server is spawned as its own group leader
+        // (`process_group(0)` in `spawn`), so a group signal reaches it and every
+        // child it started. `Child::kill()` is kept as the fallback for the case
+        // where the group signal finds nothing (already-dead group).
+        let pgid = self.child.id() as i32;
+        // SAFETY: `kill(2)` takes plain integers (pid/pgid + signal). A negative
+        // pid signals the process group with that id. When the child is already
+        // gone this fails harmlessly with ESRCH.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -748,16 +886,27 @@ impl LspRegistry {
         {
             let mut roots = self.roots.lock().unwrap();
             for (key, langs) in roots.iter_mut() {
-                langs.retain(|_, srv| match srv.try_lock() {
-                    Ok(mut guard) => {
-                        !guard.is_dead() && now.duration_since(guard.last_used) < LSP_IDLE_TTL
+                langs.retain(|language, srv| {
+                    // A heavy server (rust-analyzer: ~1.9 GB measured) is given a
+                    // much shorter idle TTL. Keyed on the LANGUAGE, which is this
+                    // map's key — the old `|_, srv|` ignored it, so every server
+                    // got the same ten minutes no matter what it cost.
+                    let ttl = if is_heavy_language(language) {
+                        LSP_HEAVY_IDLE_TTL
+                    } else {
+                        LSP_IDLE_TTL
+                    };
+                    match srv.try_lock() {
+                        Ok(mut guard) => {
+                            !guard.is_dead() && now.duration_since(guard.last_used) < ttl
+                        }
+                        // Could not lock it: it is BUSY, so it is in use — keep it.
+                        Err(std::sync::TryLockError::WouldBlock) => true,
+                        // A POISONED mutex means a panicking LSP call left the server
+                        // unusable — it can never serve again, so evict it (the same
+                        // call `lock_server` makes).
+                        Err(std::sync::TryLockError::Poisoned(_)) => false,
                     }
-                    // Could not lock it: it is BUSY, so it is in use — keep it.
-                    Err(std::sync::TryLockError::WouldBlock) => true,
-                    // A POISONED mutex means a panicking LSP call left the server
-                    // unusable — it can never serve again, so evict it (the same
-                    // call `lock_server` makes).
-                    Err(std::sync::TryLockError::Poisoned(_)) => false,
                 });
                 if langs.is_empty() {
                     evicted.push(key.clone());
@@ -829,20 +978,61 @@ impl LspRegistry {
         // Slow path: spawn + initialize WITHOUT holding the registry lock. A
         // cold rust-analyzer takes minutes to answer `initialize`, and holding
         // the lock across it would freeze every other call on this registry.
-        let srv = Arc::new(Mutex::new(Server::spawn(root, language)?));
-        // Register BEFORE the handshake. A cold start on a large workspace can
-        // outlast even a generous budget, and dropping the server there threw
-        // away every second of loading already done — the next call then paid
-        // the whole cold start again, which is what kept LSP from ever getting
-        // warm. Registered, the retry resumes draining the handshake already in
-        // flight (see `initialize_sent`).
-        {
-            let mut roots = self.roots.lock().unwrap();
-            roots
-                .entry(key)
-                .or_default()
-                .insert(language.to_string(), srv.clone());
-        }
+        //
+        // But the spawn must still be SINGLE-FLIGHT per (root, language). Reading
+        // the registry, releasing the lock, spawning and inserting is a
+        // check-then-act race: two callers (the pre-warm thread plus a tool call,
+        // measured happening 3s apart) both missed the entry, both spawned, and
+        // the second insert silently overwrote the first `Arc` — leaving TWO live
+        // servers for one workspace, with the loser invisible to `prune_idle`. On
+        // the real profile that meant two `typescript-language-server` wrappers,
+        // four `tsserver` children and ~470 MB of node RSS for a single project.
+        // This guard serialises only the spawn+insert pair; the handshake below
+        // still runs outside it, so a cold start never blocks another language.
+        let srv = {
+            let _spawn_guard = LSP_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Re-check under the guard: while we waited, the other thread may have
+            // finished spawning exactly this server.
+            let raced = self
+                .roots
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|l| l.get(language))
+                .cloned();
+            if let Some(existing) = raced {
+                let usable = match lock_bounded(&existing, SERVER_PROBE_WAIT) {
+                    Some(mut guard) => !guard.is_dead(),
+                    None => true,
+                };
+                if usable {
+                    return Ok(existing);
+                }
+            }
+            let srv = Arc::new(Mutex::new(Server::spawn(root, language)?));
+            // Register BEFORE the handshake. A cold start on a large workspace can
+            // outlast even a generous budget, and dropping the server there threw
+            // away every second of loading already done — the next call then paid
+            // the whole cold start again, which is what kept LSP from ever getting
+            // warm. Registered, the retry resumes draining the handshake already in
+            // flight (see `initialize_sent`).
+            {
+                let mut roots = self.roots.lock().unwrap();
+                roots
+                    .entry(key)
+                    .or_default()
+                    .insert(language.to_string(), srv.clone());
+            }
+            srv
+            // Guard released HERE: the handshake below must not hold it.
+            // A cold rust-analyzer takes minutes, and the guard is global, so
+            // keeping it here serialised every spawn in the app behind one slow
+            // server — the pre-warm thread blocked tool calls for other
+            // languages. The pair that actually needed protecting (spawn +
+            // insert) is inside this block.
+        };
         // BOUNDED lock, like every other per-server wait: an unbounded `.lock()`
         // here could block a turn forever (and panic on a poisoned mutex). A
         // failed handshake leaves the server registered, so the next call resumes
@@ -883,9 +1073,11 @@ fn lock_bounded<'a>(
     }
 }
 
+/// The process-wide registry (a `OnceLock` so it is reachable from shutdown).
+static REGISTRY: std::sync::OnceLock<LspRegistry> = std::sync::OnceLock::new();
+
 fn registry() -> &'static LspRegistry {
-    static REG: std::sync::OnceLock<LspRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(LspRegistry::default)
+    REGISTRY.get_or_init(LspRegistry::default)
 }
 
 /// Release language servers that have not been used for a while.
@@ -894,6 +1086,31 @@ fn registry() -> &'static LspRegistry {
 /// the memory held by the ones you left. See `LspRegistry::prune_idle`.
 pub fn prune_idle() {
     registry().prune_idle();
+}
+
+/// Kill EVERY language server and forget the registry.
+///
+/// Called on app shutdown. Nothing used to release them on exit: the registry
+/// lives in a `OnceLock` for the life of the process, so its `Arc`s were never
+/// dropped and `impl Drop for Server` never ran. The servers then outlived the
+/// window as orphans — and a language server is the single largest thing this app
+/// keeps off-process (one `tsserver` held ~294 MB, `rust-analyzer` more), so an
+/// exit that left them behind looked exactly like a memory leak in the app.
+pub fn shutdown_all() {
+    let Some(reg) = REGISTRY.get() else {
+        return;
+    };
+    // Take the map out from under the lock, then let the values drop OUTSIDE it:
+    // `Drop for Server` waits on the child, which must never happen while the
+    // registry lock is held (the idle reaper would block behind it).
+    let taken = {
+        let mut roots = match reg.roots.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *roots)
+    };
+    drop(taken);
 }
 
 /// Start the background idle reaper for language servers.
@@ -955,6 +1172,13 @@ pub fn prewarm(root: &str) {
         let mut langs: Vec<&'static str> = Vec::new();
         collect_languages(&root_path, 0, &mut langs);
         for language in langs {
+            // Never PRE-WARM a server that costs more than it saves: a heavy one
+            // measured 1921 MB (`rust-analyzer`) and `pylsp` measured 158 MB,
+            // while most sessions never make a single LSP call. A real LSP tool
+            // call still starts them on demand (`server_for`).
+            if !should_prewarm(language) {
+                continue;
+            }
             // `server_for` spawns AND initializes; the registry then keeps that
             // server warm for every later call in this process.
             let _ = registry().server_for(&root_path, language);
@@ -1361,6 +1585,37 @@ pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A heavy server must be recognised from its registry key, must not be
+    /// pre-warmed, and must get a shorter idle TTL than a light one.
+    ///
+    /// `rust-analyzer` measured 1921 MB of physical footprint for one workspace
+    /// — twice the whole app's budget — while the app shell was 233 MB. Two
+    /// things made it permanent: `prewarm` spawned one for every project ever
+    /// opened, and the shared ten-minute idle TTL never expired for it because
+    /// each agent turn's `prewarm` refreshed `last_used` through the fast path.
+    #[test]
+    fn heavy_servers_are_never_prewarmed_and_expire_sooner() {
+        // The languages whose index is measured in gigabytes.
+        for lang in ["rust", "c", "cpp", "java", "scala", "haskell", "dart", "csharp"] {
+            assert!(is_heavy_language(lang), "{lang} must be heavy");
+        }
+        // The cheap ones this app pre-warms on purpose.
+        for lang in ["typescript", "python", "json", "yaml", "bash"] {
+            assert!(!is_heavy_language(lang), "{lang} must not be heavy");
+        }
+        // The short TTL must actually be shorter, or the policy is cosmetic.
+        assert!(LSP_HEAVY_IDLE_TTL < LSP_IDLE_TTL);
+
+        // Pre-warm is a latency/memory TRADE, decided by measured cost: the
+        // cheap server stays warm, everything that costs more than the app shell
+        // waits for a real call. `pylsp` measured 158 MB for one workspace.
+        assert!(should_prewarm("typescript"));
+        assert!(!should_prewarm("python"));
+        for lang in HEAVY_LANGUAGES {
+            assert!(!should_prewarm(lang), "{lang} must not be pre-warmed");
+        }
+    }
+
     #[test]
     fn language_detection_matches_python_registry() {
         assert_eq!(language_for_suffix(".py"), Some("python"));
@@ -1368,6 +1623,29 @@ mod tests {
         assert_eq!(language_for_suffix(".hpp"), Some("cpp"));
         assert_eq!(language_for_suffix(".yaml"), Some("yaml"));
         assert_eq!(language_for_suffix(".unknown"), None);
+    }
+
+    /// One PROCESS key per binary: `.js` and `.ts` share
+    /// `typescript-language-server`, so both must resolve to the same registry
+    /// key. With two keys the pre-warm started TWO servers (each with its own
+    /// `tsserver` children) for a single root — ~470 MB of node RSS for one
+    /// project.
+    #[test]
+    fn js_and_ts_share_one_server_key() {
+        assert_eq!(language_for_suffix(".js"), language_for_suffix(".ts"));
+        assert_eq!(language_for_suffix(".mjs"), Some("typescript"));
+        assert_eq!(language_for_suffix(".cjs"), Some("typescript"));
+        assert_eq!(language_for_suffix(".jsx"), Some("typescript"));
+    }
+
+    /// The protocol languageId is NOT the process key: a plain `.js` file must
+    /// still be announced as JavaScript.
+    #[test]
+    fn js_language_id_stays_javascript() {
+        assert_eq!(language_id_for_suffix(".js"), "javascript");
+        assert_eq!(language_id_for_suffix(".mjs"), "javascript");
+        assert_eq!(language_id_for_suffix(".cjs"), "javascript");
+        assert_eq!(language_id_for_suffix(".jsx"), "javascriptreact");
     }
 
     #[test]

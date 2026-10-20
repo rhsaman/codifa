@@ -199,6 +199,53 @@ console.log('8) FileResultLinks: duplicate read results deduped to one row:')
   check('distinct lines kept as two rows', (distinctHtml.match(/class="file-result"/g) || []).length === 2, distinctHtml.slice(0, 500))
 }
 
+console.log('9) WebResultLinks: فقط ۳ نتیجه اول + «+N more» (فهرست وب کلیپس می‌شود):')
+{
+  const manyWeb = Array.from({ length: 8 }, (_, i) => ({
+    title: `result ${i}`,
+    url: `https://example.com/${i}`,
+    snippet: `snippet ${i}`,
+  })) as never
+  let manyWebHtml = ''
+  try {
+    manyWebHtml = renderToString(<WebResultLinks items={manyWeb} />)
+    check('رندر شد', manyWebHtml.length > 0)
+  } catch (e) {
+    check('رندر شد', false, e)
+  }
+  check(
+    'فقط ۳ ردیف رندر شد',
+    (manyWebHtml.match(/class="web-result"/g) || []).length === 3,
+    manyWebHtml.slice(0, 400),
+  )
+  check('ردیف چهارم پنهان است', !manyWebHtml.includes('result 3'))
+  check('دکمهٔ «+5 more» هست', manyWebHtml.includes('+5 more'))
+}
+
+console.log('10) WebResultLinks: شمارش فچ + نشانهٔ ردیف snippet-only:')
+{
+  const fetchedItems = [
+    { title: 'a', url: 'https://a.example/1', snippet: 's', fetched: true },
+    { title: 'b', url: 'https://b.example/2', snippet: 's', fetched: true },
+    { title: 'c', url: 'https://c.example/3', snippet: 's', fetched: false },
+  ] as never
+  const fHtml = renderToString(<WebResultLinks items={fetchedItems} />)
+  check('خط خلاصهٔ فچ رندر شد', fHtml.includes('web-results-head'))
+  check('تعداد نتایج نوشته شد', fHtml.includes('3 results'))
+  check('تعداد فچ‌شده نوشته شد', fHtml.includes('2 fetched'))
+  check('ردیف snippet-only علامت خورد', fHtml.includes('web-result-fetched'))
+  check(
+    'فقط ردیف ناموفق علامت دارد',
+    (fHtml.match(/class="web-result-fetched"/g) || []).length === 1,
+    fHtml,
+  )
+  // ترنسکریپت قدیمی: هیچ ردیفی `fetched` ندارد → نه خط خلاصه، نه چیپ.
+  const legacy = [{ title: 'x', url: 'https://x.example/1', snippet: 's' }] as never
+  const lHtml = renderToString(<WebResultLinks items={legacy} />)
+  check('بدون fetched: خط خلاصه رندر نمی‌شود', !lHtml.includes('web-results-head'))
+  check('بدون fetched: چیپ رندر نمی‌شود', !lHtml.includes('web-result-fetched'))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

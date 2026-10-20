@@ -89,12 +89,27 @@ console.log('۴) trusts the provider when it reports the LARGER input_tokens (fu
   check('متر مقدار بزرگتر گزارش‌شده را می‌پذیرد (99999)', used === 99999, used)
 }
 
-console.log('۴ب) meter follows the LATEST message inputTokens (the backend input):')
+console.log('۴ب) the backend context_tokens wins over inputTokens (it is what compaction measures):')
 {
-  // The meter mirrors the latest main request's input_tokens — the same value
-  // that drives auto-compaction. Earlier turns' input_tokens are ignored, and the
-  // larger middle turn (9000) does not pin it.
+  // The backend reports the prompt it billed AND folds on (context_tokens), so
+  // the meter must prefer it: the ring has to reach 100% exactly when
+  // auto-compaction fires, instead of trailing behind by the output tokens.
   const chat = {
+    messages: [
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 5000, outputTokens: 50, contextTokens: 4800 }),
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 9000, outputTokens: 400, contextTokens: 8800 }),
+      mkMsg('user', null),
+      mkMsg('assistant', { inputTokens: 4000, outputTokens: 60, contextTokens: 3900 }),
+    ],
+  }
+  const used = computeContextUsed(chat as any, '', 200000)
+  check('متر آخرین contextTokens را نشان می‌دهد (3900)', used === 3900, used)
+
+  // No backend number (older event / provider that reports no usage): fall back
+  // to the provider's own input tokens for the latest turn.
+  const legacy = {
     messages: [
       mkMsg('user', null),
       mkMsg('assistant', { inputTokens: 5000, outputTokens: 50, contextTokens: 1000 }),
@@ -104,8 +119,8 @@ console.log('۴ب) meter follows the LATEST message inputTokens (the backend inp
       mkMsg('assistant', { inputTokens: 4000, outputTokens: 60, contextTokens: 3000 }),
     ],
   }
-  const used = computeContextUsed(chat as any, '', 200000)
-  check('متر آخرین inputTokens را نشان می‌دهد (4000)', used === 4000, used)
+  const legacyUsed = computeContextUsed(legacy as any, '', 200000)
+  check('بدون contextTokens، inputTokens آخرین نوبت می‌آید (3000)', legacyUsed === 3000, legacyUsed)
 }
 
 console.log('۵) compacted messages are excluded from the estimated context:')

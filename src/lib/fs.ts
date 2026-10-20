@@ -30,6 +30,10 @@ export const api = {
     window.coder.fsWrite(root, rel, content),
   fsDelete: (root: string, rel: string): Promise<boolean> =>
     window.coder.fsDelete(root, rel),
+  fsCopy: (root: string, from: string, to: string): Promise<boolean> =>
+    window.coder.fsCopy(root, from, to),
+  fsRename: (root: string, from: string, to: string): Promise<boolean> =>
+    window.coder.fsRename(root, from, to),
   coderList: (rel: string): Promise<FileEntry[]> => window.coder.coderList(rel),
   coderRead: (rel: string): Promise<{ content: string }> => window.coder.coderRead(rel),
   coderWrite: (rel: string, content: string): Promise<boolean> =>
@@ -150,7 +154,10 @@ export async function workspaceFiles(root: string): Promise<WorkspaceFile[]> {
   // 800-file cap that used to silently drop whole subfolders (e.g. the second
   // of two project folders). Falls back to the old per-dir walk if unavailable.
   const walked = await api.fsWalk(root).catch(() => null)
-  const files = walked ?? (await fallbackWalk(root))
+  // `?? fallbackWalk`: `.catch` only covers a REJECTION — a bridge that
+  // resolves nullish (web build, stub) would otherwise cache a non-array and
+  // every consumer of this index would throw on it.
+  const files = Array.isArray(walked) ? walked : await fallbackWalk(root)
   workspaceCache.set(root, { at: Date.now(), files })
   // Keep the cache bounded: drop the oldest entry when it grows past 20 roots.
   if (workspaceCache.size > 20) {
@@ -165,7 +172,7 @@ async function fallbackWalk(root: string): Promise<WorkspaceFile[]> {
   const stack: string[] = ['']
   while (stack.length > 0 && out.length < MAX_INDEXED) {
     const rel = stack.pop()!
-    const entries = await api.fsList(root, rel).catch(() => [])
+    const entries = (await api.fsList(root, rel).catch(() => [])) ?? []
     for (const e of entries) {
       if (e.kind === 'dir') {
         if (SKIP_DIRS.has(e.name)) continue
@@ -203,6 +210,10 @@ export function resolveWorkspacePath(
   const clean = normPath(target)
   const base = clean.split('/').pop() ?? clean
   if (!base) return null
+  // Same resolved-null hazard as suggestSimilarFiles (see the guard there):
+  // `workspaceFiles` can hand back a nullish list when the bridge resolves
+  // instead of rejecting, and `files.find` would throw on it.
+  if (!Array.isArray(files)) return null
   const exact = files.find((f) => f.name === base)
   if (exact) return exact
   return suggestSimilarFiles(clean, files, 1)[0] ?? null
@@ -222,6 +233,12 @@ export function suggestSimilarFiles(
   const norm = normPath
   const target = norm(targetRel)
   if (!target) return []
+  // The bridge may RESOLVE null instead of rejecting (web build, a stub, an
+  // empty `fs_walk` payload), and `.catch` alone lets that null through —
+  // then this loop throws "files is not iterable" and the viewer loses the
+  // whole suggestion list. Callers keep their own guard, but the choke point
+  // refuses to throw either way.
+  if (!Array.isArray(files)) return []
   const base = target.split('/').pop() ?? target
   const dot = base.lastIndexOf('.')
   const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase()

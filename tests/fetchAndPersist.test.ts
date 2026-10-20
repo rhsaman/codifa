@@ -506,6 +506,63 @@ await run(
   { ok: true, models: ['llama3'] },
 )
 
+// --- per-model capacity (context window) is persisted with the catalog ------
+
+await run(
+  'fetched models are persisted WITH a capacity: reported window, else 200k default',
+  async () => {
+    const store = mkStore([mkProvider({ id: 'local', models: [] })])
+    const p = mkProvider({ id: 'local' })
+    await fetchAndPersist(p, {
+      fetchFn: async () => ({
+        models: ['llama3', 'mistral'],
+        // only llama3 reports a window — mistral must still be stored with 200k
+        context: { llama3: 131072 },
+        pricing: {},
+        reasoning: {},
+      }),
+      store: { getState: () => store },
+    })
+    return store.calls.find((c) => c.method === 'setProviderContextMap')?.args[1] ?? null
+  },
+  { llama3: 131072, mistral: 200000 },
+)
+
+await run(
+  'a fetch that stops reporting a window keeps the known one (never downgrades to the default)',
+  async () => {
+    const store = mkStore([
+      mkProvider({ id: 'local', models: ['llama3', 'mistral'], contextMap: { llama3: 1000000 } }),
+    ])
+    const p = mkProvider({ id: 'local' })
+    await fetchAndPersist(p, {
+      fetchFn: async () => ({ models: ['llama3', 'mistral'], context: {}, pricing: {}, reasoning: {} }),
+      store: { getState: () => store },
+    })
+    return store.calls.find((c) => c.method === 'setProviderContextMap')?.args[1] ?? null
+  },
+  { llama3: 1000000, mistral: 200000 },
+)
+
+await run(
+  'provider-prefixed model id is also stored under the bare id the picker uses',
+  async () => {
+    const store = mkStore([mkProvider({ id: 'nvidia', models: [] })])
+    const p = mkProvider({ id: 'nvidia' })
+    await fetchAndPersist(p, {
+      fetchFn: async () => ({
+        models: ['nvidia/deepseek-v3'],
+        context: { 'nvidia/deepseek-v3': 64000 },
+        pricing: {},
+        reasoning: {},
+      }),
+      store: { getState: () => store },
+    })
+    return store.calls.find((c) => c.method === 'setProviderContextMap')?.args[1] ?? null
+  },
+  { 'nvidia/deepseek-v3': 64000, 'deepseek-v3': 64000 },
+)
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------

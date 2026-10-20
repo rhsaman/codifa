@@ -18,6 +18,17 @@
           {
             get: function (target, prop) {
               if (prop in target) return target[prop];
+              // Every `on*` bridge method is a SUBSCRIPTION: its contract is to
+              // return a synchronous unsubscribe (`() => void`, see
+              // src/types/coderApi.ts). Resolving those to null like a normal
+              // async method makes React call a Promise as an effect cleanup
+              // ("off is not a function") and the ErrorBoundary swallows the
+              // whole app instead of the one subscription.
+              if (typeof prop === 'string' && prop.indexOf('on') === 0) {
+                return function () {
+                  return function () {};
+                };
+              }
               return function () {
                 return Promise.resolve(null);
               };

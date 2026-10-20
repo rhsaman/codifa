@@ -5,12 +5,27 @@ import { registerChatDeleteHook, useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'plan' | 'browser' | 'file' | 'text' | 'explore'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files'
 
 /** Kinds that belong to ONE chat. File tabs are chat-scoped too
  *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
- *  live edits only refresh the owning chat. Inbox stays global. */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore'])
+ *  live edits only refresh the owning chat. Inbox and Schedule stay global. */
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'files'])
+
+/** Pages that own a dedicated icon in the pane rail. Opening them goes
+ *  through that icon, and `viewerTabRows` never renders them as a rail ROW:
+ *  one entry point per page, and exactly one representation of it. Showing
+ *  both an icon and its own tab row made the same page look like two pages
+ *  (literally two inboxes in the rail). The Todos page is the rail's own
+ *  toggle and never had a tab entry at all. */
+export const RAIL_PAGE_KINDS: ReadonlySet<ViewerKind> = new Set<ViewerKind>([
+  'files',
+  'schedule',
+  'inbox',
+  'review',
+  'trace',
+  'browser',
+])
 
 export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): string {
   if (kind === 'file') {
@@ -22,10 +37,28 @@ export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): st
   return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
 }
 
+/** Every kind the store may rehydrate. An unknown kind (an older/newer build,
+ *  a hand-edited localStorage payload) is dropped on load instead of being
+ *  trusted — the whitelist is never widened into "accept anything". */
+const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
+  'review',
+  'trace',
+  'inbox',
+  'schedule',
+  'plan',
+  'browser',
+  'file',
+  'text',
+  'explore',
+  'files',
+])
+
+
 const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   review: 'Git',
   trace: 'Trace',
   inbox: 'Inbox',
+  schedule: 'Schedule',
   plan: 'Plan',
   browser: 'Browser',
   // Unused: file tabs keep their per-path title (the file name).
@@ -33,6 +66,7 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   text: 'Text',
   // Unused: explore tabs keep their own title ("Explore · <description>").
   explore: 'Explore',
+  files: 'Files',
 }
 
 /** Display title for a viewer tab. File/text tabs and sub-agent trace tabs
@@ -52,6 +86,48 @@ export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
     if (t.kind === 'file' && !t.chatId) return true
     return !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId
   })
+}
+
+/** Id of the tab the pane body is showing RIGHT NOW, or `null` when the pane
+ *  shows the todos page instead (panel mode, or no visible tab at all — the
+ *  body's own fallback).
+ *
+ *  This mirrors the body rule in ViewerContent/ViewerWindows exactly, and it is
+ *  the single source of truth for the rail icons' pressed state: an icon must
+ *  mark the page that is ON SCREEN, never merely "a tab with this id exists".
+ *  Those two differ as soon as a second tab is open — the page behind it read
+ *  as pressed and its click CLOSED it, so "show me that page" needed a second
+ *  click. Pure, for tests. */
+export function shownViewerTabId(
+  tabs: ViewerTab[],
+  activeId: string | null,
+  panelMode: boolean,
+  chatId: string,
+): string | null {
+  if (panelMode) return null
+  const visible = visibleTabs(tabs, chatId)
+  const active = visible.find((t) => t.id === activeId) ?? visible[0] ?? null
+  return active?.id ?? null
+}
+
+/** True when a tab is drawn as a ROW in the pane rail.
+ *
+ *  Rail-owned pages are represented by their icon (pressed while open), so
+ *  drawing their tab as well made ONE page read as two — an icon plus a tab,
+ *  which looked like two inboxes. The one exception is a sub-agent trace tab:
+ *  it shares the `trace` kind with the main chat trace but is a separate tab
+ *  that has no icon of its own, so dropping it would make it unreachable.
+ *  Pure, for tests. */
+export function isRailRow(t: ViewerTab): boolean {
+  if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return true
+  return !RAIL_PAGE_KINDS.has(t.kind)
+}
+
+/** Tabs the pane rail draws as ROWS (visible tabs minus the icon-owned pages).
+ *  Opening, closing and the tab-list dropdown still go through the real tab;
+ *  only the rail row is dropped. Pure, for tests. */
+export function viewerTabRows(tabs: ViewerTab[], chatId: string): ViewerTab[] {
+  return visibleTabs(tabs, chatId).filter(isRailRow)
 }
 
 /** True when the viewer tab-list has anything to show inline (visible open
@@ -117,6 +193,9 @@ interface ViewerTabsState {
   openGitDiff: (chatId?: string) => void
   openTraces: (chatId?: string, tab?: TraceTab, taskId?: string, title?: string) => void
   openInbox: () => void
+  /** Open the Schedule page: the cron task list (create form + rows) in its
+   *  own viewer tab, separate from the Todos page. One global tab. */
+  openSchedule: () => void
   /** Open the implementation-plan document of a chat (Plan card's
    *  "View full plan"). Defaults to the active chat. */
   openPlan: (chatId?: string) => void
@@ -141,6 +220,9 @@ interface ViewerTabsState {
    *  with one tab per chat: clicking another run retargets the same tab
    *  instead of stacking a tab per run. */
   openExplore: (messageId: string, index: number, title?: string, chatId?: string) => void
+  /** Open the workspace file explorer of a chat (one tab per chat). The tree
+   *  itself is read lazily from disk by the panel. */
+  openFiles: (chatId?: string) => void
   closeViewer: (id: string) => void
   /** Close all viewer tabs, or only the tabs visible in one chat.
    *  Closed tabs land in the "Recently closed" list so they can be
@@ -181,13 +263,13 @@ interface ViewerTabsState {
   /** Side pane visibility (the whole docked viewer group). The app bar's
    *  single pane toggle flips it; every open* action forces it open so a tab
    *  opened from anywhere becomes visible. With the pane open but no tabs,
-   *  the pane shows the "Open tab" chooser. Persisted. */
+   *  the pane falls back to the todos page. Persisted. */
   paneOpen: boolean
   setPaneOpen: (v: boolean) => void
   togglePane: () => void
-  /** Panel mode: the side pane shows the todos / sub-agents / schedules
-   *  sections INSTEAD of viewer tab content. Toggled from the button inside
-   *  the pane; activating any tab drops back to tabs mode. Persisted. */
+  /** Panel mode: the side pane shows the todos page INSTEAD of viewer tab
+   *  content. Toggled from the pane's todos icon; activating any tab drops
+   *  back to tabs mode. Persisted. */
   panelMode: boolean
   setPanelMode: (v: boolean) => void
   togglePanelMode: () => void
@@ -271,7 +353,7 @@ function loadPersisted(): {
       closed?: ClosedViewerTab[]
     }
     const valid = Array.isArray(parsed.tabs)
-      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && (t.kind === 'review' || t.kind === 'trace' || t.kind === 'inbox' || t.kind === 'plan' || t.kind === 'browser' || t.kind === 'file' || t.kind === 'text'))
+      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && VALID_KINDS.has(t.kind))
       : []
     // One tab per kind per chat (one per sub-agent for trace tabs).
     // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
@@ -302,7 +384,7 @@ function loadPersisted(): {
     const activeId = typeof parsed.activeId === 'string' && capped.some((t) => t.id === parsed.activeId) ? parsed.activeId : (capped[0]?.id ?? null)
     const closed = Array.isArray(parsed.closed)
       ? parsed.closed
-          .filter((c) => c && typeof c.closedAt === 'number' && c.tab && typeof c.tab.id === 'string' && (c.tab.kind === 'review' || c.tab.kind === 'trace' || c.tab.kind === 'inbox' || c.tab.kind === 'plan' || c.tab.kind === 'browser' || c.tab.kind === 'file' || c.tab.kind === 'text'))
+          .filter((c) => c && typeof c.closedAt === 'number' && c.tab && typeof c.tab.id === 'string' && VALID_KINDS.has(c.tab.kind))
           .slice(0, CLOSED_CAP)
       : []
     return { tabs: capped, activeId, closed }
@@ -583,6 +665,20 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       useStore.getState().setScheduleInboxOpen(true)
       return next
     }),
+  openSchedule: () =>
+    set((s) => {
+      const id = 'schedule'
+      const entry: ViewerTab = {
+        id,
+        kind: 'schedule',
+        title: 'Schedule',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
   openPlan: (chatId) =>
     set((s) => {
       // One plan tab per chat (PlanPanel reads the live activeChatId).
@@ -703,6 +799,24 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = capTabs(s.tabs.some((t) => t.id === id)
         ? s.tabs.map((t) => (t.id === id ? { ...t, ...entry } : t))
         : [...s.tabs, entry])
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openFiles: (chatId) =>
+    set((s) => {
+      // One explorer tab per chat: the tree follows that chat's workspace root.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('files', cid)
+      const entry: ViewerTab = {
+        id,
+        kind: 'files',
+        chatId: cid,
+        title: 'Files',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
       persist(next.tabs, next.activeId)

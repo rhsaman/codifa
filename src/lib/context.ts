@@ -199,15 +199,24 @@ export function computeContextUsed(
     if (u && m.role === "assistant") last = u
   }
 
-  // The provider's `totalTokens` (the backend's `total_tokens`) is the real
-  // measured context: it already encodes whether cache is additive (Anthropic)
-  // or a subset of input (OpenAI / OpenRouter / Google). Once it has arrived
-  // and is positive it WINS — even when smaller than the local estimate, since
-  // the estimate's builtin-prompt floor over-estimates tiny turns. It can never
-  // be smaller than the input itself, though (total = input + output, with the
-  // cache either folded into input or added on top): a total below inputTokens
-  // means the router dropped the cached portion from its total, so clamp up to
-  // the real input instead of under-reporting the meter.
+  // The backend's `context_tokens` is the PREFERRED number: it is the prompt the
+  // provider actually billed for the last request (system prompt + tool schemas
+  // + whole wire history) AND the exact baseline the mid-turn auto-compaction
+  // trigger compares against its threshold. Preferring it is what makes the ring
+  // reach 100% at the same moment compaction fires. Without it the meter showed
+  // `input + output` of the latest round-trip while the backend folded on
+  // `input` plus whatever the turn appended, so messages got compacted while the
+  // ring still read well under the configured percentage.
+  if (last && (last.contextTokens ?? 0) > 0) return last.contextTokens as number
+
+  // Fall back to the provider's own total: it already encodes whether cache is
+  // additive (Anthropic) or a subset of input (OpenAI / OpenRouter / Google).
+  // Once it has arrived and is positive it WINS — even when smaller than the
+  // local estimate, since the estimate's builtin-prompt floor over-estimates
+  // tiny turns. It can never be smaller than the input itself, though (total =
+  // input + output, with the cache either folded into input or added on top): a
+  // total below inputTokens means the router dropped the cached portion from its
+  // total, so clamp up to the real input instead of under-reporting the meter.
   if (last && (last.inputTokens ?? 0) > 0) {
     const providerTotal = Math.max(last.totalTokens ?? 0, last.inputTokens ?? 0)
     if (providerTotal > 0) return providerTotal
@@ -218,22 +227,35 @@ export function computeContextUsed(
   return estimateContextTokens(chat, systemPrompt, contextWindow, historyLimit)
 }
 
+/** Default context window when neither models.dev nor the provider reports one.
+ *  Mirrors `DEFAULT_CONTEXT_WINDOW` in src-tauri/src/agent.rs — the backend
+ *  applies the same 200k fallback, so the meter and the compaction trigger can
+ *  never disagree. */
+export const DEFAULT_CONTEXT_WINDOW = 200_000
+
 /** Resolve a model's context window from the provider's maps, trying
  *  both the bare id (what the picker stores) and the provider-prefixed id
  *  (NVIDIA's /models returns "nvidia/<model>" while the picker stores the
  *  bare form, so the map is keyed by the prefixed id). Resolution order:
  *  ۱) مقدار دستی کاربر (manualContextMap — فقط مدل‌های کاستوم) ۲) مقدار
- *  زنده‌ی contextMap (گزارش‌شده از /models پروایدر). */
+ *  زنده‌ی contextMap (گزارش‌شده از /models پروایدر — که خودش models.dev را
+ *  ترجیح می‌دهد) ۳) DEFAULT_CONTEXT_WINDOW (۲۰۰ هزار) وقتی هیچ‌کدام چیزی
+ *  نمی‌دانند.
+ *
+ *  The third tier matters: returning `null` for an unknown model made every
+ *  caller substitute 0, the backend then measured auto-compaction against its
+ *  own guess, and the ring showed no number at all. The capacity rule is the
+ *  same everywhere — models.dev → the provider's metadata → this default — so
+ *  the meter and the backend trigger can never disagree. */
 export function modelContextWindow(
   provider: {
     id?: string
     contextMap?: Record<string, number>
     manualContextMap?: Record<string, number>
-    contextWindow?: number
   } | null | undefined,
   model: string,
-): number | null {
-  if (!provider) return null
+): number {
+  if (!provider) return DEFAULT_CONTEXT_WINDOW
   const manual = provider.manualContextMap ?? {}
   const directManual = manual[model]
   if (directManual && directManual > 0) return directManual
@@ -244,7 +266,10 @@ export function modelContextWindow(
   if (direct && direct > 0) return direct
   const prefixed = map[`${provider.id ?? ''}/${model}`]
   if (prefixed && prefixed > 0) return prefixed
-  return null
+  // Tier 3: nobody knows this model — assume the app-wide default rather than
+  // reporting "unknown", so the meter stays a number and the backend compacts
+  // at the same window the user sees.
+  return DEFAULT_CONTEXT_WINDOW
 }
 
 /** Resolve a model's reasoning-support flag, trying both the bare and

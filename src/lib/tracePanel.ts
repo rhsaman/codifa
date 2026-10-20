@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 
 /** فیلتر فعال پنل لاگ چت جاری: همه یا یک نوع خاص (مثل لنگ‌اسمیت). */
-export type TraceTab = 'all' | 'llm' | 'prompt' | 'tool'
+export type TraceTab = 'all' | 'llm' | 'prompt' | 'tool' | 'fold'
 
 interface TracePanelState {
   open: boolean

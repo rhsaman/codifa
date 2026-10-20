@@ -44,6 +44,9 @@ const FILES = [
   { path: "src/b.ts", diff: DIFF_B, adds: 1, dels: 0 },
 ];
 const noop = (_p: string) => {};
+/** متنِ خروجیِ رندرشده بدون تگ‌ها: دیف با سینتکس‌هایلایت رندر می‌شود، پس
+ *  یک عبارت مثل `const y` بین چند <span> تکه می‌شود و includes خام نمی‌گیرد. */
+const plain = (html: string) => html.replace(/<[^>]*>/g, "");
 
 console.log("۱) فایل باز → دیف زیر همان ردیف فایل (آکاردئون):");
 {
@@ -76,8 +79,9 @@ console.log("۳) فایل دوم باز → دیف همان فایل، نه فا
   );
   check("فقط یک دیف رندر شد", (html.match(/diff-unified/g) || []).length === 1);
   // محتوای دیف باید مال b.ts باشد (const y) نه a.ts (const b).
-  check("دیف فایل انتخاب‌شده رندر شد", html.includes("const y"));
-  check("دیف فایل دیگر رندر نشد", !html.includes("const b = 2"));
+  const text = plain(html);
+  check("دیف فایل انتخاب‌شده رندر شد", text.includes("const y"));
+  check("دیف فایل دیگر رندر نشد", !text.includes("const b = 2"));
 }
 
 if (failed > 0) {

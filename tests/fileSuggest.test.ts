@@ -60,6 +60,11 @@ console.log('4) edge cases:')
   check('limit respected', suggestSimilarFiles('src/components/ChatWindows.tsx', files, 2).length === 2)
   check('backslash paths normalized', suggestSimilarFiles('src\\components\\ChatWindows.tsx', files).length === 3)
   check('exact existing path is never suggested', suggestSimilarFiles('src/lib/store.ts', files).every((f) => f.rel !== 'src/lib/store.ts'))
+  // A bridge that RESOLVES null instead of rejecting (web build, stub) used to
+  // reach `for (const f of files)` and throw "files is not iterable", wiping
+  // the whole suggestion list. The choke point must swallow it instead.
+  check('a nullish list is not iterable-proofed by the caller', suggestSimilarFiles('src/App.tsx', null as unknown as typeof files).length === 0)
+  check('an undefined list is tolerated', suggestSimilarFiles('src/App.tsx', undefined as unknown as typeof files).length === 0)
 }
 
 if (failed > 0) {

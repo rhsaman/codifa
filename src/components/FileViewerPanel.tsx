@@ -8,7 +8,7 @@ import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
 import { FileChip, FileIcon } from "./FileIcon";
-import { getHighlightedLines } from "./ChatMessage";
+import { getHighlightedLines } from "../lib/highlight";
 
 /** Native PDF pane: WKWebView renders PDFs itself, so the viewer shows the
  *  file through a Blob object URL instead of backend-rasterized page images.
@@ -185,7 +185,10 @@ function VirtualSheetTable({ name, rows, query, activeRow }: { name: string; row
       // a word never highlights it anywhere else.
       if (isCurrent && q.length > 0) {
         out = markQueryHtml(out, query ?? "");
-        out = out.replace(/<tr(?=[\s>])/, '<tr data-search-current="1" style="background:#fff3b0;"');
+        out = out.replace(
+          /<tr(?=[\s>])/,
+          '<tr data-search-current="1" style="background:color-mix(in srgb, var(--accent) 20%, transparent);"',
+        );
       }
       return out;
     }).join("");
@@ -1249,7 +1252,6 @@ export function FileViewerPanel({
                   key={i}
                   data-line={n}
                   className={`fv-line${n === fileLine ? " target" : ""}${isSearchCurrent ? " search-current" : ""}${isCommentTarget ? " comment-target" : ""}`}
-                  style={isSearchCurrent ? { background: "#fff3b0" } : undefined}
                 >
                   <span className="fv-gutter" aria-hidden="true">
                     {n}

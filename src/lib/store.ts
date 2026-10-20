@@ -45,6 +45,7 @@ import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry, normalizeUsageModel } from './usage'
 import { modelReasoning } from './context'
 import { supportsReasoning } from './thinking'
+import { withOtherSlotsFilled } from './toolSlots'
 import { normalizeToolActivity } from './toolActivity'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
 import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
@@ -114,6 +115,29 @@ export function lspStatusFromEvent(ev: {
   return { phase: updating ? 'updating' : 'installing', language: ev.language }
 }
 
+/** How long a SENT queue entry is kept before it is dropped from the persisted
+ *  copy. Long enough that the turn it produced is certainly in the transcript,
+ *  short enough that a session never carries screenshots it already sent. */
+const QUEUED_SENT_GRACE_MS = 10 * 60 * 1000
+
+/** Drop queue entries that have already been handed to the agent.
+ *
+ *  A queued message is a PENDING send: once `markQueuedSent` flipped `sent` the
+ *  transcript owns the content and the queue copy is dead weight — the UI hides
+ *  it (`Chat.tsx` filters `!q.sent`), yet nothing deleted it. Entries therefore
+ *  accumulated forever, complete with their base64 screenshots: on one real
+ *  profile that was 5.4 MB of a 5.5 MB settings.json, i.e. the whole chat index
+ *  was dead queue copies, re-serialized on every persist.
+ */
+export function pruneQueued(
+  queued: QueuedMessage[] | undefined,
+  now = Date.now(),
+): QueuedMessage[] | undefined {
+  if (!queued || queued.length === 0) return queued
+  const kept = queued.filter((q) => !q.sent || now - (q.createdAt ?? 0) < QUEUED_SENT_GRACE_MS)
+  return kept.length === queued.length ? queued : kept
+}
+
 // Strip transient, in-memory-only fields from messages AND chats before
 // persisting so they never reappear after a restart (e.g. the rate-limit retry
 // banner, or a stale ask/permission popup whose agent is long gone).
@@ -121,7 +145,10 @@ export function lspStatusFromEvent(ev: {
 // becomes real (sidebar row + file on disk) once the first message is sent.
 export function sanitizeChats(chats: Chat[]): Chat[] {
   const out: Chat[] = []
-  for (const c of chats) {
+  const now = Date.now()
+  for (const original of chats) {
+    const pruned = pruneQueued(original.queued, now)
+    const c = pruned === original.queued ? original : { ...original, queued: pruned }
     const hasBody = Array.isArray(c.messages) && c.messages.length > 0
     // INDEX ROW (the transcript lives in its own file and is not in memory):
     // persist the metadata verbatim, with `messages` REMOVED. This is the
@@ -629,6 +656,99 @@ function persistTerminalFullscreen(v: boolean): void {
   }
 }
 
+/** Where the terminal is docked: the bottom panel (default, Cmd/Ctrl+J) or
+ *  docked into the right side pane. Session-level UI state like the other
+ *  terminal keys — localStorage, never the settings payload. */
+const TERMINAL_HEIGHT_KEY = 'coder:terminalHeight'
+
+/** Smallest the dock may be dragged: below this the tab strip eats the shell. */
+export const MIN_TERMINAL_HEIGHT = 140
+
+/** Fallback height for a fresh install / unreadable storage. */
+export const DEFAULT_TERMINAL_HEIGHT = 300
+
+/** Clamp a dock height (drag input, stored value) into the usable range.
+ *  Pure, so the drag maths and the hydration rule cannot disagree. */
+export function clampTerminalHeight(px: number): number {
+  return Number.isFinite(px)
+    ? Math.max(MIN_TERMINAL_HEIGHT, Math.round(px))
+    : DEFAULT_TERMINAL_HEIGHT
+}
+
+function loadTerminalHeight(): number {
+  try {
+    const raw = localStorage.getItem(TERMINAL_HEIGHT_KEY)
+    // A missing or unreadable value falls back instead of collapsing the dock
+    // to its minimum.
+    return raw === null ? DEFAULT_TERMINAL_HEIGHT : clampTerminalHeight(Number(raw))
+  } catch {
+    return DEFAULT_TERMINAL_HEIGHT
+  }
+}
+
+function persistTerminalHeight(px: number): void {
+  try {
+    localStorage.setItem(TERMINAL_HEIGHT_KEY, String(px))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export type TerminalPlacement = 'bottom' | 'right'
+
+const TERMINAL_PLACEMENT_KEY = 'coder:terminalPlacement'
+
+function loadTerminalPlacement(): TerminalPlacement {
+  try {
+    // A corrupt/unknown value falls back to the bottom dock rather than
+    // leaving the terminal homeless.
+    return localStorage.getItem(TERMINAL_PLACEMENT_KEY) === 'right' ? 'right' : 'bottom'
+  } catch {
+    return 'bottom'
+  }
+}
+
+function persistTerminalPlacement(p: TerminalPlacement): void {
+  try {
+    localStorage.setItem(TERMINAL_PLACEMENT_KEY, p)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/**
+ * Which dock the terminal actually renders in. `'right'` is a *request*: the
+ * side pane can be hidden (its toggle, or the chat going fullscreen), and the
+ * docked panel has nothing to sit on then — so the request silently degrades to
+ * the bottom dock instead of hiding the terminal. Pure, so the fallback rules
+ * are testable without a DOM.
+ */
+export function resolveTerminalPlacement(
+  requested: TerminalPlacement,
+  paneOpen: boolean,
+  chatFull: boolean,
+): TerminalPlacement {
+  return requested === 'right' && paneOpen && !chatFull ? 'right' : 'bottom'
+}
+
+/** Pane content the dock must never eat: the tab rail plus a few visible rows.
+ *  Without a floor the dock could be dragged to the pane's full height and the
+ *  pane would look empty. */
+export const MIN_PANE_CONTENT_HEIGHT = 160
+
+/**
+ * Height the side dock may claim inside a pane of `paneHeight` px. The stored
+ * height wins, but never so far that the pane's own content disappears — the
+ * whole point of docking the terminal into the pane is seeing both. Pure, so
+ * the rule is testable without a DOM.
+ */
+export function resolveTerminalDockHeight(height: number, paneHeight: number): number {
+  const wanted = clampTerminalHeight(height)
+  if (!Number.isFinite(paneHeight) || paneHeight <= 0) return wanted
+  const room = Math.max(MIN_TERMINAL_HEIGHT, Math.round(paneHeight) - MIN_PANE_CONTENT_HEIGHT)
+  return Math.min(wanted, room)
+}
+
 // Lightweight debounced write for panel visibility toggles (sidebar / right
 // panel). A toggle must feel instant: it only flips a boolean in
 // memory and schedules a settings-only write in the background — never the
@@ -673,8 +793,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -759,7 +879,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -775,7 +895,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -795,6 +915,8 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
 
 // Per-chat in-memory undo/redo stacks (not persisted). An "exchange" is a user
 // message plus every message that follows it (usually one assistant reply).
+/** How many removed exchanges stay replayable per chat. */
+const MAX_REDO_EXCHANGES = 20
 const historyStacks = new Map<string, { undo: ChatMessage[][]; redo: ChatMessage[][] }>()
 function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][] } {
   let st = historyStacks.get(chatId)
@@ -969,6 +1091,13 @@ interface State {
   /** Bottom terminal panel (Cmd/Ctrl+J). Persisted in localStorage like
    *  chatFullscreen, NOT in the settings payload. Sessions survive hiding. */
   terminalPanelOpen: boolean
+  /** Requested dock for the terminal (bottom vs the right side pane). The
+   *  effective dock is resolveTerminalPlacement(...) — see setTerminalPlacement. */
+  terminalPlacement: TerminalPlacement
+  /** Dock height in px (localStorage `coder:terminalHeight`). Held here, not in
+   *  the panel: App reserves the SAME strip as padding on the side pane, so both
+   *  sides must read one number. */
+  terminalHeight: number
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
   /** Chat ids pinned to the top of their workspace group (most-recently-pinned first). */
@@ -1083,6 +1212,11 @@ interface State {
   terminalFullscreen: boolean
   setTerminalFullscreen: (v: boolean) => void
   toggleTerminalFullscreen: () => void
+  /** Move the terminal between the bottom dock and the right side pane. */
+  setTerminalPlacement: (placement: TerminalPlacement) => void
+  toggleTerminalPlacement: () => void
+  /** Set the dock height (drag). Clamped by clampTerminalHeight. */
+  setTerminalHeight: (px: number) => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
@@ -1103,6 +1237,10 @@ interface State {
   sttModel: string
   /** Ordered STT fallback targets, tried after the primary STT source fails. */
   sttFallbacks: SttFallback[]
+  /** STT language hint ('fa', 'en', …). Empty = auto (RTL UI implies Persian). */
+  sttLanguage: string
+  /** Extra STT prompt/glossary appended to the per-language default prompt. */
+  sttPrompt: string
   /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
   ttsProviderId: string
   /** Remote TTS model id sent to {base_url}/audio/speech. */
@@ -1111,9 +1249,21 @@ interface State {
   ttsVoice: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks: TtsFallback[]
+  /** Realtime (speech-to-speech) provider id. Empty = live voice runs the
+   *  chunked STT + TTS pipeline instead of a realtime session. */
+  liveProviderId: string
+  /** Realtime model id sent to the session mint (e.g. gpt-realtime). */
+  liveModel: string
+  /** Realtime voice id sent to the session mint (e.g. alloy). */
+  liveVoice: string
   setSttProviderId: (id: string) => void
   setSttModel: (m: string) => void
   setSttFallbacks: (f: SttFallback[]) => void
+  setSttLanguage: (l: string) => void
+  setSttPrompt: (p: string) => void
+  setLiveProviderId: (id: string) => void
+  setLiveModel: (m: string) => void
+  setLiveVoice: (v: string) => void
   setTtsProviderId: (id: string) => void
   setTtsModel: (m: string) => void
   setTtsVoice: (v: string) => void
@@ -1235,6 +1385,7 @@ interface State {
   /** Transient compact/command/stall banners, stored per-chat so they survive
    *  the ChatPanel remount on chat switch (same rationale as pendingAsk). */
   setChatCompacting: (id: string, compacting: boolean) => void
+  setChatCompactProgress: (id: string, progress: Chat['compactProgress']) => void
   setChatCompactNotice: (id: string, notice: string | null) => void
   setChatCompactError: (id: string, error: string | null) => void
   setChatCmdError: (id: string, error: string | null) => void
@@ -1335,6 +1486,15 @@ interface State {
    *  chats to run concurrently). */
   chatAborts: Record<string, AbortController | null>
   setChatAbort: (chatId: string, abort: AbortController | null) => void
+  /** Chat ids whose agent turn is LIVE right now (the SSE socket is open or the
+   *  agent is still working). Unlike the message-level `streaming` flag — which
+   *  is cleared between turns, on a socket drop and on a mid-stream persist —
+   *  and unlike a component-local `busyMap` (lost when `<ChatPanel>` remounts on
+   *  a chat switch), this lives in the store and is only cleared when the turn
+   *  actually settles. The composer reads it so the Stop button cannot vanish
+   *  while the agent is still working. */
+  chatBusy: Record<string, true>
+  setChatBusy: (chatId: string, busy: boolean) => void
 }
 
 /**
@@ -1403,6 +1563,41 @@ export function selectLoadedChats(
 /** How many hydrated chat bodies stay resident (most-recently-open first). */
 const HYDRATED_CHAT_CAP = 10
 
+/** Byte budget for the resident transcripts, on top of the count cap above.
+ *
+ *  Bodies are per-chat files that can reach several megabytes each (screenshots
+ *  plus untruncated tool output), so ten of them is not a memory bound: on a
+ *  real profile the ten largest bodies alone were ~35 MB of text, and the parsed
+ *  objects cost several times the text. Dropping a body is free — it is one
+ *  local file read away through `chatGet`, which is why a chat reopens with no
+ *  visible delay — so the budget only decides what stays warm.
+ */
+const HYDRATED_BYTE_BUDGET = 24 * 1024 * 1024
+
+/** Approximate in-memory weight of a chat body, by summing string lengths.
+ *
+ *  Deliberately allocation-free (no `JSON.stringify` of a multi-MB body just to
+ *  measure it) and depth-limited: it only has to RANK bodies well enough for the
+ *  eviction loop, not be exact. */
+function approxBytes(v: unknown, depth = 0): number {
+  if (typeof v === 'string') return v.length
+  if (typeof v === 'number' || typeof v === 'boolean') return 8
+  if (!v || typeof v !== 'object' || depth > 3) return 16
+  if (Array.isArray(v)) {
+    let n = 0
+    for (const item of v) n += approxBytes(item, depth + 1)
+    return n
+  }
+  let n = 0
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    n += k.length + approxBytes(val, depth + 1)
+  }
+  return n
+}
+
+/** Measured weight of each resident body, keyed by chat id (not persisted). */
+const bodyBytes = new Map<string, number>()
+
 /** In-flight body fetches, keyed by chat id (single-flight). */
 const hydratePromises = new Map<string, Promise<void>>()
 
@@ -1415,12 +1610,16 @@ const hydratePromises = new Map<string, Promise<void>>()
  */
 function applyChatBody(body: Chat): void {
   const src = body as Chat & { messages?: ChatMessage[] }
+  const messages = Array.isArray(src.messages) ? src.messages : []
+  // Remember the body's weight for the byte-budget eviction below. Cheap
+  // (string lengths only) and recomputed on every (re)load. Done outside the
+  // state updater so the measurement is not re-run when React replays it.
+  bodyBytes.set(body.id, approxBytes(messages))
   useStore.setState((s) => {
     let changed = false
     const chats = s.chats.map((c) => {
       if (c.id !== body.id) return c
       changed = true
-      const messages = Array.isArray(src.messages) ? src.messages : []
       return {
         ...body,
         mode: src.mode ? normalizeMode(src.mode) : c.mode,
@@ -1451,15 +1650,23 @@ function evictChatBodies(): void {
   // Let the pending flush land first; eviction happens on the next hydrate.
   if (persistTimer) return
   const keep = new Set<string>([s.activeChatId, ...s.openChatIds, ...s.visibleChatIds])
-  const candidates = s.chats.filter((c) => c.hydrated === true && !keep.has(c.id))
-  if (candidates.length <= HYDRATED_CHAT_CAP) return
-  const drop = new Set(
-    candidates
-      .slice()
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-      .slice(HYDRATED_CHAT_CAP)
-      .map((c) => c.id),
-  )
+  const candidates = s.chats
+    .filter((c) => c.hydrated === true && !keep.has(c.id))
+    // Most recently used first: the tail of this list is what gets dropped.
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+  if (candidates.length <= HYDRATED_CHAT_CAP) {
+    const total = candidates.reduce((n, c) => n + (bodyBytes.get(c.id) ?? 0), 0)
+    if (total <= HYDRATED_BYTE_BUDGET) return
+  }
+  // Drop past the count cap AND past the byte budget: a handful of huge bodies
+  // must not survive just because it is fewer than ten of them.
+  const drop = new Set<string>()
+  let bytes = 0
+  candidates.forEach((c, i) => {
+    bytes += bodyBytes.get(c.id) ?? 0
+    if (i >= HYDRATED_CHAT_CAP || bytes > HYDRATED_BYTE_BUDGET) drop.add(c.id)
+  })
+  for (const id of drop) bodyBytes.delete(id)
   useStore.setState((st) => ({
     chats: st.chats.map((c) =>
       drop.has(c.id)
@@ -1597,10 +1804,15 @@ export const useStore = create<State>((set, get) => ({
   sttProviderId: '',
   sttModel: 'whisper-1',
   sttFallbacks: [],
+  sttLanguage: 'fa',
+  sttPrompt: '',
   ttsProviderId: '',
   ttsModel: 'tts-1',
   ttsVoice: 'alloy',
   ttsFallbacks: [],
+  liveProviderId: '',
+  liveModel: '',
+  liveVoice: '',
   recentModels: [],
   subagentModels: {},
   subagentThinking: {},
@@ -1612,6 +1824,8 @@ export const useStore = create<State>((set, get) => ({
   rightPanelOpen: false,
   terminalPanelOpen: typeof window !== 'undefined' ? loadTerminalPanel() : false,
   terminalFullscreen: typeof window !== 'undefined' ? loadTerminalFullscreen() : false,
+  terminalPlacement: typeof window !== 'undefined' ? loadTerminalPlacement() : 'bottom',
+  terminalHeight: typeof window !== 'undefined' ? loadTerminalHeight() : DEFAULT_TERMINAL_HEIGHT,
   dataPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
@@ -1656,6 +1870,18 @@ export const useStore = create<State>((set, get) => ({
   chatAborts: {},
   setChatAbort: (chatId, abort) =>
     set((s) => ({ chatAborts: { ...s.chatAborts, [chatId]: abort } })),
+  chatBusy: {},
+  setChatBusy: (chatId, busy) =>
+    set((s) => {
+      const isBusy = s.chatBusy[chatId] === true
+      if (busy === isBusy) return {}
+      if (busy) {
+        return { chatBusy: { ...s.chatBusy, [chatId]: true as const } }
+      }
+      const next = { ...s.chatBusy }
+      delete next[chatId]
+      return { chatBusy: next }
+    }),
 
   load: async () => {
     const [settings, chats, deletedProviders] = await Promise.all([
@@ -1713,6 +1939,7 @@ export const useStore = create<State>((set, get) => ({
       // `stalled` would show a stale loading banner forever.
       const clean = { ...c }
       delete clean.compacting
+      delete clean.compactProgress
       delete clean.compactNotice
       delete clean.compactError
       delete clean.cmdError
@@ -1758,9 +1985,17 @@ export const useStore = create<State>((set, get) => ({
       // present here from a pre-migration settings.json — then `hydrated` is
       // true and nothing needs fetching.
       const withMode = next.mode ? { ...next, mode: normalizeMode(next.mode) } : next
+      // Index rows loaded from disk still carry dead queue copies (they were
+      // persisted before the prune below existed) and, on a pre-migration
+      // settings.json, a whole transcript. Prune the queue here as well so the
+      // very first in-memory state is already clean, and record the body weight
+      // of anything that arrived hydrated so eviction can size it.
+      const queued = pruneQueued(withMode.queued)
+      const base = queued === withMode.queued ? withMode : { ...withMode, queued }
+      if (Array.isArray(next.messages)) bodyBytes.set(base.id, approxBytes(next.messages))
       return {
-        ...withMode,
-        messages: Array.isArray(withMode.messages) ? withMode.messages : [],
+        ...base,
+        messages: Array.isArray(base.messages) ? base.messages : [],
         hydrated: Array.isArray(next.messages),
       }
     }) as Chat[]
@@ -2019,6 +2254,9 @@ export const useStore = create<State>((set, get) => ({
           : '',
       sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
       sttFallbacks: normalizeSttFallbacks((raw as Record<string, unknown>).sttFallbacks),
+      // Empty means "auto": resolveSttLanguage() then follows the UI direction.
+      sttLanguage: typeof raw.sttLanguage === 'string' ? raw.sttLanguage.trim().toLowerCase() : 'fa',
+      sttPrompt: typeof raw.sttPrompt === 'string' ? raw.sttPrompt : '',
       ttsProviderId:
         typeof raw.ttsProviderId === 'string' && raw.ttsProviderId.trim() !== 'local'
           ? raw.ttsProviderId.trim()
@@ -2028,9 +2266,18 @@ export const useStore = create<State>((set, get) => ({
       ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
+      // Realtime speech-to-speech. All three empty means "not configured",
+      // which makes live voice use the chunked STT + TTS pipeline instead.
+      liveProviderId: typeof raw.liveProviderId === 'string' ? raw.liveProviderId.trim() : '',
+      liveModel: typeof raw.liveModel === 'string' ? raw.liveModel.trim() : '',
+      liveVoice: typeof raw.liveVoice === 'string' ? raw.liveVoice.trim() : '',
       subagentModels: (() => {
         if (typeof raw.subagentModels !== 'object' || raw.subagentModels === null) return {};
-        return { ...(raw.subagentModels as Record<string, string>) };
+        // One Tools → "Other" row stores ONE model under compact / web / title,
+        // but each consumer reads a single key. Fill the keys that were left
+        // behind so the commit message and the title generator cannot keep
+        // running on the main model while the settings row shows the picked one.
+        return withOtherSlotsFilled(raw.subagentModels as Record<string, string>);
       })(),
       subagentThinking: (() => {
         // Absent (fresh install / never saved) → seed the first-boot defaults:
@@ -2513,6 +2760,29 @@ export const useStore = create<State>((set, get) => ({
     set({ sttFallbacks: normalizeSttFallbacks(f) })
     get().persist()
   },
+  setSttLanguage: (l) => {
+    // Empty is a real choice (= auto-detect); it must not snap back to 'fa'.
+    set({ sttLanguage: (l ?? '').trim().toLowerCase() })
+    get().persist()
+  },
+  setSttPrompt: (p) => {
+    set({ sttPrompt: p ?? '' })
+    get().persist()
+  },
+  setLiveProviderId: (id) => {
+    // Empty is allowed (= no realtime provider): live voice then falls back to
+    // the chunked STT + TTS pipeline, which works with any STT provider.
+    set({ liveProviderId: (id ?? '').trim() })
+    get().persist()
+  },
+  setLiveModel: (m) => {
+    set({ liveModel: (m ?? '').trim() })
+    get().persist()
+  },
+  setLiveVoice: (v) => {
+    set({ liveVoice: (v ?? '').trim() })
+    get().persist()
+  },
   setTtsProviderId: (id) => {
     set({ ttsProviderId: (id ?? '').trim() })
     get().persist()
@@ -2630,6 +2900,26 @@ export const useStore = create<State>((set, get) => ({
 
   toggleTerminalFullscreen: () => {
     get().setTerminalFullscreen(!get().terminalFullscreen)
+  },
+
+  setTerminalPlacement: (terminalPlacement) => {
+    // Fullscreen floats over everything, so a dock change while fullscreen
+    // would be invisible — leave fullscreen instead of applying it silently.
+    if (terminalPlacement === 'right' && get().terminalFullscreen) {
+      get().setTerminalFullscreen(false)
+    }
+    persistTerminalPlacement(terminalPlacement)
+    set({ terminalPlacement })
+  },
+
+  toggleTerminalPlacement: () => {
+    get().setTerminalPlacement(get().terminalPlacement === 'right' ? 'bottom' : 'right')
+  },
+
+  setTerminalHeight: (px) => {
+    const next = clampTerminalHeight(px)
+    persistTerminalHeight(next)
+    set({ terminalHeight: next })
   },
 
   setRecentModels: (recentModels) => {
@@ -2805,6 +3095,8 @@ export const useStore = create<State>((set, get) => ({
       const chatWindowSizes = mirrors.chatWindowSizes
       const chatAborts = { ...s.chatAborts }
       delete chatAborts[id]
+      const chatBusy = { ...s.chatBusy }
+      delete chatBusy[id]
       return {
         chats,
         activeChatId,
@@ -2813,6 +3105,7 @@ export const useStore = create<State>((set, get) => ({
         chatWindowSizes,
         chatTree,
         chatAborts,
+        chatBusy,
         deletedChatIds: [...s.deletedChatIds, id],
         pinnedChats: s.pinnedChats.filter((k) => k !== id),
         unreadChats: s.unreadChats.filter((cid) => cid !== id),
@@ -4030,7 +4323,19 @@ export const useStore = create<State>((set, get) => ({
 
   setChatCompacting: (id, compacting) => {
     set((s) => ({
-      chats: s.chats.map((c) => (c.id === id ? { ...c, compacting } : c)),
+      chats: s.chats.map((c) =>
+        // Clearing the flag also drops the progress, so a later compaction can
+        // never inherit a stale phase/elapsed pair from the previous run.
+        c.id === id
+          ? { ...c, compacting, compactProgress: compacting ? c.compactProgress : null }
+          : c,
+      ),
+    }))
+  },
+
+  setChatCompactProgress: (id, compactProgress) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, compactProgress } : c)),
     }))
   },
 
@@ -4304,10 +4609,16 @@ export const useStore = create<State>((set, get) => ({
     const removed = chat.messages.slice(idx)
     const st = stackFor(chat.id)
     // Move the exchange onto the redo stack rather than a separate undo list:
-    // redo must be able to replay exactly what this undo removed. Any earlier
-    // redo entries were taken from a different history state, so they are
-    // dropped (only the newest removed exchange is replayable).
+    // redo must be able to replay exactly what this undo removed. Repeated
+    // /undo calls stack up, so multi-step redo replays them newest-first.
     st.redo.push(removed)
+    // Bound the stack. Each entry is an exchange sliced out of the transcript
+    // (a large assistant reply carries its whole text), and nothing ever
+    // trimmed this list, so a long undo/redo session grew it without limit.
+    // Twenty exchanges is far more redo depth than a chat UI needs.
+    if (st.redo.length > MAX_REDO_EXCHANGES) {
+      st.redo.splice(0, st.redo.length - MAX_REDO_EXCHANGES)
+    }
     set((stt) => ({
       chats: stt.chats.map((c) =>
         c.id === chat.id ? { ...c, messages: c.messages.slice(0, idx), updatedAt: Date.now() } : c,

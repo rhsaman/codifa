@@ -719,6 +719,17 @@ fn drop_driver(chat: &str) {
     }
 }
 
+/// Forget a chat's driver from outside this module (called when the browser
+/// reaps that chat's tab).
+///
+/// The cached driver holds a CDP WebSocket and the page snapshots it collected;
+/// once its target is closed it can never answer again, so keeping it is a
+/// retained allocation plus a ref table that will never resolve. Only the
+/// module's own `drop_driver` knew how to release it.
+pub(crate) fn forget(chat: &str) {
+    drop_driver(&chat_key(chat));
+}
+
 /// Run `f` with the chat's driver, reconnecting ONCE when the connection turns
 /// out to be dead (the browser was reaped, the tab was closed, the renderer
 /// swapped processes on a cross-site navigation).

@@ -355,13 +355,19 @@ export function resolveToolResult(
 }
 
 /** Tools whose native result is plain prose with no file paths (LSP lookups,
- *  memory search, explore reports). `filesFromNativeResult` returns null
- *  for them, so their text is kept verbatim in `ToolActivity.resultText` and
- *  rendered as-is — without this the whole result was dropped and the card
- *  showed no output at all. For explore this text is also the ONLY record
- *  of the findings: the backend's history recap reads `resultText` to tell the
- *  next turn what was already researched (see history_recap in agent.rs), so
- *  dropping it made the main agent re-delegate the same question. */
+ *  memory search, explore reports) — plus `read`, whose result is the file
+ *  content itself. `filesFromNativeResult` returns null for the prose tools, so
+ *  their text is kept verbatim in `ToolActivity.resultText` and rendered as-is;
+ *  without this the whole result was dropped and the card showed no output at
+ *  all. For explore this text is also the ONLY record of the findings: the
+ *  backend's history recap reads `resultText` to tell the next turn what was
+ *  already researched (see history_recap in agent.rs), so dropping it made the
+ *  main agent re-delegate the same question.
+ *
+ *  `read` is the special case: `filesFromNativeResult` DOES give it a chip (the
+ *  path), but only the path — the window it returned is nowhere else in the
+ *  activity, so a read row in the explore panel expanded to nothing. Keep the
+ *  text and let the renderers drop the redundant path chip when both exist. */
 export const TEXT_RESULT_TOOLS = new Set([
   "find_symbol",
   "lsp_symbols",
@@ -372,6 +378,7 @@ export const TEXT_RESULT_TOOLS = new Set([
   "search_memory",
   "save_memory",
   "explore",
+  "read",
 ]);
 
 /** Tools whose result rows come from the BACKEND as structured JSON
@@ -477,6 +484,36 @@ export function terminalOutputText(items: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+/** True when every row only carries the path the tool was GIVEN — no output of
+ *  its own. `terminalOutputText` falls back to `row.file`, so such rows print
+ *  the bare path as if it were the result: a `read` row showed its own filename
+ *  and nothing else, which looked like the read had returned nothing. */
+export function pathOnlyItems(items: unknown): boolean {
+  if (!Array.isArray(items) || items.length === 0) return false;
+  return items.every((row) => {
+    if (!row || typeof row !== "object") return false;
+    const r = row as Record<string, unknown>;
+    const body = r.content ?? r.snippet ?? r.text ?? r.title ?? r.url ?? r.path;
+    return body === undefined || body === null || String(body) === "";
+  });
+}
+
+/** Everything one tool call produced, as one block: search/terminal output, a
+ *  diff, or prose/source text. `read` is the case this guards — it carries BOTH
+ *  a path row (from its args) and the file window in `resultText`, so printing
+ *  the rows first buried the content under a bare filename. */
+export function toolCallBody(activity: ToolActivity): string {
+  const parts: string[] = [];
+  const items = activity.items ?? activity.results;
+  if (!(activity.resultText && pathOnlyItems(items))) {
+    const out = terminalOutputText(items);
+    if (out) parts.push(out);
+  }
+  if (activity.diff) parts.push(activity.diff);
+  if (activity.resultText) parts.push(activity.resultText);
+  return parts.join("\n\n");
 }
 
 /**

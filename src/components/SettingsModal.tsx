@@ -13,6 +13,8 @@ import { THEMES } from '../lib/themes'
 import { RangeSlider } from './RangeSlider'
 import { ProviderModelSelect } from './ProviderModelSelect'
 import { supportsReasoning } from '../lib/thinking'
+import { STT_LANGUAGES } from '../lib/stt'
+import { OTHER_SLOTS, otherSlotLevel, otherSlotModel } from '../lib/toolSlots'
 import { modelReasoning } from '../lib/context'
 import {
   THINKING_OPTIONS,
@@ -432,7 +434,8 @@ function PluginEditor() {
           One number for every <b>web_search</b>: how many results it returns, and how many of
           those top results get their <b>real page content</b> fetched (not just a snippet)
           before the result distiller reads them. <code>0</code> still returns results but skips
-          the page fetch, so the model only sees snippets. Default: <code>5</code>.
+          the page fetch, so the model only sees snippets. Range <code>0</code>–
+          <code>10</code>; values outside it are clamped. Default: <code>5</code>.
         </div>
         <div className="settings-row-control" style={{ marginTop: 10 }}>
           <input
@@ -515,6 +518,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setSttModel = useStore((s) => s.setSttModel)
   const sttFallbacks = useStore((s) => s.sttFallbacks)
   const setSttFallbacks = useStore((s) => s.setSttFallbacks)
+  const sttLanguage = useStore((s) => s.sttLanguage)
+  const setSttLanguage = useStore((s) => s.setSttLanguage)
+  const sttPrompt = useStore((s) => s.sttPrompt)
+  const setSttPrompt = useStore((s) => s.setSttPrompt)
+  const liveProviderId = useStore((s) => s.liveProviderId)
+  const setLiveProviderId = useStore((s) => s.setLiveProviderId)
+  const liveModel = useStore((s) => s.liveModel)
+  const setLiveModel = useStore((s) => s.setLiveModel)
+  const liveVoice = useStore((s) => s.liveVoice)
+  const setLiveVoice = useStore((s) => s.setLiveVoice)
   const ttsProviderId = useStore((s) => s.ttsProviderId)
   const ttsModel = useStore((s) => s.ttsModel)
   const ttsVoice = useStore((s) => s.ttsVoice)
@@ -533,11 +546,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   // so one row writes/reads all three at once. `web` is consumed in Rust by
   // `run_web_distill` — it distils the fetched web_search results so the main
   // agent's context stays lean (with no model set, the raw results are used).
-  const OTHER_SLOTS = ['compact', 'web', 'title'] as const
-  const otherModel =
-    OTHER_SLOTS.map((k) => subagentModels[k] || '').find((v) => v) ?? ''
-  const otherLevel =
-    OTHER_SLOTS.map((k) => subagentThinking[k] || '').find((v) => v) ?? 'none'
+  // The slot list lives in `lib/toolSlots.ts` so every consumer (commit
+  // message, title generator, compactor) reads the SAME group instead of one
+  // hardcoded key.
+  const otherModel = otherSlotModel(subagentModels)
+  const otherLevel = otherSlotLevel(subagentThinking)
   const setOtherModel = (_agent: string, model: string) => {
     for (const k of OTHER_SLOTS) setSubagentModel(k, model)
   }
@@ -812,6 +825,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       ...(deleted.length > 0 ? { deletedFiles: deleted } : {}),
     })
     setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
+    if (res.ok && (res.fa_keyword_count ?? 0) === 0) {
+      // Without keywords the skill is invisible to auto-match: the catalog line
+      // is the only trigger, and the settings list gives no other signal.
+      setSkillsMsg(
+        'Saved ✓ but no Persian keywords: this skill will never be auto-selected from a request. Add keywords above.',
+      )
+    }
     if (res.ok) {
       const savedName = res.name || newName
       const renamed = name === NEW_SKILL_KEY || name !== savedName
@@ -2392,6 +2412,31 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       <label className="field-label">STT model</label>
                     <input value={sttModel} onChange={(e) => setSttModel(e.target.value)} dir="ltr" placeholder="whisper-1" />
                     </div>
+                    <div className="voice-field">
+                      <label className="field-label">STT language</label>
+                    <select value={sttLanguage ?? ''} onChange={(e) => setSttLanguage(e.target.value)} dir="ltr">
+                      {STT_LANGUAGES.map((l) => (
+                        <option key={l.code || 'auto'} value={l.code}>
+                          {l.label}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="hint">
+                      بدون زبان صریح، Whisper روی کلیپ‌های کوتاه زبان را اشتباه تشخیص می‌دهد و کلمات فارسی خراب می‌شوند.
+                    </div>
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">STT prompt (optional)</label>
+                    <textarea
+                      value={sttPrompt ?? ''}
+                      onChange={(e) => setSttPrompt(e.target.value)}
+                      rows={2}
+                      placeholder="مثال: کوئرا، رفیوژ، نیم‌فاصله، اسم‌های خاص"
+                    />
+                    <div className="hint">
+                      فقط <b>فهرست واژه‌ها</b> بنویس، نه جملهٔ دستوری. Whisper متن prompt را «حرف قبلی» فرض می‌کند و آن را ادامه می‌دهد؛ پس یک جملهٔ کامل مثل «متن را با املای درست بنویس» به‌جای صدای شما تایپ می‌شود.
+                    </div>
+                    </div>
                   </div>
                   <div className="voice-fallbacks">
                   <label className="field-label">STT fallbacks</label>
@@ -2483,6 +2528,41 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                   ))}
                   <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>+ Add TTS fallback</button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Live voice</span>
+                    <span className="model-card-desc">Speech-to-speech conversation</span>
+                  </div>
+                </div>
+                <div className="model-card-body">
+                  <div className="voice-section">
+                    <div className="voice-field">
+                      <label className="field-label">Realtime provider (optional)</label>
+                    <select value={liveProviderId} onChange={(e) => setLiveProviderId(e.target.value)} dir="ltr">
+                      <option value="">Not selected — chunked STT + TTS</option>
+                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="hint">
+                      با انتخاب پروایدر، حالت live voice تمام‌دوطرفه (realtime) روی همان پروایدر اجرا می‌شود — هر endpoint سازگار با OpenAI realtime، نه فقط OpenAI. خالی بماند، حالت چانکی با هر پروایدر STT/TTS کار می‌کند.
+                    </div>
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">Realtime model</label>
+                    <input value={liveModel} onChange={(e) => setLiveModel(e.target.value)} dir="ltr" placeholder="gpt-realtime" />
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">Realtime voice</label>
+                    <input value={liveVoice} onChange={(e) => setLiveVoice(e.target.value)} dir="ltr" placeholder="alloy" />
+                    </div>
                   </div>
                 </div>
               </div>

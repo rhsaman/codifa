@@ -10,8 +10,18 @@
      and the card frame (--bg-panel), so the body reads as recessed vs the
      frame without leaving the theme palette. */
   --bg-inset: color-mix(in srgb, var(--bg) 60%, var(--bg-panel) 40%);
-  /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs). */
-  --bg-raised: #403d52;
+  /* Raised surface for inner tool surfaces (sub-lists, cascade cards, diffs).
+     Derived from the theme like --bg-inset: no theme defines --bg-raised, so a
+     literal here would stay Rose Pine under every palette (the terminal
+     scrollbar was the visible symptom). */
+  --bg-raised: color-mix(in srgb, var(--bg-hover) 76%, var(--border) 24%);
+  /* Raised surface for card-like rows (web-result links). `--bg-elev` was
+     referenced by `.web-result-link` but never DEFINED anywhere, so both
+     `background: color-mix(…, var(--bg-elev))` declarations were invalid and
+     the cards rendered fully transparent — no card surface at all. Derived
+     from the theme (like --bg-raised) so every palette gets its own lift
+     instead of a literal that would stay Rose Pine everywhere. */
+  --bg-elev: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
   --bg-input: #26233a;
   --bg-hover: #403d52;
   --border: #524f67;
@@ -470,6 +480,7 @@ textarea {
 .file-viewer-body,
 .plan-panel-body,
 .review-files,
+.files-list,
 .browser-stage,
 .codemap-tree,
 .tab-bar.viewer-tabs,
@@ -487,6 +498,7 @@ textarea {
 .file-viewer-body:hover,
 .plan-panel-body:hover,
 .review-files:hover,
+.files-list:hover,
 .browser-stage:hover,
 .codemap-tree:hover,
 .tab-bar.viewer-tabs:hover,
@@ -503,6 +515,7 @@ textarea {
 .file-viewer-body::-webkit-scrollbar-thumb,
 .plan-panel-body::-webkit-scrollbar-thumb,
 .review-files::-webkit-scrollbar-thumb,
+.files-list::-webkit-scrollbar-thumb,
 .browser-stage::-webkit-scrollbar-thumb,
 .codemap-tree::-webkit-scrollbar-thumb,
 .tab-bar.viewer-tabs::-webkit-scrollbar-thumb,
@@ -519,6 +532,7 @@ textarea {
 .file-viewer-body:hover::-webkit-scrollbar-thumb,
 .plan-panel-body:hover::-webkit-scrollbar-thumb,
 .review-files:hover::-webkit-scrollbar-thumb,
+.files-list:hover::-webkit-scrollbar-thumb,
 .browser-stage:hover::-webkit-scrollbar-thumb,
 .codemap-tree:hover::-webkit-scrollbar-thumb,
 .tab-bar.viewer-tabs:hover::-webkit-scrollbar-thumb,
@@ -2800,6 +2814,20 @@ textarea {
 .mermaid-block svg {
   max-width: 100%;
   height: auto;
+}
+
+/* Static stand-in shown while the mermaid engine chunk loads and until the
+   block scrolls into view. It keeps the layout from jumping when the SVG
+   lands (the real block is a padded box). */
+.mermaid-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 72px;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: default;
 }
 
 /* Fallback while the assistant is still streaming an incomplete diagram: show
@@ -5362,6 +5390,58 @@ body.coder-dragging .chat-split-child {
 .composer-footer .ctx-ring-wrap {
   margin-inline-start: 0;
   align-self: center;
+}
+
+/* Live voice sits at the end of the footer cluster (next to the context ring).
+   It keeps the same borderless ghost treatment it had in the input row — no
+   ring, outline, background or shadow on any state — and matches the 28px
+   context ring so the footer row stays level. The mic picker still anchors to
+   .live-btn-wrap, which is position:relative, so its popover opens upward from
+   the footer exactly as before. */
+.composer-footer .live-btn-wrap {
+  margin-inline-start: 2px;
+  align-self: center;
+}
+.composer-footer .icon-btn.live-btn {
+  width: 26px;
+  height: 26px;
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  color: var(--text-dim);
+}
+.composer-footer .icon-btn.live-btn:hover,
+.composer-footer .icon-btn.live-btn:active,
+.composer-footer .icon-btn.live-btn:focus {
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  color: var(--text);
+}
+.composer-footer .icon-btn.live-btn.live-active {
+  color: var(--accent);
+}
+/* Keep a real focus indicator: a keyboard user must be able to see where they
+   are. Only the mouse/active ring is suppressed, never :focus-visible. */
+.composer-footer .icon-btn.live-btn:focus-visible,
+.composer-footer .live-chev-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+}
+.composer-footer .live-chev-btn {
+  height: 24px;
+}
+/* The chevron keeps the ghost treatment too: its base .live-chev-btn:hover
+   paints a grey block, which reads as a chip inside the flat footer row. */
+.composer-footer .live-chev-btn:hover,
+.composer-footer .live-chev-btn:active {
+  background: transparent;
+  color: var(--text);
 }
 
 .composer-left {
@@ -8341,12 +8421,60 @@ body.coder-dragging .chat-split-child {
   padding: 0 12px;
   border-radius: 10px;
   font-size: 13px;
+  /* Self-sufficient well: today these fields sit inside `.field`, which is
+     what used to supply the dark surface. Declaring it here keeps the card
+     correct wherever it is mounted. */
+  background: var(--bg-input);
+  color: var(--text);
 }
 
 .voice-field select:disabled,
 .voice-field input:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* The multi-line prompt fields (STT glossary) are plain textareas with no
+   class, and `.field input` / `.field select` never matched them — so they
+   kept the browser's default white surface while every sibling field was a
+   dark well. Same borderless-well recipe as the inputs beside them, but with
+   the sans face and a roomier line height, since this is prose, not code. */
+.voice-field textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  min-height: 56px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: none;
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.2s ease;
+}
+
+.voice-field textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.voice-field textarea:hover {
+  background-color: color-mix(in srgb, var(--bg-input) 93%, var(--text) 7%);
+}
+
+.voice-field textarea:focus {
+  background-color: color-mix(in srgb, var(--bg-input) 96%, var(--text) 4%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .voice-fallbacks {
@@ -10837,6 +10965,116 @@ body.coder-dragging .chat-split-child {
     0 4px 12px -6px rgba(0, 0, 0, 0.3);
 }
 
+/* Auto-matched skills: a quiet metadata row, not a row of filled pills.
+   Rendered as one dim line so several matches never compete with the answer;
+   the dimmed dot leader takes the remaining width instead of the row spilling. */
+.msg-skills {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.msg-skills-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* fit-content + nowrap: the row is always exactly ONE line, so adding a
+     fourth match can never grow the turn's height. */
+  width: fit-content;
+  max-width: 100%;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  /* Recessive, but still ≈4.5:1 against the panel — metadata should be calm,
+     not illegible. */
+  opacity: 0.7;
+  text-align: start;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.msg-skills-head:hover,
+.msg-skills-head.open,
+.msg-skills-head:focus-visible {
+  opacity: 0.95;
+}
+
+.msg-skills-head:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.msg-skills-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  color: color-mix(in srgb, var(--accent) 60%, var(--text-dim));
+}
+
+.msg-skills-icon svg {
+  display: block;
+}
+
+.msg-skills-label {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* Inline names, clamped to one line: the first match stays readable, the rest
+   fold into an ellipsis instead of pushing the row wider. */
+.msg-skills-preview {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.msg-skills-head .chev {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 8px;
+  opacity: 0.55;
+}
+
+.msg-skills-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.msg-skills-item {
+  font-size: 10.5px;
+  line-height: 1.9;
+  color: var(--text-dim);
+  opacity: 0.95;
+}
+
+.queued-bubble .msg-skills {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
 /* File attachment chips render FileIcon next to the path; no pin glyph. */
 
 /* Input file badge: small compact pill — icon + name + X.
@@ -10956,6 +11194,43 @@ body.coder-dragging .chat-split-child {
     inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.12),
     0 6px 16px -8px rgba(0, 0, 0, 0.35);
+}
+
+/* Reply-quote card ("Replying to …"): shares the paste-card frame but gets an
+   accent tint, because the plain panel fill was indistinguishable from the chat
+   bubble behind it. Everything derives from the theme accent (never a literal
+   colour) so it stays legible on all palettes, dark and light. */
+.paste-card.reply-card {
+  /* Mixed into --bg-panel (not --bg): on light themes the chat surface and the
+     accent are both pale, so a --bg base washed the card out. 42% accent keeps
+     it a distinct, theme-coloured card on every palette (worst-case contrast
+     against the chat surface ≈1.9:1; the old panel fill was ≈1.3:1, i.e. it
+     looked like part of the background). */
+  background: color-mix(in srgb, var(--accent) 42%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 30%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 6px 16px -8px rgba(0, 0, 0, 0.35);
+}
+
+.paste-card.reply-card .paste-card-preview {
+  /* Solid --text (not a dim mix): on the accent-tinted card a dimmed colour
+     fell to ~3.3:1 in nord/light. The quote must stay readable. */
+  color: var(--text);
+  opacity: 0.92;
+}
+
+.paste-card.reply-card .paste-card-badge {
+  /* Chip flips to the theme BACKGROUND colour so it reads as an inset label on
+     the accent card instead of accent-on-accent mush. */
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 62%, transparent);
+}
+
+.paste-card.reply-card .paste-card-x {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .paste-card-preview {
@@ -12452,11 +12727,15 @@ body.coder-dragging .chat-split-child {
   flex: 0 0 auto;
   font-size: 10px;
   font-family: var(--font-mono);
-  padding: 1px 5px;
-  border-radius: 4px;
+  line-height: 1.6;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   color: var(--accent);
-  opacity: 0.8;
+  white-space: nowrap;
+  opacity: 0.9;
+  user-select: none;
 }
 
 .trace-row-end {
@@ -12813,15 +13092,24 @@ body.coder-dragging .chat-split-child {
 }
 
 /* No red/green band behind the code: the tinted row made the source hard to
-   read. The cue is the 3px bare + the −/+ sign on the gutter (rules below). */
+   read. The cue is the 3px bar + the −/+ sign on the gutter (rules below), plus
+   a coloured line under every changed line — an inset box-shadow so the row
+   height does not shift. Same thinness and same faintness as the unified rows:
+   0.5px (one device pixel on HiDPI, the thinnest crisp line) faded 50% toward
+   var(--bg) so both themes read it as a hint, not a rule. See the unified rules
+   for the full reasoning.
+   `.diff-col-code .diff-line` already carries width: max-content / min-width:
+   100%, so long lines stay underlined as well. */
 .diff-line-del {
   background: transparent;
   color: var(--text);
+  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #f85149 50%, var(--bg));
 }
 
 .diff-line-add {
   background: transparent;
   color: var(--text);
+  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #3fb950 50%, var(--bg));
 }
 
 /* Side-by-side cells get the same −/+ marker as the unified rows. */
@@ -12976,7 +13264,12 @@ body.coder-dragging .chat-split-child {
     opacity 0.25s ease,
     border-color 0.25s ease,
     box-shadow 0.25s ease;
-  will-change: transform;
+  /* NO `will-change: transform` here: nothing in this card animates its
+     transform (the transitions above are opacity/border/shadow), but the hint
+     is a permanent PROMISE to the compositor, so every rendered tool call got
+     its own compositor layer plus backing store — dirty graphics memory scaled
+     with tool-call count instead of viewport size. Measured on a long session
+     that is hundreds of MB of "owned unmapped (graphics)" in the renderer. */
 }
 
 /* oldest card sits flush at the top of the cascade */
@@ -13067,12 +13360,56 @@ body.coder-dragging .chat-split-child {
 }
 
 .web-results {
+  /* Caution tone for the "this row/page did not really load" markers, derived
+     from real theme tokens: --danger and --thinking are both defined in :root
+     and overridden per theme. The codebase's --warning is never DEFINED, so
+     relying on it silently fell back to a hardcoded hex. */
+  --web-caution: color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%);
   margin: 6px 0 0;
   padding: 0;
   list-style: none;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Fetch summary above the link list: "N results · M fetched". A web_search
+   whose pages all failed to fetch still looks identical to a perfect one
+   without this line — the model just answered from 200-char snippets. */
+.web-results-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding-inline-start: 2px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-dim, #8a8a8a);
+  opacity: 0.85;
+}
+
+.web-results-count {
+  font-family: var(--font-mono, monospace);
+}
+
+.web-results-sep {
+  opacity: 0.5;
+}
+
+.web-results-fetched {
+  font-family: var(--font-mono, monospace);
+  color: color-mix(in srgb, var(--thinking) 65%, var(--text));
+}
+
+/* Nothing fetched at all is the alarming case, not just a number. */
+.web-results-fetched.none {
+  color: var(--web-caution, color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%));
+  font-weight: 600;
+}
+
+.trace-row-inline-results .web-results-head {
+  margin-top: 0;
 }
 
 /* When the link list sits inside a compact one-line tool row, force it onto
@@ -13083,14 +13420,19 @@ body.coder-dragging .chat-split-child {
 }
 
 /* CODEX-style inline web results: the hits of a `web_search` / `fetch_url` row
-   stay visible right under the row, without expanding it and without the side
-   panel detour — the payload of a search IS those links. Aligned to the head's
+   hang at the bottom of that row's own expanded body. Aligned to the head's
    12px gutter (.trace-row-head / .trace-row-expand) so the list reads as part
-   of the row instead of floating. */
+   of the row. */
 .trace-row-inline-results {
   width: 100%;
   box-sizing: border-box;
   padding: 0 12px 6px;
+}
+
+/* …but inside the expand body the 12px gutter already comes from
+   .trace-row-expand, so the list must not add a second one. */
+.trace-row-expand .trace-row-inline-results {
+  padding: 0;
 }
 
 .trace-row-inline-results .web-results {
@@ -13272,6 +13614,50 @@ body.coder-dragging .chat-split-child {
 .web-result-link:hover .web-result-arrow {
   color: var(--accent);
   transform: translate(1px, -1px);
+}
+
+/* Per-row "snippet" marker: only shown when the real page could NOT be
+   fetched, so the useful rows stay visually quiet. */
+.web-result-fetched {
+  flex: 0 0 auto;
+  align-self: center;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--web-caution, color-mix(in srgb, var(--danger) 55%, var(--thinking) 45%));
+  background: color-mix(in srgb, var(--thinking) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--thinking) 35%, transparent);
+  border-radius: 999px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
+/* "+N more" for the web list: expands IN PLACE (these are clickable links,
+   unlike file paths which open in the side panel). */
+.web-result-more-btn {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 2px 0;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.85;
+  cursor: pointer;
+  transition: color 0.16s ease, opacity 0.16s ease;
+}
+
+.web-result-more-btn:hover {
+  color: var(--accent);
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.web-result-more-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
 }
 
 .revert-btn {
@@ -15106,6 +15492,81 @@ body.coder-dragging .chat-split-child {
   width: 12px;
   height: 12px;
   border-width: 2px;
+}
+
+/* ---- live compaction progress (phase / attempt / elapsed vs. budget) ---- */
+.notice-compact .notice-text {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.notice-compact-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.notice-compact-phase {
+  font-weight: 500;
+}
+
+.notice-compact-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A 3px track, quieter than the 6px context popover bar: this sits inline in a
+   notice and must not out-shout the message list it appears under. */
+.notice-compact-bar {
+  display: block;
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  overflow: hidden;
+}
+
+.notice-compact-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  /* Linear, not eased: the bar is driven by a once-per-second clock, so easing
+     between steps would look like it lags behind the seconds counter. */
+  transition: width 1s linear;
+}
+
+.notice-compact-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.notice-compact-model {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  opacity: 0.75;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Past the budget the bar switches to the warning hue, matching "still waiting
+   for the provider": late, not broken. */
+.notice-compact.notice-warn .notice-compact-bar span {
+  background: var(--thinking);
 }
 
 /* "Still waiting for the provider…" — same warning hue as the context meter
@@ -17724,6 +18185,19 @@ body.coder-dragging .chat-split-child {
   text-align: center;
 }
 
+/* تغییراتِ بیرونِ ورک‌اسپیس پنهان می‌شوند، ولی بی‌صدا نه: این یادداشت می‌گوید
+   چند فایل حذف شده و کجایند، وگرنه کاربر فکر می‌کند تغییراتش گم شده. */
+.review-note {
+  padding: 6px 12px;
+  border-top: 1px solid var(--hairline, rgba(128, 128, 128, 0.12));
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ---- دیف تک‌ستونی کدکس ---- */
 .diff-unified {
   font-family: var(--font-mono);
@@ -17752,6 +18226,37 @@ body.coder-dragging .chat-split-child {
 .diff-u-row.diff-u-add,
 .diff-u-row.diff-u-del {
   background: transparent;
+}
+
+/* Second, independent cue: a coloured line under every changed row. The gutter
+   bar above stays exactly as it was — this only adds the line. It is an inset
+   box-shadow, not border-bottom, so the 1.5em line height and the row rhythm
+   are untouched.
+   Thickness: 0.5px is the floor. On a HiDPI display that is exactly ONE device
+   pixel — the thinnest crisp line a browser can draw. Anything below it stops
+   being thinner and just gets antialiased into a grey smear.
+   Colour: faded toward the row's OWN background with `var(--bg)` instead of a
+   literal transparent or a mix with the text colour. Mixing toward --bg keeps
+   the same faintness in both themes (a mix with the text colour went bright in
+   the dark theme and vanished in the light one). 50% is deliberately low: the
+   real cue that a line changed is the −/+ gutter bar, and this line is only a
+   whisper under the code — it must never compete with it. */
+.diff-unified .diff-u-row.diff-u-add {
+  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #3fb950 50%, var(--bg));
+}
+
+.diff-unified .diff-u-row.diff-u-del {
+  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #f85149 50%, var(--bg));
+}
+
+/* A long line makes the content wider than the viewport: without this the row
+   box (and therefore its underline) stopped at the container edge while the
+   code kept going. max-content + min-width keeps the underline under the whole
+   line and lets .diff-unified's overflow-x do the scrolling. */
+.diff-unified .diff-u-row {
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
 }
 
 /* گاتر علامت +/− با نوار رنگی کناری */
@@ -19301,6 +19806,10 @@ mark.diff-hit-active {
   background: var(--warning);
 }
 
+.trace-panel-dot.kind-fold {
+  background: var(--success);
+}
+
 .trace-panel-title {
   font-size: 12px;
   font-weight: 500;
@@ -19387,6 +19896,11 @@ mark.diff-hit-active {
 .trace-kind-badge.kind-tool {
   color: var(--warning);
   border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.trace-kind-badge.kind-fold {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
 }
 
 .trace-status-chip {
@@ -19490,6 +20004,13 @@ mark.trace-hit-active {
   font-size: 11px;
   color: var(--text-dim);
   min-width: 0;
+}
+
+.trace-empty-body {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 8px 2px;
+  font-style: italic;
 }
 
 .trace-meta-error {
@@ -20497,7 +21018,6 @@ mark.trace-hit-active {
 
 .tab-bar.chat-tabs .editor-tab-new,
 .tab-bar.chat-tabs .editor-tab-full,
-.viewer-add-btn,
 .viewer-pane-full {
   margin: 0;
   width: 30px;
@@ -20522,7 +21042,6 @@ mark.trace-hit-active {
 
 .tab-bar.chat-tabs .editor-tab-new:hover,
 .tab-bar.chat-tabs .editor-tab-full:hover,
-.viewer-add-btn:hover,
 .viewer-pane-full:hover {
   color: var(--text);
   background: color-mix(in srgb, var(--text) 8%, transparent);
@@ -20568,6 +21087,29 @@ mark.trace-hit-active {
   opacity: 0.6;
 }
 
+/* Drop feedback in the chat bar: no insertion line — the dragged tab is
+   re-ordered into its landing slot (inline CSS `order` set by ChatTabBar, so the
+   DOM node never moves mid-drag) and drawn as a muted landing slot, so the user
+   sees the tab itself arriving where it will land. */
+.tab-bar.chat-tabs .editor-tab.drop-before::after,
+.tab-bar.chat-tabs .editor-tab.drop-after::after {
+  display: none;
+}
+
+.tab-bar.chat-tabs .editor-tab.chat-tab.drop-preview {
+  opacity: 0.72;
+  transform: none;
+  box-shadow: none;
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: -2px;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    outline-color 0.12s ease;
+}
+
 /* Viewer tabs: same flat pill shape as chat tabs, no shadow. */
 .tab-bar.viewer-tabs {
   gap: 6px;
@@ -20579,9 +21121,9 @@ mark.trace-hit-active {
   overflow-x: hidden;
 }
 
-/* Side pane header: the viewer tab bar shares one row with the "+" opener
-   and the panel/collapse buttons. The border runs under the whole row and
-   the empty stretch drags the frameless window. */
+/* Side pane header: the viewer tab bar shares one row with the panel and
+   collapse buttons. The border runs under the whole row and the empty stretch
+   drags the frameless window. */
 .viewer-pane-head {
   flex: 0 0 auto;
   display: flex;
@@ -20592,8 +21134,7 @@ mark.trace-hit-active {
   -webkit-app-region: drag;
 }
 
-.viewer-pane-head button,
-.viewer-pane-head .viewer-add-menu {
+.viewer-pane-head button {
   -webkit-app-region: no-drag;
 }
 
@@ -20820,20 +21361,11 @@ mark.trace-hit-active {
   cursor: default;
 }
 
-/* "+" opener for the side pane (opens the add-tab dropdown). It sits directly
-   beside the tab-list chevron with minimal gap, even when no tabs are open. */
-.viewer-add-wrap {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  padding: 0;
-  margin-inline-start: 2px;
-}
 
-/* Empty viewer tabs: collapse the tab strip so the "+" opener stays tight
-   against the tab-list chevron. The flexible spacer stays visible so the
-   right-side panel icons stay pinned to the right corner (chevron + "+" on
-   the left, panel icons on the right). */
+
+/* Empty viewer tabs: collapse the tab strip so nothing claims vertical room
+   in the rail. The flexible spacer stays visible so the layout below the page
+   icons does not shift when the last tab closes. */
 .tab-bar.viewer-tabs:empty {
   flex: 0 0 auto;
   min-width: 0;
@@ -20841,16 +21373,14 @@ mark.trace-hit-active {
   border-bottom: none;
 }
 
-/* Keep the flexible spacer when tabs are empty so right-side icons stay
-   pinned to the right corner (chevron + "+" left, panel icons right). */
+/* Keep the flexible spacer when tabs are empty so the icons above it do not
+   migrate to the bottom edge. */
 .viewer-pane-head:has(.tab-bar.viewer-tabs:empty) .viewer-pane-spacer {
   display: block;
   flex: 1 1 auto;
 }
 
-.viewer-add-menu {
-  min-width: 230px;
-}
+
 
 /* "Open tab" screen — the empty side pane (same entries as the + menu). */
 .viewer-chooser {
@@ -20975,6 +21505,50 @@ mark.trace-hit-active {
   padding: 10px 12px 16px;
 }
 
+/* Full pane pages (todos, schedule): one card per page, capped to a readable
+   width so a wide pane never stretches a card from edge to edge. The scroll
+   box and the outer padding stay on `.panel-pane`. */
+.panel-page .panel-page-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: 760px;
+  min-width: 0;
+  margin: 0 auto;
+}
+
+/* No todos yet: the page keeps the card shell so the pane reads as "empty",
+   not as a rendering failure. */
+.sidebar-panel.todos-empty .sidebar-panel-head {
+  cursor: default;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sidebar-todos-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 14px 18px;
+  text-align: start;
+}
+
+.sidebar-todos-empty-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.sidebar-todos-empty-text {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  max-width: 42ch;
+  overflow-wrap: anywhere;
+}
+
 .tab-bar.viewer-tabs .editor-tab-full {
   margin-left: auto;
   flex: 0 0 auto;
@@ -21054,6 +21628,11 @@ mark.trace-hit-active {
 .viewer-tab.kind-review .viewer-tab-icon {
   background: color-mix(in srgb, var(--link) 14%, transparent);
   color: var(--link);
+}
+
+.viewer-tab.kind-schedule .viewer-tab-icon {
+  background: color-mix(in srgb, var(--thinking) 14%, transparent);
+  color: var(--thinking);
 }
 
 /* Drag & drop reorder states. */
@@ -22126,28 +22705,28 @@ mark.trace-hit-active {
   flex: 0 0 auto;
 }
 
-/* Search hit highlight: substring mark (visible yellow) + row tint.
-   Row tint alone is nearly invisible on white Excel tables. */
+/* Search hit highlight: substring mark + row tint, derived from the theme so
+   it stays legible on dark palettes (a light-yellow row made the light code
+   text vanish). The mark gets a solid-ish tint + forced dark-on-light text so
+   the hit itself always reads, while the row keeps a faint theme tint. */
 .fv-mark,
 mark.fv-mark {
-  background: #ffe066;
-  color: inherit;
+  background: color-mix(in srgb, var(--thinking) 85%, transparent);
+  color: var(--bg);
   border-radius: 2px;
   padding: 0 1px;
 }
 
 tr[data-search-current] .fv-mark,
 .fv-line.search-current .fv-mark {
-  background: #ffb700;
-}
-
-.fv-line.search-match {
-  background: color-mix(in srgb, #ffe066 28%, transparent);
+  background: var(--accent);
+  color: var(--bg);
 }
 
 .fv-line.search-current {
-  background: color-mix(in srgb, #ffb700 38%, transparent);
-  outline: 1px solid color-mix(in srgb, #ffb700 70%, transparent);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -1px;
 }
 
 /* Floating comment trigger at the highlight position: small pill button that
@@ -22871,6 +23450,138 @@ tr[data-search-current] .fv-mark,
   font-weight: 700;
 }
 
+/* Diff code uses the SAME token palette as the file viewer, so a change reads
+   like the real file instead of flat text. Scoped to `.diff-code` (the span
+   DiffLineText wraps highlight.js output in) — the raw `.hljs` rules above are
+   scoped to .file-viewer-pre and would not reach inside a diff. */
+.diff-code {
+  color: var(--text);
+}
+
+.diff-code .hljs-comment,
+.diff-code .hljs-quote {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.diff-code .hljs-keyword,
+.diff-code .hljs-selector-tag,
+.diff-code .hljs-literal,
+.diff-code .hljs-doctag,
+.diff-code .hljs-name,
+.diff-code .hljs-tag {
+  color: var(--accent);
+}
+
+.diff-code .hljs-string,
+.diff-code .hljs-regexp,
+.diff-code .hljs-addition {
+  color: var(--success);
+}
+
+.diff-code .hljs-number,
+.diff-code .hljs-symbol,
+.diff-code .hljs-bullet,
+.diff-code .hljs-attr,
+.diff-code .hljs-variable,
+.diff-code .hljs-template-variable,
+.diff-code .hljs-type,
+.diff-code .hljs-attribute {
+  color: var(--thinking);
+}
+
+.diff-code .hljs-title,
+.diff-code .hljs-title.function_,
+.diff-code .hljs-section,
+.diff-code .hljs-built_in,
+.diff-code .hljs-link {
+  color: var(--link);
+}
+
+.diff-code .hljs-deletion {
+  color: var(--danger);
+}
+
+.diff-code .hljs-emphasis {
+  font-style: italic;
+}
+
+.diff-code .hljs-strong {
+  font-weight: 700;
+}
+
+/* Click-opened preview of an edit/write diff: a floating card over the chat so
+   the change can be read without leaving the transcript. It is opened by the
+   `Review ↗` pill on the row; clicking the row itself still opens the full
+   Review panel. Visual language matches .usage-popover.
+
+   The classes used to be .diff-hover-*: the preview is click-opened now, never
+   hover-driven (a card that followed the pointer landed on top of the row it
+   belonged to, which then reported a `pointerleave` and closed it again). */
+.diff-preview-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pop);
+  animation: popover-in 0.12s ease;
+}
+
+.diff-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--bg-raised);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  user-select: none;
+}
+
+.diff-preview-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* Close (✕) — a click-opened card needs an explicit way out (Escape and an
+   outside press also work). Modelled on .review-header-btn, one size down. */
+.diff-preview-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.diff-preview-close:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.diff-preview-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 8px;
+}
+
 /* ============================================================
    Bottom terminal panel (Cmd/Ctrl+J)
    Docked under the whole app body. Tabs mirror the reference
@@ -22886,6 +23597,13 @@ tr[data-search-current] .fv-mark,
   background: var(--bg-alt);
   border-top: 1px solid var(--border);
   overflow: visible;
+  /* xterm.css is a copy of VS Code's scrollbar stylesheet: xterm.js replaced
+     the slider colours with runtime-injected CSS but kept the
+     `var(--vscode-scrollbar-shadow, #000)` fallback on the scroll area's inset
+     shadows — and nothing in the app defines that variable, so those shadows
+     painted pure black under every theme. Scoped here, at the one place both
+     xterm and this panel live. */
+  --vscode-scrollbar-shadow: var(--bg-alt);
 }
 
 .terminal-panel[data-open='false'] {
@@ -22905,6 +23623,34 @@ tr[data-search-current] .fv-mark,
 
 .terminal-panel.terminal-full .terminal-resize-handle {
   display: none;
+}
+
+/* Terminal docked in the side pane (Viewer → Move to side pane). It renders as
+   a STRIP along the pane's bottom edge, not as an overlay across the pane: App
+   reserves exactly this height as padding on .viewer-group, so the viewer tabs
+   and the file tree stay visible above the shell. The strip's left/top/width/
+   height are measured from the pane and applied inline (the pane is resized by
+   its own split handle, which CSS cannot know), so these rules only shape the
+   panel itself. The vertical drag handle is hidden here because the pane's own
+   split handle owns the width. */
+.terminal-panel.terminal-right {
+  position: fixed;
+  z-index: 120;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+
+/* The drag handle stays VISIBLE in the side dock: the strip sits along the
+   pane's bottom edge, so grabbing its top edge is exactly how the user resizes
+   it (App supplies maxDockHeight as the ceiling). */
+
+/* Fullscreen outranks the side-pane dock: it re-claims the whole viewport and
+   drops the side border. (The component never sets both classes — it also
+   drops the dock's inline geometry — but the precedence stays explicit.) */
+.terminal-panel.terminal-full.terminal-right {
+  inset: 0;
+  border-left: none;
 }
 
 .terminal-resize-handle {
@@ -23077,6 +23823,17 @@ tr[data-search-current] .fv-mark,
    strip along the panel's bottom. */
 .terminal-screen .xterm-viewport {
   overflow-x: hidden;
+  /* xterm.css hard-codes #000 here (the opaque-scrollbar trick on macOS). The
+     canvas covers most of it with the theme background, but the gap beside the
+     scrollbar showed as a black strip along the panel's edge. */
+  background-color: var(--bg-alt);
+}
+
+/* IME composition popup: xterm.css hard-codes background:#000 / color:#FFF,
+   which lands a black box on a light theme. */
+.terminal-screen .xterm .composition-view {
+  background: var(--bg-panel);
+  color: var(--text);
 }
 
 .terminal-screen .xterm .xterm-scrollable-element > .scrollbar.horizontal {
@@ -23102,6 +23859,231 @@ tr[data-search-current] .fv-mark,
   font-size: 12.5px;
   color: var(--text-dim);
   text-align: center;
+}
+
+/* ============================================================
+   File explorer (right pane, Viewer → Files)
+   Lazy workspace tree rendered as ONE flat row list indented by
+   depth — a deep tree stays a single scrolling container instead
+   of nested scroll boxes.
+   ============================================================ */
+.files-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.files-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 6px 0 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.files-panel-title {
+  flex: 1 1 auto;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.files-panel-action {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.files-panel-action:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.files-panel-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.files-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* RTL safety net: a stray horizontal scroll offset in the docked pane would
+     visually swallow the rows' right inset. */
+  overflow-x: hidden;
+  padding: 4px 0;
+}
+
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  /* padding-left is set INLINE per depth (see FilesPanel) — the value here is
+     only the depth-0 fallback. */
+  padding: 3px 8px 3px 6px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s ease;
+}
+
+.files-row:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.files-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.files-row-caret {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  color: var(--text-dim);
+}
+
+.files-chevron {
+  display: inline-flex;
+  transition: transform 0.12s ease;
+}
+
+.files-chevron.open {
+  transform: rotate(90deg);
+}
+
+.files-row-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-dim);
+}
+
+/* Folders carry the app's path/link colour, files stay neutral: the icon is
+   what tells the two apart at a glance in a deep tree. */
+.files-row-dir .files-row-icon {
+  color: var(--link);
+}
+
+.files-row-dir .files-row-name {
+  font-weight: 500;
+}
+
+.files-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- editing rows: context menu, drop highlight, rename --------------- */
+
+/* A failed mutation is reported ABOVE the tree, never instead of it: the rows
+   the user was working with must stay on screen. */
+.files-panel-error {
+  flex: 0 0 auto;
+  margin: 6px 8px 0;
+  padding: 6px 9px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  overflow-wrap: anywhere;
+}
+
+/* The folder a dragged row is currently over: the whole row tints, so the
+   target reads at a glance even in a deep tree. */
+.files-row.files-row-drop {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+
+/* The dragged row itself stays visible as the source of the move. */
+.files-row.files-row-dragging {
+  opacity: 0.5;
+}
+
+.files-row.files-row-renaming {
+  cursor: default;
+}
+
+.files-row.files-row-renaming:hover {
+  background: transparent;
+}
+
+/* Inline rename input: one row tall, indented with its own row. */
+.files-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+/* Context menu: the shared `.ws-menu` box, cursor-anchored inside the pane. */
+.files-ctx-menu {
+  min-width: 178px;
+}
+
+.files-ctx-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 9px 2px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.files-ctx-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.files-ctx-actions {
+  display: flex;
+  gap: 2px;
+  padding-top: 2px;
+  border-top: 1px solid var(--hairline);
+}
+
+.files-ctx-actions .ws-menu-btn {
+  justify-content: center;
 }
 
 /* Live voice composer controls (separate from dictate mic). */
@@ -23451,21 +24433,46 @@ tr[data-search-current] .fv-mark,
   pointer-events: auto;
 }
 
-/* Drop markers follow the rail's vertical axis. */
-.viewer-tabs-rail .editor-tab.drop-before {
-  box-shadow: inset 0 2px 0 currentColor;
-}
-
+/* Drop feedback in the rail: no insertion line — the dragged tab is re-ordered
+   into its landing slot (inline CSS `order` set by ViewerTabBar, so the DOM node
+   never moves mid-drag) and drawn as a ghost, so the user sees where it lands. */
+.viewer-tabs-rail .editor-tab.drop-before,
 .viewer-tabs-rail .editor-tab.drop-after {
-  box-shadow: inset 0 -2px 0 currentColor;
+  box-shadow: none;
 }
 
-/* Rail buttons (tab list, "+", fullscreen, panel/collapse) are icon squares:
-   one full-width row each, glyph centered on the rail's axis. */
+.viewer-tabs-rail .editor-tab.drop-before::after,
+.viewer-tabs-rail .editor-tab.drop-after::after {
+  display: none;
+}
+
+/* The dragged tab stays where the pointer is and is ghosted; its DOM `order`
+   moves it into the landing slot, so this outline IS the drop preview. */
+.tab-bar.viewer-tabs .editor-tab.viewer-tab.drop-preview {
+  opacity: 0.55;
+  transform: none;
+  border-color: color-mix(in srgb, var(--link) 55%, transparent);
+  background: color-mix(in srgb, var(--link) 12%, transparent);
+  box-shadow:
+    inset 0 0 0 1.5px color-mix(in srgb, var(--link) 62%, transparent),
+    0 10px 24px -14px rgba(0, 0, 0, 0.65);
+  outline: 1px dashed color-mix(in srgb, var(--link) 50%, transparent);
+  outline-offset: -3.5px;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+/* Rail buttons (tab list, fullscreen, page icons) are icon squares: one
+   full-width row each, glyph centered on the rail's axis. Every page icon is a
+   `.titlebar-icon-btn`, so a new page inherits the row geometry for free. */
 .viewer-pane-body .viewer-pane-head .tab-list-btn,
 .viewer-pane-body .viewer-pane-head .editor-tab-new,
 .viewer-pane-body .viewer-pane-head .editor-tab-full,
-.viewer-pane-body .viewer-pane-head .titlebar-icon-btn {
+.viewer-pane-body .viewer-pane-head .titlebar-icon-btn,
+.viewer-pane-body .viewer-pane-head .viewer-schedule-btn,
+.viewer-pane-body .viewer-pane-head .viewer-inbox-btn {
   width: 100%;
   height: 30px;
   flex: 0 0 auto;
@@ -23476,15 +24483,13 @@ tr[data-search-current] .fv-mark,
   padding: 0;
 }
 
-.viewer-pane-body .viewer-pane-head .viewer-add-wrap,
 .viewer-pane-body .viewer-pane-head .viewer-pane-full {
   width: 100%;
 }
 
 /* The wraps keep their horizontal-bar paddings otherwise; in the rail every
    button must fill the row so its glyph lands on the shared center line. */
-.viewer-pane-body .viewer-pane-head .tab-list-wrap,
-.viewer-pane-body .viewer-pane-head .viewer-add-wrap {
+.viewer-pane-body .viewer-pane-head .tab-list-wrap {
   padding: 0;
 }
 

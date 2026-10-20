@@ -64,6 +64,14 @@ check(
   resolveWorkspacePath('\u202atoolNesting.test.ts', files),
 )
 
+// A bridge that RESOLVES null instead of rejecting (web build, stub) used to
+// make `files.find(...)` throw and kill the whole viewer lookup.
+check(
+  'a nullish workspace index resolves to null instead of throwing',
+  resolveWorkspacePath('src/App.tsx', null as unknown as WorkspaceFile[]) === null,
+  resolveWorkspacePath('src/App.tsx', null as unknown as WorkspaceFile[]),
+)
+
 if (failed > 0) {
   console.error(`${failed} failed`)
   process.exit(1)

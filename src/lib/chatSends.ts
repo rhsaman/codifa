@@ -11,7 +11,7 @@
  */
 
 import type { McpServerConfig, QueuedMessage } from "../types"
-import { useStore } from "./store"
+import { registerChatDeleteHook, useStore } from "./store"
 
 type SendFn = (
   text: string,
@@ -33,6 +33,25 @@ export function uid2(): string {
 export function registerChatSend(chatId: string, fn: SendFn): void {
   registry.set(chatId, fn)
 }
+
+/** Drop a chat's registered send closure. Exported for tests; in production the
+ *  store's delete hook below is the caller. */
+export function unregisterChatSend(chatId: string): void {
+  registry.delete(chatId)
+}
+
+/** How many chats hold a live send closure (test/diagnostics only). */
+export function chatSendCount(): number {
+  return registry.size
+}
+
+// A DELETED chat can never drain a queued turn again — `sendQueuedNext` bails
+// on the missing chat row — so its retained `send` closure (and the whole panel
+// render scope it closes over, drafts and images included) was pure leak: it
+// lived for the rest of the session. Now it dies with the chat. Unmount is
+// deliberately NOT a release point: a background chat must still be able to
+// start its queued turn while its panel is unmounted.
+registerChatDeleteHook(unregisterChatSend)
 
 /** Start the NEXT queued (unsent) message of a chat as a normal turn. Returns
  *  true if a message was sent, false if there's nothing left to drain. */

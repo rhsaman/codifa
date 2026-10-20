@@ -35,7 +35,7 @@ console.log('۱) modelContextWindow — پنجرهی کانتکست مدل عد�
   } as any
   check('از contextMap (id پیشونددار) عدد واقعی برمیگردد', modelContextWindow(p2, 'gpt-4o') === 128000, modelContextWindow(p2, 'gpt-4o'))
 
-  // مدل ناشناخته در contextMap → null (context window فقط از مدل گرفته می‌شود).
+  // مدل ناشناخته در contextMap → دیفالت ۲۰۰ هزار (نه fallback به provider.contextWindow).
   const p3 = {
     id: 'x',
     name: 'X',
@@ -43,7 +43,18 @@ console.log('۱) modelContextWindow — پنجرهی کانتکست مدل عد�
     contextMap: {},
     contextWindow: 200000,
   } as any
-  check('مدل ناشناخته در contextMap null برمیگرداند (نه fallback به provider.contextWindow)', modelContextWindow(p3, 'm1') === null, modelContextWindow(p3, 'm1'))
+  check('مدل ناشناخته در contextMap null برمیگرداند (نه fallback به provider.contextWindow)', modelContextWindow(p3, 'm1') === 200_000, modelContextWindow(p3, 'm1'))
+
+  // Tier 3 of the capacity rule (models.dev → provider → default): nothing is
+  // known about the model, so the shared default is returned and the meter still
+  // shows a number instead of a blank ring.
+  check('provider empty -> DEFAULT 200k', modelContextWindow({} as any, 'x') === 200_000, modelContextWindow({} as any, 'x'))
+  check('provider null -> DEFAULT 200k', modelContextWindow(null, 'x') === 200_000, modelContextWindow(null, 'x'))
+  // A zero/garbage entry must not become the window (that would compact on every
+  // single message).
+  check('zero entry in contextMap -> DEFAULT 200k', modelContextWindow({ id: 'x', contextMap: { m1: 0 } } as any, 'm1') === 200_000, modelContextWindow({ id: 'x', contextMap: { m1: 0 } } as any, 'm1'))
+  // The manual override still wins over everything (custom models).
+  check('manualContextMap beats contextMap', modelContextWindow({ id: 'x', manualContextMap: { m1: 32000 }, contextMap: { m1: 128000 } } as any, 'm1') === 32000, modelContextWindow({ id: 'x', manualContextMap: { m1: 32000 }, contextMap: { m1: 128000 } } as any, 'm1'))
 
   // When the backend supplies ANY context (our fix guarantees this), the bar must
   // never fall back to showing a blank/“—”. A genuinely unknown provider returns

@@ -1333,10 +1333,12 @@ pub fn dispatch_with_data_root(
             if name.trim().is_empty() {
                 return Err("create_skill requires name".into());
             }
+            // An empty body is allowed on purpose: `sync_skill` keeps the
+            // stored body when one exists and fails only when a NEW skill would
+            // be written with nothing in it. A delete, a rename, or a call that
+            // only touches an extra file must not have to resend the whole
+            // markdown — the old guard rejected exactly those calls.
             let content = s("content");
-            if content.trim().is_empty() {
-                return Err("create_skill requires content".into());
-            }
             let mut body = json!({
                 "name": name,
                 "previous_name": s("previous_name"),
@@ -1354,11 +1356,29 @@ pub fn dispatch_with_data_root(
             if let Some(extra) = args["extra_files"].as_object() {
                 body["extra_files"] = json!(extra);
             }
+            if let Some(del) = args["deleted_files"].as_array() {
+                body["deleted_files"] = json!(del);
+            }
             let res = crate::skills::sync_skill(Path::new(store_base), &body)?;
+            let name_out = res["name"].as_str().unwrap_or(&name);
+            // A skill the model just wrote is the USER's text: mark it so the
+            // startup seeder cannot revert it behind their back.
+            if let Some(dir) = crate::skills::find_skill_dir_pub(Path::new(store_base), name_out) {
+                crate::skills::mark_user_edit(&dir);
+            }
+            // An empty keyword list silently makes the skill INVISIBLE to
+            // auto-match: the catalog line is the only trigger, so the model
+            // must be told to fix it instead of believing the save was enough.
+            let warning = if res["fa_keyword_count"].as_u64().unwrap_or(0) == 0 {
+                "\nWARNING: this skill has NO fa_keywords, so it will never be auto-selected \
+                 from a user request. Call create_skill again with fa_keywords set \
+                 (comma-separated Persian phrases the user would actually say)."
+            } else {
+                ""
+            };
             Ok(format!(
-                "Skill saved: {}\nThe catalog in the system prompt now lists it, so it can be \
-                 loaded on demand in later turns.",
-                res["name"].as_str().unwrap_or(&name)
+                "Skill saved: {name_out}\nThe catalog in the system prompt now lists it, so it can be \
+                 loaded on demand in later turns.{warning}"
             ))
         }
         // Create or update an MCP connector from a command (the `/create-mcp`

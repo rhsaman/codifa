@@ -112,6 +112,8 @@ fn main() {
             commands::fs_read,
             commands::fs_write,
             commands::fs_delete,
+            commands::fs_copy,
+            commands::fs_rename,
             commands::search_content,
             commands::read_image,
             commands::read_pdf_base64,
@@ -268,6 +270,11 @@ fn main() {
                     // they must be reaped here or every visited chat leaves a
                     // browser process behind.
                     browser::kill_all_sessions();
+                    // Language servers are the largest off-process memory the app
+                    // holds (a warm tsserver/rrust-analyzer keeps a whole project
+                    // index resident). Nothing released them on exit, so they
+                    // survived the window as orphans.
+                    lsp::shutdown_all();
                     app.state::<Quitting>()
                         .0
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -291,6 +298,10 @@ fn main() {
                     // Chromium must be reaped here too — otherwise those exits
                     // left a headless browser running with no window to close.
                     browser::kill_all_sessions();
+                    // Same for language servers: a Cmd-Q that skipped the
+                    // CloseRequested path left them (and their project indexes)
+                    // running with no window to own them.
+                    lsp::shutdown_all();
                 }
                 _ => {}
             }

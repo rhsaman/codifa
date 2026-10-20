@@ -106,7 +106,12 @@ console.log("۵) کامنت داخل دیف کم‌رنگ می‌شود:");
   const html = renderToString(
     <DiffView diff={withComments} path="x.ts" layout="unified" />,
   );
-  check("کامنت کلاس diff-comment گرفت", html.includes("diff-comment"));
+  // با هایلایت واقعیِ زبان (رنگ تم)، hljs خودش کامنت را کلاس می‌زند؛
+  // diff-comment فقط fallback زبان‌هایی است که گرامر ندارند.
+  check(
+    "کامنت کم‌رنگ شد (diff-comment یا hljs-comment)",
+    html.includes("diff-comment") || html.includes("hljs-comment"),
+  );
   check("متن کامنت حفظ شد", html.includes("توضیح فارسی"));
   check("مارکر کامنت در تکهٔ کم‌رنگ است", html.includes(">// توضیح فارسی<"));
 

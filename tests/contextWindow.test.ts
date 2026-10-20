@@ -1,6 +1,7 @@
 // Test for the per-model context-window fix in src/lib/api.ts:
-// streamChat must send the PER-MODEL window (contextMap[model] first, then the
-// provider-wide fallback) as context_window — NOT provider.contextWindow alone.
+// streamChat must send the PER-MODEL window resolved by `modelContextWindow`
+// (manual override → the provider's contextMap → DEFAULT_CONTEXT_WINDOW) as
+// context_window — NOT provider.contextWindow alone.
 // Before the fix, a provider whose contextMap[model] was smaller than its
 // contextWindow made the frontend meter exceed 100% while the backend (which
 // only received the provider-wide window) never compacted.
@@ -80,7 +81,7 @@ console.log('1) contextMap[model] کوچکتر از contextWindow پروواید
   check('context_window = 128000 (پنجرهٔ مدل، نه 200000 پرووایدر)', body.context_window === 128000, body)
 }
 
-console.log('2) بدون contextMap → مدل ناشناخته، context_window صفر (بکاند از کاتالوگ models.dev حل میکند):')
+console.log('2) no contextMap -> DEFAULT 200k (capacity rule: models.dev -> provider -> 200k):')
 {
   const body = await sentBody({
     id: 'openai',
@@ -90,10 +91,10 @@ console.log('2) بدون contextMap → مدل ناشناخته، context_window
     model: 'gpt-4o',
     contextWindow: 200000,
   })
-  check('context_window = 0 (fallback به provider.contextWindow حذف شده)', body.context_window === 0, body)
+  check('context_window = 200000 (provider.contextWindow is not read; tier-3 default)', body.context_window === 200000, body)
 }
 
-console.log('3) نه contextMap نه contextWindow → صفر (بکاند از کاتالوگ models.dev حل میکند):')
+console.log('3) neither contextMap nor provider window -> DEFAULT 200k (never 0):')
 {
   const body = await sentBody({
     id: 'openai',
@@ -102,7 +103,7 @@ console.log('3) نه contextMap نه contextWindow → صفر (بکاند از �
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o',
   })
-  check('context_window = 0', body.context_window === 0, body)
+  check('context_window = 200000', body.context_window === 200000, body)
 }
 
 console.log('4) کلید پیشونددار id/model (NVIDIA /models فرم پیشوندی برمیگرداند):')

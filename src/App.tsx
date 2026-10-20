@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useStore } from './lib/store'
+import { useCallback, useEffect, useRef, useState, Suspense, lazy } from 'react'
+import { MIN_PANE_CONTENT_HEIGHT, MIN_TERMINAL_HEIGHT, resolveTerminalDockHeight, resolveTerminalPlacement, useStore } from './lib/store'
 import { ChatWindows } from './components/ChatWindows'
 
 /** Tab row visible only in single-window mode. Multi-window hides the row:
@@ -17,7 +17,7 @@ import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
 import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs, visibleTabs } from './lib/viewerTabs'
-import { ViewerAddButton, ViewerPaneFullscreenButton, ViewerTabListButton } from './components/ViewerTabBar'
+import { ViewerBrowserButton, ViewerFilesButton, ViewerInboxButton, ViewerPaneFullscreenButton, ViewerReviewButton, ViewerScheduleButton, ViewerTabListButton, ViewerTerminalButton, ViewerTodosButton, ViewerTraceButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
@@ -35,7 +35,13 @@ import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 import { WindowStripCluster } from './components/WindowStripCluster'
 import { WorkspaceMenuButton } from './components/WorkspaceMenuButton'
-import { TerminalPanel } from './components/TerminalPanel'
+import type { TerminalDockRect } from './components/TerminalPanel'
+// xterm.js (term rendering) is only needed once the panel is actually opened,
+// so it is split out of the startup chunk: the panel is a plain component with
+// no imperative handle, and it renders `null` until the first open anyway.
+const TerminalPanel = lazy(() =>
+  import('./components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
+)
 
 export default function App() {
   const loaded = useStore((s) => s.loaded)
@@ -65,11 +71,75 @@ export default function App() {
   // viewport, resizable via the dock handle, persisted in localStorage.
   const [splitW, setSplitW] = useState(() => loadSplitWidth(0.5))
   const splitDrag = useRef<{ startX: number; startW: number } | null>(null)
+  // Side-pane dock: the terminal is a fixed overlay, so it needs the pane's
+  // viewport rect. Measuring the pane itself (instead of deriving a width from
+  // splitW and the sidebar) keeps the terminal correct through the split drag,
+  // the sidebar toggle and viewer fullscreen without a single manual sum.
+  // The element is held in STATE, not a ref: App renders <LoadingScreen />
+  // until `loaded`, so on the first commit `.viewer-group` does not exist and
+  // a plain ref stays null forever (none of the effect's deps change when the
+  // pane finally mounts). State makes the element's arrival itself a dep, so
+  // the measurement always runs once the pane is really attached.
+  const [viewerEl, setViewerEl] = useState<HTMLElement | null>(null)
+  const [viewerRect, setViewerRect] = useState<TerminalDockRect | null>(null)
+  // Requested dock; the EFFECTIVE one also depends on the pane being visible
+  // (resolveTerminalPlacement), so hiding the pane sends the terminal back to
+  // the bottom instead of stranding it.
+  const terminalRequested = useStore((s) => s.terminalPlacement)
+  const terminalOpen = useStore((s) => s.terminalPanelOpen)
+  const terminalHeight = useStore((s) => s.terminalHeight)
+  const terminalPlacement = resolveTerminalPlacement(terminalRequested, paneOpen, chatFull)
+  // The dock sits INSIDE the side pane as a strip along its bottom edge, not as
+  // an overlay on top of it: `terminalDockHeight` is both the strip's height
+  // and the padding the pane reserves for it, so the viewer tabs and the file
+  // tree stay visible above the shell. Capped so the pane always keeps a
+  // readable strip of its own content.
+  const paneHeight = viewerRect?.height ?? 0
+  const terminalDockHeight = resolveTerminalDockHeight(terminalHeight, paneHeight)
+  // Reservation is gated on the panel being OPEN: reserving a strip for a
+  // hidden terminal would leave a dead band under the viewer content.
+  const terminalDocked = terminalPlacement === 'right' && terminalOpen
+  const terminalDock = viewerRect
+    ? {
+        left: viewerRect.left,
+        top: viewerRect.top + viewerRect.height - terminalDockHeight,
+        width: viewerRect.width,
+        height: terminalDockHeight,
+      }
+    : null
+  // Drag ceiling for the docked strip: same rule as resolveTerminalDockHeight,
+  // so dragging to the limit lands exactly where the reservation already sits.
+  const terminalMaxDockHeight =
+    paneHeight > 0
+      ? Math.max(MIN_TERMINAL_HEIGHT, Math.round(paneHeight) - MIN_PANE_CONTENT_HEIGHT)
+      : undefined
   useEffect(() => {
     const onResize = () => setSplitW((w) => clampSplitWidth(w))
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
+  useEffect(() => {
+    if (!viewerEl) {
+      // Pane hidden (or chat fullscreen): drop the stale rect so a re-shown
+      // pane can never reuse the old geometry.
+      setViewerRect(null)
+      return
+    }
+    const measure = () => {
+      const r = viewerEl.getBoundingClientRect()
+      setViewerRect({ left: r.left, top: r.top, width: r.width, height: r.height })
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(viewerEl)
+    return () => ro.disconnect()
+    // splitW + sidebarOpen are in the deps even though the ResizeObserver
+    // already catches SIZE changes: they also keep the geometry right in
+    // environments without ResizeObserver, and a sidebar toggle moves the
+    // pane's left edge without changing its width.
+  }, [viewerEl, splitW, sidebarOpen])
+
   const startSplitResize = (e: React.MouseEvent) => {
     e.preventDefault()
     splitDrag.current = { startX: e.clientX, startW: splitW }
@@ -584,6 +654,7 @@ export default function App() {
                           minHeight: 0,
                           minWidth: 0,
                           overflow: "hidden",
+                          paddingBottom: terminalDocked ? terminalDockHeight : undefined,
                         }
                       : ({
                           flexBasis: splitW,
@@ -593,14 +664,19 @@ export default function App() {
                           minHeight: 0,
                           minWidth: 0,
                           overflow: "hidden",
+                          paddingBottom: terminalDocked ? terminalDockHeight : undefined,
                         } as React.CSSProperties)
                   }
                   aria-label="Viewers"
+                  ref={setViewerEl}
                 >
                   {/* Pane body: viewer content beside a vertical icon rail
-                      pinned to the pane's right edge — the panel/collapse
-                      icons on top, then the tab-list chevron, the "+" opener,
-                      fullscreen and the tabs themselves below them. */}
+                      pinned to the pane's right edge. Canonical rail order, top
+                      to bottom: [collapse | tab list | fullscreen | files |
+                      todos | terminal | schedule | inbox | review | trace |
+                      browser]. Every page owns exactly ONE rail icon and no
+                      "+" menu exists, so a page can never be reachable from two
+                      differently-worded entry points. */}
                   <div className="viewer-pane-body">
                     <div
                       className="viewer-content"
@@ -630,25 +706,25 @@ export default function App() {
                             <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
                           </svg>
                         </button>
-                        <button
-                          className="titlebar-icon-btn panel-toggle"
-                          title={panelMode ? 'Show viewer tabs' : 'Show panel — todos, schedules, sub-agents'}
-                          aria-label={panelMode ? 'Show viewer tabs' : 'Show panel'}
-                          aria-pressed={panelMode}
-                          onClick={() => useViewerTabs.getState().togglePanelMode()}
-                        >
-                          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                            <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                            <path d="M3 9.5h18" />
-                            <path d="M7 13.5h7M7 16.5h5" />
-                          </svg>
-                        </button>
                       </div>
                       <ViewerTabListButton />
+                      {/* Canonical rail order, top to bottom:
+                          [collapse | tab list | fullscreen | files | todos |
+                          terminal | schedule | inbox | review | trace |
+                          browser]. Every page reachable from the rail owns
+                          exactly ONE icon here and no "+" menu exists, so a
+                          page can never appear twice (an icon plus its own
+                          tab row) and read as two different pages. */}
                       <ViewerPaneFullscreenButton />
+                      <ViewerFilesButton />
+                      <ViewerTodosButton />
+                      <ViewerTerminalButton />
+                      <ViewerScheduleButton />
+                      <ViewerInboxButton />
+                      <ViewerReviewButton />
+                      <ViewerTraceButton />
+                      <ViewerBrowserButton />
                       <ViewerTabBar />
-                      {/* The "+" opener sits right below the tabs. */}
-                      <ViewerAddButton />
                       <span className="viewer-pane-spacer" aria-hidden="true" />
                     </div>
                   </div>
@@ -659,7 +735,13 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
-      <TerminalPanel />
+      <Suspense fallback={null}>
+        <TerminalPanel
+          placement={terminalPlacement}
+          dock={terminalDocked ? terminalDock : null}
+          maxDockHeight={terminalMaxDockHeight}
+        />
+      </Suspense>
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}
       {searchOpen && <SearchOverlay onClose={() => setSearchOpen(false)} />}

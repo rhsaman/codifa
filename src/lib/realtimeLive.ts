@@ -51,17 +51,33 @@ interface ServerMessage {
 const DEFAULT_SAMPLE_RATE = 24000;
 const DEFAULT_PLAYBACK_RATE = 24000;
 const RECORDER_TIMESLICE_MS = 250;
+/** How long capture has to deliver its first frame before we call it dead. */
+const CAPTURE_WATCHDOG_MS = 1500;
+/** How long the socket may stay silent after opening before we call it dead. */
+const SERVER_WATCHDOG_MS = 12_000;
 
 // AudioWorklet processor for mic capture: downmix is already mono (single
-// channel source), forwards Float32 frames to the main thread for PCM16
-// encoding. Inline via Blob URL so no extra asset file is needed.
+// channel source), batches ~21 ms of samples, then forwards Float32 frames to
+// the main thread for PCM16 encoding. Inline via Blob URL so no extra asset
+// file is needed.
 const CAPTURE_WORKLET_NAME = 'live-voice-capture';
 const CAPTURE_WORKLET_CODE = `
 class LiveVoiceCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(1024);
+    this.n = 0;
+  }
   process(inputs) {
     const channel = inputs && inputs[0] && inputs[0][0];
     if (channel && channel.length > 0) {
-      this.port.postMessage(channel.slice(0));
+      for (let i = 0; i < channel.length; i++) {
+        this.buf[this.n++] = channel[i];
+        if (this.n === this.buf.length) {
+          this.port.postMessage(this.buf.slice(0));
+          this.n = 0;
+        }
+      }
     }
     return true;
   }
@@ -205,8 +221,18 @@ export class LiveVoiceSession {
   // Capture pipeline.
   private micStream: MediaStream | null = null;
   private captureCtx: AudioContext | null = null;
-  private captureNode: AudioWorkletNode | null = null;
+  private captureNode: AudioWorkletNode | ScriptProcessorNode | null = null;
   private captureSource: MediaStreamAudioSourceNode | null = null;
+  /** Zero-gain node keeping the capture graph connected to the destination. */
+  private captureSink: GainNode | null = null;
+  /** Which capture backend is running (used by the watchdog fallback). */
+  private captureKind: 'worklet' | 'processor' | 'recorder' | null = null;
+  /** Frames seen this session — the watchdog's proof that audio flows. */
+  private captureFrameCount = 0;
+  private captureWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True once the server said anything at all on the socket. */
+  private gotServerMessage = false;
+  private serverWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private recorder: MediaRecorder | null = null;
 
   // Playback pipeline.
@@ -242,6 +268,7 @@ export class LiveVoiceSession {
       const url = this.buildUrl(this.options.url, token);
       await this.openSocket(url, token);
       this.setState('live');
+      this.armServerWatchdog();
       if (this.options.autoStartMic !== false) {
         await this.startMicrophone();
       }
@@ -255,6 +282,8 @@ export class LiveVoiceSession {
   // Stop mic + playback and close the socket.
   disconnect(): void {
     this.manualClose = true;
+    this.clearServerWatchdog();
+    this.stopCaptureWatchdog();
     this.stopMicrophone();
     this.stopPlayback();
     if (this.ws) {
@@ -314,6 +343,7 @@ export class LiveVoiceSession {
 
   // Stop the mic tracks and tear down the capture graph.
   stopMicrophone(): void {
+    this.stopCaptureWatchdog();
     if (this.recorder && this.recorder.state !== 'inactive') {
       try {
         this.recorder.stop();
@@ -324,7 +354,8 @@ export class LiveVoiceSession {
     this.recorder = null;
     if (this.captureNode) {
       try {
-        this.captureNode.port.onmessage = null;
+        if ('port' in this.captureNode) this.captureNode.port.onmessage = null;
+        (this.captureNode as ScriptProcessorNode).onaudioprocess = null;
         this.captureNode.disconnect();
       } catch {
         // Node already disconnected; ignore.
@@ -339,6 +370,16 @@ export class LiveVoiceSession {
       }
     }
     this.captureSource = null;
+    if (this.captureSink) {
+      try {
+        this.captureSink.disconnect();
+      } catch {
+        // Sink already disconnected; ignore.
+      }
+    }
+    this.captureSink = null;
+    this.captureKind = null;
+    this.captureFrameCount = 0;
     if (this.captureCtx) {
       void this.captureCtx.close().catch(() => undefined);
     }
@@ -417,29 +458,159 @@ export class LiveVoiceSession {
     const rate = this.options.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const ctx = new AudioContext({ sampleRate: rate });
     this.captureCtx = ctx;
-    const blob = new Blob([CAPTURE_WORKLET_CODE], { type: 'application/javascript' });
-    const moduleUrl = URL.createObjectURL(blob);
-    try {
-      await ctx.audioWorklet.addModule(moduleUrl);
-    } finally {
-      URL.revokeObjectURL(moduleUrl);
-    }
+    // Web Audio only pulls nodes whose graph reaches the destination. A
+    // capture node with numberOfOutputs: 0 and no path to `destination` is not
+    // guaranteed to be rendered — WebKit (the WKWebView this app runs in on
+    // macOS) does not pull it at all. The result is the worst live-voice
+    // failure there is: the mic is open, no frame is ever produced, nothing is
+    // sent, the server stays quiet, and NOTHING reports an error because "no
+    // audio" is not an exception. A zero-gain sink keeps the graph rendered
+    // without playing the mic back through the speakers.
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(ctx.destination);
+    this.captureSink = sink;
     const source = ctx.createMediaStreamSource(stream);
     this.captureSource = source;
-    const node = new AudioWorkletNode(ctx, CAPTURE_WORKLET_NAME, {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-    });
-    this.captureNode = node;
-    node.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-      if (!this.connected) return;
-      const input = ev.data;
-      if (!input || input.length === 0) return;
-      const pcm = floatToPcm16(input);
-      this.send({ type: 'input_audio_buffer.append', audio: encodeInt16ToBase64(pcm) });
-    };
-    source.connect(node);
+    this.captureFrameCount = 0;
+    try {
+      if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        const blob = new Blob([CAPTURE_WORKLET_CODE], { type: 'application/javascript' });
+        const moduleUrl = URL.createObjectURL(blob);
+        try {
+          await ctx.audioWorklet.addModule(moduleUrl);
+        } finally {
+          URL.revokeObjectURL(moduleUrl);
+        }
+        const node = new AudioWorkletNode(ctx, CAPTURE_WORKLET_NAME, {
+          numberOfInputs: 1,
+          // One output routed into the zero-gain sink: a worklet with no
+          // output is not guaranteed to be pulled by WebKit.
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+          channelCount: 1,
+        });
+        node.port.onmessage = (ev: MessageEvent<Float32Array>) => this.pushCapture(ev.data);
+        source.connect(node);
+        node.connect(sink);
+        this.captureNode = node;
+        this.captureKind = 'worklet';
+      } else {
+        this.startProcessorCapture(ctx, source, sink);
+      }
+    } catch (err) {
+      // A failed AudioWorklet must not kill live voice: fall back to the
+      // ScriptProcessor path, which every WebKit build supports.
+      this.startProcessorCapture(ctx, source, sink);
+      void err;
+    }
     void ctx.resume().catch(() => undefined);
+    this.armCaptureWatchdog();
+  }
+
+  /** Legacy capture path, also used when the AudioWorklet yields nothing. */
+  private startProcessorCapture(
+    ctx: AudioContext,
+    source: MediaStreamAudioSourceNode,
+    sink: GainNode,
+  ): void {
+    const proc = ctx.createScriptProcessor(1024, 1, 1);
+    proc.onaudioprocess = (ev) => {
+      const ch = ev.inputBuffer.getChannelData(0);
+      // Copy: the buffer is recycled by the engine after this callback.
+      this.pushCapture(new Float32Array(ch));
+    };
+    source.connect(proc);
+    proc.connect(sink);
+    this.captureNode = proc;
+    this.captureKind = 'processor';
+  }
+
+  /**
+   * Encode one mic frame and stream it to the server.
+   *
+   * Capture starts after the socket opens, so frames arriving while it is not
+   * OPEN are dropped on purpose — the server rejects audio appended outside a
+   * session ready state anyway.
+   */
+  private pushCapture(frame: Float32Array | undefined): void {
+    if (!frame || frame.length === 0) return;
+    this.captureFrameCount++;
+    if (!this.connected) return;
+    const pcm = floatToPcm16(frame);
+    this.send({ type: 'input_audio_buffer.append', audio: encodeInt16ToBase64(pcm) });
+  }
+
+  /**
+   * Turn "mic open but no audio" into an explicit, actionable error.
+   *
+   * Empty capture is not an exception, so without this watchdog live voice
+   * looks simply dead: the user talks, the button says live, nothing arrives.
+   */
+  private armCaptureWatchdog(): void {
+    this.stopCaptureWatchdog();
+    this.captureWatchdogTimer = setTimeout(() => {
+      this.captureWatchdogTimer = null;
+      if (this.state === 'error' || this.state === 'closed') return;
+      if (this.captureFrameCount > 0) return;
+      if (this.captureKind === 'worklet') {
+        // Worklet produced nothing: retry once with the ScriptProcessor path.
+        const ctx = this.captureCtx;
+        const source = this.captureSource;
+        const sink = this.captureSink;
+        if (ctx && source && sink) {
+          try {
+            this.captureNode?.disconnect();
+          } catch {
+            // Already disconnected.
+          }
+          this.startProcessorCapture(ctx, source, sink);
+          this.armCaptureWatchdog();
+          return;
+        }
+      }
+      this.fail(
+        new Error(
+          'Microphone is open but no audio is reaching Codifa — check the input device in Settings → Sound, then restart live voice.',
+        ),
+      );
+    }, CAPTURE_WATCHDOG_MS);
+  }
+
+  private stopCaptureWatchdog(): void {
+    if (this.captureWatchdogTimer !== null) {
+      clearTimeout(this.captureWatchdogTimer);
+      this.captureWatchdogTimer = null;
+    }
+  }
+
+  /**
+   * Turn "the socket is open but no event ever comes back" into an error.
+   *
+   * A gateway that accepts the WebSocket and then says nothing (wrong model,
+   * rejected session.update, dead upstream) leaves the user talking into a
+   * session that will never answer, with no feedback at all.
+   */
+  private armServerWatchdog(): void {
+    this.clearServerWatchdog();
+    this.gotServerMessage = false;
+    this.serverWatchdogTimer = setTimeout(() => {
+      this.serverWatchdogTimer = null;
+      if (this.gotServerMessage) return;
+      if (this.state === 'error' || this.state === 'closed') return;
+      this.fail(
+        new Error(
+          'Live voice connected but the provider sent no response — check the live model and key in Settings → Media Providers.',
+        ),
+      );
+    }, SERVER_WATCHDOG_MS);
+  }
+
+  private clearServerWatchdog(): void {
+    if (this.serverWatchdogTimer !== null) {
+      clearTimeout(this.serverWatchdogTimer);
+      this.serverWatchdogTimer = null;
+    }
   }
 
   // MediaRecorder path: stream compressed chunks for servers that accept them.
@@ -449,8 +620,12 @@ export class LiveVoiceSession {
       : undefined;
     const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
     this.recorder = recorder;
+    this.captureKind = 'recorder';
+    this.captureFrameCount = 0;
     recorder.ondataavailable = (ev) => {
-      if (!this.connected || ev.data.size === 0) return;
+      if (ev.data.size === 0) return;
+      this.captureFrameCount++;
+      if (!this.connected) return;
       void ev.data
         .arrayBuffer()
         .then((buf) => {
@@ -463,9 +638,15 @@ export class LiveVoiceSession {
     };
     recorder.onerror = () => this.fail(new Error('Microphone recorder error'));
     recorder.start(RECORDER_TIMESLICE_MS);
+    // Same guarantee as the PCM path: a recorder that emits nothing must be
+    // reported instead of leaving live voice silently dead.
+    this.armCaptureWatchdog();
   }
 
   private handleMessage(ev: MessageEvent): void {
+    // Any byte from the server proves the session is alive.
+    this.gotServerMessage = true;
+    this.clearServerWatchdog();
     if (ev.data instanceof ArrayBuffer) {
       this.enqueuePlayback(new Float32Array(ev.data));
       return;

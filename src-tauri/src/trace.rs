@@ -34,6 +34,17 @@ pub struct Tokens {
 /// Per-chat trace log, persisted as JSONL under {data_root}/traces/.
 pub struct TraceStore {
     chat_id: String,
+    /// Identifier of the agent run that owns this store.
+    ///
+    /// Every row written through one `TraceStore` carries it. Without it a
+    /// trace file is unattributable: the main agent fans its `explore` calls
+    /// out CONCURRENTLY (`join_all`) and every sibling inherits the parent's
+    /// `chat_id`, so their rows interleave in the SAME file. Rows only had
+    /// `kind`/`tokens`, and the ruler attributed them to main-or-explore by
+    /// POSITION (the last `prompt` row seen) — which silently billed a
+    /// still-running sibling's calls to the main agent as soon as the first
+    /// sibling finished and its card closed. `run_id` makes the split exact.
+    run_id: u64,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -135,7 +146,23 @@ fn sanitize(chat_id: &str) -> String {
 
 impl TraceStore {
     pub fn new(chat_id: String) -> Self {
-        Self { chat_id }
+        Self { chat_id, run_id: 0 }
+    }
+
+    /// Same store, stamped with the id of the run that owns it.
+    ///
+    /// `run_id` is the metric that makes concurrency survivable in one file:
+    /// concurrent explore siblings write interleaved rows, and this is the only
+    /// field that tells them apart (each sibling has its own id).
+    pub fn with_run(mut self, run_id: u64) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
+    /// The run this store was stamped with (0 when unstamped).
+    #[cfg(test)]
+    pub fn run_id(&self) -> u64 {
+        self.run_id
     }
 
     /// Append one entry to the chat's JSONL trace file.
@@ -150,6 +177,11 @@ impl TraceStore {
         let id = format!("t{}", SEQ.fetch_add(1, Ordering::Relaxed));
         let row = json!({
             "id": id,
+            // Which run produced this row. Concurrent explore siblings share one
+            // chat id and therefore one file, so this is the ONLY exact way to
+            // attribute a row; the ruler maps `run` -> main/explore through the
+            // matching `prompt` row. 0 on rows written by an unstamped store.
+            "run": self.run_id,
             "at": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -233,8 +265,8 @@ impl TraceKind {
     }
 }
 
-/// Counts over the whole log: `[all, llm, prompt, tool, tool_without_sub]`.
-type TraceCounts = [usize; 5];
+/// Counts over the whole log: `[all, llm, prompt, tool, tool_without_sub, fold]`.
+type TraceCounts = [usize; 6];
 
 /// Slice one page out of the log and count the whole log's kinds.
 ///
@@ -248,7 +280,7 @@ fn trace_page(
     kind: &str,
     include_sub: bool,
 ) -> (Vec<Value>, TraceCounts) {
-    let mut counts: TraceCounts = [0; 5];
+    let mut counts: TraceCounts = [0; 6];
     // Indices of the entries this page may draw from, in log order.
     let mut matching: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -259,6 +291,10 @@ fn trace_page(
         match k.kind.as_str() {
             "llm" => counts[1] += 1,
             "prompt" => counts[2] += 1,
+            // An in-turn fold. Counted separately because it is the event that
+            // resets the prefix cache: seeing how often it fires is the whole
+            // point of recording it.
+            "fold" => counts[5] += 1,
             "tool" => {
                 counts[3] += 1;
                 if !k.is_sub() {
@@ -298,6 +334,7 @@ fn matching_total(counts: &TraceCounts, kind: &str, include_sub: bool) -> usize 
         "" => counts[0],
         "llm" => counts[1],
         "prompt" => counts[2],
+        "fold" => counts[5],
         "tool" => {
             if include_sub {
                 counts[3]
@@ -319,9 +356,9 @@ pub async fn traces_list(
     axum::extract::Path(chat_id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<TracesQuery>,
 ) -> axum::response::Response {
-    let limit = q.limit.clamp(1, TRACE_LIMIT_MAX);
+    let mut counts: TraceCounts = [0; 6];
     let mut page: Vec<Value> = Vec::new();
-    let mut counts: TraceCounts = [0; 5];
+    let limit = q.limit.clamp(1, TRACE_LIMIT_MAX);
     if let Some(dir) = traces_dir() {
         let path = dir.join(format!("{}.jsonl", sanitize(&chat_id)));
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -341,6 +378,7 @@ pub async fn traces_list(
             "all": counts[0],
             "llm": counts[1],
             "prompt": counts[2],
+            "fold": counts[5],
             "tool": if q.sub { counts[3] } else { counts[4] },
         },
     }))
@@ -417,7 +455,7 @@ mod tests {
         assert_eq!(older.len(), 1);
         assert_eq!(older[0]["id"], "a");
         // Counts stay whole-log regardless of the filter.
-        assert_eq!(counts, [5, 1, 1, 3, 3]);
+        assert_eq!(counts, [5, 1, 1, 3, 3, 0]);
     }
 
     /// The Tools tab mirrors the chat's cards: a sub-agent's own calls nest
@@ -433,7 +471,7 @@ mod tests {
         let (page, counts) = trace_page(&lines, 10, 0, "tool", false);
         let ids: Vec<&str> = page.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["top1", "top2"]);
-        assert_eq!(counts, [3, 0, 0, 3, 2]);
+        assert_eq!(counts, [3, 0, 0, 3, 2, 0]);
         assert_eq!(matching_total(&counts, "tool", false), 2);
         assert_eq!(matching_total(&counts, "tool", true), 3);
         // A sub-agent's own trace shows everything.
@@ -454,10 +492,29 @@ mod tests {
             "not json",
         ];
         let (page, counts) = trace_page(&lines, 10, 0, "", true);
-        assert_eq!(counts, [4, 1, 1, 2, 2]);
+        assert_eq!(counts, [4, 1, 1, 2, 2, 0]);
         assert_eq!(page.len(), 4);
         // A torn/unparsable line is skipped, not counted.
         assert_eq!(counts[0], 4);
+    }
+
+    /// A `fold` row is its own kind: it must be counted, paged on its own tab,
+    /// and — crucially — `matching_total` must know it, or "load older" would
+    /// stop after the first page of folds.
+    #[test]
+    fn trace_page_counts_and_pages_fold_rows() {
+        let lines = [
+            r#"{"kind":"llm"}"#,
+            r#"{"kind":"fold"}"#,
+            r#"{"kind":"tool"}"#,
+            r#"{"kind":"fold"}"#,
+        ];
+        let (all, counts) = trace_page(&lines, 10, 0, "", true);
+        assert_eq!(counts, [4, 1, 0, 1, 1, 2]);
+        assert_eq!(all.len(), 4);
+        assert_eq!(matching_total(&counts, "fold", false), 2);
+        let (folds, _) = trace_page(&lines, 1, 0, "fold", false);
+        assert_eq!(folds.len(), 1);
     }
 
     /// A runaway trace log is trimmed from the OLDEST end, keeping whole lines
@@ -542,6 +599,50 @@ mod tests {
         assert_eq!(first["tokens"]["cache_read"], 4);
         std::fs::remove_file(&path).ok();
         // Restore the previous env so parallel tests are unaffected.
+        match prev {
+            Some(v) => std::env::set_var("CODER_DATA_DIR", v),
+            None => std::env::remove_var("CODER_DATA_DIR"),
+        }
+    }
+
+    #[test]
+    fn record_stamps_the_run_id_that_owns_the_row() {
+        // Concurrent explore siblings share the parent's chat id, so they all
+        // write into ONE trace file and their rows interleave. `run` is the only
+        // field that keeps them apart, so it must survive into the JSONL.
+        let chat = format!("trace-run-test-{}", std::process::id());
+        let _env = crate::memory::tests::DATA_DIR_LOCK.lock();
+        let prev = std::env::var("CODER_DATA_DIR").ok();
+        let tmp = std::env::temp_dir().join(format!("codifa-trace-run-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        std::env::set_var("CODER_DATA_DIR", &tmp);
+
+        let store = TraceStore::new(chat.clone()).with_run(42);
+        assert_eq!(store.run_id(), 42);
+        store.record(TraceEntry {
+            kind: "llm".into(),
+            summary: "m · 1 tokens".into(),
+            ..Default::default()
+        });
+        // An unstamped store still writes a row, and says so with 0.
+        TraceStore::new(chat.clone()).record(TraceEntry {
+            kind: "llm".into(),
+            summary: "m · 1 tokens".into(),
+            ..Default::default()
+        });
+
+        let dir = traces_dir().expect("CODER_DATA_DIR set above");
+        let path = dir.join(format!("{chat}.jsonl"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["run"], 42);
+        assert_eq!(rows[1]["run"], 0);
+        std::fs::remove_file(&path).ok();
         match prev {
             Some(v) => std::env::set_var("CODER_DATA_DIR", v),
             None => std::env::remove_var("CODER_DATA_DIR"),

@@ -377,12 +377,18 @@ export async function transcribeAudio(
   onModelLoading?: (loading: boolean) => void,
   lang?: string,
   opts?: TranscribeProviderOpts,
+  prompt?: string,
 ): Promise<string> {
   const url = await ensureSidecar()
   if (!url) throw new Error('the local backend is not ready')
   const form = new FormData()
   form.append('audio', blob, 'clip.wav')
   if (lang) form.append('lang', lang)
+  // The prompt is BIASING CONTEXT for Whisper, not an instruction: the model
+  // treats it as text that preceded this audio and may continue it. Callers
+  // therefore send only a user glossary (see buildSttPrompt); an empty prompt
+  // is omitted entirely rather than substituted with a fabricated sentence.
+  if (prompt) form.append('prompt', prompt)
   if (opts) {
     form.append('provider', opts.kind)
     form.append('base_url', opts.baseUrl)
@@ -655,6 +661,10 @@ export interface StreamParams {
    *  temp file (covers uploads and screenshots). */
   images?: Array<string | { path: string; dataUrl?: string }>
   systemPrompt?: string
+  /** Extra instruction APPENDED to the system prompt for this turn only.
+   *  Live voice uses it to shape a speakable answer; typed turns send nothing,
+   *  so the chat's own custom prompt is never mutated. */
+  systemSuffix?: string
   thinkingLevel?: string
   /** Whether the selected model is reasoning-capable (from the /models
    *  `reasoning` flag). The backend uses this to emit a lightweight composer
@@ -856,6 +866,7 @@ export async function streamChat(
           attachments: params.attachments ?? [],
           images: params.images ?? [],
           system_prompt: params.systemPrompt ?? '',
+          system_suffix: params.systemSuffix ?? '',
           thinking_level: params.thinkingLevel ?? '',
           model_reasoning: params.modelReasoning ?? false,
           mcp_servers: params.mcpServers ?? {},
@@ -863,7 +874,10 @@ export async function streamChat(
           web_search_auto_fetch: params.webSearchAutoFetch ?? 5,
           skills: params.skills ?? [],
           allow_create: params.allowCreate ?? false,
-          cap: params.cap ?? {},
+          // Omitted as `null` (not `{}`) when the caller sends nothing: the
+          // backend then derives the table from `mode`, whereas an empty object
+          // would deserialize to the permissive default and disarm the gate.
+          cap: params.cap ?? null,
           allow_outside: params.allowOutside ?? false,
           allow_outside_folders: params.allowOutsideFolders ?? [],
           allow_computer: params.allowComputer ?? false,
@@ -876,7 +890,7 @@ export async function streamChat(
           restart: params.restart ?? false,
           goal: params.goal ?? null,
           goal_turns: params.goalTurns ?? 0,
-          context_window: modelContextWindow(params.provider, params.provider.model) ?? 0,
+          context_window: modelContextWindow(params.provider, params.provider.model),
         }),
       })
     } catch (err) {
@@ -1009,6 +1023,29 @@ export interface CompactResult {
   usage?: CompactUsage
 }
 
+/** One live progress tick from a running compaction.
+ *
+ *  Not a measured completion percentage: a single model call reports nothing
+ *  until it answers. What IS real is the phase, which attempt is running, and
+ *  how much of the backend's wall-clock budget is already spent — enough for an
+ *  honest "42s / 180s" instead of an anonymous spinner. */
+export interface CompactProgress {
+  /** `preparing` (selecting the verbatim tail) | `summarizing` | `merging`. */
+  phase: string
+  /** 1-based attempt across the primary + fallback chain; 0 before the first. */
+  attempt: number
+  /** How many attempts this run may still make in total (0 when unknown). */
+  attempts: number
+  /** Model running the current attempt. */
+  model: string
+  /** Share of the budget already spent, 0-100. */
+  percent: number
+  /** Wall-clock budget for the WHOLE compaction, in seconds. */
+  budgetSecs: number
+  /** Seconds elapsed since the compaction started. */
+  elapsedSecs: number
+}
+
 /** Native plan persistence (Rust router): the plan lives at
  *  <data>/plan/<workspace-slug>/<chat-id>/plan.md. */
 export async function fetchPlan(
@@ -1060,6 +1097,9 @@ export async function triggerCompact(params: {
   subagentThinking?: Record<string, string>
   thinkingLevel?: string
   modelReasoning?: boolean
+  /** Called on every live progress tick the backend streams while the
+   *  summarizer runs (phase, attempt, elapsed vs. budget). */
+  onProgress?: (progress: CompactProgress) => void
   signal?: AbortSignal
 }): Promise<CompactResult> {
   const url = await ensureSidecar()
@@ -1091,7 +1131,63 @@ export async function triggerCompact(params: {
     const body = (await res.json().catch(() => ({}))) as { detail?: string }
     throw new Error(body.detail || `compact request failed (${res.status})`)
   }
-  return (await res.json()) as CompactResult
+  if (!res.body) throw new Error('the compact stream is unavailable')
+
+  // The route streams SSE: progress ticks while the summarizer runs, then
+  // exactly one result frame. Read all the way to the end so a missing result
+  // surfaces as a real failure instead of an empty "summary".
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  // Holder, not a bare `let`: the assignment happens inside `parseFrame`, and a
+  // plain variable would keep its `null` narrowing at the call site below.
+  const state: { result: CompactResult | null } = { result: null }
+  let buffer = ''
+
+  const parseFrame = (frame: string) => {
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (!raw) continue
+      let payload: Record<string, unknown>
+      try {
+        payload = JSON.parse(raw) as Record<string, unknown>
+      } catch {
+        continue // a malformed frame must not fail the whole compaction
+      }
+      // Progress frames are tagged; everything else is the result.
+      if (payload.compact_progress === true) {
+        params.onProgress?.({
+          phase: String(payload.phase ?? ''),
+          attempt: Number(payload.attempt ?? 0),
+          attempts: Number(payload.attempts ?? 0),
+          model: String(payload.model ?? ''),
+          percent: Number(payload.percent ?? 0),
+          budgetSecs: Number(payload.budget_secs ?? 0),
+          elapsedSecs: Number(payload.elapsed_secs ?? 0),
+        })
+        continue
+      }
+      state.result = payload as unknown as CompactResult
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let idx: number
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const chunk = buffer.slice(0, idx)
+      buffer = buffer.slice(idx + 2)
+      parseFrame(chunk)
+    }
+  }
+  // The last frame usually arrives without a trailing blank line (the stream
+  // just closes); flushing is what keeps that result frame from being dropped.
+  buffer += decoder.decode()
+  if (buffer.trim()) parseFrame(buffer)
+  if (!state.result) throw new Error('the compact stream ended without a result')
+  return state.result
 }
 
 /** Deliver a message to a RUNNING agent for this chat (no abort, injected at
@@ -1159,8 +1255,16 @@ export async function retrySubagentNow(chatId: string): Promise<boolean> {
       body: JSON.stringify({ chat_id: chatId }),
     })
     if (!res.ok) return false
-    const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
-    return body.ok !== false
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean
+      listening?: boolean
+    }
+    if (body.ok === false) return false
+    // `listening` is the honest half: a banner can outlive the ladder that
+    // produced it (turn ended, stream dropped), and reporting that click as
+    // accepted is what made the button look broken. Absent field (older
+    // backend) keeps the previous behaviour.
+    return body.listening !== false
   } catch {
     return false
   }
@@ -1355,6 +1459,12 @@ export interface SkillSyncResult {
   indexed?: boolean
   note?: string
   removed?: boolean
+  /** Extra files kept in the skill folder (slug -> name). */
+  files?: string[]
+  /** Number of Persian keywords stored; 0 means auto-match can never pick it. */
+  fa_keyword_count?: number
+  /** Previous name when the save renamed an existing skill. */
+  renamed_from?: string
 }
 
 /** List all skills (file-based storage in the sidecar's skill dir). */
@@ -2002,7 +2112,7 @@ export async function getChatTraces(
   taskId?: string,
   page?: { limit?: number; before?: number; sub?: boolean },
 ): Promise<TracePage | { error: string }> {
-  if (!chatId) return { traces: [], total: 0, counts: { all: 0, llm: 0, prompt: 0, tool: 0 } }
+  if (!chatId) return { traces: [], total: 0, counts: { all: 0, llm: 0, prompt: 0, tool: 0, fold: 0 } }
   const params = new URLSearchParams()
   if (kind) params.set('kind', kind)
   if (taskId) params.set('task_id', taskId)
@@ -2029,6 +2139,7 @@ export async function getChatTraces(
       llm: out.counts?.llm ?? 0,
       prompt: out.counts?.prompt ?? 0,
       tool: out.counts?.tool ?? 0,
+      fold: out.counts?.fold ?? 0,
     },
   }
 }

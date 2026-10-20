@@ -138,6 +138,56 @@ console.log('4) cyan has no dedicated app variable but is still resolved:')
   check('brightCyan resolves to the success colour', theme.brightCyan === '#00ff88', theme.brightCyan)
 }
 
+console.log('5) scrollbar + selection fields come from the theme, not xterm defaults:')
+{
+  vars = {}
+  const theme = xtermTheme() as Record<string, string>
+  check(
+    'scrollbarSliderBackground falls back to --border',
+    theme.scrollbarSliderBackground === '#524f67',
+    theme.scrollbarSliderBackground,
+  )
+  check(
+    'scrollbarSliderHoverBackground falls back to --text-dim',
+    theme.scrollbarSliderHoverBackground === '#6e6a86',
+    theme.scrollbarSliderHoverBackground,
+  )
+  check(
+    'scrollbarSliderActiveBackground falls back to --text',
+    theme.scrollbarSliderActiveBackground === '#e0def4',
+    theme.scrollbarSliderActiveBackground,
+  )
+  check('overviewRulerBorder falls back to --border', theme.overviewRulerBorder === '#524f67', theme.overviewRulerBorder)
+  check(
+    'selectionInactiveBackground falls back to --bg-hover',
+    theme.selectionInactiveBackground === '#403d52',
+    theme.selectionInactiveBackground,
+  )
+}
+
+console.log('6) theme variables win for those fields too:')
+{
+  vars = {
+    '--border': '#111111',
+    '--text-dim': '#222222',
+    '--text': '#333333',
+    '--bg-hover': '#444444',
+  }
+  const theme = xtermTheme() as Record<string, string>
+  check('scrollbar slider follows --border', theme.scrollbarSliderBackground === '#111111', theme.scrollbarSliderBackground)
+  check('scrollbar hover follows --text-dim', theme.scrollbarSliderHoverBackground === '#222222', theme.scrollbarSliderHoverBackground)
+  check('scrollbar active follows --text', theme.scrollbarSliderActiveBackground === '#333333', theme.scrollbarSliderActiveBackground)
+  check('overview ruler follows --border', theme.overviewRulerBorder === '#111111', theme.overviewRulerBorder)
+  check('inactive selection follows --bg-hover', theme.selectionInactiveBackground === '#444444', theme.selectionInactiveBackground)
+  // Guard against a `color-mix()` leaking in: xterm parses these as colour
+  // VALUES and would render the slot unpainted.
+  check(
+    'no computed-expression value leaks into the palette',
+    Object.values(theme).every((v) => !String(v).includes('color-mix')),
+    theme,
+  )
+}
+
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`)
   process.exit(1)

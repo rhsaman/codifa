@@ -5,6 +5,8 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useMemo,
+  useCallback,
   type KeyboardEvent,
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
@@ -13,6 +15,13 @@ import { diffStatsFromUnified, terminalOutputText } from "../lib/toolActivity";
 import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
+import {
+  buildCommentSpans,
+  commentSyntax,
+  splitCommentSegments,
+  type CommentSpan,
+} from "../lib/diffComments";
+import { highlightSideLines, languageOfPath } from "../lib/highlight";
 import { copyToClipboard } from "../lib/clipboard";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { api } from "../lib/fs";
@@ -24,8 +33,10 @@ import { useDragScroll } from "../lib/useDragScroll";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { createPortal } from "react-dom";
 import { commentFileSelection } from "../lib/fileComments";
+import { toWorkspacePath } from "../lib/fileTree";
 import { selectionBarPos } from "../lib/selectionBar";
 import { bareToolName, mcpServerOf } from "../lib/mcpTools";
+import { diffPopupPos, type DiffPopPos } from "../lib/hoverCardPos";
 
 /** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
  *  dozens of tool rows; one interval driving every live clock keeps CPU and
@@ -293,6 +304,12 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
   const root = useStore((s) => s.root);
   const activeChatId = useStore((s) => s.activeChatId);
   const [reverting, setReverting] = useState<number | null>(null);
+  // Click-opened diff preview. The content is snapshotted by the hook at open
+  // time (see `useDiffPreview`), so a streaming `diff` event can neither
+  // unmount the card nor reset the scroll/selection inside it. A row click goes
+  // through to the Review panel — the preview opens only from the `Review ↗`
+  // pill.
+  const preview = useDiffPreview();
   const running = activities.some((a) => a.activity.status === "running");
   const { adds, dels } = editGroupStats(activities);
   // Live clock so the group total ticks while any file edit is still running.
@@ -361,10 +378,21 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                 key={entry.index}
                 className={`edit-group-row ${entry.activity.status}${entry.activity.reverted ? " reverted" : ""}`}
               >
-                <button
+                {/* A div with button semantics, not a real <button>: the
+                    `Review ↗` pill below is a real button and must not be
+                    nested inside another one. */}
+                <div
                   className="edit-group-row-main"
-                  title={path || undefined}
+                  role="button"
+                  tabIndex={0}
+                  title={path ? toWorkspacePath(root, path) : undefined}
                   onClick={() => messageId && openReview(messageId, path)}
+                  onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (messageId) openReview(messageId, path);
+                    }
+                  }}
                 >
                   <StatusIcon status={entry.activity.status} />
                   <FileIcon path={path} size={20} />
@@ -381,16 +409,45 @@ export const ToolEditGroupView = memo(function ToolEditGroupView({
                       const ms = act.status === "running" && act.startedAt ? Math.max(0, now - act.startedAt) : act.elapsedMs;
                       return ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null;
                     })()}
-                    {messageId && entry.activity.diff && (
-                      <span className="trace-row-review" aria-hidden="true">Review ↗</span>
+                    {entry.activity.diff && (
+                      <button
+                        type="button"
+                        className="trace-row-review"
+                        title="Preview diff"
+                        onClick={(e) => {
+                          // The pill sits inside the row's clickable area, which
+                          // opens the Review panel: this click is the preview,
+                          // not the panel.
+                          e.stopPropagation();
+                          preview.open(
+                            e.currentTarget.closest(".edit-group-row"),
+                            entry.activity.diff,
+                            reviewPathOf(entry.activity),
+                          );
+                        }}
+                      >
+                        Review ↗
+                      </button>
                     )}
                   </span>
-                </button>
+                </div>
               </div>
             );
           })}
         </div>
       )}
+      {preview.snap &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <DiffPreview
+            diff={preview.snap.diff}
+            path={preview.snap.path}
+            pos={preview.snap.pos}
+            onClose={preview.close}
+            onPress={preview.keep}
+          />,
+          document.body,
+        )}
     </div>
   );
 });
@@ -534,18 +591,29 @@ function hostOf(url?: string): string {
   }
 }
 
+/** Human label for a web-search engine kind (`duckduckgo` → DuckDuckGo). The
+ *  backend reports the kind that actually answered the query — a fallback may
+ *  have served it, so the settings primary is not necessarily the right one. */
+function webProviderLabel(kind: string): string {
+  switch (kind) {
+    case "duckduckgo":
+      return "DuckDuckGo";
+    case "tavily":
+      return "Tavily";
+    default:
+      return kind;
+  }
+}
+
 /** Tools whose rows are web hits/fetched pages rather than files. */
 function isWebRow(activity: ToolActivity): boolean {
   return activity.tool === "web_search" || activity.tool === "fetch_url";
 }
 
-/** CODEX-style inline web results: the hits ARE the payload of a search row,
- *  so they render directly under it and stay visible without expanding.
- *
- *  Previously the rows only existed inside the `expanded` body, and the head
- *  click opened a side text panel instead of expanding whenever the output was
- *  longer than TRACE_TEXT_PANEL_MIN — so a real `web_search` (whose distilled
- *  answer exceeds 600 chars) never showed a single link. */
+/** The hits of a `web_search` / `fetch_url` row. Rendered at the bottom of the
+ *  row's OWN expanded body — never as a sibling block hanging outside the tool
+ *  call — so folding the call tucks the list back inside it. Web rows therefore
+ *  start expanded (see `TraceRow` / `ToolSingleRow`). */
 const InlineWebResults = memo(function InlineWebResults({
   activity,
 }: {
@@ -560,20 +628,59 @@ const InlineWebResults = memo(function InlineWebResults({
   );
 });
 
+/** How many web hits the collapsed list shows before "+N more". */
+const WEB_RESULTS_VISIBLE = 3;
+
 /** Shared, beautifully-styled list of web_search result links. Rendered in
  *  EVERY tool view (full card, single row, timeline row) so the links the
  *  model found are always visible — not just in the expanded card. Pure
  *  presentational component (no store/fullscreen hooks) so it can be
- *  unit-tested in isolation. */
+ *  unit-tested in isolation.
+ *
+ *  Collapsed to `WEB_RESULTS_VISIBLE` rows: a 5-10 hit search used to render a
+ *  wall of full-height cards that pushed every following tool row off screen.
+ *  The hidden rows open IN PLACE — these are links the user clicks, so the
+ *  FileResultLinks pattern (dump the rest into the side panel) would make them
+ *  unusable.
+ *
+ *  Each row may carry `fetched` from the backend: `true` = real page content
+ *  reached the model, `false` = the fetch failed and only the snippet did. That
+ *  flag and the "N results · M fetched" line are the only way to tell a thin
+ *  answer caused by a broken fetch from one caused by bad results. */
 export const WebResultLinks = memo(function WebResultLinks({
   items,
 }: {
   items: SearchResultItem[];
 }) {
+  // Hooks run before the empty-list bail-out (rules of hooks).
+  const [showAll, setShowAll] = useState(false);
   if (!items || items.length === 0) return null;
+  // Only rows that actually carry the flag count — an old transcript shows no
+  // badge and no count line at all.
+  const fetchInfo = items.filter((it) => typeof it.fetched === "boolean");
+  const fetchedCount = fetchInfo.filter((it) => it.fetched).length;
+  const visible = showAll ? items : items.slice(0, WEB_RESULTS_VISIBLE);
+  const hidden = items.length - visible.length;
   return (
-    <ul className="web-results" dir="auto">
-      {items.map((it, i) => {
+    <>
+      {fetchInfo.length > 0 && (
+        <div className="web-results-head" dir="auto">
+          <span className="web-results-count">
+            {`${items.length} result${items.length === 1 ? "" : "s"}`}
+          </span>
+          <span className="web-results-sep" aria-hidden="true">
+            ·
+          </span>
+          <span
+            className={`web-results-fetched${fetchedCount === 0 ? " none" : ""}`}
+            title="Results whose real page content was fetched. The rest reached the model as a short snippet only."
+          >
+            {`${fetchedCount} fetched`}
+          </span>
+        </div>
+      )}
+      <ul className="web-results" dir="auto">
+        {visible.map((it, i) => {
         const host = hostOf(it.url);
         return (
           <li key={i} className="web-result">
@@ -612,6 +719,17 @@ export const WebResultLinks = memo(function WebResultLinks({
                   <span className="web-result-snippet">{it.snippet}</span>
                 )}
               </span>
+              {/* Flag only the EXCEPTION (snippet-only) rows: a chip on every
+                  successfully fetched row would just be noise on a 10-row list,
+                  while a missing page is the thing worth noticing. */}
+              {it.fetched === false && (
+                <span
+                  className="web-result-fetched"
+                  title="This page could not be fetched — only the short search snippet reached the model."
+                >
+                  snippet
+                </span>
+              )}
               <span className="web-result-host">{host}</span>
               <span className="web-result-arrow" aria-hidden="true">
                 ↗
@@ -619,8 +737,28 @@ export const WebResultLinks = memo(function WebResultLinks({
             </a>
           </li>
         );
-      })}
-    </ul>
+        })}
+      </ul>
+      {hidden > 0 && (
+        <button
+          type="button"
+          className="web-result-more-btn"
+          onClick={() => setShowAll(true)}
+          title="Show every result"
+        >
+          {`+${hidden} more`}
+        </button>
+      )}
+      {showAll && items.length > WEB_RESULTS_VISIBLE && (
+        <button
+          type="button"
+          className="web-result-more-btn"
+          onClick={() => setShowAll(false)}
+        >
+          Show less
+        </button>
+      )}
+    </>
   );
 });
 
@@ -817,110 +955,15 @@ function TomlLine({ text }: { text: string }) {
   );
 }
 
-/** Comment markers for a file, chosen from its extension.
- *  Only used to dim the comment part of a diff line, so an annotation never
- *  reads as code. Unknown extensions return nothing (no dimming). */
-function commentMarkers(path?: string): string[] {
-  if (!path) return [];
-  const ext = path.split("?")[0].toLowerCase().split(".").pop() ?? "";
-  switch (ext) {
-    case "ts":
-    case "tsx":
-    case "js":
-    case "jsx":
-    case "mjs":
-    case "cjs":
-    case "rs":
-    case "go":
-    case "java":
-    case "c":
-    case "h":
-    case "cc":
-    case "cpp":
-    case "hpp":
-    case "cs":
-    case "kt":
-    case "swift":
-    case "scss":
-    case "less":
-    case "php":
-    case "mm":
-    case "dart":
-    case "zig":
-    case "jsonc":
-    case "proto":
-    case "groovy":
-      return ["//"];
-    case "py":
-    case "rb":
-    case "sh":
-    case "bash":
-    case "zsh":
-    case "fish":
-    case "yml":
-    case "yaml":
-    case "ini":
-    case "cfg":
-    case "conf":
-    case "pl":
-    case "jl":
-    case "nim":
-    case "tf":
-    case "hcl":
-    case "dockerfile":
-    case "makefile":
-    case "mk":
-      return ["#"];
-    case "sql":
-    case "lua":
-    case "hs":
-    case "elm":
-      return ["--"];
-    case "css":
-    case "html":
-    case "htm":
-    case "xml":
-    case "svg":
-    case "vue":
-    case "svelte":
-      return ["/*"];
-    default:
-      return [];
-  }
-}
-
-/** Index where a trailing comment starts in `text`, or -1.
- *  Quotes are respected, so a marker inside a string literal stays code. */
-function commentIndex(text: string, markers: string[]): number {
-  if (markers.length === 0) return -1;
-  let quote: string | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === "\\") {
-        i++;
-        continue;
-      }
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      quote = ch;
-      continue;
-    }
-    for (const m of markers) {
-      if (text.startsWith(m, i)) return i;
-    }
-  }
-  return -1;
-}
-
-/** متن یک خط دیف: برای toml هایلایت‌دار، بقیه ساده.
- *  وقتی کوئری جست‌وجو فعال است، رخدادها با <mark> هایلایت می‌شوند؛
+/** یک خط دیف: سینتکس‌هایلایتِ همان زبان فایل (با رنگ‌های تم فعال)،
+ *  و اگر زبانی برایش ثبت نشده باشد فقط کامنت‌هایش کم‌رنگ می‌شوند.
+ *  وقتی کوئری جست‌وجو فعال است، رخدادها با <mark> هایلایت می‌شوند و
  *  رخداد فعال (`activeHit`) کلاس متمایز می‌گیرد تا با دکمه‌های عقب/جلو دیده شود. */
 function DiffLineText({
   text,
   path,
+  html,
+  commentSpans,
   query,
   hitBase = 0,
   activeHit = -1,
@@ -928,6 +971,10 @@ function DiffLineText({
 }: {
   text: string;
   path?: string;
+  /** HTML سینتکس‌هایلایت‌شدهٔ همین خط — متنِ کاملِ یک سمت با هم هایلایت
+   *  می‌شود تا توکن‌های چندخطی رنگشان را از دست ندهند. */
+  html?: string;
+  commentSpans?: CommentSpan[];
   query?: string;
   hitBase?: number;
   activeHit?: number;
@@ -941,18 +988,33 @@ function DiffLineText({
   if (path && path.split("?")[0].toLowerCase().endsWith(".toml")) {
     return <TomlLine text={text} />;
   }
-  // Dim a trailing comment so annotation never reads as code. Only the part
-  // after the marker is wrapped: the code keeps the theme's normal text colour.
-  const ci = commentIndex(text, commentMarkers(path));
-  if (ci >= 0) {
+  // highlight.js already colours comments (--text-dim) and keeps a block
+  // comment coloured across every line it spans, so the manual splitter below
+  // is only the fallback for extensions it has no grammar for.
+  if (html != null) {
     return (
-      <>
-        <span>{text.slice(0, ci)}</span>
-        <span className="diff-comment">{text.slice(ci)}</span>
-      </>
+      <span
+        className="diff-code"
+        dir="auto"
+        dangerouslySetInnerHTML={{ __html: html === "" ? "\n" : html }}
+      />
     );
   }
-  return <>{text}</>;
+  const segments = splitCommentSegments(text, commentSpans);
+  if (segments.length === 1 && !segments[0].comment) return <>{text}</>;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.comment ? (
+          <span key={i} className="diff-comment">
+            {seg.text}
+          </span>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  );
 }
 
 /** متن را به تکه‌های عادی/هایلایت می‌شکند (case-insensitive).
@@ -1066,6 +1128,144 @@ export function diffQuoteForSelection(
  *  رخداد فعال داخل همین دیف است (‎-1‎ یعنی هیچ‌کدام) که خودکار اسکرول می‌شود.
  *  `layout` حالت نما را اجبار می‌کند (`auto` عرض کانتینر را با ناظر تغییراندازه
  *  می‌سنجد) و `threshold` آستانه‌ی سوییچ خودکار است. */
+/** Click-opened preview of an edit/write diff, floating over the chat.
+ *
+ *  The diff never opens inline (Codex-style: the card stays one quiet line), so
+ *  the `Review ↗` pill on each row opens this card instead — the change can be
+ *  read without leaving the transcript — while a click on the row itself still
+ *  sends the whole turn to the side Review panel. It renders the very same
+ *  `DiffView` the Review panel uses, so colours and layout match.
+ *
+ *  Deliberately click-only. An earlier version followed the pointer and could
+ *  not work: the card lands exactly where the cursor already is, so the row
+ *  underneath reported `pointerleave` the moment the card appeared and closed
+ *  the thing that had just opened.
+ */
+const DiffPreview = memo(function DiffPreview({
+  diff,
+  path,
+  pos,
+  onClose,
+  onPress,
+}: {
+  diff: string;
+  path?: string;
+  pos: DiffPopPos;
+  onClose: () => void;
+  /** Keeps a press inside the card from counting as an outside press. */
+  onPress?: () => void;
+}) {
+  const basename = path ? path.split("/").pop() ?? path : "";
+  return (
+    <div
+      className="diff-preview-card"
+      style={{
+        position: "fixed",
+        top: pos.top,
+        left: pos.left,
+        width: pos.width,
+        maxHeight: pos.maxHeight,
+        zIndex: 9998,
+      }}
+      role="dialog"
+      aria-label={basename ? `Diff preview for ${basename}` : "Diff preview"}
+      dir="ltr"
+      onPointerDown={onPress}
+    >
+      {/* The head renders even without a path so the ✕ is always reachable. */}
+      <div className="diff-preview-head">
+        {path && <FileIcon path={path} size={16} />}
+        <span className="diff-preview-path" dir="auto" title={path}>
+          {basename}
+        </span>
+        <button
+          type="button"
+          className="diff-preview-close"
+          title="Close preview"
+          aria-label="Close diff preview"
+          onClick={onClose}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+        </button>
+      </div>
+      {/* select → Copy / Reply exactly like the Review panel. Both the toolbar
+          and the comment editor are portaled to document.body, i.e. OUTSIDE
+          this card: the hook that owns it keeps presses on them from closing
+          it (see `useDiffPreview`). */}
+      <div className="diff-preview-body">
+        <DiffView diff={diff} path={path} layout="unified" />
+      </div>
+    </div>
+  );
+});
+
+/** Click-opened diff preview state, shared by the three edit surfaces (edit
+ *  card, trace row, grouped edit rows).
+ *
+ *  No hover behaviour by design: the card would be portaled on top of the
+ *  cursor, so the row underneath reports `pointerleave` the moment it appears
+ *  and a hover-opened card closes itself immediately (that was the very bug
+ *  this replaced). It opens from the `Review ↗` pill, anchored to the row that
+ *  owns it, and closes on ✕, Escape, or a press outside it.
+ */
+function useDiffPreview() {
+  // The OPEN SNAPSHOT, not a live view. While the agent streams, every diff
+  // event replaces `activity` with a fresh object and briefly blanks
+  // `activity.diff`; a portal gated on the live value therefore unmounted and
+  // remounted the card mid-read, which reset both scroll offsets and destroyed
+  // any text selection inside it (a DOM selection cannot survive its node being
+  // removed). Freezing diff/path at open time is what makes reading + selecting
+  // stable while the turn is still running.
+  const [snap, setSnap] = useState<
+    { diff: string; path?: string; pos: DiffPopPos } | null
+  >(null);
+  // When it was opened. The press that opened it is still propagating up to
+  // document while the listeners below get attached, so a press immediately
+  // after an open is ignored instead of closing what it just opened.
+  const openedAt = useRef(0);
+  const open = useCallback((el: Element | null | undefined, diff: string | undefined, path?: string) => {
+    if (!el || !diff || typeof window === "undefined") return;
+    openedAt.current = Date.now();
+    setSnap({
+      diff,
+      path,
+      pos: diffPopupPos(
+        el.getBoundingClientRect(),
+        window.innerWidth,
+        window.innerHeight,
+      ),
+    });
+  }, []);
+  const close = useCallback(() => setSnap(null), []);
+  /** A press landed inside the card: same grace as opening, so interacting with
+   *  the diff (scrolling by dragging, selecting) never closes it. */
+  const keep = useCallback(() => {
+    openedAt.current = Date.now();
+  }, []);
+  useEffect(() => {
+    if (!snap) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setSnap(null);
+    };
+    const onDown = (e: globalThis.PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t || typeof t.closest !== "function") return;
+      // The Copy/Reply toolbar and the comment editor are portaled to
+      // document.body — outside the card — so pressing them must keep it open.
+      if (t.closest(".diff-preview-card, .fv-sel-bar, .fv-comment-float")) return;
+      if (Date.now() - openedAt.current < 250) return;
+      setSnap(null);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onDown);
+    };
+  }, [snap]);
+  return { snap, open, close, keep };
+}
+
 export function DiffView({
   diff,
   path,
@@ -1112,6 +1312,34 @@ export function DiffView({
           ? shouldShowSideBySide(measuredWidth, threshold)
           : true
         : shouldShowSideBySide(measuredWidth, threshold);
+  // Syntax highlighting for the diff: each file side is highlighted as ONE
+  // text (not line by line), so a token that spans lines — doc comment,
+  // template literal, docstring — keeps its colour on all of its lines. The
+  // result is keyed by gutter line number and shared by both layouts.
+  const lang = languageOfPath(path);
+  const { beforeHtml, afterHtml, beforeSpans, afterSpans } = useMemo(() => {
+    const before: { lineNo: number; text: string }[] = [];
+    const after: { lineNo: number; text: string }[] = [];
+    for (const row of rows) {
+      if ("text" in row) continue;
+      if (row.type === "add") {
+        after.push({ lineNo: row.aLine, text: row.after });
+      } else if (row.type === "del") {
+        before.push({ lineNo: row.bLine, text: row.before });
+      } else {
+        before.push({ lineNo: row.bLine, text: row.before });
+        after.push({ lineNo: row.aLine, text: row.after });
+      }
+    }
+    const syntax = commentSyntax(path);
+    return {
+      beforeHtml: highlightSideLines(before, lang),
+      afterHtml: highlightSideLines(after, lang),
+      beforeSpans: buildCommentSpans(before, syntax),
+      afterSpans: buildCommentSpans(after, syntax),
+    };
+  }, [rows, path, lang]);
+
   const activeRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest" });
@@ -1254,6 +1482,7 @@ export function DiffView({
     gutter: string,
     lineNo: number,
     text: string,
+    side: "before" | "after" | "both",
   ) => {
     const q = (query ?? "").trim();
     const base = hitCursor;
@@ -1266,6 +1495,20 @@ export function DiffView({
           <DiffLineText
             text={text}
             path={path}
+            html={
+              side === "before"
+                ? beforeHtml.get(lineNo)
+                : side === "after"
+                  ? afterHtml.get(lineNo)
+                  : (afterHtml.get(lineNo) ?? beforeHtml.get(lineNo))
+            }
+            commentSpans={
+              side === "before"
+                ? beforeSpans.get(lineNo)
+                : side === "after"
+                  ? afterSpans.get(lineNo)
+                  : (afterSpans.get(lineNo) ?? beforeSpans.get(lineNo))
+            }
             query={query}
             hitBase={base}
             activeHit={activeHit}
@@ -1283,6 +1526,7 @@ export function DiffView({
     lineNo: number,
     text: string,
     empty: boolean,
+    side: "before" | "after",
   ) => {
     const q = (query ?? "").trim();
     const base = hitCursor;
@@ -1302,6 +1546,16 @@ export function DiffView({
             <DiffLineText
               text={text}
               path={path}
+              html={
+                side === "before"
+                  ? beforeHtml.get(lineNo)
+                  : afterHtml.get(lineNo)
+              }
+              commentSpans={
+                side === "before"
+                  ? beforeSpans.get(lineNo)
+                  : afterSpans.get(lineNo)
+              }
               query={query}
               hitBase={base}
               activeHit={activeHit}
@@ -1343,7 +1597,7 @@ export function DiffView({
                 {contents.map((r, ri) => {
                   if ("text" in r) return null;
                   if (r.type === "same")
-                    return renderSideCell(`${ri}-b`, "", r.bLine, r.before, false);
+                    return renderSideCell(`${ri}-b`, "", r.bLine, r.before, false, "before");
                   if (r.type === "del" || r.type === "mod")
                     return renderSideCell(
                       `${ri}-b`,
@@ -1351,8 +1605,9 @@ export function DiffView({
                       r.bLine,
                       r.before,
                       false,
+                      "before",
                     );
-                  return renderSideCell(`${ri}-b`, "diff-line-empty", -1, "", true);
+                  return renderSideCell(`${ri}-b`, "diff-line-empty", -1, "", true, "before");
                 })}
               </pre>
             </div>
@@ -1361,7 +1616,7 @@ export function DiffView({
                 {contents.map((r, ri) => {
                   if ("text" in r) return null;
                   if (r.type === "same")
-                    return renderSideCell(`${ri}-a`, "", r.aLine, r.after, false);
+                    return renderSideCell(`${ri}-a`, "", r.aLine, r.after, false, "after");
                   if (r.type === "add" || r.type === "mod")
                     return renderSideCell(
                       `${ri}-a`,
@@ -1369,8 +1624,9 @@ export function DiffView({
                       r.aLine,
                       r.after,
                       false,
+                      "after",
                     );
-                  return renderSideCell(`${ri}-a`, "diff-line-empty", -1, "", true);
+                  return renderSideCell(`${ri}-a`, "diff-line-empty", -1, "", true, "after");
                 })}
               </pre>
             </div>
@@ -1391,15 +1647,15 @@ export function DiffView({
           );
         }
         if (row.type === "same")
-          return renderRow(i, "diff-u-ctx", " ", row.aLine, row.after);
+          return renderRow(i, "diff-u-ctx", " ", row.aLine, row.after, "both");
         if (row.type === "del")
-          return renderRow(i, "diff-u-del", "-", row.bLine, row.before);
+          return renderRow(i, "diff-u-del", "-", row.bLine, row.before, "before");
         if (row.type === "add")
-          return renderRow(i, "diff-u-add", "+", row.aLine, row.after);
+          return renderRow(i, "diff-u-add", "+", row.aLine, row.after, "after");
         // mod: خط قدیمی قرمز + خط جدید سبز، هر دو با شماره‌ی خودشان.
         return [
-          renderRow(`${i}-d`, "diff-u-del", "-", row.bLine, row.before),
-          renderRow(`${i}-a`, "diff-u-add", "+", row.aLine, row.after),
+          renderRow(`${i}-d`, "diff-u-del", "-", row.bLine, row.before, "before"),
+          renderRow(`${i}-a`, "diff-u-add", "+", row.aLine, row.after, "after"),
         ];
       })}
     </div>
@@ -1583,7 +1839,11 @@ export const ToolGroupView = memo(function ToolGroupView({
    *  summary). */
   captions?: (string | null)[];
 }) {
-  const [open, setOpen] = useState(false);
+  // A run that contains a web call opens by default: the hits live INSIDE those
+  // rows, so a collapsed head would hide the search payload behind a click.
+  const [open, setOpen] = useState(() =>
+    activities.some(({ activity }) => isWebRow(activity)),
+  );
   const running = activities.some((a) => a.activity.status === "running");
   // Live clock so the group total ticks while any call is still running.
   const now = useRunningClock(running);
@@ -1661,8 +1921,12 @@ export const ToolGroupView = memo(function ToolGroupView({
           ))}
         </span>
         {searchEngines.map((engine) => (
-          <span key={engine} className="trace-row-engine">
-            {engine}
+          <span
+            key={engine}
+            className="trace-row-engine"
+            title="Web search provider"
+          >
+            {webProviderLabel(engine)}
           </span>
         ))}
         {headCaption && (
@@ -1677,19 +1941,9 @@ export const ToolGroupView = memo(function ToolGroupView({
           <IconChevron open={open} className="trace-chev" />
         </span>
       </button>
-      {/* CODEX-style: the hits of a search ARE the payload of the run, so they
-          stay visible under the collapsed group head. The child TraceRows are
-          not even mounted while the group is collapsed, so relying on them
-          alone hid every web link until a second click. */}
-      {!open &&
-        activities.map(({ activity, index }) =>
-          isWebRow(activity) ? (
-            <InlineWebResults
-              key={`grp-web-${index}`}
-              activity={activity}
-            />
-          ) : null,
-        )}
+      {/* The hits of a search belong to the individual `web_search` row: they
+          are rendered INSIDE that row while it is expanded, so a collapsed
+          group head stays a single compact line. */}
       {open && (
         <div className="trace-list">
           {activities.map(({ activity, index }, i) => (
@@ -1852,8 +2106,12 @@ function subArgSummary(activity: ToolActivity): string {
  *  a closed card would show. */
 export const ToolSubRow = memo(function ToolSubRow({
   activity,
+  hideResult,
 }: {
   activity: ToolActivity;
+  /** Suppress the prose result block (used by the collapsed cascade preview,
+   *  where a `read` would otherwise paste an entire file into the card). */
+  hideResult?: boolean;
 }) {
   const [now, setNow] = useState(() => Date.now());
   const running = activity.status === "running";
@@ -1884,9 +2142,10 @@ export const ToolSubRow = memo(function ToolSubRow({
         )}
         <span className="tool-ms">{fmtTime(ms)}</span>
       </div>
-      {/* Text-output tools (LSP lookups, memory search) have no file rows, so
-          their prose result is the only output — show it under the row. */}
-      {activity.resultText && (
+      {/* Text-output tools (LSP lookups, memory search, read windows) have no
+          file rows of their own, so their prose result is the only output —
+          show it under the row. */}
+      {activity.resultText && !hideResult && (
         <pre className="tool-sub-result" dir="auto">
           {activity.resultText}
         </pre>
@@ -1958,9 +2217,14 @@ const TraceRow = memo(function TraceRow({
   activity: ToolActivity;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  // edit_file / write_file همیشه باز باشن (diff نشون بدن)
+  // edit_file / write_file and web rows always start open: a diff and a search
+  // result list are the payload of their row, so a collapsed line would hide
+  // them. A fold click still tucks the content inside the call.
   const [expanded, setExpanded] = useState(
-    () => activity.tool === "edit_file" || activity.tool === "write_file",
+    () =>
+      activity.tool === "edit_file" ||
+      activity.tool === "write_file" ||
+      isWebRow(activity),
   );
   const running = activity.status === "running";
   useEffect(() => {
@@ -1992,6 +2256,13 @@ const TraceRow = memo(function TraceRow({
   const outputText = traceRowOutputText(activity, argsText);
   const sideTitle = `${label} — ${detail.slice(0, 40)}`;
   const onHeadClick = () => {
+    // Web rows always toggle in place: their result list lives inside this
+    // row, and the long-output side-panel path below would leave it
+    // unreachable from the header (user request).
+    if (isWebRow(activity)) {
+      setExpanded((e) => !e);
+      return;
+    }
     if (!isEdit && outputText.length > TRACE_TEXT_PANEL_MIN) {
       useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
@@ -2018,7 +2289,9 @@ const TraceRow = memo(function TraceRow({
         </span>
         <span className="trace-pill">{label}</span>
         {activity.tool === "web_search" && activity.engine && (
-          <span className="trace-row-engine">{activity.engine}</span>
+          <span className="trace-row-engine" title="Web search provider">
+            {webProviderLabel(activity.engine)}
+          </span>
         )}
         <span className="trace-row-detail" dir="auto" title={detail ?? ""}>
           {detail}
@@ -2029,7 +2302,6 @@ const TraceRow = memo(function TraceRow({
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
       </button>
-      <InlineWebResults activity={activity} />
       {expanded && (
         <div className="trace-row-expand">
           {ms ? (
@@ -2076,16 +2348,20 @@ const TraceRow = memo(function TraceRow({
               </pre>
             </div>
           )}
-          {(activity.items ?? activity.results) &&
+          {/* The hits of a `web_search` / `fetch_url` row belong to THIS row:
+              they render at the bottom of its own expanded body — never as a
+              sibling block hanging outside the tool call — and the row starts
+              expanded so the payload shows without a second click. Folding the
+              row tucks them back inside the collapsed call. */}
+          {isWebRow(activity) && <InlineWebResults activity={activity} />}
+          {/* The `Results` section below is the FILE-path list (read / grep /
+              terminal); web rows already rendered their links above. */}
+          {!isWebRow(activity) &&
+            (activity.items ?? activity.results) &&
             (activity.items ?? activity.results)!.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
-              {activity.tool === "web_search" ||
-                activity.tool === "fetch_url" ? (
-                <WebResultLinks
-                  items={(activity.items ?? activity.results)!}
-                />
-              ) : activity.tool === "run_terminal" ? (
+              {activity.tool === "run_terminal" ? (
                 <TerminalResultText
                   items={activity.items ?? activity.results}
                 />
@@ -2225,7 +2501,7 @@ const ToolCascade = memo(function ToolCascade({
           className="tool-cascade-item"
           style={{ zIndex: i + 1 }}
         >
-          <ToolSubRow activity={a} />
+          <ToolSubRow activity={a} hideResult />
         </div>
       ))}
     </div>
@@ -2268,7 +2544,14 @@ export const ToolSingleRow = memo(function ToolSingleRow({
   messageId?: string;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  const [expanded, setExpanded] = useState(false);
+  // A web row starts EXPANDED: the search hits are its payload, so they should
+  // be visible inside the call from the first paint (a blank one-line row hides
+  // the very thing the user asked for). Folding it tucks the list back into the
+  // collapsed call. Every other tool starts collapsed.
+  const [expanded, setExpanded] = useState(() => isWebRow(activity));
+  // Edit rows open their diff preview from the `Review ↗` pill (click) and send
+  // a plain row click to the side Review panel.
+  const preview = useDiffPreview();
   const running = activity.status === "running";
   useEffect(() => {
     if (!running) return;
@@ -2311,6 +2594,13 @@ export const ToolSingleRow = memo(function ToolSingleRow({
       useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
     }
+    // Web rows expand IN PLACE: the distilled answer is long enough to trip
+    // the side-panel path below, which left the row's own result list
+    // unreachable. The header must always toggle this row.
+    if (isWebRow(activity)) {
+      setExpanded((e) => !e);
+      return;
+    }
     if (outputText.length > TRACE_TEXT_PANEL_MIN) {
       useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
@@ -2330,15 +2620,30 @@ export const ToolSingleRow = memo(function ToolSingleRow({
     <div
       className={`trace-row single ${activity.status}${running ? " running" : ""}${expanded ? " expanded" : ""}${isEdit ? " edit-file" : ""}`}
     >
-      <button
+      {/* A div with button semantics, not a real <button>: the `Review ↗` pill
+          below is a real button and must not be nested inside another one. */}
+      <div
         className="trace-row-head"
+        role="button"
+        tabIndex={0}
         /* کارت ویرایش دیف را در چت باز نمی‌کند — کلیک، ترن را در پنل Review
            سمت راست نشان می‌دهد (سبک کدکس). بقیهٔ ردیف‌ها مثل قبل باز/بسته. */
         onClick={onHeadClick}
         title={isEdit ? "Review changes in the side panel" : undefined}
+        onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onHeadClick();
+          }
+        }}
       >
         <StatusIcon status={activity.status} />
         <span className="trace-pill">{label}</span>
+        {activity.tool === "web_search" && activity.engine && (
+          <span className="trace-row-engine" title="Web search provider">
+            {webProviderLabel(activity.engine)}
+          </span>
+        )}
         {isEdit ? (
           <span
             className="trace-row-detail"
@@ -2354,23 +2659,33 @@ export const ToolSingleRow = memo(function ToolSingleRow({
             {detail}
           </span>
         )}
-        {activity.tool === "web_search" && activity.engine && (
-          <span className="trace-row-engine">{activity.engine}</span>
-        )}
         <span className="trace-row-end">
           {isEdit && diffStats && (
             <span className="trace-row-diff-stats">{diffStats}</span>
           )}
-          {isEdit && messageId && activity.diff && (
-            <span className="trace-row-review" aria-hidden="true">
+          {isEdit && activity.diff && (
+            <button
+              type="button"
+              className="trace-row-review"
+              title="Preview diff"
+              onClick={(e) => {
+                // The pill sits inside the row's clickable area, which opens the
+                // Review panel: this click is the preview, not the panel.
+                e.stopPropagation();
+                preview.open(
+                  e.currentTarget.closest(".trace-row.single"),
+                  activity.diff,
+                  reviewPathOf(activity),
+                );
+              }}
+            >
               Review ↗
-            </span>
+            </button>
           )}
           {ms ? <span className="trace-row-ms">{fmtTime(ms)}</span> : null}
           <IconChevron open={expanded} className="trace-row-chev" />
         </span>
-      </button>
-      <InlineWebResults activity={activity} />
+      </div>
       {expanded ? (
         <div className="trace-row-expand">
           {ms ? (
@@ -2417,16 +2732,20 @@ export const ToolSingleRow = memo(function ToolSingleRow({
               </pre>
             </div>
           )}
-          {(activity.items ?? activity.results) &&
+          {/* The hits of a `web_search` / `fetch_url` row belong to THIS row:
+              they render at the bottom of its own expanded body — never as a
+              sibling block hanging outside the tool call — and the row starts
+              expanded so the payload shows without a second click. Folding the
+              row tucks them back inside the collapsed call. */}
+          {isWebRow(activity) && <InlineWebResults activity={activity} />}
+          {/* The `Results` section below is the FILE-path list (read / grep /
+              terminal); web rows already rendered their links above. */}
+          {!isWebRow(activity) &&
+            (activity.items ?? activity.results) &&
             (activity.items ?? activity.results)!.length > 0 && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
-              {activity.tool === "web_search" ||
-                activity.tool === "fetch_url" ? (
-                <WebResultLinks
-                  items={(activity.items ?? activity.results)!}
-                />
-              ) : activity.tool === "run_terminal" ? (
+              {activity.tool === "run_terminal" ? (
                 <TerminalResultText
                   items={activity.items ?? activity.results}
                 />
@@ -2445,6 +2764,18 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           )}
         </div>
       ) : null}
+      {preview.snap &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <DiffPreview
+            diff={preview.snap.diff}
+            path={preview.snap.path}
+            pos={preview.snap.pos}
+            onClose={preview.close}
+            onPress={preview.keep}
+          />,
+          document.body,
+        )}
     </div>
   );
 });
@@ -2491,6 +2822,9 @@ export const ToolCallView = memo(function ToolCallView({
   onReverted?: () => void;
 }) {
   const [reverting, setReverting] = useState(false);
+  // The card's `Review ↗` pill opens the diff preview; a click on the head still
+  // opens the Review panel.
+  const preview = useDiffPreview();
   // سبک کدکس: کارت ویرایش کوچک می‌ماند و دیف هرگز داخل چت باز نمی‌شود؛
   // کلیک روی خودِ کارت (یا دکمهٔ Review) دیف را در پنل سمت راست نشان می‌دهد.
   const openReview = useViewerTabs((s) => s.openReview);
@@ -2701,13 +3035,17 @@ export const ToolCallView = memo(function ToolCallView({
                 </span>
               ) : null;
             })()}
-          {isWrite && activity.diff && messageId && (
+          {isWrite && activity.diff && (
             <button
               className="tool-review-btn"
-              title="Open in Review panel"
+              title="Preview diff"
               onClick={(e) => {
                 e.stopPropagation();
-                openReview(messageId, writePath);
+                preview.open(
+                  e.currentTarget.closest(".tool-card"),
+                  activity.diff,
+                  writePath,
+                );
               }}
             >
               Review ↗
@@ -2735,6 +3073,40 @@ export const ToolCallView = memo(function ToolCallView({
           {activity.summary && !isWrite && (
             <div className="tool-summary">{fixZwsp(activity.summary)}</div>
           )}
+          {/* A `read` result IS the file window: it is a code dump, not a
+              one-line summary — render it as a clamped pre (same block the
+              terminal output uses) so the card body cannot balloon. */}
+          {activity.tool === "read" && activity.resultText && (
+            <pre
+              className={`trace-expand-val trace-expand-pre trace-terminal-output${
+                activity.resultText.length > 600 ? " clickable" : ""
+              }`}
+              dir="ltr"
+              title={
+                activity.resultText.length > 600
+                  ? "Open the full content in the side panel"
+                  : undefined
+              }
+              onClick={
+                activity.resultText.length > 600
+                  ? () =>
+                      useViewerTabs
+                        .getState()
+                        .openText(
+                          `read — ${String(
+                            (activity.args as Record<string, unknown> | undefined)?.filePath ??
+                              (activity.args as Record<string, unknown> | undefined)?.path ??
+                              "file",
+                          )}`,
+                          activity.resultText as string,
+                          "text",
+                        )
+                  : undefined
+              }
+            >
+              {activity.resultText}
+            </pre>
+          )}
           {activity.tool === "explore" &&
             activity.children &&
             activity.children.length > 0 && (
@@ -2743,6 +3115,10 @@ export const ToolCallView = memo(function ToolCallView({
                   <ToolSubRow
                     key={`${child.tool}-${i}-${child.callId ?? i}`}
                     activity={child}
+                    // A read child carries the whole file window; the sub-row
+                    // already names the path, so keep the list scannable and
+                    // leave the content to the Explore side panel.
+                    hideResult={child.tool === "read"}
                   />
                 ))}
               </div>
@@ -2768,6 +3144,18 @@ export const ToolCallView = memo(function ToolCallView({
           )}
         </div>
       )}
+      {preview.snap &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <DiffPreview
+            diff={preview.snap.diff}
+            path={preview.snap.path}
+            pos={preview.snap.pos}
+            onClose={preview.close}
+            onPress={preview.keep}
+          />,
+          document.body,
+        )}
     </div>
   );
 });

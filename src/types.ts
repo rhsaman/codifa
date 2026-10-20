@@ -183,6 +183,10 @@ export interface Settings {
   sttModel?: string
   /** Ordered STT fallback targets, tried after the primary STT source fails. */
   sttFallbacks?: SttFallback[]
+  /** STT language hint sent to the provider ('fa', 'en', …). Empty = auto. */
+  sttLanguage?: string
+  /** Extra STT prompt/glossary prepended to the built-in per-language prompt. */
+  sttPrompt?: string
   /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
   ttsProviderId?: string
   /** TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
@@ -191,6 +195,9 @@ export interface Settings {
   ttsVoice?: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks?: TtsFallback[]
+  /** Realtime (speech-to-speech) provider id. Empty = live voice runs the
+   *  chunked STT + TTS pipeline instead of a realtime session. */
+  liveProviderId?: string
   /** Live voice (realtime speech-to-speech) model id (e.g. gpt-realtime). */
   liveModel?: string
   /** Live voice id used for the realtime session (e.g. alloy). */
@@ -269,6 +276,11 @@ export interface SearchResultItem {
   title: string
   url: string
   snippet?: string
+  /** Web results only: did the real page body get fetched for this row?
+   *  `false` means the model only received the ~200-char search snippet, so a
+   *  thin answer may be a fetch failure rather than a bad result. Absent on
+   *  transcripts recorded before the backend started sending the flag. */
+  fetched?: boolean
 }
 
 export interface DiffStats { adds: number; dels: number }
@@ -537,6 +549,10 @@ export interface Chat {
    *  silently drop these the moment the user looks at another chat and comes
    *  back. Cleared on load — nothing is running after a restart. */
   compacting?: boolean
+  /** Live progress of the running compaction (`compact_progress`). Kept on the
+   *  chat for the same reason as `compacting`: the panel remounts on a chat
+   *  switch, and a bare spinner says nothing about whether it will ever end. */
+  compactProgress?: ChatCompactProgress | null
   compactNotice?: string | null
   compactError?: string | null
   cmdError?: string | null
@@ -581,7 +597,7 @@ export interface Chat {
 }
 
 /** یک ورودی لاگ چت جاری برای پنل Trace (لایا / LLM / پرامپت / ابزار) — مثل لنگ‌اسمیت. */
-export type TraceKind = 'llm' | 'prompt' | 'tool'
+export type TraceKind = 'llm' | 'prompt' | 'tool' | 'fold'
 
 /** یک صفحه از لاگ Trace + شمارش کل لاگ برای نشان‌های تب‌ها.
  *
@@ -590,7 +606,7 @@ export type TraceKind = 'llm' | 'prompt' | 'tool'
 export interface TracePage {
   traces: TraceEntry[]
   total: number
-  counts: { all: number; llm: number; prompt: number; tool: number }
+  counts: { all: number; llm: number; prompt: number; tool: number; fold: number }
 }
 
 export interface TraceEntry {
@@ -615,6 +631,32 @@ export interface TraceEntry {
   result?: string
 }
 
+/** One live tick of a running context compaction.
+ *
+ *  Deliberately NOT a completion percentage: a model call reports nothing until
+ *  it answers, so the only truthful numbers are the phase, which attempt is
+ *  running, and how much of the backend's wall-clock budget is already spent. */
+export interface ChatCompactProgress {
+  /** `preparing` (selecting the verbatim tail) | `summarizing` | `merging`. */
+  phase: string
+  /** 1-based attempt across the primary + fallback chain; 0 before the first. */
+  attempt: number
+  /** Attempts this run may still make in total (0 when unknown). */
+  attempts: number
+  /** Model running the current attempt. */
+  model: string
+  /** Share of the budget already spent, 0-100. */
+  percent: number
+  /** Wall-clock budget for the WHOLE compaction, in seconds. */
+  budgetSecs: number
+  /** Seconds elapsed since the compaction started. */
+  elapsedSecs: number
+  /** Local wall-clock stamp (ms) of the last tick. The banner counts on from it
+   *  so the clock keeps moving between ticks — a summarizer can sit silent for
+   *  a minute inside a single attempt. */
+  at: number
+}
+
 export type LspProgressPhase = 'installing' | 'updating' | 'done' | 'error'
 
 /** Live LSP install/update progress for one assistant message. Kept on the
@@ -627,7 +669,7 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   content?: string
@@ -643,6 +685,17 @@ export interface SidecarEvent {
   /** Number of recent turns the backend preserved verbatim on a 'compact'
    *  event, so the frontend folds exactly the same older turns. */
   keep?: number
+  /** `compact_progress`: which phase the summarizer is in (`preparing` /
+   *  `summarizing` / `merging`) — lets the banner name what is happening. */
+  phase?: string
+  /** `compact_progress`: total attempts this run may make (primary + fallback). */
+  attempts?: number
+  /** `compact_progress`: share of the backend's wall-clock budget already spent. */
+  percent?: number
+  /** `compact_progress`: wall-clock budget for the whole compaction, seconds. */
+  budget_secs?: number
+  /** `compact_progress`: seconds elapsed since the compaction started. */
+  elapsed_secs?: number
   diff?: string
   path?: string
   /** شماره‌ی snapshot (checkpoint seq) پشت این تغییر — روی eventهای diff

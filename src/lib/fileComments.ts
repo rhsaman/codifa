@@ -3,7 +3,7 @@
 // no polling) — Chat.tsx already drains queued messages into the agent turn.
 import { sendQueuedNext } from "./chatSends";
 import { steerChat } from "./api";
-import { ensureChatHydrated, useStore } from "./store";
+import { ensureChatHydrated, registerChatDeleteHook, useStore } from "./store";
 
 export interface FileComment {
   id: string;
@@ -14,6 +14,13 @@ export interface FileComment {
 }
 
 const commentsByChat = new Map<string, FileComment[]>();
+
+// A DELETED chat's highlights can never be listed or sent again, so release
+// them with the chat instead of keeping every deleted chat's comments alive for
+// the rest of the session.
+registerChatDeleteHook((chatId) => {
+  commentsByChat.delete(chatId);
+});
 
 /** Cap stored comments per chat so highlights never fill RAM. */
 const MAX_COMMENTS_PER_CHAT = 100;

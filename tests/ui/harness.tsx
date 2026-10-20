@@ -41,6 +41,22 @@ const longText = (label: string, lines = 40) =>
     (_, i) => `${label} line ${i + 1} for the live UI harness`,
   ).join("\n");
 
+/** A small unified diff so the click-opened preview has something to scroll. */
+const sampleDiff = (label: string) =>
+  [
+    `--- a/src/${label}.ts`,
+    `+++ b/src/${label}.ts`,
+    "@@ -1,7 +1,9 @@",
+    " const a = 1",
+    "-const b = 2",
+    `+const b = 3 // ${label}`,
+    " const c = 4",
+    " const d = 5",
+    `+const e = 6 // ${label} continued`,
+    " const f = 7",
+    " const g = 8",
+  ].join("\n");
+
 function initialState(scenario: string | null) {
   const now = Date.now();
   const chat = (extra: Record<string, unknown>) => ({
@@ -337,6 +353,35 @@ function initialState(scenario: string | null) {
                   tool: "explore",
                   gaveUp: true,
                 },
+              },
+            ],
+          }),
+        ],
+      };
+    case "hoverdiff":
+      // Three stacked edit rows in ONE message. The diff preview is CLICK-opened
+      // from the `Review ↗` pill: clicking one row's pill must show THAT file's
+      // diff (never a neighbour's), stay up until ✕/Escape/outside press, and
+      // offer Copy/Reply when text inside it is selected. A plain row click must
+      // still open the side Review panel instead.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "assistant",
+                createdAt: now,
+                content: "",
+                toolActivity: ["first", "second", "third"].map((label) => ({
+                  tool: "edit_file",
+                  status: "done",
+                  args: { path: `src/${label}.ts` },
+                  diff: sampleDiff(label),
+                  diffStats: { adds: 3, dels: 1 },
+                })),
               },
             ],
           }),

@@ -38,6 +38,16 @@ const CDP_TIMEOUT: Duration = Duration::from_secs(30);
 /// polls every ~1.2s while open, so only "no panel anywhere" goes idle.
 const IDLE_REAP: Duration = Duration::from_secs(600);
 
+/// How long a single TAB may sit untouched before its renderer is closed.
+///
+/// The browser-wide TTL above cannot bound per-chat cost: an open panel for ANY
+/// chat refreshes `BrowserProc::last_used` on every poll (~1.2s), so one polled
+/// tab kept every OTHER chat's renderer alive for the whole session. Measured:
+/// three abandoned tabs still held ~492 MB of Chromium 45 minutes into a run.
+/// Five minutes is safe because a tab that is really in use is polled far more
+/// often than that; "no touch for five minutes" means nobody is looking.
+const TAB_IDLE_TTL: Duration = Duration::from_secs(300);
+
 /// The one shared Chromium the whole app drives.
 ///
 /// A single browser (with a single `--user-data-dir` profile) serves every
@@ -59,6 +69,10 @@ struct Tab {
     /// fit-to-pane resizes STICK: every `/browser/status` and screenshot
     /// reports this size, and a poll can never reset the user's choice.
     viewport: (u32, u32),
+    /// When this tab was last looked at. Drives per-tab reaping (see
+    /// `TAB_IDLE_TTL`): a chat whose panel was closed, or that the agent stopped
+    /// driving, used to keep its whole renderer process until app exit.
+    last_used: Instant,
 }
 
 /// The shared browser process. `Option` (not a lazy cell) so the static stays
@@ -676,6 +690,7 @@ pub fn start_idle_reaper() {
     }
     std::thread::spawn(|| loop {
         std::thread::sleep(REAPER_INTERVAL);
+        reap_idle_tabs();
         reap_if_idle();
     });
 }
@@ -820,10 +835,10 @@ fn ensure_browser() -> Result<u16, String> {
 /// A tab whose target vanished (surfaced as a `No target` CDP error) is
 /// replaced rather than returned, so a stale entry never wedges a chat.
 async fn ensure_tab_async(chat: &str) -> Result<Tab, String> {
-    let existing = TABS
-        .lock()
-        .ok()
-        .and_then(|tabs| tabs.iter().find(|(k, _)| k == chat).map(|(_, t)| t.clone()));
+    // Reading the tab refreshes its idle clock (`existing_tab` does that), which
+    // is exactly right: the agent asking for the tab IS the tab being in use, so
+    // the per-tab reaper must not close it between two tool calls.
+    let existing = existing_tab(chat);
     if let Some(tab) = existing {
         if tab_usable(tab.target_id.as_str()).await {
             return Ok(tab);
@@ -838,6 +853,7 @@ async fn ensure_tab_async(chat: &str) -> Result<Tab, String> {
     let tab = Tab {
         target_id,
         viewport: DEFAULT_VIEWPORT,
+        last_used: Instant::now(),
     };
     if let Ok(mut tabs) = TABS.lock() {
         tabs.retain(|(k, _)| k != chat);
@@ -953,7 +969,11 @@ async fn adopt_async(chat: &str) -> Option<Tab> {
         .as_ref()
         .map(|t| t.viewport)
         .unwrap_or(DEFAULT_VIEWPORT);
-    let tab = Tab { target_id, viewport };
+    let tab = Tab {
+        target_id,
+        viewport,
+        last_used: Instant::now(),
+    };
     if let Ok(mut tabs) = TABS.lock() {
         tabs.retain(|(k, _)| k != chat);
         tabs.push((chat.to_string(), tab.clone()));
@@ -978,13 +998,68 @@ fn active_tab(chat: &str) -> Option<Tab> {
 }
 
 /// The chat's registered tab without creating one.
+///
+/// Reading a tab IS using it: every panel poll and every driver call funnels
+/// through here, so this refresh is what keeps a tab that is genuinely in use
+/// from being reaped as idle.
 fn existing_tab(chat: &str) -> Option<Tab> {
-    TABS
-        .lock()
-        .ok()?
-        .iter()
-        .find(|(k, _)| k == chat)
-        .map(|(_, t)| t.clone())
+    let mut tabs = TABS.lock().ok()?;
+    let idx = tabs.iter().position(|(k, _)| k == chat)?;
+    tabs[idx].1.last_used = Instant::now();
+    Some(tabs[idx].1.clone())
+}
+
+/// Whether a tab has gone untouched long enough to be closed. Pure so the policy
+/// is unit-tested without spawning a browser.
+fn tab_is_stale(tab: &Tab) -> bool {
+    tab.last_used.elapsed() >= TAB_IDLE_TTL
+}
+
+/// Close every tab nobody has looked at for `TAB_IDLE_TTL`.
+///
+/// Per-tab reaping is what actually releases the renderer processes: closing the
+/// CDP target makes Chromium tear down that tab's renderer, which is the only
+/// per-chat memory cost in the shared browser (~20-50 MB each measured).
+fn reap_idle_tabs() {
+    let stale: Vec<(String, String)> = match TABS.lock() {
+        Ok(mut tabs) => {
+            let mut stale = Vec::new();
+            tabs.retain(|(chat, tab)| {
+                if !tab_is_stale(tab) {
+                    return true;
+                }
+                stale.push((chat.clone(), tab.target_id.clone()));
+                false
+            });
+            stale
+        }
+        Err(_) => return,
+    };
+    if stale.is_empty() {
+        return;
+    }
+    // `stale` is still needed after the await (to forget the cached drivers),
+    // so hand the async block only the target ids instead of moving the vector.
+    let targets: Vec<String> = stale.iter().map(|(_, t)| t.clone()).collect();
+    let _ = block_on(async move {
+        // No live browser (or a unit-test registry): the entries are already
+        // gone from the map, which is the part that matters here.
+        let Some(port) = alive_port() else {
+            return Ok(Value::Null);
+        };
+        let Ok(mut cdp) = Cdp::connect(port).await else {
+            return Ok(Value::Null);
+        };
+        for target in &targets {
+            let _ = close_target(&mut cdp, target).await;
+        }
+        Ok(Value::Null)
+    });
+    // The cached CDP driver points at a target that no longer exists. Dropping
+    // it releases the WebSocket and the page snapshots it was holding.
+    for (chat, _) in &stale {
+        crate::browser_driver::forget(chat);
+    }
 }
 
 /// Remember a tab's viewport so later polls report the same size.
@@ -1907,6 +1982,7 @@ mod tests {
             Tab {
                 target_id: "T-viewport".to_string(),
                 viewport: DEFAULT_VIEWPORT,
+                last_used: Instant::now(),
             },
         ));
         store_viewport(chat, (900, 600));
@@ -1985,7 +2061,27 @@ mod tests {
     }
 
     #[test]
-    fn tabs_are_isolated_by_chat_key() {
+    fn an_idle_tab_is_closed_but_a_fresh_one_is_kept() {
+        // Per-tab reaping is what releases the renderer processes: the
+        // browser-wide TTL could never do it, because one polled panel kept
+        // `BrowserProc::last_used` fresh for every other chat's tab too.
+        let mut fresh = Tab {
+            target_id: "T1".to_string(),
+            viewport: DEFAULT_VIEWPORT,
+            last_used: Instant::now(),
+        };
+        assert!(!tab_is_stale(&fresh));
+
+        fresh.last_used = Instant::now() - TAB_IDLE_TTL - Duration::from_secs(1);
+        assert!(tab_is_stale(&fresh));
+
+        // The per-tab TTL must be shorter than the browser-wide one, or a tab
+        // could outlive the process that reaps it and the policy is cosmetic.
+        assert!(TAB_IDLE_TTL < IDLE_REAP);
+    }
+
+    #[test]
+    fn reading_a_tab_counts_as_using_it() {
         for (chat, target) in [("chat-a", "T1"), ("chat-b", "T2")] {
             let mut tabs = TABS.lock().unwrap();
             tabs.retain(|(k, _)| k != chat);
@@ -1994,6 +2090,7 @@ mod tests {
                 Tab {
                     target_id: target.to_string(),
                     viewport: DEFAULT_VIEWPORT,
+                    last_used: Instant::now(),
                 },
             ));
         }

@@ -559,6 +559,8 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         prompt,
         history: vec![],
         system_prompt: String::new(),
+        // A scheduled run has no listener, so it is never spoken.
+        system_suffix: String::new(),
         skills: vec![],
         context_window: 0,
         chat_id: format!("schedule-{sid}"),
@@ -594,6 +596,9 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         // A headless run has no UI, so it reads no Storage setting: it uses the
         // same default auto-fetch count the UI starts at.
         web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
+        // No renderer to send a table: `run_turn` derives it from the task's
+        // mode, so a scheduled Ask run is read-only like an interactive one.
+        cap: None,
     };
 
     let mut final_text = String::new();

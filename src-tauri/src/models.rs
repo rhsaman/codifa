@@ -600,6 +600,38 @@ fn bad_request(detail: impl Into<String>) -> Response {
 
 /// GET /models — the provider's model catalog with context / pricing /
 /// reasoning, enriched from models.dev.
+/// Apply the models.dev catalog to one row.
+///
+/// This is the FIRST tier of the capacity rule, so a catalog context window is
+/// assigned unconditionally: a gateway's own payload is frequently a bogus
+/// placeholder (opencode advertises 4k) and trusting it made auto-compaction
+/// fire far below the model's real window. The row's existing `context` (the
+/// provider's own metadata) survives only when the catalog has no entry.
+///
+/// Extracted from `list_models` so the precedence is unit-testable without an
+/// HTTP harness — the merge order is the entire point of this function.
+fn apply_models_dev(row: &mut Row, catalog: &Value, provider: &str, base_url: &str) {
+    let dev_id = models_dev_id(provider, &row.id, base_url);
+    let dev_keys: Vec<String> = models_dev_keys(provider, base_url, &dev_id)
+        .into_iter()
+        .collect();
+    if let Some(ctx) = models_dev_limit(catalog, &dev_keys, &dev_id, "context") {
+        row.context = Some(ctx);
+    }
+    // These only fill gaps: the provider's own payload already described them.
+    if row.max_output.is_none() {
+        if let Some(out) = models_dev_limit(catalog, &dev_keys, &dev_id, "output") {
+            row.max_output = Some(out);
+        }
+    }
+    if row.pricing.is_none() {
+        row.pricing = models_dev_pricing(catalog, &dev_keys, &dev_id);
+    }
+    if row.reasoning.is_none() {
+        row.reasoning = models_dev_reasoning(catalog, &dev_keys, &dev_id);
+    }
+}
+
 pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
     let provider = q.provider.trim().to_string();
     let (url, format) = match models_endpoint(&provider, &q.base_url) {
@@ -748,35 +780,18 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                 reasoning: entry_reasoning(entry),
             });
         }
-        // models.dev enrichment (community-maintained, provider + model
-        // specific). It is the PRIMARY context source for opencode-compatible
-        // gateways (their payload advertises a bogus 4K) and a gap-filler
-        // everywhere else, so a provider's own correct number is never
-        // overridden by a cross-provider catalog entry.
+        // Capacity rule for the context window: **models.dev → the provider's
+        // own metadata → 200k** (the last tier is applied at the bottom of this
+        // function). models.dev is the canonical, community-maintained catalog
+        // and therefore the FIRST source: a gateway's own payload is often a
+        // bogus placeholder (opencode advertises 4k), and trusting it made
+        // auto-compaction fire far below the model's real window. So a catalog
+        // window ALWAYS overrides the provider's value; the provider's number is
+        // kept only when the catalog has no entry for that model.
         let catalog = models_dev_catalog(&client).await;
         if catalog.as_object().is_some_and(|o| !o.is_empty()) {
-            let is_oc = is_opencode(&q.base_url);
             for row in rows.iter_mut() {
-                let dev_id = models_dev_id(&provider, &row.id, &q.base_url);
-                let dev_keys: Vec<String> = models_dev_keys(&provider, &q.base_url, &dev_id)
-                    .into_iter()
-                    .collect();
-                if let Some(ctx) = models_dev_limit(&catalog, &dev_keys, &dev_id, "context") {
-                    if is_oc || row.context.is_none() {
-                        row.context = Some(ctx);
-                    }
-                }
-                if row.max_output.is_none() {
-                    if let Some(out) = models_dev_limit(&catalog, &dev_keys, &dev_id, "output") {
-                        row.max_output = Some(out);
-                    }
-                }
-                if row.pricing.is_none() {
-                    row.pricing = models_dev_pricing(&catalog, &dev_keys, &dev_id);
-                }
-                if row.reasoning.is_none() {
-                    row.reasoning = models_dev_reasoning(&catalog, &dev_keys, &dev_id);
-                }
+                apply_models_dev(row, &catalog, &provider, &q.base_url);
             }
         }
         let _ = &m;
@@ -798,7 +813,9 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
             }
         }
         // Local servers (llama.cpp / LM Studio) expose their REAL window
-        // directly — resolve it from the server instead of guessing.
+        // directly — resolve it from the server, but only for rows nothing else
+        // filled: models.dev and the provider payload both outrank a local probe
+        // (neither is reached when this block runs, and a probe can fail).
         if meta(&provider).editable_base_url && rows.iter().any(|r| r.context.is_none()) {
             for row in rows.iter_mut() {
                 if row.context.is_none() {
@@ -807,6 +824,17 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                     }
                 }
             }
+        }
+    }
+
+    // Tier 3 of the capacity rule: neither models.dev nor the provider reported a
+    // window, so assume DEFAULT_CONTEXT_WINDOW (200k). Returning null here used to
+    // push a 0 into the renderer's `contextMap`, the renderer then sent
+    // `context_window: 0`, and the backend measured auto-compaction against its
+    // own guess — the "compacts way before my setting" report.
+    for row in rows.iter_mut() {
+        if row.context.is_none_or(|c| c <= 0) {
+            row.context = Some(crate::agent::DEFAULT_CONTEXT_WINDOW as i64);
         }
     }
 
@@ -965,5 +993,92 @@ mod tests {
             "deepseek-v4-flash-free"
         );
         assert_eq!(models_dev_id("nvidia", "nvidia/llama", ""), "nvidia/llama");
+    }
+
+    /// Tier 1 of the capacity rule: models.dev WINS over the provider's own
+    /// payload, even when the provider reports a different (smaller) number.
+    ///
+    /// This is the regression lock for the "it compacts way before my setting"
+    /// report: trusting a gateway's placeholder window (opencode advertises 4k)
+    /// made auto-compaction fire at a fraction of the model's real window. The
+    /// provider value must only survive when the catalog has no entry at all.
+    #[test]
+    fn models_dev_context_wins_over_the_provider_payload() {
+        let catalog = json!({
+            "openai": {
+                "models": {
+                    "gpt-4o": { "limit": { "context": 128_000, "output": 16_384 } }
+                }
+            }
+        });
+
+        // Provider payload said 4000 (a placeholder); the catalog says 128k.
+        let mut provider_says_4k = Row {
+            id: "gpt-4o".into(),
+            context: Some(4_000),
+            max_output: Some(4_096),
+            pricing: None,
+            reasoning: None,
+        };
+        apply_models_dev(&mut provider_says_4k, &catalog, "openai", "");
+        assert_eq!(
+            provider_says_4k.context,
+            Some(128_000),
+            "the catalog window must override the provider's placeholder"
+        );
+        // max_output only fills a gap — the provider already knew its own.
+        assert_eq!(provider_says_4k.max_output, Some(4_096));
+
+        // No provider value at all: the catalog still fills it.
+        let mut provider_says_nothing = Row {
+            id: "gpt-4o".into(),
+            context: None,
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+        };
+        apply_models_dev(&mut provider_says_nothing, &catalog, "openai", "");
+        assert_eq!(provider_says_nothing.context, Some(128_000));
+        assert_eq!(provider_says_nothing.max_output, Some(16_384));
+
+        // A model the catalog does not know keeps the provider's number (tier 2).
+        let mut unknown_to_catalog = Row {
+            id: "some-proprietary-model".into(),
+            context: Some(200_000),
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+        };
+        apply_models_dev(&mut unknown_to_catalog, &catalog, "openai", "");
+        assert_eq!(
+            unknown_to_catalog.context,
+            Some(200_000),
+            "without a catalog entry the provider's own value must survive"
+        );
+    }
+
+    /// The provider-prefixed catalog key must be found too: NVIDIA-style
+    /// gateways report `nvidia/<model>` while the catalog stores the bare id
+    /// under the `nvidia` key (see `models_dev_keys`).
+    #[test]
+    fn models_dev_context_resolves_provider_prefixed_ids() {
+        let catalog = json!({
+            "nvidia": {
+                "models": { "deepseek-v3": { "limit": { "context": 163_840 } } }
+            }
+        });
+        let mut row = Row {
+            id: "deepseek-ai/deepseek-v3".into(),
+            context: Some(8_192),
+            max_output: None,
+            pricing: None,
+            reasoning: None,
+        };
+        apply_models_dev(&mut row, &catalog, "nvidia", "https://integrate.api.nvidia.com/v1");
+        assert_eq!(
+            row.context,
+            Some(163_840),
+            "the prefixed id must resolve to the catalog entry, not fall through"
+        );
     }
 }

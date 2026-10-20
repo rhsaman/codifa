@@ -10,7 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { AutoRetryScheduler, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { AutoRetryScheduler, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
   isSlashCommand,
   parseSlashInput,
@@ -44,6 +44,7 @@ import {
 import { PROVIDER_META } from "../lib/provider-meta";
 import { bareModelId } from "../lib/provider-fetch";
 import { normalizeUsageModel } from "../lib/usage";
+import { otherSlotLevel, otherSlotModel } from "../lib/toolSlots";
 import { stripLeadingModeTag } from "../lib/modeTag";
 import {
   contextPercent,
@@ -67,6 +68,7 @@ import {
   streamChat,
   fetchCredits,
   transcribeAudio,
+  createRealtimeSession,
   respondPermission,
   respondAsk,
   listSkills,
@@ -158,6 +160,7 @@ import {
   editQueuedText,
   isCollapsibleText,
 } from "./ChatMessage";
+import type { ChatCompactProgress } from "../types";
 import { MessageImages } from "./MessageImages";
 import { FileIcon, openWorkspaceFile } from "./FileIcon";
 import { ModeIcon } from "./ModeIcon";
@@ -175,8 +178,11 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
 import { LocalLiveSession, sanitizeLocalTranscript } from "../lib/localLive";
-import { isHtmlTranscriptJunk } from "../lib/realtimeLive";
-import { playTts, playTtsStream, stopTts, speakableMessageText } from "../lib/tts";
+import { blobToWav16k, buildSttPrompt, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
+import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
+import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
+import { buildLiveSpeakSuffix } from "../lib/livePrompt";
+import { playTts, playTtsStream, stopTts, speakableMessageText, subscribeTts } from "../lib/tts";
 import type { LiveVoiceState } from "../types";
 const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
@@ -340,6 +346,95 @@ function ChatLoader() {
     <div className="chat-loader" data-testid="chat-hydrating">
       <span className="spinner" />
       <span>Loading conversation…</span>
+    </div>
+  );
+}
+
+/** Live progress banner for a running compaction.
+ *
+ *  A summary call is one long silent request, so a bare spinner told the user
+ *  nothing about whether it would ever end — the exact complaint that made
+ *  compaction feel broken. This shows what is happening (phase), which attempt
+ *  is running, a bar filled to the share of the backend's wall-clock budget
+ *  already spent, and a clock that keeps counting between ticks: the backend
+ *  cannot report true completion of a model call, but "42s of 180s" is honest
+ *  and enough to decide whether to keep waiting. */
+function CompactBanner({ progress }: { progress: ChatCompactProgress | null }) {
+  // Own 1s ticker: the backend only speaks when the phase or attempt changes,
+  // which can be a minute apart. Elapsed is derived from the local stamp of the
+  // last tick so the clock stays in sync with the backend's own count.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!progress) {
+    return (
+      <div className="notice-banner notice-loading" dir="ltr">
+        <span className="notice-icon">
+          <span className="spinner" />
+        </span>
+        <span className="notice-text">
+          Compacting context — older messages are being summarized…
+        </span>
+      </div>
+    );
+  }
+
+  const phaseLabel =
+    progress.phase === "preparing"
+      ? "Reading the conversation"
+      : progress.phase === "merging"
+        ? "Writing the summary"
+        : "Summarizing";
+  // Count on from the last tick instead of showing a frozen number.
+  const elapsed =
+    progress.elapsedSecs + Math.max(0, Math.round((Date.now() - progress.at) / 1000));
+  // Never shrink the bar as the clock drifts past the reported percent, and
+  // never claim 100% while the call is still running.
+  const percent = Math.min(99, Math.max(progress.percent, progress.budgetSecs > 0
+    ? Math.round((elapsed * 100) / progress.budgetSecs)
+    : progress.percent));
+  const attemptLabel =
+    progress.attempt > 0 && progress.attempts > 0
+      ? progress.attempts > 1
+        ? `attempt ${progress.attempt}/${progress.attempts}`
+        : null
+      : null;
+  const overBudget = progress.budgetSecs > 0 && elapsed > progress.budgetSecs;
+
+  return (
+    <div
+      className={`notice-banner notice-loading notice-compact${overBudget ? " notice-warn" : ""}`}
+      dir="ltr"
+    >
+      <span className="notice-icon">
+        <span className="spinner" />
+      </span>
+      <span className="notice-text">
+        <span className="notice-compact-row">
+          <span className="notice-compact-phase">
+            {phaseLabel} — {percent}%
+          </span>
+          <span className="notice-compact-meta">
+            {attemptLabel && <span>{attemptLabel}</span>}
+            <span>
+              {elapsed}s
+              {progress.budgetSecs > 0 ? ` / ${progress.budgetSecs}s` : ""}
+            </span>
+          </span>
+        </span>
+        <span className="notice-compact-bar" aria-hidden="true">
+          <span style={{ width: `${percent}%` }} />
+        </span>
+        <span className="notice-compact-foot">
+          {overBudget
+            ? "Taking longer than the summary budget — will stop on its own."
+            : "Older messages are being summarized…"}
+          {progress.model ? <span className="notice-compact-model">{progress.model}</span> : null}
+        </span>
+      </span>
     </div>
   );
 }
@@ -575,7 +670,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const switchMsgs = chat?.messages ?? [];
     const agentActive =
       switchMsgs.some((m) => m.streaming || m.retry?.reconnecting === true) ||
-      (chat ? (busyMap[chat.id] ?? false) : false) ||
+      (chat ? useStore.getState().chatBusy[chat.id] === true : false) ||
       chat?.pendingAsk != null ||
       chat?.pendingPermission != null;
     const landLatest = shouldLandOnLatest({
@@ -633,34 +728,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id]);
-  // Per-chat isolation: the panel stays mounted across switches (no
-  // key={activeChatId}), so ALL per-turn mutable state must be keyed by chatId.
-  // A single boolean/ref would leak the Stop button, aborts, watchdog timers
-  // and error banners across chats. Each chat tracks its own local busy flag;
-  // the message-level `streaming` flag stays the source of truth for activity.
+  // Per-chat isolation: ALL per-turn mutable state must be keyed by chatId.
+  // The "agent is live" flag lives in the STORE (`chatBusy`), not in component
+  // state: <ChatPanel> remounts on a chat switch and every window mounts its
+  // own panel, so a component-local map came back empty and the Stop button
+  // vanished while the agent was still streaming. chatBusy survives remounts,
+  // is shared by every panel, and is only cleared when the turn really settles.
   const chatIdRef = useRef(chat?.id ?? "");
-  const [busyMap, setBusyMap] = useState<Record<string, boolean>>({});
   const setBusyFor = useCallback((chatId: string, v: boolean) => {
-    setBusyMap((m) => {
-      if (v) {
-        if (m[chatId]) return m;
-        return { ...m, [chatId]: true };
-      }
-      if (!m[chatId]) return m;
-      const n = { ...m };
-      delete n[chatId];
-      return n;
-    });
+    useStore.getState().setChatBusy(chatId, v);
   }, []);
-  const setBusy = useCallback(
-    (v: boolean) => {
-      const id = chatIdRef.current || chat?.id;
-      if (!id) return;
-      setBusyFor(id, v);
-    },
-    [chat?.id, setBusyFor],
+  /** Drop a chat's live flag ONLY when nothing is really running for it: no
+   *  streaming assistant message and no live abort controller. Shared by the
+   *  turn settle path and by compaction, so neither can flip the composer back
+   *  to Send while the other is still working. */
+  const releaseChatBusyIfIdle = useCallback((id: string) => {
+    const st = useStore.getState();
+    const c = st.chats.find((x) => x.id === id);
+    if (c?.messages.some((m) => m.streaming)) return;
+    if (st.chatAborts?.[id]) return;
+    st.setChatBusy(id, false);
+  }, []);
+  const busyLocal = useStore((s) =>
+    chat?.id ? s.chatBusy[chat.id] === true : false,
   );
-  const busyLocal = chat?.id ? (busyMap[chat.id] ?? false) : false;
   // This chat is busy when THIS chat has a streaming assistant message (so
   // another chat streaming in the background doesn't lock this composer). The
   // message-level streaming flag is the source of truth — the global
@@ -680,7 +771,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  if any. Its RetryBanner is rendered once, at the END of the message list
    *  (not inline inside the message) so it never sits "above the agent's reply"
    *  between the user's message and the incoming content. */
-  const retryingMsg = chat?.messages.find((m) => m.retry) ?? null;
+  // The NEWEST banner, not the first one in the list: a message can keep a
+  // stale banner (a terminal `gaveUp` from an earlier failed turn) while a
+  // LATER message is the one actually retrying right now. Picking the first
+  // showed the dead old banner, and its Retry button acted on the wrong turn.
+  const retryingMsg =
+    [...(chat?.messages ?? [])].reverse().find((m) => m.retry) ?? null;
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   // Separate git-action states so commit/undo/push spinners never lock the
   // composer (the shared `busy` flag disables sending).
@@ -909,7 +1005,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [recording, setRecording] = useState(false);
   const [liveState, setLiveState] = useState<LiveVoiceState>('idle');
   const [liveError, setLiveError] = useState<string | null>(null);
+  // Which pipeline the current live session runs on. Set at start, read by the
+  // mic-device switch and by stop, so both act on the right session object.
+  const liveModeRef = useRef<'realtime' | 'chunked'>('chunked');
+  // Chunked pipeline session (STT + TTS) — used with any provider.
   const liveSessionRef = useRef<LocalLiveSession | null>(null);
+  // Realtime (speech-to-speech) session — used when a realtime provider is set.
+  const liveRealtimeRef = useRef<LiveVoiceSession | null>(null);
+  // Chat message mirroring the live realtime transcript. One bubble per role:
+  // the id is kept so partials grow the same bubble instead of spamming new
+  // ones, and `text` accumulates deltas from gateways that only stream them.
+  const liveMirrorRef = useRef<{ userId: string | null; assistantId: string | null }>({
+    userId: null,
+    assistantId: null,
+  });
+  const liveAccRef = useRef<{ user: string; assistant: string }>({ user: '', assistant: '' });
+  /** Unsubscribes the live TTS-status listener that drives the echo gate. */
+  const liveTtsUnsubRef = useRef<(() => void) | null>(null);
   const toggleLiveRef = useRef<() => void>(() => {});
   const [selectedMicId, setSelectedMicId] = useState<string>(() => {
     try {
@@ -925,6 +1037,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Composer action visibility: live voice takes over, streaming shows stop
   // + dictate mic, typing shows send only, empty shows mic + live buttons.
   const isLiveVoiceActive = liveState === 'live' || liveState === 'speaking' || liveState === 'connecting';
+  /**
+   * Ref mirror of {@link isLiveVoiceActive}.
+   *
+   * End-of-turn alarms must stay silent in live voice mode: the answer is
+   * SPOKEN there, so a chime lands on top of it — and the mic is open, so the
+   * chime itself is heard as speech. The ring sites live inside the per-turn
+   * event handler created by `send()`, which cannot read component state, so
+   * the flag is mirrored here where that closure can see it.
+   */
+  const liveActiveRef = useRef(false);
+  useEffect(() => {
+    liveActiveRef.current = isLiveVoiceActive;
+  }, [isLiveVoiceActive]);
+  /** Ring the turn/ask/error alarm, except while live voice owns the audio. */
+  const ringTurnAlarm = (kind: "alert" | "error") => {
+    if (liveActiveRef.current) return;
+    playAlarm(kind);
+  };
   const isStreamingActive = busy || chatHasStreaming;
   // Only typed text counts as written text; attached photos/files and
   // collapsed paste cards alone do not: the user attaches first and
@@ -950,6 +1080,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const sttProviderId = useStore((s) => s.sttProviderId);
   const sttModel = useStore((s) => s.sttModel);
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
+  const sttLanguage = useStore((s) => s.sttLanguage);
+  const sttPrompt = useStore((s) => s.sttPrompt);
+  // Live voice settings: a realtime provider makes live run speech-to-speech;
+  // empty keeps the provider-agnostic chunked pipeline.
+  const liveProviderId = useStore((s) => s.liveProviderId);
+  const liveModel = useStore((s) => s.liveModel);
+  const liveVoice = useStore((s) => s.liveVoice);
+  // Text we last pushed into the composer from live STT: ownership marker so a
+  // chunk update never overwrites something the user typed themselves.
+  const liveTypedRef = useRef("");
+  /** Write the live partial into the composer (chunk by chunk). */
+  const applyLivePartial = (text: string) => {
+    setInput((prev) => {
+      if (prev.trim() !== "" && prev !== liveTypedRef.current) return prev;
+      liveTypedRef.current = text;
+      return text;
+    });
+  };
+  /** Drop the live preview, but only if the composer still holds our text. */
+  const clearLivePartial = () => {
+    const ours = liveTypedRef.current;
+    liveTypedRef.current = "";
+    if (!ours) return;
+    setInput((prev) => (prev === ours ? "" : prev));
+  };
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
   // Mirror of `recording` so the global keydown handler (which lives in a
@@ -1290,6 +1445,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const compactNotice = chat?.compactNotice ?? null;
   const compactError = chat?.compactError ?? null;
   const compacting = chat?.compacting ?? false;
+  const compactProgress = chat?.compactProgress ?? null;
   const cmdError = chat?.cmdError ?? null;
   const skillNotice = chat?.skillNotice ?? null;
   const undoNotice = chat?.undoNotice ?? null;
@@ -2174,6 +2330,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name);
   }, [cmdOpen, cmdQuery, commandUsage]);
 
+  // Always a number: `modelContextWindow` applies the capacity rule
+  // (models.dev → provider metadata → DEFAULT_CONTEXT_WINDOW), so the meter and
+  // the backend's compaction trigger measure against the same window.
   const ctxWindow = modelContextWindow(provider, activeModel);
 
   // Context count for the titlebar meter — see `computeContextUsed`: the latest
@@ -2185,7 +2344,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       computeContextUsed(
         chat,
         systemPrompt,
-        ctxWindow ?? undefined,
+        ctxWindow,
         historyLimit,
       ),
     [chat, systemPrompt, ctxWindow, historyLimit],
@@ -2195,8 +2354,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // (compactAtPercent% of the raw window) — the same point where backend
   // auto-compaction fires.
   const compactAtPercent = settings.compactAtPercent ?? 80;
-  const usable =
-    ctxWindow != null ? Math.round(ctxWindow * (compactAtPercent / 100)) : null;
+  const usable = Math.round(ctxWindow * (compactAtPercent / 100));
 
   // Ring progress is measured against the usable window (auto-compaction
   // threshold), not the raw window: 100% means compaction fires. E.g. with a
@@ -3023,7 +3181,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     reuseMsgId?: string,
     continueAssistantId?: string,
     forceScroll = false,
-    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[]; restart?: boolean },
+    overrides?: { mcpServers?: Record<string, McpServerConfig>; skills?: string[]; restart?: boolean; liveSuffix?: string },
     forChatId?: string,
   ) => {
     // Per-chat isolation: resolve the ORIGIN chat first (background drains via
@@ -3685,6 +3843,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
       lastEventAtMs = Date.now();
       lastContentAtMs = Date.now();
+      // ASSERT LIVE: an event arriving on this chat's socket proves the agent
+      // is still working, so the composer must show Stop. The explicit set/clear
+      // pairs around a turn cover the normal flow; this is the safety net for
+      // every path that can drop the flag while the stream is alive (a socket
+      // drop + reconnect, a drain armed one macrotask later, a remount between
+      // turns). Without it the UI read "stopped" while the agent kept streaming.
+      // Skipped after an explicit Stop: trailing events from the aborted stream
+      // must not resurrect the button the user just dismissed.
+      if (
+        stoppedMapRef.current.get(chat.id) !== true &&
+        !useStore.getState().chatBusy[chat.id]
+      ) {
+        setBusyFor(chat.id, true);
+      }
       // Live reads: `useStore.getState()` on every event. A snapshot captured
       // once per turn goes stale after the first updateMessage, and the second
       // event then overwrites the first one's segments (steer segment lost when
@@ -3932,6 +4104,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "tool_result") {
         dropToolRunning(toolRunning);
         clearTransientRetry();
+        // A LIVE sub-agent retry banner is retired ONLY here. `clearTransientRetry`
+        // above deliberately ignores it (the parent keeps streaming its own tool
+        // events the whole time explore retries), and the ladder emits NOTHING
+        // when an attempt finally succeeds — it just returns the report. So a
+        // recovered explore left "Provider rate limit (2/10) — retrying…" frozen
+        // on screen for the rest of the turn while the agent worked normally. The
+        // owning tool's own result is the one event that proves the retry is over.
+        const priorRetry = findMsg()?.retry;
+        if (priorRetry && retryRetiredByEvent(priorRetry, event)) {
+          store.updateMessage(assistantMsg.id, { retry: null });
+        }
         // Live document preview: a finished write_document bumps the file's
         // revision so an open right-panel viewer re-fetches immediately.
         if (event.tool === "write_document") {
@@ -4004,8 +4187,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // must not be mistaken for a stalled stream and force-aborted.
         bumpToolRunning(toolRunning);
         useStore.getState().setChatCompacting(chat.id, true);
+        // Fresh run: the previous phase/elapsed pair must not leak into it.
+        useStore.getState().setChatCompactProgress(chat.id, null);
         useStore.getState().setChatCompactNotice(chat.id, null);
         useStore.getState().setChatCompactError(chat.id, null);
+      } else if (event.kind === "compact_progress") {
+        // Live tick from the backend's summarizer: phase, attempt and the share
+        // of its wall-clock budget already spent. Stored per-chat so switching
+        // away and back still shows the real state, not a blank spinner.
+        bumpToolRunning(toolRunning);
+        useStore.getState().setChatCompactProgress(chat.id, {
+          phase: event.phase ?? "",
+          attempt: event.attempt ?? 0,
+          attempts: event.attempts ?? 0,
+          model: event.model ?? "",
+          percent: event.percent ?? 0,
+          budgetSecs: event.budget_secs ?? 0,
+          elapsedSecs: event.elapsed_secs ?? 0,
+          at: Date.now(),
+        });
       } else if (event.kind === "compact") {
         // Auto-compact: fold the older messages into the summary. The summary
         // is persisted as a system message so the next request still sends it
@@ -4154,9 +4354,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           options,
           style: typeof event.style === "string" ? event.style : undefined,
         });
-        playAlarm("alert");
-      } else if (event.kind === "error") {
-        // A late backend error arriving after an explicit Stop must not re-arm
+        // Silent in live voice: the answer is spoken and the mic is open.
+        ringTurnAlarm("alert");
+      } else if (event.kind === "error") {        // A late backend error arriving after an explicit Stop must not re-arm
         // the retry banner — the user already cancelled this turn.
         if (shouldIgnoreLateRetryEvent(stoppedMapRef.current.get(chat.id) === true)) return;
         // A backend error while the summarizer was supposedly running means the
@@ -4430,8 +4630,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         // Turn-finished alarm: the error sound when the turn ended in a backend
         // failure (an inline `error` event always precedes this `done`
-        // sentinel), the alert sound on a successful completion.
-        playAlarm(curMsg?.error === true ? "error" : "alert");
+        // sentinel), the alert sound on a successful completion. Silent in
+        // live voice: the answer is spoken, and an open mic would hear a chime
+        // as the user talking.
+        ringTurnAlarm(curMsg?.error === true ? "error" : "alert");
       }
     };
 
@@ -4464,6 +4666,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
           ),
           systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
+          // Live voice only: shape the answer for the ear (one language, plain
+          // prose, numbers as words). APPENDED by the backend, so the chat's
+          // own custom prompt is untouched and typed turns send nothing at all
+          // (their request stays byte-identical to before).
+          systemSuffix: overrides?.liveSuffix ?? "",
           thinkingLevel: supportsReasoning(
             activeProvider.model,
             activeProvider.kind,
@@ -4527,11 +4734,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           },
         });
         preserveToolActivity();
-        playAlarm("error");
+        ringTurnAlarm("error");
       } else if ((err as Error).name !== "AbortError") {
         handleEvent({ kind: "error", content: (err as Error).message });
         preserveToolActivity();
-        playAlarm("error");
+        ringTurnAlarm("error");
       } else {
         // User-initiated Stop: the request was simply cancelled (no
         // retry/resume loop). Folding the completed tool calls into content is
@@ -4551,7 +4758,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       lastContentAtMs = Date.now();
       stalledSinceMs = null;
       toolRunning.current = 0;
-      setBusyFor(chat.id, false);
+      // Do NOT clear the live flag here: the turn's own continue-path (goal
+      // loop, error retry, queued/steer drain) arms the next turn one macrotask
+      // later, and clearing now would show Send while the agent keeps working.
+      // If a successor is armed it already holds the flag; otherwise the
+      // settle block below releases it.
       useStore.getState().setChatCompacting(chat.id, false);
       useStore.getState().setChatPendingAsk(chat.id, null);
       useStore.getState().setChatPendingPermission(chat.id, null);
@@ -4601,6 +4812,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // the SSE connection is closing, and the user has seen it correlate
       // with the stream dropping.
     }
+    // Whether a successor turn is now armed. If it is, the live flag stays set
+    // across the one-macrotask gap before its send() runs, so the composer
+    // cannot flash Send / hide Stop while the agent keeps working.
+    let successorArmed = false;
     // Auto-drain: this turn ended and other messages are still queued for this
     // chat (typed while the agent was working, or unconsumed steers) — start
     // the next one immediately. Runs via the registry so it works even when
@@ -4625,14 +4840,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // Epoch-guarded: an explicit Stop drops this drain instead of
           // restarting the turn the user just cancelled.
           autoRetryFor(chat.id).schedule(0, () => sendPendingSteerNext(chat.id));
+          successorArmed = true;
         } else {
           const remaining = cNow.queued?.filter((q) => !q.sent);
           if (remaining && remaining.length > 0) {
             autoRetryFor(chat.id).schedule(0, () => sendQueuedNext(chat.id));
+            successorArmed = true;
           }
         }
       }
     }
+    // Settle: release the live flag only when no successor turn took over and
+    // nothing is still streaming/aborted for this chat.
+    if (!successorArmed) releaseChatBusyIfIdle(chat.id);
   };
 
   // Expose this chat's latest `send` so queued turns can be drained even while
@@ -4656,14 +4876,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // chat and is updated synchronously on switch.
     let ch = s.chats.find((c) => c.id === chatIdRef.current) ?? null;
     if (!ch) return;
+    // Any exit from here on must clear `compacting`, or the /compact guard
+    // (`if (ch?.compacting)`) would refuse every later compaction for this chat.
 
-    // How long the manual /compact call may run before we give up. Slow/free
-    // models can take minutes to summarize a large history, so this is generous
-    // — the backend streams no progress for this JSON call, and aborting early
-    // just discards a compaction that would otherwise succeed (the backend keeps
-    // running and logs "[compact] success"). 600s gives even a heavy summarizer
-    // room; raising it further only delays the failure banner.
-    const COMPACT_TIMEOUT_MS = 600_000;
+    // How long the manual /compact call may run before we give up. The backend
+    // already bounds its own attempts with a shared wall-clock budget
+    // (compact.rs `COMPACT_TOTAL_BUDGET_SECS`) and now enforces a per-request
+    // timeout on the summarizer call, so this only has to cover that budget plus
+    // transport slack: always comfortably longer than the backend, never so long
+    // that a dead provider leaves the user staring at "Compacting…" again.
+    const COMPACT_TIMEOUT_MS = 240_000;
+    // Bounds the wait for a live stream below. The abort signal does NOT cover
+    // that wait, so a stream that stalls (silent socket) would otherwise park the
+    // compaction — and its banner — forever.
+    const COMPACT_STREAM_WAIT_MS = 60_000;
 
     // Queue behind any in-flight stream on THIS chat: running the summarizer
     // concurrently with the agent interleaves two model streams (usage events,
@@ -4677,33 +4903,60 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return c?.messages.some((m) => m.streaming) ?? false;
     };
     if (chatStreaming()) {
-      setBusyFor(chatId, true);
       useStore.getState().setChatCompacting(chatId, true);
-      await new Promise<void>((resolve) => {
+      const streamEnded = await new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (ended: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(waitTimer);
+          unsub();
+          resolve(ended);
+        };
         const unsub = useStore.subscribe((state) => {
           const c = state.chats.find((x) => x.id === chatId);
-          if (!c?.messages.some((m) => m.streaming)) {
-            unsub();
-            resolve();
-          }
+          if (!c?.messages.some((m) => m.streaming)) finish(true);
         });
+        // Never wait on the stream forever. `ctr.signal` does not cover this
+        // wait, so a stalled socket used to park the compaction — and its
+        // "Compacting…" banner — with no timeout and no way out.
+        const waitTimer = setTimeout(() => finish(false), COMPACT_STREAM_WAIT_MS);
       });
+      if (!streamEnded) {
+        // Summarizing underneath a live stream interleaves two model streams, so
+        // give up loudly instead of hanging or compacting concurrently.
+        useStore.getState().setChatCompacting(chatId, false);
+        useStore
+          .getState()
+          .setChatCompactError(
+            chatId,
+            "the reply is still streaming — stop it, then compact again",
+          );
+        releaseChatBusyIfIdle(chatId);
+        return;
+      }
     }
 
     // Re-read state after the wait — messages may have changed while streaming.
     s = useStore.getState();
     ch = s.chats.find((c) => c.id === chatId) ?? null;
-    if (!ch) return;
+    if (!ch) {
+      useStore.getState().setChatCompacting(chatId, false);
+      releaseChatBusyIfIdle(chatId);
+      return;
+    }
     const msgs = ch.messages.filter(
       (m) => !m.compacted && (m.role === "user" || m.role === "assistant"),
     );
     if (msgs.length === 0) {
-      setBusyFor(chatId, false);
       useStore.getState().setChatCompacting(chatId, false);
+      releaseChatBusyIfIdle(chatId);
       return;
     }
     const rootDir = ch.root || s.root;
-    setBusyFor(ch.id, true);
+    // NOTE: no busy flag is set here. Compaction is a side task, not an agent
+    // turn — taking the composer's live flag used to strand the Stop button
+    // (and hide Send) whenever the summarizer outlived the stream it waited on.
     useStore.getState().setChatCompactError(ch.id, null);
     useStore.getState().setChatCompactNotice(ch.id, null);
     useStore.getState().setChatCompacting(ch.id, true);
@@ -4728,12 +4981,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         preservedToolSummary: m.preservedToolSummary,
       }));
 
-    // Route the primary summarizer through the user's configured "compact"
-    // subagent (Settings → Tools) when set, else the active provider. The
-    // active provider is always the fallback — the backend retries the compact
-    // subagent on it, mirroring opencode's subagent -> main-model fallback.
+    // Route the primary summarizer through the user's configured Tools →
+    // "Other" model GROUP (compact / web / title share one settings row), when
+    // set, else the active provider. The active provider is always the
+    // fallback — the backend retries the compact subagent on it, mirroring
+    // opencode's subagent -> main-model fallback. Reading only the `compact`
+    // key left the row's model unused whenever the pick had been stored under
+    // `web`/`title`, so the summariser silently ran on the main model.
     const activeProvider = getChatProvider(ch.id);
-    const compactEntry = (s.subagentModels?.compact || "").trim();
+    const compactEntry = otherSlotModel(s.subagentModels);
     let compactProvider = activeProvider;
     if (compactEntry) {
       const slash = compactEntry.indexOf("/");
@@ -4757,14 +5013,26 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const timeout = setTimeout(() => ctr.abort(), COMPACT_TIMEOUT_MS);
     let result: CompactResult | null = null;
     let errMsg = "";
+    // Seed a preparing tick before the request is even sent: the backend spends
+    // a moment selecting the verbatim tail and serializing the head, and an
+    // empty banner during that gap reads as "nothing is happening".
+    useStore.getState().setChatCompactProgress(ch.id, {
+      phase: "preparing",
+      attempt: 0,
+      attempts: 0,
+      model: compactProvider.model,
+      percent: 0,
+      budgetSecs: 0,
+      elapsedSecs: 0,
+      at: Date.now(),
+    });
     try {
-      // Per-tool reasoning: the compact slot's own level wins; empty inherits
-    // the origin chat's level. A model that cannot reason sends "".
-    const compactSlotThinking = (s.subagentThinking?.compact || "") as typeof thinkingLevel;
-    const compactThinkingLevel =
-      compactSlotThinking ||
-      ((useStore.getState().chats.find((c) => c.id === chatId)?.thinkingLevel ??
-        thinkingLevel) as typeof thinkingLevel);
+      // Per-tool reasoning: the "Other" group's own level wins (one row writes
+      // compact / web / title together); with nothing set it stays 'none', so a
+      // small side model is never forced to spend tokens on a thinking block.
+      const compactThinkingLevel = otherSlotLevel(
+        s.subagentThinking,
+      ) as typeof thinkingLevel;
     const compactLevelSupported = supportsReasoning(
       compactProvider.model,
       compactProvider.kind,
@@ -4774,14 +5042,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         provider: compactProvider,
         fallback: activeProvider,
         history,
-        contextWindow:
-          modelContextWindow(activeProvider, activeProvider.model) ?? 0,
+        contextWindow: modelContextWindow(activeProvider, activeProvider.model),
         compactAtPercent: useStore.getState().settings.compactAtPercent ?? 80,
         subagentThinking: s.subagentThinking,
         thinkingLevel: compactLevelSupported ? compactThinkingLevel : "",
         modelReasoning:
           modelReasoning(compactProvider, compactProvider.model) ??
           compactLevelSupported,
+        // Live ticks from the SSE route: phase, attempt and elapsed/budget, so
+        // the banner reports progress instead of spinning blindly.
+        onProgress: (p) => {
+          useStore.getState().setChatCompactProgress(chatId, {
+            phase: p.phase,
+            attempt: p.attempt,
+            attempts: p.attempts,
+            model: p.model,
+            percent: p.percent,
+            budgetSecs: p.budgetSecs,
+            elapsedSecs: p.elapsedSecs,
+            at: Date.now(),
+          });
+        },
         signal: ctr.signal,
       });
     } catch (err) {
@@ -4793,8 +5074,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       clearTimeout(timeout);
     }
 
-    setBusyFor(ch.id, false);
+    // Compaction finished as a side task: hand the composer back only if no
+    // agent turn is running for this chat (a queued drain may already be live).
     useStore.getState().setChatCompacting(ch.id, false);
+    releaseChatBusyIfIdle(ch.id);
     // No auto-refresh of the credit chip after compact either — see the
     // credits block above. Strictly click-to-refresh.
 
@@ -4805,6 +5088,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       useStore
         .getState()
         .setChatCompactError(ch.id, result?.error || errMsg || "empty summary");
+      useStore.getState().setChatCompacting(ch.id, false);
+      releaseChatBusyIfIdle(ch.id);
       // Drain the queue even on manual compact failure so no user message is lost.
       // Epoch-guarded so an explicit Stop drops the drain.
       autoRetryFor(ch.id).schedule(0, () => {
@@ -5684,11 +5969,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Every entry targets a configured (external) provider — there is no
   // on-device Whisper source anymore.
   const resolveSttChain = (): {
-    lang: string | undefined;
+    lang: string;
     chains: TranscribeProviderOpts[];
   } => {
-    const lang =
-      dir === "rtl" || /[\u0600-\u06FF]/.test(input) ? "fa" : undefined;
+    // The language hint is what stops short clips from being auto-detected
+    // as the wrong language (the main cause of mangled Persian). The user's
+    // setting wins; otherwise the UI direction / typed text decides.
+    const lang = resolveSttLanguage(sttLanguage, dir, input);
     const toTranscribeOpts = (
       cfg: (typeof settings.providers)[number],
       model: string | undefined,
@@ -5719,7 +6006,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           "Microphone unavailable — grant Codifa microphone access in System Settings, then restart the app.",
         );
       }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          // Same processing as live capture (see LocalLiveSession.openMic):
+          // echo cancellation on, but noise suppression and AGC off — they are
+          // tuned for phone calls and eat the Persian fricatives (/s/ /ʃ/ /z/
+          // /f/ /x/) the model actually needs, while AGC pumps the gain
+          // mid-word. Level consistency comes from normalizePeak instead.
+          echoCancellation: true,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+        },
+      });
       // Prefer a format the sidecar's `av` can decode; fall back to whatever the
       // browser supports (Whisper handles webm/ogg/opus/wav via decode_audio).
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -5731,7 +6030,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             : "";
       const rec = new MediaRecorder(stream, {
         ...(mime ? { mimeType: mime } : {}),
-        audioBitsPerSecond: 48_000,
+        // Opus is lossy and its artefacts land on the same high frequencies the
+        // Persian fricatives live in. The clip is re-encoded to 16 kHz WAV
+        // before it is sent, so the only quality loss left is this first encode
+        // — 48 kbps was squeezing exactly the consonants the model needs.
+        audioBitsPerSecond: 128_000,
       });
       mediaChunksRef.current = [];
       rec.ondataavailable = (e) => {
@@ -5757,18 +6060,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         setTranscribing(true);
         try {
-          const { lang, chains } = resolveSttChain();
+          const { lang, chains } = resolveSttChain();          // Normalise the recorded container to 16 kHz mono WAV, the format
+          // providers decode most reliably (and exactly what live voice
+          // already sends). Without this, dictate uploaded the raw
+          // webm/opus blob, so the same voice could transcribe correctly in
+          // live mode and come back garbled here.
+          const wavBlob = await blobToWav16k(blob);
+          const audio = wavBlob ?? blob;
           console.debug("[voice] transcribing", {
             mime: blob.type,
             bytes: blob.size,
+            sentMime: audio.type,
+            sentBytes: audio.size,
             lang,
           });
           // Try each STT target in order; first success wins.
+          const sttPromptText = buildSttPrompt(lang, sttPrompt);
           let text = "";
           let lastError: unknown = null;
           for (const opts of chains) {
             try {
-              text = await transcribeAudio(blob, setTranscribing, lang, opts);
+              text = await transcribeAudio(
+                audio,
+                setTranscribing,
+                lang || undefined,
+                opts,
+                sttPromptText || undefined,
+              );
               lastError = null;
               break;
             } catch (e) {
@@ -5776,7 +6094,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             }
           }
           if (lastError) throw lastError;
-          const finalText = (text ?? "").trim();
+          // Drop any echo of the prompt we sent: a provider that continues the
+          // prompt would otherwise auto-send our own glossary back as a turn.
+          const finalText = stripSttPromptEcho((text ?? "").trim(), sttPromptText);
           // A gateway HTML error page must never land in the composer.
           // Errors surface in the banner under messages, never in the input.
           if (finalText && (isHtmlTranscriptJunk(finalText) || /<\/?[a-z]/i.test(finalText) || finalText.includes('&lt;') || finalText.includes('/_next/') || /preload|fetchpriority/i.test(finalText) || /<[a-z][^<>]*$/i.test(finalText))) {
@@ -5902,8 +6222,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // Storage unavailable; keep in-memory selection only.
     }
     setMicMenuOpen(false);
+    if (!isLiveVoiceActive) return;
+    // Act on the session the current mode actually created: realtime and
+    // chunked have different objects and different device APIs.
+    if (liveModeRef.current === 'realtime') {
+      const rt = liveRealtimeRef.current;
+      if (rt) {
+        try {
+          await rt.setMicrophoneDeviceId(deviceId);
+        } catch (err) {
+          reportLiveError(err instanceof Error ? err.message : String(err));
+        }
+      }
+      return;
+    }
     const live = liveSessionRef.current;
-    if (live && isLiveVoiceActive) {
+    if (live) {
       try {
         await live.setMicrophoneDeviceId(deviceId);
       } catch (err) {
@@ -5919,17 +6253,201 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     stopTts(LIVE_TTS_OWNER);
     clearLiveError();
     setLiveState('connecting');
+
+    // ── Chat mirror for the realtime path ───────────────────────────────────
+    // The realtime server owns the conversation (server VAD + responses), so
+    // the chat transcript is a mirror of its transcript events: one user
+    // bubble, one growing assistant bubble per turn.
+    const mirrorUserText = (text: string) => {
+      const cid = chatIdRef.current;
+      if (!cid || !text.trim()) return;
+      try {
+        const st = useStore.getState();
+        const existingId = liveMirrorRef.current.userId;
+        if (existingId) {
+          st.updateMessage(existingId, { content: text });
+          return;
+        }
+        const msg = st.addMessage(cid, { role: 'user', content: text, mode: chat?.mode });
+        liveMirrorRef.current.userId = msg.id;
+        forceScrollToBottom();
+      } catch {
+        // Mirror is best-effort; the voice session keeps running either way.
+      }
+    };
+    const mirrorAssistantText = (text: string, final: boolean) => {
+      const cid = chatIdRef.current;
+      if (!cid) return;
+      try {
+        const st = useStore.getState();
+        const existingId = liveMirrorRef.current.assistantId;
+        if (!existingId) {
+          const msg = st.addMessage(cid, {
+            role: 'assistant',
+            content: text,
+            mode: chat?.mode,
+            toolActivity: [],
+            segments: [],
+            streaming: !final,
+            workingStartedAt: Date.now(),
+          });
+          liveMirrorRef.current.assistantId = msg.id;
+          if (final) {
+            st.updateMessage(msg.id, { streaming: false, thinkingActive: false, turnElapsedMs: 0 });
+          }
+          forceScrollToBottom();
+          return;
+        }
+        const cur = st.chats.find((c) => c.id === cid)?.messages.find((m) => m.id === existingId);
+        const started = cur?.workingStartedAt ?? cur?.thinkingStartedAt;
+        st.updateMessage(existingId, {
+          content: text,
+          streaming: !final,
+          ...(final
+            ? {
+                thinkingActive: false,
+                turnElapsedMs: started != null ? Math.max(0, Date.now() - started) : undefined,
+              }
+            : {}),
+        });
+        if (final) forceScrollToBottom();
+      } catch {
+        // Mirror is best-effort.
+      }
+    };
+    const finalizeMirror = () => {
+      const cid = chatIdRef.current;
+      const id = liveMirrorRef.current.assistantId;
+      if (!cid || !id) return;
+      try {
+        const st = useStore.getState();
+        const cur = st.chats.find((c) => c.id === cid)?.messages.find((m) => m.id === id);
+        if (!cur?.streaming) return;
+        const started = cur.workingStartedAt ?? cur.thinkingStartedAt;
+        st.updateMessage(id, {
+          streaming: false,
+          thinkingActive: false,
+          ...(started != null ? { turnElapsedMs: Math.max(0, Date.now() - started) } : {}),
+        });
+      } catch {
+        // Best-effort.
+      }
+    };
+
+    // ── Realtime (speech-to-speech) path ────────────────────────────────────
+    // Taken whenever the user picked a realtime provider. The ephemeral token
+    // is minted through THAT provider, so any OpenAI-compatible realtime
+    // endpoint works (OpenAI, OpenRouter, LiteLLM, vLLM, Azure-style
+    // gateways) — this is not an OpenAI-only path.
+    const stLive = useStore.getState();
+    const rtProvider = stLive.settings.providers.find((p) => p.id === liveProviderId);
+    const rtTarget = buildRealtimeTarget(
+      rtProvider,
+      rtProvider ? providerApiKeys(rtProvider) : [],
+      liveModel,
+      liveVoice,
+    );
+    if (resolveLiveMode(liveProviderId, !!rtProvider) === 'realtime' && rtTarget) {
+      let rt: LiveVoiceSession | null = null;
+      try {
+        const session = await createRealtimeSession(rtTarget);
+        liveAccRef.current = { user: '', assistant: '' };
+        liveMirrorRef.current = { userId: null, assistantId: null };
+        rt = new LiveVoiceSession({
+          url: session.websocketUrl,
+          token: session.ephemeralToken,
+          deviceId: selectedMicId || undefined,
+          onStateChange: (s) => {
+            if (s === 'closed' || s === 'error') {
+              // A bubble left streaming would read as "still answering".
+              finalizeMirror();
+              clearLivePartial();
+            }
+            setLiveState(s);
+          },
+          onTranscript: (ev) => {
+            // A gateway HTML error page must never reach the chat mirror.
+            const clean = sanitizeTranscriptText(ev.text);
+            if (!clean) return;
+            const acc = liveAccRef.current;
+            if (ev.role === 'user') {
+              acc.user = ev.isFinal
+                ? finalizeLiveTranscript(acc.user, clean)
+                : mergeLiveTranscript(acc.user, clean);
+              mirrorUserText(acc.user);
+              // The user speaking (again) starts a NEW assistant response, so
+              // the next assistant transcript must open its own bubble instead
+              // of appending to the previous answer.
+              const activeAssistant = liveMirrorRef.current.assistantId;
+              if (activeAssistant) {
+                const cid = chatIdRef.current;
+                let stillStreaming = false;
+                try {
+                  stillStreaming =
+                    cid
+                      ? useStore
+                          .getState()
+                          .chats.find((c) => c.id === cid)
+                          ?.messages.find((m) => m.id === activeAssistant)?.streaming === true
+                      : false;
+                } catch {
+                  // Treat an unreadable bubble as settled.
+                }
+                if (!stillStreaming) {
+                  finalizeMirror();
+                  liveMirrorRef.current.assistantId = null;
+                  acc.assistant = '';
+                }
+              }
+            } else {
+              acc.assistant = ev.isFinal
+                ? finalizeLiveTranscript(acc.assistant, clean)
+                : mergeLiveTranscript(acc.assistant, clean);
+              mirrorAssistantText(acc.assistant, ev.isFinal);
+            }
+          },
+          onError: (e) => reportLiveError(e instanceof Error ? e.message : String(e)),
+        });
+        liveRealtimeRef.current = rt;
+        liveModeRef.current = 'realtime';
+        await rt.connect();
+        return;
+      } catch (err) {
+        // Provider has no realtime endpoint, no key, or a bad model: keep the
+        // live button useful by running the provider-agnostic chunked path.
+        try {
+          rt?.disconnect();
+        } catch {
+          // Already closed.
+        }
+        liveRealtimeRef.current = null;
+        liveModeRef.current = 'chunked';
+        console.debug('[voice] realtime session unavailable, using chunked pipeline:', err);
+      }
+    }
+
     try {
-      const transcribeChunk = async (blob: Blob, lang?: string): Promise<string> => {
+      const transcribeChunk = async (
+        blob: Blob,
+        lang?: string,
+        prompt?: string,
+      ): Promise<string> => {
         const { lang: chainLang, chains } = resolveSttChain();
-        // Live has no typed input to sniff, so default to Persian when the
-        // UI is RTL: otherwise short Persian turns go without the fa hint
-        // and Whisper mistranscribes them unlike dictate mode.
-        const effectiveLang = lang ?? chainLang ?? (dir === 'rtl' ? 'fa' : 'fa');
+        // Live has no typed input to sniff, so fall back to the UI direction
+        // (Persian for RTL): without a language hint short Persian chunks come
+        // back transliterated or in Arabic orthography.
+        const effectiveLang = lang || chainLang || 'fa';
+        const chainPrompt = prompt || buildSttPrompt(effectiveLang, sttPrompt);
         let lastError: unknown = null;
         for (const opts of chains) {
           try {
-            const text = await transcribeAudio(blob, undefined, effectiveLang, opts);
+            const text = await transcribeAudio(
+              blob,
+              undefined,
+              effectiveLang,
+              opts,
+              chainPrompt || undefined,
+            );
             lastError = null;
             return text;
           } catch (e) {
@@ -5963,19 +6481,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const makeLiveStreamSource = (chatId: string) => {
         let trackedId: string | null = null;
         let finalText = '';
+        // Assistant messages that ALREADY existed when this answer started are
+        // not this turn's answer. Without this, a previous turn whose stream
+        // was still settling got adopted as "the answer": its `streaming` flag
+        // then flipped to false and the source reported done, so TTS stopped
+        // dead after the first sentence ("everything is fine, then it suddenly
+        // cuts off when it wants to speak").
+        let staleIds: Set<string> | null = null;
         return {
           snapshot: () => {
             try {
               const st = useStore.getState();
               const chat = st.chats.find((c) => c.id === chatId);
-              const streaming = chat?.messages.find((m) => m.role === 'assistant' && m.streaming);
+              if (!chat) return { text: '', done: false };
+              if (!staleIds) {
+                staleIds = new Set(chat.messages.filter((m) => m.role === 'assistant').map((m) => m.id));
+              }
+              const stale = staleIds;
+              const streaming = chat.messages.find(
+                (m) => m.role === 'assistant' && m.streaming && !stale.has(m.id),
+              );
               if (streaming) {
                 trackedId = streaming.id;
                 finalText = streaming.content ?? '';
                 return { text: finalText, done: false };
               }
               if (trackedId) {
-                const msg = chat?.messages.find((m) => m.id === trackedId);
+                const msg = chat.messages.find((m) => m.id === trackedId);
                 if (msg) finalText = msg.content ?? finalText;
                 return { text: finalText, done: true };
               }
@@ -6001,20 +6533,52 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const { args } = buildLiveTtsChain();
         const live = liveSessionRef.current;
         try {
-          live?.notifySpeaking(true);
-          setLiveState('speaking');
           await playTts(speakable, args, LIVE_TTS_OWNER);
         } catch (err) {
           reportLiveError(err instanceof Error ? err.message : String(err));
         } finally {
-          live?.notifySpeaking(false);
-          if (liveSessionRef.current) setLiveState('live');
+          // The echo gate is driven by the TTS status subscription above, so
+          // this only has to restore the session when no audio is playing.
+          if (live && liveSessionRef.current) live.notifySpeaking(false);
         }
       };
+      // The language the user SPEAKS decides the language of the answer: live
+      // voice reads the reply aloud, so an English-worded Persian answer sounds
+      // broken instead of bilingual. `liveHearLang` may stay empty when the
+      // language is on Auto — the suffix then says "stay in the language the
+      // user is speaking" instead of guessing one, while STT keeps its own
+      // (existing) Persian default.
+      const liveHearLang = resolveSttLanguage(sttLanguage, dir, "");
+      const liveLang = liveHearLang || 'fa';
+      const liveSendOpts = { liveSuffix: buildLiveSpeakSuffix(liveHearLang) };
+      // The echo gate must follow ACTUAL playback, never the whole agent turn.
+      // `notifySpeaking(true)` used to be called before `send()` and cleared
+      // only when the turn finished, so for the entire answer — tens of seconds
+      // — the VAD ran with the echo gate raised and a five-frame onset. The
+      // user's next sentence then never opened a turn: "it worked once, then
+      // what I say never becomes text". Subscribing to the real TTS status
+      // raises the gate only while audio is actually coming out of the
+      // speakers, and drops it the moment playback stops (barge-in included,
+      // because a stop flips the status to idle).
+      liveTtsUnsubRef.current?.();
+      liveTtsUnsubRef.current = subscribeTts((status) => {
+        const playing = status === 'speaking' || status === 'loading';
+        const session = liveSessionRef.current;
+        if (!session) return;
+        session.notifySpeaking(playing);
+        setLiveState(playing ? 'speaking' : 'live');
+      });
       const live = new LocalLiveSession({
         deviceId: selectedMicId || undefined,
-        lang: dir === 'rtl' ? 'fa' : undefined,
+        lang: liveLang,
+        prompt: sttPrompt,
         transcribe: transcribeChunk,
+        onPartial: (text) => {
+          // Progressive transcript: the words appear in the composer as they
+          // are recognized, chunk by chunk, instead of only after the turn.
+          if (text) applyLivePartial(text);
+          else clearLivePartial();
+        },
         onSpeechStart: () => {
           // Barge-in: user started talking while the agent answers — stop
           // TTS playback immediately so the user hears themselves. The
@@ -6027,10 +6591,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             // Best-effort.
           }
           liveSessionRef.current?.notifySpeaking(false);
+          setLiveState('live');
         },
-        onStateChange: (s) => setLiveState(s),
+        onStateChange: (s) => {
+          if (s !== 'live' && s !== 'speaking') clearLivePartial();
+          setLiveState(s);
+        },
         onUserText: async (raw) => {
           const text = sanitizeLocalTranscript(raw).trim();
+          // The turn is now a real message: clear the progressive preview so
+          // the composer never shows the same words twice.
+          clearLivePartial();
           if (!text) return;
           // Noise gate: never interrupt the agent for a 1-char hallucination.
           if (text.length < 2) return;
@@ -6088,7 +6659,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             for (let i = 0; i < 30; i++) {
               const cur = useStore.getState().chats.find((c) => c.id === targetChatId);
               const stillStreaming = cur?.messages.some((m) => m.streaming);
-              if (!stillStreaming) break;
+              // `send()` is SINGLE-FLIGHT per chat (abortMapRef): while the
+              // previous turn's controller is alive and not aborted, a second
+              // send returns silently and the utterance is lost. Wait for the
+              // slot as well as for the streaming bubble, or the second live
+              // turn "transcribes but never becomes a message".
+              const live = abortMapRef.current.get(targetChatId);
+              const slotBusy = !!live && !live.signal.aborted;
+              if (!stillStreaming && !slotBusy) break;
               await new Promise((r) => setTimeout(r, 100));
             }
           } catch {
@@ -6107,16 +6685,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             () => false,
             () => true,
           );
-          liveSessionRef.current?.notifySpeaking(true);
-          setLiveState('speaking');
+          // No notifySpeaking(true) here: the TTS status subscription does it
+          // the moment audio starts, so the mic stays fully sensitive during
+          // the think phase (before any sound comes out) instead of being
+          // deafened for the whole turn.
           try {
-            await send(text);
+            await send(text, [], [], false, undefined, undefined, false, liveSendOpts);
           } catch (err) {
+            // A user barge-in ABORTS the previous turn; retrying here would
+            // re-send text the user has already moved past, and that retry
+            // re-occupies the single-flight slot the NEXT utterance needs.
+            const aborted = (err as Error)?.name === "AbortError";
+            if (aborted) {
+              liveSessionRef.current?.notifySpeaking(false);
+              if (liveSessionRef.current) setLiveState('live');
+              return;
+            }
             // The aborted turn may still hold the backend slot: settle
             // briefly and retry once instead of dropping the live turn.
             try {
               await new Promise((r) => setTimeout(r, 1500));
-              await send(text);
+              await send(text, [], [], false, undefined, undefined, false, liveSendOpts);
             } catch (err2) {
               stopTts(LIVE_TTS_OWNER);
               liveSessionRef.current?.notifySpeaking(false);
@@ -6134,6 +6723,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           } catch (err) {
             reportLiveError(err instanceof Error ? err.message : String(err));
           } finally {
+            // Playback already ended (the subscription cleared the gate); this
+            // is the belt-and-braces case where TTS never started at all.
             liveSessionRef.current?.notifySpeaking(false);
             if (liveSessionRef.current) setLiveState('live');
           }
@@ -6141,6 +6732,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         onError: (e) => reportLiveError(e instanceof Error ? e.message : String(e)),
       });
       liveSessionRef.current = live;
+      liveModeRef.current = 'chunked';
       await live.connect();
     } catch (err) {
       liveSessionRef.current = null;
@@ -6149,6 +6741,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
   const stopLive = () => {
+    // Both pipelines can hold a session; stop whichever one is running.
+    try {
+      liveRealtimeRef.current?.disconnect();
+    } catch {
+      // Disconnect is best-effort; state reset below is what matters.
+    }
     try {
       liveSessionRef.current?.disconnect();
     } catch {
@@ -6159,7 +6757,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     } catch {
       // TTS stop is best-effort.
     }
+    liveRealtimeRef.current = null;
     liveSessionRef.current = null;
+    // Drop the playback listener with the session it fed.
+    liveTtsUnsubRef.current?.();
+    liveTtsUnsubRef.current = null;
+    // A bubble still marked streaming would read as "still answering" after the
+    // user stopped live voice, so settle it here too.
+    const cid = chatIdRef.current;
+    const mirrorId = liveMirrorRef.current.assistantId;
+    if (cid && mirrorId) {
+      try {
+        const st = useStore.getState();
+        const cur = st.chats.find((c) => c.id === cid)?.messages.find((m) => m.id === mirrorId);
+        if (cur?.streaming) st.updateMessage(mirrorId, { streaming: false, thinkingActive: false });
+      } catch {
+        // Best-effort.
+      }
+    }
+    liveMirrorRef.current = { userId: null, assistantId: null };
+    liveAccRef.current = { user: '', assistant: '' };
+    liveModeRef.current = 'chunked';
+    clearLivePartial();
     setLiveState('idle');
   };
   const toggleLive = () => {
@@ -6654,8 +7273,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       /* already aborted */
     }
     // Force-clear THIS chat's busy so its Stop button vanishes immediately.
-    // Normally the send() finally block handles this, but if abort was
-    // already null (e.g. reconnect race) the finally block never ran, leaving
+    // Normally the send() settle block handles this, but if abort was
+    // already null (e.g. reconnect race) that path may never have run, leaving
     // busy stuck as true and the Stop button permanently visible. Do NOT touch
     // other chats' busy flags, and only clear the global streaming gate when
     // no chat is still streaming.
@@ -6994,6 +7613,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                                   key={i}
                                   activity={act}
                                   chatId={chat.id}
+                                  /* بدون messageId، کلیک روی کارت ویرایش و
+                                     دکمهٔ Review هیچ کاری نمی‌کنند (openReview
+                                     بی‌صدا no-op می‌شود). پیام‌های جدید این
+                                     را از ChatMessage می‌گیرند؛ فقط نشست‌های
+                                     قدیمیِ بدون segments از این مسیر می‌آیند. */
+                                  messageId={m.id}
                                   onReverted={() =>
                                     useStore.getState().markToolReverted(m.id, i)
                                   }
@@ -7139,18 +7764,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 stalled={stalled}
                 startedAt={effectiveRetry.startedAt}
                 onRetry={() => {
-                  // A LIVE sub-agent retry (no gaveUp): the parent turn is STILL
-                  // streaming, so re-sending the turn is swallowed by send()'s
-                  // own single-flight guard (`abortMapRef` still holds this
-                  // chat's controller) and the button appeared DEAD. The right
-                  // action here is not to reboot the turn but to stop waiting:
-                  // ask the backend to skip the ladder's backoff so the next
-                  // explore attempt runs immediately.
-                  if (effectiveRetry.agent && !effectiveRetry.gaveUp) {
-                    const originId = chat?.id;
-                    if (originId) void retrySubagentNow(originId);
-                    return;
-                  }
                   // Resume-only (banner semantics via planRetry): re-send the last
                   // user turn WITHOUT deleting anything, reusing the user bubble
                   // and continuing the failed assistant bubble so completed tools,
@@ -7165,7 +7778,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   ]
                     .reverse()
                     .find((m) => m.role === "user");
-                  if (userMsg) {
+                  const resumeTurn = () => {
+                    // A banner can outlive the retry it describes while the
+                    // turn itself keeps running. Re-sending then would be
+                    // swallowed by send()'s single-flight guard, so retire the
+                    // stale banner instead: the only honest reading of "this
+                    // retry is over" while the turn is alive.
+                    const liveChat = useStore
+                      .getState()
+                      .chats.find((c) => c.id === chat?.id);
+                    if (liveChat?.messages.some((m) => m.streaming)) {
+                      const staleId = retryingMsg?.id;
+                      if (staleId) {
+                        useStore
+                          .getState()
+                          .updateMessage(staleId, { retry: null });
+                      }
+                      return;
+                    }
+                    if (!userMsg) return;
                     const plan = planRetry(msgs, userMsg.id, 'banner');
                     send(
                       userMsg.content,
@@ -7175,7 +7806,54 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       userMsg.id,
                       plan?.target.continueAssistantId ?? retryingMsg?.id,
                     );
+                  };
+                  // A LIVE sub-agent retry (no gaveUp): the parent turn is STILL
+                  // streaming, so re-sending the turn is swallowed by send()'s
+                  // own single-flight guard (`abortMapRef` still holds this
+                  // chat's controller) and the button appeared DEAD. The right
+                  // action here is not to reboot the turn but to stop waiting:
+                  // ask the backend to run the next attempt immediately.
+                  if (effectiveRetry.agent && !effectiveRetry.gaveUp) {
+                    const originId = chat?.id;
+                    const id = retryingMsg?.id;
+                    if (!originId) {
+                      resumeTurn();
+                      return;
+                    }
+                    void retrySubagentNow(originId).then((accepted) => {
+                      // Only acknowledge a click the backend actually consumed.
+                      // A banner can outlive its ladder (the turn ended while it
+                      // was up), and painting "retrying now (requested)" on a
+                      // click nothing is listening for is exactly how this
+                      // button came to look broken.
+                      if (!accepted || !id) {
+                        // Nothing is listening for the nudge, so the banner
+                        // describes a retry that no longer exists. Resuming the
+                        // turn is the only action that can still move this
+                        // conversation forward — without it the click was
+                        // swallowed silently, which reads as a dead button.
+                        resumeTurn();
+                        return;
+                      }
+                      const cur = useStore
+                        .getState()
+                        .chats.find((c) => c.id === originId)
+                        ?.messages.find((m) => m.id === id);
+                      // Bail if the banner retired (or another event replaced
+                      // it) while the request was in flight.
+                      if (!cur?.retry || cur.retry.gaveUp === true) return;
+                      useStore.getState().updateMessage(id, {
+                        retry: {
+                          ...cur.retry,
+                          delay: 0,
+                          reason: "retrying now (requested)",
+                          startedAt: Date.now(),
+                        },
+                      });
+                    });
+                    return;
                   }
+                  resumeTurn();
                 }}
                 onCancel={dismissRetry}
               />
@@ -7192,16 +7870,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             prefixNotice ||
             compacting) && (
               <div className="chat-notices">
-                {compacting && (
-                  <div className="notice-banner notice-loading" dir="ltr">
-                    <span className="notice-icon">
-                      <span className="spinner" />
-                    </span>
-                    <span className="notice-text">
-                      Compacting context — older messages are being summarized…
-                    </span>
-                  </div>
-                )}
+                {compacting && <CompactBanner progress={compactProgress} />}
                 {cmdError && (
                   <div className="notice-banner notice-error" dir="ltr">
                     <span className="notice-icon">⚠</span>
@@ -7819,26 +8488,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             void (async () => {
               setIsCommitting(true);
               try {
-                // Commit messages run on the "compact" tool model
-                // (Settings → Tools → Compact model): a one-line message needs
-                // a small fast model, not the main chat model. Empty or the
-                // "main model" sentinel falls back to the active provider.
-                // Mirrors the compact-path resolution above (provider id first,
-                // then kind for legacy "custom/…" values).
+                // Commit messages run on the Tools → "Other" model group
+                // (Settings → Tools → Other): a one-line message needs a small
+                // fast model, not the main chat model. The group's slots
+                // (compact / web / title) share ONE row in the UI, so the pick
+                // may be stored under any of them — reading only
+                // `subagentModels.compact` is exactly why this button kept
+                // running on the main chat model while Settings showed the
+                // picked one. `otherSlotModel` resolves the same value the row
+                // displays; empty = follow the chat's model.
                 const st = useStore.getState();
-                const compactEntry = (st.subagentModels?.compact || "").trim();
+                const otherEntry = otherSlotModel(st.subagentModels);
                 let commitProvider = provider;
                 let commitModel = activeModel;
-                if (
-                  compactEntry &&
-                  compactEntry !== "main model" &&
-                  compactEntry !== "main_model" &&
-                  compactEntry !== "main"
-                ) {
-                  const slash = compactEntry.indexOf("/");
-                  const prefix = slash > 0 ? compactEntry.slice(0, slash) : "";
+                if (otherEntry) {
+                  const slash = otherEntry.indexOf("/");
+                  const prefix = slash > 0 ? otherEntry.slice(0, slash) : "";
                   const modelName =
-                    slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
+                    slash > 0 ? otherEntry.slice(slash + 1) : otherEntry;
                   const explicitProvider = prefix
                     ? st.settings.providers.find(
                         (p) => p.id === prefix || p.kind === prefix,
@@ -7851,20 +8518,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     commitModel = modelName;
                   }
                 }
+                console.info(
+                  "[commit] message model:",
+                  commitModel,
+                  "via",
+                  commitProvider.id,
+                  "| other slot:",
+                  otherEntry || "main model",
+                );
                 const res = await gitAutoCommit(wroot, {
                   kind: commitProvider.kind,
                   model: commitModel,
                   baseUrl: commitProvider.baseUrl,
                   apiKeys: providerApiKeys(commitProvider),
                   id: commitProvider.id,
-                  // The commit message is a main-model-quality call, so it uses
-                  // the chat's own level (the compact SLOT level does not apply).
+                  // Reasoning effort follows the "Other" group's own slider
+                  // when the message runs on that group's model; with no slot
+                  // set the call is a main-model call and uses the chat's level.
                   thinkingLevel: supportsReasoning(
                     commitModel,
                     commitProvider.kind,
                     modelReasoning(commitProvider, commitModel),
                   )
-                    ? chat.thinkingLevel ?? thinkingLevel
+                    ? otherEntry
+                      ? otherSlotLevel(st.subagentThinking)
+                      : chat.thinkingLevel ?? thinkingLevel
                     : "",
                   modelReasoning:
                     modelReasoning(commitProvider, commitModel) ??
@@ -8220,7 +8898,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             )}
             {activeQuote && (
               <div className="paste-cards">
-                <div className="paste-card" dir="ltr">
+                <div className="paste-card reply-card" dir="ltr">
                   <button
                     className="chip-x paste-card-x"
                     onClick={() => setActiveQuote(null)}
@@ -8581,151 +9259,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     )}
                   </button>
                   )}
-                    {(showLiveIdle || showLiveActive) && (
-                    <div className="live-btn-wrap" ref={micMenuRef}>
-                      <button
-                        type="button"
-                        className={`icon-btn attach-btn live-btn${showLiveActive ? " live-active" : ""}`}
-                        onClick={toggleLive}
-                        title={showLiveActive ? "Stop live voice" : "Live voice conversation (Ctrl+X then L)"}
-                      >
-                        {showLiveActive ? (
-                          <span className="wave animate" aria-hidden="true">
-                            <span className="wave-bar" />
-                            <span className="wave-bar" />
-                            <span className="wave-bar" />
-                            <span className="wave-bar" />
-                          </span>
-                        ) : (
-                          <span className="wave" aria-hidden="true">
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M4.5 10v4" />
-                              <path d="M8.5 7v10" />
-                              <path d="M12 4v16" />
-                              <path d="M15.5 7v10" />
-                              <path d="M19.5 10v4" />
-                            </svg>
-                          </span>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        className="live-chev-btn"
-                        aria-label="Choose microphone"
-                        aria-expanded={micMenuOpen}
-                        onClick={() => {
-                          if (!micMenuOpen) void refreshMicDevices();
-                          setMicMenuOpen((v) => !v);
-                        }}
-                      >
-                        <svg
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2.5"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M6 9l6 6 6-6" />
-                        </svg>
-                      </button>
-                      {micMenuOpen && (
-                        <div className="mic-menu" role="menu" aria-label="Microphone" dir="ltr">
-                          <div className="mic-menu-head">
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              aria-hidden="true"
-                            >
-                              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-                              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                              <line x1="12" y1="19" x2="12" y2="22" />
-                            </svg>
-                            <span className="mic-level"><span className="mic-level-dot" /></span>
-                          </div>
-                          {(() => {
-                            const normalizeMicLabel = (raw: string) => {
-                              let label = (raw || "").trim() || "Microphone";
-                              // Strip trailing USB ids like " (1235:800e)" and leading
-                              // "Default -" prefixes (any dash variant) repeatedly so
-                              // "Default - Default - X (1235:800e)" collapses to "X".
-                              for (let i = 0; i < 5; i++) {
-                                const noUsb = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim();
-                                if (noUsb !== label) {
-                                  label = noUsb || label;
-                                  continue;
-                                }
-                                const noDef = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
-                                if (noDef !== label) {
-                                  label = noDef || label;
-                                  continue;
-                                }
-                                break;
-                              }
-                              label = label.replace(/\s+/g, " ").trim() || "Microphone";
-                              // Guard against a missed prefix leaving "Default - X".
-                              const guard = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
-                              if (guard) label = guard;
-                              label = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim() || label;
-                              return label;
-                            };
-                            const stripDefaultPrefix = normalizeMicLabel;
-                            const seenLabels = new Set<string>();
-                            const uniqueDevices = micDevices.filter((d) => {
-                              const norm = stripDefaultPrefix(d.label || "Microphone").toLowerCase();
-                              if (seenLabels.has(norm)) return false;
-                              seenLabels.add(norm);
-                              return true;
-                            });
-                            const rawFirst = uniqueDevices.length > 0 ? stripDefaultPrefix(uniqueDevices[0].label || "Microphone") : "";
-                            const firstName = rawFirst.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim() || rawFirst;
-                            const rows = [
-                              { id: "", label: firstName ? `Default - ${firstName}` : "Default" },
-                              ...uniqueDevices
-                                .filter((d) => {
-                                  const id = (d.deviceId ?? "").trim();
-                                  // The "default" pseudo-device duplicates the synthetic row.
-                                  if (!id || id.toLowerCase() === "default") return false;
-                                  return true;
-                                })
-                                .map((d, i) => ({
-                                  id: d.deviceId ?? "",
-                                  label: stripDefaultPrefix(d.label || `Microphone ${i + 1}`),
-                                })),
-                            ];
-                            return rows.map((r, i) => {
-                              const active = (selectedMicId || "") === r.id;
-                              return (
-                                <button
-                                  key={`${r.id || "default"}-${i}`}
-                                  type="button"
-                                  role="menuitemradio"
-                                  aria-checked={active}
-                                  className={`mic-item${active ? " active" : ""}`}
-                                  onClick={() => void selectMicDevice(r.id)}
-                                >
-                                  <span className="mic-item-label">{r.label}</span>
-                                  {active && <span className="mic-check" aria-hidden="true">✓</span>}
-                                </button>
-                              );
-                            });
-                          })()}
-                        </div>
-                      )}
-                    </div>
-                    )}
                   </>
                   )}
                   {ctxPopoverOpen &&
@@ -8988,6 +9521,156 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <ContextRing pct={ctxPct} />
               </button>
             </div>
+            {/* Live voice lives in the footer next to the context meter: it is a
+                session-level control (mic + conversation), not a per-message
+                send action, and the input row is the tightest space in the
+                composer. The mic picker still anchors to .live-btn-wrap, so its
+                popover opens upward from the footer unchanged. */}
+            {(showLiveIdle || showLiveActive) && (
+              <div className="live-btn-wrap" ref={micMenuRef}>
+                <button
+                  type="button"
+                  className={`icon-btn attach-btn live-btn${showLiveActive ? " live-active" : ""}`}
+                  onClick={toggleLive}
+                  title={showLiveActive ? "Stop live voice" : "Live voice conversation (Ctrl+X then L)"}
+                >
+                  {showLiveActive ? (
+                    <span className="wave animate" aria-hidden="true">
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                      <span className="wave-bar" />
+                    </span>
+                  ) : (
+                    <span className="wave" aria-hidden="true">
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="M4.5 10v4" />
+                        <path d="M8.5 7v10" />
+                        <path d="M12 4v16" />
+                        <path d="M15.5 7v10" />
+                        <path d="M19.5 10v4" />
+                      </svg>
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="live-chev-btn"
+                  aria-label="Choose microphone"
+                  aria-expanded={micMenuOpen}
+                  onClick={() => {
+                    if (!micMenuOpen) void refreshMicDevices();
+                    setMicMenuOpen((v) => !v);
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
+                </button>
+                {micMenuOpen && (
+                  <div className="mic-menu" role="menu" aria-label="Microphone" dir="ltr">
+                    <div className="mic-menu-head">
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                        <line x1="12" y1="19" x2="12" y2="22" />
+                      </svg>
+                      <span className="mic-level"><span className="mic-level-dot" /></span>
+                    </div>
+                    {(() => {
+                      const normalizeMicLabel = (raw: string) => {
+                        let label = (raw || "").trim() || "Microphone";
+                        // Strip trailing USB ids like " (1235:800e)" and leading
+                        // "Default -" prefixes (any dash variant) repeatedly so
+                        // "Default - Default - X (1235:800e)" collapses to "X".
+                        for (let i = 0; i < 5; i++) {
+                          const noUsb = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim();
+                          if (noUsb !== label) {
+                            label = noUsb || label;
+                            continue;
+                          }
+                          const noDef = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
+                          if (noDef !== label) {
+                            label = noDef || label;
+                            continue;
+                          }
+                          break;
+                        }
+                        label = label.replace(/\s+/g, " ").trim() || "Microphone";
+                        // Guard against a missed prefix leaving "Default - X".
+                        const guard = label.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim();
+                        if (guard) label = guard;
+                        label = label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/g, "").trim() || label;
+                        return label;
+                      };
+                      const stripDefaultPrefix = normalizeMicLabel;
+                      const seenLabels = new Set<string>();
+                      const uniqueDevices = micDevices.filter((d) => {
+                        const norm = stripDefaultPrefix(d.label || "Microphone").toLowerCase();
+                        if (seenLabels.has(norm)) return false;
+                        seenLabels.add(norm);
+                        return true;
+                      });
+                      const rawFirst = uniqueDevices.length > 0 ? stripDefaultPrefix(uniqueDevices[0].label || "Microphone") : "";
+                      const firstName = rawFirst.replace(/^default\s*[-\u2013\u2014:]\s*/i, "").trim() || rawFirst;
+                      const rows = [
+                        { id: "", label: firstName ? `Default - ${firstName}` : "Default" },
+                        ...uniqueDevices
+                          .filter((d) => {
+                            const id = (d.deviceId ?? "").trim();
+                            // The "default" pseudo-device duplicates the synthetic row.
+                            if (!id || id.toLowerCase() === "default") return false;
+                            return true;
+                          })
+                          .map((d, i) => ({
+                            id: d.deviceId ?? "",
+                            label: stripDefaultPrefix(d.label || `Microphone ${i + 1}`),
+                          })),
+                      ];
+                      return rows.map((r, i) => {
+                        const active = (selectedMicId || "") === r.id;
+                        return (
+                          <button
+                            key={`${r.id || "default"}-${i}`}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={active}
+                            className={`mic-item${active ? " active" : ""}`}
+                            onClick={() => void selectMicDevice(r.id)}
+                          >
+                            <span className="mic-item-label">{r.label}</span>
+                            {active && <span className="mic-check" aria-hidden="true">✓</span>}
+                          </button>
+                        );
+                      });
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
           </span>
         </div>
       </div>

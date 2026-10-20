@@ -621,6 +621,41 @@ pub fn resolve_slot_target(
     }
 }
 
+/// The Tools → "Other" model group: `compact`, `web` and `title` share ONE
+/// settings row, so the picked model may be stored under any of the three keys.
+/// Returns the group's first explicit entry, or `""` when the group follows the
+/// main model.
+///
+/// Every side-task consumer must resolve through this instead of reading a
+/// single hardcoded key: reading only `compact` while the row had stored the
+/// pick under `title`/`web` is exactly why the commit message and the chat
+/// title silently kept running on the main chat model. Mirrors
+/// `otherSlotModel` in `src/lib/toolSlots.ts`.
+pub fn other_slot_entry(models: &std::collections::HashMap<String, String>) -> &str {
+    for key in ["compact", "web", "title"] {
+        let Some(v) = models.get(key) else { continue };
+        let v = v.trim();
+        if v.is_empty() || v == "main" || v == "main_model" || v == "main model" {
+            continue;
+        }
+        return v;
+    }
+    ""
+}
+
+/// The Tools → "Other" group's reasoning effort: its first explicit level, or
+/// `""` (which every caller maps to "none" — sell no reasoning parameter).
+pub fn other_slot_level(levels: &std::collections::HashMap<String, String>) -> &str {
+    for key in ["compact", "web", "title"] {
+        let Some(v) = levels.get(key) else { continue };
+        let v = v.trim();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    ""
+}
+
 /// The provider KIND a Tool Models slot entry routes to.
 ///
 /// `resolve_slot_target` returns the model/base/keys but not the kind, and the
@@ -694,16 +729,70 @@ fn normalize_compact_usage(
     Some(Value::Object(norm))
 }
 
+/// Stream one JSON payload as an SSE frame. A closed channel just means the
+/// renderer aborted (Stop / timeout) — nothing to do.
+fn send_compact_frame(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
+    payload: Value,
+) {
+    let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {payload}\n\n"))));
+}
+
+/// One progress frame. Tagged with `compact_progress` so the renderer can tell it
+/// apart from the final result (`summary`), since both arrive on this stream.
+fn compact_progress_frame(p: &crate::compact::CompactProgress) -> Value {
+    json!({
+        "compact_progress": true,
+        "phase": p.phase,
+        "attempt": p.attempt,
+        "attempts": p.attempts_total,
+        "model": p.model,
+        "percent": p.percent,
+        "budget_secs": p.budget_secs,
+        "elapsed_secs": p.elapsed_secs,
+    })
+}
+
+/// Manual `/compact`. Streams the summarizer's progress as SSE and finishes with
+/// one result frame, so the renderer can show a live phase/elapsed bar instead of
+/// waiting blindly on a JSON body that says nothing until the very end.
 async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
+    tokio::spawn(async move {
+        compact_worker(body, &tx).await;
+        // Dropping `tx` closes the stream: the renderer treats a closed stream
+        // that never produced a result frame as a failed compact.
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response()
+        })
+}
+
+async fn compact_worker(
+    body: CompactBody,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
+) {
     if body.history.is_empty() {
-        return Json(json!({ "summary": Value::Null, "keep": 0, "error": "no messages to compact" }))
-            .into_response();
+        send_compact_frame(
+            tx,
+            json!({ "summary": Value::Null, "keep": 0, "error": "no messages to compact" }),
+        );
+        return;
     }
     let client = llm::http_client();
-    // The "compact" Tool Models slot overrides the summarizer model
-    // ("providerId/model" routes cross-provider; empty = the chat model).
+    // The "Other" Tool Models group overrides the summarizer model ("compact",
+    // "web" and "title" share one settings row, so the pick may live under any
+    // of them; "providerId/model" routes cross-provider, empty = the chat
+    // model). Reading only the `compact` key left the row's model unused.
+    let other_entry = other_slot_entry(&body.subagent_models);
     let (model_name, base_url, api_keys, slot_provider_id) = resolve_slot_target(
-        body.subagent_models.get("compact").map(|s| s.as_str()).unwrap_or(""),
+        other_entry,
         &body.model,
         &body.base_url,
         &{
@@ -720,18 +809,9 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
     // inherits the main model's. The finding is derived from the slot's OWN
     // provider kind, so a cross-provider summarizer is invoked like a native
     // call to that provider would be.
-    let compact_entry = body
-        .subagent_models
-        .get("compact")
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    let compact_entry = other_entry;
     let slot_kind = resolve_slot_kind(compact_entry, &body.provider, &body.providers);
-    let compact_level = body
-        .subagent_thinking
-        .get("compact")
-        .map(String::as_str)
-        .unwrap_or("")
-        .trim();
+    let compact_level = other_slot_level(&body.subagent_thinking);
     let level = if compact_level.is_empty() {
         // Missing/empty slot level = OFF (send no reasoning param). Tool slots
         // do NOT inherit the main model's level — their default is none.
@@ -748,7 +828,7 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
         api_keys,
         temperature: Some(0.2),
         max_tokens: Some(4096),
-        timeout_secs: 300,
+        timeout_secs: 90,
         reasoning_level: r_level.clone(),
         model_reasoning: r_model,
         auto_think: r_auto,
@@ -770,7 +850,7 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
             api_keys: if body.fallback_api_key.is_empty() { model.api_keys.clone() } else { vec![body.fallback_api_key.clone()] },
             temperature: Some(0.2),
             max_tokens: Some(4096),
-            timeout_secs: 300,
+            timeout_secs: 90,
             // The fallback usually shares the primary's kind; when it does not,
             // derive the gate from its own kind so a cloud auto-think provider
             // is still invoked the same way as a primary call would be.
@@ -779,15 +859,43 @@ async fn chat_compact(Json(body): Json<CompactBody>) -> Response<Body> {
             auto_think: fb_auto,
         })
     };
-    match compact::compact_history(&client, &model, fallback.as_ref(), &body.history, body.context_window, body.max_output, true).await {
-        Ok(Some(out)) => Json(json!({
-            "summary": out.summary,
-            "keep": out.keep,
-            "usage": normalize_compact_usage(out.usage, &model_name, &slot_provider_id),
-        }))
-        .into_response(),
-        Ok(None) => Json(json!({ "summary": Value::Null, "keep": 0, "error": "nothing to compact" })).into_response(),
-        Err(e) => Json(json!({ "summary": Value::Null, "keep": 0, "error": e })).into_response(),
+    // The summarizer's token budget: the window the user sees, resolved through
+    // the same capacity rule as the mid-turn trigger (a bare 0 must not fall back
+    // to a private literal — see `resolve_compact_window`).
+    let compact_ctx = crate::agent::resolve_compact_window(
+        &body.providers,
+        &body.provider_id,
+        &body.model,
+        body.context_window,
+    );
+    match compact::compact_history_with_progress(
+        &client,
+        &model,
+        fallback.as_ref(),
+        &body.history,
+        compact_ctx,
+        body.max_output,
+        true,
+        &mut |p: &compact::CompactProgress| send_compact_frame(tx, compact_progress_frame(p)),
+    )
+    .await
+    {
+        Ok(Some(out)) => send_compact_frame(
+            tx,
+            json!({
+                "summary": out.summary,
+                "keep": out.keep,
+                "usage": normalize_compact_usage(out.usage, &model_name, &slot_provider_id),
+            }),
+        ),
+        Ok(None) => send_compact_frame(
+            tx,
+            json!({ "summary": Value::Null, "keep": 0, "error": "nothing to compact" }),
+        ),
+        Err(e) => send_compact_frame(
+            tx,
+            json!({ "summary": Value::Null, "keep": 0, "error": e }),
+        ),
     }
 }
 
@@ -847,8 +955,13 @@ async fn chat_retry_now(Json(body): Json<Value>) -> Response<Body> {
     if chat_id.is_empty() {
         return bad_request("chat_id is required");
     }
-    agent::nudge_subagent_retry();
-    Json(json!({"ok": true})).into_response()
+    // `ok` is TRUE only when a ladder is actually listening. The renderer shows
+    // the click as accepted only then; otherwise it must not pretend the retry
+    // happened (the banner outlives its ladder whenever the turn has ended, and
+    // a click that nothing consumes is precisely what made the button look
+    // dead while the UI still claimed "retrying now (requested)").
+    let listening = agent::nudge_subagent_retry(chat_id);
+    Json(json!({"ok": true, "listening": listening})).into_response()
 }
 
 /// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
@@ -1459,6 +1572,38 @@ mod tests {
     }
 
     #[test]
+    fn other_slot_group_reads_whichever_key_holds_the_pick() {
+        // Tools → "Other" writes ONE model for compact/web/title, but a stale
+        // settings file can carry the pick under any single key. Reading only
+        // "compact" is what made the commit message and the chat title run on
+        // the main model while Settings showed the picked one.
+        let mut m = std::collections::HashMap::new();
+        m.insert("title".to_string(), "prov-b/side-model".to_string());
+        m.insert("web".to_string(), "prov-b/side-model".to_string());
+        assert_eq!(other_slot_entry(&m), "prov-b/side-model");
+        // An explicit compact entry wins (it is the group's first key).
+        m.insert("compact".to_string(), "prov-c/first".to_string());
+        assert_eq!(other_slot_entry(&m), "prov-c/first");
+        // Sentinels are ignored in favour of a real pick.
+        let mut sentinels = std::collections::HashMap::new();
+        sentinels.insert("compact".to_string(), "main model".to_string());
+        sentinels.insert("web".to_string(), "prov-b/side-model".to_string());
+        assert_eq!(other_slot_entry(&sentinels), "prov-b/side-model");
+        // Nothing usable → the caller falls back to the main model.
+        let mut none = std::collections::HashMap::new();
+        none.insert("title".to_string(), "main".to_string());
+        assert_eq!(other_slot_entry(&none), "");
+        assert_eq!(other_slot_entry(&std::collections::HashMap::new()), "");
+
+        let mut levels = std::collections::HashMap::new();
+        levels.insert("title".to_string(), "low".to_string());
+        assert_eq!(other_slot_level(&levels), "low");
+        levels.insert("compact".to_string(), "high".to_string());
+        assert_eq!(other_slot_level(&levels), "high");
+        assert_eq!(other_slot_level(&std::collections::HashMap::new()), "");
+    }
+
+    #[test]
     fn slot_kind_follows_the_slot_provider_not_the_parent() {
         // A cross-provider slot (an anthropic decision/title model while the
         // chat runs on openrouter) must resolve to the SLOT's kind: the kind
@@ -1856,6 +2001,27 @@ mod tests {
         );
     }
 
+    /// Split an SSE compaction body (`data: {json}\n\n`) into its progress ticks
+    /// and the single result frame. `/chat/compact` streams both now, so a test
+    /// can no longer read one plain JSON body.
+    fn parse_compact_sse(bytes: &[u8]) -> (Vec<Value>, Value) {
+        let text = String::from_utf8_lossy(bytes);
+        let mut progress = Vec::new();
+        let mut result = Value::Null;
+        for frame in text.split("\n\n") {
+            for line in frame.lines() {
+                let Some(raw) = line.strip_prefix("data: ") else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(raw.trim()) else { continue };
+                if v.get("compact_progress").and_then(|p| p.as_bool()) == Some(true) {
+                    progress.push(v);
+                } else {
+                    result = v;
+                }
+            }
+        }
+        (progress, result)
+    }
+
     #[tokio::test]
     async fn compact_live_uses_the_slot_model_provider_and_reasoning() {
         // A cross-provider compact slot must: (1) hit THAT provider's base URL
@@ -1894,7 +2060,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), 200);
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
-        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let (_progress, out) = parse_compact_sse(&bytes);
 
         let sent = rx.recv().await.expect("mock upstream saw no request");
         assert_eq!(sent["model"], MOCK_MODEL, "the slot model must be sent, got {sent}");
@@ -1936,9 +2102,18 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), 200);
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
-        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let (progress, out) = parse_compact_sse(&bytes);
         let sent = rx.recv().await.expect("mock upstream saw no request");
         let usage = &out["usage"];
+        // The stream must report real work, not just the result: a run starts
+        // with a preparing tick and reports the summarizer call itself.
+        assert!(!progress.is_empty(), "no progress frames were streamed");
+        assert_eq!(progress[0]["phase"], "preparing");
+        assert!(
+            progress.iter().any(|p| p["phase"] == "summarizing"),
+            "no summarizing tick, got {progress:?}"
+        );
+        assert!(progress.iter().any(|p| p["budget_secs"].as_u64().unwrap_or(0) > 0));
         assert_eq!(sent["model"], MOCK_MODEL);
         assert_eq!(usage["provider_id"], "chat-provider");
     }

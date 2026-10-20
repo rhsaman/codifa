@@ -96,7 +96,7 @@ fn migrate_legacy_root_once(root: &Path, home: &Path) {
     let _ = copy_tree(&legacy, root);
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+pub fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;

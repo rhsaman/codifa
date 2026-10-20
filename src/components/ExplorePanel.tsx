@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ToolActivity } from "../types";
 import { useStore } from "../lib/store";
-import { terminalOutputText } from "../lib/toolActivity";
+import { toolCallBody } from "../lib/toolActivity";
 import { exploreTitle, exploreToolCounts } from "./ExploreCard";
 import { StatusIcon } from "./ToolCallView";
 
@@ -30,12 +30,10 @@ function callDetail(activity: ToolActivity): string {
 
 /** Everything a call produced: search/terminal output, diff, or result text. */
 function callBody(activity: ToolActivity): string {
-  const parts: string[] = [];
-  const out = terminalOutputText(activity.items ?? activity.results);
-  if (out) parts.push(out);
-  if (activity.diff) parts.push(activity.diff);
-  if (activity.resultText) parts.push(activity.resultText);
-  return parts.join("\n\n");
+  // Shared with the tool-card renderers: a `read` call carries both a path row
+  // (from its args) and the window it returned, and printing the path first
+  // buried the content — the row looked like it had no result at all.
+  return toolCallBody(activity);
 }
 
 /** One tool call of the run — collapsible, so a long run stays scannable: the

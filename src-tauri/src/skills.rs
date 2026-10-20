@@ -212,6 +212,11 @@ fn find_skill_dir(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     None
 }
 
+/// Public wrapper so tool dispatch can mark a just-written skill as user-owned.
+pub fn find_skill_dir_pub(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
+    find_skill_dir(root, name_or_slug)
+}
+
 fn sanitize_extra_filename(filename: &str) -> Option<String> {
     let raw = filename.trim().trim_matches(|c| c == '/' || c == '\\');
     if raw.is_empty() || raw.eq_ignore_ascii_case("skill.md") {
@@ -264,6 +269,11 @@ pub fn list_skills(root: &Path) -> Value {
         let files: Vec<String> = fs::read_dir(&dir)
             .map(|rd| {
                 rd.flatten()
+                    // Only real files count: a sub-folder inside the skill dir
+                    // used to be listed as an "extra file", and picking it then
+                    // failed with "file not found" because reading a directory
+                    // as text is impossible.
+                    .filter(|e| e.path().is_file())
                     .filter_map(|e| e.file_name().into_string().ok())
                     .filter(|f| !f.eq_ignore_ascii_case("skill.md"))
                     .filter(|f| sanitize_extra_filename(f).is_some())
@@ -328,17 +338,29 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // rendered as literal `---`/`name:` text, and every later save nested
     // another one.
     let content = strip_frontmatter(&raw_content).trim().to_string();
-    let content = strip_heading(&content, &name).trim().to_string();
-    if content.is_empty() {
-        return Err("skill content is required".into());
-    }
+    // NOT validated here: an empty body means "keep the stored one" (see the
+    // preservation block below), and whether there IS a stored body is only
+    // known once the folder is resolved. Validating here is what made
+    // `create_skill` reject a delete or an extra-file-only save.
     let mut description = body["description"].as_str().unwrap_or("").trim().to_string();
     let mut fa_keywords: Vec<String> = match &body["fa_keywords"] {
-        Value::String(s) => s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
+        // Split on the ASCII comma AND the Persian one (U+060C), exactly like
+        // `parse_frontmatter` reads them. Splitting only on the ASCII comma
+        // meant a caller that wrote `فیلم، سریال` (the natural way to type a
+        // Persian list, and what the `create_skill` schema asks for) produced
+        // ONE keyword containing a comma instead of two — the file happened to
+        // round-trip because the reader is more permissive, but the in-memory
+        // value was wrong for the empty-check and the dedupe below.
+        Value::String(s) => s
+            .split([',', '،'])
+            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect(),
         Value::Array(a) => a
             .iter()
             .filter_map(|v| v.as_str())
-            .map(|k| k.trim().to_string())
+            .flat_map(|k| k.split([',', '،']))
+            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
             .filter(|k| !k.is_empty())
             .collect(),
         _ => Vec::new(),
@@ -348,11 +370,21 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // Renaming: move the previous folder so extra files survive.
     let prev = body["previous_name"].as_str().unwrap_or("").trim().to_string();
     let dir = skill_dir(&root, &slug);
+    // Errors here used to be swallowed with `let _ =`: when the rename failed
+    // (or the old folder did not exist) the write below still created a SECOND
+    // skill folder, so the user ended up with two skills and an "old" one they
+    // could not delete by the new name.
+    let mut renamed_from: Option<String> = None;
     if !prev.is_empty() && prev != name {
         if let Some(old_dir) = find_skill_dir(&root, &prev) {
             if old_dir != dir {
-                let _ = fs::create_dir_all(dir.parent().unwrap());
-                let _ = fs::rename(&old_dir, &dir);
+                if let Some(parent) = dir.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::rename(&old_dir, &dir).map_err(|e| {
+                    format!("could not rename skill folder {} -> {}: {e}", old_dir.display(), dir.display())
+                })?;
+                renamed_from = Some(prev.clone());
             }
         }
     }
@@ -366,12 +398,34 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // (the reported "fa_keywords/description get wiped on save" bug).
     // An omitted (or empty) value now means "keep what the file already has".
     let existing_raw = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
-    let (_, _, existing_desc, existing_fa) = parse_frontmatter(&existing_raw);
+    let (existing_name, _, existing_desc, existing_fa) = parse_frontmatter(&existing_raw);
     if description.is_empty() {
         description = existing_desc;
     }
     if fa_keywords.is_empty() {
         fa_keywords = existing_fa;
+    }
+    // An EMPTY body follows the same rule: keep the stored text. A caller that
+    // only adds/removes an extra file, renames, or edits the frontmatter must
+    // not have to resend the whole markdown (the model routinely calls
+    // `create_skill` exactly that way). Creating a NEW skill still requires a
+    // body, so we never write an empty skill.md.
+    let mut content = content;
+    if content.is_empty() {
+        let stored = strip_frontmatter(&existing_raw).trim().to_string();
+        // Strip the heading by the OLD name: after a rename the stored body
+        // still starts with `# Old Name`, and leaving it in would make the
+        // rewritten file carry a second (stale) heading under the new one.
+        let old_name = if existing_name.trim().is_empty() {
+            name.as_str()
+        } else {
+            existing_name.as_str()
+        };
+        content = strip_heading(&stored, old_name).trim().to_string();
+        content = strip_heading(&content, &name).trim().to_string();
+        if content.is_empty() {
+            return Err("skill content is required".into());
+        }
     }
     // Dedupe case-insensitively, keeping the author's order: a repeated phrase
     // only bloats the catalog line the model has to read.
@@ -391,8 +445,16 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     fs::write(&md_path, &markdown).map_err(|e| e.to_string())?;
 
     // Extra files: write new/updated, delete removed.
+    //
+    // Both spellings are accepted (`extra_files` from the model's tool call,
+    // `files`/`deletedFiles` from the renderer's /skills/sync payload). The
+    // renderer sends camelCase and the Rust side only read snake_case, so a
+    // multi-file skill edited from Settings silently lost its extra files.
+    let extra_obj = body["extra_files"]
+        .as_object()
+        .or_else(|| body["files"].as_object());
     let mut files: Vec<String> = Vec::new();
-    if let Some(extra) = body["extra_files"].as_object() {
+    if let Some(extra) = extra_obj {
         for (fname, fval) in extra {
             let Some(safe) = sanitize_extra_filename(fname) else {
                 continue;
@@ -402,7 +464,10 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
             files.push(safe);
         }
     }
-    if let Some(deleted) = body["deleted_files"].as_array() {
+    if let Some(deleted) = body["deleted_files"]
+        .as_array()
+        .or_else(|| body["deletedFiles"].as_array())
+    {
         for d in deleted {
             let Some(name) = d.as_str().and_then(sanitize_extra_filename) else {
                 continue;
@@ -418,6 +483,10 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         "path": md_path.to_string_lossy(),
         "note": "saved",
         "files": files,
+        "renamed_from": renamed_from,
+        // An empty keyword list makes the skill invisible to auto-match: the
+        // callers surface this instead of pretending everything is fine.
+        "fa_keyword_count": fa_keywords.len(),
     }))
 }
 
@@ -451,6 +520,86 @@ fn strip_heading(s: &str, name: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Stable 16-hex fingerprint of a skill's shipped form.
+fn fingerprint(description: &str, body: &str, fa_keywords: &[String]) -> String {
+    let mut sorted: Vec<String> = fa_keywords.iter().map(|k| k.trim().to_string()).collect();
+    sorted.retain(|k| !k.is_empty());
+    sorted.sort();
+    let joined = format!("{}\u{1}{}\u{1}{}", norm_ws(description), norm_ws(body), sorted.join("\u{1}"));
+    sha1_hex(joined.as_bytes())[..16].to_string()
+}
+
+/// Sidecar file inside a skill folder recording the provenance of `skill.md`.
+///
+/// Format: three lines — `{origin}\n{shipped fingerprint}\n{sha1 of the file}`
+/// where origin is `seeded` (this file is exactly what `sync_skill` wrote for
+/// that shipped version) or `user` (the user's own text, seeded or edited).
+///
+/// Why it exists: the seed step used to compare the STORED text with the
+/// SHIPPED text, so any user edit to a shipped skill looked like "the store is
+/// stale" and was silently reverted on the next launch. A user's edit is not
+/// staleness. With this marker the seed can tell the two apart.
+const SHIPPED_MARKER: &str = ".shipped";
+
+struct ShippedMarker {
+    origin: String,
+    shipped_fp: String,
+    file_hash: String,
+}
+
+fn marker_path(dir: &Path) -> PathBuf {
+    dir.join(SHIPPED_MARKER)
+}
+
+fn read_marker(dir: &Path) -> Option<ShippedMarker> {
+    let raw = fs::read_to_string(marker_path(dir)).ok()?;
+    let mut lines = raw.lines();
+    let first = lines.next()?.trim().to_string();
+    let second = lines.next()?.trim().to_string();
+    // Legacy two-line marker (no origin): treat it as "we wrote it".
+    let (origin, shipped_fp, file_hash) = if
+        first == "seeded" || first == "user"
+    {
+        let third = lines.next().unwrap_or("").trim().to_string();
+        (first, second, third)
+    } else {
+        ("seeded".to_string(), first, second)
+    };
+    Some(ShippedMarker { origin, shipped_fp, file_hash })
+}
+
+fn write_marker(dir: &Path, origin: &str, shipped_fp: &str, file_hash: &str) {
+    let _ = fs::write(
+        marker_path(dir),
+        format!("{origin}\n{shipped_fp}\n{file_hash}\n"),
+    );
+}
+
+/// Mark a skill folder as "the user (or the model on their behalf) owns this
+/// file": the seeder will never overwrite it again.
+///
+/// Called by `create_skill` after a successful write, because a skill the model
+/// edited is the user's text too — otherwise the NEXT shipped update would
+/// silently discard that edit.
+pub fn mark_user_edit(dir: &Path) {
+    let prev = read_marker(dir).map(|m| m.shipped_fp).unwrap_or_default();
+    let md = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
+    write_marker(dir, "user", &prev, &sha1_hex(md.as_bytes()));
+}
+
+/// Who owns this skill file, according to the `.shipped` marker:
+/// `Some("user")`, `Some("seeded")`, or `None` when there is no marker (a skill
+/// seeded by an older build).
+///
+/// `cfg(test)` on purpose: the ownership claim itself happens through
+/// `mark_user_edit`, so the only reader is a test asserting that the seeder will
+/// leave a model-written skill alone. Compiled only for tests, it cannot drift
+/// into a production path that reads provenance it does not act on.
+#[cfg(test)]
+pub fn marker_origin(dir: &Path) -> Option<String> {
+    read_marker(dir).map(|m| m.origin)
 }
 
 /// Locate the shipped built-in skills directory (the `*.md` files that ship
@@ -559,13 +708,61 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
             norm_ws(&body),
             sorted_fa,
         );
-        let unchanged = meta
-            .get(&name)
-            .or_else(|| meta.get(&slug))
-            .map(|cur| *cur == shipped)
+        let shipped_fp = fingerprint(&description, &body, &fa_keywords);
+
+        // Three cases, in order:
+        // 1. no stored copy            -> seed it
+        // 2. the user owns the copy    -> NEVER overwrite (their text wins)
+        // 3. we wrote it, shipped moved -> re-seed so official fixes land
+        let dir = find_skill_dir(root, &name).or_else(|| find_skill_dir(root, &slug));
+        let stored_dir_exists = dir
+            .as_ref()
+            .map(|d| d.join("skill.md").is_file())
             .unwrap_or(false);
-        if unchanged {
-            continue;
+        let legacy_match = || {
+            meta.get(&name)
+                .or_else(|| meta.get(&slug))
+                .map(|cur| *cur == shipped)
+                .unwrap_or(false)
+        };
+        if stored_dir_exists {
+            let md_now = dir
+                .as_ref()
+                .and_then(|d| fs::read_to_string(d.join("skill.md")).ok())
+                .unwrap_or_default();
+            let hash_now = sha1_hex(md_now.as_bytes());
+            let marker = dir.as_ref().and_then(|d| read_marker(d));
+            let user_owns = match &marker {
+                Some(m) if m.origin == "user" => true,
+                // We wrote it: any byte we did not write means the user edited it.
+                Some(m) => m.file_hash != hash_now,
+                // No marker (seeded by an older build): fall back to comparing
+                // the stored text with the shipped one.
+                None => !legacy_match(),
+            };
+            if user_owns {
+                // Record which shipped version we are deliberately NOT applying,
+                // so later launches stay quiet instead of re-reporting it.
+                if let Some(d) = dir.as_ref() {
+                    write_marker(d, "user", &shipped_fp, &hash_now);
+                }
+                continue;
+            }
+            let already_current = match &marker {
+                Some(m) => m.shipped_fp == shipped_fp,
+                None => legacy_match(),
+            };
+            if already_current {
+                // Record provenance for a skill seeded before this marker
+                // existed. Without it the NEXT shipped change would look like a
+                // user edit to an unmarked file and be skipped.
+                if marker.is_none() {
+                    if let Some(d) = dir.as_ref() {
+                        write_marker(d, "seeded", &shipped_fp, &hash_now);
+                    }
+                }
+                continue;
+            }
         }
         let payload = json!({
             "name": name,
@@ -574,6 +771,10 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
             "fa_keywords": fa_keywords,
         });
         if sync_skill(root, &payload).is_ok() {
+            if let Some(d) = find_skill_dir(root, &name).or_else(|| find_skill_dir(root, &slug)) {
+                let md = fs::read_to_string(d.join("skill.md")).unwrap_or_default();
+                write_marker(&d, "seeded", &shipped_fp, &sha1_hex(md.as_bytes()));
+            }
             seeded.push(name);
         }
     }
@@ -738,6 +939,32 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_coding_standards_skill_parses_and_is_matchable() {
+        // The generic coding rules are no longer in the prompt text — they live
+        // in this shipped skill, so the file itself is now load-bearing. A
+        // frontmatter typo would leave the skill nameless (unloadable by the
+        // `name=Coding Standards` pointer the system prompt emits) or keyless
+        // (never auto-matched), and both failures are silent at runtime.
+        let raw = include_str!("../skills/coding-standards.md");
+        let (name, slug, description, fa_keywords) = parse_frontmatter(raw);
+        assert_eq!(name, "Coding Standards");
+        assert_eq!(slug, "coding-standards");
+        assert!(!description.trim().is_empty(), "a skill needs a description");
+        assert!(
+            fa_keywords.len() >= 3,
+            "the skill must carry Persian + English keywords so a real request \
+             triggers it: {fa_keywords:?}"
+        );
+        // The body is what the model is told to follow — an empty one would
+        // make the prompt's pointer a dead end.
+        let body = raw.split("\n---").nth(1).unwrap_or_default();
+        assert!(
+            body.contains("## 7. Debugging protocol"),
+            "the debugging protocol is the reason this skill exists — keep it"
+        );
+    }
+
+    #[test]
     fn frontmatter_parses_like_python() {
         let raw = "---\nname: Test\nslug: test\ndescription: d\nfa_keywords: a, b\n---\n\n# Test\nbody";
         let (name, slug, desc, fa) = parse_frontmatter(raw);
@@ -855,6 +1082,306 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("UPDATED"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A user edit to a SHIPPED skill must survive a relaunch: the seed step is
+    /// only allowed to overwrite a file that still has exactly the bytes it
+    /// wrote for that shipped version.
+    #[test]
+    fn seed_builtin_skills_keeps_a_user_edit_to_a_shipped_skill() {
+        let tmp = std::env::temp_dir().join(format!("codifa-seed-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+        )
+        .unwrap();
+
+        assert_eq!(seed_builtin_skills(&store, &shipped).len(), 1, "first seed");
+
+        // The user edits the shipped skill from the app.
+        sync_skill(
+            &store,
+            &json!({
+                "name": "Movie Finder",
+                "description": "my own movies helper",
+                "content": "MY OWN BODY",
+                "fa_keywords": "فیلم, سینما",
+            }),
+        )
+        .expect("user edit saves");
+
+        // Relaunch: the shipped version did NOT change, so nothing is re-seeded
+        // and the user's text is still there.
+        assert!(seed_builtin_skills(&store, &shipped).is_empty(), "user edit must not be reverted");
+        let after = list_skills(&store);
+        assert_eq!(after["skills"][0]["description"], "my own movies helper");
+        assert!(after["skills"][0]["content"].as_str().unwrap().contains("MY OWN BODY"));
+
+        // ...and a REAL shipped change must NOT clobber the user's text either:
+        // their edit wins over an upstream rewrite.
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nUPDATED SHIPPED\n",
+        )
+        .unwrap();
+        assert!(
+            seed_builtin_skills(&store, &shipped).is_empty(),
+            "an edited shipped skill must stay edited"
+        );
+        let after2 = list_skills(&store);
+        assert!(after2["skills"][0]["content"].as_str().unwrap().contains("MY OWN BODY"));
+        // ...and it stays put on every later launch (marker records the decline).
+        assert!(seed_builtin_skills(&store, &shipped).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A shipped change DOES land while the user never touched the file.
+    #[test]
+    fn seed_builtin_skills_reseeds_an_untouched_shipped_skill() {
+        let tmp = std::env::temp_dir().join(format!("codifa-seed-reseed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(seed_builtin_skills(&store, &shipped).len(), 1);
+        assert!(seed_builtin_skills(&store, &shipped).is_empty(), "idempotent");
+
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film, cinema\n---\n\n# Movie Finder\nv2\n",
+        )
+        .unwrap();
+        assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
+        assert!(list_skills(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
+        assert!(seed_builtin_skills(&store, &shipped).is_empty(), "idempotent again");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The `.shipped` marker must not show up as an "extra file" of the skill
+    /// (it would be offered to the model as a loadable extra file).
+    #[test]
+    fn shipped_marker_is_not_listed_as_an_extra_file() {
+        let tmp = std::env::temp_dir().join(format!("codifa-marker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n",
+        )
+        .unwrap();
+        let store = tmp.join("store");
+        seed_builtin_skills(&store, &shipped);
+
+        let files = list_skills(&store)["skills"][0]["files"].clone();
+        assert_eq!(files, json!([]), "the marker is a dotfile, not a skill file");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A sub-folder inside a skill folder is not an extra file: it used to be
+    /// listed, and reading it failed with "file not found".
+    #[test]
+    fn a_subfolder_is_not_listed_as_an_extra_file() {
+        let tmp = std::env::temp_dir().join(format!("codifa-subdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        sync_skill(
+            &store,
+            &json!({
+                "name": "Has Folder",
+                "description": "d",
+                "content": "c",
+                "fa_keywords": "folder",
+            }),
+        )
+        .expect("write");
+        let dir = find_skill_dir(&store, "Has Folder").expect("folder exists");
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        fs::write(dir.join("notes").join("inner.md"), "x").unwrap();
+        fs::write(dir.join("data.json"), "{}").unwrap();
+
+        let files = list_skills(&store)["skills"][0]["files"].clone();
+        assert_eq!(files, json!(["data.json"]));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Renaming a skill must move the folder (and its extra files), and the
+    /// camelCase spellings the renderer sends must be understood.
+    #[test]
+    fn rename_moves_extra_files_and_camel_case_spellings_work() {
+        let tmp = std::env::temp_dir().join(format!("codifa-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        sync_skill(
+            &store,
+            &json!({
+                "name": "Old Name",
+                "description": "d",
+                "content": "c",
+                "fa_keywords": "old",
+                "extra_files": { "keep.txt": "kept", "drop.txt": "gone" },
+            }),
+        )
+        .expect("first write");
+
+        let res = sync_skill(
+            &store,
+            &json!({
+                "name": "New Name",
+                "previous_name": "Old Name",
+                "description": "d",
+                "content": "c2",
+                "fa_keywords": "new",
+                "files": { "added.txt": "added" },
+                "deletedFiles": ["drop.txt"],
+            }),
+        )
+        .expect("rename write");
+        assert_eq!(res["renamed_from"], "Old Name");
+
+        let listed = list_skills(&store);
+        let names: Vec<&str> = listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        // The old name is gone: the folder MOVED instead of a second one being
+        // created (the old code swallowed the rename error and duplicated it).
+        assert_eq!(names, vec!["New Name"]);
+        let files: Vec<String> = listed["skills"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(files.contains(&"keep.txt".to_string()), "{files:?}");
+        assert!(files.contains(&"added.txt".to_string()), "{files:?}");
+        assert!(!files.contains(&"drop.txt".to_string()), "{files:?}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `sync_skill` reports the keyword count so callers can warn about a skill
+    /// that auto-match can never pick up.
+    #[test]
+    fn sync_skill_reports_the_keyword_count() {
+        let tmp = std::env::temp_dir().join(format!("codifa-kwcount-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let with = sync_skill(
+            &store,
+            &json!({
+                "name": "With Kws",
+                "description": "d",
+                "content": "c",
+                "fa_keywords": "فیلم، سریال",
+            }),
+        )
+        .expect("write");
+        // The Persian comma must split into TWO keywords, not one.
+        assert_eq!(with["fa_keyword_count"], 2);
+
+        // An empty list on a NEW skill really is zero.
+        let without = sync_skill(
+            &store,
+            &json!({
+                "name": "No Kws",
+                "description": "d",
+                "content": "c",
+                "fa_keywords": "",
+            }),
+        )
+        .expect("write");
+        assert_eq!(without["fa_keyword_count"], 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A skill seeded by an older build (no marker) is adopted: a later shipped
+    /// change must still overwrite it, because the user never touched it.
+    #[test]
+    fn an_unmarked_stored_skill_is_adopted_as_seeded() {
+        let tmp = std::env::temp_dir().join(format!("codifa-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n";
+        fs::write(shipped.join("movie-finder.md"), shipped_md).unwrap();
+
+        // Seed once, then pretend the marker was lost (old build wrote the file).
+        assert_eq!(seed_builtin_skills(&store, &shipped).len(), 1);
+        let dir = find_skill_dir(&store, "Movie Finder").expect("seeded");
+        let md = fs::read_to_string(dir.join("skill.md")).unwrap();
+        let _ = fs::remove_file(marker_path(&dir));
+        fs::write(dir.join("skill.md"), &md).unwrap();
+
+        // Same shipped version + no marker: nothing to do, but it is adopted.
+        assert!(seed_builtin_skills(&store, &shipped).is_empty());
+        assert!(read_marker(&dir).is_some(), "provenance is recorded");
+
+        // A real shipped change now overwrites the untouched copy.
+        fs::write(
+            shipped.join("movie-finder.md"),
+            &shipped_md.replace("body\n", "v2\n"),
+        )
+        .unwrap();
+        assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
+        assert!(list_skills(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `create_skill` (the model-side writer) marks the folder as user-owned so
+    /// a later shipped update cannot revert an edit the model just made.
+    #[test]
+    fn mark_user_edit_protects_a_model_written_skill() {
+        let tmp = std::env::temp_dir().join(format!("codifa-usermark-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        let shipped_md = "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: film\n---\n\n# Movie Finder\nbody\n";
+        fs::write(shipped.join("movie-finder.md"), shipped_md).unwrap();
+        seed_builtin_skills(&store, &shipped);
+
+        // The model rewrites the shipped skill on the user's behalf, exactly as
+        // the `create_skill` dispatch does.
+        sync_skill(
+            &store,
+            &json!({
+                "name": "Movie Finder",
+                "description": "mine",
+                "content": "MODEL BODY",
+            }),
+        )
+        .expect("write");
+        let dir = find_skill_dir(&store, "Movie Finder").expect("dir");
+        mark_user_edit(&dir);
+
+        // Even an upstream rewrite must not clobber it.
+        fs::write(
+            shipped.join("movie-finder.md"),
+            &shipped_md.replace("body\n", "UPSTREAM v2\n"),
+        )
+        .unwrap();
+        assert!(seed_builtin_skills(&store, &shipped).is_empty());
+        assert!(list_skills(&store)["skills"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("MODEL BODY"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

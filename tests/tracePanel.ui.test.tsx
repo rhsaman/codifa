@@ -82,6 +82,53 @@ console.log('3) turn group header (default open):')
   check('default open (rows rendered)', (html.match(/trace-panel-row/g) || []).length === 3)
 }
 
+console.log('3b) expanded body never renders an empty "{}":')
+{
+  // An llm row that recorded nothing but a token count used to expand to a
+  // literal `{}` — the panel looked broken even though the row was "fine".
+  const bare = { id: 'l1', at: 1, kind: 'llm', summary: 'm · 5 tokens', model: 'm' } as any
+  const bareHtml = renderToString(<TraceRow entry={bare} defaultOpen />)
+  check('no empty detail json', !bareHtml.includes('trace-detail-json'), bareHtml)
+  check('explains the empty body', bareHtml.includes('No prompt/response recorded'), bareHtml)
+
+  // A row WITH detail still shows the pretty-printed json instead of a note.
+  const detailed = {
+    id: 'l2',
+    at: 1,
+    kind: 'llm',
+    summary: 'm · 5 tokens',
+    model: 'm',
+    detail: { provider: 'openrouter', step: 2, finish_reason: 'tool_calls' },
+  } as any
+  const detailedHtml = renderToString(<TraceRow entry={detailed} defaultOpen />)
+  check('detail json rendered', detailedHtml.includes('trace-detail-json'), detailedHtml)
+  check('no empty-body note', !detailedHtml.includes('No prompt/response recorded'))
+  // The reply text wins over the detail dump (that is the llm row's real body).
+  const withReply = renderToString(<TraceRow entry={{ ...detailed, result: 'I will read the file.' }} defaultOpen />)
+  check('reply text rendered as the body', withReply.includes('I will read the file.'), withReply)
+  check('detail json skipped when a reply exists', !withReply.includes('trace-detail-json'), withReply)
+}
+
+console.log('3c) an llm row shows the wire prompt it was sent:')
+{
+  const llm = {
+    id: 'l1',
+    at: 5,
+    kind: 'llm',
+    summary: 'm · 10 tokens',
+    turn: 1,
+    prompt: '[system] 40 chars\n\n[user]\nhello world',
+    result: 'hi there',
+    detail: { provider: 'openai', step: 1 },
+  } as any
+  const html = renderToString(<TraceRow entry={llm} defaultOpen />)
+  check('has a prompt block', html.includes('trace-prompt-block'))
+  check('prompt text is rendered', html.includes('hello world'), html.slice(0, 400))
+  check('prompt is labelled', html.includes('Prompt'))
+  check('response block is rendered', html.includes('hi there'))
+  check('no empty-body placeholder', !html.includes('trace-empty-body'))
+}
+
 console.log('4) per-turn copy text:')
 {
   const text = formatTurnAsText(1, 1, [rows[0], rows[1]])

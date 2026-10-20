@@ -1,4 +1,6 @@
 import {
+  Suspense,
+  lazy,
   memo,
   useEffect,
   useLayoutEffect,
@@ -10,161 +12,6 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-// highlight.js CORE + only the languages a code fence realistically carries.
-//
-// The default `highlight.js` entry registers ~190 grammars, and this file is in
-// the main chunk (App → ChatWindows → Chat → ChatMessage), so every one of those
-// grammars was parsed at launch and kept in the renderer heap — for chats that
-// mostly show JS/TS/Python/JSON. `lib/core` ships none; each grammar is loaded
-// explicitly below.
-import hljs from "highlight.js/lib/core";
-import bash from "highlight.js/lib/languages/bash";
-import c from "highlight.js/lib/languages/c";
-import cpp from "highlight.js/lib/languages/cpp";
-import csharp from "highlight.js/lib/languages/csharp";
-import css from "highlight.js/lib/languages/css";
-import diff from "highlight.js/lib/languages/diff";
-import dockerfile from "highlight.js/lib/languages/dockerfile";
-import go from "highlight.js/lib/languages/go";
-import graphql from "highlight.js/lib/languages/graphql";
-import ini from "highlight.js/lib/languages/ini";
-import java from "highlight.js/lib/languages/java";
-import javascript from "highlight.js/lib/languages/javascript";
-import json from "highlight.js/lib/languages/json";
-import kotlin from "highlight.js/lib/languages/kotlin";
-import less from "highlight.js/lib/languages/less";
-import lua from "highlight.js/lib/languages/lua";
-import makefile from "highlight.js/lib/languages/makefile";
-import markdown from "highlight.js/lib/languages/markdown";
-import nginx from "highlight.js/lib/languages/nginx";
-import objectivec from "highlight.js/lib/languages/objectivec";
-import perl from "highlight.js/lib/languages/perl";
-import php from "highlight.js/lib/languages/php";
-import plaintext from "highlight.js/lib/languages/plaintext";
-import python from "highlight.js/lib/languages/python";
-import ruby from "highlight.js/lib/languages/ruby";
-import rust from "highlight.js/lib/languages/rust";
-import scss from "highlight.js/lib/languages/scss";
-import shell from "highlight.js/lib/languages/shell";
-import sql from "highlight.js/lib/languages/sql";
-import swift from "highlight.js/lib/languages/swift";
-import typescript from "highlight.js/lib/languages/typescript";
-import xml from "highlight.js/lib/languages/xml";
-import yaml from "highlight.js/lib/languages/yaml";
-
-/** Languages the app highlights — the fence languages that actually appear in
- *  agent output plus the file extensions the viewer opens. */
-const HLJS_LANGUAGES: Array<[string, unknown]> = [
-  ["bash", bash],
-  ["c", c],
-  ["cpp", cpp],
-  ["csharp", csharp],
-  ["css", css],
-  ["diff", diff],
-  ["dockerfile", dockerfile],
-  ["go", go],
-  ["graphql", graphql],
-  ["ini", ini],
-  ["java", java],
-  ["javascript", javascript],
-  ["json", json],
-  ["kotlin", kotlin],
-  ["less", less],
-  ["lua", lua],
-  ["makefile", makefile],
-  ["markdown", markdown],
-  ["nginx", nginx],
-  ["objectivec", objectivec],
-  ["perl", perl],
-  ["php", php],
-  ["plaintext", plaintext],
-  ["python", python],
-  ["ruby", ruby],
-  ["rust", rust],
-  ["scss", scss],
-  ["shell", shell],
-  ["sql", sql],
-  ["swift", swift],
-  ["typescript", typescript],
-  ["xml", xml],
-  ["yaml", yaml],
-];
-
-/** Aliases the model (and file extensions) actually emit, mapped onto the
- *  grammars registered above. Without these, `bash`/`sh`/`zsh` etc. would fall
- *  through to auto-detection and lose their highlighting. */
-const HLJS_ALIASES: Record<string, string> = {
-  sh: "bash",
-  zsh: "bash",
-  ksh: "bash",
-  console: "bash",
-  shellscript: "shell",
-  py: "python",
-  python3: "python",
-  js: "javascript",
-  jsx: "javascript",
-  mjs: "javascript",
-  cjs: "javascript",
-  node: "javascript",
-  ts: "typescript",
-  tsx: "typescript",
-  rs: "rust",
-  golang: "go",
-  yml: "yaml",
-  jsonc: "json",
-  json5: "json",
-  html: "xml",
-  htm: "xml",
-  svg: "xml",
-  vue: "xml",
-  "c++": "cpp",
-  cc: "cpp",
-  hpp: "cpp",
-  hxx: "cpp",
-  h: "c",
-  cs: "csharp",
-  "c#": "csharp",
-  rb: "ruby",
-  objc: "objectivec",
-  "objective-c": "objectivec",
-  md: "markdown",
-  patch: "diff",
-  docker: "dockerfile",
-  make: "makefile",
-  postgres: "sql",
-  postgresql: "sql",
-  mysql: "sql",
-  text: "plaintext",
-  txt: "plaintext",
-  log: "plaintext",
-  toml: "ini",
-  cfg: "ini",
-  conf: "ini",
-  env: "ini",
-  properties: "ini",
-  sass: "scss",
-};
-
-let hljsReady = false;
-/** Grammar for each base language name — needed for aliases, because
- *  `hljs.getLanguage()` returns a registered Language OBJECT, not the grammar
- *  function `registerLanguage` expects. */
-const HLJS_BY_NAME: Record<string, unknown> = Object.fromEntries(HLJS_LANGUAGES);
-/** Register every grammar once per webview, on the first highlight. */
-function ensureHljsLanguages(): void {
-  if (hljsReady) return;
-  for (const [name, grammar] of HLJS_LANGUAGES) {
-    hljs.registerLanguage(name, grammar as never);
-  }
-  for (const [alias, target] of Object.entries(HLJS_ALIASES)) {
-    const grammar = HLJS_BY_NAME[target];
-    if (grammar) hljs.registerLanguage(alias, grammar as never);
-  }
-  // Only after BOTH loops succeeded: a throw mid-way must not leave the module
-  // believing it is registered (every later highlight would then silently
-  // fall back to unhighlighted code).
-  hljsReady = true;
-}
 import type { ChatMessage, ToolActivity } from "../types";
 import {
   detectDir,
@@ -185,7 +32,7 @@ import { lspStatusLabel, useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
 import { handleLinkClick, splitTextByUrls } from "../lib/link";
-import { sanitizeHtml } from "../lib/sanitizeHtml";
+import { getHighlightedLines } from "../lib/highlight";
 import {
   ToolCallView,
   ToolEditGroupView,
@@ -196,12 +43,23 @@ import {
   isSubagentCard,
 } from "./ToolCallView";
 import { ExploreCard } from "./ExploreCard";
-import { ReadingMode } from "./ReadingMode";
-import { Mermaid } from "./Mermaid";
 import { MessageImages } from "./MessageImages";
 import "highlight.js/styles/github-dark.min.css";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { planDisplay } from "../lib/planDoc";
+
+// ── Heavy, rarely-mounted children are code-split ────────────────────────────
+// Reading mode is a two-pane document viewer that only mounts after the user
+// clicks "مطالعه"; Mermaid drags in the whole diagram engine (~500 KB). Both
+// used to sit in the startup chunk, so every session paid for them even when
+// neither was ever shown.
+const ReadingMode = lazy(() =>
+  import("./ReadingMode").then((m) => ({ default: m.ReadingMode })),
+);
+// Mermaid: the module itself is light (it only imports the ENGINE dynamically,
+// so the engine lands in its own chunk) and the block paints a static
+// placeholder until the user scrolls it into view.
+import { Mermaid } from "./Mermaid";
 
 /** Basename for attachment chips: message bubbles must show "report.pdf",
  *  never the full absolute path (imported uploads live in the app data root
@@ -277,6 +135,28 @@ function DocFileChips({ paths }: { paths: string[] }) {
 // showing stale text. FIFO-bounded so long sessions can't leak memory.
 const preparedCache = new Map<string, { text: string; out: string }>();
 const PREPARED_CACHE_MAX = 400;
+/** Byte ceiling for the cache, on top of the entry count.
+ *
+ *  A COUNT cap alone is not a memory bound when entries are huge: a thinking
+ *  block streams token by token and `cachedPrepareText` keys by the TEXT, so
+ *  every delta inserted a brand-new entry holding two copies (input + output) of
+ *  a growing multi-hundred-KB string. 400 such entries is tens of MB of pure
+ *  garbage that the FIFO only evicts long after it was allocated — and it never
+ *  even helped, because the NEXT token has a different key. */
+const PREPARED_CACHE_MAX_CHARS = 2_000_000;
+/** Content above this is not worth caching at all: it is (a) unlikely to be
+ *  re-rendered with identical text and (b) most of the cache's weight. */
+const PREPARED_CACHE_SKIP_CHARS = 40_000;
+let preparedCacheChars = 0;
+
+function dropPrepared(id: string): void {
+  const hit = preparedCache.get(id);
+  if (hit) {
+    preparedCacheChars -= hit.text.length + hit.out.length;
+    preparedCache.delete(id);
+  }
+}
+
 function computePrepared(
   id: string,
   text: string,
@@ -285,11 +165,21 @@ function computePrepared(
   const hit = preparedCache.get(id);
   if (hit && hit.text === text) return hit.out;
   const out = prepareContent(text, dir);
-  if (preparedCache.size >= PREPARED_CACHE_MAX) {
+  if (text.length > PREPARED_CACHE_SKIP_CHARS) return out;
+  // Replace (not just insert) so a streaming message's previous, smaller entry
+  // is released as it grows instead of leaving a trail of stale copies.
+  dropPrepared(id);
+  while (
+    preparedCache.size > 0 &&
+    (preparedCache.size >= PREPARED_CACHE_MAX ||
+      preparedCacheChars + text.length + out.length > PREPARED_CACHE_MAX_CHARS)
+  ) {
     const oldest = preparedCache.keys().next().value;
-    if (oldest !== undefined) preparedCache.delete(oldest);
+    if (oldest === undefined) break;
+    dropPrepared(oldest);
   }
   preparedCache.set(id, { text, out });
+  preparedCacheChars += text.length + out.length;
   return out;
 }
 function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
@@ -298,9 +188,16 @@ function cachedPrepare(id: string, text: string, dir?: "rtl" | "ltr"): string {
 }
 /** For content with no stable id (the thinking block only receives `text`):
  *  key by the text itself — prepareContent is deterministic, so equal text
- *  always yields equal output. */
+ *  always yields equal output.
+ *
+ *  Short-circuits before building the key for long content: the key is a full
+ *  COPY of the text (`t:${text}`), and while a reasoning block streams that is a
+ *  fresh multi-hundred-KB allocation per token that can never hit (the next token
+ *  has different text). Streaming was paying for a duplicate of the whole block
+ *  on every delta. */
 function cachedPrepareText(text: string, dir?: "rtl" | "ltr"): string {
   if (!text) return text;
+  if (text.length > PREPARED_CACHE_SKIP_CHARS) return prepareContent(text, dir);
   return computePrepared(`t:${text}`, text, dir);
 }
 
@@ -517,56 +414,6 @@ function codeStartLine(children: ReactNode): number {
   return 0;
 }
 
-// Minimal HTML escaper used as a fallback when highlight.js can't process a
-// snippet — keeps the raw text safe to inject via dangerouslySetInnerHTML.
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// Splits highlight.js output HTML into per-line HTML fragments while keeping
-// any <span> that's still open at a line boundary open across the split — so
-// a token that spans multiple lines (block comment, template literal,
-// docstring, ...) keeps its color on every line it covers, not just the
-// first. highlight.js only ever emits <span ...> / </span> tags into its
-// output (text is HTML-escaped), so a simple tag-aware scan is sufficient.
-function splitHighlightedHtml(html: string): string[] {
-  const lines: string[] = [];
-  const openTags: string[] = [];
-  let current = "";
-  let i = 0;
-  while (i < html.length) {
-    const ch = html[i];
-    if (ch === "\n") {
-      current += "</span>".repeat(openTags.length);
-      lines.push(current);
-      current = openTags.join("");
-      i++;
-      continue;
-    }
-    if (html.startsWith("<span", i)) {
-      const end = html.indexOf(">", i) + 1;
-      const tag = html.slice(i, end);
-      openTags.push(tag);
-      current += tag;
-      i = end;
-      continue;
-    }
-    if (html.startsWith("</span>", i)) {
-      openTags.pop();
-      current += "</span>";
-      i += 7;
-      continue;
-    }
-    current += ch;
-    i++;
-  }
-  lines.push(current);
-  return lines;
-}
-
 function codeFilePath(children: ReactNode): string {
   const kids = Array.isArray(children) ? children : [children];
   for (const k of kids) {
@@ -580,44 +427,6 @@ function codeFilePath(children: ReactNode): string {
   return "";
 }
 
-// Highlight cache: CodeBlock re-renders whenever its parent message re-renders
-// (e.g. every streamed token of a long reply re-renders the whole transcript
-// window). hljs.highlight over a big block on every token is the main CPU cost
-// of streaming. Cache by (lang + source) so unchanged blocks pay zero.
-// FIFO-bounded like preparedCache so long sessions can't leak memory.
-// Exported for FileViewerPanel (the file viewer tab) — same cache, same
-// sanitize + span-aware line split as chat code blocks.
-const highlightCache = new Map<string, string[]>();
-const HIGHLIGHT_CACHE_MAX = 150;
-export function getHighlightedLines(whole: string, lang: string): string[] {
-  const key = `${lang}\n${whole}`;
-  const hit = highlightCache.get(key);
-  if (hit) return hit;
-  // Grammars are registered lazily on the first highlight: `lib/core` ships
-  // none, so without this the block would fall through to `highlightAuto`
-  // (which also has nothing to detect) and render unhighlighted.
-  ensureHljsLanguages();
-  let lines: string[];
-  try {
-    const html =
-      lang && hljs.getLanguage(lang)
-        ? hljs.highlight(whole, { language: lang }).value
-        : hljs.highlightAuto(whole).value;
-    // highlight.js round-trips whatever the model wrote into the code block
-    // (e.g. unterminated tags, stray attributes) into the highlighted HTML.
-    // Sanitize the result so a malicious payload can't smuggle an event
-    // handler or a javascript: URL into the chat via a code block.
-    lines = splitHighlightedHtml(sanitizeHtml(html));
-  } catch {
-    lines = whole.split("\n").map(escapeHtml);
-  }
-  if (highlightCache.size >= HIGHLIGHT_CACHE_MAX) {
-    const oldest = highlightCache.keys().next().value;
-    if (oldest !== undefined) highlightCache.delete(oldest);
-  }
-  highlightCache.set(key, lines);
-  return lines;
-}
 
 const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
   const [copied, setCopied] = useState(false);
@@ -661,15 +470,15 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
 
   // Highlight the WHOLE block in ONE hljs pass (not line-by-line), so multi-line
   // constructs (block comments, template literals, docstrings, ...) keep their
-  // syntax state across lines and get correct colors. The resulting HTML is then
-  // split back into per-line fragments by splitHighlightedHtml, which re-opens any
-  // <span> still open at a line boundary on the next line, so a token spanning
+  // syntax state across lines and get correct colors. getHighlightedLines
+  // (src/lib/highlight.ts) splits the result back into per-line fragments and
+  // re-opens any <span> still open at a line boundary, so a token spanning
   // multiple lines keeps its color on every line, not just the first. The line
   // numbers are rendered as a VISUAL-ONLY gutter (the real file line number when
   // the fence carries `lang:start-end`, otherwise 1-based) with `user-select:
   // none`, so selecting/copying the block copies just the code, never the numbers.
   // Memoized on (code + lang): re-renders caused by streaming tokens elsewhere
-  // in the message reuse the cached highlight instead of re-running hljs.
+  // in the message reuse the module's cached highlight instead of re-running hljs.
   const highlightedLines = useMemo(
     () => getHighlightedLines(codeLines.join("\n"), lang),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1025,14 +834,23 @@ const PROSE_REMARK_PLUGINS = [remarkGfm];
 const PROSE_REHYPE_PLUGINS = [rehypeArrows];
 
 /** One markdown prose block. Besides rendering, it fixes the direction of
- *  arrows in RTL text (see lib/arrowDir.ts). The layout effect has no deps on
- *  purpose: a streaming re-render replaces text nodes, so the mirror state is
- *  re-measured after every commit (before paint, so nothing flickers). */
-function MarkdownProse({ text }: { text: string }) {
+ *  arrows in RTL text (see lib/arrowDir.ts).
+ *
+ *  The layout effect is keyed on `text` (the direction is already baked into it
+ *  by `cachedPrepare`): with NO dependency array it re-ran after every commit,
+ *  so a streaming reply walked the whole prose block —
+ *  `querySelectorAll(".md-arrow")` plus a `createTreeWalker` per arrow — once per
+ *  TOKEN, for every mounted message, defeating the point of the text cache. The
+ *  arrow direction is a pure function of the text, so re-measuring it is only
+ *  needed when the text actually changes.
+ *
+ *  `memo` keeps a parent re-render (dir toggle, sibling stream) from re-parsing
+ *  markdown that did not change. */
+const MarkdownProse = memo(function MarkdownProse({ text }: { text: string }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     if (ref.current) fixArrowDirections(ref.current);
-  });
+  }, [text]);
   return (
     <div ref={ref} className="chat-message markdown-body" dir="auto">
       <ReactMarkdown
@@ -1044,7 +862,7 @@ function MarkdownProse({ text }: { text: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+})
 
 const fmtTokens = (n?: number): string => {
   if (!n) return "0";
@@ -1383,6 +1201,59 @@ function UsageBadge({
  * وقتی مدل reasoning تولید می‌کند و «Working» وقتی ایجنت مشغول کار است ولی
  * think نمی‌کند (اجرای ابزار، انتظار برای نتیجه و…).
  */
+/**
+ * Quiet row listing the skills that were auto-matched into this turn.
+ *
+ * These are metadata about HOW the answer was produced, not part of the
+ * answer: rendered as a single dim line (count + faint names) instead of
+ * filled pills so a turn with several matches never competes visually with
+ * the message itself. Click reveals the full list as plain text.
+ */
+function AutoSkillsRow({ skills }: { skills: string[] }) {
+  const [open, setOpen] = useState(false);
+  const count = skills.length;
+  return (
+    <div className="msg-skills">
+      <button
+        type="button"
+        dir="ltr"
+        className={`msg-skills-head${open ? " open" : ""}`}
+        aria-expanded={open}
+        title={`${skills.join(" · ")} — auto-matched from your request and inlined into this turn's instructions`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="msg-skills-icon" aria-hidden="true">
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M12 1.5 14.4 9.6 22.5 12 14.4 14.4 12 22.5 9.6 14.4 1.5 12 9.6 9.6Z" />
+          </svg>
+        </span>
+        <span className="msg-skills-label">
+          {count === 1 ? "1 skill" : `${count} skills`}
+        </span>
+        {!open && <span className="msg-skills-preview">{skills.join(" · ")}</span>}
+        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
+          ▾
+        </span>
+      </button>
+      {open && (
+        <ul className="msg-skills-list">
+          {skills.map((sk) => (
+            <li className="msg-skills-item" key={`autoskill-${sk}`}>
+              {sk}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function ThinkingIndicator({
   startedAt,
   label = "Thinking",
@@ -2672,17 +2543,7 @@ export const ChatMessageView = memo(
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
       {!isUser && message.autoSkills && message.autoSkills.length > 0 && (
-        <div className="msg-attachments" dir="ltr">
-          {message.autoSkills.map((sk) => (
-            <span
-              className="attachment-chip"
-              key={`autoskill-${sk}`}
-              title="Auto-loaded skill — matched from your request and inlined into this turn's instructions"
-            >
-              ⚡ {sk}
-            </span>
-          ))}
-        </div>
+        <AutoSkillsRow skills={message.autoSkills} />
       )}
 
       {!isUser && message.interrupted && (
@@ -2934,7 +2795,9 @@ export const ChatMessageView = memo(
       )}
 
       {reading && (
-        <ReadingMode message={message} onClose={() => setReading(false)} />
+        <Suspense fallback={null}>
+          <ReadingMode message={message} onClose={() => setReading(false)} />
+        </Suspense>
       )}
     </div>
   );

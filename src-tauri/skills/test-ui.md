@@ -1,7 +1,7 @@
 ---
 name: Test UI
 description: Live-test codifa's own renderer UI in a browser — mounts the real ChatPanel with a stubbed backend, seeds store scenarios, simulates events and takes screenshots via the browser tools.
-fa_keywords: تست رابط کاربری, تست UI, live test UI
+fa_keywords: تست رابط کاربری, تست UI, live test UI, e2e, browser test
 ---
 
 # Test UI (live renderer harness)

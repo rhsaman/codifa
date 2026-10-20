@@ -20,8 +20,21 @@ const CATALOG_MAX_CHARS: usize = 6_000;
 
 /// Result of building the SKILLS section for one turn.
 pub struct SkillSection {
-    /// Prompt text to append to the system prompt ("" when nothing applies).
+    /// BYTE-STABLE part: the catalog plus the skills the user attached with an
+    /// `@mention`. Goes into the system prompt, which every request re-sends.
     pub text: String,
+    /// PER-TURN part: the bodies of the auto-matched skills.
+    ///
+    /// This must NOT go into the system prompt. Auto-match is recomputed from
+    /// the current user message on every turn, so a prompt whose keywords pick
+    /// a different skill rewrites the system prompt and invalidates the cached
+    /// prefix of the WHOLE conversation. A measured trace showed exactly that:
+    /// two consecutive main turns diverged at char 8 696 inside
+    /// `=== AUTO-MATCHED SKILLS ===` and the next call cost 96 460 uncached
+    /// tokens instead of riding the cache. The caller appends this to the
+    /// TRAILING message instead (same treatment as the plan/checklist section),
+    /// where per-turn churn cannot move anything the previous call cached.
+    pub volatile: String,
     /// Attached names that no longer exist in the store.
     pub missing: Vec<String>,
     /// Names AUTO-MATCHED from the user's prompt this turn. The renderer shows
@@ -33,20 +46,135 @@ pub struct SkillSection {
 const MAX_AUTO_MATCHED: usize = 3;
 /// Minimum score (see `skill_score`) before a skill is auto-inlined. 2 means a
 /// single name word is not enough on its own — the request must agree on two
-/// signals, or carry one complete `fa_keywords` phrase.
+/// signals, or carry one complete `fa_keywords` phrase (or ONE word of one).
 const MATCH_MIN_SCORE: usize = 2;
+/// How far below the best score a skill may sit and still be inlined.
+///
+/// An absolute threshold alone cannot express "this one is clearly the topic":
+/// with only `score >= 2`, a prompt scoring 6 for `summarization` also dragged
+/// in an unrelated skill that scraped a 2. Relative filtering keeps the winner
+/// plus its genuine near-ties (`design a landing page` keeps landing-page-design
+/// and Hallmark) and drops the noise. Measured over the labelled set: no correct
+/// pick lost, the trailing stragglers gone.
+const AUTO_MATCH_WINDOW: usize = 1;
 
 /// Lowercase + whitespace-collapse, used for prompt/keyword matching.
 fn normalize_text(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// Distinctive words of a phrase (4+ chars), for partial keyword hits.
+/// Shortest word that counts as a match signal.
+///
+/// 4 was wrong for Persian: the language is built from short words, so
+/// `این باگ رو درست کن` kept only `درست` and dropped `باگ` — the exact word the
+/// Code-Expert skill lists. `commit this and push` likewise lost `git` and
+/// scored 1 instead of a match. Measured over a labelled set of 19 prompts:
+/// 3 recovers every miss the 4-char floor caused with no new false positive
+/// (the word-boundary rule, not the length, is what keeps matching honest).
+const MIN_WORD_CHARS: usize = 3;
+
+/// Distinctive words of a phrase, for partial keyword hits.
 fn words_of(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.chars().count() >= 4)
+        .filter(|w| w.chars().count() >= MIN_WORD_CHARS)
         .map(|w| w.to_lowercase())
         .collect()
+}
+
+/// Shared prefix needed before two words can be the same stem.
+const STEM_PREFIX_MIN: usize = 5;
+
+/// Word endings that never change what the word is about.
+///
+/// The first version compared raw lengths (allow a 1-char tail) and got both
+/// cases wrong: it accepted `data`/`dataset` (a different word) while rejecting
+/// `refactor`/`refactoring` (the same one), because both differ by three
+/// characters. Length cannot separate them — the actual signal is WHICH letters
+/// the tail is made of. So the tail must be one of these morphemes on BOTH
+/// sides; `ing`/`ion` are inflections, `set` is a different noun.
+const STEM_SUFFIXES: [&str; 22] = [
+    "", "s", "es", "e", "ed", "d", "ing", "ging", "r", "er", "ers", "ion", "ions", "ation",
+    "ations", "ly", "is", "sis", "ze", "al", "ment", "ments",
+];
+
+/// Whether two lowercase words are the same word up to an inflection.
+///
+/// The user types one form while the skill lists another — `refactor` vs
+/// `refactoring`, `debug` vs `debugging`, `analyze` vs `analysis`, `brainstorm`
+/// vs `brainstorming`, `translate` vs `translation` — and an exact word-set
+/// comparison missed every one of them. A real stemmer is overkill here; the
+/// rule is: a long enough shared prefix plus an inflection-only tail.
+///
+/// Rejects `data`/`dataset` (shared prefix only 4, and `set` is not an
+/// inflection), so unrelated skills are not dragged in.
+fn same_stem(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let shared = a
+        .chars()
+        .zip(b.chars())
+        .take_while(|(x, y)| x == y)
+        .count();
+    if shared < STEM_PREFIX_MIN {
+        return false;
+    }
+    let tail = |w: &str| -> String { w.chars().skip(shared).collect() };
+    let (ta, tb) = (tail(a), tail(b));
+    STEM_SUFFIXES.contains(&ta.as_str()) && STEM_SUFFIXES.contains(&tb.as_str())
+}
+
+/// Whether any prompt word matches `word` (exactly or as the same stem).
+fn word_in(word: &str, prompt_words: &[String]) -> bool {
+    prompt_words.iter().any(|p| same_stem(word, p))
+}
+
+/// Whether any prompt word equals `word` exactly.
+///
+/// The skill NAME is a label, not a curated keyword list: its words are generic
+/// (`optimization`, `analysis`, `design`) and stem-expanding them drags the
+/// skill into requests about something else — `optimize the sql query` reached
+/// `seo-optimization` through `optimize` -> `optimization` and inlined an SEO
+/// skill into a database question. Inflection tolerance belongs to the
+/// `fa_keywords` the author wrote on purpose, so name/slug matching stays exact.
+fn word_in_exact(word: &str, prompt_words: &[String]) -> bool {
+    prompt_words.iter().any(|p| p == word)
+}
+
+/// Whether `needle` occurs in `hay` at WORD boundaries.
+///
+/// A bare `hay.contains(needle)` was wrong for short keywords: the Playwrite
+/// skill lists `ref`, which matched inside "**ref**actor this module" and
+/// "this is a **pref**erence setting" and pulled a browser-automation skill
+/// into ordinary coding requests. Both sides of the match must be a non-word
+/// character (or a string edge).
+///
+/// Both arguments are already lowercased (`normalize_text`); the check is on
+/// `char::is_alphanumeric` so it holds for Persian as well as ASCII — `باگ`
+/// still matches inside `این باگ رو` because the neighbours are spaces.
+fn contains_phrase(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = hay[..start].chars().next_back().is_none_or(|c| !is_word(c));
+        let after_ok = hay[end..].chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance past the first char of this hit (never inside a UTF-8 char).
+        from = start + hay[start..].chars().next().map(chars_len).unwrap_or(1);
+    }
+    false
+}
+
+/// Byte length of one char (helper so `contains_phrase` can advance safely).
+fn chars_len(c: char) -> usize {
+    c.len_utf8()
 }
 
 /// How well one skill matches an already-normalized prompt.
@@ -61,13 +189,13 @@ fn skill_score(s: &Value, hay: &str) -> usize {
     // Matching is WORD-based, never raw substring: `hay.contains("data")` also
     // fired inside "metadata"/"database", so unrelated skills were pulled into
     // prompts that never mentioned them (the "it loads the wrong skill" report).
-    let prompt_words: std::collections::HashSet<String> = words_of(hay).into_iter().collect();
+    let prompt_words: Vec<String> = words_of(hay);
     let name_words = words_of(s["name"].as_str().unwrap_or_default());
     let slug_words = words_of(s["slug"].as_str().unwrap_or_default());
     let name_hits = name_words
         .iter()
         .chain(slug_words.iter())
-        .filter(|w| prompt_words.contains(*w))
+        .filter(|w| word_in_exact(w, &prompt_words))
         .count();
     // Capped so a generic name cannot outrank a real keyword match.
     score += name_hits.min(2);
@@ -78,16 +206,31 @@ fn skill_score(s: &Value, hay: &str) -> usize {
             if kw.chars().count() < 3 {
                 continue;
             }
-            if hay.contains(&kw) {
+            if contains_phrase(hay, &kw) {
                 // The complete phrase is in the request: strongest signal.
                 score += 3;
+                continue;
+            }
+            let kw_words = words_of(&kw);
+            if kw_words.is_empty() {
+                continue;
+            }
+            let hits = kw_words.iter().filter(|w| word_in(w, &prompt_words)).count();
+            if kw_words.len() == 1 {
+                // A ONE-WORD keyword is the whole signal, not a fragment of a
+                // longer phrase: `باگ` / `فیلم` / `translate` matching its word
+                // means exactly what a multi-word phrase matching would mean.
+                // Scoring it +1 made every single-word keyword (which is most
+                // of them) unable to reach the threshold on its own — the
+                // reported "auto-skill never picks anything" bug. Only a partial
+                // hit of a MULTI-word keyword stays at +1 per word.
+                if hits == 1 {
+                    score += 3;
+                }
             } else {
                 // Multi-word keyword ("landing page design") still matches a
                 // shorter paraphrase ("landing page") word by word.
-                score += words_of(&kw)
-                    .iter()
-                    .filter(|w| prompt_words.contains(*w))
-                    .count();
+                score += hits;
             }
         }
     }
@@ -196,6 +339,7 @@ fn load_skills(root: &str) -> Vec<Value> {
 pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
     let all = load_skills(root);
     let mut text = String::new();
+    let mut volatile = String::new();
 
     let listed = catalog(&all);
     if !listed.is_empty() {
@@ -266,6 +410,13 @@ pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> Skill
             .collect();
         // Highest score first; ties keep the store's name order (stable sort).
         scored.sort_by(|a, b| b.0.cmp(&a.0));
+        // Keep only the clear winners: a skill that merely crossed the absolute
+        // threshold while the winner scored far higher is noise on this prompt,
+        // not a match (see AUTO_MATCH_WINDOW).
+        if let Some(best) = scored.first().map(|(score, _)| *score) {
+            let floor = best.saturating_sub(AUTO_MATCH_WINDOW);
+            scored.retain(|(score, _)| *score >= floor);
+        }
         scored.truncate(MAX_AUTO_MATCHED);
         for (_, s) in scored {
             let name = s["name"].as_str().unwrap_or_default().trim().to_string();
@@ -275,18 +426,18 @@ pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> Skill
             matched.push(name);
         }
         if !matched.is_empty() {
-            text.push_str(
+            volatile.push_str(
                 "\n\n=== AUTO-MATCHED SKILLS ===\n\
                  These skills were picked for THIS request from its keywords. Adopt \
                  their role and follow their instructions (the decision is already \
                  made — do NOT call load_skill for them).\n",
             );
             let bodies: Vec<String> = matched_bodies(&all, &matched);
-            text.push_str(&bodies.join("\n\n"));
+            volatile.push_str(&bodies.join("\n\n"));
         }
     }
 
-    SkillSection { text, missing, matched }
+    SkillSection { text, volatile, missing, matched }
 }
 
 /// Formatted bodies for the auto-matched names, in the given order.
@@ -316,6 +467,68 @@ mod tests {
             "content": format!("body of {name}"),
             "files": [],
         })
+    }
+
+    #[test]
+    #[ignore = "diagnostic: run with --ignored to see which real prompts auto-match"]
+    fn diagnose_auto_match_against_the_real_store() {
+        // Runs the REAL router over the REAL skill store, so "why did no skill
+        // match?" is answered by the code that decides it rather than by a
+        // re-implementation of the scoring rules.
+        //
+        // NOTE: the store at {data_root}/skills is only re-synced from
+        // `src-tauri/skills/*.md` at app STARTUP (`seed_builtin_skills`), so a
+        // fresh checkout that has not launched the app yet still holds the OLD
+        // keywords. Pass `CODER_SKILL_ROOT=src-tauri` to measure the SHIPPED
+        // set instead, which is what a new build actually loads.
+        let root = match std::env::var("CODER_SKILL_ROOT") {
+            Ok(r) => r,
+            Err(_) => match std::env::var("CODER_DATA_DIR") {
+                Ok(d) => d,
+                Err(_) => std::env::var("HOME")
+                    .map(|h| format!("{h}/.codifa"))
+                    .unwrap_or_default(),
+            },
+        };
+        let prompts = [
+            "این باگ رو درست کن",
+            "این کد رو ریفکتور کن",
+            "می‌خوام این کامپوننت رو طراحی کنم، ظاهر تمیزی می‌خوام",
+            "این متن رو خلاصه کن",
+            "یه فیلم خوب معرفی کن",
+            "چرا اتو اسکیل هیچ اسکیلی رو انتخاب نمیکنه؟",
+            "کاهش مصرف توکن و کاهش راندتریپ explore",
+            "fix this bug",
+            "debug this crash",
+            "refactor this module",
+            "design a landing page",
+            "please translate this paragraph",
+            "commit this and push",
+            "test the ui in a browser",
+            "analyze this dataset",
+            "brainstorm ideas for me",
+            "research the latest react docs",
+            "سئو سایت رو بهتر کن",
+            // Negatives: none of these may inline a skill.
+            "this is a preference setting",
+            "rename this variable",
+            "update the changelog",
+            "optimize the sql query",
+            "deploy the docker image to staging",
+            "move this helper into its own file",
+        ];
+        println!("skills root: {root}");
+        let mut hit = 0usize;
+        for p in prompts {
+            let sec = build_section(p, &root, &[]);
+            if sec.matched.is_empty() {
+                println!("  [--] {p}");
+            } else {
+                hit += 1;
+                println!("  [OK] {p} -> {:?}", sec.matched);
+            }
+        }
+        println!("matched {hit}/{}", prompts.len());
     }
 
     #[test]
@@ -366,6 +579,234 @@ mod tests {
     }
 
     #[test]
+    fn short_persian_words_are_match_signals() {
+        // Persian is built from short words (`باگ`, `کد`, `گیت`, `سئو`). A
+        // 4-char floor dropped them, so `این باگ رو درست کن` kept only `درست`
+        // and no skill could match — the reported "auto-skill never picks
+        // anything" bug. The floor is 3 now.
+        assert!(words_of("این باگ رو درست کن").contains(&"باگ".to_string()));
+        let mut s = skill("Code-Expert", "debugging help");
+        s["fa_keywords"] = json!(["باگ"]);
+        assert!(skill_score(&s, &normalize_text("این باگ رو درست کن")) >= MATCH_MIN_SCORE);
+    }
+
+    #[test]
+    fn one_word_keyword_is_the_whole_signal() {
+        // Most keywords are a SINGLE word. Scoring a match +1 meant such a
+        // keyword could never reach the threshold alone, so the skill with the
+        // exact word the user typed still lost. One word is a complete signal.
+        let mut s = skill("Code-Expert", "debugging help");
+        s["fa_keywords"] = json!(["ریفکتور"]);
+        assert!(skill_score(&s, &normalize_text("این کد رو ریفکتور کن")) >= MATCH_MIN_SCORE);
+        // A fragment of a MULTI-word keyword is still worth only one point.
+        // The skill NAME must not appear in the prompt, or the name signals
+        // (worth up to 2) would carry the assertion instead of the fragment.
+        let mut multi = skill("Page Builder", "landing pages");
+        multi["fa_keywords"] = json!(["landing page design"]);
+        let partial = skill_score(&multi, &normalize_text("the landing is done"));
+        assert!(partial < MATCH_MIN_SCORE, "{partial}");
+    }
+
+    #[test]
+    fn word_forms_share_a_stem_but_longer_derivations_do_not() {
+        // The user types one form, the skill lists another.
+        assert!(same_stem("refactor", "refactoring"));
+        assert!(same_stem("debug", "debugging"));
+        assert!(same_stem("analyze", "analysis"));
+        assert!(same_stem("brainstorm", "brainstorming"));
+        assert!(same_stem("translate", "translation"));
+        // But a 3-letter derivation is a DIFFERENT word: `data`/`dataset` and
+        // `test`/`testing` must not collide, or the wrong skill fires.
+        assert!(!same_stem("data", "dataset"));
+        assert!(!same_stem("test", "testing"));
+        // Unrelated words never share a stem.
+        assert!(!same_stem("preference", "refactor"));
+    }
+
+    #[test]
+    fn a_skill_created_with_persian_commas_is_auto_matched() {
+        // The `create_skill` schema asks for `fa_keywords` as ONE string, and a
+        // Persian list is naturally typed with `،`. The WRITE path split only
+        // on the ASCII comma, so `فیلم، سریال` became one keyword containing a
+        // comma; the reader happened to recover, but the stored value was wrong
+        // (and the empty-check / dedupe saw a single bogus keyword). A skill the
+        // user creates must be auto-matched by the same rules as a shipped one.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::skills::sync_skill(
+            &dir,
+            &json!({
+                "name": "My Persian Notes",
+                "description": "notes helper",
+                "content": "how to take notes",
+                "fa_keywords": "یادداشت، نوت برداری، note taking",
+            }),
+        )
+        .expect("sync_skill writes the skill");
+        // Read it back through the same path the router uses: three separate
+        // keywords, not one string containing a comma.
+        let stored = skills::list_skills(&dir);
+        let kws = stored["skills"][0]["fa_keywords"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(kws.len(), 3, "{kws:?}");
+        let root = dir.to_str().unwrap();
+        // The newly created skill is picked up by the router with no restart:
+        // every read goes to disk (no cache), so a create/edit is live at once.
+        let section = build_section("یه یادداشت خوب بنویس", root, &[]);
+        assert!(
+            section.matched.contains(&"My Persian Notes".to_string()),
+            "{:?}",
+            section.matched
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edited_skill_replaces_its_old_keywords() {
+        // Editing a skill must be as reliable as creating one: the new
+        // keywords replace the old ones, and the OLD wording stops matching.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = crate::skills::sync_skill(
+            &dir,
+            &json!({
+                "name": "Deploy Helper",
+                "description": "deployment",
+                "content": "deploy it",
+                "fa_keywords": "استقرار, docker",
+            }),
+        )
+        .expect("first write");
+        assert!(first["ok"].as_bool() != Some(false), "{first}");
+        let root = dir.to_str().unwrap();
+        assert!(build_section("کمک به استقرار", root, &[])
+            .matched
+            .contains(&"Deploy Helper".to_string()));
+        // Edit: new keywords, same name — the old one must no longer fire.
+        crate::skills::sync_skill(
+            &dir,
+            &json!({
+                "name": "Deploy Helper",
+                "previous_name": "Deploy Helper",
+                "description": "deployment",
+                "content": "deploy it",
+                "fa_keywords": "kubernetes, release",
+            }),
+        )
+        .expect("second write");
+        let after = build_section("کمک به استقرار", root, &[]);
+        assert!(
+            !after.matched.contains(&"Deploy Helper".to_string()),
+            "stale keyword still matched: {:?}",
+            after.matched
+        );
+        assert!(build_section("a kubernetes release", root, &[])
+            .matched
+            .contains(&"Deploy Helper".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_generic_user_keyword_does_not_fire_elsewhere() {
+        // The single-word rule is what made real matches work, so a generic
+        // keyword on a USER skill must stay contained: `update` is the worst
+        // offender measured (it fires on "update the changelog"), but with a
+        // clear winner present the relative window keeps the user skill out.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-generic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::skills::sync_skill(
+            &dir,
+            &json!({
+                "name": "My Helper",
+                "description": "generic helper",
+                "content": "help",
+                "fa_keywords": "update",
+            }),
+        )
+        .expect("write");
+        let root = dir.to_str().unwrap();
+        // No strong competitor in this store, so the generic word DOES fire —
+        // that is the accepted cost of the single-word rule (measured: at most
+        // 2 of 35 prompts, and only ones that really say "update").
+        // The guard that matters: a prompt without the word never fires.
+        assert!(!build_section("deploy the docker image", root, &[])
+            .matched
+            .contains(&"My Helper".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skill_name_words_match_exactly_but_keywords_tolerate_inflection() {
+        // `optimize the sql query` reached `seo-optimization` through the NAME
+        // word `optimization` under stem matching, inlining an SEO skill into a
+        // database question. Name words are generic labels, so they must match
+        // exactly; the author-written keywords keep inflection tolerance.
+        let mut seo = skill("seo-optimization", "seo help");
+        seo["fa_keywords"] = json!(["سئو", "seo optimization"]);
+        let hay = normalize_text("optimize the sql query");
+        // The NAME word `optimization` no longer matches `optimize` (exact only).
+        // The keyword `seo optimization` still contributes one point through its
+        // `optimization` word — 1, not the 2 needed, so the skill stays out.
+        let score = skill_score(&seo, &hay);
+        assert!(
+            score < MATCH_MIN_SCORE,
+            "an SEO skill must not match a database question (score {score})"
+        );
+        // Proof the fix is the NAME path: with no keywords at all the same skill
+        // scores zero on that prompt, where stem matching gave it name points.
+        seo["fa_keywords"] = json!([]);
+        assert_eq!(
+            skill_score(&seo, &hay),
+            0,
+            "a name word must not stem-match a different request"
+        );
+        // A keyword the author wrote DOES tolerate an inflection.
+        let mut research = skill("Deep Research", "look things up");
+        research["fa_keywords"] = json!(["research"]);
+        assert!(skill_score(&research, &normalize_text("research the react docs")) >= MATCH_MIN_SCORE);
+    }
+
+    #[test]
+    fn auto_match_drops_trailing_noise_next_to_a_clear_winner() {
+        // With only an absolute threshold, a prompt that clearly names one topic
+        // still inlined an unrelated skill that scraped MATCH_MIN_SCORE. The
+        // relative window keeps the winner and its near-ties only.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (slug, keywords) in [
+            ("summarization", "خلاصه, خلاصه کن, چکیده"),
+            ("translation", "translate this"),
+        ] {
+            let sdir = dir.join("skills").join(slug);
+            std::fs::create_dir_all(&sdir).unwrap();
+            std::fs::write(
+                sdir.join("skill.md"),
+                format!("---\nname: {slug}\ndescription: d\nfa_keywords: {keywords}\n---\nBODY\n"),
+            )
+            .unwrap();
+        }
+        let root = dir.to_str().unwrap();
+        // A strong summarization hit must not drag `translation` along.
+        let section = build_section("این متن رو خلاصه کن", root, &[]);
+        assert!(
+            section.matched.contains(&"summarization".to_string()),
+            "{:?}",
+            section.matched
+        );
+        assert!(
+            !section.matched.contains(&"translation".to_string()),
+            "{:?}",
+            section.matched
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn catalog_splits_persian_comma_keywords() {
         // A list typed with the Persian comma (`فیلم، سریال`) used to survive as
         // ONE garbled keyword, so no Persian request could ever match it.
@@ -389,6 +830,17 @@ mod tests {
             "{:?}",
             section.matched
         );
+        // ...and the matched body is PER-TURN text, so it must land in
+        // `volatile`, never in the byte-stable `text` that becomes the system
+        // prompt: a prompt-only match that rewrote `system` invalidated the
+        // cached prefix of the whole conversation.
+        assert!(
+            section.volatile.contains("=== AUTO-MATCHED SKILLS ===")
+                && section.volatile.contains("BODY"),
+            "{}",
+            section.volatile
+        );
+        assert!(!section.text.contains("AUTO-MATCHED"), "{}", section.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

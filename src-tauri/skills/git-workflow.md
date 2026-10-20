@@ -1,7 +1,7 @@
 ---
 name: git-workflow
 description: Follow a clean, safe git workflow: status, branch, staged commits, push.
-fa_keywords: کامیت, گیت, git workflow, git commit, git branch
+fa_keywords: کامیت, گیت, git workflow, git commit, git branch, commit, push, branch, کامیت کن, پوش
 ---
 
 # git-workflow

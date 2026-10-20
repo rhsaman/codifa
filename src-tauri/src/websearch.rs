@@ -209,7 +209,24 @@ async fn tavily(
 /// the chain entirely. The first engine that answers wins; when every one fails
 /// the error names each engine and its reason, so a broken key is visible
 /// instead of silently degrading to "no results".
+/// JSON-string form of [`search_with_engine`], kept as the plain "just give me
+/// the hits" entry point (the engine chain itself lives there).
+#[allow(dead_code)]
 pub async fn search(plugins: &[Value], query: &str, max: usize) -> Result<String, String> {
+    let (hits, _engine) = search_with_engine(plugins, query, max).await?;
+    Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Same chain as [`search`], but it also reports WHICH engine answered, as the
+/// engine `kind` (`duckduckgo`, `tavily`, …). Because the chain falls back, the
+/// configured primary is not necessarily the one that served the query — the
+/// chat card badges the engine that actually answered, so it must come from
+/// here and not from the settings list.
+pub async fn search_with_engine(
+    plugins: &[Value],
+    query: &str,
+    max: usize,
+) -> Result<(Vec<Value>, String), String> {
     let q = query.trim();
     if q.is_empty() {
         return Err("web_search requires a query".into());
@@ -233,7 +250,9 @@ pub async fn search(plugins: &[Value], query: &str, max: usize) -> Result<String
             other => Err(format!("unknown engine {other:?}")),
         };
         match attempt {
-            Ok(hits) => return Ok(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into())),
+            // Report the engine that actually answered: a fallback may have
+            // served this query, and the chat card badges that one.
+            Ok(hits) => return Ok((hits, kind.to_string())),
             Err(e) => failures.push(format!("{label}: {e}")),
         }
     }
@@ -657,12 +676,11 @@ pub async fn search_with_pages(
     query: &str,
     max: usize,
     auto_fetch: usize,
-) -> Result<(Vec<Value>, Vec<(String, String)>), String> {
-    let raw = search(plugins, query, max).await?;
-    let hits: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+) -> Result<(Vec<Value>, Vec<(String, String)>, String), String> {
+    let (hits, engine) = search_with_engine(plugins, query, max).await?;
     let n = auto_fetch.min(hits.len()).min(WEB_SEARCH_AUTO_FETCH_MAX);
     if n == 0 {
-        return Ok((hits, Vec::new()));
+        return Ok((hits, Vec::new(), engine));
     }
     let urls: Vec<String> = hits
         .iter()
@@ -677,7 +695,7 @@ pub async fn search_with_pages(
         .filter_map(|(u, p)| p.map(|p| (u, p.content)))
         .filter(|(_, body)| !body.is_empty())
         .collect();
-    Ok((hits, pairs))
+    Ok((hits, pairs, engine))
 }
 
 /// The model-facing answer for a search: one block per ranked result, with the

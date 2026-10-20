@@ -10,6 +10,7 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tokio::sync::Notify;
 
 /// Resolved per-call LLM configuration (mirrors llm.py's build_chat_model args).
@@ -474,24 +475,56 @@ pub const NO_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 /// user can always hit Stop (the cancel flag is checked every step).
 pub const HEADER_TIMEOUT_SECS_DEFAULT: u64 = 24 * 60 * 60;
 
-/// Abort a stream only after this much TOTAL silence. Same reasoning as the
-/// header budget above: a long thinking pause is not a failure, so the only
-/// second-based caps left are effectively unreachable.
-pub const IDLE_TIMEOUT_SECS_DEFAULT: u64 = 24 * 60 * 60;
+/// Abort a stream after this much TOTAL silence (not a pause between chunks —
+/// total, since the last byte of any kind). A long thinking pause is not a
+/// failure, so this is far above any legitimate gap, but it is finite on
+/// purpose: a provider that answers HTTP 200 and then keeps the socket open with
+/// keep-alive chatter and never sends an event or EOF would otherwise hang the
+/// turn forever, with no error and a Stop button that has nothing to cancel.
+/// Override with `CODIFA_STREAM_IDLE_SECS`.
+pub const IDLE_TIMEOUT_SECS_DEFAULT: u64 = 600;
 
-/// Build a plain HTTP client for provider calls (no proxy, like the sidecar).
+/// Resolve the stream idle budget, allowing an env override for long-running
+/// local models that emit nothing while they compute.
+fn stream_idle_secs() -> u64 {
+    std::env::var("CODIFA_STREAM_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(IDLE_TIMEOUT_SECS_DEFAULT)
+}
+
+/// The process-wide provider HTTP client.
+///
+/// Built ONCE. reqwest owns the connection pool and the TLS session cache, so a
+/// fresh client per call forced a new TCP handshake AND a new TLS handshake for
+/// every single request: every tool-slot call (title / compact / vision), every
+/// step of a turn and every retried key paid for it. One client still talks to
+/// however many providers are configured — the pool is keyed by origin.
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Shared provider HTTP client (no proxy, like the sidecar). Cloning is cheap:
+/// the handle is reference-counted and shares the pool.
 pub fn http_client() -> Client {
-    Client::builder()
-        .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        // TCP keepalive is NOT a deadline on the model: a slow-but-connected
-        // provider keeps answering the probes and is never cut off. It only lets
-        // the OS notice a half-open connection (VPN/proxy switch, a gateway that
-        // died without a FIN) and surface a transport error, which the retry
-        // path then handles. Without it such a socket stayed silent forever.
-        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .expect("reqwest client")
+    HTTP_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                // TCP keepalive is NOT a deadline on the model: a slow-but-connected
+                // provider keeps answering the probes and is never cut off. It only lets
+                // the OS notice a half-open connection (VPN/proxy switch, a gateway that
+                // died without a FIN) and surface a transport error, which the retry
+                // path then handles. Without it such a socket stayed silent forever.
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                // Hold idle sockets open between steps and turns so a follow-up
+                // call reuses the established connection instead of re-dialing.
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .pool_max_idle_per_host(16)
+                .build()
+                .expect("reqwest client")
+        })
+        .clone()
 }
 
 /// Normalize the base URL the same way providers.py does:
@@ -518,9 +551,16 @@ pub fn normalize_base(provider: &str, base_url: &str) -> String {
 
 /// Resolve the chat-completions endpoint + auth header style for a kind.
 /// Returns (url, header_name, header_value_prefix).
-fn endpoint_and_auth(cfg: &LlmConfig) -> (String, &'static str, String) {
+fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, String) {
     let base = normalize_base(&cfg.provider, &cfg.base_url);
-    let key = cfg.api_keys.first().cloned().unwrap_or_default();
+    // Use the key of THIS attempt, not always the first one: the caller's
+    // key-fallback loop retried a key the provider had just rejected, so a
+    // rejected first key failed the whole call instead of falling through.
+    let key = if key.is_empty() {
+        cfg.api_keys.first().cloned().unwrap_or_default()
+    } else {
+        key.to_string()
+    };
     match cfg.provider.as_str() {
         "anthropic" => (
             format!("{base}/v1/messages"),
@@ -562,9 +602,12 @@ pub async fn complete_with_images(
     if cfg.api_keys.is_empty() {
         return Err("no api key configured".into());
     }
+    // Build the payload ONCE: it does not depend on the key, and a vision call
+    // is megabytes of base64 that used to be re-serialized for every attempt.
+    let body = one_shot_body(cfg, system, user, images);
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match complete_with_key(client, cfg, key, system, user, images).await {
+        match complete_with_key(client, cfg, key, &body).await {
             Ok(res) => return Ok(res),
             Err((status, body)) if is_key_error(status, &body) => {
                 last_err = format!("key rejected ({status}): {body}");
@@ -576,15 +619,13 @@ pub async fn complete_with_images(
     Err(last_err)
 }
 
-async fn complete_with_key(
-    client: &Client,
-    cfg: &LlmConfig,
-    _key: &str,
-    system: &str,
-    user: &str,
-    images: &[String],
-) -> Result<LlmResult, (u16, String)> {
-    let (url, header_name, header_value) = endpoint_and_auth(cfg);
+/// Body of a ONE-SHOT (non-streaming) completion.
+///
+/// Split out of `complete_with_key` so the key-fallback loop serializes the
+/// payload once instead of once per API-key attempt: a vision call carries
+/// megabytes of base64, and `serde_json::json!` deep-copied all of it for every
+/// retry.
+fn one_shot_body(cfg: &LlmConfig, system: &str, user: &str, images: &[String]) -> Value {
     let mut body = json!({});
     // The user message as neutral blocks: text + one block per image, each
     // translated to the provider's own shape just before it goes on the wire.
@@ -638,27 +679,55 @@ async fn complete_with_key(
         }
     }
     apply_reasoning(cfg, &mut body);
+    body
+}
 
+async fn complete_with_key(
+    client: &Client,
+    cfg: &LlmConfig,
+    key: &str,
+    body: &Value,
+) -> Result<LlmResult, (u16, String)> {
+    let (url, header_name, header_value) = endpoint_and_auth(cfg, key);
     let mut req = client
         .post(&url)
         .header(header_name, header_value)
-        .json(&body);
+        .json(body);
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    // No header deadline: a slow provider or a large reasoning model may
-    // legitimately take minutes — even half an hour — to emit response headers,
-    // and a second-based error there was bogus while the model was still
-    // working. A dead connection still fails through the transport's own TCP
-    // error, and Stop aborts instantly via the cancel flag.
-    let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await.map_err(|e| (status, e.to_string()))?;
-    if !(200..300).contains(&status) {
-        return Err((status, text));
+    // `timeout_secs` bounds the WHOLE one-shot request (headers + body). These
+    // calls are background side tasks (compact / title / web summary / vision),
+    // never the chat turn — that path is `stream_chat`, which stays deliberately
+    // unbounded so a slow reasoning model is never cut off mid-answer. Before
+    // this deadline existed, a provider that accepted the request and then
+    // stalled kept the caller waiting forever: compaction retries on top of
+    // that, so one hung call stacked into half-hour "Compacting…" banners with
+    // no way out (Stop only aborts the streaming path).
+    let budget = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+    let attempt = async {
+        // No separate header deadline: the budget above already covers the whole
+        // request, including a reasoning model that needs minutes before its
+        // first byte.
+        let resp = req.send().await.map_err(|e| (0u16, e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| (status, e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err((status, text));
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| (status, e.to_string()))?;
+        extract_completion(&cfg.provider, &v)
+    };
+    match tokio::time::timeout(budget, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err((
+            0u16,
+            format!(
+                "provider sent no response within {}s",
+                cfg.timeout_secs.max(1)
+            ),
+        )),
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| (status, e.to_string()))?;
-    extract_completion(&cfg.provider, &v)
 }
 
 // ---------------------------------------------------------------------------
@@ -968,9 +1037,13 @@ pub async fn stream_chat(
     if cfg.api_keys.is_empty() {
         return Err((0, "no api key configured".into()));
     }
+    // Build the payload ONCE (it is key-independent): the previous code rebuilt
+    // and re-cloned the whole message array — base64 images included — for every
+    // API-key attempt.
+    let body = build_request_body(cfg, messages, tools);
     let mut last_err = String::new();
     for key in &cfg.api_keys {
-        match stream_with_key(client, cfg, key, messages, tools, on_event, cancel, steer_interrupt)
+        match stream_with_key(client, cfg, key, &body, on_event, cancel, steer_interrupt)
             .await
         {
             Ok(acc) => return Ok(acc),
@@ -988,8 +1061,7 @@ async fn stream_with_key(
     client: &Client,
     cfg: &LlmConfig,
     key: &str,
-    messages: &[Value],
-    tools: Option<&[Value]>,
+    body: &Value,
     on_event: SignalSink<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     steer_interrupt: Option<&InterruptSignal>,
@@ -1005,12 +1077,10 @@ async fn stream_with_key(
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
 
-    let body = build_request_body(cfg, messages, tools);
-
     let mut req = client
         .post(&url)
         .header(header_name, header_value)
-        .json(&body);
+        .json(body);
     if cfg.provider == "anthropic" {
         req = req.header("anthropic-version", "2023-06-01");
     }
@@ -1042,15 +1112,19 @@ async fn stream_with_key(
     // the pill off and on.
     let mut thinking_on = false;
     use futures_util::StreamExt;
-    // Idle timeout: a stalled provider stream (no bytes for this long) must
-    // abort the turn with a clear error instead of hanging it forever.
-    // Deliberately generous: some providers stay silent for many minutes while
-    // a large model thinks before the first token, and cutting that off looked
-    // like "the model errored after 60 seconds".
-    // No idle deadline either. Reading the stream directly means an aborted
-    // connection surfaces as a transport `Err` (the real, instant signal),
-    // while a provider that is merely THINKING stays connected and is never cut
-    // off — however long it takes.
+    // Idle timeout: a stalled provider stream (no DATA for this long) must abort
+    // the turn with a clear error instead of hanging it forever. Deliberately
+    // generous, because some providers stay silent for many minutes while a
+    // large model thinks before the first token, and cutting that off looked
+    // like "the model errored after 60 seconds". It is still finite on purpose:
+    // a provider that answers 200 and then keeps the socket open with keep-alive
+    // comments, never sending an event or EOF, would otherwise hang the turn with
+    // no error at all. The deadline is refreshed only by a real SSE `data:`
+    // frame, so keep-alive chatter cannot keep a dead stream alive; an aborted
+    // connection still surfaces instantly as a transport `Err`.
+    let idle_secs = stream_idle_secs();
+    let mut idle_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
     loop {
         // Stop button: the cancel flag is checked on every chunk read, so a
         // running stream (including one inside an explore sub-agent) aborts
@@ -1077,6 +1151,12 @@ async fn stream_with_key(
                 acc.interrupted = true;
                 return Ok(acc);
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                return Err((
+                    0u16,
+                    format!("provider stream sent no data for {idle_secs}s"),
+                ));
+            }
             next = stream.next() => next,
         };
         let chunk = match chunk {
@@ -1094,6 +1174,9 @@ async fn stream_with_key(
                     // The parser keeps its text-only sink; this thin adapter is
                     // what lets the caller receive BOTH kinds of signal from one
                     // closure (and keeps the parser's unit tests untouched).
+                    // A real frame is progress: push the idle deadline out.
+                    idle_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
                     let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
                     if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
                         return Ok(acc);

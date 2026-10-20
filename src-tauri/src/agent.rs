@@ -46,16 +46,18 @@ fn looks_like_source_url_agent(url: &str) -> bool {
 /// many of those top results get their real page fetched before the distiller
 /// reads them. `0` means "don't fetch pages" (snippets only), NOT "return no
 /// results" — so a 0 setting falls back to the default result count instead of
-/// collapsing the search. An explicit `max_results` from the model still wins.
-fn web_search_result_count(args: &Value, setting: usize) -> usize {
-    let clamp = |n: usize| n.clamp(1, crate::websearch::WEB_SEARCH_AUTO_FETCH_MAX);
-    if let Some(n) = args["max_results"].as_u64() {
-        return clamp(n as usize);
-    }
+/// collapsing the search.
+///
+/// The setting is AUTHORITATIVE and the tool schema deliberately exposes no
+/// `max_results` argument: models used to volunteer their own number (a real
+/// run asked for 8 while the setting said 5) and, because an explicit argument
+/// used to win, the search silently ignored the user's choice. A knob that
+/// only sometimes applies its value is worse than no knob.
+fn web_search_result_count(setting: usize) -> usize {
     if setting == 0 {
         return crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT;
     }
-    clamp(setting)
+    setting.clamp(1, crate::websearch::WEB_SEARCH_AUTO_FETCH_MAX)
 }
 
 /// System prompt for the fetched-page distiller (the same "Other" slot).
@@ -157,6 +159,71 @@ async fn run_slot_distill(
 /// pasted screenshot; entries outside the window keep their raw image blocks.
 const MAX_HISTORY_VISION_CALLS: usize = 2;
 
+/// Cache of Vision-slot descriptions, keyed by (model, prompt text, image bytes).
+///
+/// A chat re-sends the screenshots still in its history on EVERY turn (the
+/// renderer sends bare paths, so they are re-read and re-encoded each time).
+/// Without a cache each of those turns paid for the same description again —
+/// same model, same bytes, same answer. The key covers the model, the prompt
+/// text and the image payloads, so a hit is byte-for-byte the same question
+/// and cannot return a description of a different picture: this saves
+/// round-trips at ZERO quality cost.
+static VISION_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u128, String>>,
+> = std::sync::OnceLock::new();
+
+/// Descriptions kept at once. Each is a few KB, so the cap is about memory
+/// hygiene rather than a real limit.
+const VISION_CACHE_MAX: usize = 32;
+
+/// Stable 128-bit key for one vision call.
+///
+/// Two passes of `DefaultHasher` (the second over a distinct seed byte) give
+/// 128 bits from the std hasher — no extra dependency, and a collision between
+/// two DIFFERENT images is far less likely than a hardware fault.
+fn vision_cache_key(model: &str, text: &str, images: &[String]) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    for (seed, hasher) in [(0u8, &mut lo), (1u8, &mut hi)] {
+        seed.hash(hasher);
+        model.hash(hasher);
+        text.hash(hasher);
+        // The length first, so two image lists can never concatenate to the
+        // same byte stream (["ab","c"] vs ["a","bc"]).
+        images.len().hash(hasher);
+        for url in images {
+            url.len().hash(hasher);
+            url.hash(hasher);
+        }
+    }
+    ((hi.finish() as u128) << 64) | lo.finish() as u128
+}
+
+/// Read one cached description.
+fn vision_cache_get(key: u128) -> Option<String> {
+    VISION_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()
+}
+
+/// Store one description (bounded; a full cache starts over).
+fn vision_cache_put(key: u128, desc: &str) {
+    let Ok(mut map) = VISION_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    else {
+        return;
+    };
+    if map.len() >= VISION_CACHE_MAX && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, desc.to_string());
+}
+
 /// Result of trying the "Vision" tool slot on a set of images.
 enum VisionOutcome {
     /// No Vision slot configured, or it points at the main model: the images
@@ -231,6 +298,14 @@ async fn run_vision_slot(
         model_reasoning: v_model_reasoning,
         auto_think: v_auto_think,
     };
+    // Same model + same text + same image bytes = the same question, so a
+    // repeat of a screenshot this chat already sent is answered from the cache
+    // instead of a second paid round-trip. The key is the hash of the exact
+    // inputs, so a hit can never describe a different picture.
+    let cache_key = vision_cache_key(&v_cfg.model, text, images);
+    if let Some(desc) = vision_cache_get(cache_key) {
+        return VisionOutcome::Ok(desc);
+    }
     match crate::llm::complete_with_images(client, &v_cfg, VISION_SYSTEM_PROMPT, text, images).await {
         Ok(res) => {
             let desc = res.text.trim().to_string();
@@ -240,6 +315,9 @@ async fn run_vision_slot(
                     error: "the model returned an empty description".into(),
                 }
             } else {
+                // Only a real answer is cached: a failure or an empty reply must
+                // still be retried on the next turn.
+                vision_cache_put(cache_key, &desc);
                 VisionOutcome::Ok(desc)
             }
         }
@@ -321,14 +399,17 @@ async fn degrade_images_to_text(
     messages: &mut [Value],
 ) -> usize {
     let mut changed = 0usize;
-    let mut calls = 0usize;
-    for msg in messages.iter_mut() {
-        let Some(blocks) = msg.get("content").and_then(Value::as_array).cloned() else {
+    // Collect first, then describe CONCURRENTLY. Awaiting one paid round-trip
+    // per message in series is what made this fallback feel like a stall: two
+    // screenshots cost two full model round-trips back to back.
+    let mut entries: Vec<(usize, String, Vec<String>)> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
         };
         let mut text = String::new();
         let mut images: Vec<String> = Vec::new();
-        for b in &blocks {
+        for b in blocks {
             if b.get("type").and_then(Value::as_str) == Some(crate::llm::IMAGE_BLOCK_TYPE) {
                 if let Some(u) = b.get("data_url").and_then(Value::as_str) {
                     images.push(u.to_string());
@@ -343,39 +424,57 @@ async fn degrade_images_to_text(
         if images.is_empty() {
             continue;
         }
-        let desc = if calls < MAX_HISTORY_VISION_CALLS {
-            calls += 1;
-            match run_vision_slot(
-                client,
-                req,
-                &cfg.model,
-                &cfg.provider,
-                &cfg.base_url,
-                &cfg.api_keys,
-                &text,
-                &images,
-            )
-            .await
-            {
-                VisionOutcome::Ok(d) => Some(d),
-                _ => None,
+        entries.push((i, text, images));
+    }
+    // Only the first `MAX_HISTORY_VISION_CALLS` message texts are paid for; the
+    // rest are rewritten with the "omitted" note, exactly as before.
+    let paid_n = entries.len().min(MAX_HISTORY_VISION_CALLS);
+    let rest: Vec<(usize, String, Vec<String>)> = entries.split_off(paid_n);
+    let paid = entries;
+    let results = futures_util::future::join_all(paid.iter().map(|(_, text, images)| {
+        run_vision_slot(
+            client,
+            req,
+            &cfg.model,
+            &cfg.provider,
+            &cfg.base_url,
+            &cfg.api_keys,
+            text,
+            images,
+        )
+    }))
+    .await;
+    for ((i, text, _), outcome) in paid.into_iter().zip(results) {
+        let body = match outcome {
+            VisionOutcome::Ok(d) => {
+                format!("{text}\n\n=== IMAGE ANALYSIS (from the vision model) ===\n{d}")
             }
-        } else {
-            None
-        };
-        let body = match desc {
-            Some(d) => format!("{text}\n\n=== IMAGE ANALYSIS (from the vision model) ===\n{d}"),
-            None => format!(
+            _ => format!(
                 "{text}\n\n[image omitted: the main model cannot read images and no Vision \
                  model is configured in Settings → Tools]"
             ),
         };
-        let role = msg
+        let role = messages[i]
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user")
             .to_string();
-        *msg = json!({ "role": role, "content": body });
+        messages[i] = json!({ "role": role, "content": body });
+        changed += 1;
+    }
+    for (i, text, _) in rest {
+        let role = messages[i]
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_string();
+        messages[i] = json!({
+            "role": role,
+            "content": format!(
+                "{text}\n\n[image omitted: the main model cannot read images and no Vision \
+                 model is configured in Settings → Tools]"
+            ),
+        });
         changed += 1;
     }
     changed
@@ -388,15 +487,91 @@ const MAX_STEPS: usize = 60;
 /// while the agent works — but more than a handful would mean the summarizer
 /// itself is thrashing.
 const MAX_COMPACTIONS_PER_TURN: usize = 4;
-/// Context window assumed when the renderer does not know the model's real one
-/// (a custom model without metadata sends 0). Without this fallback mid-turn
-/// auto-compaction would be silently disabled for those models.
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// The context window a manual `/chat/compact` measures against: the renderer's
+/// number when it has one, otherwise the provider's own metadata, otherwise
+/// [`DEFAULT_CONTEXT_WINDOW`]. Never a private literal — an 8k window here meant
+/// the verbatim tail was budgeted at ~3.2k tokens, so a manual compact folded
+/// almost the entire history.
+pub(crate) fn resolve_compact_window(
+    providers: &std::collections::HashMap<String, Value>,
+    provider_id: &str,
+    model: &str,
+    sent: usize,
+) -> usize {
+    if sent > 0 {
+        return sent;
+    }
+    provider_context_window(providers, provider_id, model).unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
+/// Context window assumed when neither models.dev nor the provider reports one
+/// (a custom model without metadata sends 0).
+///
+/// The product rule for a model's capacity is: **models.dev → the provider's own
+/// metadata → this default**. It is 200k (not the old 128k) because the 128k
+/// fallback silently measured a 200k/1M-token model against a fraction of its
+/// real window, so auto-compaction fired at 13–25% of it while the UI still
+/// showed the user's percentage — the "it compacts way before my setting"
+/// report. `pub(crate)` so `compact.rs` reuses the SAME number instead of its own
+/// private 8192 fallback.
+pub(crate) const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+
+/// The context window a provider config knows for one model, resolved the same
+/// way the renderer's `modelContextWindow` does: the manual override first, then
+/// the map filled from `/models`, each keyed by the bare model id and then by
+/// "providerId/model". `None` means nobody knows it.
+pub(crate) fn provider_context_window(
+    providers: &std::collections::HashMap<String, Value>,
+    provider_id: &str,
+    model: &str,
+) -> Option<usize> {
+    let lookup = |key: &str| -> Option<usize> {
+        let cfg = providers.get(provider_id)?;
+        let map = cfg.get(key)?;
+        if let Some(n) = map.get(model).and_then(Value::as_u64) {
+            if n > 0 {
+                return Some(n as usize);
+            }
+        }
+        if provider_id.is_empty() {
+            return None;
+        }
+        map.get(&format!("{provider_id}/{model}"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+    };
+    lookup("manualContextMap").or_else(|| lookup("contextMap"))
+}
+
+/// The context window this turn measures against.
+///
+/// The renderer resolves it from the provider's `contextMap` (filled from the
+/// provider's `/models` metadata, which already prefers models.dev) or the user's
+/// `manualContextMap`, and sends 0 when it knows nothing about the model.
+/// Falling back to a hardcoded number for a model whose real window is larger
+/// made auto-compaction fire at a fraction of the REAL window while the UI still
+/// showed the user's percentage — the "it compacts way before my threshold"
+/// report. So the backend tries the same maps the renderer uses, then
+/// [`DEFAULT_CONTEXT_WINDOW`].
+fn effective_context_window(req: &AgentRequest) -> usize {
+    if req.context_window > 0 {
+        return req.context_window as usize;
+    }
+    // Same resolution order as the renderer's `modelContextWindow`: the manual
+    // override (custom models) first, then the map filled from `/models`.
+    provider_context_window(&req.providers, &req.provider_id, &req.model)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
 /// Output budget for the auto-compaction summary.
 const COMPACT_MAX_OUTPUT: usize = 4096;
-/// The summarizer is a side call, so it keeps a real timeout: a hung
-/// summarizer must not freeze the very turn it is trying to shrink.
-const COMPACT_TIMEOUT_SECS: u64 = 300;
+/// Per-attempt deadline for the summarizer. Compact is a side call inside the
+/// turn and `llm::complete` now honors this budget, so a hung provider fails the
+/// attempt instead of freezing the very turn it is trying to shrink.
+/// `compact::compact_history` additionally caps the TOTAL across all attempts
+/// (`COMPACT_TOTAL_BUDGET_SECS`), so this per-attempt value can stay short.
+const COMPACT_TIMEOUT_SECS: u64 = 90;
 /// The explore sub-agent must answer in seconds, not minutes — a much smaller
 /// step budget than the main agent's, with a forced final report (below).
 const SUBAGENT_MAX_STEPS: usize = 12;
@@ -451,6 +626,17 @@ fn subagent_idle_secs() -> u64 {
 const SUBAGENT_ATTEMPT_IDLE_SECS: u64 = 300;
 /// Cap on the tool result echoed to the UI (full result still goes to the LLM).
 const TOOL_RESULT_CAP: usize = 4000;
+
+/// Cap on a model reply echoed into an `llm` trace row. The trace is a local
+/// JSONL the panel reads on demand, so this only bounds one row's size — large
+/// enough to read what the model actually said during that step.
+const LLM_TRACE_TEXT_CAP: usize = 4_000;
+
+/// Cap on the wire prompt echoed into an `llm` trace row. The system message is
+/// elided to a size marker there (the `prompt` row already carries it in full),
+/// so this budget is spent on the conversation the model actually saw — which is
+/// the thing the trace panel was silently missing.
+const LLM_TRACE_PROMPT_CAP: usize = 8_000;
 /// Cap on the tool result forwarded to the MODEL: full multi-MB read/grep
 /// outputs ballooned the context (76k-token turns) and made every LLM
 /// round-trip crawl — the #1 cause of slow explore turns.
@@ -496,6 +682,134 @@ const MAIN_FOLD_MIN_TOKENS: usize = 20_000;
 /// reads it as a pointer (re-run with narrower args), not as data loss.
 const MAIN_FOLD_MARKER: &str = "[… result elided to save context. Only its beginning is kept — re-run the tool with a narrower pattern/range/file to see the rest again]";
 
+/// Sub-agent in-turn elision: rounds this fresh are never touched. Same value
+/// as the main agent — the model is actively reasoning over those results.
+const SUB_FOLD_KEEP_ROUNDS: usize = 2;
+/// Sub-agent in-turn elision: per-result budget for a stale tool result. The
+/// explore window is a fraction of the main one, so the budgets are too — and
+/// unlike the main agent the sub-agent OWNS read/grep, so a targeted re-read
+/// always recovers the body (the pointer is guaranteed resolvable).
+const SUB_FOLD_RESULT_CHARS: usize = 4_000;
+/// Sub-agent in-turn elision: fold only past this estimated wire size.
+///
+/// Deliberately the SAME as the main threshold, not lower. Folding rewrites
+/// OLD tool results, and an automatic prefix cache is a longest-prefix match:
+/// changing an early message invalidates every cached token after it. Traces
+/// show a median intra-run growth of only 7-10K tokens (short runs keep a
+/// 65-80% cache hit), while the runaway runs reach 30-90K — those are the ones
+/// worth the cache reset. A lower threshold would tax every short run for
+/// almost nothing.
+const SUB_FOLD_MIN_TOKENS: usize = 20_000;
+
+/// In-turn elision economics: do not fold once a run has fewer than this many
+/// model calls left.
+///
+/// Folding rewrites OLD tool results, and an automatic prefix cache is a
+/// longest-prefix match — so the request immediately after a fold is re-billed
+/// from the first changed byte. Measured on real traces over 85 folds: the call
+/// after a fold drops from an 89% cache hit to 61.7%, a fixed loss of roughly
+/// `0.28 × prompt tokens`. That only pays back if enough round-trips REMAIN to
+/// reuse the shorter prompt.
+///
+/// Net value of one fold, bucketed by the calls left after it (measured):
+///     0-3 left : 31 folds, 0/31 profitable, **-172_630 tokens**
+///     4-7 left : 32 folds, +12_778 total
+///     8-15 left: 21 folds, +27_768 total
+///     16+ left :  1 fold,  +1_583
+/// A fold in the last three calls is therefore a pure loss, so it is skipped.
+/// This does NOT weaken the elision: on the same traces the fold still takes
+/// uncached explore input from 14.57M down to 5.56M (2.62x), and every fold of
+/// the 54 measured in the 4+-calls-left buckets is kept.
+const FOLD_MIN_REMAINING_CALLS: usize = 3;
+
+/// Whether the explore sub-agent folds stale tool results mid-run.
+///
+/// MEASURED `false`, and the measurement is the whole argument. An in-place
+/// fold REWRITES the content of an old tool message; a prefix cache is a
+/// longest-prefix match, so the cache falls back to the system prompt + tool
+/// schemas and the entire history behind the fold is re-billed.
+///
+/// On the reference trace (236 explore calls, 1,375,702 uncached input):
+///   cold first calls      124,974  ( 9%)  unavoidable
+///   appended content      462,864  (33%)  the model actually read it
+///   prefix-break re-bill  787,864  (57%)  the fold's doing
+///
+/// The folds behind that freed about 20K chars of history while throwing away
+/// 253,824 already-cached tokens (the cache fell to ~4.5K = system + schemas on
+/// every fold). Later calls hit the cache ~91% of the time, so the tokens a
+/// fold “saves” are nearly free already: folding trades an expensive re-bill
+/// for a worthless saving. Every measured fold was net negative — worst cases
+/// (run 8, run 70, run 150) lost 17-26K tokens each.
+///
+/// Keeping it ON also costs QUALITY: the marker replaces real tool output with
+/// a pointer the model has to spend a call to re-read. With it OFF the run's
+/// prompt simply keeps growing, but each tool result is billed once and then
+/// served from cache — cheaper AND lossless.
+///
+/// The code is kept (not deleted) so the decision stays visible and reversible:
+/// a gateway without prefix caching would flip it back.
+const SUB_FOLD_ENABLED: bool = false;
+
+/// Whether an in-turn fold still pays for its prefix-cache reset — see
+/// `FOLD_MIN_REMAINING_CALLS` for the measurement behind the threshold.
+///
+/// `calls_left` includes the model call about to be made, so a run on its last
+/// step has `calls_left == 1`. A pure function of the loop counter, so the rule
+/// is testable without running a turn.
+fn fold_pays_off(calls_left: usize) -> bool {
+    calls_left >= FOLD_MIN_REMAINING_CALLS
+}
+
+/// Record one in-turn fold in the trace.
+///
+/// A fold used to leave NO trace at all (the only evidence was the marker text
+/// inside a tool message), so every attempt to price it had to infer "a fold
+/// happened here" from the prompt shrinking between two calls. That inference
+/// cannot tell a fold from compaction and cannot measure the trade-off that
+/// decides whether folding is worth anything: the prefix-cache re-bill it
+/// causes (once, at the fold point) against the smaller prompt it buys on every
+/// call after it.
+///
+/// Written as its own `kind: "fold"` row so the numbers travel with the run id
+/// and can be joined against the `llm` rows before and after it.
+///
+/// `calls_left` is the number of model calls remaining INCLUDING the one about
+/// to be made, which is exactly what decides the payoff.
+#[allow(clippy::too_many_arguments)]
+fn record_fold(
+    trace: &crate::trace::TraceStore,
+    role: &str,
+    step: usize,
+    call_no: usize,
+    calls_left: usize,
+    before_tokens: usize,
+    removed_chars: usize,
+    folded: usize,
+) {
+    // A fold that touched nothing is not an event: it would only add noise to
+    // the trace and to every later sum.
+    if folded == 0 {
+        return;
+    }
+    trace.record(crate::trace::TraceEntry {
+        kind: "fold".into(),
+        summary: format!(
+            "{role} fold: {folded} result(s), {removed_chars} chars out, {calls_left} call(s) left"
+        ),
+        detail: Some(serde_json::json!({
+            "role": role,
+            "step": step + 1,
+            "call": call_no,
+            "calls_left": calls_left,
+            "before_tokens": before_tokens,
+            "removed_chars": removed_chars,
+            "removed_tokens_est": removed_chars.div_ceil(4),
+            "folded": folded,
+        })),
+        ..Default::default()
+    });
+}
+
 /// UI-echo budget for one tool result. The echo is also what the frontend stores
 /// as `resultText`, i.e. the ONLY source the next turn's history recap is built
 /// from. An explore report must therefore be echoed at least as long as
@@ -508,6 +822,67 @@ fn ui_echo_cap(tool: &str) -> usize {
     } else {
         TOOL_RESULT_CAP
     }
+}
+
+/// Clip `s` to `cap` bytes on a UTF-8 char boundary and mark the cut.
+/// Byte slicing mid-char panics on Persian text, so this is the only safe way
+/// to bound a string that reaches the trace panel.
+fn clip_trace_text(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… (truncated)", &s[..end])
+}
+
+/// Render the wire messages of ONE model call as the text the trace panel shows
+/// on that call's `llm` row.
+///
+/// This is what the model actually received (system + history + the current
+/// user prompt + every tool result so far), as opposed to `req.prompt`, which is
+/// only the newest user line. The system message is elided to a size marker: it
+/// is stored in full on the turn's `prompt` row, and repeating it on every llm
+/// row of a long turn would push the conversation itself out of the cap.
+fn trace_prompt_text(messages: &[Value]) -> String {
+    let mut out = String::new();
+    for (i, m) in messages.iter().enumerate() {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+        let content = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if i == 0 && role == "system" {
+            out.push_str(&format!(
+                "[system] {} chars — full text on the `prompt` row of this turn\n\n",
+                content.chars().count()
+            ));
+            continue;
+        }
+        out.push_str(&format!("[{role}]\n"));
+        if !content.is_empty() {
+            out.push_str(&content);
+            out.push('\n');
+        }
+        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+            for c in calls {
+                let name = c
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let args = c
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                out.push_str(&format!("→ {name}({args})\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// Fold a history message's non-prose state into its content so the model can
@@ -638,6 +1013,13 @@ pub struct AgentRequest {
     pub history: Vec<Value>,
     #[serde(default)]
     pub system_prompt: String,
+    /// Extra instruction APPENDED to the assembled system prompt for this turn
+    /// only. Live voice uses it to shape an answer for the ear (one language,
+    /// plain prose, numbers as words) without touching the chat's own custom
+    /// prompt: `system_prompt` REPLACES the builtin prompt, so a per-turn
+    /// instruction cannot ride on it without destroying what the user set.
+    #[serde(default)]
+    pub system_suffix: String,
     /// Skill names the user attached to this turn (@mention). Their full
     /// bodies are inlined into the system prompt, exactly like the Python
     /// sidecar's ATTACHED SKILLS section.
@@ -735,6 +1117,11 @@ pub struct AgentRequest {
     /// fetch and falls back to snippets-only results.
     #[serde(default = "default_web_search_auto_fetch")]
     pub web_search_auto_fetch: usize,
+    /// What the tools may do this turn. `None` means "derive it from `mode`"
+    /// (`caps_for_mode`) — the renderer sends the real object, the scheduler and
+    /// any headless caller omit it and get the mode's table row instead.
+    #[serde(default)]
+    pub cap: Option<ToolCaps>,
 }
 
 fn default_mode() -> String {
@@ -745,6 +1132,98 @@ fn default_mode() -> String {
 /// is absent: the same five results the UI's setting starts at.
 fn default_web_search_auto_fetch() -> usize {
     crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT
+}
+
+/// What the tools may do in a turn. The renderer sends this as `cap` (mirroring
+/// `ModeCapabilities` in `src/lib/modes.ts`); callers that omit it get the
+/// mode's row from `caps_for_mode`.
+///
+/// This is a HARD gate, not a hint: a forbidden tool is dropped from the schema
+/// list the model sees, and a call that still arrives is refused in the tool
+/// loop. Prompt text alone was never enough — an Ask turn whose prompt says
+/// "you are read-only" still called `write_file` and it landed on disk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ToolCaps {
+    /// Listing / searching / reading the workspace.
+    pub read_files: bool,
+    /// `write_file` and `edit_file`.
+    pub write_files: bool,
+    /// `run_terminal`.
+    pub run_terminal: bool,
+    /// `web_search` and `fetch_url`.
+    pub web: bool,
+}
+
+impl Default for ToolCaps {
+    /// Permissive: a caller that sends nothing keeps the pre-gating behaviour,
+    /// so an unknown/legacy client never loses tools because of a missing field.
+    fn default() -> Self {
+        Self {
+            read_files: true,
+            write_files: true,
+            run_terminal: true,
+            web: true,
+        }
+    }
+}
+
+/// Capabilities of the built-in modes. An id this build does not know stays
+/// permissive — a missing table row must not silently disarm a mode.
+pub fn caps_for_mode(mode: &str) -> ToolCaps {
+    match mode {
+        // Ask: reads the code, the web AND the shell, never touches the
+        // workspace. The terminal stays bound because inspecting is reading —
+        // `du -sh`, `df -h`, `ps`, `git status` are exactly what a read-only
+        // turn needs, and the in-loop gate refuses every command that would
+        // write while `write_files` is false.
+        "ask" | "chat" => ToolCaps {
+            write_files: false,
+            run_terminal: true,
+            ..ToolCaps::default()
+        },
+        // Plan: may inspect with the terminal, still never writes.
+        "plan" => ToolCaps {
+            write_files: false,
+            ..ToolCaps::default()
+        },
+        // Sub-agents only ever get `research_schemas` (no mutating tool), and
+        // build/unknown ids keep the full set.
+        _ => ToolCaps::default(),
+    }
+}
+
+/// The refusal text when this turn's capabilities forbid `name`, else `None`.
+/// Phrased like the other in-loop refusals: one plain sentence the model can act
+/// on, no "Error:" prefix (the card already renders failure from `ok`).
+fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
+    let (allowed, action) = match name {
+        "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
+        "run_terminal" => (caps.run_terminal, "run commands"),
+        "web_search" | "fetch_url" => (caps.web, "search or fetch the web"),
+        _ => return None,
+    };
+    if allowed {
+        return None;
+    }
+    Some(format!(
+        "blocked: this turn is read-only — `{name}` is not available in this mode, so it \
+cannot {action}. Answer with the concrete change instead: which file, which line, and the \
+exact old text → new text. Tell the user to switch to Build mode if they want it applied."
+    ))
+}
+
+/// Mode gating, part one: drop every tool this turn may not use. The model
+/// cannot pick a tool it cannot see, so withholding the schema is the primary
+/// gate; `denied_by_caps` in the loop is the backstop for a stale transcript or
+/// a hallucinated (or connector-supplied) name.
+fn retain_allowed_tools(schemas: &mut Vec<Value>, caps: &ToolCaps) {
+    schemas.retain(|s| {
+        s["function"]["name"]
+            .as_str()
+            .map(|n| denied_by_caps(caps, n).is_none())
+            .unwrap_or(true)
+    });
 }
 
 /// Accept the renderer's loose image payload and normalise it to data URLs.
@@ -825,6 +1304,10 @@ impl AgentRequest {
             // Never inherited — see the doc comment above.
             history: Vec::new(),
             system_prompt: self.system_prompt.clone(),
+            // Live-voice reply shaping belongs to the turn the user HEARS.
+            // A sub-agent's output is folded into the parent's answer, so
+            // inheriting the rule would only distort its research output.
+            system_suffix: String::new(),
             skills: self.skills.clone(),
             context_window: self.context_window,
             chat_id: self.chat_id.clone(),
@@ -852,8 +1335,11 @@ impl AgentRequest {
             subagent_thinking: self.subagent_thinking.clone(),
             // A research sub-agent is text-only: images stay with the parent.
             images: Vec::new(),
-            // A sub-agent searches the web the same way the parent does.
+            // A research sub-agent searches the web the same way the parent does.
             web_search_auto_fetch: self.web_search_auto_fetch,
+            // A research sub-agent has no mutating tool at all, so it runs with
+            // the parent's capabilities unchanged.
+            cap: self.cap.clone(),
         }
     }
 }
@@ -1263,6 +1749,10 @@ pub enum AgentEvent {
         result: String,
         ok: bool,
         results: Option<Value>,
+        /// Engine that actually served a `web_search` (`duckduckgo`, `tavily`,
+        /// …) — the chat card badges it so the user can tell which provider
+        /// answered, including when a fallback stepped in.
+        engine: Option<String>,
     },
     /// Unified diff of an edit_file/write_file call. Emitted while the card is
     /// still "running" so the frontend folds it into the card and the Review
@@ -1293,6 +1783,18 @@ pub enum AgentEvent {
         model: String,
         provider_id: String,
         sub: bool,
+        /// The size of the prompt the provider just billed, as the provider
+        /// counted it (`prompt_tokens`/`input_tokens`). This is the SAME number
+        /// the mid-turn auto-compaction trigger uses as its baseline, so the
+        /// renderer's context meter and the fold agree: the ring reaches 100%
+        /// exactly when compaction fires. 0 = the provider reported no usage
+        /// (the renderer then keeps its own estimate).
+        context_tokens: u64,
+        /// The window the trigger divides `context_tokens` by — the model's real
+        /// window, resolved by the backend when the renderer did not know it.
+        /// 0 for sub-agent requests. The renderer prefers this over its own
+        /// lookup so the meter's percentage cannot drift from the trigger's.
+        context_window: u64,
     },
     /// A tool event tagged with the sub-agent branch it belongs to. Serialized
     /// as the inner event plus `branch` (and `sub`). Without the tags the
@@ -1331,6 +1833,18 @@ pub enum AgentEvent {
     /// Auto-compaction started mid-turn — the renderer shows its loading
     /// banner until the `Compact`/`CompactFailed` event lands.
     CompactStart {},
+    /// Live compaction progress (`crate::compact::CompactProgress`). Streamed
+    /// while the summarizer runs so the renderer can show the phase, which
+    /// attempt is running and the elapsed time instead of an anonymous spinner.
+    CompactProgress {
+        phase: String,
+        attempt: usize,
+        attempts: usize,
+        model: String,
+        percent: u8,
+        budget_secs: u64,
+        elapsed_secs: u64,
+    },
     /// Auto-compaction finished: `content` is the summary, `keep` the number
     /// of trailing history entries preserved verbatim, `usage` the summarizer
     /// call's token usage (None when the provider reported none).
@@ -1403,20 +1917,22 @@ impl AgentEvent {
             AgentEvent::ToolStart { id, name, args } => json!({
                 "kind": "tool", "id": id, "name": name, "tool": name, "args": args,
             }),
-            AgentEvent::Tool { id, name, args, result, ok, results } => json!({
+            AgentEvent::Tool { id, name, args, result, ok, results, engine } => json!({
                 "kind": "tool_result", "id": id, "name": name, "tool": name, "args": args,
-                "result": result, "ok": ok, "results": results,
+                "result": result, "ok": ok, "results": results, "engine": engine,
             }),
             AgentEvent::Diff { tool, path, diff } => json!({
                 "kind": "diff", "tool": tool, "path": path, "diff": diff,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
-            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub } => json!({
+            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read_tokens,
                 "model": model, "provider_id": provider_id,
                 "sub": sub,
+                "context_tokens": context_tokens,
+                "context_window": context_window,
             }),
             AgentEvent::Branch { branch, sub, inner } => {
                 let mut v = inner.to_json();
@@ -1488,6 +2004,24 @@ impl AgentEvent {
                 json!({"kind": "steer_dropped", "ids": ids})
             }
             AgentEvent::CompactStart {} => json!({"kind": "compact_start"}),
+            AgentEvent::CompactProgress {
+                phase,
+                attempt,
+                attempts,
+                model,
+                percent,
+                budget_secs,
+                elapsed_secs,
+            } => json!({
+                "kind": "compact_progress",
+                "phase": phase,
+                "attempt": attempt,
+                "attempts": attempts,
+                "model": model,
+                "percent": percent,
+                "budget_secs": budget_secs,
+                "elapsed_secs": elapsed_secs,
+            }),
             AgentEvent::Compact { content, keep, usage } => {
                 let mut v = json!({"kind": "compact", "content": content, "keep": keep});
                 if let Some(u) = usage {
@@ -1553,7 +2087,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "create_skill",
-            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH fields: `description` — ONE short line of ENGLISH saying WHEN to use the skill — and `fa_keywords` — the user's own PERSIAN phrases for when it applies (comma-separated, e.g. \"ترجمه کن, translate this\"). The skill catalog shows both, so a Persian request finds the skill without any embedding. Pass previous_name when renaming an existing skill so its extra files survive.",
+            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH fields: `description` — ONE short line of ENGLISH saying WHEN to use the skill — and `fa_keywords` — the user's own PERSIAN phrases for when it applies (comma-separated, e.g. \"ترجمه کن, translate this\"). The skill catalog shows both, so a Persian request finds the skill without any embedding. To EDIT an existing skill call `load_skill` first and send the revised body back; pass previous_name when renaming so its extra files survive.",
             json!({
                 "name": {"type": "string", "description": "Skill name (also the folder slug)"},
                 "description": {"type": "string", "description": "REQUIRED. One-line ENGLISH summary of when to use this skill"},
@@ -1561,6 +2095,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "fa_keywords": {"type": "string", "description": "REQUIRED. Comma-separated PERSIAN phrases the user would say to trigger this skill"},
                 "previous_name": {"type": "string", "description": "Old name when renaming an existing skill"},
                 "extra_files": {"type": "object", "description": "Optional extra files: filename -> content"},
+                "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete from the skill folder"},
                 "delete": {"type": "boolean", "description": "Delete the skill instead of writing it"}
             }),
         ),
@@ -1629,10 +2164,9 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "web_search",
-            "Search the web and fetch the real page content of the top results before answering. Use it for facts, docs and current information. Engines and the \"Results per search\" count (results returned + how many pages get fetched) come from Settings → Web Providers. For several searches, fire every web_search call in the SAME turn (parallel tool calls). Only use fetch_url afterwards for one specific URL that was not among the top results.",
+            "Search the web and fetch the real page content of the top results before answering. Use it for facts, docs and current information. The result count is fixed by the user's \"Results per search\" setting (Settings → Web Providers) — do NOT try to request more or fewer results; if the user wants a different count, tell them where to change it. For several searches, fire every web_search call in the SAME turn (parallel tool calls). Only use fetch_url afterwards for one specific URL that was not among the top results.",
             json!({
-                "query": {"type": "string", "description": "The search query"},
-                "max_results": {"type": "integer", "description": "Override the result count; omit to use the Settings value"}
+                "query": {"type": "string", "description": "The search query"}
             }),
         ),
         (
@@ -1793,10 +2327,9 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "web_search",
-            "Search the web and fetch the real page content of the top results before answering. Use it for facts, docs and current information. Engines and the \"Results per search\" count (results returned + how many pages get fetched) come from Settings → Web Providers. For several searches, fire every web_search call in the SAME turn (parallel tool calls). Only use fetch_url afterwards for one specific URL that was not among the top results.",
+            "Search the web and fetch the real page content of the top results before answering. Use it for facts, docs and current information. The result count is fixed by the user's \"Results per search\" setting (Settings → Web Providers) — do NOT try to request more or fewer results; if the user wants a different count, tell them where to change it. For several searches, fire every web_search call in the SAME turn (parallel tool calls). Only use fetch_url afterwards for one specific URL that was not among the top results.",
             json!({
-                "query": {"type": "string", "description": "The search query"},
-                "max_results": {"type": "integer", "description": "Override the result count; omit to use the Settings value"}
+                "query": {"type": "string", "description": "The search query"}
             }),
         ),
         (
@@ -1849,6 +2382,7 @@ fn finish_tool(
     ok: bool,
     sub: bool,
     ui_results: Option<Value>,
+    ui_engine: Option<String>,
 ) {
     // UI echo is capped; cap on a UTF-8 char boundary — byte slicing
     // mid-char panics on Persian text.
@@ -1862,27 +2396,6 @@ fn finish_tool(
         shown.truncate(end);
         shown.push_str("\n… (truncated)");
     }
-    // Trace: one tool row per executed call (args + result).
-    trace.record(crate::trace::TraceEntry {
-        kind: "tool".into(),
-        summary: name.to_string(),
-        prompt: Some(serde_json::to_string(args).unwrap_or_default()),
-        result: Some(shown.clone()),
-        detail: Some(serde_json::json!({
-            "name": name,
-            "ok": ok,
-            "sub": sub,
-        })),
-        ..Default::default()
-    });
-    emit(&AgentEvent::Tool {
-        id: id.to_string(),
-        name: name.to_string(),
-        args: args.clone(),
-        result: shown,
-        ok,
-        results: ui_results,
-    });
     // The model receives a capped copy too — a narrower re-read is one
     // cheap tool call; an unbounded context is seconds per round-trip.
     let mut for_model = result;
@@ -1920,6 +2433,34 @@ fn finish_tool(
             );
         }
     }
+    let model_chars = for_model.chars().count();
+    // Trace: one tool row per executed call (args + result).
+    trace.record(crate::trace::TraceEntry {
+        kind: "tool".into(),
+        summary: name.to_string(),
+        prompt: Some(serde_json::to_string(args).unwrap_or_default()),
+        result: Some(shown.clone()),
+        detail: Some(serde_json::json!({
+            "name": name,
+            "ok": ok,
+            "sub": sub,
+            // Size of the copy the MODEL actually received, in chars. The trace
+            // `result` field above is the UI echo (capped at 4K/8K), so measuring
+            // token cost from it was measuring the wrong thing. This is the
+            // number any future read/grep budget decision must be based on.
+            "model_chars": model_chars,
+        })),
+        ..Default::default()
+    });
+    emit(&AgentEvent::Tool {
+        id: id.to_string(),
+        name: name.to_string(),
+        args: args.clone(),
+        result: shown,
+        ok,
+        results: ui_results,
+        engine: ui_engine,
+    });
     messages.push(json!({
         "role": "tool",
         "tool_call_id": id,
@@ -1947,7 +2488,7 @@ pub async fn run_turn(
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
     cancel: &CancelFlag,
 ) -> Result<(), String> {
-    let _turn = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let run_id = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
     // Register this chat as "running" for the whole turn so `/chat/steer` can
     // inject a message into it, and guarantee the registry + inbox are cleared
     // however we exit (normal return, early return, or a panic unwinding).
@@ -1967,7 +2508,7 @@ pub async fn run_turn(
     // so the first lsp_* call usually finds an already-loaded server. Runs
     // ONCE per project per process; cheap no-op afterwards.
     crate::lsp::prewarm(&root);
-    let trace = crate::trace::TraceStore::new(req.chat_id.clone());
+    let trace = crate::trace::TraceStore::new(req.chat_id.clone()).with_run(run_id);
     let cfg = LlmConfig {
         provider: req.provider.clone(),
         model: req.model.clone(),
@@ -2017,15 +2558,24 @@ pub async fn run_turn(
     // run — the largest single fixed cost in sub-agent tokens. `ATTACHED
     // SKILLS` is empty for a sub-agent anyway (run_subagent hard-codes
     // `skills: Vec::new()`), so nothing is lost here.
-    let (matched_skills, missing_skills) = if req.mode == "subagent" {
-        (Vec::new(), Vec::new())
+    let (matched_skills, missing_skills, volatile_skills) = if req.mode == "subagent" {
+        (Vec::new(), Vec::new(), String::new())
     } else {
         let skill_section =
             crate::skill_router::build_section(&req.prompt, &skill_root, &req.skills);
         if !skill_section.text.is_empty() {
             system.push_str(&skill_section.text);
         }
-        (skill_section.matched, skill_section.missing)
+        // The auto-matched bodies are PER-TURN text: they ride the trailing
+        // context message, never `system`. Pushing them onto the system prompt
+        // made the cached prefix depend on which keywords the current message
+        // happened to carry — a traced chat lost 96 460 tokens on one call
+        // because turn N matched `summarization` and turn N+1 matched `Test UI`.
+        (
+            skill_section.matched,
+            skill_section.missing,
+            skill_section.volatile,
+        )
     };
     // Tell the renderer which skills this turn actually picked up, so the user
     // sees ⚡ chips on the assistant message. `manual: false` is what makes the
@@ -2043,40 +2593,37 @@ pub async fn run_turn(
     // the agent had forgotten the plan it was executing and re-planned from
     // scratch, redoing finished work. Both files are keyed by
     // workspace-slug + chat-id, exactly as plans.rs stores them.
-    if !req.chat_id.trim().is_empty() {
-        let ws = crate::plans::workspace_slug_for_root(&root);
-        if let Some(plan) = crate::plans::get_plan(&skill_root, &ws, &req.chat_id) {
-            let body = plan["content"].as_str().unwrap_or("").trim().to_string();
-            if !body.is_empty() {
-                system.push_str(&format!(
-                    "\n\n=== SAVED PLAN (from disk — follow it, do NOT re-plan) ===\n{body}\n"
-                ));
-            }
-        }
-        let checklist = crate::plans::get_checklist(&skill_root, &ws, &req.chat_id);
-        if let Some(items) = checklist.as_array() {
-            if !items.is_empty() {
-                let mut lines = String::new();
-                for it in items {
-                    let status = it["status"].as_str().unwrap_or("pending");
-                    let mark = match status {
-                        "completed" => "x",
-                        "in_progress" => "~",
-                        _ => " ",
-                    };
-                    lines.push_str(&format!(
-                        "- [{mark}] {}\n",
-                        it["content"].as_str().unwrap_or_default()
-                    ));
-                }
-                system.push_str(&format!(
-                    "\n\n=== CHECKLIST (from disk) ===\n{lines}\
-                     Keep it current with update_plan as you finish items; never redo a \
-                     completed one.\n"
-                ));
-            }
-        }
-    }
+    //
+    // MAIN AGENT ONLY. The explore sub-agent inherits the parent's chat_id, so
+    // this block used to fire for it too, and that was wrong three times over:
+    // (1) it has no `update_plan` tool (research_schemas), yet the checklist
+    // told it to "keep it current with update_plan" — an instruction it could
+    // only answer with an unknown-tool error and a wasted round-trip;
+    // (2) the plan body is uncapped and was re-sent on EVERY round of EVERY
+    // explore run (one traced session had 112 runs), pure input waste;
+    // (3) The plan + checklist do NOT go into the system prompt. They change
+    // every time `update_plan` runs — inside almost every turn — and the system
+    // prompt is `messages[0]`, the first byte a prefix cache can reuse. Measured
+    // on real traces: the main-agent system prompt was 7_734 -> 9_439 -> 7_734 ->
+    // 13_642 -> 7_734 bytes over five turns (the delta being exactly this
+    // section), which collapsed the main-agent prefix cache to 23.7%
+    // (649_116 uncached input tokens) while the explore sub-agent — whose
+    // system prompt is a byte-stable 7_604 — sat at 85.9%.
+    // The section is injected as a TRAILING message instead (see the push after
+    // the user prompt): the model sees the identical content, it simply appears
+    // as context above the request rather than inside `messages[0]`, so a
+    // checklist tick can no longer invalidate the prefix.
+    // The sub-agent does not get it at all: its task arrives as the user prompt,
+    // and the main agent stays the owner of the plan.
+    let main_plan_section = if req.mode == "subagent" {
+        String::new()
+    } else {
+        plan_section(
+            &skill_root,
+            &crate::plans::workspace_slug_for_root(&root),
+            &req.chat_id,
+        )
+    };
     if !missing_skills.is_empty() {
         emit(&AgentEvent::Skills {
             skills: Vec::new(),
@@ -2086,6 +2633,16 @@ pub async fn run_turn(
                 missing_skills.join(", ")
             )),
         });
+    }
+    // Per-turn extra instruction (live voice: shape the answer for the ear).
+    // APPENDED, never substituted: `system_prompt` above replaces the builtin
+    // prompt outright, so a caller cannot add a rule without wiping what the
+    // user configured. Live turns send this on every request of the session —
+    // a constant string, so it does not churn the prefix cache; typed turns
+    // send nothing and `messages[0]` is byte-identical to what it was.
+    if !req.system_suffix.trim().is_empty() {
+        system.push_str("\n\n");
+        system.push_str(req.system_suffix.trim());
     }
     messages.push(json!({"role": "system", "content": system}));
     // A history entry's images arrive as PATHS (historyPayload strips the inline
@@ -2101,8 +2658,10 @@ pub async fn run_turn(
     // refuses the images mid-turn — see the main loop) hands them to the slot.
     let main_can_vision =
         model_supports_vision(&req.providers, &req.provider_id, &cfg.model) != Some(false);
-    // Describe at most the LAST few image-carrying entries: a follow-up refers
-    // to the most recent screenshot, and every description is a paid round-trip.
+    // Describe the LAST few image-carrying entries: a follow-up refers to the
+    // most recent screenshot, and every description is a paid round-trip.
+    // Collected here, described CONCURRENTLY below — awaiting them one by one
+    // inside the message loop made every turn start after N model round-trips.
     let mut describe_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (i, m) in req.history.iter().enumerate().rev() {
         if m.get("images")
@@ -2112,6 +2671,61 @@ pub async fn run_turn(
             describe_idx.insert(i);
             if describe_idx.len() >= MAX_HISTORY_VISION_CALLS {
                 break;
+            }
+        }
+    }
+    let mut descriptions: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    if !main_can_vision && !describe_idx.is_empty() {
+        let jobs: Vec<(usize, String, Vec<String>)> = describe_idx
+            .iter()
+            .filter_map(|&idx| {
+                let m = req.history.get(idx)?;
+                let text = m.get("content").and_then(Value::as_str)?;
+                let recap = history_recap(m);
+                let text = if recap.is_empty() {
+                    text.to_string()
+                } else {
+                    format!("{text}{recap}")
+                };
+                let imgs = m
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .map(|a| resolve_image_entries(a.clone()))
+                    .unwrap_or_default();
+                if imgs.is_empty() {
+                    return None;
+                }
+                Some((idx, text, imgs))
+            })
+            .collect();
+        // Copy the shared handles out of `cfg` so the closures capture cheap
+        // references instead of moving the config into the first future.
+        let client_ref: &reqwest::Client = &client;
+        let v_model = cfg.model.as_str();
+        let v_provider = cfg.provider.as_str();
+        let v_base_url = cfg.base_url.as_str();
+        let v_api_keys: &[String] = &cfg.api_keys;
+        let results = futures_util::future::join_all(jobs.into_iter().map(
+            |(idx, text, imgs)| async move {
+                let outcome = run_vision_slot(
+                    client_ref,
+                    req,
+                    v_model,
+                    v_provider,
+                    v_base_url,
+                    v_api_keys,
+                    &text,
+                    &imgs,
+                )
+                .await;
+                (idx, outcome)
+            },
+        ))
+        .await;
+        for (idx, outcome) in results {
+            if let VisionOutcome::Ok(desc) = outcome {
+                descriptions.insert(idx, desc);
             }
         }
     }
@@ -2138,21 +2752,7 @@ pub async fn run_turn(
                 continue;
             }
             let described = if !main_can_vision && describe_idx.contains(&idx) {
-                match run_vision_slot(
-                    &client,
-                    req,
-                    &cfg.model,
-                    &cfg.provider,
-                    &cfg.base_url,
-                    &cfg.api_keys,
-                    &text,
-                    &hist_imgs,
-                )
-                .await
-                {
-                    VisionOutcome::Ok(desc) => Some(desc),
-                    _ => None,
-                }
+                descriptions.get(&idx).cloned()
             } else {
                 None
             };
@@ -2240,11 +2840,36 @@ pub async fn run_turn(
             messages.push(json!({"role": "user", "content": blocks}));
         }
     }
+    // The main agent's plan/checklist rides at the TAIL of the request (see the
+    // comment at the assembly head). Pushed AFTER the user prompt so it never
+    // sits between two byte-stable messages: the volatile part stays as far
+    // from `messages[0]` as possible, and re-sending it unchanged on the next
+    // round-trip does not move anything in front of it.
+    if let Some(m) = plan_context_message(&main_plan_section) {
+        messages.push(m);
+    }
+    // Auto-matched skill bodies are per-turn text for the same reason the plan
+    // is: they are recomputed from the current message, so on the system prompt
+    // they would rewrite the cached prefix whenever the keywords change.
+    if let Some(m) = trailing_context_message(SKILL_CONTEXT_HEAD, &volatile_skills) {
+        messages.push(m);
+    }
     // Separate context/autocompact for the explore sub-agent (user request):
     // its message list is compacted against its OWN budget — never the main
-    // agent's history or window.
+    // agent's history or window. An unresolved window follows the same capacity
+    // rule (models.dev → provider → DEFAULT_CONTEXT_WINDOW) instead of
+    // collapsing to the 4k floor, which used to fold the sub-agent's whole
+    // history on its first tool call.
     if req.mode == "subagent" {
-        compact_subagent_messages(&mut messages, req.context_window as usize);
+        // The window inherited from the parent wins when it is known; otherwise
+        // resolve it through the same capacity rule.
+        let sub_ctx = if req.context_window > 0 {
+            req.context_window as usize
+        } else {
+            provider_context_window(&req.providers, &req.provider_id, &req.model)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+        };
+        compact_subagent_messages(&mut messages, sub_ctx);
     }
 
     let client = http_client();
@@ -2260,6 +2885,15 @@ pub async fn run_turn(
     } else {
         tool_schemas(req.allow_create, req.allow_browser)
     };
+    // What the tools may do this turn. A renderer that sends `cap` wins; without
+    // it the mode's row is used, so a headless scheduled Ask run is read-only too.
+    let caps = req
+        .cap
+        .clone()
+        .unwrap_or_else(|| caps_for_mode(&req.mode));
+    // Gate the native set BEFORE the MCP merge below: a connector must not be
+    // able to re-introduce a tool the mode forbids (`write_file` through MCP).
+    retain_allowed_tools(&mut schemas, &caps);
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
     // tools/list. A connector that fails to start contributes no tools — but
@@ -2295,6 +2929,9 @@ pub async fn run_turn(
             .map(|n| !native_names.contains(n))
             .unwrap_or(false)
     });
+    // A connector is not a way around the mode gate: a read-only turn must not
+    // reach a mutating tool through MCP either.
+    retain_allowed_tools(&mut mcp_schemas, &caps);
     schemas.extend(mcp_schemas);
     // Desktop control is a hard on/off switch (composer → Computer Use): when
     // it is off the tool is never bound, so the model cannot even try.
@@ -2352,8 +2989,21 @@ pub async fn run_turn(
         prompt: Some(system.clone()),
         detail: Some(json!({
             "system_chars": system.len(),
+            // The plan/checklist section is NOT part of `system` any more: it is
+            // injected as a trailing message. Recorded separately so the ruler
+            // can tell "the system prompt shrank" apart from "the section was
+            // dropped", and so its size stays visible at all.
+            "plan_chars": main_plan_section.len(),
             "tools_chars": tools_chars,
             "tools": schemas.len(),
+            // WHOSE prompt this is. The ruler used to guess from the prompt's
+            // first words ("You are Codifa" / "You are the explore sub-agent"),
+            // but the app passes its own mode prompt via `req.system_prompt`,
+            // whose text starts differently — so every app-driven main turn was
+            // silently dropped and a file with four distinct main prefixes
+            // reported "1 turn-prompt(s) · byte-stable 0/0". Record the truth
+            // instead of guessing it downstream.
+            "mode": req.mode,
         })),
         ..Default::default()
     });
@@ -2374,11 +3024,24 @@ pub async fn run_turn(
     // not thrash either).
     let mut compact_rounds: usize = 0;
     // Prompt tokens the provider reported for the LAST round-trip of this turn.
-    // This is the same number the context meter shows (input/total tokens), so
-    // the mid-turn trigger and the meter agree: the fold fires exactly when the
-    // meter crosses the threshold. 0 = the provider has not reported usage yet
-    // this turn (fall back to the local estimate).
+    // This is the baseline of the mid-turn auto-compaction trigger: the fold
+    // fires once the measured prompt (baseline + what this turn appended, or a
+    // local estimate before any usage arrives) crosses the threshold. 0 = the
+    // provider has not reported usage yet this turn (fall back to the local
+    // estimate alone).
     let mut last_prompt_tokens: usize = 0;
+    // Index into `messages` up to which `last_prompt_tokens` describes the
+    // prompt. Everything the turn appends AFTER the measured round-trip
+    // (assistant tool calls, tool results, steers — all pushed at the end, so
+    // indices stay stable) is counted as a local delta on top of the provider's
+    // number. Measuring `max(provider, local_estimate)` instead let the crude
+    // serde-JSON estimate (which bills inline base64 images as text) fire the
+    // fold long before the meter reached the user's threshold.
+    let mut measured_upto: usize = 0;
+    // The context window this turn actually measures against. Resolved ONCE so
+    // the compaction trigger and the number reported to the renderer (the
+    // context meter's denominator) can never disagree.
+    let effective_ctx = effective_context_window(req);
 
     for step in 0..max_steps {
         // Drain any mid-turn steer BEFORE this model call: the steer is appended
@@ -2415,7 +3078,28 @@ pub async fn run_turn(
         // is actively reasoning over those. Below MAIN_FOLD_MIN_TOKENS the
         // whole thing is a no-op: short turns pay nothing.
         if req.mode != "subagent" && estimate_wire_tokens(&messages[1..]) >= MAIN_FOLD_MIN_TOKENS {
-            fold_stale_tool_results(&mut messages, &mut seen_lookups);
+            let before = estimate_wire_tokens(&messages[1..]);
+            let (removed, folded) = fold_stale_tool_results(&mut messages, &mut seen_lookups);
+            record_fold(&trace, "main", step, step + 1, max_steps - step, before, removed, folded);
+        }
+        // Same elision for the explore sub-agent, on its own (much smaller)
+        // budget. Its compaction only runs ONCE, before this loop, so without
+        // this every round re-sent every read/grep the run had already made —
+        // which is why explore input per call sits far above its window share.
+        //
+        // `fold_pays_off` skips the fold near the end of a run: measured over 85
+        // real folds, the 31 that happened with 3 or fewer calls left were ALL
+        // net losses (every one of them, -172_630 tokens total) because the
+        // prompt shrank but no call remained to reuse it, while the cache reset
+        // was still paid in full. See FOLD_MIN_REMAINING_CALLS.
+        if SUB_FOLD_ENABLED
+            && req.mode == "subagent"
+            && estimate_wire_tokens(&messages[1..]) >= SUB_FOLD_MIN_TOKENS
+            && fold_pays_off(max_steps - step)
+        {
+            let before = estimate_wire_tokens(&messages[1..]);
+            let (removed, folded) = fold_subagent_tool_results(&mut messages, &mut seen_lookups);
+            record_fold(&trace, "explore", step, step + 1, max_steps - step, before, removed, folded);
         }
 
         // --- Mid-turn auto-compaction ---------------------------------------
@@ -2428,11 +3112,7 @@ pub async fn run_turn(
         // Only the main agent compacts: the explore sub-agent has its own
         // separate budget (compact_subagent_messages, run before the loop).
         if req.mode != "subagent" && compact_rounds < MAX_COMPACTIONS_PER_TURN {
-            let ctx = if req.context_window == 0 {
-                DEFAULT_CONTEXT_WINDOW
-            } else {
-                req.context_window as usize
-            };
+            let ctx = effective_ctx;
             let threshold = ctx * req.compact_at_percent.clamp(1, 99) as usize / 100;
             // Measure what the provider actually bills as `prompt_tokens`: the
             // system prompt, the tool schemas and the whole wire history — not
@@ -2445,7 +3125,12 @@ pub async fn run_turn(
             // usage on the previous round-trip its number is ground truth — it
             // already includes system + schemas + tool-call arguments, so the
             // trigger and the meter agree.
-            let measured = estimate_prompt_tokens(&messages, tools_chars).max(last_prompt_tokens);
+            let measured = measured_prompt_tokens(
+                &messages,
+                tools_chars,
+                measured_upto,
+                last_prompt_tokens,
+            );
             // messages[0] is the system prompt; the wire history is the rest.
             let fold_at = fold_prefix_len(&messages[1..]);
             if fold_at > 0 && measured >= threshold {
@@ -2453,6 +3138,7 @@ pub async fn run_turn(
                 // The provider number described the PRE-fold prompt; clear it so
                 // the next round-trip re-measures instead of re-triggering.
                 last_prompt_tokens = 0;
+                measured_upto = 0;
                 let older: Vec<Value> = messages[1..1 + fold_at].to_vec();
                 let tail: Vec<Value> = messages[1 + fold_at..].to_vec();
                 // The summarizer may be routed to the user's "compact" Tool
@@ -2462,7 +3148,7 @@ pub async fn run_turn(
                 // fold emits usage via the chat's own accounting path, not the
                 // manual-compact usage event.
                 let (slot_model, slot_base, slot_keys, _slot_provider_id) = crate::backend_light::resolve_slot_target(
-                    req.subagent_models.get("compact").map(String::as_str).unwrap_or(""),
+                    crate::backend_light::other_slot_entry(&req.subagent_models),
                     &cfg.model,
                     &cfg.base_url,
                     &cfg.api_keys,
@@ -2472,12 +3158,7 @@ pub async fn run_turn(
                 let has_slot = !slot_model.is_empty() && slot_model != cfg.model;
                 // The summarizer may carry its own reasoning level; an empty
                 // entry inherits the main model's level for this turn.
-                let compact_level = req
-                    .subagent_thinking
-                    .get("compact")
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .trim();
+                let compact_level = crate::backend_light::other_slot_level(&req.subagent_thinking);
                 let (compact_reasoning, compact_model_reasoning, compact_auto_think) =
                     crate::llm::reasoning_fields(
                         &cfg.provider,
@@ -2523,7 +3204,10 @@ pub async fn run_turn(
                     None
                 };
                 emit(&AgentEvent::CompactStart {});
-                match crate::compact::compact_history(
+                // Bind the result first: a temporary closure borrowing `emit`
+                // would otherwise stay alive across the whole `match` and block
+                // the `Compact`/`CompactFailed` emissions in its arms.
+                let compact_result = crate::compact::compact_history_with_progress(
                     &client,
                     &compact_model,
                     compact_fallback.as_ref(),
@@ -2531,8 +3215,20 @@ pub async fn run_turn(
                     ctx,
                     COMPACT_MAX_OUTPUT,
                     true,
+                    &mut |p: &crate::compact::CompactProgress| {
+                        emit(&AgentEvent::CompactProgress {
+                            phase: p.phase.to_string(),
+                            attempt: p.attempt,
+                            attempts: p.attempts_total,
+                            model: p.model.clone(),
+                            percent: p.percent,
+                            budget_secs: p.budget_secs,
+                            elapsed_secs: p.elapsed_secs,
+                        });
+                    },
                 )
-                .await
+                .await;
+                match compact_result
                 {
                     Ok(Some(out)) if !out.summary.trim().is_empty() => {
                         // Keep the marker opencode/compact.rs uses so a later
@@ -2555,15 +3251,15 @@ pub async fn run_turn(
                         next.push(json!({"role": "user", "content": summary_text}));
                         next.extend(tail.iter().cloned());
                         messages = next;
-                        // `keep` is the renderer's fold instruction: it keeps
-                        // the last N non-system messages verbatim and folds the
-                        // rest, so the next turn stops re-sending what the
-                        // summary already covers. Nothing else is appended to
-                        // `messages` before the turn ends, so the tail length IS
-                        // that N.
+                        // `keep` is the renderer's fold instruction: it keeps the
+                        // last N non-system messages verbatim and folds the rest,
+                        // so the next turn stops re-sending what the summary
+                        // already covers. `plan_context_keep` drops the wire-only
+                        // plan message from that count (see its doc).
+                        let keep = plan_context_keep(&tail);
                         emit(&AgentEvent::Compact {
                             content: summary_text,
-                            keep: tail.len(),
+                            keep,
                             usage: out.usage,
                         });
                     }
@@ -2690,8 +3386,19 @@ the Vision model's description instead.\n"
         // The provider just told us how big the request it received was; that is
         // the ground truth the next round's mid-turn compaction trigger uses
         // (the local estimate cannot see the system prompt or the tool schemas).
+        //
+        // Anthropic reports `cache_read_input_tokens` OUTSIDE `input_tokens`, so
+        // a cache-hit-heavy turn there would otherwise look tiny and the fold
+        // would fire far too late. Every other provider folds the cached part
+        // into the prompt count already, where adding it would double-count.
+        let prompt_basis = if req.provider == "anthropic" {
+            in_tok + cache_tok
+        } else {
+            in_tok
+        };
         if in_tok > 0 {
-            last_prompt_tokens = in_tok as usize;
+            last_prompt_tokens = prompt_basis as usize;
+            measured_upto = messages.len();
         }
         emit(&AgentEvent::Usage {
             input_tokens: in_tok,
@@ -2700,9 +3407,36 @@ the Vision model's description instead.\n"
             model: req.model.clone(),
             provider_id: req.provider_id.clone(),
             sub: req.mode == "subagent",
+            // The prompt the provider just billed — the same baseline the
+            // auto-compaction trigger compares against (0 when unreported).
+            context_tokens: if req.mode == "subagent" { 0 } else { prompt_basis },
+            // The denominator the trigger divides by, so the renderer's ring
+            // reaches 100% exactly when compaction fires even when it could not
+            // resolve the model's window itself.
+            context_window: if req.mode == "subagent" {
+                0
+            } else {
+                effective_ctx as u64
+            },
         });
         // Trace: one llm row per model call (model + tokens), like the
-        // Python sidecar's trace panel rows.
+        // Python sidecar's trace panel rows. The reply text and the step's
+        // routing facts go in too — a row with only a token count expands to
+        // an empty body, which reads as "the model did nothing".
+        let reply_text = acc.text.trim().to_string();
+        // The accumulator stores OpenAI-shaped slots — `{"function": {"name": …,
+        // "arguments": …}}` (llm.rs:974) — so reading a TOP-LEVEL `name` here
+        // matched nothing and every trace row recorded `tool_calls: []`. That
+        // silently blinded the one metric the round-trip work is measured with
+        // ("how many tools did this step batch?"): 376 of 376 explore rows and
+        // 239 of 239 main rows came back empty. Read the real path.
+        let tool_names: Vec<String> = acc
+            .tool_calls
+            .iter()
+            .filter_map(|c| c["function"]["name"].as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
         trace.record(crate::trace::TraceEntry {
             kind: "llm".into(),
             model: Some(req.model.clone()),
@@ -2722,6 +3456,39 @@ the Vision model's description instead.\n"
             } else {
                 format!("{} · {} tokens", req.model, in_tok + out_tok)
             },
+            result: if reply_text.is_empty() {
+                None
+            } else {
+                Some(clip_trace_text(&reply_text, LLM_TRACE_TEXT_CAP))
+            },
+            // The wire prompt of THIS call: system (elided) + history + the
+            // user prompt + every tool result so far. Without it the row could
+            // only say "N tokens" and the panel looked like the model had been
+            // asked nothing at all.
+            prompt: {
+                let wire = trace_prompt_text(&messages);
+                if wire.is_empty() {
+                    None
+                } else {
+                    Some(clip_trace_text(&wire, LLM_TRACE_PROMPT_CAP))
+                }
+            },
+            detail: Some(serde_json::json!({
+                "provider": cfg.provider.clone(),
+                "step": step + 1,
+                "steps_max": max_steps,
+                "finish_reason": acc.finish_reason.clone(),
+                "reasoning_chars": acc.reasoning_len,
+                "reply_chars": reply_text.chars().count(),
+                "tool_calls": tool_names,
+                "prompt_messages": messages.len(),
+                // Local estimate of the wire prompt for THIS call. The provider
+                // reports `input` AFTER the fact and that number includes the
+                // prefix-cache hits, so it cannot answer "how big was the prompt
+                // the fold was trying to shrink". This can.
+                "wire_tokens_est": estimate_wire_tokens(&messages[1..]) + tools_chars.div_ceil(4),
+                "interrupted": acc.interrupted,
+            })),
             ..Default::default()
         });
 
@@ -2850,13 +3617,7 @@ the Vision model's description instead.\n"
             // An MCP tool is never batched as read-only: it may mutate remote
             // state, and a bare connector name could otherwise shadow a native
             // tool of the same name.
-            !mcp_names.contains(name)
-                && matches!(
-                    name,
-                    "read" | "grep" | "glob" | "find_symbol" | "current_time" | "system_stats"
-                        | "search_memory" | "load_skill" | "lsp_definition" | "lsp_references"
-                        | "lsp_hover" | "lsp_symbols" | "lsp_diagnostics"
-                )
+            !mcp_names.contains(name) && is_readonly_native(name)
         };
         let mut batch: Vec<(String, String, Value)> = Vec::new();
         let mut sequential: Vec<(String, String, String)> = Vec::new();
@@ -2928,6 +3689,7 @@ the Vision model's description instead.\n"
                     ok,
                     req.mode == "subagent",
                     None,
+                    None,
                 );
             }
         }
@@ -2944,6 +3706,7 @@ use what it showed, read a DIFFERENT window, or move on"
                     .into(),
                 true,
                 req.mode == "subagent",
+                None,
                 None,
             );
         }
@@ -2973,6 +3736,7 @@ use what it showed, read a DIFFERENT window, or move on"
                             .into(),
                         false,
                         true,
+                        None,
                         None,
                     );
                     continue;
@@ -3015,6 +3779,7 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                             .into(),
                         true,
                         req.mode == "subagent",
+                        None,
                         None,
                     );
                 } else {
@@ -3100,6 +3865,7 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                             ok,
                             req.mode == "subagent",
                             None,
+                            None,
                         ),
                     }
                 }
@@ -3115,6 +3881,16 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                 return Ok(());
             }
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+            // The call about to run may CHANGE the workspace (`write_file`,
+            // `edit_file`, or `run_terminal`, which runs arbitrary `sh -c` in the
+            // root), so every body cached by the repeat-guard is now possibly a
+            // snapshot of a file taken BEFORE this change. Answering a later
+            // `read`/`lsp_symbols`/`grep` with a pointer would then feed the model
+            // its own file pre-edit — the guard must forget instead. Read-only
+            // calls never reach this loop, so a pure reader costs nothing here.
+            if !is_readonly(name) {
+                seen_lookups.clear();
+            }
             emit(&AgentEvent::Status {
                 stage: "tool".into(),
                 content: name.clone(),
@@ -3144,6 +3920,8 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             // (search hits / fetched page): the card renders those as links,
             // and a DISTILLED search answer no longer contains the link list.
             let mut ui_results: Option<Value> = None;
+            // Web-search engine that actually answered (badged on the card).
+            let mut ui_engine: Option<String> = None;
             let (result, ok) = if name.is_empty() {
                 // The provider streamed the tool NAME in a separate delta that
                 // never arrived (or was empty): the call reached here with no
@@ -3169,12 +3947,34 @@ Valid names: {}",
                     ),
                     false,
                 )
+            } else if let Some(refusal) = denied_by_caps(&caps, name) {
+                // Second gate (the schema filter is the first): the tool is not
+                // advertised this turn, so a call that still arrives is a stale
+                // transcript or a hallucinated name — refuse it before anything
+                // touches the disk. This is what makes Ask mode read-only for
+                // real instead of trusting the prompt to be obeyed.
+                (refusal, false)
             } else if name == "run_terminal"
                 && req.mode != "subagent"
                 && is_file_search_command(args["command"].as_str().unwrap_or_default())
             {
                 (
                     "blocked: the main agent must not locate files via the terminal — delegate file discovery to the `explore` sub-agent".into(),
+                    false,
+                )
+            } else if name == "run_terminal"
+                && !caps.write_files
+                && is_mutating_command(args["command"].as_str().unwrap_or_default())
+            {
+                // A mode that may not write must not reach the disk through the
+                // shell either: `echo x > f`, `sed -i`, `git commit` all change
+                // the workspace without ever calling `write_file`, so gating the
+                // tool NAME alone left Plan mode able to rewrite the whole tree.
+                (
+                    "blocked: this turn is read-only — `run_terminal` may only inspect here \
+(build, test, lint, git status/diff/log). Writing through the shell is not allowed in this \
+ mode; give the concrete change instead and tell the user to switch to Build mode to apply it."
+                        .into(),
                     false,
                 )
             } else if name == "computer" {
@@ -3315,7 +4115,7 @@ Valid names: {}",
                 // Web Providers order, so this must run here (async) rather than
                 // in the sync `tools::dispatch`.
                 let query = args["query"].as_str().unwrap_or_default();
-                let max = web_search_result_count(&args, req.web_search_auto_fetch);
+                let max = web_search_result_count(req.web_search_auto_fetch);
                 // Search, then fetch the real page content of the top results
                 // (Settings → Web Providers → Results per search). A snippet is
                 // rarely enough to answer, and the distiller below can only work
@@ -3328,7 +4128,8 @@ Valid names: {}",
                 )
                 .await
                 {
-                    Ok((hits, pages)) => {
+                    Ok((hits, pages, engine)) => {
+                        ui_engine = Some(engine);
                         let rows: Vec<Value> = hits
                             .iter()
                             .map(|h| {
@@ -3490,6 +4291,7 @@ call fetch_url again with offset={next} for the rest]",
                 ok,
                 req.mode == "subagent",
                 ui_results,
+                ui_engine,
             );
         }
 
@@ -3726,6 +4528,31 @@ fn estimate_wire_tokens(messages: &[Value]) -> usize {
         .sum()
 }
 
+/// The prompt size the auto-compaction trigger compares against the threshold.
+///
+/// `provider` is the prompt the provider billed for the round-trip that
+/// described `messages[..upto]` (0 = none reported yet). Everything the turn has
+/// appended since then is estimated locally, so the number follows the REAL
+/// prompt instead of a serde-JSON character count that also bills inline base64
+/// images as text — the old `max(provider, local_estimate)` therefore folded the
+/// context far below the user's threshold as soon as a screenshot was attached.
+///
+/// The provider's number already contains the fixed per-request cost (system
+/// prompt + tool schemas), so the delta must NOT add it a second time: it
+/// measures the appended `content` only. Before the first usage of a turn there
+/// is nothing to anchor to, so the full local estimate stands alone.
+fn measured_prompt_tokens(
+    messages: &[Value],
+    tools_chars: usize,
+    upto: usize,
+    provider: usize,
+) -> usize {
+    if provider == 0 || upto == 0 || upto > messages.len() {
+        return estimate_prompt_tokens(messages, tools_chars);
+    }
+    provider + estimate_wire_tokens(&messages[upto..])
+}
+
 /// Estimate the FULL prompt the next request will carry, the way a provider
 /// bills it: the system prompt (`messages[0]`), the whole wire history
 /// (including per-message overhead and tool-call arguments) and the serialized
@@ -3740,10 +4567,82 @@ fn estimate_prompt_tokens(messages: &[Value], tools_chars: usize) -> usize {
     // `content`) folds in the per-message envelope and the tool-call arguments
     // for free, and is safe to overcount slightly: overcounting only makes the
     // fold happen a touch earlier, which is the safe direction.
+    //
+    // Inline base64 images are the exception, and they are why this estimate can
+    // no longer drive the trigger on its own: one attached screenshot is
+    // megabytes of base64 that the model does NOT receive as text (it goes over
+    // the wire as image blocks and is billed by area/patch, orders of magnitude
+    // below its character count). Counting it as text made this estimate report
+    // millions of "tokens" and fold the context far below the user's threshold.
+    // `image_data_chars` subtracts what the serialized JSON spends on images.
     let wire_chars: usize = serde_json::to_string(messages)
         .map(|s| s.chars().count())
         .unwrap_or(0);
-    (wire_chars + tools_chars).div_ceil(4)
+    wire_chars
+        .saturating_sub(image_data_chars(messages))
+        .saturating_add(tools_chars)
+        .div_ceil(4)
+}
+
+/// Rough token cost of the image blocks inside `messages`, for a prompt the
+/// model receives as images rather than as text.
+///
+/// Every image block carries a data URL. An image is billed by area and
+/// resolution (a screenshot is ~1-2k tokens), roughly proportional to its
+/// COMPRESSED byte size — never to the base64 CHARACTER count (which is ~4/3 of
+/// the bytes, and which the caller charges at 4 chars/token, i.e. ~
+/// bytes/3 tokens: hundreds of times the real cost). Returning the EXCESS the
+/// serialized JSON is charged for such blocks keeps the number right to within a
+/// factor of ~2, which is all the threshold comparison needs.
+///
+/// The excess is expressed in CHARACTERS, because that is the unit
+/// `estimate_prompt_tokens` subtracts in — returning tokens here made a 3 MB
+/// screenshot still bill ~563k tokens instead of ~2k (the subtraction removed
+/// one unit instead of four per real token), which folded the context far below
+/// the user's threshold.
+const IMAGE_CHARS_PER_TOKEN: usize = 1500;
+
+fn image_data_chars(messages: &[Value]) -> usize {
+    fn json_chars(v: &Value) -> usize {
+        serde_json::to_string(v)
+            .map(|s| s.chars().count())
+            .unwrap_or(0)
+    }
+    fn walk(value: &Value, total: &mut usize) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, total);
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values() {
+                    match item.as_str() {
+                        Some(s) if s.starts_with("data:image") => {
+                            // What the estimator will charge for this block …
+                            let charged_chars = json_chars(item);
+                            // … versus what the model really bills: ~1 image token
+                            // per IMAGE_CHARS_PER_TOKEN characters of the data URL,
+                            // converted back to characters (the caller divides by 4).
+                            let real_tokens = s
+                                .chars()
+                                .count()
+                                .div_ceil(IMAGE_CHARS_PER_TOKEN)
+                                .max(200);
+                            *total += charged_chars.saturating_sub(real_tokens * 4);
+                        }
+                        _ => walk(item, total),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut total = 0;
+    for msg in messages {
+        walk(msg, &mut total);
+    }
+    total
 }
 
 /// In-turn elision of stale tool results (main agent only): the main agent's
@@ -3753,22 +4652,39 @@ fn estimate_prompt_tokens(messages: &[Value], tools_chars: usize) -> usize {
 /// at 80% of the context window — far too late for cost — so old results ride
 /// along at full size (16K per read, 40K per explore report) forever.
 ///
-/// This fold keeps the last `MAIN_FOLD_KEEP_ROUNDS` rounds untouched and
-/// shrinks OLDER `tool` messages to a per-result budget: an explore report to
-/// `MAIN_FOLD_EXPLORE_CHARS` (the report is the main agent's only view of that
-/// research), any other tool result to `MAIN_FOLD_RESULT_CHARS` (a targeted
-/// re-read is one cheap call). A marker tells the model the tail was dropped
-/// and how to get it back — it is a pointer, not silent data loss.
+/// This fold keeps the last `keep_rounds` rounds untouched and shrinks OLDER
+/// `tool` messages to a per-result budget: an `explore` report to
+/// `explore_budget` (the report is the caller's view of that research), any
+/// other tool result to `result_budget` (a targeted re-read is one cheap call).
+/// A marker tells the model the tail was dropped and how to get it back — it is
+/// a pointer, not silent data loss.
 ///
 /// Idempotent by construction: a stub already carries `MAIN_FOLD_MARKER`, and
 /// its content length is under every budget, so re-folding is a no-op. Only
 /// `tool` messages are touched — assistant/user messages stay verbatim, and a
 /// `tool` message can never be detached from its assistant call (the message
 /// list keeps its shape, unlike fold_prefix_len's rebuild).
-fn fold_stale_tool_results(
+///
+/// `keep_rounds` is how many NEWEST tool rounds are left untouched, and the two
+/// budgets are the per-result char caps for an `explore` report and for any
+/// other tool result. Both call sites pass 2 kept rounds; they differ only in
+/// budgets and trigger thresholds.
+/// Returns `(removed_chars, folded_messages)`.
+///
+/// The numbers exist so the caller can RECORD what the fold actually did. Until
+/// now a fold left no trace at all, and every attempt to price it had to infer
+/// "a fold happened here" from the prompt shrinking between two calls — which
+/// cannot tell a fold from compaction, and cannot measure the one thing that
+/// matters: the prefix-cache re-bill it causes versus the per-call saving it
+/// earns on the calls that follow. With the two numbers in the trace the
+/// trade-off is measured instead of modelled.
+fn fold_with(
     messages: &mut [Value],
     seen: &mut std::collections::HashSet<String>,
-) {
+    keep_rounds: usize,
+    explore_budget: usize,
+    result_budget: usize,
+) -> (usize, usize) {
     // A "round" is one `assistant` message carrying tool_calls, together with
     // the `tool` results that follow it. The boundary is the FIRST of the last
     // MAIN_FOLD_KEEP_ROUNDS rounds: everything from there on stays untouched
@@ -3784,10 +4700,10 @@ fn fold_stale_tool_results(
         })
         .map(|(i, _)| i)
         .collect();
-    if rounds.len() <= MAIN_FOLD_KEEP_ROUNDS {
-        return;
+    if rounds.len() <= keep_rounds {
+        return (0, 0);
     }
-    let cut = rounds[rounds.len() - MAIN_FOLD_KEEP_ROUNDS];
+    let cut = rounds[rounds.len() - keep_rounds];
     // Name + raw args per tool_call id: the `tool` message carries only the id,
     // so both are recovered from the assistant call that produced it. Owned
     // strings — the map must not borrow `messages` while it is mutated below
@@ -3813,19 +4729,26 @@ fn fold_stale_tool_results(
     // MAIN_FOLD_KEEP_ROUNDS rounds old. (The results of the kept rounds are
     // fresh and untouched; so is everything after them, including the newest
     // user steer.)
+    let mut removed_chars = 0usize;
+    let mut folded = 0usize;
     for m in messages[..cut].iter_mut() {
         if m["role"] != "tool" { continue; }
         // Skip already-folded stubs (idempotence).
         if m["content"].as_str().is_some_and(|c| c.contains(MAIN_FOLD_MARKER)) { continue; }
         let meta = m["tool_call_id"].as_str().and_then(|id| call_meta.get(id));
         let is_explore = meta.is_some_and(|(name, _)| name == "explore");
-        let budget = if is_explore { MAIN_FOLD_EXPLORE_CHARS } else { MAIN_FOLD_RESULT_CHARS };
+        let budget = if is_explore { explore_budget } else { result_budget };
         let Some(content) = m["content"].as_str().map(String::from) else { continue };
-        if content.chars().count() <= budget { continue; }
+        let old_chars = content.chars().count();
+        if old_chars <= budget { continue; }
         // Char-boundary-safe truncation: byte slicing panics (and with
         // panic=abort kills the app) on a multi-byte Persian character.
         let head: String = content.chars().take(budget).collect();
-        m["content"] = json!(format!("{head}\n{MAIN_FOLD_MARKER}"));
+        let new_content = format!("{head}\n{MAIN_FOLD_MARKER}");
+        let new_chars = new_content.chars().count();
+        removed_chars += old_chars.saturating_sub(new_chars);
+        folded += 1;
+        m["content"] = json!(new_content);
         // The marker tells the model to re-run the tool — so the repeat-guard
         // must FORGET this lookup. Otherwise the re-run is answered with a
         // pointer to a body that no longer exists and the data is unreachable
@@ -3838,21 +4761,46 @@ fn fold_stale_tool_results(
             }
         }
     }
+    (removed_chars, folded)
+}
+
+/// Main-agent entry point: two kept rounds, the main budgets and the main
+/// trigger threshold.
+fn fold_stale_tool_results(
+    messages: &mut [Value],
+    seen: &mut std::collections::HashSet<String>,
+) -> (usize, usize) {
+    fold_with(
+        messages,
+        seen,
+        MAIN_FOLD_KEEP_ROUNDS,
+        MAIN_FOLD_EXPLORE_CHARS,
+        MAIN_FOLD_RESULT_CHARS,
+    )
+}
+
+/// Sub-agent entry point: an explore run re-sends its whole accumulated history
+/// on EVERY one of its rounds, and nothing folded it mid-loop —
+/// compact_subagent_messages runs once, before the loop. Its own older reads and
+/// greps are therefore the bulk of its input. Unlike the main agent, the
+/// sub-agent owns read/grep, so the pointer the marker leaves behind is always
+/// resolvable with one cheap targeted call.
+fn fold_subagent_tool_results(
+    messages: &mut [Value],
+    seen: &mut std::collections::HashSet<String>,
+) -> (usize, usize) {
+    fold_with(
+        messages,
+        seen,
+        SUB_FOLD_KEEP_ROUNDS,
+        SUB_FOLD_RESULT_CHARS,
+        SUB_FOLD_RESULT_CHARS,
+    )
 }
 
 /// Length of the prefix of `history` (messages WITHOUT the system prompt) that a
 /// mid-turn compaction may fold into a summary — 0 when nothing is safely
 /// foldable.
-///
-/// Two rules keep the rebuilt conversation valid for every provider:
-///  - Never fold a trailing user message: it is usually the request this turn is
-///    answering, so folding it would hide the question from the model.
-///  - Always cut at an `assistant` boundary, never at a `tool` boundary: a
-///    `tool` result must stay with the assistant `tool_calls` that produced it,
-///    or the provider rejects the orphaned reply with a 400.
-///
-/// Consequently a turn with a single user prompt and no assistant answer yet
-/// returns 0 — there is genuinely nothing to fold at that point.
 fn fold_prefix_len(history: &[Value]) -> usize {
     let mut cut = history.len();
     while cut > 0 && history[cut - 1]["role"].as_str() == Some("user") {
@@ -3914,9 +4862,161 @@ fn compact_subagent_messages(messages: &mut Vec<Value>, ctx: usize) {
 /// flag (Stop button) aborts every concurrent explore too.
 type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
-/// True when a shell command tries to LOCATE files (find/grep/rg/ls/…).
+/// True when a string contains a redirection whose TARGET is a real file.
+///
+/// `du -sh ~ 2>/dev/null` writes to a device node: nothing in the workspace
+/// changes, so it is a READ. Treating every `>` as a write (the first version of
+/// this gate) refused the very inspection a read-only mode exists for — the
+/// user hit exactly that. Numeric prefixes (`2>`) need no special case: the
+/// scan starts right after the operator, so the token that follows is the
+/// target either way.
+fn redirects_to_a_file(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(idx) = rest.find('>') {
+        let after = &rest[idx + 1..];
+        // `>>` appends and `>|` overrides noclobber; the target follows both.
+        let target = after.trim_start_matches(['>', '|']).trim_start();
+        let word = target
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['"', '\'']);
+        // An empty target is a dangling operator; `&` is a descriptor move; a
+        // `/dev/*` node absorbs the stream without touching the workspace.
+        if !word.is_empty() && !word.starts_with('&') && !word.starts_with("/dev/") {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// True when a shell command would CHANGE the workspace (write into a file,
+/// in-place edit, git/package-manager write). Only Build mode may mutate, so a
+/// read-only mode must not get around the tool gate through `run_terminal`:
+/// `echo x > src/app.ts` writes a file without ever calling `write_file`, and a
+/// Plan turn whose terminal is "inspection only" could otherwise rewrite the
+/// tree from the shell.
+fn is_mutating_command(cmd: &str) -> bool {
+    let mut scrubbed = cmd.to_lowercase();
+    // `2>&1` / `>&2` duplicate a descriptor — they create no file, so they are
+    // stripped first or every redirected build/test would look like a write.
+    for fd in ["2>&1", ">&1", ">&2", "&>1", "&>2"] {
+        scrubbed = scrubbed.replace(fd, " ");
+    }
+    // A redirection into a file is the plainest write there is — but only when
+    // the target is a file. `2>/dev/null` on an inspection command is a read.
+    if redirects_to_a_file(&scrubbed) {
+        return true;
+    }
+
+    // Commands whose whole job is to write somewhere.
+    const MUTATORS: [&str; 17] = [
+        "rm", "rmdir", "mv", "cp", "ln", "touch", "mkdir", "truncate", "dd", "tee",
+        "chmod", "chown", "patch", "unlink", "shred", "mkfifo", "install",
+    ];
+
+    // Every pipeline/chain segment is inspected, and `xargs` is followed into
+    // its argument: `ls | xargs rm` writes even though `ls` does not.
+    scrubbed.split([';', '|', '&', '\n']).any(|seg| {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            return false;
+        };
+        // Strip a leading path so `/bin/rm` is caught as well.
+        let cmd = first.rsplit('/').next().unwrap_or(first);
+        let args = &words[1..];
+        if MUTATORS.contains(&cmd) {
+            return true;
+        }
+        if cmd == "xargs" && args.iter().any(|w| MUTATORS.contains(w)) {
+            return true;
+        }
+        // An interpreter one-liner writes any file it likes without ever naming
+        // a mutating binary (`node -e "fs.writeFileSync(...)"`), so its eval
+        // form is refused while the turn may not write. A plain run stays
+        // allowed — `node --version`, `python script.py`, `npm test`.
+        if cmd == "eval" {
+            return true;
+        }
+        let eval_flags: &[&str] = match cmd {
+            "sh" | "bash" | "zsh" | "dash" | "ksh" => &["-c"],
+            "node" | "deno" | "bun" => &["-e", "--eval", "-p", "--print"],
+            "python" | "python3" | "ruby" | "perl" | "osascript" => &["-e", "-c"],
+            _ => &[],
+        };
+        if args.iter().any(|w| eval_flags.contains(w)) {
+            return true;
+        }
+        // In-place editors: `sed -i`, `sed -i.bak`, `perl -pi`/`-pni` (the flag
+        // is often BUNDLED, so `-pi` never starts with `-i`), and `find
+        // -delete` / `-exec`. Only sed/perl get the bundled-`i` rule: `find
+        // -iname` also contains an `i` but only reads.
+        if matches!(cmd, "sed" | "perl")
+            && args.iter().any(|w| {
+                *w == "--in-place"
+                    || w.starts_with("--in-place")
+                    || (w.starts_with('-')
+                        && !w.starts_with("--")
+                        && w[1..].contains('i'))
+            })
+        {
+            return true;
+        }
+        if cmd == "awk" && args.iter().any(|w| *w == "-i") {
+            return true;
+        }
+        if cmd == "find" && args.iter().any(|w| *w == "-delete" || *w == "-exec") {
+            return true;
+        }
+        // Otherwise-read-only tools with write-y subcommands (git index,
+        // package manifests, lockfiles).
+        let blocked: &[&str] = match cmd {
+            "git" => &[
+                "add", "commit", "apply", "checkout", "restore", "reset", "clean", "stash",
+                "merge", "rebase", "tag", "push", "switch", "cherry-pick", "init", "rm",
+            ],
+            "npm" | "pnpm" | "yarn" => &[
+                "install", "i", "ci", "add", "remove", "rm", "uninstall", "update",
+                "upgrade", "link", "publish", "init",
+            ],
+            "pip" | "pip3" => &["install", "uninstall", "download"],
+            "cargo" => &["add", "install", "remove", "update", "fix", "clean", "new", "init"],
+            "go" => &["get", "install", "mod", "generate"],
+            "brew" => &["install", "uninstall", "upgrade", "update", "tap"],
+            "apt" | "apt-get" => &["install", "remove", "upgrade", "update"],
+            _ => &[],
+        };
+        if !blocked.is_empty() && args.iter().any(|w| blocked.contains(w)) {
+            return true;
+        }
+        // Formatters rewrite in place, but their `--check` form only reports.
+        let check_only = args.iter().any(|w| *w == "--check" || *w == "-c");
+        if !check_only {
+            let formats = cmd == "fmt"
+                || (matches!(cmd, "cargo" | "eslint" | "prettier" | "ruff" | "black")
+                    && args
+                        .iter()
+                        .any(|w| *w == "fmt" || *w == "--fix" || *w == "--write"));
+            if formats {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// True when a shell command tries to SEARCH for files with a search engine
+/// (find/grep/rg/fd/locate/tree/glob).
 /// The main agent has no search tools by design — file discovery must go
 /// through the explore sub-agent, not terminal one-liners (user request).
+///
+/// `ls` is deliberately NOT in the list: listing a directory (and measuring it
+/// with `du`/`df`) reads what the caller already knows about, it is not a
+/// search, and a read-only mode must be able to see the disk. The user's rule
+/// is that every READ works everywhere and only APPLYING a change needs Build;
+/// a search engine is delegated because it duplicates `explore`, not because
+/// reading is restricted.
 fn is_file_search_command(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     // Check every pipeline/chain segment, not just the first token.
@@ -3924,7 +5024,7 @@ fn is_file_search_command(cmd: &str) -> bool {
         .split([';', '|', '&', '\n'])
         .any(|seg| {
             let t = seg.trim();
-            ["find", "grep", "rg", "ls", "fd", "locate", "tree", "glob"]
+            ["find", "grep", "rg", "fd", "locate", "tree", "glob"]
                 .iter()
                 .any(|p| t == *p || t.starts_with(&format!("{p} ")))
         })
@@ -3936,6 +5036,39 @@ fn is_file_search_command(cmd: &str) -> bool {
 /// LAST search tool reaches the main agent (it used to receive every step's
 /// chatter, resent on each later step). Memory tools are exempt so a report
 /// written in the same step as save_memory survives.
+/// Decide whether ONE sub-agent attempt produced a usable report.
+///
+/// `Ok(())` means "keep this report"; `Err(reason)` means "this attempt failed,
+/// so the ladder must retry it" (the reason is what the banner shows).
+///
+/// The subtle case is an attempt that streamed some text and THEN died on a
+/// provider error. Judging that by `report.is_empty()` alone reported it as a
+/// SUCCESS: the parent received a truncated report as its tool result and the
+/// retry ladder never fired — which is exactly "auto retry does not work on a
+/// sub-agent error" (the user's report). A captured `AgentEvent::Error` is
+/// always terminal for the attempt that produced it (see `run_turn`'s only
+/// Error emit), so a non-empty `sub_error` always means the attempt failed,
+/// with or without partial text.
+fn classify_subagent_attempt(res: &Result<(), String>, report: &str, sub_error: &str) -> Result<(), String> {
+    // The idle guard already converted a hang into a real error.
+    if let Err(e) = res {
+        return Err(format!("sub-agent failed: {e}"));
+    }
+    let err = sub_error.trim();
+    if !err.is_empty() {
+        return Err(format!("explore failed: {err}"));
+    }
+    if report.trim().is_empty() {
+        // The turn "succeeded" but produced no output — the parent must not
+        // treat an empty report as data.
+        return Err(
+            "explore returned no findings: the sub-agent produced no output (empty model response)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEvent) {
     match ev {
         AgentEvent::Text { content } => report.push_str(content),
@@ -3952,6 +5085,35 @@ fn fold_subagent_event(report: &mut String, sub_error: &mut String, ev: &AgentEv
         }
         _ => {}
     }
+}
+
+/// Native tools that only READ state: no file write, no memory write, no shell.
+///
+/// Used twice, and the second use is a CORRECTNESS guard, not an optimisation:
+/// the repeat-guard may only answer a lookup with a pointer while the workspace
+/// is unchanged. Anything not in this list can change it — including
+/// `run_terminal`, which runs arbitrary `sh -c` in the workspace root — so every
+/// cached lookup body must be forgotten after one of them runs (see the `rest`
+/// loop). A stale pointer would hand the model a file as it was before its own
+/// edit: a silent quality loss that no token saving justifies.
+const READONLY_NATIVE_TOOLS: [&str; 13] = [
+    "read",
+    "grep",
+    "glob",
+    "find_symbol",
+    "current_time",
+    "system_stats",
+    "search_memory",
+    "load_skill",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_symbols",
+    "lsp_diagnostics",
+];
+
+fn is_readonly_native(name: &str) -> bool {
+    READONLY_NATIVE_TOOLS.contains(&name)
 }
 
 /// Identity of a repeatable read-only lookup: a read window (file + offset +
@@ -3997,6 +5159,73 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
             }
             Some(format!("find_symbol|{symbol}|{}|{}", s("path"), s("include")))
         }
+        // The LSP family is a pure read of the file as it is on disk RIGHT NOW,
+        // so identical arguments return an identical payload. These arms were
+        // missing and the repeat guard never saw them: one traced explore run
+        // called `lsp_symbols` on the SAME file three times at 12_880 model
+        // chars each — a full variable-cost payload plus the round-trip that
+        // carried it. "As it is right now" is only true while nothing has
+        // changed the file: `run_terminal` can, which is why every mutating call
+        // clears the guard (see READONLY_NATIVE_TOOLS).
+        "lsp_symbols" => {
+            let file = s("filePath");
+            if file.is_empty() {
+                return None;
+            }
+            // `query` filters the symbol list: a different query is a different
+            // answer.
+            Some(format!("lsp_symbols|{file}|{}", s("query")))
+        }
+        "lsp_diagnostics" => {
+            let file = s("filePath");
+            if file.is_empty() {
+                return None;
+            }
+            Some(format!("lsp_diagnostics|{file}"))
+        }
+        "lsp_definition" | "lsp_references" | "lsp_hover" => {
+            let file = s("filePath");
+            if file.is_empty() {
+                return None;
+            }
+            let symbol = s("symbol");
+            // A repeated identifier is disambiguated by the line hint, and a
+            // bare position without a symbol is only valid with an explicit
+            // line — both therefore belong in the key.
+            let line = args["line"].as_i64().unwrap_or(0);
+            let character = args["character"].as_i64().unwrap_or(0);
+            if symbol.trim().is_empty() && line == 0 {
+                return None;
+            }
+            // The tool NAME is part of the key: the definition of X and the
+            // references of X are different answers.
+            Some(format!(
+                "{name}|{file}|{}|{line}|{character}",
+                symbol.trim()
+            ))
+        }
+        // `glob` output is a pure function of pattern + scope + max_results.
+        // Like `grep`, the pattern may arrive as a `patterns` array.
+        "glob" => {
+            let mut pattern = s("pattern");
+            if pattern.is_empty() {
+                if let Some(list) = args["patterns"].as_array() {
+                    pattern = list
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}");
+                }
+            }
+            if pattern.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "glob|{pattern}|{}|{}",
+                s("path"),
+                args["max_results"].as_u64().unwrap_or(100)
+            ))
+        }
         // The SAME research question must never run twice in one turn: a second
         // explore costs a whole sub-agent (up to SUBAGENT_MAX_STEPS rounds ×
         // SUBAGENT_MAX_ATTEMPTS attempts), while the first report is already in
@@ -4024,11 +5253,22 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
 /// tool call. Read-only calls of one step run in parallel, so every extra step
 /// costs seconds (one model round trip) for no extra information.
 ///
-/// Two audiences, because the waste differs:
+/// Three audiences, because the waste differs:
 /// - the explore sub-agent: one lookup per step burns rounds;
-/// - the MAIN agent: one broad explore is slow and comes back shallow, while
-///   the same step could have carried several focused explores concurrently
-///   (a traced turn fired a single wide explore and got a 4-round report).
+/// - the MAIN agent, `explore`: one broad explore is slow and comes back
+///   shallow, while the same step could have carried several focused explores
+///   concurrently (a traced turn fired a single wide explore and got 4 rounds);
+/// - the MAIN agent, native write/terminal tools: traced turns spent 72% of
+///   their steps (219 of 301) on a SINGLE call — 125 `run_terminal`, 51
+///   `edit_file`, 23 `write_file` — alternating one edit and one command per
+///   step. Every step re-sends the whole conversation (~7.3K tokens on average
+///   over those turns), so those steps alone cost ~1.3M uncached tokens.
+///
+/// The native tools are deliberately NOT described as parallel: only read-only
+/// calls are batched, and these mutate the workspace, so the wording promises
+/// ORDER instead. The hint rides on an already-sent tool result, so it costs no
+/// extra request — unlike widening the tool SCHEMA, which is paid on every
+/// single round-trip of every turn.
 fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'static str> {
     if calls.len() != 1 {
         return None;
@@ -4039,9 +5279,166 @@ fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'
         );
     }
     let name = calls[0].1.as_str();
-    (name == "explore").then_some(
-        "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
+    if name == "explore" {
+        return Some(
+            "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
+        );
+    }
+    // Native write/terminal/browser tools. Traced main-agent turns spent 76% of
+    // their steps on a SINGLE call (210 of 277, measured from tool rows) — 61 of
+    // them a lone `run_terminal`, 54 a lone `browser_evaluate`, 43 a lone
+    // `edit_file` — and every extra step re-sends the whole conversation. The
+    // browser tools were the largest group MISSING from this list, so the hint
+    // fired on only 2 of 280 main rounds and could not correct any of it. These
+    // calls do NOT run concurrently (they mutate the workspace or act on one
+    // shared page, in order), so the hint must say "in order", never "parallel".
+    matches!(
+        name,
+        "run_terminal"
+            | "edit_file"
+            | "write_file"
+            | "browser_navigate"
+            | "browser_evaluate"
+            | "browser_snapshot"
+            | "browser_click"
+            | "browser_type"
+            | "browser_fill_form"
+            | "browser_press_key"
+            | "browser_select_option"
     )
+    .then_some(
+        "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: issue all the file edits and shell commands you already know you need together (they run IN ORDER, one after another) instead of spending a step on each. Several replacements in one file go in a SINGLE edit_file call as edits:[{path, old_string, new_string, replace_all}].",
+    )
+}
+
+/// Cap on the saved-plan body injected into the system prompt. A plan is
+/// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
+/// cost; a long plan is cut in the middle (head + tail survive, so the goal and
+/// the latest items stay visible).
+const PLAN_SECTION_CAP: usize = 6_000;
+
+/// Wrap the plan/checklist section as a TRAILING context message, or `None`
+/// when there is nothing to inject.
+///
+/// The section is volatile — a single `update_plan` changes it — so it must not
+/// live in `messages[0]`: the system prompt is the first byte a prefix cache
+/// can reuse, and mutating it forced the whole request to be re-billed. Measured
+/// before this change: main-agent system prompt 7_734 -> 9_439 -> 7_734 ->
+/// 13_642 bytes across five turns, prefix cache 23.7%.
+///
+/// The label matters: the model reads this as context above the request, not as
+/// something the user just typed, and the "NOT a new request" clause keeps an
+/// unrelated turn from reacting to a stale checklist.
+/// Opening line of the trailing plan/checklist context message.
+///
+/// Used both to BUILD that message and to RECOGNISE it when measuring the kept
+/// window (see the `Compact` emit): the message exists only on the wire — the
+/// renderer never stores it — so it must not inflate the renderer's fold
+/// instruction. A string check keeps it out of the provider payload entirely
+/// (an extra marker field on the message would ride along to the gateway).
+const PLAN_CONTEXT_HEAD: &str =
+    "=== CONTEXT: current plan/checklist state (NOT a new request) ===";
+
+/// Number of messages in a compaction tail that the RENDERER can actually fold.
+///
+/// Everything in the tail is stored by the renderer except the plan/checklist
+/// context message, which exists only on the wire. Passing `tail.len()` straight
+/// through made the renderer keep one message too many verbatim — re-sending
+/// content the summary already covers.
+fn plan_context_keep(tail: &[Value]) -> usize {
+    tail.iter()
+        .filter(|m| {
+            !m["content"].as_str().is_some_and(|c| {
+                c.starts_with(PLAN_CONTEXT_HEAD) || c.starts_with(SKILL_CONTEXT_HEAD)
+            })
+        })
+        .count()
+}
+
+fn plan_context_message(section: &str) -> Option<Value> {
+    trailing_context_message(PLAN_CONTEXT_HEAD, section)
+}
+
+/// Opening line of the trailing auto-matched-skills context message.
+const SKILL_CONTEXT_HEAD: &str = "=== CONTEXT: skills auto-matched to this message ===";
+
+/// Wrap a PER-TURN section as a trailing context message, or `None` when there
+/// is nothing to send.
+///
+/// Any section that is recomputed from the current user message belongs here and
+/// NOT in the system prompt: `system` is the cached prefix of every request in
+/// the conversation, so per-turn churn there invalidates the cache for the whole
+/// history (measured: one skill swap cost a 96 460-token miss). The trailing
+/// position has the opposite property — it is the only place a message can
+/// change without moving anything the previous call already cached.
+fn trailing_context_message(head: &str, section: &str) -> Option<Value> {
+    if section.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": "user",
+        "content": format!("{head}{section}\n--- end of context ---"),
+    }))
+}
+
+/// The `=== SAVED PLAN` + `=== CHECKLIST` block injected as a trailing message
+/// for the MAIN agent (never for the sub-agent). Returns an empty string when
+/// there is no plan/checklist or no chat id to key them by. Free function (not
+/// inline) so the mode gating and the size cap are testable without running a
+/// turn.
+fn plan_section(data_root: &str, workspace: &str, chat_id: &str) -> String {
+    if chat_id.trim().is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some(plan) = crate::plans::get_plan(data_root, workspace, chat_id) {
+        let mut body = plan["content"].as_str().unwrap_or("").trim().to_string();
+        if !body.is_empty() {
+            if body.len() > PLAN_SECTION_CAP {
+                let mut head_end = PLAN_SECTION_CAP / 2;
+                while head_end > 0 && !body.is_char_boundary(head_end) {
+                    head_end -= 1;
+                }
+                let mut tail_start = body.len() - PLAN_SECTION_CAP / 2;
+                while tail_start < body.len() && !body.is_char_boundary(tail_start) {
+                    tail_start += 1;
+                }
+                body = format!(
+                    "{}\n… [{} chars omitted from the middle of the saved plan — read the plan file from disk if you need the omitted section]\n{}",
+                    &body[..head_end],
+                    body.len() - head_end - (body.len() - tail_start),
+                    &body[tail_start..]
+                );
+            }
+            out.push_str(&format!(
+                "\n\n=== SAVED PLAN (from disk — follow it, do NOT re-plan) ===\n{body}\n"
+            ));
+        }
+    }
+    let checklist = crate::plans::get_checklist(data_root, workspace, chat_id);
+    if let Some(items) = checklist.as_array() {
+        if !items.is_empty() {
+            let mut lines = String::new();
+            for it in items {
+                let status = it["status"].as_str().unwrap_or("pending");
+                let mark = match status {
+                    "completed" => "x",
+                    "in_progress" => "~",
+                    _ => " ",
+                };
+                lines.push_str(&format!(
+                    "- [{mark}] {}\n",
+                    it["content"].as_str().unwrap_or_default()
+                ));
+            }
+            out.push_str(&format!(
+                "\n\n=== CHECKLIST (from disk) ===\n{lines}\
+                 Keep it current with update_plan as you finish items; never redo a \
+                 completed one.\n"
+            ));
+        }
+    }
+    out
 }
 
 /// System prompt of the explore sub-agent: the research strategy plus a compact
@@ -4053,19 +5450,25 @@ fn explore_system_prompt(root: &str) -> String {
     format!(
         "You are the explore sub-agent inside the workspace {root}. \
 The main agent waits on you and cannot search itself, so be fast and precise. \
-Every model round trip costs seconds while tools cost milliseconds, so what matters \
-is the number of ROUNDS (steps), not the number of calls: issue every call you can \
-already foresee together in ONE step (they run in parallel) — a grep per \
-identifier/keyword variant, lsp_symbols for likely files, reads of files the \
-question names — then act on all the results at once. Aim for 2-3 rounds.\n\n\
+Every model round trip re-sends the WHOLE conversation: measured on real traces, \
+an explore ROUND costs ~7.7K uncached tokens and an unfocused 9-round run paid \
+~78K. ROUNDS are the price, not calls. So work in a fixed 3-step budget:\n\
+STEP 1 - LOCATE (ONE step, many calls): issue every search you can already \
+foresee together — a grep per directory/keyword variant, lsp_symbols for likely \
+files, find_symbol for the identifiers the question names. Do not read yet: you \
+only need paths and line ranges.\n\
+STEP 2 - READ (ONE step, many calls): read EVERY window step 1 pointed at, \
+together. Earlier results stay cached only while they remain an identical \
+PREFIX of your next request, so a cheap read now costs almost nothing, while a \
+later round to fetch the same window re-sends the whole conversation. When you \
+already know a file, a symbol or a window you will need, read it NOW.\n\
+STEP 3 - only for a genuine unknown discovered while reading, or a search that \
+failed outright; otherwise stop and write the report.\n\n\
 HARD RULE: never issue a step with a single call while you still have a \
-question whose answer could change what you do next. If you catch yourself \
-about to send one call, add the other calls you already know you need (the \
-next file's window, the second keyword, the symbol lookup) to the SAME step. \
-A one-call step is only correct when it is genuinely the last thing you need \
-before the report. Never read a file you have not located, and never guess an \
-offset: read offset=1, or the window a result pointed you at — an offset past \
-the end returns nothing and wastes a whole round.\n\
+question whose answer could change what you do next, and never spend a step on \
+something you already have enough context to answer. Never read a file you have \
+not located, and never guess an offset: read offset=1, or the window a result \
+pointed you at — an offset past the end returns nothing and wastes a whole round.\n\
 How to search — never blindly. First decide what the question gives you, enter at \
 the matching step below, and move from the cheapest PRECISE tool to the next:\n\
 1. Paths and directories come from PROJECT LAYOUT (below), never from guessing. \
@@ -4121,9 +5524,83 @@ PROJECT LAYOUT (dir: entries; hidden dirs and build output omitted):\n{layout}"
 /// actually looking at.
 static RETRY_NUDGE: AtomicU64 = AtomicU64::new(0);
 
+/// Chat ids whose sub-agent retry ladder is LIVE, ref-counted because parallel
+/// explore calls in one turn can each be retrying at the same time.
+///
+/// `POST /chat/retry_now` answers from this: a banner can outlive the ladder
+/// that produced it (the turn ended, the stream dropped), and a click that
+/// nothing is listening for must not be reported as accepted — that is exactly
+/// how the Retry button came to look broken.
+fn live_retries() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register (or drop, with `delta = -1`) one live ladder for a chat.
+fn mark_live(chat_id: &str, delta: i32) {
+    let Ok(mut map) = live_retries().lock() else {
+        return;
+    };
+    let entry = map.entry(chat_id.to_string()).or_insert(0);
+    if delta > 0 {
+        *entry += 1;
+    } else if *entry > 1 {
+        *entry -= 1;
+    } else {
+        map.remove(chat_id);
+    }
+}
+
+/// Whether a sub-agent retry ladder is currently running for this chat.
+pub fn retry_ladder_live(chat_id: &str) -> bool {
+    live_retries()
+        .lock()
+        .map(|m| m.contains_key(chat_id))
+        .unwrap_or(false)
+}
+
 /// Force the running explore ladder to retry immediately (banner Retry button).
-pub fn nudge_subagent_retry() {
+///
+/// Returns whether a ladder was actually listening, so the HTTP handler can
+/// tell the renderer the truth instead of always claiming success.
+pub fn nudge_subagent_retry(chat_id: &str) -> bool {
     RETRY_NUDGE.fetch_add(1, Ordering::Relaxed);
+    retry_ladder_live(chat_id)
+}
+
+/// Ref-counted "this chat has a live retry ladder" registration, released on
+/// EVERY exit path (success, give-up, cancel) by `Drop`. Without the guard the
+/// map would leak an entry per abandoned retry and the endpoint would keep
+/// promising that something is listening.
+struct RetryLive {
+    chat_id: String,
+    armed: bool,
+}
+
+impl RetryLive {
+    fn new(chat_id: &str) -> Self {
+        Self {
+            chat_id: chat_id.to_string(),
+            armed: false,
+        }
+    }
+
+    /// Mark live on the first retry this ladder actually announces.
+    fn arm(&mut self) {
+        if !self.armed {
+            self.armed = true;
+            mark_live(&self.chat_id, 1);
+        }
+    }
+}
+
+impl Drop for RetryLive {
+    fn drop(&mut self) {
+        if self.armed {
+            mark_live(&self.chat_id, -1);
+        }
+    }
 }
 
 /// Current nudge counter — see `RETRY_NUDGE`.
@@ -4238,6 +5715,8 @@ async fn run_subagent(
         prompt,
         history: Vec::new(),
         system_prompt: explore_system_prompt(&parent.root),
+        // A sub-agent is read, not heard: never apply the live-voice rules.
+        system_suffix: String::new(),
         skills: Vec::new(),
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
@@ -4275,6 +5754,9 @@ async fn run_subagent(
         images: Vec::new(),
         // A sub-agent inherits the parent's auto-fetch count.
         web_search_auto_fetch: parent.web_search_auto_fetch,
+        // …and its capabilities: a read-only parent must not become writable
+        // just because it handed the work to a sub-agent.
+        cap: parent.cap.clone(),
     };
 
     // Attempt ladder. A sub-agent runs INSIDE the parent turn, so the
@@ -4288,6 +5770,32 @@ async fn run_subagent(
     // re-aimed at the parent's model. Kept outside the loop so the ladder can
     // tell "the slot model is broken" from "the fallback is broken too".
     let mut using_fallback = false;
+    // How ONE attempt ended. A user-requested restart is distinct from both a
+    // failure and a hang: nothing is wrong with the model, we simply stopped
+    // waiting because the user asked us to.
+    enum AttemptEnd {
+        Finished(Result<(), String>),
+        Hung,
+        Nudged,
+    }
+    // Highest nudge value this ladder has already ACTED on.
+    //
+    // A click must be honoured exactly once, and it must be honoured whatever
+    // the ladder happens to be doing at that moment: sitting in a backoff, OR
+    // waiting on a model call that may not answer for minutes. Tracking what was
+    // already consumed is what makes both possible. Comparing against a value
+    // captured once before the loop made a single click fire forever; capturing
+    // it again at each backoff (the original bug) threw away every click that
+    // landed while an attempt was running.
+    let mut consumed_nudge = retry_nudge();
+    // Ref-counted "a ladder is live for this chat" marker, dropped on EVERY exit
+    // path below (success, give-up, break, cancel). It exists so the Retry
+    // endpoint can answer honestly instead of always claiming it was accepted.
+    let mut live = RetryLive::new(parent.chat_id.as_str());
+    // Armed for the whole ladder, not only while a banner is on screen: the
+    // nudge select watches from the FIRST attempt, so a click is honoured
+    // wherever the ladder happens to be.
+    live.arm();
     for attempt in 1..=SUBAGENT_MAX_ATTEMPTS {
         let mut report = String::new();
         let mut sub_error = String::new();
@@ -4298,7 +5806,7 @@ async fn run_subagent(
         // model.
         let pulse = std::sync::Arc::new(AtomicU64::new(1));
         let pulse_sink = std::sync::Arc::clone(&pulse);
-        let res = {
+        let (res, was_nudged) = {
             let mut sink = |ev: &AgentEvent| {
                 pulse_sink.fetch_add(1, Ordering::Relaxed);
                 fold_subagent_event(&mut report, &mut sub_error, ev);
@@ -4354,37 +5862,79 @@ async fn run_subagent(
             };
             let fut = run_turn(&sub_req, &mut sink, cancel);
             tokio::pin!(fut);
-            let outcome = tokio::select! {
-                r = &mut fut => Some(r),
-                _ = guard => None,
+            // The Retry button must be able to end an attempt that is already
+            // RUNNING, not merely shorten the wait after it. The banner stays up
+            // for the whole attempt, so a click almost always lands while the
+            // model call is in flight — often on a provider that has accepted the
+            // connection and gone quiet. Shortening only the backoff left the
+            // button visibly "acknowledged" while nothing actually happened.
+            let nudge_from = consumed_nudge;
+            let nudge = async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if retry_nudge() != nudge_from {
+                        return;
+                    }
+                }
             };
-            match outcome {
-                Some(r) => r,
-                None => Err(format!(
+            tokio::pin!(nudge);
+            let end = tokio::select! {
+                r = &mut fut => AttemptEnd::Finished(r),
+                _ = guard => AttemptEnd::Hung,
+                _ = &mut nudge => AttemptEnd::Nudged,
+            };
+            let was_nudged = matches!(end, AttemptEnd::Nudged);
+            // Whatever ended this attempt, the nudge that did so is spent. Record
+            // it BEFORE retrying, so one click can never cut the next attempt short
+            // as well (that would burn the whole ladder in a single click).
+            if was_nudged {
+                consumed_nudge = retry_nudge();
+            }
+            let res = match end {
+                AttemptEnd::Finished(r) => r,
+                AttemptEnd::Hung => Err(format!(
                     "sub-agent hung: no activity for {}s (a \
 stuck tool call or a provider that stopped responding) — attempt aborted",
                     subagent_idle_secs()
                 )),
-            }
+                AttemptEnd::Nudged => Err(String::new()),
+            };
+            (res, was_nudged)
         };
-        let failed: (String, bool) = match res {
-            Ok(()) => {
-                if report.trim().is_empty() {
-                    // The turn "succeeded" but produced no text — the parent must
-                    // not treat an empty report as data. Surface the captured
-                    // sub-agent error (or a generic message) so it can retry or
-                    // fall back to its own tools.
-                    let why = if sub_error.trim().is_empty() {
-                        "the sub-agent produced no output (empty model response)".to_string()
-                    } else {
-                        sub_error
-                    };
-                    (format!("explore returned no findings: {why}"), false)
-                } else {
-                    return (report, true);
-                }
+        // The user asked for this attempt to be REDONE. Nothing failed — we
+        // simply stopped waiting — so retry immediately with no backoff, and
+        // deliberately leave `last` untouched: if the ladder later gives up it
+        // must still report the REAL failure reason, never an empty "requested".
+        if was_nudged {
+            if cancel.load(Ordering::Relaxed) {
+                break;
             }
-            Err(e) => (format!("sub-agent failed: {e}"), false),
+            if attempt == SUBAGENT_MAX_ATTEMPTS {
+                // A manual retry on the final attempt: nothing is left to try, so
+                // end with a truthful reason instead of silently looping.
+                last = (
+                    "the last attempt was cut short for a manual retry and no attempts remained"
+                        .into(),
+                    false,
+                );
+                break;
+            }
+            emit(&AgentEvent::Retry {
+                attempt,
+                max_attempts: SUBAGENT_MAX_ATTEMPTS,
+                delay_secs: 0,
+                reason: "retrying now (requested)".into(),
+                agent: "explore subagent".into(),
+                tool: tool.to_string(),
+                model: sub_req.model.clone(),
+                reconnecting: true,
+                fallback: false,
+            });
+            continue;
+        }
+        let failed: (String, bool) = match classify_subagent_attempt(&res, &report, &sub_error) {
+            Ok(()) => return (report, true),
+            Err(reason) => (reason, false),
         };
         last = failed;
         // A FATAL failure (invalid key, unknown model, rejected request) can
@@ -4444,18 +5994,18 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             fallback: false,
         });
         // The backoff is INTERRUPTIBLE: the banner's Retry button bumps
-        // `RETRY_NUDGE` and the remaining wait is skipped, so the user can force
-        // the next attempt instead of watching a countdown. Without this the
-        // button was DEAD on a live sub-agent retry — the parent turn is still
-        // streaming, so `send()` is a no-op behind its single-flight guard and
-        // clicking Retry did literally nothing.
-        let nudged_from = retry_nudge();
+        // `RETRY_NUDGE` and the remaining wait is skipped. A click that landed
+        // while the attempt was RUNNING normally ends the attempt outright (see
+        // the nudge select above) and never reaches this loop — but the wait
+        // must stay interruptible too, or a click during the countdown would be
+        // dropped.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(SUBAGENT_RETRY_BACKOFF_MS);
         let mut forced = false;
         while std::time::Instant::now() < deadline {
-            if retry_nudge() != nudged_from {
+            if retry_nudge() != consumed_nudge {
                 forced = true;
+                consumed_nudge = retry_nudge();
                 break;
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4545,25 +6095,95 @@ fn cache_read_tuple(acc: &StreamAcc) -> u64 {
         .unwrap_or(0)
 }
 
+/// The main agent's system prompt.
+///
+/// Everything before the FINAL sentence must stay byte-identical across turns:
+/// this string is `messages[0]`, the first byte an automatic prefix cache can
+/// reuse, so a single changed character here re-bills the whole request.
+///
+/// `mode` and `root` are therefore placed at the END, not in the opening
+/// sentence where they started. Measured on real traces: a turn that switched
+/// `Mode: build` -> `Mode: ask` (a 2-byte change at offset 120) collapsed the
+/// prefix at 1.6% and re-billed 58,432 input tokens with a 0.0% cache hit,
+/// while the very next ask->ask turn of the same size hit 94.6%. Keeping the
+/// constant text first and the volatile tail last makes the switch cost the
+/// tail only.
 fn default_system_prompt(mode: &str, root: &str) -> String {
+    // The mode-specific rule rides in the VOLATILE TAIL (next to `root`/`mode`),
+    // not in the body above: the body is the cached prefix, so a byte that
+    // differed between modes would re-bill the whole prompt on every switch.
+    let mode_rule = if caps_for_mode(mode).write_files {
+        // Build (and any unknown writable mode): the edit IS the artifact, so the
+        // reply is a short report OF it. The rule has to live here — the
+        // "REPLY DISCIPLINE" text in `appstate::system_prompts` is display-only
+        // and never reaches the model — and without it a one-line fix came back
+        // wrapped in pasted file contents and a multi-paragraph write-up.
+        "You may write and edit files here. The edit_file/write_file call IS the \
+artifact: never paste whole files or large code blocks into your reply — after the edits, \
+say concisely what changed (file, function, short diff-level description) and stop. Scale \
+the report to the size of the change: a one-line fix gets one line, not a write-up. If the \
+user also asked a question, answer it directly and briefly."
+    } else if mode == "ask" || mode == "chat" {
+        // Ask is the mentoring mode: the user wants an ANSWER, not a report.
+        // Without this rule the shared body above ("delegate to `explore` and
+        // work from its full report") pulled long, structured dumps into the
+        // reply: a one-line question got an audit. Brevity is the default here;
+        // depth is opt-in.
+        "This turn is ASK mode: read-only AND short. Answer the question itself in the \
+first sentence, in plain words, in 2-4 short lines — no preamble, no headings, no numbered \
+steps, no checklist, and never paste an explore report or raw tool output. Define a \
+technical term in a clause right where it appears. Expand ONLY when the user asks for more \
+(\"explain more\", \"why\", \"step by step\", \"جزئیات\"): then go deeper but stay simple — \
+short sentences, one concrete example, exact file:line. You cannot write or edit anything \
+here, but READING IS OPEN: files through `explore`, and the shell for any inspection \
+(du/df/ps/lsof, git status/diff/log, builds, tests, typecheck) — only a command that would \
+change the workspace is refused. Describe a needed change as file + the exact old text -> \
+new text and say that Build mode applies it."
+    } else if mode == "plan" {
+        // Plan's whole deliverable IS prose, so an unbounded plan sprawls exactly
+        // the way ask's answers did. Its shape rule belongs here, next to the
+        // read-only rule: the "SHORT, scannable IMPLEMENTATION PLAN" wording in
+        // `appstate::system_prompts` is display-only and never reaches the model.
+        "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
+anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
+commit, package installs), so describe changes instead of applying them — inspection is \
+otherwise wide open (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck). The \
+deliverable is a SHORT, \
+scannable plan: one '## Plan' heading, then one line per step naming the file it touches \
+(and the line when you know it) — no essay, no restating the request, no code blocks, no \
+prose between steps. Keep the whole plan under ~25 lines: a longer plan means the steps are \
+too fine, so merge them. Name the mode each out-of-scope item belongs to instead of \
+expanding on it."
+    } else {
+        "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
+anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
+commit, package installs); every read-only command still runs. Answer with the concrete \
+change instead — which file, which line, the exact old text -> new text — and tell the user \
+to switch to Build mode to apply it."
+    };
     format!(
         "You are Codifa, a coding agent inside the user's desktop IDE. \
-Workspace root: {root}. Mode: {mode}. \
 You have NO search/read tools: delegate ALL file reading, searching and \
 LSP lookups to the `explore` sub-agent and work from its full report. \
 When a task spans several independent areas, fire SEVERAL `explore` calls \
 IN THE SAME STEP (they run concurrently, one round-trip) — one focused \
 explore per area/file group. A single broad explore is the slowest, \
 shallowest option; only a genuinely single-area question justifies one call. \
-NEVER use run_terminal to find or inspect files (find/grep/rg/ls) — file \
-discovery goes through `explore` only; run_terminal is for builds, tests \
-and git. \
+NEVER use run_terminal to SEARCH for files (find/grep/rg/fd/locate) — file \
+discovery goes through `explore` only; the shell is for listing and measuring \
+(ls, du, df, ps, lsof), builds, tests and git. \
 To verify LIVE, run the project in its OWN dev workflow, and ALWAYS check \
 first whether that dev process is already running (ps/lsof + its port): if it \
 is, REUSE it and never start a second one — duplicate dev servers fight over \
 the same port and produce conflicting logs. Only start it once when nothing \
 is running, and never verify against a release build. \
-Use write_file/edit_file/run_terminal to make changes. \
+Use the tools this mode binds to make changes, and never claim a change you \
+did not make. \
+The generic coding rules — project structure, smallest correct diff, no \
+hard-coding, efficiency, explicit errors, tests, and the debugging protocol — \
+live in the built-in `Coding Standards` skill: call load_skill with \
+name=Coding Standards before writing, changing or reviewing code, and follow \
+what it says. \
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \
 A system message holding a compacted summary is AUTHORITATIVE history: every \
@@ -4577,7 +6197,8 @@ listed there, it is finished — do NOT redo it, do NOT re-verify it, and do NOT
 re-implement it from scratch. Say what is already done and continue from what \
 is actually left. Redoing finished work is a bug, not thoroughness. \
 Reply in the user's language. \
-Docstrings and comments in code must be English."
+Docstrings and comments in code must be English. \
+Workspace root: {root}. Mode: {mode}. {mode_rule}"
     )
 }
 
@@ -4588,6 +6209,48 @@ Docstrings and comments in code must be English."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_trace_text_cuts_on_a_utf8_boundary() {
+        // A multi-byte char straddling the cap must not panic (byte slicing
+        // mid-char is exactly what broke Persian text before).
+        let s = "سلام دنیا".repeat(10);
+        let clipped = clip_trace_text(&s, 7);
+        assert!(clipped.ends_with("… (truncated)"));
+        assert!(clipped.chars().next().is_some());
+        // Short input is returned untouched — no marker, no copy damage.
+        assert_eq!(clip_trace_text("abc", 100), "abc");
+    }
+
+    #[test]
+    fn trace_prompt_text_keeps_the_wire_conversation() {
+        // The llm row's `prompt` must show what the model was actually sent:
+        // the user line, prior assistant text and tool results — with the
+        // system message reduced to a size marker (it lives on the `prompt`
+        // row in full).
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "you are helpful"}),
+            serde_json::json!({"role": "user", "content": "سلام"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [{
+                    "id": "c1",
+                    "function": {"name": "read", "arguments": "{\"filePath\":\"a.ts\"}"}
+                }],
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "line 1"}),
+        ];
+        let text = trace_prompt_text(&messages);
+        assert!(text.contains("[system] 15 chars"), "system marker missing: {text}");
+        assert!(!text.contains("you are helpful"), "system body must be elided");
+        assert!(text.contains("[user]\nسلام"));
+        assert!(text.contains("[assistant]\nchecking"));
+        assert!(text.contains("→ read("), "tool call shorthand missing: {text}");
+        assert!(text.contains("[tool]\nline 1"));
+        // An empty conversation must not produce a row body of whitespace.
+        assert_eq!(trace_prompt_text(&[]), "");
+    }
 
     /// Model id the live explore test asserts on (mirror of the backend_light
     /// live-test constant): distinctive enough that a bug which sends the
@@ -4611,6 +6274,7 @@ mod tests {
             result: "x".into(),
             ok: true,
             results: None,
+            engine: None,
         }
         .to_json();
         // Finished tools resolve the running card minted by ToolStart.
@@ -4627,6 +6291,8 @@ mod tests {
             model: "sub-model".into(),
             provider_id: "p2".into(),
             sub: true,
+            context_tokens: 0,
+            context_window: 0,
         }
         .to_json();
         // Sub-agent usage is flagged so the context meter ignores it.
@@ -4635,6 +6301,25 @@ mod tests {
         // sub-agent tokens land under the SUB model in Model usage.
         assert_eq!(t["model"], "sub-model");
         assert_eq!(t["provider_id"], "p2");
+        // `context_tokens` is the prompt the provider billed — the number the
+        // auto-compaction trigger compares against, so the meter and the fold
+        // agree.
+        assert_eq!(t["context_tokens"], 0);
+        let t = AgentEvent::Usage {
+            input_tokens: 900,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            model: "main".into(),
+            provider_id: "p1".into(),
+            sub: false,
+            context_tokens: 900,
+            context_window: 200_000,
+        }
+        .to_json();
+        assert_eq!(t["context_tokens"], 900);
+        // The denominator the trigger uses — the renderer divides by it so the
+        // ring and the fold cannot drift apart.
+        assert_eq!(t["context_window"], 200_000);
         let ts = AgentEvent::ToolStart {
             id: "call1".into(),
             name: "explore".into(),
@@ -4817,6 +6502,244 @@ mod tests {
     }
 
     #[test]
+    fn ask_mode_withholds_the_mutating_tools() {
+        // Ask is read-only for real: the model must not even see a tool that
+        // could touch the disk, and a call that still arrives is refused.
+        let names = |caps: &ToolCaps| -> Vec<String> {
+            let mut schemas = tool_schemas(true, false);
+            retain_allowed_tools(&mut schemas, caps);
+            schemas
+                .iter()
+                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        let ask = names(&caps_for_mode("ask"));
+        for banned in ["write_file", "edit_file"] {
+            assert!(
+                !ask.contains(&banned.to_string()),
+                "ask must not bind {banned}"
+            );
+        }
+        // Reading stays wide open: the sub-agent, the web, and the SHELL —
+        // inspecting IS reading (`du -sh`, `df -h`, `ps`, `git status`), so the
+        // terminal is bound in every mode and only WRITES are refused.
+        assert!(ask.contains(&"explore".to_string()));
+        assert!(ask.contains(&"web_search".to_string()));
+        assert!(ask.contains(&"fetch_url".to_string()));
+        assert!(ask.contains(&"run_terminal".to_string()));
+
+        // Plan may inspect with the terminal but still never writes.
+        let plan = names(&caps_for_mode("plan"));
+        assert!(!plan.contains(&"write_file".to_string()));
+        assert!(!plan.contains(&"edit_file".to_string()));
+        assert!(plan.contains(&"run_terminal".to_string()));
+
+        // Build keeps everything, and an id this build does not know stays
+        // permissive — a missing table row must not disarm a mode.
+        let build = names(&caps_for_mode("build"));
+        for kept in ["write_file", "edit_file", "run_terminal"] {
+            assert!(build.contains(&kept.to_string()), "build must bind {kept}");
+        }
+        assert_eq!(build.len(), names(&ToolCaps::default()).len());
+
+        // The backstop, for a call that bypassed the schema list.
+        assert!(denied_by_caps(&caps_for_mode("ask"), "write_file").is_some());
+        // The terminal is allowed in ask; the COMMAND is what gets refused, by
+        // the `!caps.write_files` gate in the tool loop.
+        assert!(denied_by_caps(&caps_for_mode("ask"), "run_terminal").is_none());
+        assert!(denied_by_caps(&caps_for_mode("build"), "write_file").is_none());
+        // A tool the capability table has no opinion on is never gated.
+        assert!(denied_by_caps(&ToolCaps::default(), "explore").is_none());
+    }
+
+    #[test]
+    fn tool_caps_follow_the_renderer_contract() {
+        // The renderer sends the `ModeCapabilities` object verbatim, so the keys
+        // are camelCase; a missing object must parse as `None` so `run_turn`
+        // derives the table from `mode` instead of falling back to permissive.
+        let caps: ToolCaps = serde_json::from_value(json!({
+            "readFiles": true,
+            "writeFiles": false,
+            "runTerminal": false,
+            "web": true
+        }))
+        .unwrap();
+        assert!(caps.read_files);
+        assert!(!caps.write_files);
+        assert!(!caps.run_terminal);
+        assert!(caps.web);
+
+        let absent: Option<ToolCaps> = serde_json::from_value(json!(null)).unwrap();
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn read_only_modes_cannot_write_through_the_terminal() {
+        // Plan keeps `run_terminal` (it must run builds and tests), so the
+        // capability gate on the tool NAME cannot be the whole story: a shell
+        // command can write a file without ever calling `write_file`. Every
+        // command that changes the workspace must be refused while the turn may
+        // not write, or "read-only" is a lie.
+        for cmd in [
+            "echo hi > src/app.ts",
+            "echo hi >> notes.md",
+            "du -sh . 2> disk.log",
+            "df -h > usage.txt",
+            "cat a.txt > b.txt",
+            "sed -i 's/a/b/' src/app.ts",
+            "sed -i.bak 's/a/b/' f.ts",
+            "perl -pi -e 's/a/b/' f.ts",
+            "rm -rf node_modules",
+            "/bin/rm -rf build",
+            "mv a.ts b.ts",
+            "cp a.ts b.ts",
+            "mkdir -p src/new",
+            "touch newfile.ts",
+            "truncate -s 0 app.log",
+            "ls | xargs rm",
+            "find . -name '*.ts' -delete",
+            "git commit -m wip",
+            "git add .",
+            "git checkout -- src/app.ts",
+            "git reset --hard",
+            "git stash",
+            "npm install left-pad",
+            "npm i",
+            "pnpm add react",
+            "cargo add serde",
+            "cargo fmt",
+            "pip install requests",
+            "brew install jq",
+            "prettier --write src",
+            "eslint --fix src",
+        ] {
+            assert!(
+                is_mutating_command(cmd),
+                "{cmd:?} changes the workspace and must be refused in a read-only mode"
+            );
+        }
+
+        // The read-only inspection the modes exist for must keep working.
+        for cmd in [
+            "git status",
+            "git diff",
+            "git diff --staged",
+            "git log --oneline -5",
+            "pwd",
+            "node --version",
+            "npm run build",
+            "npm test",
+            "cargo test",
+            "cargo check 2>&1 | tail -20",
+            // The user's real command: a device redirect is not a write.
+            "du -sh ~ 2>/dev/null",
+            "df -h > /dev/null",
+            "du -sh * 2>/dev/null | sort -h",
+            "npx tsc --noEmit",
+            "prettier --check src",
+            "eslint src",
+            "find . -iname '*.ts'",
+            "sed -n '1,20p' src/app.ts",
+        ] {
+            assert!(
+                !is_mutating_command(cmd),
+                "{cmd:?} only inspects and must still run in a read-only mode"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_and_measuring_are_reads_but_searching_stays_delegated() {
+        // The user's rule: every READ works in every mode, only APPLYING a
+        // change needs Build. Listing and measuring read what the caller
+        // already knows about, so they must never be refused; a search engine
+        // is delegated because it duplicates `explore` (the main agent's only
+        // search path), not because reading is restricted.
+        for cmd in [
+            "ls",
+            "ls -la src",
+            "ls -1 | head -20",
+            "du -sh * | sort -h",
+            "df -h",
+            "cat package.json",
+            "sed -n '1,20p' src/app.ts",
+        ] {
+            assert!(
+                !is_file_search_command(cmd),
+                "{cmd:?} lists or reads a known target and must stay allowed"
+            );
+        }
+        for cmd in [
+            "grep -rn foo src",
+            "rg TODO",
+            "find . -name '*.ts'",
+            "locate lib.rs",
+            "fd main",
+            "tree src",
+        ] {
+            assert!(
+                is_file_search_command(cmd),
+                "{cmd:?} searches and must be delegated to `explore`"
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_into_devices_are_reads_but_redirects_into_files_are_writes() {
+        // The reported bug: `du -sh ~ 2>/dev/null` was refused in a read-only
+        // mode because ANY `>` counted as a write. A device node absorbs the
+        // stream and leaves the workspace untouched, so it is a read.
+        for cmd in [
+            "du -sh ~ 2>/dev/null",
+            "df -h > /dev/null",
+            "du -sh * 2>/dev/null | sort -h",
+            "git status >/dev/null 2>&1",
+            "ps aux 2>&1 | head -5",
+        ] {
+            assert!(
+                !is_mutating_command(cmd),
+                "{cmd:?} only writes to a descriptor or a device, never to the workspace"
+            );
+        }
+        for cmd in [
+            "du -sh . 2> disk.log",
+            "df -h > usage.txt",
+            "ls >> notes.md",
+        ] {
+            assert!(
+                is_mutating_command(cmd),
+                "{cmd:?} redirects into a real file and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_turn_cannot_smuggle_a_write_through_an_interpreter() {
+        // `node -e "fs.writeFileSync(...)"` changes the workspace without naming
+        // a single mutating binary, so the eval forms are refused while the turn
+        // may not write. A plain run of the same binary stays allowed.
+        for cmd in [
+            r#"node -e "require('fs').writeFileSync('a','b')""#,
+            "python3 -c \"open('a','w')\"",
+            "sh -c 'rm -rf src'",
+            "bash -c 'echo x > f'",
+            "eval $(cat script)",
+        ] {
+            assert!(
+                is_mutating_command(cmd),
+                "{cmd:?} can write through an interpreter"
+            );
+        }
+        for cmd in ["node --version", "python --version", "node scripts/build.js"] {
+            assert!(
+                !is_mutating_command(cmd),
+                "{cmd:?} runs code without an eval form and must stay allowed"
+            );
+        }
+    }
+
+    #[test]
     fn authoring_tools_are_bound_only_when_the_turn_asks_for_them() {
         // An ordinary turn must not be able to rewrite the skill store or the
         // connector list, so the authoring tools are gated on allow_create.
@@ -4995,6 +6918,23 @@ mod tests {
     }
 
     #[test]
+    fn explore_prompt_budgets_rounds_and_says_why() {
+        // Measured on real traces: one explore ROUND costs ~7.7K uncached tokens
+        // (a 9-round run paid ~78K), so rounds — not calls — are the price. The
+        // old prompt only said "aim for 2-3 rounds" and the model drifted to a
+        // median of 4-5 with a tail of 11. The budget must be explicit and the
+        // reason a read now is cheap (stable prefix) must be stated, otherwise
+        // the model saves one cheap read and pays a whole round for it later.
+        let p = explore_system_prompt(std::env::temp_dir().to_str().unwrap());
+        assert!(p.contains("3-step budget"), "{p}");
+        assert!(p.contains("STEP 1 - LOCATE"), "{p}");
+        assert!(p.contains("STEP 2 - READ"), "{p}");
+        assert!(p.contains("PREFIX"), "{p}");
+        // The old "aim for 2-3 rounds" wish is gone — replaced by a budget.
+        assert!(!p.contains("Aim for 2-3 rounds"), "{p}");
+    }
+
+    #[test]
     fn subagent_report_keeps_only_text_after_the_last_search_tool() {
         let mut report = String::new();
         let mut err = String::new();
@@ -5052,7 +6992,10 @@ mod tests {
         // Shapes without a target are never deduped (nothing to compare).
         assert!(lookup_key("read", &json!({"path": "src"})).is_none());
         assert!(lookup_key("grep", &json!({"path": "src"})).is_none());
-        assert!(lookup_key("glob", &json!({"pattern": "**/*.ts"})).is_none());
+        // `glob` IS deduped now (it was not, and a traced run re-listed the
+        // same directory): a pattern is a real target, a bare scope is not.
+        assert!(lookup_key("glob", &json!({"pattern": "**/*.ts"})).is_some());
+        assert!(lookup_key("glob", &json!({"path": "src"})).is_none());
     }
 
     #[test]
@@ -5072,7 +7015,36 @@ mod tests {
             ("b".to_string(), "read".to_string(), "{}".to_string()),
         ];
         assert!(single_call_hint("subagent", &two).is_none());
-        assert!(single_call_hint("agent", &one("run_terminal")).is_none());
+        // Native write/terminal tools DO get a hint now: traced main-agent turns
+        // spent 72% of their steps on one call, 125 of them `run_terminal`. The
+        // wording must promise ordering, not parallelism — these calls mutate the
+        // workspace and never enter the concurrent batch.
+        for name in ["run_terminal", "edit_file", "write_file"] {
+            let hint = single_call_hint("agent", &one(name)).unwrap();
+            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
+            assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
+        }
+        // The browser tools were the BIGGEST missing group: traced main-agent
+        // rounds were 54 solo `browser_evaluate` + 12 solo `browser_navigate`
+        // and the hint never fired on any of them (it fired on 2 of 280 rounds
+        // in the whole corpus). They act on one shared page in order, so they
+        // carry the same "in order" wording, never a parallelism promise.
+        for name in [
+            "browser_evaluate",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_fill_form",
+            "browser_press_key",
+            "browser_select_option",
+        ] {
+            let hint = single_call_hint("agent", &one(name)).unwrap_or_else(|| panic!("{name} has no hint"));
+            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
+            assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
+        }
+        // A tool the hint has nothing useful to say about must stay silent.
+        assert!(single_call_hint("agent", &one("glob")).is_none());
     }
 
     #[test]
@@ -5084,14 +7056,43 @@ mod tests {
         // (search results / file list) must both survive — the main agent has
         // no read tool, so a lost tail is lost work it would re-delegate.
         let big = format!("HEAD{}TAIL", "x".repeat(EXPLORE_REPORT_CAP + 100));
-        finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big, true, false, None);
+        finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big, true, false, None, None);
         let c = messages[0]["content"].as_str().unwrap();
         assert!(c.contains("HEAD") && c.contains("TAIL"), "head and tail must survive");
         assert!(c.contains("ask explore") && !c.contains("offset/limit"));
         // A raw tool result still points at a narrower read window.
         let big2 = "x".repeat(MODEL_RESULT_CAP + 100);
-        finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big2, true, true, None);
+        finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big2, true, true, None, None);
         assert!(messages[1]["content"].as_str().unwrap().contains("offset/limit"));
+    }
+
+    #[test]
+    fn a_subagent_provider_error_fails_the_attempt_even_with_partial_text() {
+        // The bug this guards: an attempt that streamed some text and THEN hit
+        // a provider error used to be reported as a SUCCESS (only an EMPTY
+        // report counted as a failure), so the retry ladder never ran and the
+        // parent got a truncated report as its tool result.
+        let partial = "I searched the repo and found";
+        assert_eq!(
+            classify_subagent_attempt(&Ok(()), partial, "429 rate limit exceeded").is_err(),
+            true,
+            "partial text must NOT mask a provider error"
+        );
+        assert!(classify_subagent_attempt(&Ok(()), partial, "invalid api key")
+            .unwrap_err()
+            .contains("invalid api key"));
+        // A clean, complete report still succeeds.
+        assert!(classify_subagent_attempt(&Ok(()), partial, "").is_ok());
+        assert!(classify_subagent_attempt(&Ok(()), "  \n report \t", "   ").is_ok());
+        // Nothing at all: a failure, and the reason names the empty output.
+        assert!(classify_subagent_attempt(&Ok(()), "   ", "")
+            .unwrap_err()
+            .contains("no output"));
+        // The idle guard's hang is carried straight through.
+        assert_eq!(
+            classify_subagent_attempt(&Err("sub-agent hung: no activity for 300s".into()), "", ""),
+            Err("sub-agent failed: sub-agent hung: no activity for 300s".to_string())
+        );
     }
 
     #[test]
@@ -5121,6 +7122,101 @@ mod tests {
         // Synchronous guard check: empty prompt must fail fast (no model call).
         let args = json!({"description": "d"});
         assert!(args["prompt"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn retry_live_marker_tracks_the_owning_chat_only() {
+        // The Retry endpoint answers from this registry, so it must be per-chat
+        // and ref-counted: parallel explore calls in one turn can each retry at
+        // the same time, and a marker left behind by one of them would keep
+        // promising the button that something is listening.
+        assert!(!retry_ladder_live("chat-a"));
+        assert!(!retry_ladder_live("chat-b"));
+
+        let a1 = RetryLive::new("chat-a");
+        let a2 = RetryLive::new("chat-a");
+        let b = RetryLive::new("chat-b");
+        assert!(!retry_ladder_live("chat-a"), "unarmed ladder must not count");
+
+        let a1 = {
+            let mut a1 = a1;
+            a1.arm();
+            a1
+        };
+        let a2 = {
+            let mut a2 = a2;
+            a2.arm();
+            a2
+        };
+        let b = {
+            let mut b = b;
+            b.arm();
+            b
+        };
+        assert!(retry_ladder_live("chat-a"));
+        assert!(retry_ladder_live("chat-b"));
+
+        // Releasing ONE of the two ladders on chat-a must not clear it.
+        drop(a1);
+        assert!(retry_ladder_live("chat-a"), "second ladder still live");
+        drop(a2);
+        assert!(!retry_ladder_live("chat-a"));
+        // Chat-b is untouched by chat-a's lifetimes.
+        assert!(retry_ladder_live("chat-b"));
+        drop(b);
+        assert!(!retry_ladder_live("chat-b"));
+
+        // Marking the same ladder twice (arm is idempotent) must not inflate the
+        // count and leave a permanently-live chat behind.
+        let mut again = RetryLive::new("chat-c");
+        again.arm();
+        again.arm();
+        assert!(retry_ladder_live("chat-c"));
+        drop(again);
+        assert!(!retry_ladder_live("chat-c"));
+    }
+
+    #[test]
+    fn nudge_reports_whether_a_ladder_is_listening() {
+        // The honest half of POST /chat/retry_now: a banner can outlive its
+        // ladder, and a click nothing consumes must NOT be reported as accepted.
+        assert!(!nudge_subagent_retry("chat-nobody"));
+        let mut live = RetryLive::new("chat-live");
+        live.arm();
+        assert!(nudge_subagent_retry("chat-live"));
+        drop(live);
+        assert!(!nudge_subagent_retry("chat-live"));
+    }
+
+    #[tokio::test]
+    async fn a_nudge_ends_an_attempt_that_is_already_running() {
+        // The reported bug: the banner said "retrying now (requested)" and then
+        // nothing happened, because the click could only shorten the backoff —
+        // never an attempt already sitting inside a model call. This mirrors the
+        // wait the ladder races against that call.
+        let from = retry_nudge();
+        let waiter = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if retry_nudge() != from {
+                    return;
+                }
+            }
+        };
+        let clicked = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            nudge_subagent_retry("chat-running");
+        });
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            std::pin::pin!(waiter),
+        )
+        .await;
+        let _ = clicked.await;
+        assert!(
+            ended.is_ok(),
+            "a click must end a RUNNING attempt, not only a backoff wait"
+        );
     }
 
     #[test]
@@ -5187,6 +7283,97 @@ mod tests {
         // A missing name/content is rejected instead of writing a broken skill.
         assert!(dispatch(root, "create_skill", &json!({"content": "x"}), None).is_err());
         assert!(dispatch(root, "create_skill", &json!({"name": "x"}), None).is_err());
+
+        // The saved skill is marked user-owned, so a later launch cannot revert
+        // an edit made here on the user's behalf.
+        let dir_path = crate::skills::find_skill_dir_pub(&dir, "Movie Finder").expect("folder");
+        assert!(
+            crate::skills::marker_origin(&dir_path).as_deref() == Some("user"),
+            "create_skill must claim the file so the seeder leaves it alone"
+        );
+
+        // Editing with an OMITTED fa_keywords keeps the existing ones (the
+        // parser must not silently erase what a Persian request matches on).
+        let out = dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "Movie Finder", "content": "Step 1: ask for the year."}),
+            None,
+        )
+        .unwrap();
+        assert!(!out.contains("WARNING"), "keywords survived, no warning: {out}");
+        let section = crate::skill_router::build_section("", root, &[]);
+        assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
+
+        // A skill saved with NO keywords is one auto-match can never pick, and
+        // the tool says so instead of reporting a plain success.
+        let out = dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "No Keywords", "description": "d", "content": "c"}),
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("WARNING") && out.contains("NO fa_keywords"), "{out}");
+
+        // deleted_files from the model actually removes the extra file.
+        dispatch(
+            root,
+            "create_skill",
+            &json!({
+                "name": "Movie Finder",
+                "extra_files": {"note.txt": "hello"}
+            }),
+            None,
+        )
+        .unwrap();
+        let dir_path = crate::skills::find_skill_dir_pub(&dir, "Movie Finder").expect("folder");
+        assert!(dir_path.join("note.txt").is_file());
+        dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "Movie Finder", "deleted_files": ["note.txt"]}),
+            None,
+        )
+        .unwrap();
+        assert!(!dir_path.join("note.txt").exists(), "deleted_files is wired");
+
+        // An OMITTED body must not destroy the stored one: an extra-file-only
+        // save, a frontmatter-only edit and a delete all arrive without it.
+        dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "Movie Finder", "fa_keywords": "فیلم, سینما, فیلم"}),
+            None,
+        )
+        .unwrap();
+        let kept = std::fs::read_to_string(dir_path.join("skill.md")).unwrap();
+        assert!(
+            kept.contains("Step 1: ask for the year."),
+            "the stored body survives a body-less save: {kept}"
+        );
+        // …and the empty body must never be treated as "erase the description".
+        assert!(kept.contains("description: find movies"), "{kept}");
+
+        // A NEW skill with no body is still rejected (no empty skill.md).
+        assert!(dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "Bodyless", "description": "d", "fa_keywords": "x y"}),
+            None,
+        )
+        .is_err());
+
+        // Deleting needs no body either — the old guard rejected this call.
+        let out = dispatch(
+            root,
+            "create_skill",
+            &json!({"name": "Movie Finder", "delete": true}),
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("Movie Finder"), "{out}");
+        assert!(!dir_path.exists(), "delete removes the folder: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5368,6 +7555,105 @@ mod tests {
     }
 
     #[test]
+    fn lsp_and_glob_lookups_are_deduplicated_too() {
+        // These arms were missing, so an explore run traced three identical
+        // `lsp_symbols` calls on the SAME file (12_880 model chars each) that
+        // the repeat guard never saw. Every field that can change the ANSWER
+        // must be in the key.
+        let sym = lookup_key("lsp_symbols", &json!({"filePath": "src/a.rs"})).unwrap();
+        assert_eq!(sym, "lsp_symbols|src/a.rs|");
+        assert_eq!(
+            sym,
+            lookup_key("lsp_symbols", &json!({"filePath": "src/a.rs"})).unwrap(),
+            "identical lookup must produce an identical key"
+        );
+        assert_ne!(
+            sym,
+            lookup_key("lsp_symbols", &json!({"filePath": "src/a.rs", "query": "run"})).unwrap(),
+            "a query filters a different symbol list"
+        );
+        assert_ne!(
+            sym,
+            lookup_key("lsp_symbols", &json!({"filePath": "src/b.rs"})).unwrap()
+        );
+
+        assert_eq!(
+            lookup_key("lsp_diagnostics", &json!({"filePath": "src/a.rs"})).unwrap(),
+            "lsp_diagnostics|src/a.rs"
+        );
+
+        // Definition/references/hover share a key SHAPE, so the tool name is
+        // what keeps them apart — the definition of X is not the references of X.
+        let def = lookup_key("lsp_definition", &json!({"filePath": "a.rs", "symbol": "run"}))
+            .unwrap();
+        assert_eq!(def, "lsp_definition|a.rs|run|0|0");
+        assert_ne!(
+            def,
+            lookup_key("lsp_references", &json!({"filePath": "a.rs", "symbol": "run"})).unwrap()
+        );
+        // A repeated name: the line hint selects a different occurrence.
+        assert_ne!(
+            lookup_key("lsp_hover", &json!({"filePath": "a.rs", "symbol": "run", "line": 10}))
+                .unwrap(),
+            lookup_key("lsp_hover", &json!({"filePath": "a.rs", "symbol": "run", "line": 20}))
+                .unwrap()
+        );
+
+        let glob = lookup_key("glob", &json!({"pattern": "**/*.rs", "path": "src"})).unwrap();
+        assert_eq!(glob, "glob|**/*.rs|src|100");
+        assert_ne!(
+            glob,
+            lookup_key("glob", &json!({"pattern": "**/*.ts", "path": "src"})).unwrap()
+        );
+        assert_ne!(
+            glob,
+            lookup_key("glob", &json!({"pattern": "**/*.rs", "path": "src", "max_results": 5}))
+                .unwrap(),
+            "a smaller max_results is a different answer"
+        );
+        // An unusable call yields NO key, so the guard can never answer a call
+        // the dispatcher would have rejected differently.
+        assert!(lookup_key("lsp_symbols", &json!({})).is_none());
+        assert!(lookup_key("lsp_definition", &json!({"filePath": "a.rs"})).is_none());
+        assert!(lookup_key("glob", &json!({"path": "src"})).is_none());
+    }
+
+    #[test]
+    fn a_mutating_call_cannot_be_classified_as_readonly() {
+        // The repeat-guard is cleared after every NON-read-only call, so this
+        // list is a correctness boundary rather than a speed knob: a mutating
+        // tool listed as read-only would let a later `read` be answered with a
+        // pointer to the file as it was BEFORE the edit — the model would never
+        // see its own change.
+        for t in [
+            "write_file",
+            "edit_file",
+            "run_terminal", // arbitrary `sh -c` in the workspace root
+            "delete_memory",
+            "save_memory",
+            "create_skill",
+            "create_mcp",
+            "explore",
+        ] {
+            assert!(
+                !is_readonly_native(t),
+                "{t} can mutate state and must never be treated as a pure read"
+            );
+        }
+        // The pure readers the guard is allowed to answer with a pointer.
+        for t in [
+            "read",
+            "grep",
+            "glob",
+            "find_symbol",
+            "lsp_symbols",
+            "lsp_diagnostics",
+        ] {
+            assert!(is_readonly_native(t), "{t} is a pure read");
+        }
+    }
+
+    #[test]
     fn fold_shrinks_only_results_older_than_the_kept_rounds() {
         // Four rounds; the last MAIN_FOLD_KEEP_ROUNDS (2) are the fresh zone.
         let explore_big = "e".repeat(30_000);
@@ -5469,28 +7755,22 @@ mod tests {
     }
 
     /// "Results per search" (Settings → Web Providers) is ONE number with two
-    /// effects. These assertions pin the contract the UI promises: it sets the
-    /// result count, it may be overridden per call, `0` still returns results
-    /// (it only stops the page fetch), and nothing can exceed the hard cap.
+    /// effects. These assertions pin the contract the UI promises: it is the
+    /// ONLY thing that decides the result count, `0` still returns results (it
+    /// only stops the page fetch), and nothing can exceed the hard cap.
     #[test]
     fn web_search_result_count_comes_from_the_settings_number() {
-        let no_args = json!({});
         // Default setting (5) → five results.
-        assert_eq!(web_search_result_count(&no_args, 5), 5);
+        assert_eq!(web_search_result_count(5), 5);
         // Any other setting is used verbatim.
-        assert_eq!(web_search_result_count(&no_args, 8), 8);
+        assert_eq!(web_search_result_count(8), 8);
         // 0 = "don't fetch pages", NOT "return nothing".
         assert_eq!(
-            web_search_result_count(&no_args, 0),
+            web_search_result_count(0),
             crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT
         );
-        // An explicit max_results still wins, and is clamped to a sane range.
-        assert_eq!(web_search_result_count(&json!({"max_results": 2}), 8), 2);
-        assert_eq!(web_search_result_count(&json!({"max_results": 0}), 8), 1);
-        assert_eq!(
-            web_search_result_count(&json!({"max_results": 99}), 8),
-            crate::websearch::WEB_SEARCH_AUTO_FETCH_MAX
-        );
+        // Out-of-range values are clamped to a sane range instead of trusted.
+        assert_eq!(web_search_result_count(99), crate::websearch::WEB_SEARCH_AUTO_FETCH_MAX);
     }
 
     fn base_req() -> AgentRequest {
@@ -5506,6 +7786,7 @@ mod tests {
             prompt: "hi".into(),
             history: Vec::new(),
             system_prompt: String::new(),
+            system_suffix: String::new(),
             skills: Vec::new(),
             context_window: 0,
             chat_id: String::new(),
@@ -5528,6 +7809,8 @@ mod tests {
             subagent_thinking: std::collections::HashMap::new(),
             images: Vec::new(),
             web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
+            // No renderer to send a table: derive it from the mode instead.
+            cap: None,
         }
     }
 
@@ -6249,9 +8532,15 @@ mod tests {
                                 "data: {}\n\n",
                                 json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"noop_tool","arguments":"{}"}}]}}]}).to_string()
                             ));
+                            // The reported prompt is the REAL prompt size: the
+                            // trigger now anchors on this number instead of a
+                            // local estimate, so a toy value (50) would never
+                            // cross the test's 200-token threshold even though
+                            // the real system prompt + tool schemas are far
+                            // larger.
                             sse.push_str(&format!(
                                 "data: {}\n\n",
-                                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":2}}).to_string()
+                                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":250,"completion_tokens":2}}).to_string()
                             ));
                         } else {
                             sse.push_str(&format!(
@@ -6260,7 +8549,7 @@ mod tests {
                             ));
                             sse.push_str(&format!(
                                 "data: {}\n\n",
-                                json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":1}}).to_string()
+                                json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":300,"completion_tokens":1}}).to_string()
                             ));
                         }
                         sse.push_str("data: [DONE]\n\n");
@@ -6334,6 +8623,123 @@ mod tests {
             full > history_only,
             "full={full} must exceed history-only={history_only}"
         );
+    }
+
+    #[test]
+    fn inline_images_are_not_billed_as_text() {
+        // A single attached screenshot is megabytes of base64. Charging it at
+        // 4 chars/token reported millions of "tokens" and auto-compacted a chat
+        // that was nowhere near the threshold.
+        let base64 = "A".repeat(3_000_000);
+        let with_image = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is in this screenshot?" },
+                { "type": "image", "data_url": format!("data:image/png;base64,{base64}") },
+            ],
+        })];
+        let as_text = {
+            let wire: usize = serde_json::to_string(&with_image)
+                .map(|s| s.chars().count())
+                .unwrap();
+            wire.div_ceil(4)
+        };
+        let measured = estimate_prompt_tokens(&with_image, 0);
+        assert!(
+            measured < as_text / 50,
+            "the image must not be billed as text: measured={measured} vs text={as_text}"
+        );
+        // Concrete numbers, not just "much smaller": a 3 MB base64 screenshot is
+        // ~2k real tokens (2001 by the IMAGE_CHARS_PER_TOKEN budget). The old
+        // unit bug subtracted TOKENS from a CHARACTER count, so this same input
+        // measured 562_518 — a single screenshot folded a whole chat.
+        assert!(
+            (1_500..4_000).contains(&measured),
+            "a 3 MB image must cost ~2k tokens, got {measured}"
+        );
+        // The text part is still counted (no over-subtraction).
+        assert!(measured >= 5, "the prose must survive: {measured}");
+        // No images => unchanged behaviour.
+        let plain = vec![json!({"role": "user", "content": "x".repeat(400)})];
+        assert_eq!(estimate_prompt_tokens(&plain, 0), {
+            let wire: usize = serde_json::to_string(&plain)
+                .map(|s| s.chars().count())
+                .unwrap();
+            wire.div_ceil(4)
+        });
+    }
+
+    #[test]
+    fn measured_prompt_anchors_on_the_provider_not_the_inflated_estimate() {
+        // The provider said the prompt was 1_000 tokens. The turn then appended
+        // one small tool result. The measurement must be ~1_000 + that result —
+        // NOT the local serde-JSON estimate of the whole history (which is what
+        // made compaction fire below the user's threshold).
+        let msgs = vec![
+            json!({"role": "system", "content": "s".repeat(40_000)}),
+            json!({"role": "user", "content": "u".repeat(40_000)}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r".repeat(400)}),
+        ];
+        let full_estimate = estimate_prompt_tokens(&msgs, 0);
+        assert!(full_estimate > 20_000, "sanity: {full_estimate}");
+        let measured = measured_prompt_tokens(&msgs, 0, 2, 1_000);
+        // 1_000 provider + ~100 for the 400-char tool result.
+        assert!(
+            (1_050..1_200).contains(&measured),
+            "measured={measured} must anchor on the provider number"
+        );
+        // Before any usage arrives there is nothing to anchor to: the full
+        // estimate stands alone.
+        assert_eq!(measured_prompt_tokens(&msgs, 0, 0, 0), full_estimate);
+        // A stale anchor (more entries than the vec has, e.g. after a fold)
+        // falls back instead of panicking.
+        assert_eq!(
+            measured_prompt_tokens(&msgs, 0, 99, 1_000),
+            full_estimate
+        );
+    }
+
+    #[test]
+    fn effective_context_window_prefers_the_models_real_window() {
+        // Reported bug: a model whose real window is 1M was measured against the
+        // hardcoded 128k fallback (the renderer had not resolved the window and
+        // sent 0), so 80% compaction fired at ~10% of the real window.
+        let mut req: AgentRequest = serde_json::from_value(json!({
+            "provider": "custom",
+            "provider_id": "p1",
+            "model": "big-model",
+            "base_url": "http://127.0.0.1:1/v1",
+            "root": "/tmp/x",
+            "prompt": "hi",
+            "context_window": 0,
+            "providers": {
+                "p1": { "contextMap": { "big-model": 1_000_000 } }
+            }
+        }))
+        .unwrap();
+        assert_eq!(effective_context_window(&req), 1_000_000);
+
+        // The renderer's own number always wins when it knows it.
+        req.context_window = 200_000;
+        assert_eq!(effective_context_window(&req), 200_000);
+        req.context_window = 0;
+
+        // Provider-prefixed key, as NVIDIA's /models returns it.
+        req.providers.insert(
+            "p1".into(),
+            json!({"contextMap": {"p1/big-model": 400_000}}),
+        );
+        assert_eq!(effective_context_window(&req), 400_000);
+
+        // A malformed/zero entry must not become the window (that would compact
+        // on every single message).
+        req.providers
+            .insert("p1".into(), json!({"contextMap": {"big-model": 0}}));
+        assert_eq!(effective_context_window(&req), DEFAULT_CONTEXT_WINDOW);
+
+        // No providers map at all: the documented fallback.
+        req.providers.clear();
+        assert_eq!(effective_context_window(&req), DEFAULT_CONTEXT_WINDOW);
     }
 
     #[tokio::test]
@@ -6615,5 +9021,608 @@ mod tests {
                 .all(|m| !m["content"].is_array()),
             "the main model must not receive raw image blocks: {mbody}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_screenshot_is_described_once_and_reused() {
+        // A chat re-sends the screenshots still in its history on EVERY turn.
+        // The second turn must answer from the description cache instead of
+        // paying for the same model+image round-trip again — while the KEY
+        // covers the model, the text and the image bytes, so a different image
+        // or question can never be served a stale description.
+        let (vision_base, vision_rx) =
+            spawn_json_mock_upstream("a red button on a white page").await;
+        let vision_bodies = drain_bodies(vision_rx);
+        let (main_base, main_rx) = spawn_explore_mock_upstream().await;
+        let main_bodies = drain_bodies(main_rx);
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Unique prompt text keeps this test's cache key isolated from any other
+        // test that happens to send an image through the Vision slot.
+        let prompt = "what is wrong with this screenshot? (cache-key isolation probe)";
+        let build = |base: &str| {
+            let raw = json!({
+                "provider": "custom",
+                "provider_id": "chat-provider",
+                "model": "main/parent-model",
+                "base_url": format!("{base}/v1"),
+                "api_key": "sk",
+                "api_keys": ["sk"],
+                "root": "/tmp/codifa-live-vision-cache",
+                "mode": "build",
+                "prompt": prompt,
+                "history": [],
+                "images": [PNG_URL],
+                "subagent_models": { "vision": "vision-prov/vision-model" },
+                "providers": {
+                    "chat-provider": {
+                        "kind": "custom",
+                        "manualVisionMap": { "main/parent-model": false }
+                    },
+                    "vision-prov": {
+                        "kind": "custom",
+                        "baseUrl": format!("{vision_base}/v1"),
+                        "apiKeys": ["sk-vision"]
+                    }
+                },
+                "data_root": "/tmp/codifa-live-vision-cache-data"
+            });
+            let req: AgentRequest = serde_json::from_value(raw).unwrap();
+            (req, format!("{base}/v1"))
+        };
+        let (req1, _) = build(&main_base);
+        let mut emit = |_e: &AgentEvent| {};
+        let _ = run_turn(&req1, &mut emit, &cancel).await;
+        let calls_after_first = vision_bodies.lock().unwrap().len();
+        assert_eq!(
+            calls_after_first, 1,
+            "the first turn must describe the image once"
+        );
+
+        // The SAME question about the SAME bytes: no second vision call.
+        let (req2, _) = build(&main_base);
+        let _ = run_turn(&req2, &mut emit, &cancel).await;
+        assert_eq!(
+            vision_bodies.lock().unwrap().len(),
+            1,
+            "a repeated image+question must come from the cache, not a new paid call"
+        );
+        // The vision description is one of the MAIN turn's requests. The mock
+        // upstream here is also the explore sub-agent's endpoint, so filter to
+        // the bodies that actually carry the description.
+        let main_calls = main_bodies.lock().unwrap();
+        let with_desc: Vec<&Value> = main_calls
+            .iter()
+            .filter(|b| {
+                b["messages"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| match &m["content"] {
+                        Value::String(s) => s.contains("a red button on a white page"),
+                        Value::Array(blocks) => blocks
+                            .iter()
+                            .any(|x| x["text"].as_str().is_some_and(|t| {
+                                t.contains("a red button on a white page")
+                            })),
+                        _ => false,
+                    })
+                })
+            })
+            .collect();
+        assert!(
+            with_desc.len() >= 2,
+            "both turns must forward the description to the main model, got {} of {}",
+            with_desc.len(),
+            main_calls.len()
+        );
+    }
+
+    #[test]
+    fn the_vision_cache_key_depends_on_model_text_and_bytes() {
+        let imgs = vec![PNG_URL.to_string(), JPG_URL.to_string()];
+        let base = vision_cache_key("vision-model", "describe this", &imgs);
+        assert_eq!(
+            base,
+            vision_cache_key("vision-model", "describe this", &imgs),
+            "the same inputs must hit the same key"
+        );
+        assert_ne!(
+            base,
+            vision_cache_key("other-model", "describe this", &imgs),
+            "a different model must not reuse a description"
+        );
+        assert_ne!(
+            base,
+            vision_cache_key("vision-model", "different question", &imgs),
+            "a different question must not reuse a description"
+        );
+        assert_ne!(
+            base,
+            vision_cache_key("vision-model", "describe this", &[JPG_URL.to_string()]),
+            "one fewer image must not reuse a description"
+        );
+        // Concatenation ambiguity: ["ab","c"] must not collide with ["a","bc"].
+        let split_a = vec!["ab".to_string(), "c".to_string()];
+        let split_b = vec!["a".to_string(), "bc".to_string()];
+        assert_ne!(
+            vision_cache_key("m", "t", &split_a),
+            vision_cache_key("m", "t", &split_b),
+            "the image count/lengths must be part of the key"
+        );
+    }
+
+    /// Temp data root shared by the plan_section tests (same pattern as the
+    /// plan round-trip test).
+    fn plan_test_root(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("codifa-ps-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap().to_string();
+        (dir, root)
+    }
+
+    #[test]
+    fn plan_section_carries_the_plan_and_the_checklist() {
+        let (dir, root) = plan_test_root("carry");
+        let ws = crate::plans::workspace_slug_for_root("/tmp/workspace-plan");
+        crate::plans::save_plan(&root, &ws, "Plan", "## Plan\nstep one", "chat-1").unwrap();
+        crate::plans::save_checklist(
+            &root,
+            &ws,
+            "chat-1",
+            &json!([
+                {"content": "first", "status": "completed"},
+                {"content": "second", "status": "in_progress"},
+            ]),
+        );
+
+        let got = plan_section(&root, &ws, "chat-1");
+        assert!(got.contains("=== SAVED PLAN"), "{got}");
+        assert!(got.contains("step one"), "{got}");
+        assert!(got.contains("=== CHECKLIST"), "{got}");
+        // Status marks: x completed, ~ in progress.
+        assert!(got.contains("- [x] first"), "{got}");
+        assert!(got.contains("- [~] second"), "{got}");
+
+        // No chat id → no section (nothing to key the files by).
+        assert_eq!(plan_section(&root, &ws, ""), "");
+        assert_eq!(plan_section(&root, &ws, "   "), "");
+        // Unknown chat → empty, not a panic.
+        assert_eq!(plan_section(&root, &ws, "chat-none"), "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_section_is_capped_but_keeps_the_head_and_the_tail() {
+        // A plan is re-sent on every round-trip of every turn: an uncapped body
+        // is a running cost. The cut must preserve the goal (head) and the most
+        // recent items (tail).
+        let (dir, root) = plan_test_root("cap");
+        let ws = crate::plans::workspace_slug_for_root("/tmp/workspace-plan-cap");
+        let big = format!("HEAD-MARKER\n{}\nTAIL-MARKER", "x".repeat(40_000));
+        crate::plans::save_plan(&root, &ws, "Big", &big, "chat-1").unwrap();
+
+        let got = plan_section(&root, &ws, "chat-1");
+        assert!(got.contains("HEAD-MARKER"), "the head must survive");
+        assert!(got.contains("TAIL-MARKER"), "the tail must survive");
+        assert!(got.contains("chars omitted from the middle"), "{got}");
+        // The section stays near the cap instead of carrying all 40 KB.
+        assert!(
+            got.len() < PLAN_SECTION_CAP + 1_000,
+            "section not capped: {} chars",
+            got.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_section_survives_multibyte_text_at_the_cut() {
+        // Persian plan bodies are common; a byte slice at the cut would panic
+        // (and with panic=abort kill the app).
+        let (dir, root) = plan_test_root("utf8");
+        let ws = crate::plans::workspace_slug_for_root("/tmp/workspace-plan-utf8");
+        let body = format!("{}\nپایان", "فارسی‌ ".repeat(4_000));
+        crate::plans::save_plan(&root, &ws, "Persian", &body, "chat-1").unwrap();
+        let got = plan_section(&root, &ws, "chat-1");
+        assert!(!got.is_empty());
+        assert!(got.contains("chars omitted from the middle"), "not capped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_section_is_wrapped_as_a_trailing_context_message() {
+        // The section must never enter the system prompt: it is injected as a
+        // trailing message instead. Measured: it used to make `messages[0]`
+        // 7_734 -> 9_439 -> 7_734 -> 13_642 bytes across five turns and dropped
+        // the main-agent prefix cache to 23.7%.
+        assert!(plan_context_message("").is_none());
+        assert!(plan_context_message("   \n ").is_none());
+
+        let m = plan_context_message("\n\n=== SAVED PLAN (from disk) ===\nstep one\n")
+            .expect("non-empty section must produce a message");
+        assert_eq!(m["role"], "user");
+        let text = m["content"].as_str().unwrap();
+        assert!(text.contains("step one"), "{text}");
+        // The label is load-bearing: without it the model can read a stale
+        // checklist as the user's newest instruction.
+        assert!(text.contains("NOT a new request"), "{text}");
+        assert!(text.contains("end of context"), "{text}");
+        // The recogniser used by the `Compact` emit must match what is built.
+        assert!(text.starts_with(PLAN_CONTEXT_HEAD), "{text}");
+    }
+
+    #[test]
+    fn plan_context_keep_excludes_the_wire_only_plan_message() {
+        // The renderer stores every message of the tail EXCEPT the plan context,
+        // which exists only on the wire. Counting it would tell the renderer to
+        // keep one extra stored message verbatim.
+        let tail = vec![
+            json!({"role": "assistant", "content": "a"}),
+            json!({"role": "tool", "content": "t"}),
+            json!({"role": "user", "content": "question"}),
+            plan_context_message("\n\n=== SAVED PLAN ===\nx\n").unwrap(),
+        ];
+        assert_eq!(tail.len(), 4);
+        assert_eq!(plan_context_keep(&tail), 3);
+        // No plan message → the count is just the length.
+        let plain = vec![json!({"role": "user", "content": "q"})];
+        assert_eq!(plan_context_keep(&plain), 1);
+        assert_eq!(plan_context_keep(&[]), 0);
+    }
+
+    #[test]
+    fn the_system_prompt_prefix_is_byte_stable_across_a_mode_switch() {
+        // `messages[0]` is the first byte an automatic prefix cache can reuse,
+        // so any volatile value in its OPENING lines re-bills the whole request
+        // on every change. `mode` and `root` therefore live in the tail.
+        //
+        // Measured before the fix: `Mode: build` -> `Mode: ask` changed a byte
+        // at offset 120 and collapsed the shared prefix to 1.6%, re-billing
+        // 58_432 input tokens at a 0.0% cache hit — while the next ask->ask
+        // turn of the same size hit 94.6%. See `default_system_prompt`.
+        let root = "/Users/someone/projects/a-really-long-workspace-name";
+        let build = default_system_prompt("build", root);
+        let ask = default_system_prompt("ask", root);
+        let plan = default_system_prompt("plan", root);
+
+        // The two prompts differ ONLY after the constant instructional body.
+        let shared = build
+            .chars()
+            .zip(ask.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Every byte up to the volatile tail marker must be shared: a mode
+        // switch may rewrite the tail (`Mode: {mode}` plus that mode's rule)
+        // and NOTHING else. Counting in chars, since the body has em-dashes.
+        let tail_at = build
+            .find("Workspace root:")
+            .expect("the volatile tail marker must exist");
+        let body_len = build[..tail_at].chars().count();
+        assert!(
+            shared >= body_len,
+            "the prompts diverge after {shared} chars, inside the constant body \
+             (which ends at {body_len}) — a volatile value moved into the cacheable prefix"
+        );
+        // No mode value may appear in the cacheable head at all.
+        let head = &build[..shared];
+        for m in ["build", "ask", "plan"] {
+            assert!(
+                !head.contains(&format!("Mode: {m}")),
+                "the `Mode: {m}` marker is inside the cacheable prefix"
+            );
+        }
+        // The volatile values must still reach the model (nothing was dropped).
+        assert!(build.contains("Mode: build"));
+        assert!(ask.contains("Mode: ask"));
+        assert!(plan.contains("Mode: plan"));
+        assert!(build.contains(root));
+        // The trace ruler keys the main prompt off its first words.
+        assert!(build.starts_with("You are Codifa"));
+    }
+
+    #[test]
+    fn ask_prompt_forces_a_short_answer_and_opt_in_detail() {
+        // Ask mode used to receive the same "delegate to `explore` and work from
+        // its full report" body as Build, so a one-line question came back as a
+        // long structured dump: the brevity rule lived in the appstate text,
+        // which the backend never sends. The rule must ride the prompt the model
+        // actually gets, and it must be ASK-only.
+        let ask = default_system_prompt("ask", "/tmp/x");
+        let build = default_system_prompt("build", "/tmp/x");
+        let plan = default_system_prompt("plan", "/tmp/x");
+
+        assert!(ask.contains("ASK mode"), "ask must carry its own rule");
+        // Brevity is the default, depth is opt-in.
+        assert!(ask.contains("Expand ONLY when the user asks for more"));
+        assert!(ask.contains("2-4 short lines"));
+        assert!(ask.contains("no headings, no numbered steps"));
+        // Build/Plan must not inherit the answer-length rule.
+        assert!(!build.contains("2-4 short lines"));
+        assert!(!plan.contains("2-4 short lines"));
+        // The write instruction is mode-neutral in the shared body: a read-only
+        // turn must not be told to edit files (the schema carries no such tool).
+        assert!(!ask.contains("Use write_file/edit_file/run_terminal"));
+        assert!(!plan.contains("Use write_file/edit_file/run_terminal"));
+        assert!(build.contains("Use the tools this mode binds to make changes"));
+    }
+
+    #[test]
+    fn every_mode_states_the_shape_of_its_reply() {
+        // Length/style rules used to exist ONLY in `appstate::system_prompts`,
+        // which is display-only (`GET /system-prompts`): the model never saw it.
+        // Ask got its rule back; build and plan have the same failure mode —
+        // build pasted whole files into the reply, plan sprawled because its
+        // only deliverable is prose. Pin all three here so a rule cannot be
+        // written in the dead table again.
+        let root = "/tmp/ws";
+        let ask = default_system_prompt("ask", root);
+        let build = default_system_prompt("build", root);
+        let plan = default_system_prompt("plan", root);
+
+        // Build: the edit is the artifact, the reply is a short report of it.
+        assert!(build.contains("IS the artifact"));
+        assert!(build.contains("never paste whole files"));
+        // Plan: the plan itself is capped and step-shaped.
+        assert!(plan.contains("SHORT"));
+        assert!(plan.contains("under ~25 lines"));
+        assert!(plan.contains("one line per step"));
+        // Ask: short by default, detail is opt-in.
+        assert!(ask.contains("2-4 short lines"));
+
+        // The rules must not leak across modes: an ask-shaped reply rule in
+        // build would fight the "the edit IS the artifact" rule, and a plan
+        // budget in build/ask would be meaningless.
+        assert!(!build.contains("2-4 short lines"));
+        assert!(!plan.contains("2-4 short lines"));
+        assert!(!ask.contains("under ~25 lines"));
+        assert!(!build.contains("under ~25 lines"));
+
+        // The read-only rule still reaches the modes that need it (the caps gate
+        // is the hard enforcement; this is the instruction the model reads).
+        // Ask spells it lowercase inside its own rule, plan in its opening words.
+        assert!(plan.contains("READ-ONLY"));
+        assert!(ask.contains("read-only AND short"));
+        assert!(build.contains("You may write and edit files here"));
+        assert!(!build.contains("READ-ONLY"));
+    }
+
+    #[test]
+    fn every_mode_points_at_the_coding_standards_skill() {
+        // The generic coding rules were MOVED OUT of the prompt's display copy
+        // (`appstate::system_prompts`) into a skill, because that text is
+        // display-only and never reaches the model. Extracting rules into a
+        // skill only pays off if the model is actually told to load it, so the
+        // pointer lives in the SHARED body: every mode must carry it, and byte
+        // for byte (the body is the cached prefix — a per-mode pointer would
+        // re-bill the whole prompt on every mode switch).
+        let root = "/tmp/x";
+        let mut seen: Option<String> = None;
+        for mode in ["build", "ask", "plan"] {
+            let p = default_system_prompt(mode, root);
+            assert!(
+                p.contains("`Coding Standards` skill"),
+                "{mode} must point at the Coding Standards skill"
+            );
+            assert!(
+                p.contains("name=Coding Standards"),
+                "{mode} must name the skill exactly as load_skill resolves it"
+            );
+            let body = p.split("Workspace root:").next().unwrap_or_default();
+            match &seen {
+                None => seen = Some(body.to_string()),
+                Some(first) => assert_eq!(
+                    first, body,
+                    "the skill pointer must sit in the SHARED body, not in the \
+                     per-mode tail — otherwise it costs a cache re-bill per switch"
+                ),
+            }
+        }
+
+        // The pointer names the skill by NAME and `load_skill` resolves by exact
+        // name or slug, so a rename in the shipped markdown would silently turn
+        // every pointer into a dangling call that answers "not found".
+        let shipped = include_str!("../skills/coding-standards.md");
+        assert!(
+            shipped.starts_with("---"),
+            "the shipped skill must keep frontmatter first"
+        );
+        assert!(
+            shipped.contains("name: Coding Standards"),
+            "the shipped skill must keep the exact name the prompt points at"
+        );
+        // Matching is keyword-driven (name hits cap at 2, a whole fa_keyword
+        // phrase scores 3). Without keywords the skill would only ever load when
+        // the model chooses to — never because the request itself was about code.
+        assert!(
+            shipped.contains("fa_keywords:"),
+            "fa_keywords are what make the skill auto-matchable from a Persian request"
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_is_free_of_volatile_plan_text() {
+        // Byte-stability guard: `system` must not carry the plan/checklist, or a
+        // single checklist tick invalidates the cached prefix of every turn.
+        let src = include_str!("agent.rs");
+        // Built from parts: this test's own source is inside `src`, and a
+        // literal needle would match itself.
+        let needle = ["system.push_str(&plan", "_section("].concat();
+        assert!(
+            !src.contains(&needle),
+            "the plan section must not be pushed onto the system prompt"
+        );
+        // The gate still exists: the sub-agent gets no plan at all.
+        assert!(
+            src.contains("if req.mode == \"subagent\" {\n        String::new()"),
+            "the plan/checklist block must be gated on the main agent"
+        );
+
+        // And the explore prompt itself must not promise plan tools it lacks.
+        let prompt = explore_system_prompt("/tmp/workspace-none");
+        assert!(!prompt.contains("update_plan"), "explore prompt mentions update_plan");
+        assert!(!prompt.contains("SAVED PLAN"), "explore prompt mentions the plan");
+        assert!(!prompt.contains("CHECKLIST"), "explore prompt mentions the checklist");
+    }
+
+    #[test]
+    fn subagent_fold_uses_its_own_budget_and_keeps_fresh_rounds() {
+        // An explore run re-sends its whole accumulated history on EVERY one of
+        // its rounds, and nothing folded it mid-loop before
+        // (compact_subagent_messages runs once, before the loop).
+        let big = "x".repeat(6_000);
+        let mut messages: Vec<Value> = Vec::new();
+        for i in 1..=4 {
+            messages.extend(fold_round(&format!("s{i}"), "read", &big));
+        }
+        let mut seen = std::collections::HashSet::new();
+        fold_subagent_tool_results(&mut messages, &mut seen);
+
+        // The two NEWEST rounds stay verbatim: the model is reasoning over them.
+        for i in [5usize, 7usize] {
+            assert_eq!(
+                messages[i]["content"].as_str().unwrap().chars().count(),
+                6_000,
+                "a fresh round was folded (message {i})"
+            );
+        }
+        // Older rounds are cut to the SUB budget, not the main one.
+        for i in [1usize, 3usize] {
+            let c = messages[i]["content"].as_str().unwrap();
+            assert!(
+                c.chars().count() < SUB_FOLD_RESULT_CHARS + 200,
+                "stale round not folded: {} chars",
+                c.chars().count()
+            );
+            assert!(c.starts_with(&"x".repeat(SUB_FOLD_RESULT_CHARS)));
+            assert!(c.contains(MAIN_FOLD_MARKER), "stub lost its pointer marker");
+        }
+        // The fold must fire before compact_subagent_messages would (60% of a
+        // 128K window), otherwise the run pays compaction plus a cache reset.
+        assert!(
+            SUB_FOLD_MIN_TOKENS < 128_000 * 60 / 100,
+            "sub fold threshold must sit below the compaction budget"
+        );
+        // Folding rewrites old results, so it invalidates the cached prefix from
+        // that point on. The threshold is therefore not free to go low.
+        assert_eq!(SUB_FOLD_MIN_TOKENS, MAIN_FOLD_MIN_TOKENS);
+    }
+
+    #[test]
+    fn fold_with_takes_keep_rounds_and_budgets_as_parameters() {
+        // The shared core must honour whatever the caller passes, so the main
+        // and sub-agent paths differ in numbers without forking the logic.
+        let big = "y".repeat(5_000);
+        let mut messages: Vec<Value> = Vec::new();
+        for i in 1..=3 {
+            messages.extend(fold_round(&format!("p{i}"), "grep", &big));
+        }
+        let mut seen = std::collections::HashSet::new();
+        // Keep only the newest round, cut everything older to 100 chars.
+        fold_with(&mut messages, &mut seen, 1, 100, 100);
+
+        let stale = messages[1]["content"].as_str().unwrap();
+        assert!(
+            stale.starts_with(&"y".repeat(100)),
+            "custom result budget ignored"
+        );
+        assert!(stale.contains(MAIN_FOLD_MARKER));
+        assert!(
+            stale.chars().count() < 300,
+            "custom budget produced {} chars",
+            stale.chars().count()
+        );
+        // The single kept round is untouched at full size.
+        assert_eq!(
+            messages[5]["content"].as_str().unwrap().chars().count(),
+            5_000
+        );
+
+        // Folding is idempotent: a second pass changes nothing.
+        let before = stale.to_string();
+        fold_with(&mut messages, &mut seen, 1, 100, 100);
+        assert_eq!(messages[1]["content"].as_str().unwrap(), before);
+    }
+
+    /// The in-turn fold is OFF for the explore sub-agent, and this assertion is
+    /// the decision written into the build.
+    ///
+    /// Measured on the reference trace (236 explore calls, 1,375,702 uncached
+    /// input tokens): cold first calls 9%, appended content 33%, and **57%
+    /// prefix-break re-bill** — the fold's doing. With a ~91% cache hit rate the
+    /// tokens a fold "saves" are nearly free already, while the re-bill it
+    /// causes is paid in full: 253,824 already-cached tokens were thrown away
+    /// and every measured fold was net negative (17-26K tokens lost in the
+    /// worst runs).
+    ///
+    /// Flipping this back to `true` is one line — but it must come with a fresh
+    /// measurement, because the answer depends entirely on the gateway caching
+    /// the prefix. A provider without prefix caching would flip it.
+    #[test]
+    fn subagent_fold_stays_off_without_a_fresh_measurement() {
+        assert!(
+            !SUB_FOLD_ENABLED,
+            "The explore fold is disabled by measurement: 57% of uncached explore \
+             input was the prefix-break re-bill its own rewrites caused. Re-enable \
+             it only together with a fresh trace measurement."
+        );
+    }
+
+    /// `fold_with` must REPORT what it removed.
+    ///
+    /// Before it returned a number, every attempt to price the fold had to infer
+    /// "a fold happened here" from the prompt shrinking between two calls — an
+    /// inference that cannot tell a fold from mid-turn compaction, and that
+    /// measures the shrink AFTER the fact (biased). The numbers it returns now
+    /// are what the trace records.
+    #[test]
+    fn fold_with_reports_removed_chars_and_message_count() {
+        let big = "y".repeat(10_000);
+        let mut messages: Vec<Value> = Vec::new();
+        messages.extend(fold_round("c1", "read", &big));
+        messages.extend(fold_round("c2", "read", &big));
+        // Two fresh rounds that must stay untouched, so c1/c2 are stale.
+        messages.extend(fold_round("c3", "read", &big));
+        messages.extend(fold_round("c4", "read", &big));
+        let before: usize = messages
+            .iter()
+            .map(|m| m["content"].as_str().map(|c| c.chars().count()).unwrap_or(0))
+            .sum();
+
+        let (removed, folded) = fold_stale_tool_results(&mut messages, &mut seen_set());
+
+        assert_eq!(folded, 2, "exactly the two stale rounds are folded");
+        assert!(removed > 0, "the removal is reported, not silently swallowed");
+        let after: usize = messages
+            .iter()
+            .map(|m| m["content"].as_str().map(|c| c.chars().count()).unwrap_or(0))
+            .sum();
+        assert!(
+            removed >= before - after,
+            "reported {removed} chars must cover the real shrink {}",
+            before - after
+        );
+
+        // A second pass is a no-op and reports nothing: the report must not
+        // double-count the same fold on every later round.
+        assert_eq!(fold_stale_tool_results(&mut messages, &mut seen_set()), (0, 0));
+    }
+
+    #[test]
+    fn fold_pays_off_skips_the_last_calls_of_a_run() {        // A fold rewrites OLD tool results, so the request right after it is
+        // re-billed from the first changed byte: a fixed cost that only pays
+        // back if enough round-trips remain to reuse the shorter prompt.
+        // Measured over 85 real folds: the 31 that happened with 3 or fewer
+        // calls left were ALL net losses (-172_630 tokens), while every bucket
+        // from 4 calls left on was net-positive. Hence the threshold.
+        assert!(!fold_pays_off(0));
+        assert!(!fold_pays_off(1)); // the run's LAST model call
+        assert!(!fold_pays_off(2));
+        assert!(fold_pays_off(3)); // the threshold
+        assert!(fold_pays_off(SUBAGENT_MAX_STEPS)); // a full sub-agent budget
+
+        // The guard must not shadow the elision it protects: it sits far below
+        // the run length, so an explore run that folds at all still folds.
+        assert!(SUBAGENT_MAX_STEPS > FOLD_MIN_REMAINING_CALLS);
     }
 }

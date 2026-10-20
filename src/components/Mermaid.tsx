@@ -1,8 +1,10 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
-import mermaid from 'mermaid'
 import { FullscreenModal } from './FullscreenModal'
 import { useFullscreen } from '../lib/fullscreen'
 import { applyRtlToSvgText } from '../lib/bidi'
+import { useVisible } from '../lib/useVisible'
+
+/* eslint-disable react-refresh/only-export-components */
 
 
 // Read the app's theme colors from CSS variables so the diagram matches the
@@ -49,23 +51,36 @@ function readThemeVars(): Record<string, string> {
  * the enlarged diagram always matches the inline one.
  */
 
-// Initialize mermaid exactly once. Re-initializing on every render (with many
-// diagrams on screen) races mermaid's global state and can make some renders
-// reject — which would drop the diagram into the no-click fallback.
-let mermaidReady = false
-function ensureMermaidInit() {
-  if (mermaidReady) return
-  mermaidReady = true
-  try {
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: 'strict',
-      theme: 'base',
-      themeVariables: readThemeVars(),
-    })
-  } catch {
-    // best-effort; render below is what matters.
+// The mermaid bundle (core + the diagram engine, hundreds of KB) is loaded on
+// demand: it is imported dynamically the first time a diagram is actually about
+// to be rendered, and initialized exactly once. A static import would put it in
+// the startup chunk, where a chat that never shows a diagram still pays for it.
+// Re-initializing on every render (with many diagrams on screen) races mermaid's
+// global state and can make some renders reject — which would drop the diagram
+// into the no-click fallback.
+type MermaidApi = (typeof import('mermaid'))['default']
+let mermaidApi: MermaidApi | null = null
+let mermaidInit = false
+
+async function loadMermaid(): Promise<MermaidApi> {
+  if (!mermaidApi) {
+    const mod = await import('mermaid')
+    mermaidApi = mod.default
   }
+  if (!mermaidInit) {
+    mermaidInit = true
+    try {
+      mermaidApi.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: 'base',
+        themeVariables: readThemeVars(),
+      })
+    } catch {
+      // best-effort; render below is what matters.
+    }
+  }
+  return mermaidApi
 }
 
 /**
@@ -144,12 +159,29 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
   const closeFs = useFullscreen((s) => s.close)
   const expanded = activeKey === myKey
 
-  const renderDiagram = () => {
+  const blockRef = useRef<HTMLDivElement | null>(null)
+  // The chart source belt-and-suspenders check mirrors MermaidPlaceholder: a
+  // block that still contains a fence marker is mid-stream (incomplete), so it is
+  // not worth loading the engine for yet.
+  const complete = Boolean(chart && !/[`~]{3}/.test(chart))
+  const visible = useVisible(blockRef, complete)
+
+  const renderDiagram = async () => {
     const token = ++renderTokenRef.current
     const commit = () => mountedRef.current && token === renderTokenRef.current
     setFailed(false)
     const id = `mmd-${Math.random().toString(36).slice(2)}`
     const cleanChart = sanitizeChart(chart)
+    if (!cleanChart.trim()) return
+    let mermaidMod: MermaidApi
+    try {
+      mermaidMod = await loadMermaid()
+    } catch (err) {
+      console.error('[Mermaid] engine failed to load:', err)
+      if (commit()) setFailed(true)
+      return
+    }
+    if (token !== renderTokenRef.current || !mountedRef.current) return
     // Render into a container we own and remove afterward. mermaid.render()
     // otherwise leaks a temporary node into <body> (the "duplicate diagram
     // appears at the bottom of the page" bug).
@@ -158,13 +190,12 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
     container.style.left = '-99999px'
     container.style.top = '0'
     document.body.appendChild(container)
-    ensureMermaidInit()
     const cleanup = () => {
       container.remove()
       document.getElementById(id)?.remove()
       document.getElementById(`d${id}`)?.remove()
     }
-    mermaid
+    mermaidMod
       .render(id, cleanChart, container)
       .then((r) => {
         if (commit()) setSvg(applyRtlToSvgText(r.svg))
@@ -177,7 +208,7 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
         // breaks every other diagram on the page.  Instead just re-render with
         // the same init (which already has themeVariables from readThemeVars());
         // if that fails it means the chart syntax itself is bad.
-        return mermaid.render(`${id}-retry`, cleanChart, container)
+        return mermaidMod.render(`${id}-retry`, cleanChart, container)
       })
       .then((r) => {
         if (r && commit()) setSvg(applyRtlToSvgText(r.svg))
@@ -190,10 +221,14 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
   }
 
   useEffect(() => {
-    const t = setTimeout(renderDiagram, 400)
+    // Nothing to draw into the engine for an off-screen block: the 400 ms
+    // debounce below would otherwise start a render for EVERY diagram in the
+    // transcript as soon as it mounts.
+    if (!visible) return
+    const t = setTimeout(() => void renderDiagram(), 400)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chart])
+  }, [chart, visible])
 
   if (failed) {
     return (
@@ -225,14 +260,28 @@ export function Mermaid({ chart, embedded = false }: { chart: string; embedded?:
   // DOM walk runs once per rendered SVG instead of on every re-render.
   const safeSvg = useMemo(() => hardenSvg(svg), [svg])
 
+  // Nothing is drawn yet (the engine chunk is still loading, the debounce has
+  // not fired, or the block is off screen): keep the padded box so the
+  // transcript height stays stable and the spinner explains the gap.
+  if (!safeSvg) {
+    return (
+      <div className="mermaid-block mermaid-loading" ref={blockRef} data-visible={String(visible)} dir="auto">
+        <span className="spinner" />
+        <span>Diagram…</span>
+      </div>
+    )
+  }
+
   const diagram = (
     <div
       className="mermaid-block"
+      ref={blockRef}
       dir="auto"
-      dangerouslySetInnerHTML={safeSvg ? { __html: safeSvg } : undefined}
+      data-visible={String(visible)}
       style={embedded ? undefined : { cursor: 'zoom-in' }}
       title={embedded ? undefined : 'Click to expand'}
       onClick={embedded ? undefined : () => openFs(myKey)}
+      dangerouslySetInnerHTML={{ __html: safeSvg }}
     />
   )
 

@@ -781,7 +781,6 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "uuid",
- "walkdir",
  "zip 9.0.5",
 ]
 

@@ -43,7 +43,8 @@ try {
 
 console.log('2) کلاس و نام پروایدر درست رندر شده‌اند:')
 check('badge پروایدر کلاس trace-row-engine دارد', html.includes('trace-row-engine'))
-check('نام پروایدر (tavily) نمایش داده شد', html.includes('tavily'))
+check('نام پروایدر به لیبل انسانی نگاشت شد (Tavily)', html.includes('Tavily'))
+check('kind خام (tavily) نمایش داده نشد', !html.includes('>tavily<'))
 
 console.log('3) بدون engine → badge نمایش داده نمی‌شود:')
 const noEngine = { tool: 'web_search', status: 'success' } as never
@@ -75,8 +76,8 @@ try {
   check('ردیف trace رندر شد', false, e)
 }
 check('هدر گروه کلاس badge پروایدر دارد', groupedHtml.includes('trace-row-engine'))
-check('هدر گروه provider تِیولی را نشان می‌دهد', groupedHtml.includes('tavily'))
-check('هدر گروه provider داک‌داک‌گو را هم نشان می‌دهد', groupedHtml.includes('duckduckgo'))
+check('هدر گروه provider تِیولی را نشان می‌دهد', groupedHtml.includes('Tavily'))
+check('هدر گروه provider داک‌داک‌گو را هم نشان می‌دهد', groupedHtml.includes('DuckDuckGo'))
 
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)

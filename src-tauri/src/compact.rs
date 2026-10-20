@@ -9,6 +9,69 @@ use crate::llm::{self, LlmConfig};
 // 4k (was 12k): the summarizer prompt is the whole serialized history — 12k
 // chars per tool message made compaction a slow, huge-token LLM call.
 const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+
+/// Wall-clock budget for ONE compaction, covering every attempt together.
+/// Compaction is a side task the UI blocks on behind a "Compacting…" banner, so
+/// it has to finish or fail inside a window a user will actually wait for.
+/// Before this cap, "1 primary try + 2 fallback tries" at 300 s each could
+/// stack into ~15 minutes of waiting for a summary that was never coming.
+const COMPACT_TOTAL_BUDGET_SECS: u64 = 180;
+
+/// Attempts on the fallback model when the primary summarizer fails. One retry
+/// rides out a transient provider error; a second one mostly bought latency,
+/// not summary quality.
+const COMPACT_FALLBACK_ATTEMPTS: usize = 1;
+
+/// One progress tick from a running compaction.
+///
+/// A model call reports nothing until it answers, so these ticks are NOT a
+/// measured completion percentage: they carry the phase, which attempt is
+/// running, and how much of the shared wall-clock budget is already spent. The
+/// renderer keeps its own clock running between ticks, which is what lets it
+/// show a truthful "42s / 180s" instead of an anonymous spinner.
+#[derive(Debug, Clone)]
+pub struct CompactProgress {
+    /// Machine-readable phase: `"preparing"` (selecting the verbatim tail and
+    /// serializing the head), `"summarizing"` (the model call) or `"merging"`.
+    pub phase: &'static str,
+    /// 1-based attempt counter across the primary + fallback chain. `0` on the
+    /// opening tick, before any attempt has started.
+    pub attempt: usize,
+    /// How many attempts this run may still make in total (`0` when unknown).
+    pub attempts_total: usize,
+    /// Model running this attempt.
+    pub model: String,
+    /// Share of the total budget already spent, 0-100.
+    pub percent: u8,
+    /// Wall-clock budget for the WHOLE compaction, in seconds.
+    pub budget_secs: u64,
+    /// Seconds elapsed since the compaction started.
+    pub elapsed_secs: u64,
+}
+
+/// Fill in the derived fields (elapsed + percent) and hand one tick to the
+/// caller. Kept as a free function so every emit site reports the same clock.
+fn progress_tick(
+    on_progress: &mut (dyn FnMut(&CompactProgress) + Send),
+    started: std::time::Instant,
+    phase: &'static str,
+    attempt: usize,
+    attempts_total: usize,
+    model: &str,
+) {
+    let elapsed_secs = started.elapsed().as_secs();
+    let percent = ((elapsed_secs as u128 * 100) / COMPACT_TOTAL_BUDGET_SECS.max(1) as u128)
+        .min(100) as u8;
+    on_progress(&CompactProgress {
+        phase,
+        attempt,
+        attempts_total,
+        model: model.to_string(),
+        percent,
+        budget_secs: COMPACT_TOTAL_BUDGET_SECS,
+        elapsed_secs,
+    });
+}
 const SUMMARY_TEMPLATE: &str = r#"
 
 Use this exact template for the summary (markdown, anchored to the conversation):
@@ -171,6 +234,13 @@ pub struct CompactOutcome {
 }
 
 /// Port of `_compact_history`. Returns Ok(None) when there is nothing to do.
+///
+/// Test-only: every live caller needs live progress (the `/chat/compact` route
+/// streams it, the mid-turn auto-compaction emits `CompactProgress`), so both
+/// use [`compact_history_with_progress`] directly. Keeping the no-progress
+/// shape for the no-op test documents the "nothing to do" contract without
+/// leaving an unused function in the shipped binary.
+#[cfg(test)]
 pub async fn compact_history(
     client: &reqwest::Client,
     model: &LlmConfig,
@@ -180,7 +250,35 @@ pub async fn compact_history(
     max_output: usize,
     force: bool,
 ) -> Result<Option<CompactOutcome>, String> {
-    let ctx = if ctx == 0 { 8192 } else { ctx };
+    compact_history_with_progress(
+        client, model, fallback, history, ctx, max_output, force, &mut |_| {},
+    )
+    .await
+}
+
+/// Same as [`compact_history`], but reports live progress (`CompactProgress`) so
+/// the UI can show the phase, the attempt and the elapsed time instead of an
+/// anonymous spinner. Used by the streaming `/chat/compact` route and by the
+/// mid-turn auto-compaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_history_with_progress(
+    client: &reqwest::Client,
+    model: &LlmConfig,
+    fallback: Option<&LlmConfig>,
+    history: &[Value],
+    ctx: usize,
+    max_output: usize,
+    force: bool,
+    on_progress: &mut (dyn FnMut(&CompactProgress) + Send),
+) -> Result<Option<CompactOutcome>, String> {
+    let started = std::time::Instant::now();
+    progress_tick(on_progress, started, "preparing", 0, 0, &model.model);
+    // An unknown window must follow the same capacity rule as everything else
+    // (models.dev → provider → DEFAULT_CONTEXT_WINDOW), not a private 8k literal:
+    // an 8192 window put the verbatim tail at ~3.2k tokens and folded nearly the
+    // whole history, which is why a compact could look like it fired far too
+    // early.
+    let ctx = if ctx == 0 { crate::agent::DEFAULT_CONTEXT_WINDOW } else { ctx };
     let tail_budget = recent_tail_budget(ctx, max_output, None);
 
     // Select the recent tail (whole messages, backward walk).
@@ -246,12 +344,23 @@ pub async fn compact_history(
         return Ok(None);
     }
 
-    // Serialize + bound the head.
+    // Serialize + bound the head. The token estimate is summed incrementally:
+    // re-joining and re-estimating the whole transcript on every iteration is
+    // O(n²) and on a huge history stalled here for a long time BEFORE the
+    // summarizer call, where the UI shows no progress at all.
     let mut texts: Vec<String> = older_turns.iter().map(serialize).collect();
     let max_head_tokens = usable_tokens(ctx, max_output, None).saturating_sub(tail_budget + 512).max(1024);
-    while estimate_tokens(&texts.join("\n\n")) > max_head_tokens && texts.len() > 1 {
-        texts.remove(0);
+    // `join("\n\n")` contributes one separator per boundary — count it so the
+    // incremental total matches what the joined string really costs.
+    let sep_tokens = estimate_tokens("\n\n");
+    let mut head_tokens: usize = texts.iter().map(|t| estimate_tokens(t)).sum::<usize>()
+        + texts.len().saturating_sub(1) * sep_tokens;
+    let mut dropped = 0usize;
+    while head_tokens > max_head_tokens && texts.len() - dropped > 1 {
+        head_tokens = head_tokens.saturating_sub(estimate_tokens(&texts[dropped]) + sep_tokens);
+        dropped += 1;
     }
+    let texts = texts.split_off(dropped);
     let head_text = texts.join("\n\n");
 
     let user_prompt = if existing_summary.is_empty() {
@@ -272,10 +381,12 @@ pub async fn compact_history(
     };
     const SYSTEM: &str = "You are a precise summarizer for a coding agent. Produce the anchored summary exactly in the requested template. Keep concrete details: file paths, commands, errors and their fixes.";
 
-    // Summarize on the primary model, then up to 2 retries on the fallback.
-    // Each attempt is bounded by the model's own timeout (llm::complete), so a
-    // slow primary cannot stack with slow fallback retries into minutes of
-    // waiting — the UI's Compacting spinner stays bounded.
+    // Summarize on the primary model, then once on the fallback. Every attempt
+    // is bounded twice over: `llm::complete` honors the model's own timeout, and
+    // the loop below stops at a shared wall-clock deadline. Without the shared
+    // deadline the per-attempt timeouts added up, and a slow provider plus
+    // fallback retries kept the "Compacting…" banner alive for many minutes
+    // with no summary ever arriving.
     let mut outcome: Option<CompactOutcome> = None;
     let mut last_err = String::new();
     let fallbacks: Vec<&LlmConfig> = if std::ptr::eq(model, fallback.unwrap_or(model)) {
@@ -283,16 +394,46 @@ pub async fn compact_history(
     } else {
         fallback.iter().copied().collect()
     };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(COMPACT_TOTAL_BUDGET_SECS);
+    // Attempts this run may make in total: 1 on the primary + the fallback
+    // retries. Reported so the UI can say "attempt 2 of 2" instead of guessing.
+    let attempts_total = 1
+        + if std::ptr::eq(model, fallback.unwrap_or(model)) {
+            0
+        } else {
+            COMPACT_FALLBACK_ATTEMPTS
+        };
+    let mut attempt_no = 0usize;
     for m in std::iter::once(model).chain(fallbacks.into_iter()) {
-        let attempts = if std::ptr::eq(m, model) { 1 } else { 2 };
+        let attempts = if std::ptr::eq(m, model) { 1 } else { COMPACT_FALLBACK_ATTEMPTS };
         for _attempt in 0..attempts {
-            match llm::complete(client, m, SYSTEM, &user_prompt).await {
-                Ok(r) if !r.text.trim().is_empty() => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            attempt_no += 1;
+            progress_tick(
+                on_progress,
+                started,
+                "summarizing",
+                attempt_no,
+                attempts_total,
+                &m.model,
+            );
+            match tokio::time::timeout(remaining, llm::complete(client, m, SYSTEM, &user_prompt))
+                .await
+            {
+                Ok(Ok(r)) if !r.text.trim().is_empty() => {
                     outcome = Some(CompactOutcome { summary: r.text.trim().to_string(), keep: recent.len(), usage: r.usage });
                     break;
                 }
-                Ok(_) => last_err = "summarizer returned an empty summary".into(),
-                Err(e) => last_err = e,
+                Ok(Ok(_)) => last_err = "summarizer returned an empty summary".into(),
+                Ok(Err(e)) => last_err = e,
+                Err(_) => {
+                    last_err =
+                        format!("summarizer gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s")
+                }
             }
         }
         if outcome.is_some() {
@@ -300,7 +441,10 @@ pub async fn compact_history(
         }
     }
     match outcome {
-        Some(o) => Ok(Some(o)),
+        Some(o) => {
+            progress_tick(on_progress, started, "merging", attempt_no, attempts_total, &model.model);
+            Ok(Some(o))
+        }
         None => Err(if last_err.is_empty() { "summarizer failed".into() } else { last_err }),
     }
 }

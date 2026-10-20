@@ -13,6 +13,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
+import { useViewerTabs } from '../lib/viewerTabs'
 import { focusChatInput } from '../lib/chatFocus'
 import { isApplePlatform } from '../lib/shortcuts'
 import { suppressField } from '../lib/inputSuppress'
@@ -30,31 +31,10 @@ interface XtermEntry {
   el: HTMLElement | null
 }
 
-const HEIGHT_KEY = 'coder:terminalHeight'
-const MIN_HEIGHT = 140
-const DEFAULT_HEIGHT = 300
-
 /** Cmd/Ctrl + one of these is an APP chord, never shell input (J = panel,
  *  W = close tab, M = fullscreen, X = prefix). Checked on `keypress` too —
  *  see the custom key handler in attachScreen. */
 const RESERVED_TERMINAL_CHORDS = ['j', 'w', 'm', 'x']
-
-function loadTerminalHeight(): number {
-  try {
-    const n = Number(localStorage.getItem(HEIGHT_KEY))
-    return Number.isFinite(n) && n >= MIN_HEIGHT ? n : DEFAULT_HEIGHT
-  } catch {
-    return DEFAULT_HEIGHT
-  }
-}
-
-function persistTerminalHeight(px: number): void {
-  try {
-    localStorage.setItem(HEIGHT_KEY, String(Math.round(px)))
-  } catch {
-    /* storage unavailable */
-  }
-}
 
 function hasTerminalApi(): boolean {
   return typeof window !== 'undefined' && typeof window.coder?.terminalCreate === 'function'
@@ -90,6 +70,21 @@ export function xtermTheme(): ITheme {
     cursorAccent: bg,
     selectionBackground: v('--accent-dim', '#403d52'),
     selectionForeground: fg,
+    // Inactive selection (terminal unfocused): xterm's default is the same
+    // bright selection colour at half opacity, which still reads as "selected"
+    // — the theme's hover surface is the honest unfocused state.
+    selectionInactiveBackground: v('--bg-hover', '#403d52'),
+    // Scrollbar slider + overview-ruler border. Left unset, xterm derives the
+    // slider from the FOREGROUND at 20/40/50% alpha, which ties the scrollbar
+    // to the text colour instead of the theme's own structure colours. Only
+    // plain CSS vars may be used here — xterm parses these as colour values and
+    // cannot read a `color-mix()` expression.
+    scrollbarSliderBackground: v('--border', '#524f67'),
+    // Same var as `brightBlack` above, so it must carry the same fallback —
+    // one CSS variable with two different fallbacks is how a palette drifts.
+    scrollbarSliderHoverBackground: v('--text-dim', '#6e6a86'),
+    scrollbarSliderActiveBackground: v('--text', '#e0def4'),
+    overviewRulerBorder: v('--border', '#524f67'),
     // The whole 16-slot ANSI palette, every slot derived from the app theme, so
     // no xterm default leaks through and shell output matches the UI. Leaving a
     // slot out is not neutral: xterm falls back to its own GitHub-ish default
@@ -125,13 +120,43 @@ export function xtermTheme(): ITheme {
   }
 }
 
-export function TerminalPanel() {
+/** Viewport-space rectangle of the docked strip inside the side pane. */
+export interface TerminalDockRect {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+interface TerminalPanelProps {
+  /** EFFECTIVE dock, decided by App (see resolveTerminalPlacement in the
+   *  store): 'right' only while the side pane is really on screen. */
+  placement?: 'bottom' | 'right'
+  /** The pane strip the dock occupies, in viewport px. Only read when
+   *  placement is 'right'; null makes the panel fall back to the bottom dock
+   *  instead of painting at 0/0. */
+  dock?: TerminalDockRect | null
+  /** Ceiling for a drag inside the side pane (pane height minus the content
+   *  that must stay visible). App owns the number because only App measures
+   *  the pane. */
+  maxDockHeight?: number
+}
+
+export function TerminalPanel({
+  placement = 'bottom',
+  dock = null,
+  maxDockHeight,
+}: TerminalPanelProps = {}) {
   const open = useStore((s) => s.terminalPanelOpen)
   const fullscreen = useStore((s) => s.terminalFullscreen)
   const theme = useStore((s) => s.theme)
   const [tabs, setTabs] = useState<TerminalTab[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
-  const [height, setHeight] = useState(loadTerminalHeight)
+  // Height lives in the STORE, not in local state: App reserves the very same
+  // strip as padding on the side pane, so both sides must read one number.
+  const height = useStore((s) => s.terminalHeight)
+
+  const right = placement === 'right' && dock !== null
 
   // Once the panel has been opened in this session it stays mounted (hidden
   // via CSS) so the xterm buffers and the shells behind it survive toggling.
@@ -215,6 +240,10 @@ export function TerminalPanel() {
       ''
     try {
       const info = await window.coder.terminalCreate(dir || '')
+      // A bridge that RESOLVES null instead of rejecting (web build, a stub,
+      // or a create that found no shell) must not push a null tab: the render
+      // below reads `tab.id` and a null entry would crash the whole tree.
+      if (!info || typeof info.id !== 'string') return
       setTabs((prev) => [...prev, info])
       setActiveId(info.id)
     } catch (err) {
@@ -231,10 +260,15 @@ export function TerminalPanel() {
     if (!hasTerminalApi()) return
     let cancelled = false
     void (async () => {
-      const live = await window.coder.terminalList().catch(() => [])
+      // `?? []`: the bridge may RESOLVE null instead of rejecting (web build,
+      // or a stubbed bridge), and `.catch` alone would let that null through to
+      // `.filter` below.
+      const live = (await window.coder.terminalList().catch(() => [])) ?? []
       if (cancelled) return
       const known = new Set(tabsRef.current.map((t) => t.id))
-      const adopt = live.filter((s) => !known.has(s.id))
+      // Same nullish-entry defence as spawnSession: only sessions carrying a
+      // real id can become a tab (the render reads `tab.id`).
+      const adopt = live.filter((s) => !!s && typeof s.id === 'string' && !known.has(s.id))
       if (adopt.length > 0) {
         setTabs((prev) => [...prev, ...adopt])
         setActiveId((cur) => cur ?? adopt[0].id)
@@ -316,6 +350,15 @@ export function TerminalPanel() {
     return () => window.removeEventListener('resize', onResize)
   }, [scheduleFit])
 
+  // Dock switch (bottom panel <-> side pane) repaints the box; refit so the pty
+  // adopts the new grid instead of keeping the old cols/rows.
+  useEffect(() => {
+    if (!open) return
+    scheduleFit()
+    const t = window.setTimeout(() => fitActive(activeId), 50)
+    return () => window.clearTimeout(t)
+  }, [right, open, activeId, scheduleFit, fitActive])
+
   const activate = useCallback(
     (id: string) => {
       setActiveId(id)
@@ -380,10 +423,14 @@ export function TerminalPanel() {
     dragRef.current = { startY: e.clientY, startH: height }
     const onMove = (ev: MouseEvent) => {
       if (!dragRef.current) return
-      const max = window.innerHeight * 0.7
-      const next = Math.min(max, Math.max(MIN_HEIGHT, dragRef.current.startH - (ev.clientY - dragRef.current.startY)))
-      setHeight(next)
-      persistTerminalHeight(next)
+      // Side dock: the ceiling comes from App (pane height minus the content
+      // that must stay visible), so a drag can never swallow the tabs and the
+      // file tree above the dock. The bottom dock keeps the viewport cap.
+      const max = maxDockHeight ?? window.innerHeight * 0.7
+      const next = Math.min(max, dragRef.current.startH - (ev.clientY - dragRef.current.startY))
+      // The store clamps to the minimum and persists; App reads the same value
+      // back to reserve the strip, so the two sides never drift apart.
+      useStore.getState().setTerminalHeight(next)
     }
     const onUp = () => {
       dragRef.current = null
@@ -500,13 +547,24 @@ export function TerminalPanel() {
 
   const toggleLabel = isApplePlatform() ? '⌘J' : 'Ctrl+J'
 
+  // Side dock: needs BOTH the effective placement and a measured strip —
+  // without the strip the panel would paint at 0/0, so it falls back to the
+  // bottom dock instead.
+  //
+  // The panel never changes its place in the React tree; `terminal-right` is
+  // what moves it. Moving the element instead would unmount the xterm screens
+  // and take every shell buffer with it.
+
   return (
     <section
-      className={'terminal-panel' + (fullscreen ? ' terminal-full' : '')}
+      className={
+        'terminal-panel' + (fullscreen ? ' terminal-full' : '') + (right ? ' terminal-right' : '')
+      }
       data-open={open}
       data-fullscreen={fullscreen}
+      data-placement={right ? 'right' : 'bottom'}
       dir="ltr"
-      style={fullscreen ? undefined : { height }}
+      style={fullscreen ? undefined : right ? dock : { height }}
       aria-label="Terminal"
     >
       <div className="terminal-resize-handle" title="Drag to resize" onMouseDown={startResize} />
@@ -571,9 +629,33 @@ export function TerminalPanel() {
             )}
           </button>
           <button
+            className="terminal-action-btn terminal-move-btn"
+            aria-label={right ? 'Move terminal to the bottom panel' : 'Move terminal to the side pane'}
+            title={right ? 'Move to bottom panel' : 'Move to side pane'}
+            aria-pressed={right}
+            onClick={() => {
+              const next = right ? 'bottom' : 'right'
+              // Choosing the side pane implies wanting to see it, so reveal the
+              // pane instead of parking the terminal back at the bottom.
+              if (next === 'right') useViewerTabs.getState().setPaneOpen(true)
+              useStore.getState().setTerminalPlacement(next)
+            }}
+          >
+            {right ? (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 3v9m0 0-3.5-3.5M12 12l3.5-3.5M4 20h16" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                <path d="M15 4v16" />
+              </svg>
+            )}
+          </button>
+          <button
             className="terminal-action-btn"
-            aria-label={`Hide terminal panel (${toggleLabel})`}
-            title={`Hide panel (${toggleLabel})`}
+            aria-label={right ? 'Hide terminal panel' : `Hide terminal panel (${toggleLabel})`}
+            title={right ? 'Hide panel' : `Hide panel (${toggleLabel})`}
             onClick={() => useStore.getState().setTerminalPanelOpen(false)}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">

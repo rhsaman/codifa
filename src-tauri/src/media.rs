@@ -144,7 +144,21 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
         }
     };
     let lang = form_str(&form, "lang").trim().to_lowercase();
+    // Whisper context: the target script + the tail of the current utterance.
+    let prompt = form_str(&form, "prompt").trim().to_string();
     let mut key = form_str(&form, "api_key").trim().to_string();
+    if key.is_empty() {
+        // The renderer sends the whole key ring as a JSON array; use the first
+        // entry so multi-key providers work instead of silently going unauthed.
+        if let Some(first) = form
+            .get("api_keys")
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .and_then(|keys| keys.into_iter().find(|k| !k.trim().is_empty()))
+        {
+            key = first.trim().to_string();
+        }
+    }
     if key.is_empty() {
         key = crate::providers::env_key(&provider_kind, form_str(&form, "env_var").trim());
     }
@@ -159,6 +173,9 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
     let mut out_form = out_form;
     if !lang.is_empty() {
         out_form = out_form.text("language", lang);
+    }
+    if !prompt.is_empty() {
+        out_form = out_form.text("prompt", prompt);
     }
     let client = crate::llm::http_client();
     let mut req = client

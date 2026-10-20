@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { ensureChatHydrated, useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
-import { ScheduleSection } from "./SchedulePanel";
 import type { ChatMessage } from "../types";
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -152,7 +151,26 @@ export function TodosSection() {
     };
   }, [collapsed]);
 
-  if (todos.length === 0) return null;
+  if (todos.length === 0) {
+    // A page, not a floating card: returning null left the whole pane blank
+    // with no hint about what belongs here or how to get it. The empty state
+    // names the actor (the agent) and the trigger (a plan), so the pane reads
+    // as "nothing yet", not "broken".
+    return (
+      <div className="sidebar-panel todos-docked todos-empty" dir={dir}>
+        <div className="sidebar-panel-head">
+          <span className="sidebar-panel-title">Todos</span>
+        </div>
+        <div className="sidebar-todos-empty">
+          <p className="sidebar-todos-empty-title">No todos yet</p>
+          <p className="sidebar-todos-empty-text">
+            The agent fills this list while it works — each step of its plan
+            appears here and checks off as it lands.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   const done = todos.filter((t) => t.status === "completed").length;
   const pct = todos.length === 0 ? 0 : Math.round((done / todos.length) * 100);
@@ -359,9 +377,11 @@ function RightPanelContent() {
           overscrollBehavior: "contain",
         }}
       >
-        <ScheduleSection />
+        {/* Todos only: schedules are their own page/tab now, so no section
+            stacks another page's card inside this one. */}
         <TodosSection />
       </div>
     </aside>
   );
 }
+

@@ -77,6 +77,11 @@ export interface CoderApi {
   fsRead(root: string, rel: string): Promise<{ content: string } | null>
   fsWrite(root: string, rel: string, content: string): Promise<boolean>
   fsDelete(root: string, rel: string): Promise<boolean>
+  /** Copy a file/folder to a new workspace-relative path. Rejects an existing
+   *  destination (no silent overwrite). */
+  fsCopy(root: string, from: string, to: string): Promise<boolean>
+  /** Rename or move within the workspace (same primitive). */
+  fsRename(root: string, from: string, to: string): Promise<boolean>
   coderList(rel: string): Promise<FileEntry[]>
   coderRead(rel: string): Promise<{ content: string }>
   coderWrite(rel: string, content: string): Promise<boolean>

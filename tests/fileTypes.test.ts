@@ -10,6 +10,7 @@ import {
   extractInlinePathParts,
   fileBasename,
   fileIconSpec,
+  filePathFromHref,
   looksLikeFilePath,
   splitPathLine,
 } from "../src/lib/fileTypes.ts";
@@ -169,6 +170,27 @@ console.log("6) extractInlinePathParts — paths inside composite spans:");
       return chipParts(parts).length === 0 && parts.join("") === t;
     }),
   );
+}
+
+// Markdown-link hrefs: which ones are workspace files (must become chips, not
+// navigable anchors) and which ones stay real links.
+{
+  const rel = filePathFromHref("src/components/ChatMessage.tsx");
+  check("relative href is a file", rel?.path === "src/components/ChatMessage.tsx" && rel.line === undefined);
+  const withLine = filePathFromHref("src/lib/store.ts:12");
+  check("href with line keeps the line", withLine?.path === "src/lib/store.ts" && withLine.line === 12);
+  const abs = filePathFromHref("/Users/saman/x/foo.ts");
+  check("absolute href is a file", abs?.path === "/Users/saman/x/foo.ts");
+  const fileUrl = filePathFromHref("file:///Users/saman/x/foo.ts");
+  check("file:// href keeps the absolute path", fileUrl?.path === "/Users/saman/x/foo.ts");
+  const doc = filePathFromHref("report.pdf");
+  check("document href is a file", doc?.path === "report.pdf");
+  check("https href is NOT a file", filePathFromHref("https://example.com/x") === null);
+  check("http href is NOT a file", filePathFromHref("http://example.com") === null);
+  check("mailto href is NOT a file", filePathFromHref("mailto:a@b.c") === null);
+  check("anchor href is NOT a file", filePathFromHref("#section") === null);
+  check("bare word href is NOT a file", filePathFromHref("docs") === null);
+  check("empty href is NOT a file", filePathFromHref(undefined) === null && filePathFromHref("  ") === null);
 }
 
 if (failed > 0) {

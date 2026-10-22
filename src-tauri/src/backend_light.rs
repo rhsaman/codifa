@@ -456,6 +456,21 @@ async fn skills_list(State(st): State<AppState>) -> Response<Body> {
     Json(skills::list_skills(&st.root())).into_response()
 }
 
+/// Every skill the agent can actually load: the standalone store PLUS the
+/// skills of every ENABLED plugin (`skill_router::load_skills` — the same call
+/// the prompt catalog is built from).
+///
+/// Kept off `/skills` on purpose: Settings edits and deletes whatever that
+/// route returns, and a plugin's skill belongs to its bundle (it disappears
+/// with the plugin). This route exists so the composer can offer a plugin skill
+/// as its own `/`-command — the name the plugin's install message tells the
+/// user to type.
+async fn skills_available(State(st): State<AppState>) -> Response<Body> {
+    let root = st.root();
+    let rows = crate::skill_router::load_skills(&root.to_string_lossy());
+    Json(json!({ "skills": rows })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct SkillFileQuery {
     name: String,
@@ -463,7 +478,16 @@ struct SkillFileQuery {
 }
 
 async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>) -> Response<Body> {
-    match skills::read_skill_file(&st.root(), &q.name, &q.file) {
+    // A plugin's skills are served from the plugin folder, so resolve that first
+    // — otherwise an extra file of a plugin skill 404s while its skill.md loads.
+    let root = st.root();
+    let read = match crate::plugins::plugin_of_skill(&root, &q.name)
+        .and_then(|slug| crate::plugins::find_skill_dir(&root, &slug, &q.name))
+    {
+        Some(dir) => skills::read_extra_file(&dir, &q.name, &q.file),
+        None => skills::read_skill_file(&root, &q.name, &q.file),
+    };
+    match read {
         Ok(v) => Json(v).into_response(),
         // JSON `detail` like every other native error: the renderer reads that
         // key, so a plain-text body would be replaced by a generic message.
@@ -496,6 +520,100 @@ async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
     }
 }
 
+// ---------- plugins (skills + connectors as one switchable bundle) ----------
+
+async fn plugins_list(State(st): State<AppState>) -> Response<Body> {
+    Json(crate::plugins::list_plugins(&st.root())).into_response()
+}
+
+async fn plugins_create(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::create_plugin(&st.root(), &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
+}
+
+async fn plugins_update(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::update_plugin(&st.root(), &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
+}
+
+async fn plugins_toggle(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::toggle_plugin(&st.root(), &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
+}
+
+async fn plugins_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::delete_plugin(&st.root(), &body) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => bad_request(&msg),
+    }
+}
+
+/// Install a bundle from a repo. Reading the repo is blocking (git-less HTTP on
+/// a plain thread), so the handler stays off the async worker.
+async fn plugins_install(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match tokio::task::spawn_blocking(move || crate::plugins::install_plugin(&st.root(), &body))
+        .await
+    {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(msg)) => bad_request(&msg),
+        Err(e) => bad_request(&format!("install failed: {e}")),
+    }
+}
+
+/// Latest saved body of one artifact — the preview tab reads it after a restart
+/// (the transcript only carries the card's id/title/kind/content).
+async fn artifact_get(State(st): State<AppState>, Query(q): Query<ArtifactQuery>) -> Response<Body> {
+    match crate::artifacts::read(&st.root(), &q.chat_id, &q.id) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => (StatusCode::NOT_FOUND, Json(json!({ "detail": msg }))).into_response(),
+    }
+}
+
+/// Delete one artifact (every saved version) from the Artifacts page.
+async fn artifact_delete(
+    State(st): State<AppState>,
+    Query(q): Query<ArtifactQuery>,
+) -> Response<Body> {
+    match crate::artifacts::delete(&st.root(), &q.chat_id, &q.id) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => (StatusCode::NOT_FOUND, Json(json!({ "detail": msg }))).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ArtifactQuery {
+    #[serde(default)]
+    chat_id: String,
+    id: String,
+}
+
+/// `/artifacts/list` takes `chat_id` alone (no `id`) — its own struct, so the
+/// `id` requirement of `/artifacts/get` stays enforced there.
+#[derive(serde::Deserialize)]
+struct ArtifactListQuery {
+    #[serde(default)]
+    chat_id: String,
+}
+
+/// Every saved artifact (newest first) for the Artifacts page: one chat's when
+/// `chat_id` is given, every chat's otherwise. Only the indexes are read — the
+/// page lists titles, it does not load the documents.
+async fn artifact_list(
+    State(st): State<AppState>,
+    Query(q): Query<ArtifactListQuery>,
+) -> Response<Body> {
+    match crate::artifacts::list(&st.root(), &q.chat_id) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => (StatusCode::BAD_REQUEST, Json(json!({ "detail": msg }))).into_response(),
+    }
+}
+
 // ---------- native /chat/compact (phase 3-1) ----------
 
 #[derive(serde::Deserialize)]
@@ -518,6 +636,13 @@ struct CompactBody {
     fallback_base_url: String,
     #[serde(default)]
     fallback_api_key: String,
+    /// The chat provider's ordered key list. The renderer sends this PLURAL form
+    /// on every other route; without it declared here the field was silently
+    /// dropped and the appended chat-model rung fell back to the summariser
+    /// slot's keys — a different provider's key against the chat's endpoint,
+    /// which is a guaranteed "Invalid API key" 401.
+    #[serde(default)]
+    fallback_api_keys: Vec<String>,
     /// Effective provider id of the chat's own provider — the 4th element of
     /// a resolved slot, so cross-provider usage is attributed correctly.
     #[serde(default)]
@@ -540,6 +665,11 @@ struct CompactBody {
     /// "compact" slot routes the summarizer to that model/provider.
     #[serde(default)]
     subagent_models: std::collections::HashMap<String, String>,
+    /// Per-tool fallback lists from Settings → Tools, keyed by the same slot
+    /// names as `subagent_models`; the summariser retries down the "Other"
+    /// group's own list when its model fails.
+    #[serde(default)]
+    tool_fallbacks: std::collections::HashMap<String, Vec<String>>,
     /// Full provider configs keyed by id for cross-provider slots.
     #[serde(default)]
     providers: std::collections::HashMap<String, Value>,
@@ -607,7 +737,13 @@ pub fn resolve_slot_target(
                     keys.push(k.to_string());
                 }
             }
-            if keys.is_empty() {
+            // Borrowing the parent's keys is only sound when the request goes
+            // to the SAME endpoint. Sending the chat provider's key to a
+            // different provider's base URL is exactly how a slot turns into a
+            // bare "Invalid API key" 401 with no clue which model produced it,
+            // so a keyless provider on its own endpoint keeps an empty list and
+            // reports "no api key configured" instead.
+            if keys.is_empty() && base == parent_base {
                 keys = parent_keys.to_vec();
             }
             (model.to_string(), base, keys, provider_id.to_string())
@@ -685,6 +821,109 @@ pub fn resolve_slot_kind(
         .filter(|k| !k.is_empty())
         .unwrap_or(parent_kind)
         .to_string()
+}
+
+/// Identity of a resolved slot target, used to drop duplicate rungs from a
+/// fallback chain: the same provider + model pair reached twice must not be
+/// tried twice.
+fn slot_target_key(
+    provider_id: &str,
+    model: &str,
+    base_url: &str,
+) -> (String, String, String) {
+    (
+        provider_id.trim().to_string(),
+        model.trim().to_string(),
+        base_url.trim().to_string(),
+    )
+}
+
+/// The Tools → "Other" group's fallback list: the group's first non-empty list,
+/// i.e. the same value the settings row displays. Mirrors `otherSlotFallbacks`
+/// in `src/lib/toolSlots.ts` so the row and the call can never disagree about
+/// which key holds the pick.
+pub fn other_slot_fallbacks(
+    fallbacks: &std::collections::HashMap<String, Vec<String>>,
+) -> &[String] {
+    for key in ["compact", "web", "title"] {
+        if let Some(list) = fallbacks.get(key) {
+            if list.iter().any(|e| !e.trim().is_empty()) {
+                return list.as_slice();
+            }
+        }
+    }
+    &[]
+}
+
+/// Resolve a Tool Models slot into its ordered CALL CHAIN: the slot's OWN model
+/// first, then that slot's fallback list (Settings → Tools → the tool's own
+/// fallbacks) in the order the user arranged it.
+///
+/// The chain is rebuilt from scratch for every call and nothing about it is
+/// remembered, which is what makes a fallback an escape hatch for ONE failing
+/// call instead of a new default: the next call starts at the slot's own model
+/// again. Every rung is resolved through `resolve_slot_target` /
+/// `resolve_slot_kind`, so a fallback routes cross-provider (its own base URL,
+/// keys and endpoint kind) exactly like the slot entry itself. Rungs that
+/// resolve to the same provider+model are dropped, and a fallback list on an
+/// EMPTY slot entry is ignored: an entry is required for the tool to be routed
+/// anywhere, so its fallbacks only ever stand behind a real model.
+pub fn resolve_slot_chain(
+    entry: &str,
+    slot_fallbacks: &[String],
+    parent_model: &str,
+    parent_base: &str,
+    parent_keys: &[String],
+    parent_provider_id: &str,
+    parent_kind: &str,
+    providers: &std::collections::HashMap<String, Value>,
+) -> Vec<(String, String, Vec<String>, String, String)> {
+    let primary = resolve_slot_target(
+        entry,
+        parent_model,
+        parent_base,
+        parent_keys,
+        parent_provider_id,
+        providers,
+    );
+    let primary_kind = resolve_slot_kind(entry, parent_kind, providers);
+    let mut out: Vec<(String, String, Vec<String>, String, String)> = vec![(
+        primary.0,
+        primary.1,
+        primary.2,
+        primary.3,
+        primary_kind,
+    )];
+    if entry.trim().is_empty() && slot_fallbacks.iter().all(|e| e.trim().is_empty()) {
+        return out;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for step in &out {
+        seen.insert(slot_target_key(&step.3, &step.0, &step.1));
+    }
+    for fb in slot_fallbacks {
+        if fb.trim().is_empty() {
+            continue;
+        }
+        let (model, base, keys, provider_id) = resolve_slot_target(
+            fb,
+            parent_model,
+            parent_base,
+            parent_keys,
+            parent_provider_id,
+            providers,
+        );
+        if model.trim().is_empty() {
+            continue;
+        }
+        let key = slot_target_key(&provider_id, &model, &base);
+        if !seen.insert(key) {
+            continue;
+        }
+        let kind = resolve_slot_kind(fb, parent_kind, providers);
+        out.push((model, base, keys, provider_id, kind));
+    }
+    out
 }
 
 /// Normalize the raw provider usage object to the frontend's CompactUsage
@@ -833,9 +1072,52 @@ async fn compact_worker(
         model_reasoning: r_model,
         auto_think: r_auto,
     };
-    let fallback = if body.fallback_model.is_empty() {
-        None
-    } else {
+    // The retry rungs this compaction may use after its own model fails. Which
+    // one is handed to the summariser is decided by whether the caller sent a
+    // chat-model fallback (an interactive turn always does; the mid-turn fold
+    // and a headless scheduled run may not).
+    let rungs: Vec<(String, String, Vec<String>, String, String)> = resolve_slot_chain(
+        other_entry,
+        other_slot_fallbacks(&body.tool_fallbacks),
+        &body.model,
+        &body.base_url,
+        &{
+            let mut k = body.api_keys.clone();
+            if k.is_empty() && !body.api_key.is_empty() {
+                k.push(body.api_key.clone());
+            }
+            k
+        },
+        &body.provider_id,
+        &body.provider,
+        &body.providers,
+    )
+    .into_iter()
+    .skip(1)
+    .collect();
+    // The full try order this compaction walks after its own model fails: the
+    // "Other" group's own fallback list (Settings → Tools) first, in the user's
+    // order, then the chat model as the last resort. `tool_fallbacks` is a
+    // per-CALL list — nothing is remembered, so the next compaction starts at the
+    // summariser's own model again. Every rung inherits the SLOT's reasoning
+    // level: a fallback changes the model and its routing, never the effort the
+    // user chose for the tool.
+    let mut fallbacks: Vec<LlmConfig> = rungs
+        .iter()
+        .map(|(m, b, keys, pid, k)| LlmConfig {
+            provider: k.clone(),
+            model: m.clone(),
+            base_url: b.clone(),
+            api_keys: keys.clone(),
+            temperature: Some(0.2),
+            max_tokens: Some(4096),
+            timeout_secs: 90,
+            reasoning_level: model.reasoning_level.clone(),
+            model_reasoning: crate::agent::provider_model_reasoning(&body.providers, pid, m),
+            auto_think: crate::models::auto_think_for(k),
+        })
+        .collect();
+    if !body.fallback_model.trim().is_empty() {
         let fb_kind = if body.fallback_provider.is_empty() {
             body.provider.clone()
         } else {
@@ -843,22 +1125,33 @@ async fn compact_worker(
         };
         let (fb_level, fb_model, fb_auto) =
             crate::llm::reasoning_fields(&fb_kind, body.thinking_level.trim(), body.model_reasoning);
-        Some(LlmConfig {
+        fallbacks.push(LlmConfig {
             provider: fb_kind,
             model: body.fallback_model.clone(),
             base_url: if body.fallback_base_url.is_empty() { body.base_url.clone() } else { body.fallback_base_url.clone() },
-            api_keys: if body.fallback_api_key.is_empty() { model.api_keys.clone() } else { vec![body.fallback_api_key.clone()] },
+            api_keys: if !body.fallback_api_keys.is_empty() {
+                body.fallback_api_keys.clone()
+            } else if !body.fallback_api_key.is_empty() {
+                vec![body.fallback_api_key.clone()]
+            } else if !body.api_keys.is_empty() {
+                // The chat's OWN keys, not the summariser slot's: this rung calls
+                // the chat model at the chat endpoint, so a slot key here is a
+                // guaranteed 401 that looks like the fallback never ran.
+                body.api_keys.clone()
+            } else if !body.api_key.is_empty() {
+                vec![body.api_key.clone()]
+            } else {
+                model.api_keys.clone()
+            },
             temperature: Some(0.2),
             max_tokens: Some(4096),
             timeout_secs: 90,
-            // The fallback usually shares the primary's kind; when it does not,
-            // derive the gate from its own kind so a cloud auto-think provider
-            // is still invoked the same way as a primary call would be.
+            // The chat model keeps the level its own turn would use.
             reasoning_level: fb_level,
             model_reasoning: fb_model,
             auto_think: fb_auto,
-        })
-    };
+        });
+    }
     // The summarizer's token budget: the window the user sees, resolved through
     // the same capacity rule as the mid-turn trigger (a bare 0 must not fall back
     // to a private literal — see `resolve_compact_window`).
@@ -871,7 +1164,7 @@ async fn compact_worker(
     match compact::compact_history_with_progress(
         &client,
         &model,
-        fallback.as_ref(),
+        &fallbacks,
         &body.history,
         compact_ctx,
         body.max_output,
@@ -962,6 +1255,24 @@ async fn chat_retry_now(Json(body): Json<Value>) -> Response<Body> {
     // dead while the UI still claimed "retrying now (requested)").
     let listening = agent::nudge_subagent_retry(chat_id);
     Json(json!({"ok": true, "listening": listening})).into_response()
+}
+
+/// POST /chat/slot_model — push a Tool Models change to the RUNNING turn.
+///
+/// The turn's request body carries `subagent_models` as a snapshot taken when
+/// the renderer called `/chat/stream`, so changing the sub-agent model while it
+/// is retrying never reached the ladder: it kept retrying the model the user
+/// had just replaced. The renderer now posts every change here, and the ladder
+/// re-resolves the slot before its next attempt.
+async fn chat_slot_model(Json(body): Json<Value>) -> Response<Body> {
+    let slot = body.get("slot").and_then(Value::as_str).unwrap_or_default().trim();
+    if slot.is_empty() {
+        return bad_request("slot is required");
+    }
+    // Absent/null model = "parent model", which an empty entry already means.
+    let entry = body.get("model").and_then(Value::as_str).unwrap_or_default().trim();
+    agent::set_live_slot_entry(slot, entry);
+    Json(json!({"ok": true})).into_response()
 }
 
 /// Native Rust agent turn streamed as SSE `data: {"kind": ...}` lines —
@@ -1438,10 +1749,23 @@ pub fn router(state: AppState) -> Router {
         .route("/transcribe", post(crate::media::transcribe))
         .route("/tts", post(crate::media::tts))
         .route("/skills", get(skills_list))
+        .route("/skills/available", get(skills_available))
         .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
         .route("/mcp", get(mcp_list).post(mcp_save))
         .route("/mcp/delete", post(mcp_delete))
+        // Plugins: one folder bundling skills + connectors behind a single
+        // switch. Listed/edited from Settings; the agent writes them through
+        // the `plugin` tool, which goes through the same module.
+        .route("/plugins", get(plugins_list))
+        .route("/plugins/create", post(plugins_create))
+        .route("/plugins/install", post(plugins_install))
+        .route("/plugins/update", post(plugins_update))
+        .route("/plugins/toggle", post(plugins_toggle))
+        .route("/plugins/delete", post(plugins_delete))
+        .route("/artifacts/get", get(artifact_get))
+        .route("/artifacts/list", get(artifact_list))
+        .route("/artifacts", delete(artifact_delete))
         .route("/chat/compact", post(chat_compact))
         .route("/chat/stream", post(chat_stream_entry))
         // Mid-turn steer: inject a message into the RUNNING turn of a chat.
@@ -1450,6 +1774,9 @@ pub fn router(state: AppState) -> Router {
         // Banner Retry on a LIVE sub-agent retry: skip the ladder's backoff and
         // run the next attempt immediately (see `chat_retry_now`).
         .route("/chat/retry_now", post(chat_retry_now))
+        // Tool Models changed mid-turn: the running sub-agent ladder must see it
+        // (the request body only carries a snapshot — see `chat_slot_model`).
+        .route("/chat/slot_model", post(chat_slot_model))
         // User answers to a blocking agent gate. The turn is parked on a
         // oneshot inside agent.rs (`await_answer`); these two routes resolve it
         // and let the turn continue. They MUST be native: the sidecar no longer
@@ -1471,6 +1798,7 @@ pub fn router(state: AppState) -> Router {
         .route("/schedules", get(crate::appstate::schedules_list))
         .route("/schedules", post(crate::appstate::schedules_upsert))
         .route("/schedules/:id", delete(crate::appstate::schedules_delete))
+        .route("/schedules/:id/run", post(crate::appstate::schedules_run))
         .route("/schedules/:id/runs", get(crate::appstate::schedule_runs_list))
         .route("/schedules/:id/runs", delete(crate::appstate::schedule_runs_clear))
         .route("/schedule-runs", get(crate::appstate::all_schedule_runs))
@@ -1569,6 +1897,50 @@ mod tests {
         assert_eq!(keys4, vec!["sk-parent".to_string()]);
         // Unknown provider: falls back to the parent, id included.
         assert_eq!(pid4, "parent-id");
+    }
+
+    #[test]
+    fn slot_target_never_lends_the_parents_key_to_another_endpoint() {
+        // The user's 401: a slot (or fallback) whose provider is on a DIFFERENT
+        // base URL but whose stored key list is empty. Borrowing the parent's
+        // key there sends the chat provider's key to a foreign endpoint, and the
+        // provider answers a bare "Invalid API key" that names no model — the
+        // failure looks like the fallback never ran. An empty list is the honest
+        // answer: llm::complete reports "no api key configured" instead.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "keyless".to_string(),
+            serde_json::json!({"kind": "custom", "baseUrl": "http://other/v1"}),
+        );
+        let (_, base, keys, pid) = resolve_slot_target(
+            "keyless/m",
+            "parent",
+            "http://parent/v1",
+            &["sk-parent".to_string()],
+            "parent-id",
+            &providers,
+        );
+        assert_eq!(base, "http://other/v1");
+        assert!(keys.is_empty(), "the parent's key must not cross endpoints, got {keys:?}");
+        assert_eq!(pid, "keyless");
+
+        // The SAME endpoint is a different story: there the parent's key is the
+        // right key, and dropping it would break a slot that shares the chat's
+        // provider but has no key list of its own.
+        let mut shared = std::collections::HashMap::new();
+        shared.insert(
+            "same".to_string(),
+            serde_json::json!({"kind": "custom", "baseUrl": "http://parent/v1"}),
+        );
+        let (_, _, keys, _) = resolve_slot_target(
+            "same/m",
+            "parent",
+            "http://parent/v1",
+            &["sk-parent".to_string()],
+            "parent-id",
+            &shared,
+        );
+        assert_eq!(keys, vec!["sk-parent".to_string()]);
     }
 
     #[test]
@@ -1971,6 +2343,134 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    /// An OpenAI-compatible upstream that answers 401 for one model and a
+    /// completion for any other, recording `(model, authorization)` per request.
+    /// Used to prove WHICH key each rung of a chain actually sent.
+    async fn spawn_key_recording_upstream(
+        reject_model: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<(String, String)>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let auth = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("authorization:"))
+                        .map(|v| v.trim().to_string())
+                        .unwrap_or_default();
+                    let body = serde_json::from_slice::<Value>(&buf[head_end + 4..])
+                        .unwrap_or(Value::Null);
+                    let model = body["model"].as_str().unwrap_or_default().to_string();
+                    let _ = tx.send((model.clone(), auth));
+                    let (status, payload) = if model == reject_model {
+                        (
+                            "401 Unauthorized",
+                            r#"{"error":{"message":"Invalid API key","type":"invalid_request_error"}}"#
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"choices":[{"message":{"content":"ok summary"}}],"usage":{"input_tokens":21,"output_tokens":7}}"#
+                                .to_string(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn compact_chat_rung_uses_the_chat_key_not_the_slot_key() {
+        // The user's banner: `Compact failed — key rejected (401): Invalid API
+        // key`. The summariser slot ran on provider B while the chat ran on
+        // provider A, and the appended chat-model rung was built with the
+        // SLOT's key against the CHAT's endpoint — a guaranteed 401 that looks
+        // like the fallbacks were never tried. Each rung must carry the key of
+        // the provider it actually calls.
+        let (mock_base, mut rx) = spawn_key_recording_upstream("dead-model").await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "custom",
+            "provider_id": "chat-prov",
+            "model": "chat-model",
+            "base_url": format!("{mock_base}/v1"),
+            "api_keys": ["sk-chat"],
+            "fallback_provider": "custom",
+            "fallback_model": "chat-model",
+            "fallback_base_url": format!("{mock_base}/v1"),
+            "fallback_api_keys": ["sk-chat"],
+            "fallback_provider_id": "chat-prov",
+            "subagent_models": { "compact": "slot-prov/dead-model" },
+            "providers": {
+                "slot-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-slot"] },
+                "chat-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-chat"] }
+            },
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let (_progress, out) = parse_compact_sse(&bytes);
+
+        let first = rx.recv().await.expect("the slot model was never called");
+        assert_eq!(first.0, "dead-model");
+        assert_eq!(first.1, "bearer sk-slot", "the slot model must use the SLOT's key");
+        let second = rx.recv().await.expect("the chat-model rung was never reached");
+        assert_eq!(second.0, "chat-model");
+        assert_eq!(
+            second.1, "bearer sk-chat",
+            "the chat rung must use the CHAT's key — a slot key here is the 401 the user saw"
+        );
+        assert_eq!(out["summary"], "ok summary");
+        assert!(out.get("error").is_none() || out["error"].is_null());
+    }
+
     #[tokio::test]
     async fn model_probe_reports_a_failure_per_model_without_failing_the_batch() {
         // An unreachable provider must mark that model failed (no green tick)
@@ -2157,5 +2657,232 @@ mod tests {
         assert_eq!(usage["provider_id"], "title-prov", "title usage must be attributed to the slot provider, got {usage}");
         assert_eq!(usage["model"], MOCK_MODEL);
         assert!(out["title"].as_str().is_some_and(|t| !t.is_empty()), "a title must come back: {out}");
+    }
+
+    #[test]
+    fn slot_chain_keeps_the_arranged_order_without_repeats() {
+        // The chain is what a tool's own model failure walks down: the tool's
+        // model first, then its fallback list in the order the user arranged it
+        // (the settings row has up/down buttons), with unreachable repeats
+        // dropped so one dead model cannot be paid for twice.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "p1".to_string(),
+            serde_json::json!({"kind": "openai", "baseUrl": "http://one/v1", "apiKeys": ["sk-one"]}),
+        );
+        providers.insert(
+            "p2".to_string(),
+            serde_json::json!({"kind": "anthropic", "baseUrl": "http://two/v1", "apiKeys": ["sk-two"]}),
+        );
+        let fallbacks = vec![
+            "p2/fb-a".to_string(),
+            // Same provider+model as the slot's own model: dropped.
+            "p1/gpt-x".to_string(),
+            "p2/fb-b".to_string(),
+            "".to_string(),
+            // Unknown provider id: still routable (bare model on the parent),
+            // so it survives as its own rung.
+            "ghost/fb-c".to_string(),
+        ];
+        let chain = resolve_slot_chain(
+            "p1/gpt-x",
+            &fallbacks,
+            "parent-model",
+            "http://parent/v1",
+            &["sk-parent".to_string()],
+            "parent-id",
+            "custom",
+            &providers,
+        );
+        let models: Vec<&str> = chain.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(models, vec!["gpt-x", "fb-a", "fb-b", "fb-c"]);
+        // Each rung routes to ITS OWN provider — base URL, keys and endpoint
+        // kind — exactly like the slot entry itself.
+        assert_eq!(chain[1].1, "http://two/v1");
+        assert_eq!(chain[1].2, vec!["sk-two".to_string()]);
+        assert_eq!(chain[1].3, "p2");
+        assert_eq!(chain[1].4, "anthropic");
+        assert_eq!(chain[3].1, "http://parent/v1");
+        assert_eq!(chain[3].3, "parent-id");
+        assert_eq!(chain[3].4, "custom");
+
+        // Re-arranging the list (what the up/down buttons do) re-orders the
+        // chain: the try order is the LIST order, nothing else.
+        let flipped = vec!["p2/fb-b".to_string(), "p2/fb-a".to_string()];
+        let chain = resolve_slot_chain(
+            "p1/gpt-x",
+            &flipped,
+            "parent-model",
+            "http://parent/v1",
+            &[],
+            "parent-id",
+            "custom",
+            &providers,
+        );
+        let models: Vec<&str> = chain.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(models, vec!["gpt-x", "fb-b", "fb-a"]);
+    }
+
+    #[test]
+    fn slot_chain_starts_at_the_slot_model_every_call() {
+        // Nothing about a chain survives the call it was built for: a fallback
+        // is an escape hatch for ONE failing call, never a new default.
+        let providers = std::collections::HashMap::new();
+        let fallbacks = vec!["fb-x".to_string(), "fb-y".to_string()];
+        for _ in 0..2 {
+            let chain = resolve_slot_chain(
+                "",
+                &fallbacks,
+                "parent-model",
+                "http://parent/v1",
+                &[],
+                "parent-id",
+                "custom",
+                &providers,
+            );
+            assert_eq!(chain[0].0, "parent-model");
+            assert_eq!(chain[0].3, "parent-id");
+            let models: Vec<&str> = chain.iter().map(|s| s.0.as_str()).collect();
+            assert_eq!(models, vec!["parent-model", "fb-x", "fb-y"]);
+        }
+        // A slot with no fallbacks is exactly one rung long.
+        let chain = resolve_slot_chain(
+            "p1/gpt-x",
+            &[],
+            "parent-model",
+            "http://parent/v1",
+            &[],
+            "parent-id",
+            "custom",
+            &providers,
+        );
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn other_slot_fallbacks_read_the_group_first_list() {
+        // The "Other" row writes compact/web/title together, so its fallback
+        // list lives under the same keys and is read with the same precedence
+        // as its model.
+        let mut m = std::collections::HashMap::new();
+        m.insert("title".to_string(), vec!["p2/t".to_string()]);
+        m.insert("web".to_string(), vec!["p2/w".to_string()]);
+        assert_eq!(other_slot_fallbacks(&m), ["p2/w".to_string()]);
+        m.insert("compact".to_string(), vec!["p2/c".to_string()]);
+        assert_eq!(other_slot_fallbacks(&m), ["p2/c".to_string()]);
+        // An empty list under the first key must not hide a real one.
+        let mut sparse = std::collections::HashMap::new();
+        sparse.insert("compact".to_string(), Vec::new());
+        sparse.insert("title".to_string(), vec!["p2/t".to_string()]);
+        assert_eq!(other_slot_fallbacks(&sparse), ["p2/t".to_string()]);
+        assert!(other_slot_fallbacks(&std::collections::HashMap::new()).is_empty());
+    }
+
+    /// An OpenAI-compatible upstream that always rejects with 401 — the
+    /// "provider refuses the key" failure a dead provider produces.
+    async fn spawn_rejecting_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = sock.read(&mut tmp).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let Ok(n) = sock.read(&mut tmp).await else { break };
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = r#"{"error":{"message":"Invalid API key"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn compact_live_walks_the_other_slots_fallback_when_the_key_is_rejected() {
+        // The live failure this fixes: the "Other" slot's own provider rejects
+        // the key, and the compact used to die with
+        // "Compact failed — key rejected (401)" even though the user had a
+        // fallback configured. The fallback list must be walked automatically
+        // and the compaction must finish on the fallback model.
+        let dead_base = spawn_rejecting_upstream().await;
+        let (good_base, mut rx) = spawn_mock_upstream().await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/m-main",
+            "base_url": "http://chat-provider.example/v1",
+            "api_key": "sk-chat",
+            "api_keys": ["sk-chat"],
+            "subagent_models": { "compact": format!("dead-prov/{MOCK_MODEL}") },
+            "providers": {
+                "dead-prov": { "kind": "custom", "baseUrl": format!("{dead_base}/v1"), "apiKeys": ["sk-dead"] },
+                "good-prov": { "kind": "custom", "baseUrl": format!("{good_base}/v1"), "apiKeys": ["sk-good"] }
+            },
+            "tool_fallbacks": { "compact": [format!("good-prov/{MOCK_MODEL}")] },
+            // The renderer ALWAYS sends the chat model as the summariser's
+            // last resort. That used to be the only rung honoured, which threw
+            // the Tools fallback list away — the exact bug this pins. Here the
+            // chat model is broken too, so only the Tools list can answer.
+            "fallback_provider": "custom",
+            "fallback_model": "chat/last-resort",
+            "fallback_base_url": format!("{dead_base}/v1"),
+            "fallback_api_keys": ["sk-dead"],
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let (_progress, out) = parse_compact_sse(&bytes);
+        // The GOOD provider is the one that must receive the summariser call —
+        // and it must receive the slot's own model, resolved through the
+        // fallback's OWN provider config (its keys and base URL).
+        let sent = rx.recv().await.expect("the fallback provider saw no request");
+        assert_eq!(sent["model"], MOCK_MODEL);
+        assert_eq!(
+            out["summary"], "ok summary",
+            "the fallback must answer the compaction, got {out}"
+        );
+        assert!(
+            out["error"].is_null(),
+            "a walked chain must not report an error, got {out}"
+        );
     }
 }

@@ -301,10 +301,13 @@ textarea {
 .mac .sidebar-drag {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 2px;
   height: var(--titlebar-h);
   flex: 0 0 auto;
-  padding: 0 8px 0 76px;
+  /* Left gutter clears the traffic lights with breathing room — wider
+     than the cluster's own 2px gap so the lights read as a separate
+     group. */
+  padding: 0 8px 0 88px;
   overflow: hidden;
   -webkit-app-region: drag;
 }
@@ -2379,7 +2382,7 @@ textarea {
 .window-strip-cluster {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 2px;
   min-width: 0;
 }
 
@@ -2389,9 +2392,38 @@ textarea {
   display: none;
 }
 
+/* Vertical alignment with the traffic lights: wry pins the lights to their
+   stock AppKit position (center ≈14px from the window top) — only the
+   buttons' x offset is configurable, so the icon row must come up to THEM.
+   The 38px strip centers this row at 19px; shifting it up 5px puts both
+   centerlines on the same line. */
+.mac .window-strip-cluster {
+  position: relative;
+  top: -5px;
+}
+
+/* The Finder pill sits outside the cluster in the titlebar — give it the
+   same raise so the whole row shares the traffic lights' centerline. A 30px
+   pill on that raised line would poke 1px past the window's top edge (its
+   background visibly clips) — so on mac the pill itself is 28px: same
+   14px centerline, fully inside the window. */
+.mac .titlebar .ws-menu-wrap {
+  top: -5px;
+}
+
+.mac .titlebar .workspace-menu-btn {
+  height: 26px;
+}
+
+.mac .titlebar .workspace-menu-btn .mac-app-badge {
+  width: 18px;
+  height: 18px;
+}
+
 .mac .titlebar.chat-topbar.solo {
-  /* Clear the traffic lights; the cluster flows inline after them. */
-  padding-left: 76px;
+  /* Clear the traffic lights with the same wider gutter the sidebar strip
+     uses — one consistent distance in both sidebar states. */
+  padding-left: 88px;
 }
 
 .titlebar button {
@@ -2558,6 +2590,8 @@ textarea {
 }
 
 .workspace-menu-btn svg:last-child {
+  width: 10px;
+  height: 10px;
   opacity: 0.6;
 }
 
@@ -2576,10 +2610,11 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 5px 11px 5px 9px;
+  height: 30px;
+  padding: 0 9px 0 7px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
-  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border: none;
+  background: transparent;
   box-shadow: none;
   color: var(--text-dim);
   font-size: 12px;
@@ -2595,25 +2630,24 @@ textarea {
 }
 
 .workspace-btn svg {
-  width: 14px;
-  height: 14px;
+  width: 17px;
+  height: 17px;
   flex: 0 0 auto;
   color: var(--ws, var(--accent));
   opacity: 0.9;
 }
 
-.workspace-btn-dot {
-  flex: 0 0 auto;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--ws, var(--accent));
-  box-shadow: 0 0 6px color-mix(in srgb, var(--ws, var(--accent)) 70%, transparent);
+/* Cluster's icon-only buttons (sidebar toggle, settings): uniform 17px
+   glyphs — same as the titlebar default — sized against the traffic
+   lights' proportions (close, minimize, zoom). */
+.window-strip-cluster .titlebar-icon-btn svg {
+  width: 17px;
+  height: 17px;
 }
 
 .workspace-btn:hover {
-  background: color-mix(in srgb, var(--text) 10%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: transparent;
+  border-color: transparent;
   color: var(--text);
 }
 
@@ -4048,20 +4082,20 @@ body.coder-dragging .chat-split-child {
 /* RTL/LTR direction switch: text pill, same height as the other pills. */
 .dir-text-btn {
   width: auto;
-  height: 26px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 9px;
   border-radius: 999px;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: 0.6px;
-  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
-  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border: none;
+  background: transparent;
 }
 
 .dir-text-btn:hover {
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: transparent;
+  color: var(--text);
+  background: transparent;
 }
 
 .chat-scroll {
@@ -6651,52 +6685,6 @@ body.coder-dragging .chat-split-child {
   color: var(--text-dim);
 }
 
-/* Keep the effort slider and the model picker on ONE row inside a tool-slot:
-   header + hint stay full-width rows, the bar takes the remaining space and
-   the picker sits fixed at the end of the same line. */
-.field.tool-slot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  /* Keep this row from gluing to the intro hint / previous row above it. */
-  margin-top: 12px;
-}
-
-.field.tool-slot .tool-slot-head,
-.field.tool-slot .hint {
-  width: 100%;
-}
-
-.field.tool-slot .thinking-bar {
-  flex: 1;
-  /* 132px fits the 6-step track + label even in a narrow modal, so the bar
-     and the picker stay on ONE row at any settings-modal width. */
-  min-width: 132px;
-  margin: 0;
-}
-
-.field.tool-slot .pm-select {
-  flex: 0 0 auto;
-}
-
-/* Tool-row titles are section headings inside the Tools tab, not field
-   captions: bigger and brighter than the plain `.field label` (12px/dim) so
-   each tool is scannable at a glance. The "model" suffix was dropped from the
-   title text itself — the picker below obviously selects a model. */
-.field.tool-slot .tool-slot-head label {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text);
-  letter-spacing: -0.01em;
-}
-
-/* Note under a slider whose effective model does not advertise reasoning. */
-.field.tool-slot .thinking-bar-note {
-  width: 100%;
-  margin-top: 0;
-  opacity: 0.6;
-}
 
 /* ---- tool activity ---- */
 .tool-activity {
@@ -10965,116 +10953,6 @@ body.coder-dragging .chat-split-child {
     0 4px 12px -6px rgba(0, 0, 0, 0.3);
 }
 
-/* Auto-matched skills: a quiet metadata row, not a row of filled pills.
-   Rendered as one dim line so several matches never compete with the answer;
-   the dimmed dot leader takes the remaining width instead of the row spilling. */
-.msg-skills {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  max-width: 100%;
-}
-
-.msg-skills-head {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  /* fit-content + nowrap: the row is always exactly ONE line, so adding a
-     fourth match can never grow the turn's height. */
-  width: fit-content;
-  max-width: 100%;
-  overflow: hidden;
-  margin: 0;
-  padding: 0;
-  background: none;
-  border: none;
-  font-family: inherit;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-dim);
-  /* Recessive, but still ≈4.5:1 against the panel — metadata should be calm,
-     not illegible. */
-  opacity: 0.7;
-  text-align: start;
-  cursor: pointer;
-  transition: opacity 0.15s ease;
-}
-
-.msg-skills-head:hover,
-.msg-skills-head.open,
-.msg-skills-head:focus-visible {
-  opacity: 0.95;
-}
-
-.msg-skills-head:focus-visible {
-  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-
-.msg-skills-icon {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  align-self: center;
-  color: color-mix(in srgb, var(--accent) 60%, var(--text-dim));
-}
-
-.msg-skills-icon svg {
-  display: block;
-}
-
-.msg-skills-label {
-  flex: 0 0 auto;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-
-/* Inline names, clamped to one line: the first match stays readable, the rest
-   fold into an ellipsis instead of pushing the row wider. */
-.msg-skills-preview {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 10.5px;
-  color: var(--text-dim);
-}
-
-.msg-skills-head .chev {
-  flex: 0 0 auto;
-  align-self: center;
-  font-size: 8px;
-  opacity: 0.55;
-}
-
-.msg-skills-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.msg-skills-item {
-  font-size: 10.5px;
-  line-height: 1.9;
-  color: var(--text-dim);
-  opacity: 0.95;
-}
-
-.queued-bubble .msg-skills {
-  min-width: 0;
-  max-width: 100%;
-  overflow: hidden;
-}
-
 /* File attachment chips render FileIcon next to the path; no pin glyph. */
 
 /* Input file badge: small compact pill — icon + name + X.
@@ -11669,12 +11547,69 @@ body.coder-dragging .chat-split-child {
   color: var(--accent);
 }
 
+/* A click is an async round trip (POST /chat/retry_now). While it is in flight
+   the button spins, so the press is visibly acknowledged — before this the
+   button looked byte-identical after a click, which read as "nothing happened". */
+.retry-banner .retry-btn-spinner {
+  width: 10px;
+  height: 10px;
+  border-width: 1.5px;
+  border-color: currentColor;
+  border-top-color: transparent;
+  margin-right: 5px;
+  vertical-align: -1px;
+  display: inline-block;
+}
+
+.retry-banner .retry-btn:disabled {
+  cursor: progress;
+  opacity: 0.75;
+}
+
 /* Sub-agent model hard-failed → tool fell back to the MAIN model. Distinct
    look from the provider-retry banner: no spinner, no Retry button, and a
    neutral (non-amber) accent so it reads as "handled" rather than "stuck". */
 .retry-banner.retry-banner-fallback {
   border-left-color: var(--link);
   background: color-mix(in srgb, var(--link) 8%, var(--bg));
+}
+
+/* Transient retry banners (sub-agent fell back to the main model, retries
+   exhausted while the turn is no longer running) dissolve on their own:
+   informational, nothing to click, and staying pinned at the end of the
+   message list only invites clicks. They hold fully readable for READ_MS and
+   then fade out — after which the parent retires them.
+
+   The 2s duration MUST match FADE_MS in components/ChatMessage.tsx: retiring
+   earlier unmounts the banner while it is still partly opaque, which reads as
+   a flicker rather than a fade. These live here, not in a stylesheet of their
+   own, so every tree that styles a banner styles its fade too. */
+.retry-banner.retry-banner--fading {
+  animation: retry-fade-out 2s ease-in forwards;
+}
+
+.retry-banner.retry-banner--fading .retry-text {
+  opacity: 0.55;
+  transition: opacity 0.4s ease;
+}
+
+@keyframes retry-fade-out {
+  0% {
+    opacity: 1;
+  }
+
+  35% {
+    opacity: 0.45;
+  }
+
+  70% {
+    opacity: 0.12;
+  }
+
+  100% {
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 
 .retry-banner-fallback .retry-fallback-icon {
@@ -12237,6 +12172,24 @@ body.coder-dragging .chat-split-child {
 .tool-card-head .tool-path.tool-more {
   font-style: italic;
   opacity: 0.75;
+}
+
+/* The skill a `load_skill` call pulled in — the head's only statement of it,
+   since the label just says "Load Skill". Accent-tinted so it reads as the
+   payload of the call, not as another arg chip. */
+.tool-card-head .tool-skill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 24ch;
+  min-width: 0;
 }
 
 .tool-ms {
@@ -13225,6 +13178,20 @@ body.coder-dragging .chat-split-child {
   overflow-wrap: anywhere;
 }
 
+/* Result lists and file chips (grep/glob/read rows) can run to hundreds of
+   entries: cap the list and scroll it inside the row instead of stretching the
+   chat — the full data is one scroll away, not a click away in the panel. */
+.file-results {
+  max-height: 240px;
+  overflow: auto;
+}
+
+/* The explore report is prose: it scrolls inside the card's own expanded body. */
+.explore-report {
+  max-height: 420px;
+  overflow: auto;
+}
+
 .trace-expand-diff {
   color: var(--text-dim);
 }
@@ -13522,12 +13489,6 @@ body.coder-dragging .chat-split-child {
   line-height: 1.5;
 }
 
-.file-result-more {
-  font-size: 11px;
-  color: var(--text-dim, #8a8a8a);
-  opacity: 0.8;
-  padding-top: 2px;
-}
 
 .file-result-glyph {
   flex: 0 0 auto;
@@ -16728,16 +16689,14 @@ body.coder-dragging .chat-split-child {
 }
 
 .workspace-btn {
-  background: var(--bg-input);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  background: transparent;
+  box-shadow: none;
 }
 
 .workspace-btn:hover {
-  background: var(--accent-dim);
-  color: var(--accent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
-    0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
+  background: transparent;
+  color: var(--text);
+  box-shadow: none;
 }
 
 .copy-btn,
@@ -18734,6 +18693,122 @@ mark.diff-hit-active {
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
+/* ---- بخش «این ترن» (اسکیل/MCP/پلاگین) زیر تودوها در پنل راست ---- */
+.sidebar-panel.usage-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.sidebar-panel.usage-docked .sidebar-panel-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.turn-usage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+
+.turn-usage-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.turn-usage-label {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.turn-usage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* یک چیپ بهازای هر اسکیل/کانکتور/پلاگین — نقطهٔ توپر یعنی همین ترن واقعاً
+   استفادهاش کرده، نقطهٔ تُهی یعنی فقط در دسترسش بوده. */
+.turn-usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.turn-usage-chip.used {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.turn-usage-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 60%, transparent);
+}
+
+.turn-usage-chip.used .turn-usage-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.turn-usage-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-usage-meta {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-usage-empty {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  max-width: 42ch;
+  overflow-wrap: anywhere;
+}
+
 /* ---- بخش زمان‌بندی (بالای تودوها در پنل راست) ---- */
 .sidebar-panel.schedule-docked {
   position: static;
@@ -20609,6 +20684,323 @@ mark.trace-hit-active {
   color: var(--text-dim);
   font-size: 13px;
   text-align: center;
+}
+
+/* ---- artifact preview (sandboxed document tab) ---- */
+/* Fills the viewer group the same way the browser panel does: header strip on
+   top, the document owns every remaining pixel and scrolls inside itself. */
+.artifact-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.artifact-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: color-mix(in srgb, var(--bg-panel) 30%, transparent);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.artifact-panel-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Generated pages are written against a white canvas: keep it so an artifact
+   that omits its own background does not inherit the dark theme and render
+   unreadable text. */
+.artifact-panel-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+.artifact-panel-md {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px;
+}
+
+/* ---- artifact card in the transcript ---- */
+.artifact-card {
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.artifact-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px 8px 12px;
+  font-size: 12px;
+  direction: ltr;
+}
+
+.artifact-card-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+}
+
+.artifact-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifact-card-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.artifact-card-open {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  border-radius: 7px;
+}
+
+/* ---- artifacts page (every document the agent built) ---- */
+/* Fills the pane like the artifact preview: header strip, then the list owns
+   every remaining pixel and scrolls inside itself. */
+.artifacts-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.artifacts-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: color-mix(in srgb, var(--bg-panel) 30%, transparent);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.artifacts-panel-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifacts-panel-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.artifacts-refresh {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.artifacts-refresh:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--border);
+}
+
+.artifacts-error {
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+  color: var(--error);
+  font-size: 12px;
+}
+
+.artifacts-loading {
+  padding: 20px 12px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* The empty state centres itself in the pane instead of hugging the header. */
+.artifacts-panel .viewer-empty {
+  margin: auto;
+  padding: 24px;
+}
+
+.artifacts-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+}
+
+.artifacts-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.artifacts-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  direction: ltr;
+  cursor: pointer;
+}
+
+.artifacts-open:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.artifacts-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+}
+
+.artifacts-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.artifacts-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.artifacts-time {
+  flex: 0 0 auto;
+  width: 34px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The page reuses the Review search box verbatim (one search UI for every
+   panel); only the padding follows this page's own 8px list gutter. */
+.artifacts-panel > .review-search-row {
+  padding: 8px 8px 0;
+}
+
+/* Row action: a trash icon that turns into its own inline confirm, so deleting
+   a document never relies on a modal. */
+.artifacts-delete {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 0 9px;
+  border: 0;
+  border-left: 1px solid var(--hairline, rgba(255, 255, 255, 0.09));
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.artifacts-delete:hover {
+  color: var(--danger, #e5534b);
+  background: color-mix(in srgb, var(--danger, #e5534b) 12%, transparent);
+}
+
+/* The second click: now it really deletes, so it must not look like the
+   harmless icon that got the user here. */
+.artifacts-delete.active {
+  color: var(--danger, #e5534b);
+  background: color-mix(in srgb, var(--danger, #e5534b) 18%, transparent);
+  font-weight: 600;
+}
+
+.artifacts-delete:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 /* Docked panels fill the viewer group (no floating card). The docked wrapper
@@ -23344,22 +23736,6 @@ tr[data-search-current] .fv-mark,
   line-height: 1.35;
 }
 
-/* "+N more" result rows open the full list in the side panel. */
-.file-result-more-btn {
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  color: inherit;
-  opacity: 0.8;
-  cursor: pointer;
-}
-
-.file-result-more-btn:hover {
-  color: var(--text);
-  opacity: 1;
-  text-decoration: underline;
-}
 
 /* Attachment chips in messages open the file in the side panel. */
 .attachment-chip-open {
@@ -23373,14 +23749,6 @@ tr[data-search-current] .fv-mark,
     0 2px 6px rgba(0, 0, 0, 0.25);
 }
 
-/* Long terminal output / tool paths open in the side panel. */
-.trace-terminal-output.clickable {
-  cursor: pointer;
-}
-
-.trace-terminal-output.clickable:hover {
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-}
 
 .tool-path.tool-path-open {
   cursor: pointer;
@@ -24292,6 +24660,8 @@ tr[data-search-current] .fv-mark,
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+  /* One icon wide: hovering a tab must never widen the rail (the viewer would
+     jump). The row's name floats BESIDE the rail while hovered instead. */
   --viewer-rail-width: 42px;
 }
 
@@ -24315,6 +24685,8 @@ tr[data-search-current] .fv-mark,
   align-items: stretch;
   gap: 4px;
   padding: 6px 4px;
+  /* Physical layout: the rail hugs the window's right edge in RTL too. */
+  direction: ltr;
   border: 0;
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: none;
@@ -24327,7 +24699,9 @@ tr[data-search-current] .fv-mark,
 }
 
 .viewer-pane-body .viewer-pane-spacer {
-  flex: 1 1 auto;
+  /* The tab list already takes the rail's free height; the spacer must not
+     split it in half. */
+  flex: 0 0 auto;
   min-height: 0;
 }
 
@@ -24342,18 +24716,38 @@ tr[data-search-current] .fv-mark,
   padding: 0;
 }
 
+/* The page icons wrap into compact rows above the tab list: stacked one per
+   row they would eat the rail's whole height before the first tab. */
+.viewer-pane-body .viewer-pane-icons {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
 .viewer-pane-body .viewer-tabs-rail {
   display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 2px;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   width: 100%;
   min-height: 0;
-  padding: 0;
+  /* A hairline + breathing room separates the tab rows from the page icons
+     above: a new tab must never read as one more icon button. */
+  margin-top: 6px;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--hairline);
   border-bottom: 0;
-  overflow: visible;
-  scrollbar-width: none;
+  /* Rows scroll inside the rail instead of spilling past the pane's bottom
+     edge, where they used to paint over the fixed icon column. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 /* A rail tab is one full-width icon row centered on the rail's axis — the
@@ -24361,7 +24755,7 @@ tr[data-search-current] .fv-mark,
 .viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab {
   position: relative;
   width: 100%;
-  height: 32px;
+  height: 30px;
   min-width: 0;
   max-width: none;
   flex: 0 0 auto;
@@ -24371,6 +24765,7 @@ tr[data-search-current] .fv-mark,
   gap: 0;
   padding: 0;
   border-radius: 6px;
+  /* The floated name must be able to leave the row's box. */
   overflow: visible;
 }
 
@@ -24386,51 +24781,124 @@ tr[data-search-current] .fv-mark,
   justify-content: center;
 }
 
-/* Icon-only rail: the label is hidden until hover, then it unfolds leftward
-   OVER the content as an overlay anchored to the tab's own box — the rail's
-   layout (and the viewer's width) never move. Hover-only: a clicked tab does
-   NOT stay wide once the pointer leaves. */
+/* Rows are never translucent: a faded tab reads as disabled and its file
+   looks gone from the rail. The active tab is claimed by its own surface and
+   accent, not by dimming every other row, and a hovered row gets a solid
+   surface so it is unmistakably interactive. */
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab {
+  opacity: 1;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:not(.active) {
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover,
+.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 14%, var(--bg-hover));
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
+}
+
+/* Icon-only rail: a row's name is not painted inside the row. While the row is
+   hovered, ONE card replaces it: the card covers the row's own square and
+   extends leftwards over the content, holding the name AND the ✕ in a single
+   surface. Nothing widens — the card floats — so the rail stays one icon wide
+   and the viewer never jumps.
+   The card is a DOM child of the row, so moving the pointer onto it keeps the
+   row hovered: the name never vanishes halfway toward it. */
 .viewer-tabs-rail .editor-tab-label {
   display: none;
 }
 
-.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-label {
+.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-label,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-label,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .editor-tab-label {
   display: flex;
-  position: absolute;
-  top: -1px;
-  bottom: -1px;
-  /* Unfold to the LEFT of the tab so its icon square stays visible. */
-  right: 100%;
-  z-index: 3;
   align-items: center;
+  gap: 6px;
+  position: fixed;
+  /* The row publishes its own center and its own right edge, so the card lands
+     exactly on top of that row at any scroll position. */
+  top: var(--viewer-tab-hint-top, 50vh);
+  right: var(--viewer-tab-hint-right, calc(var(--viewer-rail-width) - 4px));
+  z-index: 60;
+  /* Same height as the row: the card IS the row, then some, so the ✕ it holds
+     sits on the square the kind icon used to occupy. */
+  height: 30px;
   width: max-content;
-  /* Short titles still get a comfortable unfolded width (icon + title + close). */
-  min-width: 150px;
-  max-width: 280px;
-  padding: 0 12px;
-  border: 1px solid;
-  border-color: inherit;
+  max-width: 300px;
+  margin: 0;
+  padding: 0 4px 0 12px;
+  transform: translateY(-50%);
+  border: 1px solid color-mix(in srgb, currentColor 26%, transparent);
   border-radius: 6px;
-  background: inherit;
-  box-shadow: inherit;
+  background: color-mix(in srgb, var(--text) 14%, var(--bg-hover));
+  box-shadow: 0 10px 24px -14px rgba(0, 0, 0, 0.7);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  text-align: left;
   white-space: nowrap;
+  pointer-events: auto;
+}
+
+/* The name ellipsizes inside the card: a long path never pushes the ✕ out of
+   the pill. */
+.viewer-pane-body .viewer-tabs-rail .viewer-tab-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* Closing a tab: the close button lives INSIDE the unfolded label surface,
-   BEFORE the title so it lands at the label's left edge — away from the
-   tab's icon. It appears only while the tab is hovered (unfolded wide). */
+/* The ✕ is the card's right-hand end — the very square the kind icon occupied,
+   which the card now covers. It paints no box and no background of its own, so
+   the pill reads as ONE tab with two hit areas: the name activates it, the ✕
+   beside the name closes it. */
 .viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close {
+  position: static;
   flex: 0 0 auto;
-  margin-right: 12px;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close {
+  width: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0;
+  transform: none;
+  border-radius: 5px;
   opacity: 1;
   pointer-events: auto;
+  background: none;
+}
+
+.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-close,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .editor-tab-close {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Hovering the ✕ only recolors its glyph: no box, no scale, so the card keeps
+   reading as one surface. */
+.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close:hover,
+.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close:focus-visible {
+  transform: none;
+  color: var(--danger);
+  background: none;
+  box-shadow: none;
+}
+
+/* The ✕ replaces the kind icon while the row is hovered/focused: one control
+   per square, nothing drawn on top of anything else. */
+.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .viewer-tab-icon,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .viewer-tab-icon,
+.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .viewer-tab-icon {
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* Drop feedback in the rail: no insertion line — the dragged tab is re-ordered
@@ -24473,7 +24941,7 @@ tr[data-search-current] .fv-mark,
 .viewer-pane-body .viewer-pane-head .titlebar-icon-btn,
 .viewer-pane-body .viewer-pane-head .viewer-schedule-btn,
 .viewer-pane-body .viewer-pane-head .viewer-inbox-btn {
-  width: 100%;
+  width: 30px;
   height: 30px;
   flex: 0 0 auto;
   display: flex;
@@ -24484,7 +24952,7 @@ tr[data-search-current] .fv-mark,
 }
 
 .viewer-pane-body .viewer-pane-head .viewer-pane-full {
-  width: 100%;
+  width: 30px;
 }
 
 /* The wraps keep their horizontal-bar paddings otherwise; in the rail every
@@ -24496,6 +24964,10 @@ tr[data-search-current] .fv-mark,
 /* `.tab-bar.viewer-tabs` re-declares the window drag region for the horizontal
    strip; inside the overlaying rail that swallows hover/click on the icons. */
 .viewer-pane-body .viewer-pane-head .tab-bar.viewer-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Tab rows own the rail's free height: the page icons keep their fixed box
+     above, so a new tab can never be laid over an icon. */
   -webkit-app-region: no-drag;
 }
 
@@ -24934,4 +25406,379 @@ tr[data-search-current] .fv-mark,
   flex-direction: column;
   gap: 6px;
   padding: 0 9px 8px;
+}
+
+
+/* ---- Settings → Tools: per-tool cards ----
+   One calm card per tool. The head gives the tool's name and purpose on one
+   line; the controls below share a FIXED two-column grid, so every card's
+   model picker and effort bar start and end at the same x — that alignment is
+   what makes four cards scan as one block instead of four loose forms, and it
+   is what keeps every reasoning slider exactly the same width. */
+.slot-page-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  margin-bottom: 6px;
+}
+
+.slot-intro {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  max-width: 72ch;
+}
+
+.slot-intro b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.slot-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  transition: border-color 0.15s ease;
+}
+
+.slot-card:hover {
+  border-color: color-mix(in srgb, var(--border) 75%, var(--accent) 25%);
+}
+
+.slot-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.slot-card-title {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.slot-card-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+/* The tools' models are ONE column of pickers, capped at the composer picker's
+   own 340px, so a Settings row is never wider here than in the footer. The
+   effort bar sits directly above the list and is capped to the same width, so
+   the bar and every model picker start at the same x on all four cards. */
+.slot-chain-effort {
+  max-width: 340px;
+  margin-bottom: 10px;
+}
+
+.slot-card-effort {
+  min-width: 0;
+}
+
+/* The picker fills its (capped) column instead of sizing to the longest model
+   name, so all rows line up regardless of what each one has selected. */
+.slot-fallback-picker .pm-select {
+  display: flex;
+  width: 100%;
+}
+
+.slot-fallback-picker .pm-select-btn {
+  width: 100%;
+  max-width: none;
+  justify-content: space-between;
+}
+
+.slot-fallback-picker .pm-select-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.slot-card-effort .thinking-bar {
+  margin: 0;
+}
+
+/* One width for every level label too: without this the track loses a few
+   pixels whenever the current level is a long word ("Medium", "XHigh"). */
+.slot-card-effort .thinking-bar-label {
+  flex: 0 0 44px;
+  width: 44px;
+  text-align: right;
+}
+
+/* A model that cannot report reasoning keeps the bar usable; the card only
+   dims its label instead of printing a paragraph under every row. */
+.slot-card[data-reasoning='off'] .thinking-bar-label {
+  opacity: 0.55;
+}
+
+.slot-card-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 7px;
+}
+
+.slot-card-sub-title {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.slot-card-sub-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+@media (max-width: 720px) {
+  .slot-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+
+  .slot-card-effort .thinking-bar-label {
+    flex: 0 0 40px;
+    width: 40px;
+  }
+
+  /* Full width on a narrow screen: a capped column would leave the pickers
+     shorter than the card for no reason. */
+  .slot-chain-effort {
+    max-width: none;
+  }
+}
+
+/* ---- Settings → Tools: fallback rows ---- */
+.slot-fallbacks {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.slot-fallback-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.slot-fallback-order {
+  flex: 0 0 auto;
+  width: 13px;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  opacity: 0.6;
+  text-align: right;
+}
+
+/* Row 1 is the tool's OWN model, not a fallback: its number is tinted and it is
+   nudged apart from the rest, so the list reads "this one first, then these"
+   without a second label. */
+.slot-fallback-row-own {
+  margin-bottom: 3px;
+}
+
+.slot-fallback-row-own .slot-fallback-order {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.slot-fallback-picker {
+  /* Same cap as the model picker above, so a fallback row never becomes a
+     card-wide text field either. */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 340px;
+}
+
+.slot-fallback-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex: 0 0 auto;
+  /* Dimmed until the row is hovered or focused: four cards x N rows of
+     always-on buttons is the noise this design avoids. 0.55 keeps each icon
+     above the 3:1 contrast floor for graphical controls. */
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.slot-fallback-row:hover .slot-fallback-actions,
+.slot-fallback-row:focus-within .slot-fallback-actions {
+  opacity: 1;
+}
+
+.slot-fallback-remove:hover {
+  color: var(--danger, #e5484d);
+}
+
+.slot-fallback-add {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 3px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.slot-fallback-add:hover {
+  color: var(--accent);
+}
+
+.slot-fallback-add:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+@media (max-width: 640px) {
+  .slot-fallback-actions {
+    opacity: 1;
+  }
+}
+
+/* ---- Settings: shared panel card (Web Providers / Media Providers) ----
+   The same calm anatomy as the tool cards, so all three tabs read alike. */
+.panel-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.panel-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 10px;
+}
+
+.panel-card-title {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.panel-card-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+@media (max-width: 720px) {
+  .panel-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+}
+
+/* Web Providers: engine rows are flat list items inside a panel card. */
+.plugin-list {
+  gap: 6px;
+}
+
+.plugin-row {
+  border-radius: 10px;
+  background: var(--bg-inset);
+  border-color: var(--hairline);
+}
+
+.plugin-row.off {
+  opacity: 0.5;
+}
+
+.plugin-row-head {
+  padding: 8px 10px;
+}
+
+.plugin-role-hint {
+  font-style: normal;
+  font-size: 10.5px;
+  opacity: 0.7;
+}
+
+/* Media Providers: flatten the nested wells so each card is one surface. */
+.model-card-voice {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.model-card-voice .model-card-head {
+  padding: 0;
+  border: none;
+  background: none;
+  margin-bottom: 10px;
+}
+
+.model-card-voice .model-card-head .model-card-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.model-card-voice .model-card-head .model-card-desc {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.model-card-voice .model-card-body {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 12px;
+}
+
+.voice-section {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 10px;
+}
+
+.voice-fallbacks {
+  padding: 0;
+  border: none;
+  background: none;
+  gap: 6px;
+}
+
+.voice-fallback-card {
+  gap: 8px;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--bg-inset);
+  border-color: var(--hairline);
 }

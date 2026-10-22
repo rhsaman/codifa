@@ -84,6 +84,12 @@ export function prettySlashLabel(text: string): string {
       return args ? `Create skill: ${args}` : 'Create skill'
     case 'create-mcp':
       return args ? `Create connector: ${args}` : 'Create connector'
+    case 'plugin':
+      return args ? `Plugin: ${args}` : 'Plugins'
+    case 'artifact':
+      return args ? `Artifact: ${args}` : 'Artifact'
+    case 'schedule':
+      return args ? `Schedule: ${args}` : 'Schedules'
     case 'goal':
       if (args === 'clear') return 'Clear goal'
       return args ? `Goal: ${args}` : 'Set a persistent goal'

@@ -82,7 +82,7 @@ console.log("1) ViewerTabBar renders as a vertical icon rail:")
   check("bar announces a vertical tablist", html.includes('aria-orientation="vertical"'))
   check("every tab shows an icon", (html.match(/viewer-tab-icon/g) ?? []).length === tabCount)
   check(
-    "every tab keeps its label in the DOM (hidden by CSS until hover)",
+    "every tab keeps its name in the markup (shown beside the row on hover)",
     (html.match(/editor-tab-label/g) ?? []).length === tabCount,
   )
   const railStart = html.indexOf("viewer-tabs-rail")
@@ -106,6 +106,16 @@ console.log("2) markup + CSS keep the rail fixed on the pane's right edge:")
 
   const rail = railCss.match(/\.viewer-tabs-rail\s*\{[^}]*\}/)
   check("rail stacks its tabs vertically", /flex-direction:\s*column/.test(rail?.[0] ?? ""), rail?.[0])
+  check(
+    "many tabs scroll inside the rail instead of spilling over the icons",
+    /overflow-y:\s*auto/.test(rail?.[0] ?? "") && /overflow-x:\s*hidden/.test(rail?.[0] ?? ""),
+    rail?.[0],
+  )
+  check(
+    "the rail is visually parted from the page icons above it",
+    /border-top:\s*1px solid/.test(rail?.[0] ?? ""),
+    rail?.[0],
+  )
 
   const head = railCss.match(/\.viewer-pane-body \.viewer-pane-head\s*\{[^}]*\}/)
   check(
@@ -119,19 +129,17 @@ console.log("2) markup + CSS keep the rail fixed on the pane's right edge:")
     head?.[0],
   )
 
-  // Regression: hovering used to widen the rail (squeezing the viewer) and
-  // repaint its background. Neither may come back. (`inherit` is fine: the
-  // unfolded label reuses the tab's own surface.)
+  // Regression: hovering must never widen the rail (squeezing the viewer) or
+  // repaint the rail/head container. A row's own hover surface is fine: it
+  // stays inside the row's box.
   const hoverHeadRules = railCss.match(/\.viewer-pane-body[^{}]*:hover[^{}]*\{[^}]*\}/g) ?? []
+  const containerHoverRules = hoverHeadRules.filter(
+    (r) => !/\.editor-tab/.test(r) && !/viewer-tab-hint/.test(r),
+  )
   check(
     "hovering never widens the rail or repaints it",
-    hoverHeadRules.every(
-      (r) =>
-        !/--viewer-rail-width/.test(r) &&
-        !/background:(?! *inherit)/.test(r) &&
-        !/box-shadow:(?! *inherit)/.test(r),
-    ),
-    hoverHeadRules,
+    containerHoverRules.length === 0,
+    containerHoverRules,
   )
   check(
     "the collapsed width is never overridden",
@@ -141,25 +149,79 @@ console.log("2) markup + CSS keep the rail fixed on the pane's right edge:")
     "viewer content keeps a constant rail gutter",
     /\.viewer-pane-body > \.viewer-content\s*\{[^}]*padding-right:\s*var\(--viewer-rail-width\)/.test(railCss),
   )
+  check(
+    "no rail row is painted translucent",
+    !/\.viewer-tabs-rail \.editor-tab[^{}]*\{[^}]*opacity:\s*0?\.\d/.test(railCss),
+  )
 
-  const hidden = railCss.match(/\.viewer-tabs-rail \.editor-tab-label\s*\{[^}]*\}/)
-  check("tab labels stay hidden in the rail", /display:\s*none/.test(hidden?.[0] ?? ""), hidden?.[0])
+  // Every row names itself while hovered (the rail is one icon wide, so the
+  // name floats beside it); the ✕ swaps in for the icon on the same square.
+  const label = railCss.match(/\.viewer-tabs-rail \.editor-tab-label\s*\{[^}]*\}/)
+  check("tab labels stay icon-only at rest", /display:\s*none/.test(label?.[0] ?? ""), label?.[0])
 
-  const unfold = railCss.match(
+  // The name floats beside the rail while hovered, so the rail's width never
+  // changes and the viewer never jumps.
+  const hint = railCss.match(
     /\.viewer-pane-body \.viewer-tabs-rail \.editor-tab:hover \.editor-tab-label[^{]*\{[^}]*\}/,
   )
-  check("a hovered tab unfolds its title over the content", unfold !== null, unfold?.[0])
+  check("a hovered row shows its name", hint !== null, hint?.[0])
   check(
-    "the unfolded title opens beside the tab, leaving its icon visible",
-    /position:\s*absolute/.test(unfold?.[0] ?? "") && /right:\s*100%/.test(unfold?.[0] ?? ""),
-    unfold?.[0],
+    "the name floats outside the rail's box",
+    /position:\s*fixed/.test(hint?.[0] ?? "") &&
+      /right:\s*var\(--viewer-tab-hint-right/.test(hint?.[0] ?? ""),
+    hint?.[0],
   )
   check(
-    "hovering never hides the tab's icon",
-    !/\.editor-tab:hover \.viewer-tab-icon[^{]*\{[^}]*opacity:\s*0/.test(railCss),
+    "the name stays reachable (it never vanishes mid-move)",
+    /pointer-events:\s*auto/.test(hint?.[0] ?? ""),
+    hint?.[0],
+  )
+  // The card holds the name AND the ✕ on the row's own square: one surface,
+  // two hit areas (name activates, ✕ closes).
+  check(
+    "the name card lands on the row and holds the ✕",
+    /height:\s*30px/.test(hint?.[0] ?? "") &&
+      /border-radius:\s*6px/.test(hint?.[0] ?? "") &&
+      /display:\s*flex/.test(hint?.[0] ?? ""),
+    hint?.[0],
+  )
+  // The ✕ is a bare glyph on the card's surface: a box behind it made it look
+  // like a second control sitting next to the title.
+  const closeHoverBox = railCss.match(
+    /\.viewer-pane-body \.viewer-tabs-rail \.editor-tab \.editor-tab-close:hover[^{]*\{[^}]*\}/,
+  )
+  check(
+    "a hovered ✕ only recolors its glyph",
+    /background:\s*none/.test(closeHoverBox?.[0] ?? ""),
+    closeHoverBox?.[0],
+  )
+  const closeBox = railCss.match(/\.editor-tab \.editor-tab-close\s*\{[^}]*\}/)
+  check(
+    "the ✕ sits inside the card instead of covering the row",
+    /position:\s*static/.test(closeBox?.[0] ?? "") && /width:\s*26px/.test(closeBox?.[0] ?? ""),
+    closeBox?.[0],
+  )
+  check(
+    "the ✕ swaps with the tab's kind icon on hover",
+    /\.editor-tab:hover \.viewer-tab-icon[^{]*\{[^}]*opacity:\s*0/.test(railCss),
+  )
+  check(
+    "the rail keeps its one-icon width",
+    /--viewer-rail-width:\s*42px/.test(railCss),
   )
 
   const barSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
+  // The ✕ lives INSIDE the name card: one surface, two behaviors.
+  check(
+    "the markup nests the ✕ in the name card",
+    /<span className="editor-tab-label"[\s\S]{0,400}?className="editor-tab-close"/.test(barSrc),
+  )
+  check(
+    "the row publishes its own center and right edge for the card",
+    /--viewer-tab-hint-top/.test(barSrc) &&
+      /--viewer-tab-hint-right/.test(barSrc) &&
+      /onMouseEnter=/.test(barSrc),
+  )
   check(
     "drag/keyboard reordering runs on the vertical axis",
     /dropSide\(e\.clientY, rect, "y"\)/.test(barSrc) && /tabMove\(.*"y"\)/.test(barSrc),
@@ -200,6 +262,7 @@ console.log("4) every page owns one rail icon, in a fixed order:");
   const fullAt = head.indexOf("<ViewerPaneFullscreenButton")
   const filesAt = head.indexOf("<ViewerFilesButton")
   const todosAt = head.indexOf("<ViewerTodosButton")
+  const artifactsAt = head.indexOf("<ViewerArtifactsButton")
   const termAt = head.indexOf("<ViewerTerminalButton")
   const schedAt = head.indexOf("<ViewerScheduleButton")
   const inboxAt = head.indexOf("<ViewerInboxButton")
@@ -210,12 +273,13 @@ console.log("4) every page owns one rail icon, in a fixed order:");
   const spacerAt = head.indexOf("viewer-pane-spacer")
 
   check("the terminal toggle renders in the rail", termAt !== -1, head.slice(0, 1200))
-  check("fill every page icon", [fullAt, filesAt, todosAt, schedAt, inboxAt, reviewAt, traceAt, browserAt].every((i) => i !== -1), head)
+  check("fill every page icon", [fullAt, filesAt, todosAt, artifactsAt, schedAt, inboxAt, reviewAt, traceAt, browserAt].every((i) => i !== -1), head)
   check("fullscreen sits directly below the tab-list chevron", listAt !== -1 && fullAt > listAt)
-  // The requested order: files, then todos, then the terminal dock.
+  // The requested order: files, then todos, then artifacts, then the terminal dock.
   check("files leads the rest of the page icons", filesAt > fullAt && filesAt < todosAt)
-  check("todos sits below files and above the terminal", todosAt > filesAt && todosAt < termAt)
-  check("the terminal follows todos", termAt > todosAt)
+  check("todos sits below files and above artifacts", todosAt > filesAt && todosAt < artifactsAt)
+  check("artifacts follows todos and sits above the terminal", artifactsAt > todosAt && artifactsAt < termAt)
+  check("the terminal follows artifacts", termAt > artifactsAt)
   check("schedule follows the terminal, inbox follows schedule", schedAt > termAt && inboxAt > schedAt)
   check("review, trace and browser close the icon list", reviewAt > inboxAt && traceAt > reviewAt && browserAt > traceAt)
   check("the rail rows and the tabs come last", barAt > browserAt && spacerAt > barAt)

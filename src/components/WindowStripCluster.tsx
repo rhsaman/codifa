@@ -2,12 +2,12 @@ import type { CSSProperties } from "react";
 import { useStore } from "../lib/store";
 import { workspaceDisplayFor } from "../lib/chatWindowMeta";
 
-/** Window-level controls: sidebar toggle, workspace picker, direction
- *  switch. Rendered at the window's top-left in BOTH sidebar states —
- *  inside the sidebar's drag strip when the sidebar is open, inline at the
- *  app bar's solo corner when it is closed — so opening the sidebar never
- *  pushes them to the right. CSS decides which instance is visible
- *  (.mac + .solo rules); the same JSX renders in both hosts. */
+/** Window-level controls: sidebar toggle, settings, workspace picker,
+ *  direction switch. Rendered at the window's top-left in BOTH sidebar
+ *  states — inside the sidebar's drag strip when the sidebar is open,
+ *  inline at the app bar's solo corner when it is closed — so opening the
+ *  sidebar never pushes them to the right. CSS decides which instance is
+ *  visible (.mac + .solo rules); the same JSX renders in both hosts. */
 export function WindowStripCluster() {
   const sidebarOpen = useStore((s) => s.sidebarOpen);
   const activeChatRoot = useStore(
@@ -17,6 +17,17 @@ export function WindowStripCluster() {
   const workspaceColors = useStore((s) => s.workspaceColors);
   const ws = workspaceDisplayFor(activeChatRoot, workspaces, workspaceColors);
   const dir = useStore((s) => s.dir);
+  const iconProps = {
+    width: 17,
+    height: 17,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.8,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
   return (
     <span className="window-strip-cluster">
       <button
@@ -26,8 +37,19 @@ export function WindowStripCluster() {
         aria-pressed={sidebarOpen}
         onClick={() => useStore.getState().toggleSidebar()}
       >
-        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-          <path d="M4 6h16M4 12h16M4 18h10" />
+        <svg {...iconProps}>
+          <path d="M3 6h18M3 12h18M3 18h12" />
+        </svg>
+      </button>
+      <button
+        className="titlebar-icon-btn"
+        aria-label="Open settings (⌘,)"
+        title="Settings (⌘,)"
+        onClick={() => useStore.getState().setSettingsOpen(true)}
+      >
+        <svg {...iconProps}>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
         </svg>
       </button>
       <button
@@ -43,10 +65,9 @@ export function WindowStripCluster() {
           })
         }
       >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <svg {...iconProps}>
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
         </svg>
-        <i className="workspace-btn-dot" aria-hidden="true" />
         <span className="workspace-btn-label">{ws.root ? ws.label : "Open workspace"}</span>
       </button>
       <button

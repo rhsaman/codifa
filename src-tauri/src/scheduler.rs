@@ -204,6 +204,54 @@ fn string_map(settings: &Value, key: &str) -> std::collections::HashMap<String, 
         .unwrap_or_default()
 }
 
+/// Read a `{ key: ["a", "b"] }` map of ORDERED string lists out of the settings
+/// document (the per-tool fallback lists from Settings → Tools).
+///
+/// The order is the try order, so it is preserved exactly; non-string rows and
+/// empty lists are dropped, and a hand-edited settings.json must never make a
+/// scheduled run panic.
+fn string_list_map(settings: &Value, key: &str) -> std::collections::HashMap<String, Vec<String>> {
+    settings
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let list: Vec<String> = v
+                        .as_array()?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if list.is_empty() {
+                        None
+                    } else {
+                        Some((k.clone(), list))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read a `["a", "b"]` list of names out of a task document (missing/non-array
+/// fields become an empty list, so an older task still runs).
+fn string_list(task: &Value, key: &str) -> Vec<String> {
+    task.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn atomic_write_json(path: &Path, v: &Value) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -384,7 +432,12 @@ fn mark_orphaned_running(data_root: &Path) -> usize {
 /// Resolve the provider config for a task: task.providerId → settings
 /// providers match → first provider (mirror of _execute_schedule).
 fn resolve_provider(data_root: &Path, task: &Value) -> Option<Value> {
-    let settings = read_json(&data_root.join("settings.json")).unwrap_or(json!({}));
+    let mut settings = read_json(&data_root.join("settings.json")).unwrap_or(json!({}));
+    // settings.json stores provider keys as `enc:v1:` ciphertext (the renderer
+    // encrypts on write). A headless run reads the file directly, so without
+    // this the "key" sent upstream was the ciphertext itself — an opaque 401
+    // on every scheduled run, including every fallback rung.
+    crate::secrets::decrypt_provider_secrets(&mut settings);
     let providers = settings.get("providers").and_then(Value::as_array)?.clone();
     let want_id = task
         .get("providerId")
@@ -402,7 +455,7 @@ fn resolve_provider(data_root: &Path, task: &Value) -> Option<Value> {
 
 /// One headless run: build an AgentRequest from the task + settings, run the
 /// native agent loop, record the run (output capped, usage accrued).
-async fn execute_schedule(data_root: &Path, task: Value) {
+pub async fn execute_schedule(data_root: &Path, task: Value) {
     let sid = task
         .get("id")
         .and_then(Value::as_str)
@@ -484,9 +537,13 @@ async fn execute_schedule(data_root: &Path, task: Value) {
     // schedule file. A scheduled run is a headless `run_turn`, so without this
     // the Settings → Tools "Schedule" row was written by the UI and read by
     // nobody: every run silently took the task's provider defaults instead.
-    let settings = read_json(&data_root.join("settings.json")).unwrap_or(json!({}));
+    let mut settings = read_json(&data_root.join("settings.json")).unwrap_or(json!({}));
+    // The renderer encrypts provider keys at rest; decrypt before any of them
+    // can be used as a bearer token (a headless run reads this file directly).
+    crate::secrets::decrypt_provider_secrets(&mut settings);
     let subagent_models = string_map(&settings, "subagentModels");
     let subagent_thinking = string_map(&settings, "subagentThinking");
+    let tool_fallbacks = string_list_map(&settings, "toolFallbacks");
     let providers_map = settings
         .get("providers")
         .and_then(Value::as_array)
@@ -500,7 +557,6 @@ async fn execute_schedule(data_root: &Path, task: Value) {
                 .collect::<std::collections::HashMap<String, Value>>()
         })
         .unwrap_or_default();
-
     // The "Schedule" row routes EVERY scheduled run (cross-provider aware, the
     // same slot resolution the other tools use). An empty row keeps the model
     // saved on the task, or the provider's own default.
@@ -540,6 +596,41 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         .to_string();
     let model_reasoning =
         crate::agent::provider_model_reasoning(&providers_map, &provider_id, &model);
+    // A scheduled run must see the SAME context a normal turn would: the skills
+    // and MCP connectors the task names, plus everything carried by the plugins
+    // it names (a plugin is one unit — its connectors come along, and its skills
+    // already reach the router's catalog because it reads the enabled folders).
+    let task_skills: Vec<String> = string_list(&task, "skills");
+    let plugin_slugs: Vec<String> = string_list(&task, "plugins");
+    let mut task_mcp = crate::plugins::mcp_of(data_root, &plugin_slugs);
+    let stored_mcp = crate::skills::list_mcp(data_root)["mcpServers"].clone();
+    for name in string_list(&task, "mcp_servers") {
+        // A connector that disappeared from the store is skipped instead of
+        // failing the whole run: the task keeps working with what still exists.
+        if let Some(cfg) = stored_mcp.get(&name) {
+            task_mcp.insert(name, cfg.clone());
+        }
+    }
+    // Every model a scheduled run may use, in try order: the Schedule row's own
+    // model first, then that row's fallback list (Settings → Tools), rebuilt per
+    // RUN so nothing is remembered between runs. The task/provider default is
+    // rung 0 when the row is empty, so a run always has something to call.
+    let chain: Vec<(String, String, String, Vec<String>, String)> =
+        crate::backend_light::resolve_slot_chain(
+            slot_entry,
+            tool_fallbacks.get("schedule").map(Vec::as_slice).unwrap_or(&[]),
+            &model,
+            &base_url,
+            &api_keys,
+            &provider_id,
+            &provider_kind,
+            &providers_map,
+        )
+        .into_iter()
+        // `resolve_slot_chain` returns (model, base, keys, provider_id, kind).
+        .map(|(m, b, keys, pid, kind)| (kind, m, b, keys, pid))
+        .collect();
+
     let req = crate::agent::AgentRequest {
         provider: provider_kind,
         provider_id,
@@ -561,10 +652,14 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         system_prompt: String::new(),
         // A scheduled run has no listener, so it is never spoken.
         system_suffix: String::new(),
-        skills: vec![],
+        skills: task_skills,
         context_window: 0,
         chat_id: format!("schedule-{sid}"),
-        mcp_servers: Value::Null,
+        mcp_servers: if task_mcp.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(task_mcp)
+        },
         subagent_models,
         providers: providers_map,
         data_root: data_root.to_string_lossy().to_string(),
@@ -592,6 +687,10 @@ async fn execute_schedule(data_root: &Path, task: Value) {
         thinking_level,
         model_reasoning,
         subagent_thinking,
+        // The per-tool fallback lists (Settings → Tools) apply to a scheduled
+        // run exactly like an interactive one: a tool whose own model fails is
+        // retried down that tool's list, for that call only.
+        tool_fallbacks,
         images: Vec::new(),
         // A headless run has no UI, so it reads no Storage setting: it uses the
         // same default auto-fetch count the UI starts at.
@@ -602,50 +701,83 @@ async fn execute_schedule(data_root: &Path, task: Value) {
     };
 
     let mut final_text = String::new();
-    let mut usage_in: u64 = 0;
-    let mut usage_out: u64 = 0;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let res = {
-        let mut emit = |_ev: &crate::agent::AgentEvent| {};
-        crate::agent::run_turn(&req, &mut emit, &cancel).await
-    };
-    // run_turn streams text via events; for the headless run we only need the
-    // final text — re-run is avoided by capturing from the trace store below.
-    let _ = res;
-
-    // Collect the final text from the turn's trace (the agent records the
-    // full prompt/tool trail; the final text is the last text row).
-    if let Some(dir) = crate::trace::traces_dir() {
-        if let Ok(rows) = std::fs::read_to_string(dir.join(format!("schedule-{sid}.jsonl"))) {
-            for line in rows.lines().rev() {
-                if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    if v.get("kind").and_then(Value::as_str) == Some("text") {
-                        final_text = v
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        break;
-                    }
+    // Walk the chain one rung per failure. A rejected key or an unknown model on
+    // one rung must not end the run while the user's own fallback list still has
+    // models in it — the same rule the interactive tools follow.
+    let mut tried: Vec<String> = Vec::new();
+    let mut run_error = String::new();
+    for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain {
+        let mut rung = req.clone();
+        rung.provider = kind;
+        rung.model = rung_model.clone();
+        rung.base_url = rung_base;
+        rung.api_keys = rung_keys;
+        rung.provider_id = rung_provider_id;
+        // The capability flag follows the model actually being called, so a
+        // fallback that cannot reason is not sent a reasoning parameter.
+        rung.model_reasoning = crate::agent::provider_model_reasoning(
+            &rung.providers,
+            &rung.provider_id,
+            &rung.model,
+        );
+        // The final text is accumulated from the turn's own `text` events: the
+        // trace file has no `text` row at all (it records prompt/tool/llm/fold),
+        // so reading it back always produced an empty output.
+        let mut text = String::new();
+        let res = {
+            let mut emit = |ev: &crate::agent::AgentEvent| {
+                if let crate::agent::AgentEvent::Text { content } = ev {
+                    text.push_str(content);
+                }
+            };
+            crate::agent::run_turn(&rung, &mut emit, &cancel).await
+        };
+        match res {
+            Ok(()) => {
+                final_text = text;
+                break;
+            }
+            Err(e) => {
+                // Only a model-side rejection moves to the next model. A dropped
+                // connection or a timeout ends the run with its own reason
+                // instead of billing every fallback for a network problem.
+                let next = crate::llm::should_fall_back(&e);
+                tried.push(format!("{rung_model}: {e}"));
+                run_error = e;
+                if !next {
+                    break;
                 }
             }
         }
     }
-    let _ = (&mut usage_in, &mut usage_out);
 
     let finished = now_secs();
-    let mut out_text = final_text;
-    if out_text.chars().count() > RUN_OUTPUT_CAP {
-        out_text = out_text.chars().take(RUN_OUTPUT_CAP).collect();
+    if final_text.is_empty() && !run_error.is_empty() {
+        // Every rung failed: record the reasons instead of a "done" with no
+        // output, which read like the schedule had simply produced nothing.
+        save_run(
+            data_root,
+            &json!({
+                "id": run_id, "schedule_id": sid, "status": "error",
+                "error": format!("every model failed — {}", tried.join("; ")),
+                "output": "", "started_at": started_at, "finished_at": finished,
+            }),
+        );
+    } else {
+        let mut out_text = final_text;
+        if out_text.chars().count() > RUN_OUTPUT_CAP {
+            out_text = out_text.chars().take(RUN_OUTPUT_CAP).collect();
+        }
+        save_run(
+            data_root,
+            &json!({
+                "id": run_id, "schedule_id": sid, "status": "done",
+                "output": out_text, "started_at": started_at,
+                "finished_at": finished,
+            }),
+        );
     }
-    save_run(
-        data_root,
-        &json!({
-            "id": run_id, "schedule_id": sid, "status": "done",
-            "output": out_text, "started_at": started_at,
-            "finished_at": finished,
-        }),
-    );
     // Update the task's last_run / run_count / next_run. Re-read the task from
     // disk first: writing back the pre-run snapshot silently reverted any edit
     // (prompt/name/enabled/cron/model) the user made while the run was still

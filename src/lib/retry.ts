@@ -277,3 +277,32 @@ export function retryRetiredByEvent(
   if (!owner) return false
   return (event.tool ?? '').trim() === owner
 }
+
+/**
+ * Pick the message whose retry banner must be rendered (newest first).
+ *
+ * Lives here rather than inline in Chat.tsx so the dismissal rule is testable.
+ *
+ * - `retiring`: the ~100 ms auto-fade skip-list. A banner that is fading out
+ *   must leave the scan immediately, otherwise it wins again and re-mounts in
+ *   a loop.
+ * - `dismissed`: messages whose banner the user closed with the ✕ button during
+ *   the CURRENT turn. A live sub-agent ladder re-sets `message.retry` on every
+ *   attempt, so without this the banner popped straight back — which is why the
+ *   ✕ used to be implemented as "cancel the retry" (and wrongly killed the
+ *   whole stream). The dismissal holds until the next turn starts.
+ */
+export function findRetryBannerMessage<
+  T extends { id: string; retry?: object | null },
+>(
+  messages: T[],
+  retiring: ReadonlySet<string>,
+  dismissed: ReadonlySet<string>,
+): T | null {
+  return (
+    [...messages]
+      .reverse()
+      .find((m) => m.retry && !retiring.has(m.id) && !dismissed.has(m.id)) ??
+    null
+  )
+}

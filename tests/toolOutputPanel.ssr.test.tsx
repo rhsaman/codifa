@@ -1,9 +1,9 @@
 // SSR test: a long tool result never AUTO-opens the right-hand panel.
 //
-// The panel opens only from an explicit user click (row head → text tab for
-// long output, the "more" button, openText). Rendering must not touch it, and
-// no nested <details> block is involved — an expanded row scrolls its long
-// body (trace-expand-pre has max-height + overflow). These checks pin that.
+// The panel opens only from an explicit user click (a very long CHAT MESSAGE,
+// the Review pill, openText). Tool rows never send their output there: they
+// expand in place and their long bodies scroll (trace-expand-pre /
+// .file-results carry max-height + overflow). These checks pin that.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -87,11 +87,11 @@ console.log('2) خروجی کوتاه بدون بلوک اضافی رندر می
   check('پنل همچنان بسته است', useViewerTabs.getState().paneOpen === false)
 }
 
-console.log('3) راه دستی باز کردن خروجی در پنل حفظ شده است:')
+console.log('3) باز شدن دستی خروجی در پنل حفظ شده است:')
 {
   resetViewer()
-  // The "more" affordance lives in FileResultLinks (shown once a row/group is
-  // expanded): more results than the visible cap → button that opens the panel.
+  // A tool row's result list renders INLINE (and scrolls); it has no button
+  // that hijacks the click into the side panel.
   const { FileResultLinks } = await import('../src/components/ToolCallView')
   const listHtml = renderToString(
     <FileResultLinks
@@ -104,8 +104,8 @@ console.log('3) راه دستی باز کردن خروجی در پنل حفظ ش
       ] as never}
     />,
   )
-  check('دکمهٔ «بیشتر» برای باز کردن در پنل هست', listHtml.includes('file-result-more-btn'))
-  resetViewer()
+  check('همهٔ نتایج داخل ردیف رندر شدند', (listHtml.match(/class="file-result"/g) || []).length === 4)
+  check('دکمهٔ «بیشتر» پنل را باز نمی‌کند', !listHtml.includes('file-result-more-btn'))
   useViewerTabs.getState().openText('grep results', 'body', 'md')
   check('openText دستی پنل را باز می‌کند', useViewerTabs.getState().paneOpen === true)
 }

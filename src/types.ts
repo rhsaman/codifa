@@ -133,6 +133,14 @@ export interface TtsFallback {
   voice: string
 }
 
+/** One tool-model fallback target: "providerId/model", tried in list order when
+ *  the tool's OWN model fails. It never carries its own reasoning level — a
+ *  fallback always runs at the reasoning effort of the tool it stands in for. */
+export interface ToolFallback {
+  providerId: string
+  model: string
+}
+
 /** Live voice session state for the realtime speech-to-speech UI. */
 export type LiveVoiceState = 'idle' | 'connecting' | 'live' | 'speaking' | 'closed' | 'error'
 
@@ -229,6 +237,13 @@ export interface Settings {
    *  `subagentModels` (compact / explore / web / schedule / title). Empty or
    *  missing = inherit the main model's thinking level. */
   subagentThinking?: Record<string, ThinkingLevel>
+  /** Per-tool fallback models, keyed by the SAME slot names as
+   *  `subagentModels` (explore / vision / schedule / compact / web / title).
+   *  Each list is tried top-to-bottom — and only for that tool, only while that
+   *  tool's own model is failing. Every attempt of a later call starts again at
+   *  the tool's own model, and a fallback never overrides the tool's reasoning
+   *  level. */
+  toolFallbacks?: Record<string, ToolFallback[]>
   /** Single auto-compaction threshold as a percentage of the RAW context window.
    *  Auto-compaction fires once `total_tokens >= ctx * compactAtPercent / 100`.
    *  The reserved headroom is implicit: `(100 - compactAtPercent)%` of the window
@@ -385,6 +400,17 @@ export type MessageSegment =
   | { kind: 'tool'; index: number }
   | { kind: 'user'; id: string }
   | { kind: 'compact'; id: string }
+  /** An artifact the agent built: the card sits in the transcript, the body
+   *  opens in the sandboxed preview tab. The content rides along so the card
+   *  still previews after a reload, before anything is fetched from disk. */
+  | {
+      kind: 'artifact'
+      id: string
+      title: string
+      artifactKind: 'html' | 'md'
+      content: string
+      version: number
+    }
 
 export interface ChatMessage {
   id: string
@@ -445,9 +471,6 @@ export interface ChatMessage {
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
   skills?: string[]
-  /** Skills auto-loaded by the decision router this turn ('skill' event,
-   *  manual:false) — rendered as chips under the assistant bubble. */
-  autoSkills?: string[]
   usage?: TokenUsage
   error?: boolean
   retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; tool?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
@@ -669,7 +692,7 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   content?: string
@@ -792,6 +815,38 @@ export interface SidecarEvent {
    *  stops. The backend emits this instead of streaming raw thinking text
    *  (which slowed the UI); the frontend uses it to glow the composer. */
   active?: boolean
+  /** artifact: the document format. Named `artifact_kind` because `kind` is the
+   *  event's own discriminator. */
+  artifact_kind?: 'html' | 'md'
+  /** artifact: which save of that document this is (v1, v2, …). */
+  version?: number
+}
+
+/** One plugin folder: skills + MCP connectors bundled behind a single switch. */
+export interface PluginInfo {
+  name: string
+  slug: string
+  description?: string
+  version?: string
+  enabled: boolean
+  /** Skill names the folder currently holds. */
+  skills?: string[]
+  /** Connector names the folder currently holds. */
+  mcp?: string[]
+  /** Repo (or folder) the bundle was installed from, when it was. */
+  source?: string
+  created_at?: number
+  updated_at?: number
+}
+
+/** Result of installing a plugin bundle out of a repo. */
+export interface PluginInstallResult {
+  installed: 'created' | 'updated'
+  slug: string
+  source?: string
+  skills?: string[]
+  mcp?: string[]
+  plugin?: PluginInfo
 }
 
 /** یک تسک زمان‌بندی‌شده (مثل Codex): پرامپت + تکرار کرون + اجرای پس‌زمینه. */

@@ -17,6 +17,7 @@ import type {
   Settings,
   SttFallback,
   TtsFallback,
+  ToolFallback,
   ThinkingLevel,
   TokenUsage,
   ToolActivity,
@@ -36,8 +37,28 @@ export function normalizeScheduleRunsSeen(raw: unknown): string[] {
   }
   return [...new Set(out)].slice(-MAX_SCHEDULE_RUNS_SEEN)
 }
+
+/** Words a chat title may show — the title prompt asks the model for the same budget. */
+export const TITLE_MAX_WORDS = 4
+
+/**
+ * Cap a title to TITLE_MAX_WORDS WHOLE words.
+ *
+ * Used both for the instant placeholder (the first message's first words) and
+ * for the model's reply, so a chat title is never a truncated sentence: the
+ * sidebar shows a short label, and a half cut word with an ellipsis reads worse
+ * than simply stopping after the fourth word.
+ */
+export function capTitleWords(text: string): string {
+  return text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, TITLE_MAX_WORDS)
+    .join(' ')
+}
 import { api } from './fs'
-import { deleteMcp, listMcp, requestChatTitle, saveMcp } from './api'
+import { deleteMcp, listMcp, pushSlotModel, requestChatTitle, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
 import { encryptSettings, decryptSettings } from './secrets'
 import { PROVIDER_META } from './provider-meta'
@@ -45,7 +66,7 @@ import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry, normalizeUsageModel } from './usage'
 import { modelReasoning } from './context'
 import { supportsReasoning } from './thinking'
-import { withOtherSlotsFilled } from './toolSlots'
+import { TOOL_FALLBACK_SLOTS as TOOL_SLOT_KEYS, toolFallbackEntries, withOtherSlotsFilled } from './toolSlots'
 import { normalizeToolActivity } from './toolActivity'
 import type { ChatDropPos, ChatSplitDir, ChatTreeNode } from './chatTree'
 import { appendChat, bestSplitDir, buildFromList, CHAT_WINDOW_MAX, collectChatIds, containsChat, dropOnto, dropOntoRoot, leafCount, loadChatTree, normalizeTree, openBeside, persistChatTree, removeChat, resizePair, setChatSize, setNodeSize, setRootDir, sizesByChat, swapChats, toggleFullscreenId } from './chatTree'
@@ -375,6 +396,39 @@ function normalizeSttFallbacks(raw: unknown): SttFallback[] {
     if (!providerId) continue
     const model = typeof rec.model === 'string' ? rec.model.trim() : ''
     out.push({ providerId, model })
+  }
+  return out
+}
+
+/** Normalize one tool's fallback list (Settings → Tools). Same row shape as an
+ *  STT fallback, except that a row naming NOTHING is meaningful there: it is
+ *  the "composer's own model" rung, which has no provider id to keep. A row
+ *  with only half a target is stale junk from an older build and is dropped,
+ *  exactly as before. The list order IS the try order, so rows are never
+ *  reordered here. */
+function normalizeToolFallbackRows(raw: unknown): ToolFallback[] {
+  if (!Array.isArray(raw)) return []
+  const out: ToolFallback[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rec = r as Record<string, unknown>
+    const providerId = typeof rec.providerId === 'string' ? rec.providerId.trim() : ''
+    const model = typeof rec.model === 'string' ? rec.model.trim() : ''
+    if (!providerId !== !model) continue
+    out.push({ providerId, model })
+  }
+  return out
+}
+
+/** Normalize a persisted per-slot tool-fallback map (Settings → Tools): keep
+ *  the known tool slots, keep each slot's try order, normalize every row. */
+function normalizeToolFallbacks(raw: unknown): Record<string, ToolFallback[]> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, ToolFallback[]> = {}
+  for (const [slot, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (!(TOOL_SLOT_KEYS as readonly string[]).includes(slot)) continue
+    const rows = normalizeToolFallbackRows(list)
+    if (rows.length) out[slot] = rows
   }
   return out
 }
@@ -793,8 +847,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -879,7 +933,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -895,7 +949,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1275,6 +1329,12 @@ interface State {
    *  `subagentModels`. Empty/missing = inherit the main model's level. */
   subagentThinking: Record<string, ThinkingLevel>
   setSubagentThinking: (agent: string, level: ThinkingLevel) => void
+  /** Per-tool fallback models, keyed by the same slot names as
+   *  `subagentModels`. Each list is tried top-to-bottom, only while that tool's
+   *  own model is failing; the next call starts at the tool's own model again
+   *  and a fallback never overrides the tool's reasoning level. */
+  toolFallbacks: Record<string, ToolFallback[]>
+  setToolFallbacks: (slot: string, rows: ToolFallback[]) => void
   /** Tool result cache TTL (minutes). */
   cacheTtlMinutes: number
   setMemoryTtlConfig: (c: { cache?: number }) => void
@@ -1816,6 +1876,7 @@ export const useStore = create<State>((set, get) => ({
   recentModels: [],
   subagentModels: {},
   subagentThinking: {},
+  toolFallbacks: {},
   cacheTtlMinutes: 60,
   historyLimit: 0,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
@@ -2254,6 +2315,9 @@ export const useStore = create<State>((set, get) => ({
           : '',
       sttModel: typeof raw.sttModel === 'string' && raw.sttModel.trim() ? raw.sttModel : 'whisper-1',
       sttFallbacks: normalizeSttFallbacks((raw as Record<string, unknown>).sttFallbacks),
+      // Per-tool fallback lists live in the SETTINGS document (they belong to
+      // the UI), so they are read from `raw`, not from a store-level key.
+      toolFallbacks: normalizeToolFallbacks((raw as Record<string, unknown>).toolFallbacks),
       // Empty means "auto": resolveSttLanguage() then follows the UI direction.
       sttLanguage: typeof raw.sttLanguage === 'string' ? raw.sttLanguage.trim().toLowerCase() : 'fa',
       sttPrompt: typeof raw.sttPrompt === 'string' ? raw.sttPrompt : '',
@@ -2760,6 +2824,16 @@ export const useStore = create<State>((set, get) => ({
     set({ sttFallbacks: normalizeSttFallbacks(f) })
     get().persist()
   },
+  setToolFallbacks: (slot, rows) => {
+    set((s) => {
+      const toolFallbacks = { ...s.toolFallbacks }
+      const clean = normalizeToolFallbackRows(rows)
+      if (clean.length) toolFallbacks[slot] = clean
+      else delete toolFallbacks[slot]
+      return { toolFallbacks }
+    })
+    get().persist()
+  },
   setSttLanguage: (l) => {
     // Empty is a real choice (= auto-detect); it must not snap back to 'fa'.
     set({ sttLanguage: (l ?? '').trim().toLowerCase() })
@@ -2821,6 +2895,10 @@ export const useStore = create<State>((set, get) => ({
       return { subagentModels }
     })
     get().persist()
+    // Tell the RUNNING turn too: `/chat/stream` only carries a snapshot of
+    // these entries, so without this a sub-agent that is retrying right now
+    // keeps hammering the model the user just replaced.
+    void pushSlotModel(agent, model)
   },
   setSubagentThinking: (agent, level) => {
     set((s) => {
@@ -3991,7 +4069,7 @@ export const useStore = create<State>((set, get) => ({
     // resolve step can tell an untouched auto title (safe to replace) from
     // a manual rename (must keep).
     const prev = get().chats.find((c) => c.id === chatId)
-    const autoTitle = message.content.slice(0, 48)
+    const autoTitle = capTitleWords(message.content)
     const hasPriorUser = !!prev?.messages.some((m) => m.role === 'user')
     const shouldTitle =
       message.role === 'user' &&
@@ -4019,7 +4097,8 @@ export const useStore = create<State>((set, get) => ({
                 (message.role === 'user' || message.role === 'assistant')
                   ? Date.now()
                   : c.updatedAt,
-              title: c.messages.length === 0 && message.role === 'user' ? message.content.slice(0, 48) : c.title,
+              title:
+                c.messages.length === 0 && message.role === 'user' ? autoTitle : c.title,
             }
           : c,
       )
@@ -4043,6 +4122,7 @@ export const useStore = create<State>((set, get) => ({
             provider,
             subagentModels: st.subagentModels ?? {},
             subagentThinking: st.subagentThinking ?? {},
+            toolFallbacks: toolFallbackEntries(st.toolFallbacks),
             providers: Object.fromEntries(
               (st.settings.providers ?? []).map((p) => [p.id, p]),
             ),
@@ -4054,7 +4134,9 @@ export const useStore = create<State>((set, get) => ({
             text: message.content.slice(0, 1000),
             chatId,
           })
-          const title = typeof res?.title === 'string' ? res.title.trim() : ''
+          // Re-cap here as well: the backend already limits the reply, but the
+          // sidebar invariant must not depend on which build is running.
+          const title = capTitleWords(typeof res?.title === 'string' ? res.title : '')
           if (title) {
             // Apply first: usage bookkeeping must never block the rename.
             try {

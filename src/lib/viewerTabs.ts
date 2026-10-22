@@ -5,11 +5,14 @@ import { registerChatDeleteHook, useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts'
 
 /** Kinds that belong to ONE chat. File tabs are chat-scoped too
  *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
- *  live edits only refresh the owning chat. Inbox and Schedule stay global. */
+ *  live edits only refresh the owning chat. Inbox, Schedule and artifact tabs
+ *  stay global: an artifact is opened from the Artifacts page and from a
+ *  transcript card, and hiding it whenever another chat had focus made the
+ *  row look broken (the document opened onto a tab that chat could not show). */
 const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'files'])
 
 /** Pages that own a dedicated icon in the pane rail. Opening them goes
@@ -20,6 +23,7 @@ const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'brows
  *  toggle and never had a tab entry at all. */
 export const RAIL_PAGE_KINDS: ReadonlySet<ViewerKind> = new Set<ViewerKind>([
   'files',
+  'artifacts',
   'schedule',
   'inbox',
   'review',
@@ -51,6 +55,8 @@ const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
   'text',
   'explore',
   'files',
+  'artifact',
+  'artifacts',
 ])
 
 
@@ -67,13 +73,20 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   // Unused: explore tabs keep their own title ("Explore · <description>").
   explore: 'Explore',
   files: 'Files',
+  artifacts: 'Artifacts',
+  // Fallback only: artifact tabs keep their own document title (see
+  // viewerTabTitle), otherwise every artifact tab reads "Artifact".
+  artifact: 'Artifact',
 }
 
-/** Display title for a viewer tab. File/text tabs and sub-agent trace tabs
- *  keep their own title so a sub-agent trace never looks like the main chat
- *  trace; every other kind shows the shared kind label. Pure, for tests. */
+/** Display title for a viewer tab. File/text/explore tabs, artifact tabs and
+ *  sub-agent trace tabs keep their own title — a sub-agent trace must never
+ *  look like the main chat trace, and two artifacts of one chat must be
+ *  tellable apart (they are one tab per document). Every other kind shows the
+ *  shared kind label. Pure, for tests. */
 export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId'>): string {
   if (t.kind === 'file' || t.kind === 'text' || t.kind === 'explore') return t.title
+  if (t.kind === 'artifact') return t.title || VIEWER_KIND_LABEL.artifact
   if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return t.title
   return VIEWER_KIND_LABEL[t.kind] ?? t.title
 }
@@ -177,6 +190,15 @@ export interface ViewerTab {
    *  arg). Without it the panel always launched about:blank, so the user
    *  watched an empty browser while the agent worked on a real page. */
   browserUrl?: string
+  /** Artifact tab: the document body + format the agent generated. In memory
+   *  only (stripped by slimTab) — the panel refetches it by id after a restart. */
+  artifactBody?: string
+  artifactKind?: 'html' | 'md'
+  artifactVersion?: number
+  /** Backend id of the artifact (the part after `artifact:<chatId>:`), kept
+   *  separate from the tab id so the panel can re-read the body after a
+   *  restart without parsing the id back apart. */
+  artifactId?: string
   createdAt: number
 }
 
@@ -196,6 +218,10 @@ interface ViewerTabsState {
   /** Open the Schedule page: the cron task list (create form + rows) in its
    *  own viewer tab, separate from the Todos page. One global tab. */
   openSchedule: () => void
+  /** Open the Artifacts page: every document the agent built, newest first.
+   *  GLOBAL on purpose — an artifact belongs to a chat, but the page's job is
+   *  to show them across chats. */
+  openArtifacts: () => void
   /** Open the implementation-plan document of a chat (Plan card's
    *  "View full plan"). Defaults to the active chat. */
   openPlan: (chatId?: string) => void
@@ -206,6 +232,17 @@ interface ViewerTabsState {
   /** Point an ALREADY-open browser tab at a new page (the agent navigated
    *  again after the tab was docked). No-op when the chat has no browser tab. */
   setBrowserUrl: (chatId: string, url: string) => void
+  /** Open (or refresh) the sandboxed artifact preview. One tab per artifact
+   *  id, so re-rendering the same document updates it in place.
+   *
+   *  GLOBAL, like the Artifacts page it is opened from: the tab shows in every
+   *  chat and opening it never switches or focuses one. The owner chat rides on
+   *  the tab because that is what re-reads the body after a restart — it is not
+   *  a visibility filter. */
+  openArtifact: (
+    chatId: string,
+    artifact: { id: string; title: string; kind: string; body: string; version?: number },
+  ) => void
   /** Open a workspace file in its own viewer tab, scoped to ONE chat
    *  (id `file:<chatId>:<path>`, one tab per file per chat). Reopening the
    *  same path in the same chat focuses the tab and updates the target line.
@@ -322,6 +359,9 @@ function capTabs(tabs: ViewerTab[]): ViewerTab[] {
 
 function slimTab(t: ViewerTab): ViewerTab {
   if (t.kind === 'text') return { ...t, textBody: undefined }
+  // An artifact body can be a whole generated page: like a text tab, keep the
+  // tab (id/title/chat) and refetch the body from the backend on demand.
+  if (t.kind === 'artifact') return { ...t, artifactBody: undefined }
   // File tabs persist only id/path/chatId (plus title/line/root for restore).
   // The file body is never stored so localStorage and RAM stay low.
   if (t.kind === 'file') {
@@ -358,7 +398,9 @@ function loadPersisted(): {
     // One tab per kind per chat (one per sub-agent for trace tabs).
     // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
     // are kept so old sessions don't lose them; every other chat-scoped kind
-    // without an owner is dropped — its owner chat is unknowable.
+    // without an owner is dropped — its owner chat is unknowable. Artifact
+    // tabs are global, so an ownerless one is kept too: its id still carries
+    // the artifact id, which is all the panel needs to re-read the body.
     const seen = new Set<string>()
     const tabs: ViewerTab[] = []
     for (const t of valid) {
@@ -368,7 +410,12 @@ function loadPersisted(): {
       // chat into a single `file:<chatId>` id.
       const legacyId = viewerTabId(t.kind, t.chatId ?? '')
       const id =
-        t.kind === 'file'
+        // Artifact tabs carry the artifact id in their own id
+        // (`artifact:<chatId>:<artifactId>`), exactly like file tabs carry the
+        // path: recomputing via `viewerTabId` collapses every artifact of one
+        // chat into a single `artifact:<chatId>` tab and silently drops the
+        // rest on reload.
+        t.kind === 'file' || t.kind === 'artifact'
           ? t.id
           : t.kind === 'trace' && typeof (t as ViewerTab).traceTaskId === 'string' && (t as ViewerTab).traceTaskId
             ? t.id.startsWith('trace:')
@@ -377,7 +424,18 @@ function loadPersisted(): {
             : legacyId
       if (seen.has(id)) continue
       seen.add(id)
-      tabs.push({ ...t, id, title: t.kind === 'review' ? 'Git' : t.title })
+      tabs.push({
+        ...t,
+        id,
+        // Tabs persisted before `artifactId` existed carry the id only inside
+        // their tab id (`artifact:<chatId>:<artifactId>`) — recover it so the
+        // restored panel can still re-read its body instead of showing the
+        // "no longer in memory" notice forever.
+        ...(t.kind === 'artifact' && !(t as ViewerTab).artifactId
+          ? { artifactId: id.split(':').slice(2).join(':') || undefined }
+          : {}),
+        title: t.kind === 'review' ? 'Git' : t.title,
+      })
     }
     // Enforce the tab cap on load so a bloated store never fills RAM/localStorage.
     const capped = capTabs(tabs)
@@ -679,6 +737,20 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
+  openArtifacts: () =>
+    set((s) => {
+      const id = 'artifacts'
+      const entry: ViewerTab = {
+        id,
+        kind: 'artifacts',
+        title: 'Artifacts',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
   openPlan: (chatId) =>
     set((s) => {
       // One plan tab per chat (PlanPanel reads the live activeChatId).
@@ -706,6 +778,34 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       )
       persist(tabs, s.activeId)
       return { tabs }
+    }),
+
+  openArtifact: (chatId, artifact) =>
+    set((s) => {
+      // One tab per artifact id: re-rendering the same document replaces its
+      // body in place instead of stacking a tab per version.
+      const cid = chatId || currentChatId()
+      const id = `artifact:${cid}:${artifact.id}`
+      const entry: ViewerTab = {
+        id,
+        kind: 'artifact',
+        chatId: cid,
+        title: artifact.title || artifact.id,
+        artifactBody: artifact.body,
+        artifactKind: artifact.kind === 'md' ? 'md' : 'html',
+        artifactId: artifact.id,
+        ...(artifact.version ? { artifactVersion: artifact.version } : {}),
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(
+        s.tabs.some((t) => t.id === id)
+          ? s.tabs.map((t) => (t.id === id ? entry : t))
+          : [...s.tabs, entry],
+      )
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      persist(next.tabs, next.activeId)
+      return next
     }),
 
   openBrowser: (chatId, url) =>

@@ -2,7 +2,7 @@
 // history must carry ONLY what the Rust backend reads (agent.rs
 // `history_recap`), otherwise every turn re-serializes megabytes of inline
 // image data URLs, per-message thinking and full tool output for nothing.
-import { projectHistoryMessage } from '../src/lib/historyPayload.ts'
+import { isWireHistoryMessage, projectHistoryMessage } from '../src/lib/historyPayload.ts'
 import type { ChatMessage } from '../src/types.ts'
 
 let failed = 0
@@ -140,6 +140,27 @@ const base = (over: Partial<ChatMessage>): ChatMessage => ({
   check('no plan key', !('plan' in out))
   check('no preservedToolSummary key', !('preservedToolSummary' in out))
   check('no images key', !('images' in out))
+}
+
+{
+  console.log('── mode-switch notices never reach the wire ──')
+  // A `[Mode switched to …]` notice is system-role, so the send path sorts it
+  // to the FRONT of the history: keeping it pushed a new message in ahead of
+  // the whole conversation on every switch and invalidated the provider's
+  // cached prefix (traced: 63 of 235 requests carried one). The active mode
+  // already rides in the system prompt, so the notice carries no task content.
+  const sw = base({
+    role: 'system',
+    content: '[Mode switched to Plan — the next user message runs in Plan mode.]',
+    modeSwitch: true,
+  })
+  check('mode-switch notice is dropped', !isWireHistoryMessage(sw))
+  const summary = base({ role: 'system', content: 'SUMMARY OF OLDER TURNS' })
+  check('a real compaction summary is kept', isWireHistoryMessage(summary))
+  check('user message is kept', isWireHistoryMessage(base({ role: 'user' })))
+  check('assistant message is kept', isWireHistoryMessage(base({ role: 'assistant' })))
+  check('compacted message is dropped', !isWireHistoryMessage(base({ compacted: true })))
+  check('tool-role message is dropped', !isWireHistoryMessage(base({ role: 'tool' })))
 }
 
 if (failed) {

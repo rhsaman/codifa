@@ -19,6 +19,15 @@ pub const MAX_TERMINAL_OUTPUT: usize = 10_000;
 /// to the canonical-path visited set, so a pathological tree cannot blow the
 /// stack.
 const MAX_WALK_DEPTH: usize = 64;
+
+/// How many skill names a miss/ambiguity message may print. A store can hold
+/// hundreds of skills, so echoing all of them would spend a transcript's worth
+/// of tokens on a failed lookup.
+const SKILL_LIST_MAX: usize = 30;
+
+/// How many search hits `load_skill query=` lists before asking the model to
+/// name one.
+const SKILL_SEARCH_MAX: usize = 8;
 const MAX_GREP_ALTERNATIVES: usize = 3;
 const MAX_LINE_LENGTH: usize = 2000;
 
@@ -1076,6 +1085,119 @@ pub fn dispatch(root: &str, name: &str, args: &Value, permit: Option<&Value>) ->
 /// `<workspace>/mcp` where nothing reads them. `None` keeps the previous
 /// behaviour, which the tool tests rely on (they build the store inside their
 /// own temp root).
+/// The body block for one skill, shared by the by-name and by-query paths.
+fn skill_body(sk: &Value) -> String {
+    let files: Vec<&str> = sk["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut out = format!(
+        "===== SKILL: {} =====\nDescription: {}\n",
+        sk["name"].as_str().unwrap_or_default(),
+        sk["description"].as_str().unwrap_or_default()
+    );
+    if !files.is_empty() {
+        out.push_str(&format!(
+            "Extra files: {} — load a specific file with load_skill(file=<name>) only when needed.\n",
+            files.join(", ")
+        ));
+    }
+    out.push_str(&format!("\n{}\n", sk["content"].as_str().unwrap_or_default()));
+    out
+}
+
+/// Skill names to suggest after a miss, bounded (`SKILL_LIST_MAX`) so a big
+/// store cannot flood the turn that failed to find one skill.
+fn available_hint(all: &[Value]) -> String {
+    let names: Vec<&str> = all.iter().filter_map(|sk| sk["name"].as_str()).collect();
+    if names.is_empty() {
+        return "(none)".to_string();
+    }
+    if names.len() <= SKILL_LIST_MAX {
+        return names.join(", ");
+    }
+    format!(
+        "{} … (and {} more — load_skill with query=<words> searches all of them)",
+        names[..SKILL_LIST_MAX].join(", "),
+        names.len() - SKILL_LIST_MAX
+    )
+}
+
+/// Everything about one skill a search query is matched against: name, slug,
+/// description and the user's own `fa_keywords` — a Persian word has to find
+/// its skill exactly as it does in the prompt catalog.
+fn skill_haystack(sk: &Value) -> String {
+    let mut hay = String::new();
+    for key in ["name", "slug", "description", "plugin"] {
+        if let Some(v) = sk[key].as_str() {
+            hay.push_str(v);
+            hay.push(' ');
+        }
+    }
+    if let Some(kw) = sk["fa_keywords"].as_array() {
+        for k in kw.iter().filter_map(Value::as_str) {
+            hay.push_str(k);
+            hay.push(' ');
+        }
+    }
+    hay.to_lowercase()
+}
+
+/// Find a skill by words when the prompt's catalog does not cover the task.
+///
+/// The catalog is byte-capped, so a store with hundreds of skills cannot list
+/// them all — this is the way in for everything it had to leave out: every
+/// installed skill is scored against the query's words, and the best hit's body
+/// comes back, so the model spends one call instead of guessing a name it was
+/// never shown.
+fn search_skills(store_base: &str, query: &str) -> Result<String, String> {
+    // Word-boundary split (`is_alphanumeric` is Unicode-aware, so Persian words
+    // survive whole). One-character words are dropped: they match everything.
+    let terms: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() > 1)
+        .map(str::to_string)
+        .collect();
+    if terms.is_empty() {
+        return Err(format!("load_skill query {query:?} has no word to search for"));
+    }
+    let all = crate::skill_router::load_skills(store_base);
+    let mut scored: Vec<(usize, &Value)> = all
+        .iter()
+        .filter_map(|sk| {
+            let hay = skill_haystack(sk);
+            let score = terms.iter().filter(|t| hay.contains(t.as_str())).count();
+            (score > 0).then_some((score, sk))
+        })
+        .collect();
+    // Best hit first; `sort_by` is stable, so ties keep the store's own order
+    // and the same query always answers the same thing.
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    match scored.len() {
+        0 => Err(format!(
+            "no skill matches {query:?}. Available: {}",
+            available_hint(&all)
+        )),
+        // Exactly one skill fits the words: returning its body saves the model
+        // the second call it would have spent naming it.
+        1 => Ok(skill_body(scored[0].1)),
+        _ => {
+            let mut out = String::from(
+                "Several skills match — call load_skill again with the `name` of the right one:\n",
+            );
+            for (_, sk) in scored.iter().take(SKILL_SEARCH_MAX) {
+                out.push_str(&format!(
+                    "- {}: {}\n",
+                    sk["name"].as_str().unwrap_or_default(),
+                    sk["description"].as_str().unwrap_or_default().trim()
+                ));
+            }
+            Ok(out)
+        }
+    }
+}
+
 pub fn dispatch_with_data_root(
     root: &str,
     name: &str,
@@ -1329,16 +1451,44 @@ pub fn dispatch_with_data_root(
         // from a Persian request: the catalog line carries them, so the model
         // can match the user's own wording without any embedding or classifier.
         "create_skill" => {
-            let name = s("name");
+            // A repo is an alternative SOURCE for the whole skill: read it first,
+            // then hand it to `sync_skill` exactly like a model-written body, so
+            // the frontmatter, slug and extra-file rules stay in one place
+            // (the same trick `plugins::apply_parts` uses).
+            let repo_spec = args["repo"].as_str().unwrap_or("").trim().to_string();
+            let from_repo = if repo_spec.is_empty() {
+                None
+            } else {
+                Some(crate::repo::read_skill(
+                    &repo_spec,
+                    args["repo_path"].as_str().unwrap_or(""),
+                    args["repo_ref"].as_str().unwrap_or(""),
+                    &s("name"),
+                )?)
+            };
+            let name = if !s("name").trim().is_empty() {
+                s("name")
+            } else {
+                from_repo
+                    .as_ref()
+                    .and_then(|r| r["name"].as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
             if name.trim().is_empty() {
-                return Err("create_skill requires name".into());
+                return Err("create_skill requires name (or a repo that names the skill)".into());
             }
             // An empty body is allowed on purpose: `sync_skill` keeps the
             // stored body when one exists and fails only when a NEW skill would
             // be written with nothing in it. A delete, a rename, or a call that
             // only touches an extra file must not have to resend the whole
             // markdown — the old guard rejected exactly those calls.
-            let content = s("content");
+            let mut content = s("content");
+            if content.trim().is_empty() {
+                if let Some(r) = &from_repo {
+                    content = r["content"].as_str().unwrap_or("").to_string();
+                }
+            }
             let mut body = json!({
                 "name": name,
                 "previous_name": s("previous_name"),
@@ -1350,11 +1500,29 @@ pub fn dispatch_with_data_root(
                 "description": args["description"].clone(),
                 "fa_keywords": args["fa_keywords"].clone(),
             });
+            if let Some(r) = &from_repo {
+                // The repo fills only what the call left out.
+                for key in ["description", "fa_keywords"] {
+                    if body[key].is_null() {
+                        body[key] = r[key].clone();
+                    }
+                }
+                if let Some(files) = r["extra_files"].as_object() {
+                    if !files.is_empty() {
+                        body["extra_files"] = json!(files);
+                    }
+                }
+            }
             if args["delete"].as_bool().unwrap_or(false) {
                 body["delete"] = json!(true);
             }
             if let Some(extra) = args["extra_files"].as_object() {
-                body["extra_files"] = json!(extra);
+                // Explicit files win over the ones that came with the repo.
+                let mut merged = body["extra_files"].as_object().cloned().unwrap_or_default();
+                for (k, v) in extra {
+                    merged.insert(k.clone(), v.clone());
+                }
+                body["extra_files"] = json!(merged);
             }
             if let Some(del) = args["deleted_files"].as_array() {
                 body["deleted_files"] = json!(del);
@@ -1366,12 +1534,12 @@ pub fn dispatch_with_data_root(
             if let Some(dir) = crate::skills::find_skill_dir_pub(Path::new(store_base), name_out) {
                 crate::skills::mark_user_edit(&dir);
             }
-            // An empty keyword list silently makes the skill INVISIBLE to
-            // auto-match: the catalog line is the only trigger, so the model
+            // An empty keyword list leaves the catalog line English-only, so a
+            // Persian request has no trigger to find the skill by: the model
             // must be told to fix it instead of believing the save was enough.
             let warning = if res["fa_keyword_count"].as_u64().unwrap_or(0) == 0 {
-                "\nWARNING: this skill has NO fa_keywords, so it will never be auto-selected \
-                 from a user request. Call create_skill again with fa_keywords set \
+                "\nWARNING: this skill has NO fa_keywords, so a Persian request has \
+                 nothing to find it by. Call create_skill again with fa_keywords set \
                  (comma-separated Persian phrases the user would actually say)."
             } else {
                 ""
@@ -1421,58 +1589,157 @@ pub fn dispatch_with_data_root(
                 res["name"].as_str().unwrap_or(&name)
             ))
         }
-        // Load one stored skill's body on demand (the auto-matcher inlines the
-        // obvious picks; anything else costs one tool call instead of a
-        // prompt-sized body). `file` reads an extra file of that skill.
+        // Plugins: one folder bundling skills + MCP connectors behind a single
+        // on/off switch (see plugins.rs for the layout). Kept as ONE tool with
+        // an `action` multiplexer so the catalog stays short.
+        "plugin" => {
+            let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+            let store = Path::new(store_base);
+            match action.as_str() {
+                "list" => Ok(crate::plugins::list_plugins(store).to_string()),
+                "install" => crate::plugins::install_plugin(store, args).map(|v| v.to_string()),
+                "create" => crate::plugins::create_plugin(store, args).map(|v| v.to_string()),
+                "update" => crate::plugins::update_plugin(store, args).map(|v| v.to_string()),
+                "toggle" => crate::plugins::toggle_plugin(store, args).map(|v| {
+                    let on = v["enabled"].as_bool().unwrap_or(false);
+                    format!("{}\n{}", if on { "Plugin enabled" } else { "Plugin disabled" }, v)
+                }),
+                "delete" => crate::plugins::delete_plugin(store, args).map(|v| v.to_string()),
+                other => Err(format!(
+                    "plugin requires action one of list/install/create/update/toggle/delete (got {other:?})"
+                )),
+            }
+        }
+        // Schedules as data: the agent writes the task, the Schedule page only
+        // displays it. A task carries its own skills/connectors so a headless
+        // run gets the same context as a normal turn.
+        "schedule" => {
+            let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+            let store_base_sched = data_root.ok_or("schedule needs a data root")?;
+            let store = Path::new(store_base_sched);
+            match action.as_str() {
+                "list" => Ok(crate::appstate::list_schedules(store).to_string()),
+                "create" | "update" => {
+                    let id = s("id");
+                    let existing: Option<Value> = if action == "create" {
+                        None
+                    } else {
+                        if id.trim().is_empty() {
+                            return Err("update requires the schedule id".into());
+                        }
+                        match crate::appstate::get_schedule(store, &id) {
+                            Some(t) => Some(t),
+                            None => return Err(format!("schedule not found: {id}")),
+                        }
+                    };
+                    let mut task = existing.unwrap_or_else(|| json!({}));
+                    let obj = task.as_object_mut().expect("task starts as an object");
+                    for key in ["name", "prompt", "mode"] {
+                        if let Some(v) = args[key].as_str() {
+                            if !v.trim().is_empty() {
+                                obj.insert(key.into(), json!(v));
+                            }
+                        }
+                    }
+                    let root_arg = args["root"].as_str().unwrap_or("").trim();
+                    if !root_arg.is_empty() {
+                        obj.insert("root".into(), json!(root_arg));
+                    } else if action == "create" {
+                        obj.insert("root".into(), json!(root));
+                    }
+                    if let Some(cron) = args["cron"].as_str() {
+                        if !cron.trim().is_empty() && !crate::scheduler::is_valid_cron(cron) {
+                            return Err(format!("invalid cron expression: {cron}"));
+                        }
+                        obj.insert("cron".into(), json!(cron.trim()));
+                    }
+                    if let Some(on) = args["enabled"].as_bool() {
+                        obj.insert("enabled".into(), json!(on));
+                    }
+                    // The run context: skills are names, connectors are names,
+                    // plugins are slugs whose skills + connectors are expanded
+                    // at run time (see scheduler::execute_schedule).
+                    for key in ["skills", "mcp_servers", "plugins"] {
+                        if let Some(list) = args[key].as_array() {
+                            obj.insert(key.into(), json!(list));
+                        }
+                    }
+                    let saved = crate::appstate::save_schedule(store, task)?;
+                    Ok(format!("Schedule saved:\n{saved}"))
+                }
+                "toggle" => {
+                    let id = s("id");
+                    let Some(mut task) = crate::appstate::get_schedule(store, &id) else {
+                        return Err(format!("schedule not found: {id}"));
+                    };
+                    let on = args["enabled"]
+                        .as_bool()
+                        .unwrap_or_else(|| !task["enabled"].as_bool().unwrap_or(true));
+                    task["enabled"] = json!(on);
+                    let saved = crate::appstate::save_schedule(store, task)?;
+                    Ok(format!(
+                        "Schedule {}:\n{saved}",
+                        if on { "resumed" } else { "paused" }
+                    ))
+                }
+                "delete" => {
+                    let id = s("id");
+                    if id.trim().is_empty() {
+                        return Err("delete requires the schedule id".into());
+                    }
+                    crate::appstate::delete_schedule(store, &id);
+                    Ok(format!("Schedule deleted: {id}"))
+                }
+                other => Err(format!(
+                    "schedule requires action one of list/create/update/toggle/delete (got {other:?})"
+                )),
+            }
+        }
+        // Load one stored skill's body on demand: the prompt lists only a slice
+        // of the installed skills, so a body costs one tool call instead of
+        // carrying all of them in the prompt. `file` reads an extra file of it;
+        // `query` searches the WHOLE store, which is what keeps a store with
+        // hundreds of skills reachable from a prompt that cannot list them.
         "load_skill" => {
             let name = s("name");
             if name.trim().is_empty() {
-                return Err("load_skill requires name".into());
+                let query = s("query");
+                if query.trim().is_empty() {
+                    return Err(
+                        "load_skill requires name, or query to search the installed skills".into(),
+                    );
+                }
+                return search_skills(store_base, &query);
             }
             let file = s("file");
             if !file.trim().is_empty() {
-                let v = crate::skills::read_skill_file(Path::new(store_base), &name, &file)?;
-                return Ok(v["content"].as_str().unwrap_or_default().to_string());
+                // A skill lives either in the standalone store or inside an
+                // ENABLED plugin folder, and only this branch needs the plugin
+                // dir — so it is resolved here instead of on every call.
+                let store = Path::new(store_base);
+                let plugin_dir = crate::plugins::plugin_of_skill(store, &name)
+                    .and_then(|slug| crate::plugins::find_skill_dir(store, &slug, &name));
+                let read = match &plugin_dir {
+                    Some(dir) => crate::skills::read_extra_file(dir, &name, &file),
+                    None => crate::skills::read_skill_file(store, &name, &file),
+                };
+                return Ok(read?["content"].as_str().unwrap_or_default().to_string());
             }
-            let all = crate::skills::list_skills(Path::new(store_base));
+            // Same list the catalog is built from (`skill_router::load_skills`),
+            // so the NOT-FOUND hint names exactly what the model was shown.
+            let all = crate::skill_router::load_skills(store_base);
             let wanted = name.trim().to_lowercase();
-            let hit = all["skills"].as_array().and_then(|list| {
-                list.iter().find(|sk| {
-                    let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
-                    let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
-                    n == wanted || slug == wanted
-                })
+            let hit = all.iter().find(|sk| {
+                let n = sk["name"].as_str().unwrap_or_default().trim().to_lowercase();
+                let slug = sk["slug"].as_str().unwrap_or_default().trim().to_lowercase();
+                n == wanted || slug == wanted
             });
             match hit {
-                Some(sk) => {
-                    let files: Vec<&str> = sk["files"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(Value::as_str).collect())
-                        .unwrap_or_default();
-                    let mut out = format!(
-                        "===== SKILL: {} =====\nDescription: {}\n",
-                        sk["name"].as_str().unwrap_or_default(),
-                        sk["description"].as_str().unwrap_or_default()
-                    );
-                    if !files.is_empty() {
-                        out.push_str(&format!(
-                            "Extra files: {} — load a specific file with load_skill(file=<name>) only when needed.\n",
-                            files.join(", ")
-                        ));
-                    }
-                    out.push_str(&format!("\n{}\n", sk["content"].as_str().unwrap_or_default()));
-                    Ok(out)
-                }
-                None => {
-                    let names: Vec<&str> = all["skills"]
-                        .as_array()
-                        .map(|l| l.iter().filter_map(|sk| sk["name"].as_str()).collect())
-                        .unwrap_or_default();
-                    Err(format!(
-                        "skill not found: {name}. Available: {}",
-                        if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
-                    ))
-                }
+                Some(sk) => Ok(skill_body(sk)),
+                None => Err(format!(
+                    "skill not found: {name}. Available: {}",
+                    available_hint(&all)
+                )),
             }
         }
         _ => Err(format!("tool {name:?} is not available")),

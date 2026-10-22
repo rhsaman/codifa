@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod artifacts;
 mod browser;
 mod browser_driver;
 mod computer;
@@ -26,7 +27,9 @@ mod media;
 mod models;
 mod oauth;
 mod plans;
+mod plugins;
 mod providers;
+mod repo;
 mod appstate;
 mod pty;
 mod secrets;
@@ -184,6 +187,10 @@ fn main() {
             // until the disk fills. Owns its thread, so boot is never blocked.
             {
                 let root = state::get_data_root(app.handle());
+                // Prime the at-rest key while a handle still exists: the
+                // scheduler and the router run on handle-free threads and must
+                // still be able to decrypt provider keys from settings.json.
+                secrets::prime_key(app.handle());
                 // Native schedule due-check loop (migrated from the Python
                 // sidecar's _start_schedule_loop): polls every 30s, runs due
                 // tasks headless through the native agent, records runs.

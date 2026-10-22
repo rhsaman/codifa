@@ -84,10 +84,42 @@ console.log('3) حالت gave-up → بدون spinner و بدون دکمه Retry
       onCancel={() => {}}
     />,
   )
-  check('برچسب give-up', html.includes('Retry limit reached'))
+  // Gave-up is a transient, informational line now: it says the turn stopped
+  // retrying instead of naming a "limit". Dismissing stays available (the ✕
+  // passed as onCancel), and Retry is not offered because the caller passed
+  // none — the retries are already exhausted.
+  check('متن give-up', html.includes('kept failing after retries'), html.slice(0, 300))
+  check('دلیل failure نمایش داده شد', html.includes('boom'))
   check('spinner ندارد', !html.includes('spinner'))
   check('دکمه Retry ندارد', !html.includes('retry-btn'))
   check('دکمه Cancel (✕) دارد', html.includes('retry-cancel'))
+  check('متن در کلاس retry-text بسته‌بندی شد', html.includes('retry-text'))
+}
+
+console.log('3b) unlimited retries (maxAttempts=0) → countdown, NOT the give-up line:')
+{
+  // maxAttempts <= 0 means "retry forever", so it must NOT read as a cap: the
+  // inverted guard made every unlimited retry render the give-up one-liner and
+  // hide the countdown it was meant to show.
+  const html = renderToString(
+    <RetryBanner
+      attempt={3}
+      maxAttempts={0}
+      delay={30}
+      reason="upstream hiccup"
+      gaveUp={false}
+      stalled={false}
+      onRetry={() => {}}
+    />,
+  )
+  check('متن give-up نمایش داده نشد', !html.includes('kept failing after retries'), html.slice(0, 300))
+  check('شمارش تلاش نمایش داده شد', html.includes('attempt 3'))
+  // The label and the countdown are the point of NOT treating unlimited as a
+  // cap: an unlimited retry keeps the ordinary banner (a label naming WHO is
+  // retrying, plus time left) instead of collapsing into the give-up line.
+  check('بنر عادی با برچسب ماند', html.includes('Provider hiccup') || html.includes('Provider rate limit'), html.slice(0, 300))
+  check('شمارش معکوس ماند', html.includes('retry in 30s'), html.slice(0, 300))
+  check('دکمه Retry دارد', html.includes('retry-btn'))
 }
 
 console.log('4) float delay (backoff jitter) → whole seconds, no decimals:')

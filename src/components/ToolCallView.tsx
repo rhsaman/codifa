@@ -98,6 +98,7 @@ const TOOL_LABEL: Record<string, string> = {
   vision: "Vision",
   create_skill: "Create Skill",
   create_mcp: "Create MCP",
+  load_skill: "Load Skill",
   update_plan: "Update Plan",
   git_status: "Git Status",
   git_diff: "Git Diff",
@@ -186,6 +187,7 @@ const TOOL_ICON: Record<string, string> = {
   vision: "🖼",
   create_skill: "⚙",
   create_mcp: "🔌",
+  load_skill: "📘",
   update_plan: "📝",
   git_status: "🌿",
   git_diff: "📊",
@@ -481,7 +483,7 @@ function IconSparkle({ className }: { className?: string }) {
   );
 }
 
-function IconChevron({
+export function IconChevron({
   open,
   className,
 }: {
@@ -767,24 +769,20 @@ export const WebResultLinks = memo(function WebResultLinks({
  *  خروجی بلند با `trace-expand-pre` اسکرول عمودی می‌خورد. */
 export const TerminalResultText = function TerminalResultText({
   items,
+  fallbackText,
 }: {
   items: unknown;
+  /** Plain `event.result` string when the sidecar sent no result rows. */
+  fallbackText?: string;
 }) {
-  const text = terminalOutputText(items);
+  const text = terminalOutputText(items) || fallbackText || "";
   if (!text) return null;
-  // Long output is clipped here anyway — open the full text in the side panel.
-  const long = text.length > 600;
+  // Long output scrolls inside this block (.trace-terminal-output max-height);
+  // it never hops to the side panel (user request).
   return (
     <pre
-      className={`trace-expand-val trace-expand-pre trace-terminal-output${long ? " clickable" : ""}`}
+      className="trace-expand-val trace-expand-pre trace-terminal-output"
       dir="ltr"
-      title={long ? "Open the full output in the side panel" : undefined}
-      onClick={
-        long
-          ? () =>
-              useViewerTabs.getState().openText("Terminal output", text, "text")
-          : undefined
-      }
     >
       {text}
     </pre>
@@ -821,12 +819,12 @@ export const FileResultLinks = memo(function FileResultLinks({
     deduped.push(it);
   }
   if (deduped.length === 0) return null;
-  const VISIBLE = 3;
-  const visible = deduped.slice(0, VISIBLE);
-  const extra = deduped.length - visible.length;
+  // Every hit renders right here and the list scrolls (.file-results carries a
+  // max-height): the row expands IN PLACE — results never hop to the side
+  // panel (user request).
   return (
-    <ul className="file-results" dir="ltr">
-      {visible.map((it, i) => {
+    <ul className="file-results" dir="ltr" aria-label={`${tool} results`}>
+      {deduped.map((it, i) => {
         const file = String(it.file ?? it.path ?? "");
         if (!file) return null;
         const line =
@@ -844,40 +842,6 @@ export const FileResultLinks = memo(function FileResultLinks({
           </li>
         );
       })}
-      {extra > 0 && (
-        <li className="file-result-more" key="more">
-          <button
-            type="button"
-            className="file-result-more-btn"
-            title="Open all results in the side panel"
-            onClick={() =>
-              useViewerTabs
-                .getState()
-                .openText(
-                  `${tool} results`,
-                  // Markdown list so the side panel renders every path as a
-                  // clickable file chip (inline `code` -> FileChip) instead of
-                  // a wall of raw text.
-                  deduped
-                    .map((it) => {
-                      const f = String(it.file ?? it.path ?? "");
-                      const ln = it.line != null ? `:${String(it.line)}` : "";
-                      // A backtick in the matched line would end the inline
-                      // code span early — swap it so the path chip stays put.
-                      const tx = String(it.text ?? "")
-                        .replace(/`/g, "'")
-                        .slice(0, 300);
-                      return `- \`${f}${ln}\`${tx ? ` — ${tx}` : ""}`;
-                    })
-                    .join("\n"),
-                  "md",
-                )
-            }
-          >
-            +{extra} more
-          </button>
-        </li>
-      )}
     </ul>
   );
 });
@@ -914,11 +878,26 @@ function fmtArgValue(v: unknown): string {
   return String(v);
 }
 
+/** Args the row head/subtitle already states for one tool: repeating them as
+ *  `key: value` chips only adds noise (`name:ponytail` beside the skill's own
+ *  name). Scoped per tool so e.g. `create_skill` keeps showing its `name`. */
+const REDUNDANT_ARG_KEYS: Record<string, Set<string>> = {
+  load_skill: new Set(["name", "file", "query"]),
+};
+
 /** Remaining args rendered as clean `key: value` chips inside the card head —
  *  no raw JSON blob in the body. */
-function ToolArgs({ args }: { args: Record<string, unknown> }) {
+function ToolArgs({
+  args,
+  tool,
+}: {
+  args: Record<string, unknown>;
+  tool?: string;
+}) {
+  const skip = REDUNDANT_ARG_KEYS[canonicalTool(tool ?? "")];
   const entries = Object.entries(args).filter(
-    ([k]) => !HEADER_SHOWN_KEYS.has(k) && !HIDDEN_KEYS.has(k),
+    ([k]) =>
+      !HEADER_SHOWN_KEYS.has(k) && !HIDDEN_KEYS.has(k) && !skip?.has(k),
   );
   if (entries.length === 0) return null;
   return (
@@ -931,6 +910,29 @@ function ToolArgs({ args }: { args: Record<string, unknown> }) {
       ))}
     </span>
   );
+}
+
+/** Expanded-body arg dump. Shared by both row variants so they can never drift,
+ *  and filtered so a tool's already-stated args are not printed twice. */
+function argsTextFor(activity: ToolActivity): string {
+  const args = activity.args;
+  if (!args) return "";
+  const skip = REDUNDANT_ARG_KEYS[canonicalTool(activity.tool)];
+  return Object.entries(args)
+    .filter(([k]) => !skip?.has(k))
+    .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join("\n");
+}
+
+/** One-line row detail: the skill name for `load_skill` (its backend summary is
+ *  only the tool name, which the label already shows), else the backend
+ *  summary, else whatever the args say. */
+function rowDetail(activity: ToolActivity): string {
+  if (canonicalTool(activity.tool) === "load_skill") {
+    const name = String(activity.args?.name ?? activity.args?.file ?? "");
+    if (name) return shortArg(name, 60);
+  }
+  return activity.summary ? fixZwsp(activity.summary) : subArgSummary(activity);
 }
 
 /** هایلایت ساده‌ی TOML: کلید نارنجی، رشته زرد-سبز، کامنت خاکستری.
@@ -1980,6 +1982,15 @@ function subArgSummary(activity: ToolActivity): string {
   if (!args) return "";
   const parts: string[] = [];
 
+  // load_skill: the skill's own name is the whole story — printing `name:x`
+  // as a `key:value` arg (the generic fallback below) reads like machine output.
+  if (canonicalTool(activity.tool) === "load_skill") {
+    const skill = String(args.name ?? args.file ?? "");
+    if (skill) return shortArg(skill, 60);
+    const q = String(args.query ?? "");
+    return q ? shortArg(q, 48) : "";
+  }
+
   // run_terminal: the shell command
   if (args.command !== undefined && args.command !== "") {
     parts.push(shortArg(String(args.command), 80));
@@ -2137,8 +2148,11 @@ export const ToolSubRow = memo(function ToolSubRow({
         <span className="tool-sub-args" title={subSummary}>
           {subSummary}
         </span>
-        {activity.summary && (
-          <span className="tool-sub-summary">{activity.summary}</span>
+        {/* The backend stamps the tool NAME as the summary; for a skill load
+            that only repeats the label, so the row would read
+            "Load Skill  ponytail  load_skill". */}
+        {activity.summary && canonicalTool(activity.tool) !== "load_skill" && (
+          <span className="tool-sub-summary">{fixZwsp(activity.summary)}</span>
         )}
         <span className="tool-ms">{fmtTime(ms)}</span>
       </div>
@@ -2153,57 +2167,6 @@ export const ToolSubRow = memo(function ToolSubRow({
     </>
   );
 });
-
-/** Minimum output length (chars) for a tool row to open its full output as a
- *  text tab in the side panel instead of expanding inline — long outputs read
- *  like diff/plan on the right; short ones stay a quick inline peek. */
-const TRACE_TEXT_PANEL_MIN = 600;
-
-/** A code fence that can never appear inside the payload itself: one backtick
- *  longer than the longest ` run in the text (min 3), so embedded markdown
- *  fences or template literals never terminate the block early. */
-function fenceFor(s: string): string {
-  let max = 0;
-  let run = 0;
-  for (const ch of s) {
-    if (ch === "`") {
-      run++;
-      if (run > max) max = run;
-    } else {
-      run = 0;
-    }
-  }
-  return "`".repeat(Math.max(3, max + 1));
-}
-
-/** Markdown dump of a tool row's output (summary/args/diff/terminal) — the
- *  body the side panel opens for long rows. Bold section labels + fenced
- *  blocks so the markdown text view renders args/diff/output with the code
- *  block chrome instead of collapsing the lines into paragraphs. */
-function traceRowOutputText(activity: ToolActivity, argsText: string): string {
-  const parts: string[] = [];
-  if (activity.summary) parts.push(`**Summary**\n\n${fixZwsp(activity.summary)}`);
-  if (argsText) {
-    const f = fenceFor(argsText);
-    parts.push(`**Args**\n\n${f}\n${argsText}\n${f}`);
-  }
-  if (activity.diff) {
-    const f = fenceFor(activity.diff);
-    parts.push(`**Diff**\n\n${f}diff\n${activity.diff}\n${f}`);
-  }
-  if (activity.tool === "run_terminal") {
-    const out = terminalOutputText(activity.items ?? activity.results);
-    if (out) {
-      const f = fenceFor(out);
-      parts.push(`**Output**\n\n${f}\n${out}\n${f}`);
-    }
-  }
-  if (activity.resultText) {
-    const f = fenceFor(activity.resultText);
-    parts.push(`**Result**\n\n${f}\n${activity.resultText}\n${f}`);
-  }
-  return parts.join("\n\n");
-}
 
 /** One row in a Claude-style trace group: a single quiet line per call with
  *  a tool icon, a short description (the model's arg summary or activity
@@ -2237,38 +2200,15 @@ const TraceRow = memo(function TraceRow({
       ? now - activity.startedAt
       : activity.elapsedMs;
   const label = toolLabel(activity.tool);
-  const detail = activity.summary
-    ? fixZwsp(activity.summary)
-    : subArgSummary(activity);
+  const detail = rowDetail(activity);
 
-  const argsText = activity.args
-    ? Object.entries(activity.args)
-      .map(
-        ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-      )
-      .join("\n")
-    : "";
+  const argsText = argsTextFor(activity);
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
-  // Long outputs open as a text tab in the side panel (like diff/plan);
-  // short ones keep the quick inline expand.
-  const outputText = traceRowOutputText(activity, argsText);
-  const sideTitle = `${label} — ${detail.slice(0, 40)}`;
-  const onHeadClick = () => {
-    // Web rows always toggle in place: their result list lives inside this
-    // row, and the long-output side-panel path below would leave it
-    // unreachable from the header (user request).
-    if (isWebRow(activity)) {
-      setExpanded((e) => !e);
-      return;
-    }
-    if (!isEdit && outputText.length > TRACE_TEXT_PANEL_MIN) {
-      useViewerTabs.getState().openText(sideTitle, outputText, "md");
-      return;
-    }
-    setExpanded((e) => !e);
-  };
+  // Every row expands IN PLACE: args / result / results stay inside the row
+  // (long bodies scroll) — a click never opens the side panel (user request).
+  const onHeadClick = () => setExpanded((e) => !e);
 
   return (
     <div
@@ -2310,14 +2250,18 @@ const TraceRow = memo(function TraceRow({
               <span className="trace-expand-val">{fmtTime(ms)}</span>
             </div>
           ) : null}
-          {activity.summary && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Summary</span>
-              <span className="trace-expand-val" dir="auto">
-                {fixZwsp(activity.summary)}
-              </span>
-            </div>
-          )}
+          {/* The backend stamps the tool NAME as the summary; for a skill load
+              that only repeats the head label — the skill name is the real
+              detail. */}
+          {activity.summary &&
+            canonicalTool(activity.tool) !== "load_skill" && (
+              <div className="trace-expand-section">
+                <span className="trace-expand-key">Summary</span>
+                <span className="trace-expand-val" dir="auto">
+                  {fixZwsp(activity.summary)}
+                </span>
+              </div>
+            )}
           {argsText && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Args</span>
@@ -2337,13 +2281,10 @@ const TraceRow = memo(function TraceRow({
               </pre>
             </div>
           )}
-          {activity.resultText && (
+          {activity.resultText && activity.tool !== "run_terminal" && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Result</span>
-              <pre
-                className="trace-expand-val trace-expand-pre"
-                dir="auto"
-              >
+              <pre className="trace-expand-val trace-expand-pre" dir="auto">
                 {activity.resultText}
               </pre>
             </div>
@@ -2357,13 +2298,15 @@ const TraceRow = memo(function TraceRow({
           {/* The `Results` section below is the FILE-path list (read / grep /
               terminal); web rows already rendered their links above. */}
           {!isWebRow(activity) &&
-            (activity.items ?? activity.results) &&
-            (activity.items ?? activity.results)!.length > 0 && (
+            (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
+              (activity.tool === "run_terminal" &&
+                Boolean(activity.resultText))) && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
               {activity.tool === "run_terminal" ? (
                 <TerminalResultText
                   items={activity.items ?? activity.results}
+                  fallbackText={activity.resultText}
                 />
               ) : (
                 <FileResultLinks
@@ -2563,46 +2506,19 @@ export const ToolSingleRow = memo(function ToolSingleRow({
       ? now - activity.startedAt
       : activity.elapsedMs;
   const label = toolLabel(activity.tool);
-  const detail = activity.summary
-    ? fixZwsp(activity.summary)
-    : subArgSummary(activity);
+  const detail = rowDetail(activity);
 
-  const argsText = activity.args
-    ? Object.entries(activity.args)
-      .map(
-        ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-      )
-      .join("\n")
-    : "";
+  const argsText = argsTextFor(activity);
 
   const isEdit =
     activity.tool === "edit_file" || activity.tool === "write_file";
   const openReview = useViewerTabs((s) => s.openReview);
-  // Long outputs open as a text tab in the side panel (like diff/plan);
-  // short ones keep the quick inline expand.
-  const outputText = traceRowOutputText(activity, argsText);
-  const sideTitle = `${label} — ${detail.slice(0, 40)}`;
   const onHeadClick = () => {
+    // Only a write row leaves the chat: its diff opens in the Review panel.
+    // Every other row expands IN PLACE — args / result / results stay inside
+    // the row (long bodies scroll), never the side panel (user request).
     if (isEdit) {
       if (messageId) openReview(messageId, reviewPathOf(activity));
-      return;
-    }
-    // Sub-agent (explore) cards: the report IS the payload, so clicking
-    // the card opens it in the side panel instead of expanding a cramped
-    // inline body (user request).
-    if (isSubagentCard(activity) && outputText.trim()) {
-      useViewerTabs.getState().openText(sideTitle, outputText, "md");
-      return;
-    }
-    // Web rows expand IN PLACE: the distilled answer is long enough to trip
-    // the side-panel path below, which left the row's own result list
-    // unreachable. The header must always toggle this row.
-    if (isWebRow(activity)) {
-      setExpanded((e) => !e);
-      return;
-    }
-    if (outputText.length > TRACE_TEXT_PANEL_MIN) {
-      useViewerTabs.getState().openText(sideTitle, outputText, "md");
       return;
     }
     setExpanded((e) => !e);
@@ -2694,14 +2610,18 @@ export const ToolSingleRow = memo(function ToolSingleRow({
               <span className="trace-expand-val">{fmtTime(ms)}</span>
             </div>
           ) : null}
-          {activity.summary && (
-            <div className="trace-expand-section">
-              <span className="trace-expand-key">Summary</span>
-              <span className="trace-expand-val" dir="auto">
-                {fixZwsp(activity.summary)}
-              </span>
-            </div>
-          )}
+          {/* The backend stamps the tool NAME as the summary; for a skill load
+              that only repeats the head label — the skill name is the real
+              detail. */}
+          {activity.summary &&
+            canonicalTool(activity.tool) !== "load_skill" && (
+              <div className="trace-expand-section">
+                <span className="trace-expand-key">Summary</span>
+                <span className="trace-expand-val" dir="auto">
+                  {fixZwsp(activity.summary)}
+                </span>
+              </div>
+            )}
           {argsText && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Args</span>
@@ -2721,13 +2641,10 @@ export const ToolSingleRow = memo(function ToolSingleRow({
               </pre>
             </div>
           )}
-          {activity.resultText && (
+          {activity.resultText && activity.tool !== "run_terminal" && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Result</span>
-              <pre
-                className="trace-expand-val trace-expand-pre"
-                dir="auto"
-              >
+              <pre className="trace-expand-val trace-expand-pre" dir="auto">
                 {activity.resultText}
               </pre>
             </div>
@@ -2741,13 +2658,15 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           {/* The `Results` section below is the FILE-path list (read / grep /
               terminal); web rows already rendered their links above. */}
           {!isWebRow(activity) &&
-            (activity.items ?? activity.results) &&
-            (activity.items ?? activity.results)!.length > 0 && (
+            (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
+              (activity.tool === "run_terminal" &&
+                Boolean(activity.resultText))) && (
             <div className="trace-expand-section">
               <span className="trace-expand-key">Results</span>
               {activity.tool === "run_terminal" ? (
                 <TerminalResultText
                   items={activity.items ?? activity.results}
+                  fallbackText={activity.resultText}
                 />
               ) : (
                 <FileResultLinks
@@ -2834,9 +2753,12 @@ export const ToolCallView = memo(function ToolCallView({
   // Sub-agent (explore) cards are collapsible and start collapsed: the nested
   // read/grep/glob sub-list is noisy, so it stays hidden until clicked.
   const [collapsed, setCollapsed] = useState(isSubagentCard(activity));
+  // Explore cards fold their report; terminal cards fold their output — both
+  // toggle in place instead of hijacking clicks to the side panel.
   const collapsible =
-    activity.tool === "explore" &&
-    ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary));
+    (activity.tool === "explore" &&
+      ((activity.children?.length ?? 0) > 0 || Boolean(activity.summary))) ||
+    activity.tool === "run_terminal";
 
   const toolRunning = activity.status === "running" || (activity.children?.some((c) => c.status === "running") ?? false);
   const now = useRunningClock(toolRunning);
@@ -2854,6 +2776,15 @@ export const ToolCallView = memo(function ToolCallView({
     : [];
 
   const fetchSummary = activity.tool === "fetch_url" ? activity.summary : "";
+  /** The skill a `load_skill` call loaded. The label only says "Load Skill", and
+   *  the raw `name` arg chip is stripped as redundant (REDUNDANT_ARG_KEYS), so
+   *  without this the head never states WHICH skill the turn pulled in. */
+  const skillName =
+    canonicalTool(activity.tool) === "load_skill"
+      ? String(
+          activity.args?.name ?? activity.args?.file ?? activity.args?.query ?? "",
+        )
+      : "";
 
   const revert = async () => {
     if (!root) return;
@@ -2901,7 +2832,13 @@ export const ToolCallView = memo(function ToolCallView({
         role={isWrite || collapsible ? "button" : undefined}
         tabIndex={isWrite || collapsible ? 0 : undefined}
         aria-expanded={collapsible ? !collapsed : undefined}
-        title={isWrite ? "Review changes in the side panel" : undefined}
+        title={
+          isWrite
+            ? "Review changes in the side panel"
+            : activity.tool === "run_terminal"
+              ? "Toggle command output"
+              : undefined
+        }
         onKeyDown={
           isWrite || collapsible
             ? (e: KeyboardEvent<HTMLDivElement>) => {
@@ -2935,6 +2872,13 @@ export const ToolCallView = memo(function ToolCallView({
             toolLabel(activity.tool)
           )}
         </span>
+        {/* The head must say WHICH skill was loaded: the label is only
+            "Load Skill" and the raw `name` arg is filtered out of the chips. */}
+        {skillName && (
+          <span className="tool-skill" title={`Skill: ${skillName}`} dir="ltr">
+            {skillName}
+          </span>
+        )}
         {activity.tool === "web_search" && activity.engine && (
           <span className="tool-badge tool-engine-badge">
             {activity.engine}
@@ -3017,7 +2961,9 @@ export const ToolCallView = memo(function ToolCallView({
         )}
         {/* Sub-agent cards render their own description badge above — dumping
             the raw args here garbled the head row (overlapping key fragments). */}
-        {activity.args && !isSubagentCard(activity) && <ToolArgs args={activity.args} />}
+        {activity.args && !isSubagentCard(activity) && (
+          <ToolArgs args={activity.args} tool={activity.tool} />
+        )}
         {/* Trailing meta in ONE group pinned to the right edge by a single
             auto margin — without this the row only reached the right edge
             when the timer happened to render (write cards have no timer). */}
@@ -3070,39 +3016,20 @@ export const ToolCallView = memo(function ToolCallView({
           دیف فقط در پنل Review سمت راست باز می‌شود (سبک کدکس). */}
       {!collapsed && !isWrite && (
         <div className="tool-card-body">
-          {activity.summary && !isWrite && (
-            <div className="tool-summary">{fixZwsp(activity.summary)}</div>
-          )}
+          {/* The backend stamps a tool's summary with its own NAME; for a skill
+              load that only repeats the head label, so the body stays empty. */}
+          {activity.summary &&
+            !isWrite &&
+            canonicalTool(activity.tool) !== "load_skill" && (
+              <div className="tool-summary">{fixZwsp(activity.summary)}</div>
+            )}
           {/* A `read` result IS the file window: it is a code dump, not a
               one-line summary — render it as a clamped pre (same block the
               terminal output uses) so the card body cannot balloon. */}
           {activity.tool === "read" && activity.resultText && (
             <pre
-              className={`trace-expand-val trace-expand-pre trace-terminal-output${
-                activity.resultText.length > 600 ? " clickable" : ""
-              }`}
+              className="trace-expand-val trace-expand-pre trace-terminal-output"
               dir="ltr"
-              title={
-                activity.resultText.length > 600
-                  ? "Open the full content in the side panel"
-                  : undefined
-              }
-              onClick={
-                activity.resultText.length > 600
-                  ? () =>
-                      useViewerTabs
-                        .getState()
-                        .openText(
-                          `read — ${String(
-                            (activity.args as Record<string, unknown> | undefined)?.filePath ??
-                              (activity.args as Record<string, unknown> | undefined)?.path ??
-                              "file",
-                          )}`,
-                          activity.resultText as string,
-                          "text",
-                        )
-                  : undefined
-              }
             >
               {activity.resultText}
             </pre>
@@ -3129,11 +3056,15 @@ export const ToolCallView = memo(function ToolCallView({
               <WebResultLinks items={(activity.items ?? activity.results)!} />
             )}
           {activity.tool === "run_terminal" &&
-            (activity.items ?? activity.results) &&
-            (activity.items ?? activity.results)!.length > 0 && (
-              <TerminalResultText
-                items={activity.items ?? activity.results}
-              />
+            (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
+              Boolean(activity.resultText)) && (
+              <>
+                <span className="trace-expand-key">Output</span>
+                <TerminalResultText
+                  items={activity.items ?? activity.results}
+                  fallbackText={activity.resultText}
+                />
+              </>
             )}
           {/* فقط ابزارهای غیر-ویرایش دیف را در چت نشان می‌دهند. */}
           {activity.diff && (

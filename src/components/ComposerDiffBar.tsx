@@ -92,8 +92,10 @@ export function ComposerDiffBar({
       try {
         const res = await gitBranches(root);
         if (cancelled || "error" in res) return;
-        setBranches(res.branches);
-        setCurrent(res.current);
+        // Trust the declared shape defensively: a malformed response must not
+        // crash the whole bar (and with it the app's error boundary).
+        setBranches(res.branches ?? []);
+        setCurrent(res.current ?? "");
       } catch {
         /* branch list is non-critical — bar still shows diff counts */
       }

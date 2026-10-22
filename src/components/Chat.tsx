@@ -10,7 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { AutoRetryScheduler, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
+import { AutoRetryScheduler, findRetryBannerMessage, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
   isSlashCommand,
   parseSlashInput,
@@ -44,7 +44,7 @@ import {
 import { PROVIDER_META } from "../lib/provider-meta";
 import { bareModelId } from "../lib/provider-fetch";
 import { normalizeUsageModel } from "../lib/usage";
-import { otherSlotLevel, otherSlotModel } from "../lib/toolSlots";
+import { otherSlotLevel, otherSlotModel, toolFallbackEntries } from "../lib/toolSlots";
 import { stripLeadingModeTag } from "../lib/modeTag";
 import {
   contextPercent,
@@ -72,6 +72,7 @@ import {
   respondPermission,
   respondAsk,
   listSkills,
+  listAvailableSkills,
   fetchSystemPrompts,
   listMcp,
   triggerCompact,
@@ -92,17 +93,23 @@ import {
   THINKING_LABELS,
   THINKING_DESCS,
 } from "../lib/thinking-options";
-import { projectHistoryMessage } from "../lib/historyPayload";
+import { isWireHistoryMessage, projectHistoryMessage } from "../lib/historyPayload";
 import { applyHistoryLimit } from "../lib/historyWindow";
 import { allModes, getMode } from "../lib/modes";
 import {
   extractMentionSkills,
-  getSkillsList,
   ensureSkillsList,
   invalidateSkillsList,
   setSkillsFetcher,
   loadSkillUsage,
   recordSkillUsage,
+  getAvailableSkills,
+  ensureAvailableSkills,
+  invalidateAvailableSkills,
+  setAvailableSkillsFetcher,
+  pluginSkillCommands,
+  mentionCatalog,
+  type PluginSkillCommand,
 } from "../lib/skills";
 import { detectDir, prepareContent } from "../lib/bidi";
 import {
@@ -131,7 +138,7 @@ import {
   scrollMatchesPin,
   scrollPopupRowIntoView,
 } from "../lib/scroll";
-import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget } from "../lib/messageWindow";
+import { sliceWindow, MSG_WINDOW_MIN_KEEP, windowBudget, shouldTrimMountedWindow } from "../lib/messageWindow";
 import { RENDER_CAP, PASTE_MAX, fmtSize } from "../lib/renderCap";
 import {
   GLOBAL_SHORTCUTS,
@@ -172,6 +179,7 @@ import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
 import { isFileDrag } from "../lib/fileDrag";
 import { useViewerTabs } from "../lib/viewerTabs";
+import { listPlugins, togglePlugin } from "../lib/plugins";
 
 // Sentinels the plan-approval card sends as the ask answer — must match
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
@@ -208,6 +216,18 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
     name: "create-mcp",
     hint: "Create an MCP connector (describe what you want after the command)",
   },
+  {
+    name: "plugin",
+    hint: "Create, edit, toggle or delete a plugin — skills + connectors as one bundle (e.g. /plugin list)",
+  },
+  {
+    name: "artifact",
+    hint: "Build an artifact — a previewable HTML/Markdown document (describe what you want after the command)",
+  },
+  {
+    name: "schedule",
+    hint: "Create, edit, pause or delete a scheduled task (describe it after the command)",
+  },
   { name: "goal", hint: "Set a persistent goal (e.g. /goal all tests pass); /goal clear clears it" },
 ];
 
@@ -224,6 +244,46 @@ function wantsSkillOrMcp(text: string): boolean {
       low,
     );
   const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|کانکتور|ام‌سی‌پی)/.test(low);
+  return action && target;
+}
+
+/** True when a message asks to build/edit an artifact, so the agent gets the
+ *  `artifact` tool for the turn. Same English + Persian intent words as
+ *  `wantsSkillOrMcp`, targeting artifacts only. */
+function wantsArtifact(text: string): boolean {
+  const low = text.toLowerCase();
+  const action =
+    /\b(build|make|create|draw|render|generate|edit|update|change|fix|add|modify)\b|(بساز|ساخت|ایجاد|رسم|درست|تولید|ویرایش|ادیت|اصلاح|تغییر|اضافه)/.test(
+      low,
+    );
+  const target = /\b(artifact|artefact|dashboard|chart|mockup|prototype|page|widget)s?\b|(آرتیفکت|ارتیفکت|داشبورد|نمودار|ماکاپ|ویجت)/.test(
+    low,
+  );
+  return action && target;
+}
+
+/** True when a message asks to create/edit/pause/delete a scheduled task, so
+ *  the agent gets the `schedule` tool for the turn. */
+function wantsSchedule(text: string): boolean {
+  const low = text.toLowerCase();
+  const action =
+    /\b(create|add|make|set up|setup|edit|update|change|pause|resume|enable|disable|delete|remove|schedule)\b|(بساز|ساخت|ایجاد|ویرایش|ادیت|اصلاح|تغییر|حذف|متوقف|فعال|غیرفعال|زمان‌بندی|زمانبندی)/.test(
+      low,
+    );
+  const target = /\b(schedule|scheduled|cron|recurring|reminder)s?\b|(تسک|کرون|تکرار|یادآور|زمان‌بندی)/.test(
+    low,
+  );
+  return action && target;
+}
+
+/** True when a message asks to create/edit/toggle/delete a plugin bundle. */
+function wantsPlugin(text: string): boolean {
+  const low = text.toLowerCase();
+  const action =
+    /\b(install|add|create|make|edit|update|change|toggle|enable|disable|delete|remove)\b|(نصب|ساخت|بساز|ایجاد|ویرایش|ادیت|اصلاح|تغییر|حذف|روشن|خاموش|فعال|غیرفعال)/.test(
+      low,
+    );
+  const target = /\bplugin(s)?\b|(پلاگین|افزونه)/.test(low);
   return action && target;
 }
 
@@ -767,16 +827,34 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     chat?.messages.some((m) => m.retry?.reconnecting === true) ?? false;
   const queuedMsgs = chat?.queued?.filter((q) => !q.sent) ?? [];
   const busy = busyLocal || chatHasStreaming || chatReconnecting;
-  /** The assistant message currently being rate-limited/retried by the provider,
-   *  if any. Its RetryBanner is rendered once, at the END of the message list
-   *  (not inline inside the message) so it never sits "above the agent's reply"
-   *  between the user's message and the incoming content. */
-  // The NEWEST banner, not the first one in the list: a message can keep a
-  // stale banner (a terminal `gaveUp` from an earlier failed turn) while a
-  // LATER message is the one actually retrying right now. Picking the first
-  // showed the dead old banner, and its Retry button acted on the wrong turn.
-  const retryingMsg =
-    [...(chat?.messages ?? [])].reverse().find((m) => m.retry) ?? null;
+  /** The assistant message whose banner is showing right now — the NEWEST one
+   *  carrying a `retry`. Its RetryBanner is rendered once, at the END of the
+   *  message list (not inline inside the message), so it never sits "above the
+   *  agent's reply" between the user's message and the incoming content.
+   *
+   *  Newest and not first: a message can keep a stale banner (a terminal
+   *  `gaveUp` from an earlier failed turn) while a LATER message is the one
+   *  retrying right now — picking the first showed the dead old banner and its
+   *  Retry button acted on the wrong turn.
+   *
+   *  The ref is declared HERE, above its first use: a `ref` dereferenced before
+   *  its `const` declaration is a temporal-dead-zone crash at render time, not
+   *  a lint nit. Banners that are mid-fade are skipped: their `retry` field is
+   *  still set until the store update lands, so the same message would
+   *  otherwise win the scan again and re-mount right after it faded, in a loop. */
+  const retiringIdsRef = useRef(new Set<string>());
+  /**
+   * Messages whose retry banner the user closed with ✕ during the CURRENT turn.
+   * A live sub-agent ladder re-sets `message.retry` on every attempt, so without
+   * this the banner popped straight back. Cleared per message when a new turn
+   * starts (see the pre-send sweep in `send`).
+   */
+  const dismissedRetryIdsRef = useRef(new Set<string>());
+  const retryingMsg = findRetryBannerMessage(
+    chat?.messages ?? [],
+    retiringIdsRef.current,
+    dismissedRetryIdsRef.current,
+  );
   const [sidecarStatus, setSidecarStatus] = useState<"ok" | "fail">("ok");
   // Separate git-action states so commit/undo/push spinners never lock the
   // composer (the shared `busy` flag disables sending).
@@ -787,6 +865,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
+  // One `/`-command per skill an ENABLED plugin ships. Seeded from the module
+  // cache so a remount (chat switch) keeps the commands without a refetch.
+  const [skillCmds, setSkillCmds] = useState<PluginSkillCommand[]>(() =>
+    pluginSkillCommands(getAvailableSkills()),
+  );
   // Prompt history popup (ArrowUp): previous prompts + up to 3 pinned
   // commands. History/pins persist in localStorage (see src/lib/slash).
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -911,9 +994,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // keep working on the real input. Only known commands highlight; unknown
   // "/xxx" stays plain text until submit reports it.
   const composerBackdropRef = useRef<HTMLDivElement>(null);
+  // Every command the composer offers: the built-ins plus one per skill an
+  // enabled plugin ships. Plugin skills are the only ones that earn a command:
+  // the standalone store is what `@mention` already covers, and a bundle that
+  // advertises "try /<skill>" must not answer "Unknown command".
+  const commands = useMemo(() => [...COMMANDS, ...skillCmds], [skillCmds]);
   const slashParsed = parseSlashInput(input);
   const slashActive =
-    !!slashParsed?.name && COMMANDS.some((c) => c.name === slashParsed.name);
+    !!slashParsed?.name && commands.some((c) => c.name === slashParsed.name);
   const slashRange = slashActive ? slashTokenRange(input) : null;
   const syncBackdropScroll = useCallback(() => {
     const el = textareaRef.current;
@@ -980,9 +1068,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [skillMention, setSkillMention] = useState<{ at: number } | null>(null);
   const [skillMentionQuery, setSkillMentionQuery] = useState("");
   const [skillMentionIdx, setSkillMentionIdx] = useState(0);
-  const [skillsList, setSkillsList] = useState<SkillRow[]>(getSkillsList());
+  const [skillsList, setSkillsList] = useState<SkillRow[]>(() => mentionCatalog());
   const [skillsLoading, setSkillsLoading] = useState(
-    getSkillsList().length === 0,
+    mentionCatalog().length === 0,
   );
   // Recently used skills (slugs, newest first) — drives the @mention popup
   // order bottom-anchored, like commandUsage for slash.
@@ -1264,6 +1352,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  pre-append scrollHeight so a layout effect can re-anchor the scroll
    *  position (otherwise the content visibly jumps). */
   const prependAnchorRef = useRef<number | null>(null);
+  /** Delay before the mounted window is trimmed back down once the user is at
+   *  the newest message. Long enough that a burst of scroll-up/scroll-down does
+   *  not trim and immediately re-page, short enough that the memory returns
+   *  while the user is still looking at the chat. */
+  const TRANSCRIPT_TRIM_DELAY_MS = 1500;
   /** True once the saved scroll position has been restored this mount. */
   const restoredRef = useRef(false);
   /** Bumped on every chat switch so the restore layout effect below re-runs
@@ -1819,6 +1912,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     stickToBottom.current = true;
     setShowJump(false);
     lastScrollPosRef.current = atBottomScrollPos();
+    // Returning to the newest message is the moment to give back the history
+    // paged in while reading above (see `scheduleTranscriptTrim`).
+    scheduleTranscriptTrim();
   };
 
   const onChatScroll = () => {
@@ -1896,6 +1992,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       ).length;
       if (rendered < visible.length) {
         prependAnchorRef.current = el.scrollHeight;
+        // Not capped: scrolling up is an explicit request to read deeper into
+        // the history, and the trim effect below reclaims the memory as soon as
+        // the user returns to the newest message. A cap here would make
+        // auto-load silently stop working at the cap.
         setMsgLimit((n) => n + MSG_PAGE);
       }
     }
@@ -2042,8 +2142,47 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const prevHeight = prependAnchorRef.current;
     prependAnchorRef.current = null;
     // Flagged re-anchor, not a raw set: same fake-scroll-up hazard as above.
+    // A NEGATIVE delta (the trim below removes content) is handled by the same
+    // arithmetic: scrollTop moves up by exactly the height that disappeared, so
+    // the viewport stays visually still.
     setProgrammaticScroll(el, el.scrollTop + (el.scrollHeight - prevHeight));
   }, [msgLimit]);
+
+  // Release the pages the user has scrolled past once they are back at the
+  // newest message (the idle state, and the one where nothing above the
+  // viewport is being read). Trimmed from a timer rather than from the scroll
+  // handler on purpose: shrinking while the user is at the TOP would delete
+  // content under their viewport and immediately re-trigger the auto-load,
+  // which oscillates. Pinned to the bottom, removing content above is
+  // invisible — the viewport is already at the maximum scroll offset.
+  const trimTimerRef = useRef<number | null>(null);
+  const scheduleTranscriptTrim = () => {
+    if (!shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current)) return;
+    if (trimTimerRef.current != null) return;
+    trimTimerRef.current = window.setTimeout(() => {
+      trimTimerRef.current = null;
+      const el = scrollRef.current;
+      // Re-check at fire time: the user may have scrolled up meanwhile, and
+      // trimming under a viewport that is no longer pinned would jump. The next
+      // arrival at the bottom schedules it again (see `recordAtBottom`).
+      if (!el || !shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current)) return;
+      prependAnchorRef.current = el.scrollHeight;
+      setMsgLimit(MSG_PAGE);
+    }, TRANSCRIPT_TRIM_DELAY_MS);
+  };
+  // Covered separately from the `msgLimit` change: re-entering the bottom without
+  // the window changing (scroll up, then back down) must also release the pages
+  // loaded in the meantime, so the effect cannot be the only trigger.
+  useEffect(() => {
+    if (stickToBottom.current) scheduleTranscriptTrim();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msgLimit]);
+  useEffect(
+    () => () => {
+      if (trimTimerRef.current != null) window.clearTimeout(trimTimerRef.current);
+    },
+    [],
+  );
 
   // Restore the saved scroll position once the anchor message is rendered.
   // Runs before paint, so the viewport lands where the user left it without a
@@ -2322,13 +2461,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const filteredCmds = useMemo(() => {
     if (!cmdOpen) return [];
     const q = cmdQuery.toLowerCase();
-    const matched = COMMANDS.filter(
+    const matched = commands.filter(
       (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
     );
     // Bottom-anchored like the recent-prompt popup: oldest on top, newest
     // just above the bottom (closest to the input). Shows all matches.
     return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name);
-  }, [cmdOpen, cmdQuery, commandUsage]);
+  }, [cmdOpen, cmdQuery, commandUsage, commands]);
 
   // Always a number: `modelContextWindow` applies the capacity rule
   // (models.dev → provider metadata → DEFAULT_CONTEXT_WINDOW), so the meter and
@@ -3258,12 +3397,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // tools it was originally granted (the user's install request is still in
     // history and matches the intent).
     if (!allowCreate) {
-      if (wantsSkillOrMcp(text)) {
+      if (wantsSkillOrMcp(text) || wantsArtifact(text) || wantsSchedule(text) || wantsPlugin(text)) {
         allowCreate = true;
       } else {
         const recent = chat.messages.slice(-6);
         for (const m of recent) {
-          if (m.role === "user" && m.content && wantsSkillOrMcp(m.content)) {
+          if (
+            m.role === "user" &&
+            m.content &&
+            (wantsSkillOrMcp(m.content) ||
+              wantsArtifact(m.content) ||
+              wantsSchedule(m.content) ||
+              wantsPlugin(m.content))
+          ) {
             allowCreate = true;
             break;
           }
@@ -3324,11 +3470,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Guard: ensure the skill list is loaded before matching, so a mention
     // typed/pasted before the picker opened (or before the async fetch
     // resolved) is never missed.
-    if (getSkillsList().length === 0) {
+    if (mentionCatalog().length === 0) {
       await ensureSkillsList();
     }
     const { skills: mentionSkills, cleaned: cleanedText } =
-      extractMentionSkills(text, getSkillsList());
+      extractMentionSkills(text, mentionCatalog());
     const effectiveSkills = overrides?.skills ?? Array.from(mentionSkills);
     const effectiveMcpServers: Record<string, McpServerConfig> =
       overrides?.mcpServers ??
@@ -3435,6 +3581,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // left an assistant message with streaming:true; without this cleanup the new
     // turn would add a second streaming message and show two "Thinking" indicators.
     for (const m of chat.messages) {
+      // A new turn re-arms the ✕ dismissal for EVERY message, including the one
+      // this turn continues into, so a banner closed last turn can show again.
+      dismissedRetryIdsRef.current.delete(m.id);
       if (m.id === assistantMsg.id) continue;
       if (m.retry) s.updateMessage(m.id, { retry: null });
       // A stale streaming flag from a previous turn: close it AND stamp its
@@ -3455,12 +3604,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (chat.skillNotice) s.setChatSkillNotice(chat.id, null);
 
     const allHistory = chat.messages
-      .filter(
-        (m) =>
-          m.id !== userMsg.id &&
-          !m.compacted &&
-          (m.role === "user" || m.role === "assistant" || m.role === "system"),
-      )
+      .filter((m) => m.id !== userMsg.id && isWireHistoryMessage(m))
       // The summary is stored last (so it renders below the conversation), but
       // the model must receive it FIRST — it stands in for the older turns.
       .sort(
@@ -3932,12 +4076,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // skill was NOT found (deleted/renamed) — without it the user never
         // learns why the skill silently didn't apply. Stored per-chat (like
         // compactNotice) so it survives a chat switch mid-turn.
-        // AUTO-matched skills (manual:false) are different: the user wants to
-        // see which skills the decision router picked, so they are stamped on
-        // the assistant message and rendered as chips under its bubble.
-        if (!event.manual && event.skills && event.skills.length > 0) {
-          store.updateMessage(assistantMsg.id, { autoSkills: event.skills });
-        }
+        // Nothing is auto-picked for the model any more, so a `skill` event
+        // never carries names — `note` is the whole payload, and it is the
+        // warning that an attached skill was not found.
         if (event.note) {
           useStore.getState().setChatSkillNotice(chat.id, event.note);
         }
@@ -4053,8 +4194,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           fallback: event.fallback,
           reconnecting: event.reconnecting,
           startedAt: Date.now(),
-        };
-        if (isKeepTextRetry(event.reconnecting, event.fallback)) {
+        };        if (isKeepTextRetry(event.reconnecting, event.fallback)) {
           // Backend automatic retry, client self-heal reconnect, OR a
           // sub-agent fallback notice: keep the already-streamed text and
           // segments — do NOT reset the message. The banner is informational
@@ -4135,9 +4275,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // the frontend skills cache so the @mention picker picks it up.
         // Must also refresh the component's skillsList state — clearing the
         // module-level cache alone doesn't trigger a re-render.
-        if (event.tool === "create_skill") {
+        // A plugin carries skills, so installing/toggling one changes BOTH
+        // catalogs: the @mention list and the `/`-command list. Both caches are
+        // dropped and the command list re-derived, so `/ponytail` appears (and
+        // a switched-off plugin's commands leave) without a reload.
+        if (event.tool === "create_skill" || event.tool === "plugin") {
           invalidateSkillsList();
+          invalidateAvailableSkills();
           void ensureSkills();
+          void refreshPluginCmds();
         }
       } else if (event.kind === "diff") {
         clearTransientRetry();
@@ -4307,6 +4453,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             if (st.activeChatId !== chat.id) st.focusWindow(chat.id);
           } catch {
             // Viewer open must never break the stream.
+          }
+        }
+      } else if (event.kind === "artifact") {
+        // The agent built or re-rendered a document. The card goes into the
+        // transcript at this point in the stream, and the preview tab is
+        // refreshed in place so the newest version is what the user sees.
+        ensureLiveBubble();
+        const seg: MessageSegment = {
+          kind: "artifact",
+          id: event.id ?? "",
+          title: event.title ?? "",
+          artifactKind: event.artifact_kind === "md" ? "md" : "html",
+          content: event.content ?? "",
+          version: event.version ?? 1,
+        };
+        if (seg.id) {
+          useStore.getState().appendMessageSegments(assistantMsg.id, [seg]);
+          try {
+            useViewerTabs.getState().openArtifact(chat.id, {
+              id: seg.id,
+              title: seg.title,
+              kind: seg.artifactKind,
+              body: seg.content,
+              version: seg.version,
+            });
+          } catch {
+            // Opening the preview must never break the stream.
           }
         }
       } else if (event.kind === "mode_changed") {
@@ -4701,6 +4874,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           allowBrowser: s.browserUse,
           subagentModels: s.subagentModels,
           subagentThinking: s.subagentThinking,
+          toolFallbacks: toolFallbackEntries(s.toolFallbacks),
           providers: Object.fromEntries(
             (s.settings.providers ?? []).map((p) => [p.id, p]),
           ),
@@ -5045,6 +5219,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         contextWindow: modelContextWindow(activeProvider, activeProvider.model),
         compactAtPercent: useStore.getState().settings.compactAtPercent ?? 80,
         subagentThinking: s.subagentThinking,
+        // The "Other" slot's own model may live on a DIFFERENT provider than
+        // the chat. Sending the slot picks plus every provider config lets the
+        // backend resolve that model with its own keys and base URL, instead of
+        // calling it with the chat's — the cause of "key rejected (401)".
+        subagentModels: s.subagentModels,
+        providers: Object.fromEntries(
+          (s.settings.providers ?? []).map((p) => [p.id, p]),
+        ),
+        toolFallbacks: toolFallbackEntries(s.toolFallbacks),
         thinkingLevel: compactLevelSupported ? compactThinkingLevel : "",
         modelReasoning:
           modelReasoning(compactProvider, compactProvider.model) ??
@@ -5150,7 +5333,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Track usage only for known commands so typos never pollute the popup order.
     // Compute from localStorage (the source of truth) instead of inside a
     // state updater, so the write + cross-window broadcast run exactly once.
-    if (COMMANDS.some((c) => `/${c.name}` === word)) {
+    if (commands.some((c) => `/${c.name}` === word)) {
       setCommandUsage(recordCommandUsage(v));
     }
     switch (word) {
@@ -5233,8 +5416,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               .map((m) => `- **${m.label}** — ${m.description}`)
               .join("\n") +
             "\n\n**Commands**\n\n" +
-            COMMANDS.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n") +
-            "\n\n**Keyboard shortcuts**\n\n" +
+            commands.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n") +            "\n\n**Keyboard shortcuts**\n\n" +
             GLOBAL_SHORTCUTS.map((s) => `- ${formatGlobalShortcut(s)}`).join(
               "\n",
             ) +
@@ -5269,8 +5451,87 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         });
         void send(
           target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
+            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
             : `Create a new MCP connector or edit an existing one from this description: "${rest}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
+          [],
+          [],
+          true,
+          created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
+        );
+        break;
+      }
+      case "/plugin":
+      case "/artifact":
+      case "/schedule": {
+        if (!ch) break;
+        const rest = v.slice(word.length).trim();
+        const usage: Record<string, string> = {
+          "/plugin":
+            "Usage: `\/plugin <description>` to create or edit a plugin bundle, `\/plugin list` to list them, or `\/plugin on|off <slug>` to toggle one.",
+          "/artifact":
+            "Usage: `\/artifact <description>` — describe the document you want (e.g. `\/artifact a sales dashboard`).",
+          "/schedule":
+            "Usage: `\/schedule <description>` to create or edit a scheduled task (e.g. `\/schedule every day at 9am summarize open PRs`).",
+        };
+        if (!rest) {
+          s.addMessage(ch.id, { role: "assistant", content: usage[word] });
+          return;
+        }
+        // Two actions of these commands are pure state and must not cost a
+        // turn: listing plugins and flipping one on/off.
+        if (word === "/plugin") {
+          const [sub, arg] = rest.split(/\s+/);
+          const slug = (arg ?? "").trim();
+          if (sub === "list") {
+            const out = await listPlugins();
+            if ("error" in out) {
+              s.addMessage(ch.id, {
+                role: "assistant",
+                content: `Could not list plugins: ${out.error}`,
+              });
+              break;
+            }
+            s.addMessage(ch.id, {
+              role: "assistant",
+              content:
+                out.length === 0
+                  ? "No plugins installed yet — create one with `/plugin <description>`."
+                  : out
+                      .map(
+                        (p) =>
+                          `- **${p.name}** (\`${p.slug}\`) — ${p.enabled ? "on" : "off"} · ${(p.skills ?? []).length} skills · ${(p.mcp ?? []).length} connectors`,
+                      )
+                      .join("\n"),
+            });
+            setNotice(`Loaded ${out.length} plugin${out.length === 1 ? "" : "s"}.`);
+            break;
+          }
+          if ((sub === "on" || sub === "off") && slug) {
+            const out = await togglePlugin(slug, sub === "on");
+            setNotice(
+              "error" in out
+                ? `Plugin ${slug}: ${out.error}`
+                : `Plugin ${slug} is now ${out.enabled ? "on" : "off"}.`,
+            );
+            break;
+          }
+        }
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(v),
+          ...(ch.mode ? { mode: ch.mode } : {}),
+        });
+        const prompts: Record<string, string> = {
+          "/plugin": `Create or edit a plugin from this description: "${rest}". A plugin is a folder bundling skills AND MCP connectors so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass the skills (name + content + description + fa_keywords in English AND Persian) and/or the mcp map. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
+          "/artifact": `Build an artifact from this description: "${rest}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
+          "/schedule": `Create or edit a scheduled task from this description: "${rest}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode, and the skills/mcp_servers/plugins the run needs. To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
+        };
+        void send(
+          prompts[word],
           [],
           [],
           true,
@@ -5325,7 +5586,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         );
         break;
       }
-      default:
+      default: {
+        // A skill shipped by an enabled plugin is invocable as `/<slug>` — the
+        // bundle advertises exactly that. Attaching it through `overrides`
+        // inlines its body, so the turn runs the skill instead of answering
+        // "Unknown command".
+        const pluginCmd = skillCmds.find((c) => `/${c.name}` === word);
+        if (pluginCmd && ch) {
+          const rest = v.slice(word.length).trim();
+          const created = s.addMessage(ch.id, {
+            role: "user",
+            content: prettySlashLabel(v),
+            ...(ch.mode ? { mode: ch.mode } : {}),
+          });
+          void send(
+            rest ||
+              `Apply the ${pluginCmd.skill} skill to this turn's task.`,
+            [],
+            [],
+            false,
+            created.id,
+            undefined,
+            false,
+            { skills: [pluginCmd.skill] },
+            ch.id,
+          );
+          break;
+        }
         // With no chat there is nowhere to render the banner (setChatCmdError
         // only patches an existing chat), so surface it as a transient notice
         // instead of silently swallowing the typo.
@@ -5339,6 +5626,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         } else {
           setNotice(`Unknown command \`${word}\`. Type \`/help\` to see available commands.`);
         }
+        break;
+      }
     }
   };
 
@@ -5571,7 +5860,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Record plain prompts so ArrowUp recalls them; slash commands and
     // skill mentions stay out (they have their own recent-use popups).
     if (typed && !typed.startsWith("/")) {
-      const hasSkill = extractMentionSkills(typed, getSkillsList()).skills.length > 0;
+      const hasSkill = extractMentionSkills(typed, mentionCatalog()).skills.length > 0;
       if (!hasSkill) {
         setPromptHistory((prev) => recordHistory(typed, prev));
       }
@@ -5607,11 +5896,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return sel;
     })();
     const selectedSkills: string[] = Array.from(
-      extractMentionSkills(v, getSkillsList()).skills,
+      extractMentionSkills(v, mentionCatalog()).skills,
     );
     // Record skill uses so the @mention popup sorts recent-first.
     if (selectedSkills.length > 0) {
-      const list = getSkillsList();
+      const list = mentionCatalog();
       let usage = loadSkillUsage();
       for (const nm of selectedSkills) {
         const hit = list.find((s) => s.name === nm);
@@ -5705,10 +5994,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const sel: Record<string, McpServerConfig> = {};
     for (const n of enabled) if (all[n]) sel[n] = all[n];
     const queuedSkills: string[] = Array.from(
-      extractMentionSkills(v, getSkillsList()).skills,
+      extractMentionSkills(v, mentionCatalog()).skills,
     );
     if (queuedSkills.length > 0) {
-      const list = getSkillsList();
+      const list = mentionCatalog();
       let usage = loadSkillUsage();
       for (const nm of queuedSkills) {
         const hit = list.find((s) => s.name === nm);
@@ -6819,7 +7108,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setSkillMention(null);
     setCmdQuery("");
     // Bottom-anchored like history: newest sits just above the bottom.
-    setCmdIndex(Math.max(0, COMMANDS.length - 1));
+    setCmdIndex(Math.max(0, commands.length - 1));
   };
 
   const acceptCmd = (name: string) => {
@@ -6842,9 +7131,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     });
   };
 
+  // Populate the attach list from the FULL catalog (store + enabled plugins).
+  // This list backs the @mention popup and mention matching, and a skill a
+  // plugin ships must be attachable by name too — not only invocable as
+  // `/<slug>`. Falls back to the standalone store when the wider fetch is empty
+  // (a backend too old for `/skills/available`, or a cold-boot race).
   const ensureSkills = useCallback(async () => {
-    const list = await ensureSkillsList();
-    setSkillsList(list);
+    const list = await ensureAvailableSkills();
+    setSkillsList(list.length > 0 ? list : await ensureSkillsList());
     setSkillsLoading(false);
   }, []);
 
@@ -6855,12 +7149,26 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setSkillsFetcher(listSkills);
   }, []);
 
+  // Plugin skills are invocable as `/`-commands, which means the composer needs
+  // the FULL catalog (store + enabled plugins). Wired here and refreshed on
+  // install/toggle: seeding `skillCmds` at mount alone ran before the fetch
+  // resolved, so `/ponytail` stayed missing from the popup.
+  const refreshPluginCmds = useCallback(async () => {
+    const rows = await ensureAvailableSkills();
+    setSkillCmds(pluginSkillCommands(rows));
+  }, []);
+
+  useEffect(() => {
+    setAvailableSkillsFetcher(listAvailableSkills);
+    void refreshPluginCmds();
+  }, [refreshPluginCmds]);
+
   // Load the skill list up-front (once) so manual @mentions typed/pasted
   // before the picker ever opens — or sent before the async fetch resolves —
   // are still matched. The cache is module-level (src/lib/skills), so this runs
   // at most once across remounts.
   useEffect(() => {
-    if (getSkillsList().length === 0) void ensureSkills();
+    if (mentionCatalog().length === 0) void ensureSkills();
   }, [ensureSkills]);
 
   // Keep the keyboard-highlighted skill row visible: Ctrl+J/K (and arrow
@@ -6997,7 +7305,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         } else {
           setCmdQuery(after);
           const q = after.toLowerCase();
-          const count = COMMANDS.filter(
+          const count = commands.filter(
             (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
           ).length;
           setCmdIndex(Math.max(0, count - 1));
@@ -7293,20 +7601,28 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
 
-  // Dismiss the retry banner WITHOUT deleting the turn: clear the message's
-  // `retry` flag (so the banner unmounts) and then abort the stream. The
-  // default `stop` alone leaves the banner up because the stream's `finally`
-  // block keeps `retry` for gaveUp/watchdog failures — so we must clear it
-  // explicitly here. This is the ✕ button on the error/stalled banner.
+  // Dismiss the retry banner WITHOUT touching the turn: clear the message's
+  // `retry` flag (so the banner unmounts) and remember the dismissal. This is
+  // the ✕ button on the error/stalled banner.
+  //
+  // It deliberately does NOT call `stop()`: ✕ on a live sub-agent retry used to
+  // abort the whole stream, so the chat died because the user closed a notice
+  // while explore was still working. A live ladder keeps emitting `retry`
+  // events for the same message, so the id stays in `dismissedRetryIdsRef`
+  // (read by `findRetryBannerMessage` above) until a new turn re-arms the
+  // banner — while the turn itself keeps running.
   const dismissRetry = useCallback(() => {
     const msgs = chat?.messages ?? [];
     const target =
       retryingMsg ?? [...msgs].reverse().find((m) => m.role === "assistant");
-    if (target) {
-      useStore.getState().updateMessage(target.id, { retry: null });
-    }
-    stop();
-  }, [retryingMsg, stop, chat?.messages]);
+    if (!target) return;
+    const st = useStore.getState();
+    // The banner may be a STALL banner for the newest assistant message, which
+    // carries no `retry` field yet. Stamp the id either way so the notice stays
+    // closed for the rest of this attempt.
+    dismissedRetryIdsRef.current.add(target.id);
+    if (target.retry) st.updateMessage(target.id, { retry: null });
+  }, [retryingMsg, chat?.messages]);
 
   if (!chat) {
     const noWorkspace = workspaces.length === 0;
@@ -7737,9 +8053,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             // yet) — both render the SAME RetryBanner so the user always has a
             // one-click Retry and the "still waiting" hint, never a dead-end
             // "Still waiting" notice with only a Stop button.
+            //
+            // The stall hint has no `message.retry` of its own, so the ✕
+            // dismissal has to be honoured explicitly here — otherwise closing
+            // that notice would change nothing at all.
+            const newestAssistantId =
+              [...(chat?.messages ?? [])]
+                .reverse()
+                .find((m) => m.role === "assistant")?.id ?? null;
+            const stallDismissed =
+              !!newestAssistantId &&
+              dismissedRetryIdsRef.current.has(newestAssistantId);
             const effectiveRetry =
               retryingMsg?.retry ??
-              (busy && stalled
+              (busy && stalled && !stallDismissed
                 ? {
                   attempt: 1,
                   maxAttempts: 10,
@@ -7751,6 +8078,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             if (!effectiveRetry) return null;
             return (
               <RetryBanner
+                // Keyed by the message it belongs to: without it React reuses
+                // the instance when the retrying message CHANGES, and the new
+                // banner inherits the previous one's `leaving` state — it would
+                // mount already mid-fade and be retired on the spot, so a fresh
+                // failure appeared to never show.
+                key={retryingMsg?.id ?? "stalled"}
                 attempt={effectiveRetry.attempt}
                 maxAttempts={effectiveRetry.maxAttempts}
                 delay={effectiveRetry.delay}
@@ -7761,8 +8094,43 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 agent={effectiveRetry.agent}
                 tool={effectiveRetry.tool}
                 fallback={effectiveRetry.fallback}
+                // Transient: a banner dissolves on its own only when it is
+                // PURE INFORMATION — nothing to click, nothing the user must
+                // reach for.
+                //  - the sub-agent fallback notice is exactly that: no button,
+                //    and the main turn keeps streaming behind it. It must still
+                //    fade while `busy` (the backend marks it `reconnecting`,
+                //    and a live turn is busy by definition) — gating it on
+                //    `!busy` would mean it never fades at all.
+                //  - an exhausted-retry banner keeps a Retry button, so it only
+                //    dissolves once its turn is no longer running; before that,
+                //    fading would take the button away mid-reach.
+                // A watchdog banner never dissolves: that turn did not quietly
+                // heal, it needs an explicit click.
+                transient={
+                  effectiveRetry.watchdog !== true &&
+                  (effectiveRetry.fallback === true ||
+                    (effectiveRetry.gaveUp === true &&
+                      effectiveRetry.reconnecting !== true &&
+                      !busy))
+                }
                 stalled={stalled}
                 startedAt={effectiveRetry.startedAt}
+                onRetire={() => {
+                  const id = retryingMsg?.id;
+                  if (!id) return;
+                  // Stage A: take the message out of the "newest retry" scan
+                  // FIRST, so any newer retry event wins immediately instead
+                  // of being shadowed by the banner we are about to drop.
+                  retiringIdsRef.current.add(id);
+                  useStore.getState().updateMessage(id, { retry: null });
+                  // Then release: a NEW retry on the same message has to be
+                  // able to show again, so the ID leaves the skip-list right
+                  // after this render has flushed.
+                  setTimeout(() => {
+                    retiringIdsRef.current.delete(id);
+                  }, 100);
+                }}
                 onRetry={() => {
                   // Resume-only (banner semantics via planRetry): re-send the last
                   // user turn WITHOUT deleting anything, reusing the user bubble
@@ -7816,23 +8184,35 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   if (effectiveRetry.agent && !effectiveRetry.gaveUp) {
                     const originId = chat?.id;
                     const id = retryingMsg?.id;
+                    const before = effectiveRetry.attempt;
+                    // The attempt number this click acknowledged. The confirmation
+                    // window below waits for the badge to move PAST it.
+                    let ackedAttempt = before;
                     if (!originId) {
                       resumeTurn();
                       return;
                     }
-                    void retrySubagentNow(originId).then((accepted) => {
+                    // A banner can outlive the ladder that produced it. When the
+                    // click cannot be acted on, the banner is describing a retry
+                    // that no longer exists: retire it (then resume only if the
+                    // turn is already over) instead of leaving a button that does
+                    // nothing. It must NEVER abort the turn — a leftover explore
+                    // banner would otherwise kill a parent turn that is still
+                    // working, and "Contacting model" is often the PARENT.
+                    const retireStale = () => {
+                      if (id) {
+                        useStore.getState().updateMessage(id, { retry: null });
+                      }
+                      resumeTurn();
+                    };
+                    return retrySubagentNow(originId).then((accepted) => {
                       // Only acknowledge a click the backend actually consumed.
                       // A banner can outlive its ladder (the turn ended while it
                       // was up), and painting "retrying now (requested)" on a
                       // click nothing is listening for is exactly how this
                       // button came to look broken.
                       if (!accepted || !id) {
-                        // Nothing is listening for the nudge, so the banner
-                        // describes a retry that no longer exists. Resuming the
-                        // turn is the only action that can still move this
-                        // conversation forward — without it the click was
-                        // swallowed silently, which reads as a dead button.
-                        resumeTurn();
+                        retireStale();
                         return;
                       }
                       const cur = useStore
@@ -7842,16 +8222,47 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       // Bail if the banner retired (or another event replaced
                       // it) while the request was in flight.
                       if (!cur?.retry || cur.retry.gaveUp === true) return;
+                      // The ladder answered: it consumed the click. Bumping the
+                      // attempt is the visible proof that something happened — a
+                      // click that left "6/10" untouched is exactly why this
+                      // button kept looking dead.
+                      ackedAttempt = Math.min(
+                        cur.retry.attempt + 1,
+                        cur.retry.maxAttempts,
+                      );
                       useStore.getState().updateMessage(id, {
                         retry: {
                           ...cur.retry,
+                          attempt: ackedAttempt,
                           delay: 0,
                           reason: "retrying now (requested)",
                           startedAt: Date.now(),
                         },
                       });
+                      // Confirmation window. A ladder that can genuinely act
+                      // starts the next attempt immediately (the nudge emits with
+                      // delay 0 and its select fires within 250 ms), so the badge
+                      // moves — or the banner retires — almost at once. If neither
+                      // happens, the click landed on a ladder that cannot act, and
+                      // leaving the banner up is what makes the button look dead.
+                      // Returning this promise is also what keeps the button in
+                      // its loading state until the click has really been handled.
+                      const start = Date.now();
+                      return new Promise<void>((resolve) => {
+                        const tick = setInterval(() => {
+                          const r = useStore
+                            .getState()
+                            .chats.find((c) => c.id === originId)
+                            ?.messages.find((x) => x.id === id)?.retry;
+                          const advanced =
+                            !r || r.gaveUp === true || r.attempt > ackedAttempt;
+                          if (!advanced && Date.now() - start <= 3000) return;
+                          clearInterval(tick);
+                          if (!advanced) retireStale();
+                          resolve();
+                        }, 100);
+                      });
                     });
-                    return;
                   }
                   resumeTurn();
                 }}

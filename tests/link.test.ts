@@ -45,6 +45,30 @@ console.log('2) handleLinkClick:')
   check('به مرورگر فرستاده نشد', box.opened === null)
 }
 
+// A relative href has no in-app page: the click must be inert so the webview
+// never navigates away from the app (it used to follow the href).
+{
+  const box: { prevented: boolean; opened: string | null } = { prevented: false, opened: null }
+  const handled = handleLinkClick(
+    { preventDefault: () => { box.prevented = true } },
+    'docs',
+    (url) => { box.opened = url },
+  )
+  check('relative link is handled (inert click)', handled === true)
+  check('relative link default prevented', box.prevented)
+  check('relative link not sent to the browser', box.opened === null)
+}
+{
+  const box: { prevented: boolean; opened: string | null } = { prevented: false, opened: null }
+  const handled = handleLinkClick(
+    { preventDefault: () => { box.prevented = true } },
+    'mailto:a@b.com',
+    (url) => { box.opened = url },
+  )
+  check('mailto left alone', handled === false)
+  check('mailto default not prevented', !box.prevented)
+}
+
 console.log('3) splitTextByUrls:')
 check('متن بدون لینک دست‌نخورده می‌ماند', JSON.stringify(splitTextByUrls('hello world')) === JSON.stringify(['hello world']))
 {

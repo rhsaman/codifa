@@ -159,6 +159,36 @@ export function isDocPath(raw: string): boolean {
   return DOC_EXTS.has(extOf(path));
 }
 
+/** Web schemes that keep their link behaviour. */
+const WEB_HREF_RE = /^(?:https?|mailto|tel):/i;
+
+/** The workspace file a markdown link points at, or null when the link is a
+ *  web URL or an in-page `#anchor`.
+ *
+ *  Models cite files as links — `[ChatMessage.tsx](src/ChatMessage.tsx)`,
+ *  `[store.ts:12](src/lib/store.ts:12)`, absolute paths, `file://` URLs.
+ *  Rendered as a plain `<a target="_blank">` the webview FOLLOWED the href, so
+ *  clicking a file name left the app (the OS browser opened) instead of
+ *  opening the file; callers render these as file chips instead. */
+export function filePathFromHref(
+  raw: string | undefined,
+): { path: string; line?: number } | null {
+  if (!raw) return null;
+  const s = raw.replace(INVISIBLE, "").trim();
+  if (!s || s.startsWith("#") || WEB_HREF_RE.test(s)) return null;
+  // Any other scheme (data:, javascript:, …) is a web-ish target, not a file.
+  // `file://` is a file — its prefix is not part of the path.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s) && !/^file:/i.test(s)) return null;
+  const body = s.replace(/^file:\/\//i, "").trim();
+  if (!body) return null;
+  const { path, line } = splitPathLine(body);
+  if (!path) return null;
+  // A bare word ("docs") is not a file: require a path shape (a separator or
+  // an extension) so ordinary relative links stay normal anchors.
+  if (!/[\\/]/.test(path) && !extOf(path)) return null;
+  return line === undefined ? { path } : { path, line };
+}
+
 /** Accent hues for the media glyph tiles (previously solid fills, now used
  *  only as a tile tint + glyph source so they stay quiet on any theme). */
 const IMAGE_ACCENT = "#a074c4";

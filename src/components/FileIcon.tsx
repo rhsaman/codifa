@@ -567,6 +567,9 @@ export function openWorkspaceFile(path: string, line?: number): void {
     /* non-DOM environment (tests) */
   }
   const st = useStore.getState();
+  // A fullscreen chat hides the viewer pane completely, so the tab would open
+  // behind an invisible pane and the click would look like a no-op.
+  if (st.chatFullscreen) st.setChatFullscreen(false);
   const root = st.chats.find((c) => c.id === st.activeChatId)?.root ?? st.root;
   // Absolute paths must reach the viewer AS-IS: FileViewerPanel reads them
   // as (dir, basename) with their own containment — joining them with the

@@ -81,6 +81,20 @@ function ExploreIcon() {
   );
 }
 
+/** Package-box glyph for the Artifacts page (everything the agent built).
+ *  A closed box reads as "container of built things" — distinct from the
+ *  plain file glyphs next to it on the rail and from ArtifactIcon, which
+ *  marks ONE open document tab. */
+function ArtifactsIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+      <path d="M3.3 7 12 12l8.7-5" />
+      <path d="M12 22V12" />
+    </svg>
+  );
+}
+
 /** Folder glyph for the file-explorer tab. */
 const FilesIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -88,6 +102,18 @@ const FilesIcon = () => (
     <path d="M3 13h18" opacity="0.6" />
   </svg>
 );
+
+/** Window/gem glyph for a chat artifact tab (a document the agent built). */
+function ArtifactIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2.5" />
+      <path d="M3 9h18" />
+      <path d="m8 13 2 2-2 2" />
+      <path d="M13 17h3" />
+    </svg>
+  );
+}
 
 /** Terminal prompt glyph (`>_` inside a pane) for the rail's dock toggle.
  *  Deliberately a currentColor stroke glyph rather than MacAppIcons'
@@ -116,6 +142,8 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   text: PlanIcon,
   explore: ExploreIcon,
   files: FilesIcon,
+  artifact: ArtifactIcon,
+  artifacts: ArtifactsIcon,
 };
 
 function CloseIcon() {
@@ -293,6 +321,20 @@ export function ViewerTerminalButton() {
   );
 }
 
+/** Publish a rail row's box to CSS so its floating name can be positioned by
+ *  the stylesheet: `--viewer-tab-hint-top` (vertical center) and
+ *  `--viewer-tab-hint-right` (distance from the viewport's right edge to the
+ *  row's left edge). The rail scrolls, so both are measured per hover instead
+ *  of being hard-coded; the rail's own width is never touched. */
+function publishHintAnchor(row: HTMLElement): void {
+  const rect = row.getBoundingClientRect();
+  row.style.setProperty("--viewer-tab-hint-top", `${Math.round(rect.top + rect.height / 2)}px`);
+  row.style.setProperty(
+    "--viewer-tab-hint-right",
+    `${Math.round(window.innerWidth - rect.right)}px`,
+  );
+}
+
 /** VSCode-style tab bar for the right editor group (diff / trace / inbox). */
 export function ViewerTabBar() {
   const allTabs = useViewerTabs((s) => s.tabs);
@@ -305,6 +347,7 @@ export function ViewerTabBar() {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
+
 
   // Keep the active tab visible when the bar overflows.
   useEffect(() => {
@@ -362,7 +405,7 @@ export function ViewerTabBar() {
         e.dataTransfer.dropEffect = "move";
         const bar = barRef.current;
         if (!bar) return;
-        // Dragging near a rail edge scrolls it, so off-screen tabs stay reachable.
+        // Dragging near the rail's edge scrolls it, so off-screen tabs stay reachable.
         const delta = edgeScroll(e.clientY, bar.getBoundingClientRect(), "y");
         if (delta) bar.scrollTop += delta;
         // Empty space past the visible last tab previews a landing at the very end.
@@ -411,6 +454,15 @@ export function ViewerTabBar() {
             className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging drop-preview" : ""}${dropCls}`}
             style={order === undefined ? undefined : { order }}
             aria-label={title}
+            // No `title`: while hovered the name is painted on the tab itself,
+            // so a native tooltip would repeat it.
+            // The row publishes where the floating name must land: vertically
+            // centered on the hovered row and flush against its left edge. Both
+            // are measured here (not in CSS) because the rail scrolls.
+            onMouseEnter={(e) => publishHintAnchor(e.currentTarget)}
+            // Keyboard focus shows the same name; React's focus event bubbles,
+            // so focusing the row or its ✕ both land here.
+            onFocus={(e) => publishHintAnchor(e.currentTarget)}
             onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
@@ -463,13 +515,15 @@ export function ViewerTabBar() {
                 <Icon />
               )}
             </span>
+            {/* One card holds BOTH halves: the name (clicking it activates the
+                tab — the event bubbles to the row) and the ✕ at its right end
+                (which closes, and sits where the kind icon was). The card is
+                only painted while hovered; at rest the rail stays icon-only. */}
             <span className="editor-tab-label" dir="ltr">
-              {/* Sits BEFORE the title so it lands at the label's left edge,
-                  away from the tab's icon. */}
+              <span className="viewer-tab-name">{title}</span>
               <button
                 type="button"
                 className="editor-tab-close"
-                title="Close viewer"
                 aria-label={`Close ${title}`}
                 draggable={false}
                 onClick={(e) => {
@@ -479,7 +533,6 @@ export function ViewerTabBar() {
               >
                 <CloseIcon />
               </button>
-              {title}
             </span>
           </div>
         );
@@ -532,8 +585,8 @@ export function ViewerInboxButton() {
 /** Fullscreen toggle for the whole side pane — lives in the pane header,
  *  directly below the tab-list chevron and above the page icons (not inside
  *  the tab bar). Canonical rail order, top to bottom: [collapse | tab list |
- *  fullscreen | files | todos | terminal | schedule | inbox | review | trace |
- *  browser]. Hidden with no tabs. */
+ *  fullscreen | files | todos | artifacts | terminal | schedule | inbox |
+ *  review | trace | browser]. Hidden with no tabs. */
 export function ViewerPaneFullscreenButton() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeChatId = useStore((s) => s.activeChatId);
@@ -620,6 +673,25 @@ function PageRailButton({
     >
       {children}
     </button>
+  );
+}
+
+/** Rail icon: the Artifacts page — every document the agent built. Same
+ *  toggle contract as the other page icons (the icon is the page's only
+ *  entry point, so a second press closes it). */
+export function ViewerArtifactsButton() {
+  const shown = usePageShown('artifacts');
+  return (
+    <PageRailButton
+      className="viewer-artifacts-btn"
+      shown={shown}
+      open={() => useViewerTabs.getState().openArtifacts()}
+      close={() => useViewerTabs.getState().closeViewer('artifacts')}
+      openTitle="Open the artifacts page"
+      closeTitle="Close the artifacts page"
+    >
+      <ArtifactsIcon />
+    </PageRailButton>
   );
 }
 

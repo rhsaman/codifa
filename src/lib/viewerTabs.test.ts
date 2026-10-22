@@ -163,6 +163,13 @@ console.log('7) viewerTabTitle — sub-agent trace keeps its own title:')
   check('main trace shows kind label', viewerTabTitle({ kind: 'trace', title: 'Trace', traceTaskId: undefined } as any) === 'Trace')
   check('sub-agent trace keeps own title', viewerTabTitle({ kind: 'trace', title: 'Trace · Fix bug', traceTaskId: 'task-abc' } as any) === 'Trace · Fix bug')
   check('file tab keeps own title', viewerTabTitle({ kind: 'file', title: 'a.ts', traceTaskId: undefined } as any) === 'a.ts')
+  // One tab per artifact document: the kind label alone would show three
+  // identical "Artifact" tabs for three documents of the same chat.
+  check('artifact tab keeps own title', viewerTabTitle({ kind: 'artifact', title: 'Q3 Sales' } as any) === 'Q3 Sales')
+  check(
+    'artifact tab without a title falls back to the kind label',
+    viewerTabTitle({ kind: 'artifact', title: '' } as any) === 'Artifact',
+  )
 }
 
 console.log('8) multi-window visible list — order kept, unknown dropped, fallback to focus:')

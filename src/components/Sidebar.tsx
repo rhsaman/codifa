@@ -1239,16 +1239,6 @@ function SidebarContent() {
         })}
       </div>
 
-      <div className="sidebar-footer">
-        <button
-          className="sidebar-foot-btn"
-          title="Settings (⌘,)"
-          onClick={() => useStore.getState().setSettingsOpen(true)}
-        >
-          ⚙️
-          <span>Settings</span>
-        </button>
-      </div>
     </aside>
   );
 }

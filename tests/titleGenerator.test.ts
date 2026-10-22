@@ -26,6 +26,9 @@ export {}
 
 let titleCalls = 0
 let titleDone = 0
+// The title the mocked backend answers with; case 5 swaps in a long one to
+// prove the frontend never shows a truncated sentence.
+let mockTitle = 'نمایش درصد در دایره'
 ;(globalThis as any).fetch = async (url: string) => {
   const u = String(url)
   if (u.endsWith('/health')) return { ok: true, status: 200, json: async () => ({}) }
@@ -36,7 +39,7 @@ let titleDone = 0
       ok: true,
       status: 200,
       json: async () => ({
-        title: 'نمایش درصد در دایره',
+        title: mockTitle,
         usage: {
           input_tokens: 10,
           output_tokens: 5,
@@ -149,6 +152,24 @@ console.log('4) build/plan mode switch before first send still triggers:')
       'نمایش درصد در دایره',
   )
   check('model title applied in build mode', ok)
+}
+
+console.log('5) a long model title is capped at four whole words:')
+{
+  mockTitle = 'خطاهای تست را رفع کن و بعد کامیت کن'
+  const s = useStore.getState()
+  const chatId = s.newChat('ask')
+  s.addMessage(chatId, { role: 'user', content: LONG_TEXT })
+  const ok = await waitFor(
+    () =>
+      useStore.getState().chats.find((c) => c.id === chatId)?.title ===
+      'خطاهای تست را رفع',
+  )
+  check(
+    'title capped at 4 words',
+    ok,
+    useStore.getState().chats.find((c) => c.id === chatId)?.title,
+  )
 }
 
 if (failed > 0) {

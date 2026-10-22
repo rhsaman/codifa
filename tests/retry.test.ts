@@ -1,7 +1,7 @@
 // Quick sanity test for the retry decision logic (src/lib/retry.ts).
 // Run: node test/retry.test.ts
 import type { ChatMessage } from '../src/types.ts'
-import { planRetry, isKeepTextRetry } from '../src/lib/retry.ts'
+import { planRetry, isKeepTextRetry, findRetryBannerMessage } from '../src/lib/retry.ts'
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -165,6 +165,36 @@ console.log('9) isKeepTextRetry: کدام رویدادهای retry متن است
   check('بدون reconnecting/fallback → wipe', isKeepTextRetry(undefined, undefined) === false)
   check('reconnecting=false → wipe', isKeepTextRetry(false, undefined) === false)
   check('fallback=false → wipe', isKeepTextRetry(undefined, false) === false)
+}
+
+console.log('10) انتخاب بنر برای نمایش: بستن با ✕ باید بماند (چت استاپ نمیشود):')
+{
+  type M = { id: string; retry?: { reason?: string; agent?: string } | null }
+  const none = new Set<string>()
+  const live: M = { id: 'a20', retry: { reason: 'explore failed', agent: 'explore' } }
+  const older: M = { id: 'a19', retry: { reason: 'older' } }
+  const noRetry: M = { id: 'a21' }
+
+  check(
+    'جدیدترین پیام دارای retry انتخاب میشود',
+    findRetryBannerMessage([older, live, noRetry], none, none)?.id === 'a20',
+  )
+  // سناریوی باگ: لدر سابایجنت در همان نوبت retry را دوباره ست میکند؛ اگر
+  // بستن با ✕ فراموش شود، بنر بلافاصله برمیگردد.
+  check(
+    'پس از بستن با ✕ بنر همان پیام دیگر نمایش داده نمی‌شود',
+    findRetryBannerMessage([live, noRetry], none, new Set(['a20'])) === null,
+  )
+  check(
+    'بستن یک پیام بقیه را مخفی نمیکند',
+    findRetryBannerMessage([older, live], none, new Set(['a19']))?.id === 'a20',
+  )
+  check(
+    'بنر در حال محو شدن (retiring) انتخاب نمیشود',
+    findRetryBannerMessage([live], new Set(['a20']), none) === null,
+  )
+  check('پیام بدون retry → null', findRetryBannerMessage([noRetry], none, none) === null)
+  check('لیست خالی → null', findRetryBannerMessage([], none, none) === null)
 }
 
 if (failed > 0) {

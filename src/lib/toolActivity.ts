@@ -1,4 +1,5 @@
 import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
+import { isBrowserTool } from "./mcpTools";
 
 /** Extract the +N / -M tally from a unified diff string (the `+++` / `---`
  *  file-header lines are skipped). */
@@ -335,9 +336,11 @@ export function resolveToolResult(
         elapsedMs: now - (act.startedAt ?? now),
         // Text-output tools (LSP lookups, memory search) return prose with no
         // file paths, so `items` above stays empty — keep the raw text so the
-        // card can render it instead of showing nothing.
+        // card can render it instead of showing nothing. Browser tools belong
+        // here too: their result is the page/JS value, never a file list.
         resultText:
-          typeof event.result === "string" && TEXT_RESULT_TOOLS.has(act.tool)
+          typeof event.result === "string" &&
+          (TEXT_RESULT_TOOLS.has(act.tool) || isBrowserTool(act.tool))
             ? event.result
             : act.resultText,
       };
@@ -379,6 +382,9 @@ export const TEXT_RESULT_TOOLS = new Set([
   "save_memory",
   "explore",
   "read",
+  // Terminal output arrives as a plain string in `event.result` — without
+  // this the Run-a-command card shows Duration/Args but never its output.
+  "run_terminal",
 ]);
 
 /** Tools whose result rows come from the BACKEND as structured JSON
@@ -434,7 +440,10 @@ export function filesFromNativeResult(
     tool === "run_terminal" ||
     tool === "explore" ||
     tool === "search_memory" ||
-    tool === "save_memory"
+    tool === "save_memory" ||
+    // A browser tool answers with a page/JS value; scanning it for file-looking
+    // tokens produced chips that pointed at files that do not exist.
+    isBrowserTool(tool)
   )
     return null;
   const re = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,10})(?::(\d+))?/g;

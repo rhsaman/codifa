@@ -42,3 +42,30 @@ export function sliceWindow<T>(
   const minStart = Math.max(0, items.length - minKeep)
   return items.slice(Math.max(countStart, Math.min(start, minStart)))
 }
+
+/**
+ * Whether the mounted transcript window may be shrunk back to one page.
+ *
+ * `msgLimit` only ever grew: every scroll-to-top raised it, nothing lowered it,
+ * and it reset only on a chat switch. So once a user had scrolled up through a
+ * long chat, every message they had passed stayed in the DOM for the rest of the
+ * session. Each mounted message keeps a laid-out subtree and its paint
+ * resources, which is why the renderer's footprint tracked the longest scroll
+ * ever performed rather than what was on screen.
+ *
+ * The trim is only safe while the viewport is pinned to the NEWEST message:
+ * there, removing content above the viewport is invisible (the scroll offset is
+ * already clamped at the maximum). While the user is reading history, shrinking
+ * would delete content under their viewport and immediately re-trigger the
+ * scroll-to-top auto-load, oscillating between mount and unmount.
+ *
+ * Pure so the policy is testable without a DOM — `nowPinned` is the caller's
+ * live `stickToBottom` ref.
+ */
+export function shouldTrimMountedWindow(
+  msgLimit: number,
+  msgPage: number,
+  nowPinned: boolean,
+): boolean {
+  return nowPinned && msgLimit > msgPage
+}

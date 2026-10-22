@@ -577,11 +577,164 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
     }
 }
 
+/// The provider telling us the MODEL's upstream endpoint is gone.
+///
+/// The status code cannot be trusted for this one: a gateway may carry it on a
+/// 429 (observed body: `Upstream request failed: Endpoint is unavailable.` with
+/// `"code":"rate_limit_exceeded"`), which reads like "come back later" and
+/// keeps a model that cannot serve the request at all. The body names the
+/// failure, so the body decides.
+const UPSTREAM_DOWN: [&str; 5] = [
+    "upstream request failed",
+    "endpoint is unavailable",
+    "endpoint unavailable",
+    "no available endpoint",
+    "upstream is unavailable",
+];
+
+/// Whether a provider response says the model's upstream endpoint is down.
+fn upstream_is_down(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    UPSTREAM_DOWN.iter().any(|needle| t.contains(needle))
+}
+
 fn is_key_error(status: u16, body: &str) -> bool {
+    // A dead upstream endpoint is not a key problem: walking the key list would
+    // only repeat the same doomed call with every configured key. Returning
+    // `false` fails immediately and hands the raw provider error upward, where
+    // it is classified as a model-side failure and the next configured model
+    // gets the call.
+    if upstream_is_down(body) {
+        return false;
+    }
     matches!(status, 401 | 402 | 403 | 429)
         || body.to_ascii_lowercase().contains("invalid api key")
         || body.to_ascii_lowercase().contains("unauthorized")
         || body.to_ascii_lowercase().contains("quota")
+}
+
+/// Whether a failed model call means "THIS model cannot serve us", i.e. the only
+/// case where trying the next configured fallback is the right move.
+///
+/// The rule is deliberately narrow. A fallback is an escape hatch for a model
+/// that does not work — NOT a retry for the network. Only a provider REJECTING
+/// the request in a way another model could fix qualifies:
+///
+/// * the key or account is refused (401 / 402 / 403, "invalid api key",
+///   "forbidden", "insufficient credit", "permission denied");
+/// * the provider does not serve this model ("model not found", "unknown
+///   model", "not supported", "does not exist");
+/// * the provider's upstream endpoint for the model is unavailable — some
+///   gateways report that on a 429, so [`upstream_is_down`] is checked BEFORE
+///   the rate-limit gate and the body wins over the status;
+/// * the model answered with nothing usable (an empty summary/title/description)
+///   — the model itself is not working, which is not a transport problem.
+///
+/// Everything else stays on the SAME model: a dropped connection, a timeout, a
+/// 5xx, a genuine 429/rate limit (one that does not name a broken endpoint), an
+/// idle stream or a user abort. Falling back there
+/// would spend the user's whole fallback list on a provider hiccup, hide the
+/// real reason behind the last rung's error, and pay for calls that could never
+/// have succeeded.
+pub fn should_fall_back(err: &str) -> bool {
+    let e = err.trim().to_ascii_lowercase();
+    if e.is_empty() {
+        return false;
+    }
+    // Transport-level first. A gateway body can contain "invalid" or "model" by
+    // accident, so these must never reach the model needles below.
+    const TRANSPORT: [&str; 13] = [
+        "no response within",
+        "no data for",
+        "aborted by user",
+        "error sending request",
+        "connect",
+        "timed out",
+        "timeout",
+        "dns",
+        "tls",
+        "broken pipe",
+        "reset by peer",
+        "incomplete message",
+        "unexpected eof",
+    ];
+    if TRANSPORT.iter().any(|needle| e.contains(needle)) {
+        return false;
+    }
+    // Checked BEFORE the rate-limit gate: a gateway can carry "this model's
+    // endpoint is gone" on a 429, and that status alone would read as "come
+    // back later" and keep the broken model for the rest of the attempts.
+    if upstream_is_down(&e) {
+        return true;
+    }
+    // The provider asking us to come back later is not a broken model: retrying
+    // the SAME model is exactly right, so a genuine 429 must never consume a
+    // fallback.
+    if e.contains("rate limit") || e.contains("429") || e.contains("too many requests") {
+        return false;
+    }
+    // "key rejected (NNN): …" carries the status. 401/402/403 mean the account
+    // or key is refused; anything else that reached this branch is a request
+    // problem, not a model problem.
+    if let Some(rest) = e.split("key rejected (").nth(1) {
+        let status: u16 = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        return matches!(status, 401 | 402 | 403);
+    }
+    // A model that answered with nothing usable is not working either.
+    if e.contains("returned an empty summary")
+        || e.contains("returned an empty title")
+        || e.contains("returned an empty description")
+        || e.contains("empty model response")
+        || e.contains("returned no content")
+    {
+        return true;
+    }
+    const REJECTED: [&str; 19] = [
+        "invalid api key",
+        "incorrect api key",
+        "invalid_api_key",
+        "api key not valid",
+        "no api key configured",
+        "unauthorized",
+        "unauthenticated",
+        "authentication",
+        "model not found",
+        "model_not_found",
+        "unknown model",
+        "no such model",
+        "not a valid model",
+        "does not exist",
+        "forbidden",
+        "permission",
+        "insufficient",
+        "no credit",
+        "not supported",
+    ];
+    if REJECTED.iter().any(|needle| e.contains(needle)) {
+        return true;
+    }
+    // "model `gpt-x` not found" / "model `gpt-x` is unavailable": the model NAME
+    // sits between the two halves, so no single substring can ever match. Pair
+    // the halves instead — every provider words this one differently, but they
+    // all name the model AND say it is missing.
+    let names_a_model = e.contains("model");
+    let says_missing = [
+        "not found",
+        "not available",
+        "unavailable",
+        "unknown",
+        "invalid",
+        "unsupported",
+        "rejected",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle));
+    names_a_model && says_missing
 }
 
 /// One-shot completion. Tries each API key in order on key errors
@@ -742,6 +895,11 @@ pub struct StreamAcc {
     pub tool_calls: Vec<Value>,
     pub finish_reason: String,
     pub usage: Option<Value>,
+    /// Provider failure carried INSIDE the stream: an `error`/`detail` object on
+    /// an HTTP 200 response. The read loop cannot raise it as an `Err` the moment
+    /// it arrives without discarding the text already streamed, so it is latched
+    /// here and promoted to a real error by [`finish_stream`] once it closes.
+    pub error: Option<String>,
     /// Bytes of REASONING ("thinking") content seen so far. The reasoning text
     /// itself is deliberately never streamed — rendering it token by token made
     /// the UI crawl — but its arrival has to be observable, otherwise the pill
@@ -847,9 +1005,49 @@ impl InterruptSignal {
     }
 }
 
+/// Message carried by a provider error object. Failures do not all arrive with a
+/// non-2xx status, and every provider words them differently, so the shape — not
+/// the provider name — decides: OpenAI-style `{"error": {"message": …}}`, a plain
+/// `{"error": "…"}`, FastAPI-style `{"detail": "…"}`, Anthropic's
+/// `{"type": "error", "message": …}` frame, and Google's message-less
+/// `{"error": {"code": …, "status": "…"}}`.
+pub(crate) fn provider_error_message(v: &Value) -> Option<String> {
+    let err = &v["error"];
+    // Anthropic reports a mid-stream failure as `{"type":"error","message":…}`:
+    // there is no `error` object at all. The top-level `message` is read ONLY
+    // when the body declares itself an error envelope, so a healthy delta (which
+    // carries `type` too, but never `message`) cannot be mistaken for a failure.
+    let envelope = (v["type"].as_str() == Some("error"))
+        .then(|| v["message"].as_str())
+        .flatten();
+    let named = err["message"]
+        .as_str()
+        .or_else(|| err["detail"].as_str())
+        .or_else(|| err["type"].as_str())
+        .or_else(|| err.as_str())
+        .or_else(|| v["detail"].as_str())
+        .or(envelope);
+    let msg = match named {
+        Some(m) => m.trim().to_string(),
+        // Google sends no message at all — the status/code pair is the whole
+        // reason, and without it the failure would read as an empty answer.
+        None => match (
+            err["status"].as_str().unwrap_or_default().trim(),
+            err["code"].as_i64(),
+        ) {
+            ("", None) => return None,
+            ("", Some(code)) => format!("error code {code}"),
+            (status, None) => status.to_string(),
+            (status, Some(code)) => format!("{status} (code {code})"),
+        },
+    };
+    (!msg.is_empty()).then(|| msg.to_string())
+}
+
 /// Parse one SSE `data:` payload into accumulator updates, forwarding text
-/// deltas to `on_delta` as they arrive. Returns true when the payload was a
-/// terminal `[DONE]` marker.
+/// deltas to `on_delta` as they arrive. Returns true when the payload ends the
+/// read loop: the `[DONE]` marker, or an error frame — whose reason is latched
+/// into [`StreamAcc::error`] for [`finish_stream`] to raise.
 fn apply_sse_payload(
     provider: &str,
     payload: &str,
@@ -863,6 +1061,13 @@ fn apply_sse_payload(
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return false;
     };
+    // The request failed even though the transport did not. Reading on would
+    // hang on a provider that holds the socket open, and ignoring the frame is
+    // what made a dead model look like a silent success.
+    if let Some(msg) = provider_error_message(&v) {
+        acc.error = Some(msg);
+        return true;
+    }
     match provider {
         "anthropic" => {
             match v["type"].as_str() {
@@ -1004,6 +1209,47 @@ fn apply_sse_payload(
         }
     }
     false
+}
+
+/// Promote a finished stream to a real error when it produced nothing usable.
+///
+/// A provider does not have to fail on the transport to fail the request: it can
+/// answer 200 and then close the socket, or close a stream that only ever
+/// carried reasoning. Both used to end the turn as a silent success — an empty
+/// bubble, no banner, nothing logged — which is exactly what a model that cannot
+/// serve the request looked like from the outside. Every other case keeps the
+/// streamed text.
+fn finish_stream(provider: &str, acc: StreamAcc) -> Result<StreamAcc, (u16, String)> {
+    if let Some(msg) = acc.error.as_deref() {
+        return Err((
+            0u16,
+            format!("{provider} reported an error mid-stream: {msg}"),
+        ));
+    }
+    // A mid-turn steer drops this request on purpose: the agent loop re-issues
+    // the step with the steer appended, so an empty accumulator is the expected
+    // outcome here and not a failure.
+    if acc.interrupted {
+        return Ok(acc);
+    }
+    if !acc.text.trim().is_empty() || !acc.tool_calls.is_empty() {
+        return Ok(acc);
+    }
+    let ending = if acc.finish_reason.is_empty() {
+        "the provider closed the stream without finishing".to_string()
+    } else {
+        format!("the stream finished with '{}'", acc.finish_reason)
+    };
+    if acc.reasoning_len > 0 {
+        return Err((
+            0u16,
+            format!(
+                "{provider} returned no content after streaming reasoning — {ending} \
+                 (the thinking block may have used the whole budget)"
+            ),
+        ));
+    }
+    Err((0u16, format!("{provider} returned no content — {ending}")))
 }
 
 /// Resolves once the Stop flag is raised; never resolves when there is no flag.
@@ -1149,7 +1395,7 @@ async fn stream_with_key(
                 }
             } => {
                 acc.interrupted = true;
-                return Ok(acc);
+                return finish_stream(&cfg.provider, acc);
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 return Err((
@@ -1178,8 +1424,10 @@ async fn stream_with_key(
                     idle_deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_secs(idle_secs);
                     let mut text_sink = |t: &str| on_event(StreamSignal::Text(t));
+                    // A terminal frame — the `[DONE]` marker or a stream error:
+                    // either way this step's outcome is decided here.
                     if apply_sse_payload(&cfg.provider, payload, &mut acc, &mut text_sink) {
-                        return Ok(acc);
+                        return finish_stream(&cfg.provider, acc);
                     }
                 }
             }
@@ -1193,11 +1441,20 @@ async fn stream_with_key(
             on_event(StreamSignal::Thinking(false));
         }
     }
-    Ok(acc)
+    // The socket closed without a terminal frame. Only now can the outcome be
+    // judged, because everything streamed before the close is accumulated.
+    finish_stream(&cfg.provider, acc)
 }
 
 /// Pull (text, usage) out of a provider response.
-fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, String)> {    match provider {
+fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, String)> {
+    // A 200 carrying an error object is a failure, not an empty answer: the body
+    // names the reason, so every one-shot caller (title, compact, model test)
+    // reports that instead of a blank "empty reply".
+    if let Some(msg) = provider_error_message(v) {
+        return Err((0u16, msg));
+    }
+    match provider {
         "anthropic" => {
             let text: String = v["content"]
                 .as_array()
@@ -1592,6 +1849,221 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_error_frame_on_a_200_is_a_real_error() {
+        // A gateway can answer 200 and report the failure INSIDE the stream. The
+        // parser only ever read `choices`, so that frame was ignored outright and
+        // the turn finished as a silent success with an empty bubble — exactly
+        // what a model that cannot serve the request looked like.
+        let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
+        assert!(apply_sse_payload(
+            "nvidia",
+            r#"{"error":{"message":"Upstream request failed: Endpoint is unavailable."}}"#,
+            &mut acc,
+            &mut sink
+        ));
+        let err = finish_stream("nvidia", acc).unwrap_err().1;
+        assert!(err.contains("Upstream request failed"), "{err}");
+        // The class matters end to end: a dead endpoint is a MODEL-side
+        // rejection, so the next configured model takes the call instead of the
+        // same one being retried, and no key is blamed for it.
+        assert!(should_fall_back(&err));
+        assert!(!is_key_error(0, &err));
+
+        // FastAPI-shaped error bodies name the reason in `detail`.
+        let mut acc = StreamAcc::default();
+        assert!(apply_sse_payload(
+            "custom",
+            r#"{"detail":"no available endpoint"}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(
+            finish_stream("custom", acc).unwrap_err().1,
+            "custom reported an error mid-stream: no available endpoint"
+        );
+    }
+
+    #[test]
+    fn provider_error_shapes_are_recognized_without_naming_the_provider() {
+        // Every provider words a failure differently, so the guard keys on the
+        // SHAPE, never on the provider name — the same call has to work for a
+        // gateway added tomorrow.
+        for provider in [
+            "nvidia",
+            "openrouter",
+            "tokenrouter",
+            "cloudflare",
+            "custom",
+            "ollama",
+            "anthropic",
+            "google",
+        ] {
+            let mut acc = StreamAcc::default();
+            let mut sink = |_: &str| {};
+            assert!(
+                apply_sse_payload(
+                    provider,
+                    r#"{"error":{"message":"boom"}}"#,
+                    &mut acc,
+                    &mut sink
+                ),
+                "{provider} missed an OpenAI-shaped error frame"
+            );
+            let err = finish_stream(provider, acc).unwrap_err().1;
+            assert!(err.contains("boom"), "{err}");
+        }
+
+        // Anthropic reports a mid-stream failure with no `error` object at all.
+        let mut acc = StreamAcc::default();
+        let mut sink = |_: &str| {};
+        assert!(apply_sse_payload(
+            "anthropic",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(finish_stream("anthropic", acc)
+            .unwrap_err()
+            .1
+            .contains("Overloaded"));
+        let mut acc = StreamAcc::default();
+        assert!(apply_sse_payload(
+            "anthropic",
+            r#"{"type":"error","message":"Overloaded"}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(finish_stream("anthropic", acc)
+            .unwrap_err()
+            .1
+            .contains("Overloaded"));
+
+        // Google sends no message at all: the status/code pair is the reason.
+        let mut acc = StreamAcc::default();
+        assert!(apply_sse_payload(
+            "google",
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT"}}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(
+            finish_stream("google", acc).unwrap_err().1,
+            "google reported an error mid-stream: INVALID_ARGUMENT (code 400)"
+        );
+
+        // The one-shot path (title, compact, model test) reads the same shapes.
+        assert!(extract_completion(
+            "google",
+            &json!({"error": {"code": 403, "status": "PERMISSION_DENIED"}})
+        )
+        .err()
+        .unwrap()
+        .1
+        .contains("PERMISSION_DENIED"));
+        assert_eq!(
+            extract_completion(
+                "anthropic",
+                &json!({"type": "error", "message": "Overloaded"})
+            )
+            .err()
+            .unwrap()
+            .1,
+            "Overloaded"
+        );
+
+        // HEALTHY frames of every provider shape keep flowing as text, and a
+        // `null` error key (several APIs always send it) is not a failure: a
+        // false positive here would kill a working turn.
+        let mut acc = StreamAcc::default();
+        let mut out = String::new();
+        let mut sink = |t: &str| out.push_str(t);
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(!apply_sse_payload(
+            "anthropic",
+            r#"{"type":"content_block_delta","delta":{"text":"hi"}}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(!apply_sse_payload(
+            "google",
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert!(!apply_sse_payload(
+            "custom",
+            r#"{"error":null,"choices":[{"delta":{"content":"!"}}]}"#,
+            &mut acc,
+            &mut sink
+        ));
+        assert_eq!(out, "hihihi!");
+        assert!(finish_stream("custom", acc).is_ok());
+    }
+
+    #[test]
+    fn a_stream_with_no_output_is_not_a_silent_success() {
+        let mut acc = StreamAcc::default();
+        acc.finish_reason = "stop".into();
+        let err = finish_stream("nvidia", acc).unwrap_err().1;
+        assert!(err.contains("returned no content"), "{err}");
+        assert!(err.contains("'stop'"), "{err}");
+        assert!(should_fall_back(&err));
+
+        // Reasoning that never reached an answer: same verdict, and the hint
+        // says where the budget went.
+        let mut acc = StreamAcc::default();
+        acc.reasoning_len = 42;
+        let err = finish_stream("nvidia", acc).unwrap_err().1;
+        assert!(err.contains("streaming reasoning"), "{err}");
+
+        // Whitespace-only output is an empty answer, not content.
+        let mut acc = StreamAcc::default();
+        acc.text = "\n".into();
+        assert!(finish_stream("nvidia", acc).is_err());
+
+        // Real output — text or a tool call — stays a success.
+        let mut acc = StreamAcc::default();
+        acc.text = "hi".into();
+        assert!(finish_stream("nvidia", acc).is_ok());
+        let mut acc = StreamAcc::default();
+        acc.tool_calls
+            .push(json!({"function": {"name": "read", "arguments": "{}"}}));
+        assert!(finish_stream("nvidia", acc).is_ok());
+
+        // A mid-turn steer ended the request on purpose: the agent re-issues the
+        // step, so an empty accumulator is the expected outcome.
+        let mut acc = StreamAcc::default();
+        acc.interrupted = true;
+        assert!(finish_stream("nvidia", acc).is_ok());
+    }
+
+    #[test]
+    fn a_one_shot_error_body_reports_its_reason() {
+        // 200 + `{"error": …}` on the non-streaming path used to come back as an
+        // empty text SUCCESS, so every caller (title, compact, model test) showed
+        // a blank result instead of the provider's own message.
+        let v = json!({"error": {"message": "quota exhausted", "type": "insufficient_quota"}});
+        assert_eq!(
+            extract_completion("custom", &v).err().unwrap().1,
+            "quota exhausted"
+        );
+        let v = json!({"detail": "no available endpoint"});
+        assert_eq!(
+            extract_completion("custom", &v).err().unwrap().1,
+            "no available endpoint"
+        );
+        // A healthy response is untouched.
+        let v = json!({"choices": [{"message": {"content": "ok"}}]});
+        assert_eq!(extract_completion("custom", &v).unwrap().text, "ok");
+    }
+
+    #[test]
     fn interrupt_signal_wakes_a_parked_waiter_and_stamps_generations() {
         // Mid-turn steer: the stream read loop selects on this signal, so a raise
         // must wake a waiter that is ALREADY parked (a lost wakeup would put the
@@ -1825,5 +2297,80 @@ mod tests {
         let body = build_request_body(&c, &msgs, None);
         assert_eq!(body["contents"][0]["parts"][1]["inlineData"]["data"], "AAAA");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
+    }
+
+    /// A dead upstream endpoint must not be mistaken for a key problem: the key
+    /// loop would spend every configured key on the same doomed call.
+    #[test]
+    fn an_unavailable_endpoint_is_not_a_key_error() {
+        assert!(!is_key_error(
+            429,
+            "{\"error\":{\"message\":\"Upstream request failed: Endpoint is \
+             unavailable.\"}}"
+        ));
+        // A genuine rate limit still tries the next key: another key has its own
+        // quota.
+        assert!(is_key_error(429, "429 Too Many Requests"));
+    }
+
+    /// The fallback rule: ONLY a model that cannot serve us may be replaced.
+    #[test]
+    fn fallback_only_for_a_model_side_rejection() {
+        // A refused key/account or a model the provider does not serve: another
+        // model can work, so the next fallback must be tried.
+        assert!(should_fall_back(
+            "key rejected (401): {\"error\":{\"message\":\"Invalid API key\"}}"
+        ));
+        assert!(should_fall_back("key rejected (403): forbidden"));
+        assert!(should_fall_back("no api key configured"));
+        assert!(should_fall_back("model `gpt-x` not found"));
+        // A model that answers with nothing usable is not working either.
+        assert!(should_fall_back("the model returned an empty description"));
+        assert!(should_fall_back("returned an empty summary"));
+        // A stream that ended with no output, and a gateway error carried INSIDE
+        // a 200 stream: both name a model that cannot serve the request.
+        assert!(should_fall_back(
+            "nvidia returned no content — the stream finished with 'stop'"
+        ));
+        assert!(should_fall_back(
+            "nvidia reported an error mid-stream: \"Upstream request failed: Endpoint is \
+             unavailable.\""
+        ));
+
+        // Everything else stays on the SAME model: another model cannot fix the
+        // network, and spending the whole list on one hiccup hides the reason.
+        assert!(!should_fall_back("provider sent no response within 90s"));
+        assert!(!should_fall_back(
+            "error sending request for url (http://x/v1/chat/completions): \
+             error trying to connect: tcp connect error: Connection refused (os error 61)"
+        ));
+        assert!(!should_fall_back("provider stream sent no data for 60s"));
+        assert!(!should_fall_back("aborted by user"));
+        assert!(!should_fall_back("429 Too Many Requests"));
+        // The real one from the field: a gateway answers 429 for an upstream
+        // failure. The status says "rate limit", the body says the model's
+        // endpoint is gone — the body wins, because retrying that model cannot
+        // help and the user's fallbacks sat unused.
+        assert!(should_fall_back(
+            "{\"error\":{\"message\":\"[429]: Upstream request failed: \
+             Endpoint is unavailable.\",\"code\":\"rate_limit_exceeded\"}}"
+        ));
+        // The SAME gateway failure carried on a 503, in the exact shape the
+        // renderer shows it (observed in the field): `[503]` plus
+        // `service_unavailable` reads like a provider hiccup, but the body names
+        // the model's dead upstream endpoint, so the next fallback must take the
+        // call instead of retrying a model that cannot serve it.
+        assert!(should_fall_back(
+            r#"explore failed: {"error":{"message":"[503]: {\"error\":{\"type\":\"server_error\",\"message\":\"Upstream request failed: Endpoint is unavailable.\"}}","type":"server_error","code":"service_unavailable"}}"#
+        ));
+        // A BARE 5xx with no such body is the provider breaking, not the model:
+        // it keeps the SAME model and retries it.
+        assert!(!should_fall_back("503 Service Unavailable"));
+        assert!(!should_fall_back(
+            "{\"error\":{\"message\":\"Internal server error\"}}"
+        ));
+        // A 5xx key rejection is the PROVIDER breaking, not the model.
+        assert!(!should_fall_back("key rejected (500): upstream exploded"));
+        assert!(!should_fall_back(""));
     }
 }

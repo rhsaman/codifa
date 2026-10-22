@@ -150,7 +150,7 @@ try {
   check('خروجی خالی است', false, e)
 }
 
-console.log('7) FileResultLinks: فقط ۳ مورد اول نمایش داده می‌شود و بقیه truncate می‌شوند:')
+console.log('7) FileResultLinks: همهٔ نتایج در همان ردیف رندر می‌شوند (لیست اسکرول می‌شود):')
 const manyItems = Array.from({ length: 8 }, (_, i) => ({
   file: `src/module_${i}.ts`,
   line: i + 1,
@@ -165,9 +165,11 @@ try {
 }
 check('مورد اول نمایش داده شد', manyHtml.includes('src/module_0.ts'))
 check('مورد سوم نمایش داده شد', manyHtml.includes('src/module_2.ts'))
-check('مورد چهارم (module_3) نمایش داده نشد', !manyHtml.includes('src/module_3.ts'))
-check('خط truncate (more) نمایش داده شد', manyHtml.includes('more'))
-check('تعداد محدود (۳ آیتم + ۱ more) رعایت شد', (manyHtml.match(/class="file-result"/g) || []).length === 3)
+// A tool row never sends its results to the side panel: every hit renders
+// inside the row and the list scrolls (.file-results max-height).
+check('مورد چهارم هم داخل ردیف است', manyHtml.includes('src/module_3.ts'))
+check('دکمهٔ «+N more» وجود ندارد', !manyHtml.includes('file-result-more-btn'))
+check('همهٔ ۸ ردیف رندر شدند', (manyHtml.match(/class="file-result"/g) || []).length === 8)
 
 console.log('8) FileResultLinks: duplicate read results deduped to one row:')
 {

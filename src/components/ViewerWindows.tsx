@@ -6,7 +6,6 @@ import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { buildFromList, collectChatIds, findNodeById, leafCount } from "../lib/chatTree";
 import { SchedulePage, TodosPage } from "./ViewerPages";
 import { ViewerContent } from "./ViewerContent";
-
 // Every viewer panel is dispatched by tab kind, so at most ONE of them is ever
 // on screen — yet all of them used to sit in the startup chunk with the viewer
 // shell, because the imports were static. Several pull real weight (highlight.js
@@ -29,6 +28,12 @@ const FileViewerPanel = lazy(() =>
 );
 const TextViewerPanel = lazy(() =>
   import("./TextViewerPanel").then((m) => ({ default: m.TextViewerPanel })),
+);
+const ArtifactsPanel = lazy(() =>
+  import("./ArtifactsPanel").then((m) => ({ default: m.ArtifactsPanel })),
+);
+const ArtifactPanel = lazy(() =>
+  import("./ArtifactPanel").then((m) => ({ default: m.ArtifactPanel })),
 );
 const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.FilesPanel })));
 const ExplorePanel = lazy(() =>
@@ -170,8 +175,23 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
   }
   // The schedule page in a split pane. Must sit before the fallback below,
   // which is the catch-all inbox return of this dispatcher.
+  if (tab.kind === "artifacts") {
+    return <ArtifactsPanel key={tab.id} />;
+  }
   if (tab.kind === "schedule") {
     return <SchedulePage key={tab.id} />;
+  }
+  if (tab.kind === "artifact") {
+    return (
+      <ArtifactPanel
+        key={tab.id}
+        title={tab.title}
+        kind={tab.artifactKind ?? "html"}
+        body={tab.artifactBody ?? ""}
+        chatId={tab.chatId}
+        id={tab.artifactId}
+      />
+    );
   }
   return (
     <ScheduleInboxDocked

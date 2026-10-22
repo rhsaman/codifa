@@ -85,6 +85,23 @@ function projectTool(a: ToolActivity): HistoryToolEntry {
   return out
 }
 
+/** Whether a stored message belongs on the WIRE history of the next turn.
+ *  Extracted from the `Chat.tsx` filter so it can be unit-tested: the two
+ *  reasons to drop a message are not obvious from the call site.
+ *
+ *  - `compacted`: already folded into a summary that stands in for it.
+ *  - `modeSwitch`: a `[Mode switched to …]` notice is a UI affordance. The
+ *    active mode already rides in the system prompt, and the notice carries no
+ *    task content — but it is system-role, so the send path sorts it to the
+ *    FRONT of the history. Every mode switch therefore pushed a fresh message
+ *    in AHEAD of the whole conversation and invalidated the provider's cached
+ *    prefix (traced: 63 of 235 requests carried one).
+ */
+export function isWireHistoryMessage(m: ChatMessage): boolean {
+  if (m.compacted || m.modeSwitch) return false
+  return m.role === 'user' || m.role === 'assistant' || m.role === 'system'
+}
+
 /** Project one stored message into the shape the backend actually consumes.
  *  Half-finished cards are dropped here, matching `history_recap`, which skips
  *  `status == "running"` — a running call must never be replayed to the model.

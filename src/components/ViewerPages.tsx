@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { ScheduleSection } from "./SchedulePanel";
 import { TodosSection } from "./TodosPanel";
+import { TurnUsageSection } from "./TurnUsagePanel";
+import { useStore } from "../lib/store";
 
 /** Scroll shell shared by every full pane page (todos, schedule). One place
  *  owns the scroll box and the reading-width cap, so a page never re-derives
@@ -30,13 +32,17 @@ export function ViewerPage({ children }: { children: ReactNode }) {
   );
 }
 
-/** Todos page: the plan checklist of the active chat. It used to render the
- *  schedule section above the list; schedules now own their own page, so this
- *  one holds exactly one card. */
+/** Todos page: the plan checklist of the active chat, followed by what that
+ *  turn ran with (skills / MCP connectors / plugins). Both cards read the
+ *  ACTIVE chat's messages, so switching chats switches both. Schedules now own
+ *  their own page, so this one holds only per-chat cards. */
 export function TodosPage() {
+  const chat = useStore((s) => s.chats.find((c) => c.id === s.activeChatId) ?? null);
+  const dir = useStore((s) => s.dir);
   return (
     <ViewerPage>
       <TodosSection />
+      <TurnUsageSection messages={chat?.messages ?? []} dir={dir} />
     </ViewerPage>
   );
 }

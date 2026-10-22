@@ -2,6 +2,7 @@ import {
   Suspense,
   lazy,
   memo,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -10,7 +11,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage, ToolActivity } from "../types";
 import {
@@ -21,17 +22,19 @@ import {
 } from "../lib/bidi";
 import { fixArrowDirections, rehypeArrows } from "../lib/arrowDir";
 import { copyToClipboard } from "../lib/clipboard";
-import { dedupDocPaths, extractInlinePathParts, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { dedupDocPaths, extractInlinePathParts, filePathFromHref, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
 import { cancelSteer } from "../lib/api";
+import { fallbackReason, humanizeError } from "../lib/errorText";
 import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
 import type { SpeakProviderOpts } from "../lib/api";
 import { lspStatusLabel, useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
 import { handleLinkClick, splitTextByUrls } from "../lib/link";
+import { ArtifactCard } from "./ArtifactCard";
 import { getHighlightedLines } from "../lib/highlight";
 import {
   ToolCallView,
@@ -794,15 +797,31 @@ export const mdComponents = {
         />
       );
     }
-    // Non-code document links (pdf/word/excel/csv) render as clickable file
-    // chips that open in the viewer panel, same as attachment chips.
-    if (href && !/^[a-z][a-z0-9+.-]*:/i.test(href) && isDocPath(href)) {
-      const { path, line } = splitPathLine(href);
+    // EVERY link that points at a workspace file — a code path, a path with a
+    // line, an absolute path, a `file://` URL or a document (pdf/word/excel/
+    // csv) — renders as a clickable chip that opens the viewer, exactly like
+    // inline-code paths. As a plain `<a target="_blank">` the webview followed
+    // the href and left the app (the OS browser opened) instead of opening the
+    // file; only real web URLs and in-page anchors stay links.
+    const fileRef = filePathFromHref(href);
+    if (fileRef) {
       const label =
         typeof props.children === "string" && props.children
           ? props.children
           : href;
-      return <FileChip path={path} line={line} display={String(label)} />;
+      return (
+        <FileChip
+          path={fileRef.path}
+          line={fileRef.line}
+          display={String(label)}
+        />
+      );
+    }
+    // react-markdown's sanitizer blanks the href of anything it refuses
+    // (javascript:, data:, …): show the label as plain text — an anchor with an
+    // empty href would reload the whole webview when clicked.
+    if (!href) {
+      return <>{props.children}</>;
     }
     return (
       <a
@@ -833,6 +852,13 @@ export const mdComponents = {
 const PROSE_REMARK_PLUGINS = [remarkGfm];
 const PROSE_REHYPE_PLUGINS = [rehypeArrows];
 
+/** react-markdown blanks the href of every scheme it does not know, which
+ *  killed `file://` citations before the `a` override could turn them into
+ *  file chips. Keep `file:` intact; every other scheme stays sanitized. */
+function keepFileUrls(url: string): string {
+  return /^file:/i.test(url) ? url : defaultUrlTransform(url);
+}
+
 /** One markdown prose block. Besides rendering, it fixes the direction of
  *  arrows in RTL text (see lib/arrowDir.ts).
  *
@@ -856,6 +882,7 @@ const MarkdownProse = memo(function MarkdownProse({ text }: { text: string }) {
       <ReactMarkdown
         remarkPlugins={PROSE_REMARK_PLUGINS}
         rehypePlugins={PROSE_REHYPE_PLUGINS}
+        urlTransform={keepFileUrls}
         components={mdComponents}
       >
         {text}
@@ -996,8 +1023,10 @@ export function RetryBanner({
   agent,
   tool,
   fallback,
+  transient,
   stalled,
   startedAt,
+  onRetire,
   onCancel,
   onRetry,
 }: {
@@ -1015,8 +1044,19 @@ export function RetryBanner({
   fallback?: boolean;
   stalled?: boolean;
   startedAt?: number;
+  /** Informational banners (sub-agent fallback, exhausted retries) are silent,
+   *  here-to-tell-you notes — the turn keeps streaming and nothing needs a
+   *  click. Instead of pinning them at the end of the transcript, they read
+   *  (first ~4s) and then dissolve with `retry-fade-out`: visibility bounded,
+   *  attention cost bounded. When the fade ends the banner is retired by the
+   *  parent; a NEW failure replaces this one outright, so no action is lost. */
+  /** Fires once the fade-out is done. */
+  onRetire?: () => void;
+  transient?: boolean;
   onCancel?: () => void;
-  onRetry?: () => void;
+  /** May be async: the banner keeps the button in its loading state until the
+   *  click has actually been handled (see `pending` below). */
+  onRetry?: () => void | Promise<void>;
 }) {
   // Recompute `left` from props on every render. The banner may receive a new
   // `startedAt` (and a bumped `attempt`) on each retry cycle WITHOUT remounting
@@ -1031,6 +1071,32 @@ export function RetryBanner({
   // bumped it for any reason). When `startedAt` changes, force `left` back to
   // its freshly-computed value before re-arming the interval.
   const lastStartedAt = useRef<number | undefined>(startedAt);
+  // A click is an ASYNC round trip (POST /chat/retry_now, or a whole re-sent
+  // turn), and a button that looks identical before and after being pressed
+  // reads as broken — the user clicks again and again. While the request is in
+  // flight the button shows a spinner and refuses a second click.
+  const [pending, setPending] = useState(false);
+  // Number of clicks whose promise has not settled yet. `pending` alone is not
+  // enough: acknowledging a click immediately bumps `attempt`/`startedAt` on the
+  // banner, so the reset below would clear the spinner WHILE the click was still
+  // being handled. The button then flickered back to "Retry" mid-request, which
+  // is exactly how it kept reading as a dead button.
+  const inFlight = useRef(0);
+  // A NEW retry cycle (or a replaced banner) ends the previous click's loading
+  // state — but only once nothing is still in flight.
+  useEffect(() => {
+    if (inFlight.current === 0) setPending(false);
+  }, [attempt, startedAt]);
+  useEffect(() => {
+    if (!pending) return;
+    // Safety net: if nothing comes back (backend gone, banner about to retire),
+    // never leave the button spinning forever.
+    const t = setTimeout(() => {
+      inFlight.current = 0;
+      setPending(false);
+    }, 15_000);
+    return () => clearTimeout(t);
+  }, [pending]);
   useEffect(() => {
     if (delay <= 0) return;
     if (lastStartedAt.current !== startedAt) {
@@ -1048,6 +1114,12 @@ export function RetryBanner({
     }, 1000);
     return () => clearInterval(t);
   }, [delay, startedAt, attempt]);
+  /** How long a transient banner is readable before it starts dissolving. */
+  const READ_MS = 4000;
+  /** How long the dissolve itself takes. MUST match the `.retry-banner--fading`
+   *  animation duration in styles/global.css — retiring earlier unmounts the
+   *  banner while it is still ~20% opaque, which reads as a flicker. */
+  const FADE_MS = 2000;
   const unlimited = maxAttempts <= 0;
   const isRateLimit =
     reason?.toLowerCase().includes("rate limit") ||
@@ -1060,7 +1132,15 @@ export function RetryBanner({
       : " — retrying…";
   // The tool that owns the retry (e.g. "explore") + the agent label, joined so
   // the user can tell a main-agent retry from a specific tool's at a glance.
-  const tags = [...(tool ? [`tool: ${tool}`] : []), ...(agent ? [agent] : [])];
+  // Skipped when the agent label already names the tool ("explore subagent" vs
+  // "explore"): repeating it as "tool: explore, explore subagent" is noise.
+  const tags = agent
+    ? tool && !agent.toLowerCase().includes(tool.toLowerCase())
+      ? [`tool: ${tool}`, agent]
+      : [agent]
+    : tool
+      ? [`tool: ${tool}`]
+      : [];
   const who = model
     ? ` — ${model}${tags.length ? ` (${tags.join(", ")})` : ""}`
     : tags.length
@@ -1069,27 +1149,107 @@ export function RetryBanner({
   // A sub-agent (explore/task/…) retry: it runs INSIDE the parent turn, so
   // calling it a "provider" hiccup would be misleading — the wording names it.
   const subAgent = !!agent && !fallback;
+  // Exhausted-retire: when the banner says the attempt count is at its cap.
+  // `unlimited` (maxAttempts <= 0) is the OPPOSITE of a cap: folding it in made
+  // every unlimited retry render the "still trying" line instead of its
+  // countdown, i.e. the banner hid the retry it was supposed to offer.
+  const atLimit = maxAttempts > 0 && attempt >= maxAttempts;
+  // Transient banners dissolve: a press-down period (READ_MS, fully readable),
+  // then the full fade-out (FADE_MS, timed to the CSS animation). Hooks above
+  // must stay unconditional — this is a prop, not a render-mode branch.
+  const [leaving, setLeaving] = useState(false);
+  useEffect(() => {
+    if (!transient) {
+      // A banner that STOPS being transient (the retry resolved, the turn
+      // resumed) must not stay stuck half-faded.
+      setLeaving(false);
+      return;
+    }
+    // A NEW notice — a second failure, a fresh cycle — starts fully readable
+    // again instead of inheriting the previous one's half-faded state.
+    setLeaving(false);
+    const a = setTimeout(() => setLeaving(true), READ_MS);
+    return () => clearTimeout(a);
+  }, [transient, reason, startedAt]);
+  useEffect(() => {
+    if (!transient || !leaving || !onRetire) return;
+    const t = setTimeout(onRetire, FADE_MS);
+    return () => clearTimeout(t);
+  }, [transient, leaving, onRetire]);
+  // Provider bodies arrive pasted in raw (escaped JSON and all) and can run to
+  // several screen lines. The banner shows the sentence inside them; the full
+  // text stays reachable through the tooltip (`title`).
+  const detail = fallback
+    ? fallbackReason(reason ?? "")
+    : humanizeError(reason ?? "");
+  // Label and suffix are computed BEFORE the early-return branches below: the
+  // capped branch renders the attempt suffix, and declaring it after that
+  // return put the variable in its temporal dead zone — every gave-up render
+  // threw `Cannot access 'suffix' before initialization` instead of showing a
+  // banner.
+  const label = subAgent
+    ? "Sub-agent retrying"
+    : isRateLimit
+      ? "Provider rate limit"
+      : "Provider hiccup";
+  const suffix = unlimited
+    ? ` (attempt ${attempt})${countdown}`
+    : ` (${attempt}/${maxAttempts})${countdown}`;
   // A sub-agent model hard-failed and the tool fell back to the MAIN model.
   // Distinct banner: no spinner, no retry button — the fallback already ran.
   if (fallback) {
     return (
       <div
-        className="retry-banner retry-banner-fallback"
+        className={[
+          "retry-banner",
+          "retry-banner-fallback",
+          ...(transient && leaving ? ["retry-banner--fading"] : []),
+        ].join(" ")}
         title={reason || undefined}
       >
         <span className="retry-fallback-icon" aria-hidden>
           ⚠
         </span>
-        <span>
-          Sub-agent failed — using main model
+        <span className="retry-text">
+          Sub-agent hit a wall — switched to the main model
           {who ? <span className="retry-who">{who}</span> : null}
-          {reason ? <span className="retry-reason"> — {reason}</span> : null}
+          {detail ? <span className="retry-reason"> — {detail}</span> : null}
         </span>
+      </div>
+    );
+  }
+  // Attempt capped: nothing left to ride but pressure. One message, one line,
+  // no countdown — and transient: the turn has either already moved on or is
+  // about to surface its real error; lingering would stay unreadable noise.
+  if (gaveUp || atLimit) {
+    const ranOut = gaveUp === true;
+    return (
+      <div
+        className={[
+          "retry-banner",
+          ...(transient && leaving ? ["retry-banner--fading"] : []),
+        ].join(" ")}
+        title={reason || undefined}
+      >
+        {!ranOut && <span className="spinner" />}
+        <span className="retry-text">
+          {agent ? `${agent} — ` : ""}
+          {ranOut
+            ? "kept failing after retries"
+            : `still trying (${attempt}/${maxAttempts})`}
+          {who ? <span className="retry-who">{who}</span> : null}
+          {detail ? <span className="retry-reason"> — {detail}</span> : null}
+        </span>
+        {onRetry && (
+          <button className="retry-btn" onClick={() => void onRetry()}>
+            Retry
+          </button>
+        )}
         {onCancel && (
           <button
             className="retry-cancel"
             onClick={onCancel}
-            title="Cancel retry"
+            title="Dismiss"
           >
             ✕
           </button>
@@ -1097,26 +1257,7 @@ export function RetryBanner({
       </div>
     );
   }
-  const label = gaveUp
-    ? watchdog
-      ? "Connection lost"
-      : attempt > 1
-        ? "Retry limit reached"
-        : "Provider rejected the request"
-    : isRateLimit
-      ? "Provider rate limit"
-      : unlimited
-        ? "Provider rate limit"
-        : subAgent
-          ? "Sub-agent retrying"
-          : "Provider hiccup";
-  const suffix = gaveUp
-    ? watchdog
-      ? ""
-      : ` (${attempt}/${maxAttempts})`
-    : unlimited
-      ? ` (attempt ${attempt})${countdown}`
-      : ` (${attempt}/${maxAttempts})${countdown}`;
+  // gave-up/watchdog wording is handled by the early return above.
   return (
     <div className="retry-banner" title={reason || undefined}>
       {!gaveUp && <span className="spinner" />}
@@ -1124,7 +1265,7 @@ export function RetryBanner({
         {label}
         {suffix}
         {who ? <span className="retry-who">{who}</span> : null}
-        {reason ? <span className="retry-reason"> — {reason}</span> : null}
+        {detail ? <span className="retry-reason"> — {detail}</span> : null}
         {stalled && !gaveUp ? (
           <span className="retry-stalled">
             {" "}
@@ -1135,10 +1276,30 @@ export function RetryBanner({
       {onRetry && (
         <button
           className="retry-btn"
-          onClick={onRetry}
-          title="Retry — resumes where it stopped without redoing completed work"
+          disabled={pending}
+          onClick={() => {
+            if (pending) return;
+            const out = onRetry();
+            // Async handler: hold the loading state until it settles. A sync
+            // one (resume the turn) restarts a stream, so the banner is about
+            // to be replaced anyway.
+            if (out && typeof (out as Promise<void>).then === "function") {
+              inFlight.current += 1;
+              setPending(true);
+              void (out as Promise<void>).finally(() => {
+                inFlight.current = Math.max(0, inFlight.current - 1);
+                if (inFlight.current === 0) setPending(false);
+              });
+            }
+          }}
+          title={
+            pending
+              ? "Retrying…"
+              : "Retry — resumes where it stopped without redoing completed work"
+          }
         >
-          Retry
+          {pending ? <span className="spinner retry-btn-spinner" /> : null}
+          {pending ? "Retrying…" : "Retry"}
         </button>
       )}
       {onCancel && (
@@ -1201,59 +1362,6 @@ function UsageBadge({
  * وقتی مدل reasoning تولید می‌کند و «Working» وقتی ایجنت مشغول کار است ولی
  * think نمی‌کند (اجرای ابزار، انتظار برای نتیجه و…).
  */
-/**
- * Quiet row listing the skills that were auto-matched into this turn.
- *
- * These are metadata about HOW the answer was produced, not part of the
- * answer: rendered as a single dim line (count + faint names) instead of
- * filled pills so a turn with several matches never competes visually with
- * the message itself. Click reveals the full list as plain text.
- */
-function AutoSkillsRow({ skills }: { skills: string[] }) {
-  const [open, setOpen] = useState(false);
-  const count = skills.length;
-  return (
-    <div className="msg-skills">
-      <button
-        type="button"
-        dir="ltr"
-        className={`msg-skills-head${open ? " open" : ""}`}
-        aria-expanded={open}
-        title={`${skills.join(" · ")} — auto-matched from your request and inlined into this turn's instructions`}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="msg-skills-icon" aria-hidden="true">
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 24 24"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M12 1.5 14.4 9.6 22.5 12 14.4 14.4 12 22.5 9.6 14.4 1.5 12 9.6 9.6Z" />
-          </svg>
-        </span>
-        <span className="msg-skills-label">
-          {count === 1 ? "1 skill" : `${count} skills`}
-        </span>
-        {!open && <span className="msg-skills-preview">{skills.join(" · ")}</span>}
-        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
-          ▾
-        </span>
-      </button>
-      {open && (
-        <ul className="msg-skills-list">
-          {skills.map((sk) => (
-            <li className="msg-skills-item" key={`autoskill-${sk}`}>
-              {sk}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
 export function ThinkingIndicator({
   startedAt,
   label = "Thinking",
@@ -1321,6 +1429,22 @@ export function isCollapsibleText(text: string): boolean {
   );
 }
 
+// Above this size a message is too big to paint inline at all: it keeps a
+// short preview in the chat and the full text opens in the side panel.
+const USER_PANEL_CHARS = 4000;
+const USER_PANEL_LINES = 100;
+
+/** True for a message that must open in the side panel instead of unfolding
+ *  in the chat. Only a VERY long text (a pasted log/dump) qualifies — a
+ *  merely long one expands in place, because clicking "Show more" should not
+ *  move a message the user can already read out of the conversation. */
+export function opensInPanel(text: string): boolean {
+  return (
+    text.length > USER_PANEL_CHARS ||
+    text.split("\n").length > USER_PANEL_LINES
+  );
+}
+
 /** Tab title for a full-text side panel: the first non-empty line, capped. */
 function textTabTitle(text: string, fallback: string): string {
   const firstLine = text.split("\n").find((l) => l.trim())?.trim() ?? "";
@@ -1378,13 +1502,20 @@ function UserMessageBubble({
     el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
   }, [isEditing, draft]);
   const content = message.content || "";
-  const isLong =
-    content.length > USER_COLLAPSE_CHARS ||
-    content.split("\n").length > USER_COLLAPSE_LINES;
-  // Folded preview only: the full text opens in the side panel (right), never
-  // expands inline — long texts read like diff/plan tabs.
-  const body = isLong ? content.slice(0, USER_COLLAPSE_CHARS) : content;
-  const clamped = isLong;
+  // Two separate limits: `folded` clamps the bubble to a preview, while
+  // `inPanel` marks a HUGE text (pasted log/dump) whose full body is only
+  // readable in the side panel. A merely long message unfolds IN PLACE, so
+  // "Show more" never moves something the user can already read out of the
+  // conversation (user request).
+  const folded = isCollapsibleText(content);
+  const inPanel = folded && opensInPanel(content);
+  const [expanded, setExpanded] = useState(false);
+  // Virtualized bubbles recycle: a fold state must not leak to the next message.
+  useEffect(() => setExpanded(false), [message.id]);
+  const showFull = folded && !inPanel && expanded;
+  const body =
+    folded && !showFull ? content.slice(0, USER_COLLAPSE_CHARS) : content;
+  const clamped = folded && !showFull;
 
   const copy = async () => {
     try {
@@ -1456,17 +1587,25 @@ function UserMessageBubble({
           {cachedPrepare(message.id, body, dir) || "(empty)"}
         </div>
         )}
-        {!isEditing && isLong && (
+        {!isEditing && folded && (
           <button
             className="msg-expand"
-            onClick={() =>
+            onClick={() => {
+              if (!inPanel) {
+                setExpanded((v) => !v);
+                return;
+              }
               useViewerTabs
                 .getState()
-                .openText(textTabTitle(content, "Message"), content)
+                .openText(textTabTitle(content, "Message"), content);
+            }}
+            title={
+              inPanel
+                ? "Open the full text in the side panel"
+                : undefined
             }
-            title="Open the full text in the side panel"
           >
-            Show more
+            {inPanel ? "Show more" : expanded ? "Show less" : "Show more"}
           </button>
         )}
         {message.attachments && message.attachments.length > 0 && (
@@ -1631,7 +1770,12 @@ export function QueuedCollapsibleText({
   editingDisabled?: boolean;
 }) {
   const dir = useStore((s) => s.dir);
-  const isLong = isCollapsibleText(text);
+  const folded = isCollapsibleText(text);
+  // Same rule as the user bubble: a huge text keeps a preview and opens in the
+  // panel, anything merely long unfolds in place.
+  const inPanel = folded && opensInPanel(text);
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => setExpanded(false), [id]);
   // Inline edit mode: same UX as UserMessageBubble — the text swaps for a
   // textarea with Save/Cancel.
   const [isEditing, setIsEditing] = useState(false);
@@ -1700,22 +1844,30 @@ export function QueuedCollapsibleText({
       ) : (
         <>
           <div
-            className={`queued-bubble-text${isLong ? " clamped" : ""}`}
+            className={`queued-bubble-text${folded && !expanded ? " clamped" : ""}`}
             dir={detectDir(text)}
           >
             {cachedPrepare(id, text, dir) || "(empty)"}
           </div>
-          {isLong && (
+          {folded && (
             <button
               className="msg-expand queued-expand"
-              onClick={() =>
+              onClick={() => {
+                if (!inPanel) {
+                  setExpanded((v) => !v);
+                  return;
+                }
                 useViewerTabs
                   .getState()
-                  .openText(textTabTitle(text, "Queued text"), text)
+                  .openText(textTabTitle(text, "Queued text"), text);
+              }}
+              title={
+                inPanel
+                  ? "Open the full text in the side panel"
+                  : undefined
               }
-              title="Open the full text in the side panel"
             >
-              Show more
+              {inPanel ? "Show more" : expanded ? "Show less" : "Show more"}
             </button>
           )}
         </>
@@ -2036,6 +2188,15 @@ export function renderSegments(
       }
       return;
     }
+    if (seg.kind === "artifact") {
+      // An artifact card sits where the agent built it, between the prose that
+      // introduced it and whatever comes next — not appended at the end.
+      flush();
+      wrapTrace();
+      flushEdits();
+      nodes.push(<ArtifactCard key={i} segment={seg} />);
+      return;
+    }
     if (seg.kind === "text") {
       // Whitespace-only text (the model often emits a bare "\n\n" between two
       // tool calls, with no narration around it): pure formatting noise.
@@ -2277,6 +2438,16 @@ export const ChatMessageView = memo(
   // replies render caption slices around tool cards (small by construction);
   // the full text stays in history/copy regardless.
   const cap = useCapped(message.id, displayContent ?? "", !!message.streaming);
+  // A reply only leaves the chat when it is VERY long (a dumped log): it then
+  // keeps a short preview here and the full body opens in the side panel.
+  // Anything shorter renders in full, exactly as before — the chat must not
+  // grow a "Show more" for every ordinary answer. Streaming replies are never
+  // folded (that would flicker).
+  const replyText = displayContent ?? message.content ?? "";
+  const replyInPanel = !message.streaming && opensInPanel(replyText);
+  const replyBody = replyInPanel
+    ? replyText.slice(0, USER_COLLAPSE_CHARS)
+    : cap.shown;
 
   // Reading mode: only assistant replies with ≥2 headed sections get the
   // "مطالعه" button — short answers don't need a two-pane viewer.
@@ -2517,22 +2688,19 @@ export const ChatMessageView = memo(
         ) : (
           <>
             <div className="msg-bubble">
-              <MarkdownProse text={cachedPrepare(message.id, cap.shown, dir)} />
+              <MarkdownProse text={cachedPrepare(message.id, replyBody, dir)} />
             </div>
-            {cap.over && (
+            {replyInPanel && (
               <button
                 className="msg-expand"
                 onClick={() =>
                   useViewerTabs
                     .getState()
-                    .openText(
-                      textTabTitle(displayContent ?? message.content, "Reply"),
-                      displayContent ?? message.content,
-                    )
+                    .openText(textTabTitle(replyText, "Reply"), replyText)
                 }
-                title={`Full reply is ${fmtSize((displayContent ?? "").length)} — opens in the side panel`}
+                title={`Full reply is ${fmtSize(replyText.length)} — opens in the side panel`}
               >
-                Show all ({fmtSize(cap.cut)} more)
+                {`Show all (${fmtSize(replyText.length)})`}
               </button>
             )}
           </>
@@ -2542,9 +2710,6 @@ export const ChatMessageView = memo(
 
       {!isUser && planDoc && <PlanDocCard planDoc={planDoc} />}
 
-      {!isUser && message.autoSkills && message.autoSkills.length > 0 && (
-        <AutoSkillsRow skills={message.autoSkills} />
-      )}
 
       {!isUser && message.interrupted && (
         <div className="msg-interrupted" dir="auto">

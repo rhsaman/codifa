@@ -702,6 +702,11 @@ export interface StreamParams {
   /** Per-tool reasoning-effort overrides, keyed by the same slot names as
    *  `subagentModels`. A missing key means "inherit the main model's level". */
   subagentThinking?: Record<string, string>
+  /** Per-tool fallback models (Settings → Tools), keyed by slot name, each a
+   *  "providerId/model" list tried top-to-bottom while THAT tool's own model
+   *  fails. A fallback inherits the tool's reasoning level and is never
+   *  remembered: the next call starts at the tool's own model again. */
+  toolFallbacks?: Record<string, string[]>
   /** Full provider configs keyed by provider id, so a "providerId/model"
    *  subagent entry is routed to that provider's own base URL / key. */
   providers?: Record<string, ProviderConfig>
@@ -884,6 +889,7 @@ export async function streamChat(
           allow_browser: params.allowBrowser ?? false,
           subagent_models: params.subagentModels ?? {},
           subagent_thinking: params.subagentThinking ?? {},
+          tool_fallbacks: params.toolFallbacks ?? {},
           providers: params.providers ?? {},
           // Single auto-compaction threshold as a percentage of the raw window.
           compact_at_percent: params.compactAtPercent ?? 80,
@@ -1095,6 +1101,17 @@ export async function triggerCompact(params: {
   /** Per-tool reasoning overrides so the compact slot can carry its own
    *  effort; the main level is the fallback for the slot and the primary. */
   subagentThinking?: Record<string, string>
+  /** Per-tool fallback models for the compact slot (and the "Other" group it
+   *  shares), tried in list order when the summariser model fails. */
+  toolFallbacks?: Record<string, string[]>
+  /** Per-slot sub-agent model picks, so the backend can resolve the "Other"
+   *  group's own model AND its own provider. Without them a slot model that
+   *  lives on a different provider is called with the chat's keys and address,
+   *  which is exactly the "key rejected (401)" failure. */
+  subagentModels?: Record<string, string>
+  /** Full provider configs keyed by id, so a cross-provider slot model (and
+   *  every fallback rung) is called with its OWN keys and base URL. */
+  providers?: Record<string, unknown>
   thinkingLevel?: string
   modelReasoning?: boolean
   /** Called on every live progress tick the backend streams while the
@@ -1112,14 +1129,20 @@ export async function triggerCompact(params: {
       provider: params.provider.kind,
       model: params.provider.model,
       base_url: params.provider.baseUrl,
-      api_keys: params.provider.apiKeys,
+      // Filtered like every other route: a blank entry in `apiKeys` passed the
+      // backend's `is_empty()` guard and went out as `Authorization: Bearer `
+      // (empty), which the provider answers with a bare "Invalid API key" 401.
+      api_keys: providerKeys(params.provider),
       provider_id: params.provider.id ?? '',
       fallback_provider: params.fallback.kind,
       fallback_model: params.fallback.model,
       fallback_base_url: params.fallback.baseUrl,
-      fallback_api_keys: params.fallback.apiKeys,
+      fallback_api_keys: providerKeys(params.fallback),
       fallback_provider_id: params.fallback.id ?? '',
       subagent_thinking: params.subagentThinking ?? {},
+      subagent_models: params.subagentModels ?? {},
+      tool_fallbacks: params.toolFallbacks ?? {},
+      providers: params.providers ?? {},
       thinking_level: params.thinkingLevel ?? '',
       model_reasoning: params.modelReasoning ?? false,
       history: params.history,
@@ -1270,6 +1293,27 @@ export async function retrySubagentNow(chatId: string): Promise<boolean> {
   }
 }
 
+/** Push a Tool Models change to the backend so a RUNNING sub-agent ladder picks
+ *  it up before its next attempt.
+ *
+ *  `/chat/stream` carries `subagent_models` as a snapshot, so fixing the
+ *  sub-agent model mid-retry used to have no effect until the next turn — the
+ *  ladder kept retrying the model the user had just replaced. Fire-and-forget:
+ *  a failure only means the next turn applies the change instead. */
+export async function pushSlotModel(slot: string, model: string): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/chat/slot_model`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slot, model }),
+    })
+  } catch {
+    /* the setting is persisted locally either way */
+  }
+}
+
 /** Token usage of a title call, billed under the provider/model that ran it. */
 export interface ChatTitleUsage {
   input_tokens?: number
@@ -1289,6 +1333,9 @@ export async function requestChatTitle(params: {
   provider: ProviderConfig
   subagentModels?: Record<string, string>
   subagentThinking?: Record<string, string>
+  /** Per-tool fallback models, keyed by slot name — the title slot (and the
+   *  "Other" group it shares with compact/web) retries on these in order. */
+  toolFallbacks?: Record<string, string[]>
   providers?: Record<string, ProviderConfig>
   /** Whether the chat's main model is reasoning-capable. Gates the title
    *  slot's reasoning parameter the same way the main call gates it. */
@@ -1314,6 +1361,7 @@ export async function requestChatTitle(params: {
         model: params.provider.model,
         subagent_models: params.subagentModels ?? {},
         subagent_thinking: params.subagentThinking ?? {},
+        tool_fallbacks: params.toolFallbacks ?? {},
         providers: params.providers ?? {},
         model_reasoning: params.modelReasoning ?? false,
         text: params.text,
@@ -1451,6 +1499,8 @@ export interface SkillRow {
   /** Persian phrases that should trigger this skill (matches a Persian ask). */
   fa_keywords?: string[]
   files?: string[]
+  /** Owning plugin's display name, when the skill ships inside a plugin. */
+  plugin?: string
 }
 
 export interface SkillSyncResult {
@@ -1461,31 +1511,45 @@ export interface SkillSyncResult {
   removed?: boolean
   /** Extra files kept in the skill folder (slug -> name). */
   files?: string[]
-  /** Number of Persian keywords stored; 0 means auto-match can never pick it. */
+  /** Number of Persian keywords stored; 0 means no Persian request can find it. */
   fa_keyword_count?: number
   /** Previous name when the save renamed an existing skill. */
   renamed_from?: string
 }
 
-/** List all skills (file-based storage in the sidecar's skill dir). */
-export async function listSkills(): Promise<SkillRow[]> {
+/** Shared reader for both skill catalogs; `label` only shapes the log line. */
+async function fetchSkillRows(path: string, label: string): Promise<SkillRow[]> {
   const url = await ensureSidecar()
   if (!url) {
-    console.error('[skills] listSkills: sidecar not available')
+    console.error(`[skills] ${label}: sidecar not available`)
     return []
   }
   try {
-    const res = await fetch(`${url}/skills`)
+    const res = await fetch(`${url}${path}`)
     if (!res.ok) {
-      console.error(`[skills] listSkills: /skills returned ${res.status}`)
+      console.error(`[skills] ${label}: ${path} returned ${res.status}`)
       return []
     }
     const data = (await res.json()) as { skills?: SkillRow[] }
     return data.skills ?? []
   } catch (err) {
-    console.error('[skills] listSkills: fetch failed', err)
+    console.error(`[skills] ${label}: fetch failed`, err)
     return []
   }
+}
+
+/** List the skills in the standalone store — what Settings edits and deletes. */
+export async function listSkills(): Promise<SkillRow[]> {
+  return fetchSkillRows('/skills', 'listSkills')
+}
+
+/** List EVERY skill the agent can load: the standalone store PLUS the skills of
+ *  every enabled plugin (mirrors `skill_router::load_skills`). Plugin skills
+ *  carry a `plugin` label and are what the composer turns into `/`-commands,
+ *  so a skill a plugin ships is invocable by the name its install message
+ *  advertises instead of answering "Unknown command". */
+export async function listAvailableSkills(): Promise<SkillRow[]> {
+  return fetchSkillRows('/skills/available', 'listAvailableSkills')
 }
 
 /** Fetch one extra (Codex-style) file of a skill. Null when missing. */

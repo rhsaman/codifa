@@ -7,6 +7,9 @@
 //! and no extra model call — only the skills the user attached (`@mention`) are
 //! inlined whole.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use serde_json::Value;
 
 use crate::skills;
@@ -20,221 +23,11 @@ const CATALOG_MAX_CHARS: usize = 6_000;
 
 /// Result of building the SKILLS section for one turn.
 pub struct SkillSection {
-    /// BYTE-STABLE part: the catalog plus the skills the user attached with an
-    /// `@mention`. Goes into the system prompt, which every request re-sends.
+    /// The catalog plus the skills the user attached with an `@mention`. Goes
+    /// into the system prompt, which every request re-sends.
     pub text: String,
-    /// PER-TURN part: the bodies of the auto-matched skills.
-    ///
-    /// This must NOT go into the system prompt. Auto-match is recomputed from
-    /// the current user message on every turn, so a prompt whose keywords pick
-    /// a different skill rewrites the system prompt and invalidates the cached
-    /// prefix of the WHOLE conversation. A measured trace showed exactly that:
-    /// two consecutive main turns diverged at char 8 696 inside
-    /// `=== AUTO-MATCHED SKILLS ===` and the next call cost 96 460 uncached
-    /// tokens instead of riding the cache. The caller appends this to the
-    /// TRAILING message instead (same treatment as the plan/checklist section),
-    /// where per-turn churn cannot move anything the previous call cached.
-    pub volatile: String,
     /// Attached names that no longer exist in the store.
     pub missing: Vec<String>,
-    /// Names AUTO-MATCHED from the user's prompt this turn. The renderer shows
-    /// them as ⚡ chips, so the user can see which skill actually ran.
-    pub matched: Vec<String>,
-}
-
-/// Auto-match budget: how many skills one turn may pick up from the prompt.
-const MAX_AUTO_MATCHED: usize = 3;
-/// Minimum score (see `skill_score`) before a skill is auto-inlined. 2 means a
-/// single name word is not enough on its own — the request must agree on two
-/// signals, or carry one complete `fa_keywords` phrase (or ONE word of one).
-const MATCH_MIN_SCORE: usize = 2;
-/// How far below the best score a skill may sit and still be inlined.
-///
-/// An absolute threshold alone cannot express "this one is clearly the topic":
-/// with only `score >= 2`, a prompt scoring 6 for `summarization` also dragged
-/// in an unrelated skill that scraped a 2. Relative filtering keeps the winner
-/// plus its genuine near-ties (`design a landing page` keeps landing-page-design
-/// and Hallmark) and drops the noise. Measured over the labelled set: no correct
-/// pick lost, the trailing stragglers gone.
-const AUTO_MATCH_WINDOW: usize = 1;
-
-/// Lowercase + whitespace-collapse, used for prompt/keyword matching.
-fn normalize_text(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
-/// Shortest word that counts as a match signal.
-///
-/// 4 was wrong for Persian: the language is built from short words, so
-/// `این باگ رو درست کن` kept only `درست` and dropped `باگ` — the exact word the
-/// Code-Expert skill lists. `commit this and push` likewise lost `git` and
-/// scored 1 instead of a match. Measured over a labelled set of 19 prompts:
-/// 3 recovers every miss the 4-char floor caused with no new false positive
-/// (the word-boundary rule, not the length, is what keeps matching honest).
-const MIN_WORD_CHARS: usize = 3;
-
-/// Distinctive words of a phrase, for partial keyword hits.
-fn words_of(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.chars().count() >= MIN_WORD_CHARS)
-        .map(|w| w.to_lowercase())
-        .collect()
-}
-
-/// Shared prefix needed before two words can be the same stem.
-const STEM_PREFIX_MIN: usize = 5;
-
-/// Word endings that never change what the word is about.
-///
-/// The first version compared raw lengths (allow a 1-char tail) and got both
-/// cases wrong: it accepted `data`/`dataset` (a different word) while rejecting
-/// `refactor`/`refactoring` (the same one), because both differ by three
-/// characters. Length cannot separate them — the actual signal is WHICH letters
-/// the tail is made of. So the tail must be one of these morphemes on BOTH
-/// sides; `ing`/`ion` are inflections, `set` is a different noun.
-const STEM_SUFFIXES: [&str; 22] = [
-    "", "s", "es", "e", "ed", "d", "ing", "ging", "r", "er", "ers", "ion", "ions", "ation",
-    "ations", "ly", "is", "sis", "ze", "al", "ment", "ments",
-];
-
-/// Whether two lowercase words are the same word up to an inflection.
-///
-/// The user types one form while the skill lists another — `refactor` vs
-/// `refactoring`, `debug` vs `debugging`, `analyze` vs `analysis`, `brainstorm`
-/// vs `brainstorming`, `translate` vs `translation` — and an exact word-set
-/// comparison missed every one of them. A real stemmer is overkill here; the
-/// rule is: a long enough shared prefix plus an inflection-only tail.
-///
-/// Rejects `data`/`dataset` (shared prefix only 4, and `set` is not an
-/// inflection), so unrelated skills are not dragged in.
-fn same_stem(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let shared = a
-        .chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .count();
-    if shared < STEM_PREFIX_MIN {
-        return false;
-    }
-    let tail = |w: &str| -> String { w.chars().skip(shared).collect() };
-    let (ta, tb) = (tail(a), tail(b));
-    STEM_SUFFIXES.contains(&ta.as_str()) && STEM_SUFFIXES.contains(&tb.as_str())
-}
-
-/// Whether any prompt word matches `word` (exactly or as the same stem).
-fn word_in(word: &str, prompt_words: &[String]) -> bool {
-    prompt_words.iter().any(|p| same_stem(word, p))
-}
-
-/// Whether any prompt word equals `word` exactly.
-///
-/// The skill NAME is a label, not a curated keyword list: its words are generic
-/// (`optimization`, `analysis`, `design`) and stem-expanding them drags the
-/// skill into requests about something else — `optimize the sql query` reached
-/// `seo-optimization` through `optimize` -> `optimization` and inlined an SEO
-/// skill into a database question. Inflection tolerance belongs to the
-/// `fa_keywords` the author wrote on purpose, so name/slug matching stays exact.
-fn word_in_exact(word: &str, prompt_words: &[String]) -> bool {
-    prompt_words.iter().any(|p| p == word)
-}
-
-/// Whether `needle` occurs in `hay` at WORD boundaries.
-///
-/// A bare `hay.contains(needle)` was wrong for short keywords: the Playwrite
-/// skill lists `ref`, which matched inside "**ref**actor this module" and
-/// "this is a **pref**erence setting" and pulled a browser-automation skill
-/// into ordinary coding requests. Both sides of the match must be a non-word
-/// character (or a string edge).
-///
-/// Both arguments are already lowercased (`normalize_text`); the check is on
-/// `char::is_alphanumeric` so it holds for Persian as well as ASCII — `باگ`
-/// still matches inside `این باگ رو` because the neighbours are spaces.
-fn contains_phrase(hay: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut from = 0usize;
-    while let Some(rel) = hay[from..].find(needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let before_ok = hay[..start].chars().next_back().is_none_or(|c| !is_word(c));
-        let after_ok = hay[end..].chars().next().is_none_or(|c| !is_word(c));
-        if before_ok && after_ok {
-            return true;
-        }
-        // Advance past the first char of this hit (never inside a UTF-8 char).
-        from = start + hay[start..].chars().next().map(chars_len).unwrap_or(1);
-    }
-    false
-}
-
-/// Byte length of one char (helper so `contains_phrase` can advance safely).
-fn chars_len(c: char) -> usize {
-    c.len_utf8()
-}
-
-/// How well one skill matches an already-normalized prompt.
-///
-/// Weighted on purpose: the user's own `fa_keywords` phrase is the strongest
-/// signal (it is literally what they type), then the skill's name/slug, then
-/// the individual words of a multi-word keyword. The description is
-/// deliberately NOT used — it is prose, and matching it fired on almost every
-/// request.
-fn skill_score(s: &Value, hay: &str) -> usize {
-    let mut score = 0usize;
-    // Matching is WORD-based, never raw substring: `hay.contains("data")` also
-    // fired inside "metadata"/"database", so unrelated skills were pulled into
-    // prompts that never mentioned them (the "it loads the wrong skill" report).
-    let prompt_words: Vec<String> = words_of(hay);
-    let name_words = words_of(s["name"].as_str().unwrap_or_default());
-    let slug_words = words_of(s["slug"].as_str().unwrap_or_default());
-    let name_hits = name_words
-        .iter()
-        .chain(slug_words.iter())
-        .filter(|w| word_in_exact(w, &prompt_words))
-        .count();
-    // Capped so a generic name cannot outrank a real keyword match.
-    score += name_hits.min(2);
-
-    if let Some(kws) = s["fa_keywords"].as_array() {
-        for kw in kws.iter().filter_map(Value::as_str) {
-            let kw = normalize_text(kw);
-            if kw.chars().count() < 3 {
-                continue;
-            }
-            if contains_phrase(hay, &kw) {
-                // The complete phrase is in the request: strongest signal.
-                score += 3;
-                continue;
-            }
-            let kw_words = words_of(&kw);
-            if kw_words.is_empty() {
-                continue;
-            }
-            let hits = kw_words.iter().filter(|w| word_in(w, &prompt_words)).count();
-            if kw_words.len() == 1 {
-                // A ONE-WORD keyword is the whole signal, not a fragment of a
-                // longer phrase: `باگ` / `فیلم` / `translate` matching its word
-                // means exactly what a multi-word phrase matching would mean.
-                // Scoring it +1 made every single-word keyword (which is most
-                // of them) unable to reach the threshold on its own — the
-                // reported "auto-skill never picks anything" bug. Only a partial
-                // hit of a MULTI-word keyword stays at +1 per word.
-                if hits == 1 {
-                    score += 3;
-                }
-            } else {
-                // Multi-word keyword ("landing page design") still matches a
-                // shorter paraphrase ("landing page") word by word.
-                score += hits;
-            }
-        }
-    }
-    score
 }
 
 /// One inlined skill (the ones the user attached with `@mention`).
@@ -276,82 +69,330 @@ fn format_skill_body(s: &Value) -> String {
 /// The Persian keywords are part of the line on purpose: the catalog is the
 /// only thing the model sees before deciding to call `load_skill`, so a skill
 /// whose description is English-only would never be found from a Persian
-/// request. Emitting the user's own keywords keeps matching language-agnostic
-/// without any embedding or classifier.
+/// request. Emitting the user's own keywords keeps the catalog findable from
+/// the way the user actually writes, without any embedding or classifier.
+///
 /// Bytes reserved so the "list truncated" note always fits inside the cap.
 const CATALOG_TRUNCATE_NOTE_RESERVE: usize = 160;
 
-fn catalog(all: &[Value]) -> String {
+/// Longest description one catalog line keeps.
+const CATALOG_DESC_MAX_CHARS: usize = 120;
+
+/// Most `fa_keywords` one catalog line carries (the user's order is kept: the
+/// first ones are the ones they actually say).
+const CATALOG_KEYWORDS_MAX: usize = 6;
+
+/// Ceiling on the description+keywords part of a single line, so one verbose
+/// skill cannot eat the room every other skill needs.
+const CATALOG_DETAIL_PER_ROW: usize = 180;
+
+/// Clip to `max` CHARACTERS on a word boundary (byte slicing would panic on the
+/// Persian keywords, which are multi-byte).
+fn clip_words(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    match cut.rfind(' ') {
+        Some(i) if i > 0 => format!("{}…", cut[..i].trim_end()),
+        _ => format!("{cut}…"),
+    }
+}
+
+/// The `: description [fa: …]` tail of one catalog line, fitted into `room`
+/// bytes. The Persian keywords are the trigger, so they are kept whole (already
+/// capped by the caller); the DESCRIPTION absorbs the clipping.
+fn catalog_detail(desc: &str, fa: &[&str], room: usize) -> String {
+    let mut kw = if fa.is_empty() {
+        String::new()
+    } else {
+        format!(" [fa: {}]", fa.join(", "))
+    };
+    let mut detail_room = room;
+    if !kw.is_empty() {
+        if kw.len() < detail_room {
+            detail_room -= kw.len();
+        } else {
+            kw.clear();
+        }
+    }
     let mut out = String::new();
-    let mut truncated = false;
-    for s in all {
-        let name = s["name"].as_str().unwrap_or_default().trim();
-        if name.is_empty() {
-            continue;
+    if !desc.is_empty() && detail_room > 4 {
+        let clip = (detail_room - 2).min(CATALOG_DESC_MAX_CHARS);
+        let clipped = clip_words(desc, clip);
+        if !clipped.is_empty() {
+            out.push_str(": ");
+            out.push_str(&clipped);
         }
-        let desc = s["description"].as_str().unwrap_or_default().trim();
-        let fa: Vec<&str> = s["fa_keywords"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).collect())
-            .unwrap_or_default();
-        let mut line = format!("- {name}");
-        if !desc.is_empty() {
-            line.push_str(&format!(": {desc}"));
-        }
-        if !fa.is_empty() {
-            line.push_str(&format!(" [fa: {}]", fa.join(", ")));
-        }
-        line.push('\n');
-        if out.len() + line.len() + CATALOG_TRUNCATE_NOTE_RESERVE > CATALOG_MAX_CHARS {
-            truncated = true;
+    }
+    out.push_str(&kw);
+    out
+}
+
+/// `- name: description [fa: کلمات]` line per installed skill: everything the
+/// model gets up front, and nothing more.
+///
+/// This line IS the trigger for `load_skill`. A skill whose description is
+/// English-only is unreachable from a Persian request, which is why the user's
+/// own keywords are emitted verbatim rather than translated.
+fn catalog(all: &[Value]) -> String {
+    let rows: Vec<(&str, &str, Vec<&str>, Option<String>)> = all
+        .iter()
+        .filter_map(|s| {
+            let name = s["name"].as_str().unwrap_or_default().trim();
+            if name.is_empty() {
+                return None;
+            }
+            let desc = s["description"].as_str().unwrap_or_default().trim();
+            let fa: Vec<&str> = s["fa_keywords"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|k| !k.is_empty())
+                        .take(CATALOG_KEYWORDS_MAX)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A skill that ships inside a plugin is ALSO a `/`-command in the
+            // composer, so the catalog has to name it: an installer script that
+            // says "try /ponytail" produced "Unknown command" because the model
+            // had no way to learn the command existed.
+            let command = s["plugin"].as_str().and_then(|_| {
+                let slug = s["slug"].as_str().unwrap_or_default().trim();
+                if slug.is_empty() {
+                    None
+                } else {
+                    Some(slug.to_string())
+                }
+            });
+            Some((name, desc, fa, command))
+        })
+        .collect();
+
+    // The bare name of EVERY skill is paid for first, and the leftover room is
+    // then split evenly. A catalog that silently dropped the tail made the last
+    // installed skills unreachable: with 25 installed skills their full-length
+    // descriptions overflowed the cap and three of them disappeared from the
+    // list — the model never learned they existed, so `load_skill` was never
+    // called for them. Detail is what gets sacrificed, never the entry itself.
+    let heads: Vec<String> = rows
+        .iter()
+        .map(|(name, _, _, command)| match command {
+            // A plugin skill is invocable as `/<slug>` in the composer, so its
+            // line names the command: a bundle whose install output says "try
+            // /ponytail" left the model unable to explain how to run it, and
+            // the user got "Unknown command".
+            Some(cmd) => format!("- {name} (command: /{cmd})"),
+            None => format!("- {name}"),
+        })
+        .collect();
+    let bare: usize = heads.iter().map(|h| h.len() + 1).sum();
+    let room = CATALOG_MAX_CHARS.saturating_sub(bare + CATALOG_TRUNCATE_NOTE_RESERVE);
+    let per_row = if rows.is_empty() { 0 } else { (room / rows.len()).min(CATALOG_DETAIL_PER_ROW) };
+
+    let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+    let mut detail_clipped = false;
+    for (i, (_name, desc, fa, _)) in rows.iter().enumerate() {
+        let head = &heads[i];
+        // The untrimmed detail (description up to its own cap plus every
+        // keyword) — comparing it to the row's even share is what separates a
+        // store that fits from one whose details had to be sacrificed.
+        let natural = catalog_detail(desc, &fa, CATALOG_DETAIL_PER_ROW);
+        let detail = if natural.len() <= per_row {
+            natural
+        } else {
+            detail_clipped = true;
+            catalog_detail(desc, &fa, per_row)
+        };
+        lines.push(format!("{head}{detail}"));
+    }
+
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    for line in &lines {
+        // Names are paid for first (see `per_row` above), so by construction a
+        // name alone always fits: this is a safety net, not the normal path.
+        if out.len() + line.len() + 1 + CATALOG_TRUNCATE_NOTE_RESERVE > CATALOG_MAX_CHARS {
+            dropped = lines.len() - out.lines().count();
             break;
         }
-        out.push_str(&line);
+        out.push_str(line);
+        out.push('\n');
     }
-    // Say so instead of silently ending the list: the model then knows a skill
-    // may exist that it cannot see, and can still load one the user names.
-    if truncated {
-        out.push_str(
-            "- …(more skills are installed than fit here — call load_skill with \
-             the name if the user names one)\n",
-        );
+    // Say so instead of silently ending the list, AND say how to reach what was
+    // left out: a store with hundreds of skills always overflows this cap, and a
+    // bare count would leave the model no way to find the ones it cannot see.
+    // (`load_skill query=` searches every installed skill without adding a byte
+    // to the prompt, which is the whole point of the capped catalog.)
+    if dropped > 0 || detail_clipped {
+        // Both notes must stay under CATALOG_TRUNCATE_NOTE_RESERVE bytes: that
+        // reserve is what the emit loop above holds back for them.
+        let note = if dropped > 0 {
+            format!(
+                "- …({dropped} more skill(s) are installed than fit here — call \
+                 load_skill with query=<words> to search all of them)\n"
+            )
+        } else {
+            "- …(descriptions are trimmed to fit; call load_skill with the name \
+             for a skill's full instructions)\n"
+                .to_string()
+        };
+        out.push_str(&note);
     }
     out
 }
 
-/// Load the skill store for a workspace root.
-fn load_skills(root: &str) -> Vec<Value> {
-    skills::list_skills(std::path::Path::new(root))["skills"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+/// Load the skill store for a workspace root: the standalone `<root>/skills`
+/// folder plus every ENABLED plugin's skills.
+///
+/// The standalone store is read first on purpose — a plugin must never shadow a
+/// skill the user saved directly, and a disabled plugin contributes nothing,
+/// which is how switching a plugin off removes its skills from the catalog.
+/// How many roots (data roots) `load_skills` keeps cached at once. A process
+/// normally has one, so the bound is only a safety net against a root that
+/// changes on every call (e.g. a caller passing a new temp dir each time).
+const SKILLS_CACHE_MAX: usize = 8;
+
+/// Change-detector for the two on-disk stores the catalog reads: every path
+/// under `<root>/skills` and `<root>/plugins` folded in as (path, mtime, size).
+///
+/// No file CONTENT is read, so a turn stops re-reading and re-parsing every
+/// `skill.md` — the cost that made a large store cost ~100 ms per turn. It is a
+/// filesystem signature rather than an invalidation hook on purpose: a skill
+/// written straight to disk (the app's own writer, a test, or the user's editor)
+/// still invalidates, which a mutation-hook cache would miss.
+fn store_signature(root: &str) -> u64 {
+    let mut acc: u64 = 0;
+    for base in ["skills", "plugins"] {
+        acc = acc.wrapping_add(tree_stamp(&std::path::Path::new(root).join(base), 0));
+    }
+    acc
 }
 
-/// Build the SKILLS section for one turn: the catalog of installed skills, the
-/// bodies of the ones the user attached, and the bodies of the ones that
-/// AUTO-MATCH the request.
+/// Order-independent stamp of one directory tree: the sum of every entry's
+/// (name, mtime, size) hash, so a rename, an edit, an add and a remove all
+/// change the result. Summing avoids collecting and sorting the tree, which
+/// made the stamp cost as much as the parse it is meant to save.
+fn tree_stamp(dir: &std::path::Path, depth: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // `<root>/plugins/<slug>/skills/<name>/skill.md` is depth 4; anything
+    // deeper is not part of the catalog and must not cost a walk.
+    if depth > 6 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut acc: u64 = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entry.file_name().hash(&mut hasher);
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        mtime.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        let mut stamp = hasher.finish();
+        if meta.is_dir() {
+            stamp ^= tree_stamp(&entry.path(), depth + 1).rotate_left(29);
+        }
+        acc = acc.wrapping_add(stamp);
+    }
+    acc
+}
+
+/// Per-root cache of `load_skills`, validated by `store_signature`.
+fn skills_cache() -> &'static Mutex<HashMap<String, (u64, Vec<Value>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (u64, Vec<Value>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Every skill the prompt may offer: the standalone store first, then the
+/// skills of every enabled plugin.
+fn read_skills_from_disk(root: &str) -> Vec<Value> {
+    let store = std::path::Path::new(root);
+    let mut all = skills::list_skills(store)["skills"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for row in crate::plugins::enabled_plugin_skills(store) {
+        if !all.iter().any(|s| s["name"] == row["name"]) {
+            all.push(row);
+        }
+    }
+    all
+}
+
+pub fn load_skills(root: &str) -> Vec<Value> {
+    let signature = store_signature(root);
+    if let Some(rows) = skills_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(root).filter(|(sig, _)| *sig == signature).map(|(_, r)| r.clone()))
+    {
+        return rows;
+    }
+    let all = read_skills_from_disk(root);
+    if let Ok(mut c) = skills_cache().lock() {
+        if c.len() >= SKILLS_CACHE_MAX && !c.contains_key(root) {
+            // Any eviction is fine: a miss simply re-reads the store.
+            if let Some(k) = c.keys().next().cloned() {
+                c.remove(&k);
+            }
+        }
+        c.insert(root.to_string(), (signature, all.clone()));
+    }
+    all
+}
+
+/// Build the SKILLS section for one turn: the catalog of installed skills plus
+/// the bodies of the ones the user attached.
 ///
 /// The catalog is what makes on-demand loading possible — without it the model
-/// has no way to know a skill exists. Attached skills are inlined whole because
-/// the user asked for them explicitly; auto-matched ones are inlined too, since
-/// leaving the pick to the model meant it mostly skipped the `load_skill` call
-/// and the user never saw which skill applied (no badge, no effect).
-pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
+/// has no way to know a skill exists. WHICH skill applies is the model's call
+/// (`load_skill`), the way Codex and Claude do it: scoring the prompt against
+/// keywords picked the wrong skill often enough to be worse than no pick at all.
+pub fn build_section(_prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
     let all = load_skills(root);
     let mut text = String::new();
-    let mut volatile = String::new();
 
     let listed = catalog(&all);
     if !listed.is_empty() {
         text.push_str(
             "\n\n=== AVAILABLE SKILLS ===\n\
-             These skills are installed. When a task falls under one of them, call \
-             load_skill with name=<name> to load its full instructions BEFORE doing \
-             the work. Do not load a skill you do not need.\n\
-             The `[fa: …]` keywords are the user's own Persian terms for that skill — \
-             match against them too, so a Persian request finds the right skill.\n",
+             These skills are installed. This list is a TRIGGER, not a summary: if \
+             the request falls under one of them, call load_skill with that skill's \
+             name BEFORE doing the work and follow its instructions for the rest of \
+             the turn. Match on the description AND on the `[fa: …]` keywords (the \
+             user's own Persian terms). Do not load a skill you do not need — but a \
+             task a skill covers must not be answered from memory.\n\
+             This list is CAPPED: a large store does not fit here. An absent entry \
+             does NOT mean the skill is missing — call load_skill with a `query` of \
+             the task's words to search every installed skill.\n",
         );
         text.push_str(&listed);
+        // The duty is restated AFTER the list. A long catalog pushes the opening
+        // instruction thousands of characters away from the model's attention, and
+        // weak models then read the list as reference material and never call the
+        // tool: real traces showed 2 `load_skill` calls across ~250 steps with an
+        // 11 KB catalog in the prompt. The list itself is unchanged, so the
+        // cached prefix does not move.
+        text.push_str(
+            "If one of the skills above covers this request, call load_skill for it \
+             NOW — before any other tool call.\n",
+        );
     }
 
     let mut manual: Vec<String> = Vec::new();
@@ -391,67 +432,7 @@ pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> Skill
         );
     }
 
-    // ---- AUTO-MATCH from the prompt -------------------------------------
-    // This is the "decision router": instead of only listing the catalog and
-    // hoping the model calls `load_skill`, the turn's own prompt is scored
-    // against every installed skill and the best fits are inlined. The user
-    // sees them as ⚡ chips, and the model no longer has to guess.
-    let hay = normalize_text(prompt);
-    let mut matched: Vec<String> = Vec::new();
-    if !hay.is_empty() {
-        let mut scored: Vec<(usize, &Value)> = all
-            .iter()
-            .filter(|s| {
-                // An attached skill is already inlined — never duplicate it.
-                !picked.iter().any(|p| p["name"] == s["name"])
-            })
-            .map(|s| (skill_score(s, &hay), s))
-            .filter(|(score, _)| *score >= MATCH_MIN_SCORE)
-            .collect();
-        // Highest score first; ties keep the store's name order (stable sort).
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        // Keep only the clear winners: a skill that merely crossed the absolute
-        // threshold while the winner scored far higher is noise on this prompt,
-        // not a match (see AUTO_MATCH_WINDOW).
-        if let Some(best) = scored.first().map(|(score, _)| *score) {
-            let floor = best.saturating_sub(AUTO_MATCH_WINDOW);
-            scored.retain(|(score, _)| *score >= floor);
-        }
-        scored.truncate(MAX_AUTO_MATCHED);
-        for (_, s) in scored {
-            let name = s["name"].as_str().unwrap_or_default().trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            matched.push(name);
-        }
-        if !matched.is_empty() {
-            volatile.push_str(
-                "\n\n=== AUTO-MATCHED SKILLS ===\n\
-                 These skills were picked for THIS request from its keywords. Adopt \
-                 their role and follow their instructions (the decision is already \
-                 made — do NOT call load_skill for them).\n",
-            );
-            let bodies: Vec<String> = matched_bodies(&all, &matched);
-            volatile.push_str(&bodies.join("\n\n"));
-        }
-    }
-
-    SkillSection { text, volatile, missing, matched }
-}
-
-/// Formatted bodies for the auto-matched names, in the given order.
-fn matched_bodies(all: &[Value], matched: &[String]) -> Vec<String> {
-    matched
-        .iter()
-        .filter_map(|n| {
-            all.iter().find(|s| {
-                s["name"].as_str().unwrap_or_default().trim().to_lowercase()
-                    == n.to_lowercase()
-            })
-        })
-        .map(format_skill_body)
-        .collect()
+    SkillSection { text, missing }
 }
 
 #[cfg(test)]
@@ -470,346 +451,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic: run with --ignored to see which real prompts auto-match"]
-    fn diagnose_auto_match_against_the_real_store() {
-        // Runs the REAL router over the REAL skill store, so "why did no skill
-        // match?" is answered by the code that decides it rather than by a
-        // re-implementation of the scoring rules.
-        //
-        // NOTE: the store at {data_root}/skills is only re-synced from
-        // `src-tauri/skills/*.md` at app STARTUP (`seed_builtin_skills`), so a
-        // fresh checkout that has not launched the app yet still holds the OLD
-        // keywords. Pass `CODER_SKILL_ROOT=src-tauri` to measure the SHIPPED
-        // set instead, which is what a new build actually loads.
-        let root = match std::env::var("CODER_SKILL_ROOT") {
-            Ok(r) => r,
-            Err(_) => match std::env::var("CODER_DATA_DIR") {
-                Ok(d) => d,
-                Err(_) => std::env::var("HOME")
-                    .map(|h| format!("{h}/.codifa"))
-                    .unwrap_or_default(),
-            },
-        };
-        let prompts = [
-            "این باگ رو درست کن",
-            "این کد رو ریفکتور کن",
-            "می‌خوام این کامپوننت رو طراحی کنم، ظاهر تمیزی می‌خوام",
-            "این متن رو خلاصه کن",
-            "یه فیلم خوب معرفی کن",
-            "چرا اتو اسکیل هیچ اسکیلی رو انتخاب نمیکنه؟",
-            "کاهش مصرف توکن و کاهش راندتریپ explore",
-            "fix this bug",
-            "debug this crash",
-            "refactor this module",
-            "design a landing page",
-            "please translate this paragraph",
-            "commit this and push",
-            "test the ui in a browser",
-            "analyze this dataset",
-            "brainstorm ideas for me",
-            "research the latest react docs",
-            "سئو سایت رو بهتر کن",
-            // Negatives: none of these may inline a skill.
-            "this is a preference setting",
-            "rename this variable",
-            "update the changelog",
-            "optimize the sql query",
-            "deploy the docker image to staging",
-            "move this helper into its own file",
-        ];
-        println!("skills root: {root}");
-        let mut hit = 0usize;
-        for p in prompts {
-            let sec = build_section(p, &root, &[]);
-            if sec.matched.is_empty() {
-                println!("  [--] {p}");
-            } else {
-                hit += 1;
-                println!("  [OK] {p} -> {:?}", sec.matched);
-            }
-        }
-        println!("matched {hit}/{}", prompts.len());
-    }
-
-    #[test]
-    fn auto_match_picks_from_the_prompt_keywords() {
-        // The user's own Persian phrase must match without any embedding —
-        // that is what `fa_keywords` exists for.
-        let movie = json!({
-            "name": "Movie Finder",
-            "slug": "movie-finder",
-            "description": "find movies",
-            "fa_keywords": ["فیلم", "سریال"],
-            "content": "BODY",
-            "files": [],
-        });
-        let trans = json!({
-            "name": "translation",
-            "slug": "translation",
-            "description": "translate",
-            "fa_keywords": ["ترجمه", "ترجمه کن"],
-            "content": "BODY",
-            "files": [],
-        });
-        let hay = normalize_text("یه فیلم خوب معرفی کن");
-        assert!(skill_score(&movie, &hay) >= MATCH_MIN_SCORE);
-        // An unrelated request must NOT drag a skill in.
-        let other = normalize_text("refactor this module");
-        assert!(skill_score(&trans, &other) < MATCH_MIN_SCORE);
-    }
-
-    #[test]
-    fn auto_match_needs_two_signals_or_a_whole_keyword() {
-        let mut s = skill("Summarization", "summarize text");
-        s["fa_keywords"] = json!(["خلاصه کن"]);
-        // A bare shared word is not enough on its own...
-        assert!(skill_score(&s, &normalize_text("a short note")) < MATCH_MIN_SCORE);
-        // ...but one complete keyword phrase is decisive.
-        assert!(skill_score(&s, &normalize_text("این متن رو خلاصه کن")) >= MATCH_MIN_SCORE);
-    }
-
-    #[test]
-    fn auto_match_ignores_substrings_inside_other_words() {
-        // "read" lives inside "already"/"spread": plain substring matching
-        // pulled the wrong skill into prompts that never mentioned it.
-        let s = skill("Read File", "read a file");
-        assert!(skill_score(&s, &normalize_text("already spread the changes")) < MATCH_MIN_SCORE);
-        // A real mention of the word still scores on the two name signals.
-        assert!(skill_score(&s, &normalize_text("please read the file")) >= MATCH_MIN_SCORE);
-    }
-
-    #[test]
-    fn short_persian_words_are_match_signals() {
-        // Persian is built from short words (`باگ`, `کد`, `گیت`, `سئو`). A
-        // 4-char floor dropped them, so `این باگ رو درست کن` kept only `درست`
-        // and no skill could match — the reported "auto-skill never picks
-        // anything" bug. The floor is 3 now.
-        assert!(words_of("این باگ رو درست کن").contains(&"باگ".to_string()));
-        let mut s = skill("Code-Expert", "debugging help");
-        s["fa_keywords"] = json!(["باگ"]);
-        assert!(skill_score(&s, &normalize_text("این باگ رو درست کن")) >= MATCH_MIN_SCORE);
-    }
-
-    #[test]
-    fn one_word_keyword_is_the_whole_signal() {
-        // Most keywords are a SINGLE word. Scoring a match +1 meant such a
-        // keyword could never reach the threshold alone, so the skill with the
-        // exact word the user typed still lost. One word is a complete signal.
-        let mut s = skill("Code-Expert", "debugging help");
-        s["fa_keywords"] = json!(["ریفکتور"]);
-        assert!(skill_score(&s, &normalize_text("این کد رو ریفکتور کن")) >= MATCH_MIN_SCORE);
-        // A fragment of a MULTI-word keyword is still worth only one point.
-        // The skill NAME must not appear in the prompt, or the name signals
-        // (worth up to 2) would carry the assertion instead of the fragment.
-        let mut multi = skill("Page Builder", "landing pages");
-        multi["fa_keywords"] = json!(["landing page design"]);
-        let partial = skill_score(&multi, &normalize_text("the landing is done"));
-        assert!(partial < MATCH_MIN_SCORE, "{partial}");
-    }
-
-    #[test]
-    fn word_forms_share_a_stem_but_longer_derivations_do_not() {
-        // The user types one form, the skill lists another.
-        assert!(same_stem("refactor", "refactoring"));
-        assert!(same_stem("debug", "debugging"));
-        assert!(same_stem("analyze", "analysis"));
-        assert!(same_stem("brainstorm", "brainstorming"));
-        assert!(same_stem("translate", "translation"));
-        // But a 3-letter derivation is a DIFFERENT word: `data`/`dataset` and
-        // `test`/`testing` must not collide, or the wrong skill fires.
-        assert!(!same_stem("data", "dataset"));
-        assert!(!same_stem("test", "testing"));
-        // Unrelated words never share a stem.
-        assert!(!same_stem("preference", "refactor"));
-    }
-
-    #[test]
-    fn a_skill_created_with_persian_commas_is_auto_matched() {
-        // The `create_skill` schema asks for `fa_keywords` as ONE string, and a
-        // Persian list is naturally typed with `،`. The WRITE path split only
-        // on the ASCII comma, so `فیلم، سریال` became one keyword containing a
-        // comma; the reader happened to recover, but the stored value was wrong
-        // (and the empty-check / dedupe saw a single bogus keyword). A skill the
-        // user creates must be auto-matched by the same rules as a shipped one.
-        let dir = std::env::temp_dir().join(format!("codifa-skill-create-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::skills::sync_skill(
-            &dir,
-            &json!({
-                "name": "My Persian Notes",
-                "description": "notes helper",
-                "content": "how to take notes",
-                "fa_keywords": "یادداشت، نوت برداری، note taking",
-            }),
-        )
-        .expect("sync_skill writes the skill");
-        // Read it back through the same path the router uses: three separate
-        // keywords, not one string containing a comma.
-        let stored = skills::list_skills(&dir);
-        let kws = stored["skills"][0]["fa_keywords"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(kws.len(), 3, "{kws:?}");
-        let root = dir.to_str().unwrap();
-        // The newly created skill is picked up by the router with no restart:
-        // every read goes to disk (no cache), so a create/edit is live at once.
-        let section = build_section("یه یادداشت خوب بنویس", root, &[]);
-        assert!(
-            section.matched.contains(&"My Persian Notes".to_string()),
-            "{:?}",
-            section.matched
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_edited_skill_replaces_its_old_keywords() {
-        // Editing a skill must be as reliable as creating one: the new
-        // keywords replace the old ones, and the OLD wording stops matching.
-        let dir = std::env::temp_dir().join(format!("codifa-skill-edit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = crate::skills::sync_skill(
-            &dir,
-            &json!({
-                "name": "Deploy Helper",
-                "description": "deployment",
-                "content": "deploy it",
-                "fa_keywords": "استقرار, docker",
-            }),
-        )
-        .expect("first write");
-        assert!(first["ok"].as_bool() != Some(false), "{first}");
-        let root = dir.to_str().unwrap();
-        assert!(build_section("کمک به استقرار", root, &[])
-            .matched
-            .contains(&"Deploy Helper".to_string()));
-        // Edit: new keywords, same name — the old one must no longer fire.
-        crate::skills::sync_skill(
-            &dir,
-            &json!({
-                "name": "Deploy Helper",
-                "previous_name": "Deploy Helper",
-                "description": "deployment",
-                "content": "deploy it",
-                "fa_keywords": "kubernetes, release",
-            }),
-        )
-        .expect("second write");
-        let after = build_section("کمک به استقرار", root, &[]);
-        assert!(
-            !after.matched.contains(&"Deploy Helper".to_string()),
-            "stale keyword still matched: {:?}",
-            after.matched
-        );
-        assert!(build_section("a kubernetes release", root, &[])
-            .matched
-            .contains(&"Deploy Helper".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_generic_user_keyword_does_not_fire_elsewhere() {
-        // The single-word rule is what made real matches work, so a generic
-        // keyword on a USER skill must stay contained: `update` is the worst
-        // offender measured (it fires on "update the changelog"), but with a
-        // clear winner present the relative window keeps the user skill out.
-        let dir = std::env::temp_dir().join(format!("codifa-skill-generic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::skills::sync_skill(
-            &dir,
-            &json!({
-                "name": "My Helper",
-                "description": "generic helper",
-                "content": "help",
-                "fa_keywords": "update",
-            }),
-        )
-        .expect("write");
-        let root = dir.to_str().unwrap();
-        // No strong competitor in this store, so the generic word DOES fire —
-        // that is the accepted cost of the single-word rule (measured: at most
-        // 2 of 35 prompts, and only ones that really say "update").
-        // The guard that matters: a prompt without the word never fires.
-        assert!(!build_section("deploy the docker image", root, &[])
-            .matched
-            .contains(&"My Helper".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn skill_name_words_match_exactly_but_keywords_tolerate_inflection() {
-        // `optimize the sql query` reached `seo-optimization` through the NAME
-        // word `optimization` under stem matching, inlining an SEO skill into a
-        // database question. Name words are generic labels, so they must match
-        // exactly; the author-written keywords keep inflection tolerance.
-        let mut seo = skill("seo-optimization", "seo help");
-        seo["fa_keywords"] = json!(["سئو", "seo optimization"]);
-        let hay = normalize_text("optimize the sql query");
-        // The NAME word `optimization` no longer matches `optimize` (exact only).
-        // The keyword `seo optimization` still contributes one point through its
-        // `optimization` word — 1, not the 2 needed, so the skill stays out.
-        let score = skill_score(&seo, &hay);
-        assert!(
-            score < MATCH_MIN_SCORE,
-            "an SEO skill must not match a database question (score {score})"
-        );
-        // Proof the fix is the NAME path: with no keywords at all the same skill
-        // scores zero on that prompt, where stem matching gave it name points.
-        seo["fa_keywords"] = json!([]);
-        assert_eq!(
-            skill_score(&seo, &hay),
-            0,
-            "a name word must not stem-match a different request"
-        );
-        // A keyword the author wrote DOES tolerate an inflection.
-        let mut research = skill("Deep Research", "look things up");
-        research["fa_keywords"] = json!(["research"]);
-        assert!(skill_score(&research, &normalize_text("research the react docs")) >= MATCH_MIN_SCORE);
-    }
-
-    #[test]
-    fn auto_match_drops_trailing_noise_next_to_a_clear_winner() {
-        // With only an absolute threshold, a prompt that clearly names one topic
-        // still inlined an unrelated skill that scraped MATCH_MIN_SCORE. The
-        // relative window keeps the winner and its near-ties only.
-        let dir = std::env::temp_dir().join(format!("codifa-skill-window-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for (slug, keywords) in [
-            ("summarization", "خلاصه, خلاصه کن, چکیده"),
-            ("translation", "translate this"),
-        ] {
-            let sdir = dir.join("skills").join(slug);
-            std::fs::create_dir_all(&sdir).unwrap();
-            std::fs::write(
-                sdir.join("skill.md"),
-                format!("---\nname: {slug}\ndescription: d\nfa_keywords: {keywords}\n---\nBODY\n"),
-            )
-            .unwrap();
-        }
-        let root = dir.to_str().unwrap();
-        // A strong summarization hit must not drag `translation` along.
-        let section = build_section("این متن رو خلاصه کن", root, &[]);
-        assert!(
-            section.matched.contains(&"summarization".to_string()),
-            "{:?}",
-            section.matched
-        );
-        assert!(
-            !section.matched.contains(&"translation".to_string()),
-            "{:?}",
-            section.matched
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn catalog_splits_persian_comma_keywords() {
         // A list typed with the Persian comma (`فیلم، سریال`) used to survive as
-        // ONE garbled keyword, so no Persian request could ever match it.
+        // ONE garbled keyword, so the keywords the user actually types were
+        // missing from the catalog line.
         let dir = std::env::temp_dir().join(format!("codifa-skill-fa-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sdir = dir.join("skills").join("movie-finder");
@@ -823,25 +468,63 @@ mod tests {
 
         let listed = catalog(&load_skills(root));
         assert!(listed.contains("فیلم, سریال, سینما"), "{listed}");
-        // Each keyword stands alone: mentioning only the second one is enough.
-        let section = build_section("یه سریال خوب معرفی کن", root, &[]);
-        assert!(
-            section.matched.contains(&"Movie Finder".to_string()),
-            "{:?}",
-            section.matched
-        );
-        // ...and the matched body is PER-TURN text, so it must land in
-        // `volatile`, never in the byte-stable `text` that becomes the system
-        // prompt: a prompt-only match that rewrote `system` invalidated the
-        // cached prefix of the whole conversation.
-        assert!(
-            section.volatile.contains("=== AUTO-MATCHED SKILLS ===")
-                && section.volatile.contains("BODY"),
-            "{}",
-            section.volatile
-        );
-        assert!(!section.text.contains("AUTO-MATCHED"), "{}", section.text);
+        // Each keyword stands alone, so any one of them is a trigger the model
+        // can find the skill by.
+        assert!(listed.contains("[fa: فیلم, سریال, سینما]"), "{listed}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_section_never_picks_a_skill_from_the_prompt() {
+        // Auto-match is GONE on purpose: scoring the prompt against keywords
+        // picked the wrong skill often enough to be worse than no pick at all.
+        // The router only lists the catalog now, and WHICH skill applies is the
+        // model's call through `load_skill` (the Codex/Claude model). A
+        // regression here would silently inline a skill again and move the
+        // cached system-prompt prefix with it.
+        let dir =
+            std::env::temp_dir().join(format!("codifa-skill-nomatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sdir = dir.join("skills").join("movie-finder");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("skill.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم, سینما\n---\nBODY\n",
+        )
+        .unwrap();
+        let root = dir.to_str().unwrap();
+
+        // The prompt carries the skill's own keyword and still nothing is inlined.
+        let section = build_section("یه فیلم خوب معرفی کن", root, &[]);
+        assert!(section.text.contains("- Movie Finder"), "{}", section.text);
+        assert!(!section.text.contains("BODY"), "{}", section.text);
+
+        // An explicit @mention is the only route to a body.
+        let attached = build_section("یه فیلم خوب معرفی کن", root, &["Movie Finder".into()]);
+        assert!(attached.text.contains("BODY"), "{}", attached.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_names_the_slash_command_of_a_plugin_skill() {
+        // The plugin's own install output tells the user "try /ponytail", and
+        // the composer only knows a command the full catalog contains. Naming
+        // the command in the catalog is what lets the model explain it — and a
+        // standalone skill has no command, so it must not grow one.
+        let rows = vec![
+            json!({
+                "name": "Ponytail",
+                "slug": "ponytail",
+                "description": "lazy senior dev",
+                "plugin": "Ponytail",
+            }),
+            json!({"name": "Movie Finder", "description": "find movies"}),
+        ];
+        let listed = catalog(&rows);
+        assert!(listed.contains("- Ponytail (command: /ponytail)"), "{listed}");
+        assert!(!listed.contains("/movie-finder"), "{listed}");
+        assert!(listed.contains("- Movie Finder: find movies"), "{listed}");
     }
 
     #[test]
@@ -870,11 +553,95 @@ mod tests {
     }
 
     #[test]
+    fn catalog_keeps_every_skill_even_when_the_details_overflow() {
+        // Regression: 25 installed skills with their real-length descriptions
+        // overflowed the cap, and the loop `break`-ed — the three last skills
+        // (summarization, threejs-scroll-storytelling, translation) vanished from
+        // the catalog entirely, so the model never knew they existed and could
+        // never call load_skill for them. Detail may be clipped; an entry may not.
+        let all: Vec<Value> = (0..60)
+            .map(|i| {
+                json!({
+                    "name": format!("Skill {i}"),
+                    "description": "a long english description that would overflow the catalog cap on its own \
+                                    when sixty of them are listed one after another in the system prompt",
+                    "fa_keywords": ["کلمه کلیدی", "دوم", "سوم", "چهارم", "پنجم", "ششم", "هفتم", "هشتم"],
+                })
+            })
+            .collect();
+        let listed = catalog(&all);
+        assert!(listed.len() <= CATALOG_MAX_CHARS, "{} bytes", listed.len());
+        for i in 0..60 {
+            assert!(listed.contains(&format!("- Skill {i}")), "Skill {i} missing:\n{listed}");
+        }
+        // Clipping is on a character boundary: Persian keywords must survive
+        // intact (byte slicing would have panicked here).
+        assert!(listed.contains("[fa: کلمه کلیدی"), "{listed}");
+        // The tail that overflows must be bounded to the keyword cap.
+        assert!(!listed.contains("هشتم"), "keywords past the cap leaked: {listed}");
+    }
+
+    #[test]
     fn catalog_caps_the_listing() {
         let all: Vec<Value> = (0..500)
             .map(|i| skill(&format!("Skill {i}"), "a description long enough to fill the cap"))
             .collect();
         assert!(catalog(&all).len() <= CATALOG_MAX_CHARS);
+    }
+
+    #[test]
+    fn catalog_lists_short_named_skills_way_past_the_detail_cap() {
+        // A realistic overflowing store: short names, long descriptions. Every
+        // skill must still be NAMED (the model learns it exists), only the
+        // details are trimmed, and the model is told so.
+        let all: Vec<Value> = (0..500)
+            .map(|i| {
+                json!({
+                    "name": format!("Sk{i}"),
+                    "description": "a fairly long english description that would overflow the \
+                                    catalog cap on its own when five hundred of them are listed \
+                                    one after another in the system prompt of a real turn",
+                    "fa_keywords": ["یک", "دو", "سه"],
+                })
+            })
+            .collect();
+        let listed = catalog(&all);
+        assert!(listed.len() <= CATALOG_MAX_CHARS, "{} bytes", listed.len());
+        let names: Vec<&str> = listed
+            .lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .map(|l| l.split([':', ' ']).next().unwrap_or(""))
+            .collect();
+        for i in 0..500 {
+            assert!(
+                names.contains(&format!("Sk{i}").as_str()),
+                "Sk{i} missing:\n{listed}"
+            );
+        }
+        assert!(listed.contains("descriptions are trimmed"), "{listed}");
+    }
+
+    #[test]
+    fn load_skills_sees_a_skill_written_after_the_first_read() {
+        // The cache must not hide a skill the store gains between turns: a
+        // create/seed/edit writes to disk, which has to invalidate.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+
+        assert!(load_skills(root).is_empty());
+        let sdir = dir.join("skills").join("movie-finder");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("skill.md"),
+            "---\nname: Movie Finder\ndescription: find movies\n---\nBODY\n",
+        )
+        .unwrap();
+        let after = load_skills(root);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0]["name"], "Movie Finder");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -896,6 +663,36 @@ mod tests {
     }
 
     #[test]
+    fn catalog_restates_the_duty_after_the_list() {
+        // The opening instruction sits ABOVE a list that can run to thousands of
+        // characters, and weak models then read the list as reference material:
+        // real traces showed 2 `load_skill` calls across ~250 steps with an 11 KB
+        // catalog in the prompt. The duty is restated directly UNDER the list.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sdir = dir.join("skills").join("movie-finder");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("skill.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم\n---\nBODY\n",
+        )
+        .unwrap();
+        let root = dir.to_str().unwrap();
+
+        let text = build_section("", root, &[]).text;
+        let line = "- Movie Finder: find movies";
+        let listed_at = text.find(line).expect("catalog line");
+        let restated_at = text.find("call load_skill for it").expect("restated duty");
+        assert!(
+            restated_at > listed_at,
+            "the reminder must come AFTER the list it refers to: {text}"
+        );
+        // The keywords still ride along, so a Persian request has a trigger.
+        assert!(text.contains("[fa: فیلم]"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn build_section_lists_catalog_and_inlines_attached() {
         let dir = std::env::temp_dir().join(format!("codifa-skill-router-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -912,6 +709,11 @@ mod tests {
         let plain = build_section("", root, &[]);
         assert!(plain.text.contains("=== AVAILABLE SKILLS ==="), "{}", plain.text);
         assert!(plain.text.contains("Movie Finder: find movies"), "{}", plain.text);
+        // The cap is stated, and the escape hatch with it: a store of hundreds
+        // of skills overflows this list, and "absent from the list" must not be
+        // readable as "not installed".
+        assert!(plain.text.contains("CAPPED"), "{}", plain.text);
+        assert!(plain.text.contains("query"), "{}", plain.text);
         assert!(!plain.text.contains("BODY HERE"), "catalog must not inline bodies");
         assert!(plain.missing.is_empty());
 
@@ -938,5 +740,33 @@ mod tests {
         assert!(section.text.is_empty(), "{}", section.text);
         assert!(section.missing.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_points_at_the_query_search_when_names_had_to_be_dropped() {
+        // Hundreds of skills cannot all be named inside the cap. The note must
+        // name the way in (`load_skill query=`) — a bare count left the model
+        // unable to reach any of the skills it was told existed.
+        let all: Vec<Value> = (0..500)
+            .map(|i| {
+                json!({
+                    "name": format!("Skill Number {i:03}"),
+                    "description": "a fairly long english description that would overflow the \
+                                    catalog cap on its own when five hundred of them are listed \
+                                    one after another in the system prompt of a real turn",
+                })
+            })
+            .collect();
+        let listed = catalog(&all);
+        assert!(listed.len() <= CATALOG_MAX_CHARS, "{} bytes", listed.len());
+        assert!(listed.contains("load_skill with query=<words>"), "{listed}");
+        // The full note fits inside the bytes held back for it, or the emit loop
+        // above would have dropped the line after it.
+        let note = listed.lines().last().unwrap_or_default();
+        assert!(
+            note.len() <= CATALOG_TRUNCATE_NOTE_RESERVE,
+            "note is {} bytes: {note}",
+            note.len()
+        );
     }
 }

@@ -72,7 +72,23 @@ try {
   console.error('  FAIL raw view threw', err)
 }
 
-console.log('3) cap note for huge bodies:')
+console.log('3) markdown links to files become chips, not navigable anchors:')
+try {
+  const linkBody =
+    '- [foo.ts](src/foo.ts) — code path\n- [`store.ts:12`](src/lib/store.ts:12) — path with line\n- [report.pdf](report.pdf) — document\n\n[site](https://example.com) and [docs](docs) stay links'
+  const linked = renderToString(<TextViewerPanel title="links" body={linkBody} />)
+  check('path link rendered as a chip', linked.includes('file-chip'))
+  check('path link keeps no navigable href', !linked.includes('href="src/foo.ts"'))
+  check('path link chip keeps the line', linked.includes('src/lib/store.ts:12'))
+  check('document link is a chip', linked.includes('report.pdf'))
+  check('external link stays an anchor', linked.includes('href="https://example.com"'))
+  check('plain relative link stays an anchor', linked.includes('href="docs"'))
+} catch (err) {
+  failed++
+  console.error('  FAIL link chips threw', err)
+}
+
+console.log('4) cap note for huge bodies:')
 try {
   const big = 'x'.repeat(400_001)
   const capped = renderToString(<TextViewerPanel title="Big" body={big} format="text" />)

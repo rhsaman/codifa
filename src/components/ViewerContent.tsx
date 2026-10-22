@@ -29,6 +29,12 @@ const FilesPanel = lazy(() => import("./FilesPanel").then((m) => ({ default: m.F
 const ExplorePanel = lazy(() =>
   import("./ExplorePanel").then((m) => ({ default: m.ExplorePanel })),
 );
+const ArtifactsPanel = lazy(() =>
+  import("./ArtifactsPanel").then((m) => ({ default: m.ArtifactsPanel })),
+);
+const ArtifactPanel = lazy(() =>
+  import("./ArtifactPanel").then((m) => ({ default: m.ArtifactPanel })),
+);
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
@@ -166,6 +172,25 @@ function ViewerContentInner() {
         initialUrl={active.browserUrl ?? ""}
       />
     );
+  }
+
+  if (active.kind === "artifact") {
+    return (
+      <ArtifactPanel
+        key={active.id}
+        title={active.title}
+        kind={active.artifactKind ?? "html"}
+        body={active.artifactBody ?? ""}
+        chatId={active.chatId}
+        id={active.artifactId}
+      />
+    );
+  }
+
+  if (active.kind === "artifacts") {
+    // Every document the agent built, across chats. A row opens the same
+    // sandboxed preview the transcript card does.
+    return <ArtifactsPanel key={active.id} />;
   }
 
   if (active.kind === "schedule") {

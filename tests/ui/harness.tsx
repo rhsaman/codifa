@@ -516,6 +516,10 @@ if (params.get("scenario") === "diff") {
   // geometry checks (RTL insets, split widths). Plan tab opens after mount.
   const { default: App } = await import("../../src/App");
   const { useViewerTabs } = await import("../../src/lib/viewerTabs");
+  // The viewer-tabs store is a second zustand store; expose it so a driver
+  // can open files and assert the rail/pane without importing a duplicate
+  // module instance.
+  (window as any).__ui.viewer = useViewerTabs;
   root.render(<App />);
   useViewerTabs.getState().openPlan();
 } else if (params.get("scenario") === "settings") {

@@ -1,6 +1,12 @@
+import { useState } from "react";
 import type { ToolActivity } from "../types";
-import { useViewerTabs } from "../lib/viewerTabs";
-import { StatusIcon, toolLabel, useRunningClock } from "./ToolCallView";
+import {
+  IconChevron,
+  StatusIcon,
+  ToolSubRow,
+  toolLabel,
+  useRunningClock,
+} from "./ToolCallView";
 
 /** Short label of an explore (sub-agent) run: the model's own description when
  *  it supplied one, else the run summary, else a plain "Explore". */
@@ -76,18 +82,18 @@ function statusLabel(status: ToolActivity["status"]): string {
  *  The card stays a compact summary inside the chat: a live status badge
  *  (spinner while the run works, a check once it lands), the run title, and
  *  one chip per tool with its call count — so the user sees WHAT ran and HOW
- *  MANY times without reading a wall of output. The calls themselves live in
- *  the right-hand panel — clicking the card opens (or retargets) that run's
- *  tool group there via `openExplore` (user request). */
+ *  MANY times without reading a wall of output. Expanding the head shows the
+ *  run's own tool calls and its report IN PLACE (long report scrolls); a click
+ *  never opens the side panel (user request). */
 export function ExploreCard({
   activity,
-  messageId,
-  index,
 }: {
   activity: ToolActivity;
-  messageId: string;
-  index: number;
+  /** Kept in the props for callers; the card no longer targets the side panel. */
+  messageId?: string;
+  index?: number;
 }) {
+  const [open, setOpen] = useState(false);
   const running = activity.status === "running";
   const now = useRunningClock(running);
   const ms =
@@ -96,6 +102,8 @@ export function ExploreCard({
   const counts = exploreToolCounts(activity);
   const total = exploreCallTotal(activity);
   const state = statusLabel(activity.status);
+  const children = activity.children ?? [];
+  const report = (activity.resultText ?? "").trim();
 
   return (
     <div className={`tool-card explore ${activity.status}${running ? " running" : ""}`}>
@@ -103,11 +111,9 @@ export function ExploreCard({
         <button
           type="button"
           className="trace-head explore-card-open"
-          title="Open this run's tool calls in the side panel"
-          aria-label={`Open ${title} in the side panel`}
-          onClick={() =>
-            useViewerTabs.getState().openExplore(messageId, index, title)
-          }
+          title={open ? "Fold this run" : "Show this run's tool calls"}
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
         >
           <span
             className={`explore-card-status ${activity.status}`}
@@ -127,7 +133,7 @@ export function ExploreCard({
             )}
             {ms ? <span className="trace-time">{fmtMs(ms)}</span> : null}
             <span className="explore-card-arrow" aria-hidden="true">
-              ↗
+              <IconChevron open={open} />
             </span>
           </span>
         </button>
@@ -140,6 +146,24 @@ export function ExploreCard({
                 <span className="explore-tool-n">{`×${c.count}`}</span>
               </span>
             ))}
+          </div>
+        )}
+        {open && (
+          <div className="tool-sub-list">
+            {children.map((child, i) => (
+              <ToolSubRow
+                key={`${child.tool}-${i}-${child.callId ?? i}`}
+                activity={child}
+                // A read child carries the whole file window; the sub-row
+                // already names the path, so the list stays scannable.
+                hideResult={child.tool === "read"}
+              />
+            ))}
+            {report && (
+              <pre className="tool-sub-result explore-report" dir="auto">
+                {report}
+              </pre>
+            )}
           </div>
         )}
       </div>

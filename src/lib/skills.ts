@@ -28,6 +28,15 @@ import type { SkillRow } from "./api";
 let skillsCache: SkillRow[] | null = null;
 let skillsFetcher: () => Promise<SkillRow[]> = async () => [];
 
+// Second cache: EVERY skill the agent can load — the standalone store PLUS the
+// skills of enabled plugins (backend `/skills/available`). Kept apart from
+// `skillsCache` on purpose, because that one backs Settings' edit/delete list
+// and a plugin's skill belongs to its bundle (it must not be editable there).
+// This list is what turns a shipped plugin skill into a `/`-command, so the
+// name a plugin advertises actually resolves in the composer.
+let availableCache: SkillRow[] | null = null;
+let availableFetcher: () => Promise<SkillRow[]> = async () => [];
+
 /** Inject the function used to load the skill list (call once at startup). */
 export function setSkillsFetcher(fn: () => Promise<SkillRow[]>): void {
   skillsFetcher = fn;
@@ -58,9 +67,85 @@ export function invalidateSkillsList(): void {
   void ensureSkillsList();
 }
 
+/** Inject the loader for the FULL catalog (store + enabled-plugin skills). */
+export function setAvailableSkillsFetcher(fn: () => Promise<SkillRow[]>): void {
+  availableFetcher = fn;
+}
+
+/** Synchronous read of the full catalog (empty until the first load). */
+export function getAvailableSkills(): SkillRow[] {
+  return availableCache ?? [];
+}
+
+/** Fetch the full catalog if not cached yet, then return it (retries an empty
+ *  result like `ensureSkillsList`: a cold-boot fetch that raced the backend
+ *  must not cache `[]` for the rest of the session). */
+export async function ensureAvailableSkills(): Promise<SkillRow[]> {
+  if (availableCache === null || availableCache.length === 0) {
+    availableCache = await availableFetcher();
+  }
+  return availableCache;
+}
+
+/** Drop the full catalog so the next read/ensure refetches. Called after the
+ *  agent installs/edits a plugin, whose skills become new commands. */
+export function invalidateAvailableSkills(): void {
+  availableCache = null;
+  void ensureAvailableSkills();
+}
+
+/** The list `@mention` matches against: every ATTACHABLE skill — the store plus
+ *  the skills of enabled plugins — falling back to the store list until the
+ *  wider fetch resolves, so a mention typed in the first seconds still matches.
+ *
+ *  Settings keeps using `getSkillsList()`: a plugin's skill belongs to its
+ *  bundle and must not appear in that panel's edit/delete list. */
+export function mentionCatalog(): SkillRow[] {
+  return availableCache && availableCache.length > 0 ? availableCache : getSkillsList();
+}
+
 /** Test-only: reset the module cache between cases. */
 export function resetSkillsCacheForTest(): void {
   skillsCache = null;
+}
+
+/** Test-only: reset the full-catalog cache between cases. */
+export function resetAvailableSkillsCacheForTest(): void {
+  availableCache = null;
+}
+
+/** One `/`-command per PLUGIN skill: the skill's slug is the command word, so a
+ *  bundle's advertised name (`/ponytail`) is invocable instead of answering
+ *  "Unknown command". Standalone skills are excluded — they keep being reached
+ *  through `@mention`, and the store is unbounded (a command per saved skill
+ *  would flood the popup).
+ *
+ *  `name` on the returned row is the skill's display name, which is what the
+ *  backend attaches by (case-insensitive on `name`), not the slug. */
+export interface PluginSkillCommand {
+  /** Command word without the leading slash. */
+  name: string
+  hint: string
+  /** Display name to attach the skill by. */
+  skill: string
+}
+
+export function pluginSkillCommands(rows: SkillRow[]): PluginSkillCommand[] {
+  const out: PluginSkillCommand[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!row.plugin) continue;
+    const word = (row.slug || row.name).trim().toLowerCase();
+    if (!word || seen.has(word)) continue;
+    seen.add(word);
+    const description = (row.description || '').trim();
+    out.push({
+      name: word,
+      hint: description ? `${row.plugin}: ${description}` : `Skill from ${row.plugin}`,
+      skill: row.name,
+    });
+  }
+  return out;
 }
 
 export interface SkillMention {

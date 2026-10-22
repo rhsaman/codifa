@@ -276,27 +276,36 @@ export function ProviderModelSelect(props?: {
   // Settings → Providers) doesn't sneak back into the dropdown just because
   // it's still in `p.models` from an earlier write.
   //
-  // The foreign-id check (isForeignModelId) is applied to the PERSISTED
-  // sources below (`p.models`, `p.model`) — e.g. a stale "openrouter/sonnet"
-  // that landed in nvidia's `p.models` via recentModels migration or a
-  // custom-row copy. Aggregator kinds like OpenRouter/TokenRouter
-  // legitimately carry vendor-prefixed ids ("google/gemini-2.5-flash",
-  // "nvidia/llama-3.1-nemotron-70b-instruct") whose vendor name coincides
-  // with one of Coder's own built-in provider kind ids, so the check runs on
-  // the BARE id `b` (post-strip), not on the raw `m` — otherwise a
-  // doubled-prefix entry like "local/opencode/big-pickle" would pass the raw
-  // check (head === p.id) but still render as the wrong model.
+  // The provider's OWN catalog is authoritative here: `p.models` is what its
+  // /models payload (plus the hand-added list) says it serves, and
+  // `removedModels` is the user's explicit veto. The `isForeignModelId`
+  // heuristic deliberately does NOT run on it any more — it is a GUESS that a
+  // vendor-prefixed id belongs to some other provider, and it hid real models
+  // from every list built on `allModels` (e.g. a custom gateway whose catalog
+  // carries "openrouter/x-ai/grok-4": head "openrouter" is a built-in kind id,
+  // so the row counted 5 models while the picker offered 4). A picker that
+  // silently withholds selectable models is worse than one that shows an
+  // unexpected id the provider itself reported. The guard still applies where
+  // it is actually needed: `mergeFetchedModels` uses it to keep ANOTHER
+  // provider's stale entries out of a freshly fetched list.
   const allModels = (p: ProviderConfig): string[] => {
     const removed = new Set(p.removedModels ?? []);
     const out = new Set<string>();
     for (const m of p.models ?? []) {
       const b = bareModel(p, m);
-      if (isForeignModelId(p, b)) continue;
+      if (!removed.has(b)) out.add(b);
+    }
+    // Models the user added BY HAND are never filtered either. `addedModels`
+    // exists exactly for catalogs a provider hides from its /models payload, so
+    // an explicit pick always wins.
+    for (const m of p.addedModels ?? []) {
+      const b = bareModel(p, m).trim();
+      if (!b) continue;
       if (!removed.has(b)) out.add(b);
     }
     if (p.model) {
       const b = bareModel(p, p.model);
-      if (!isForeignModelId(p, b) && !removed.has(b)) out.add(b);
+      if (!removed.has(b)) out.add(b);
     }
     return Array.from(out);
   };
@@ -338,7 +347,6 @@ export function ProviderModelSelect(props?: {
       if (!p) continue;
       if ((p.removedModels ?? []).includes(r.model)) continue;
       const model = bareModel(p, r.model);
-      if (isForeignModelId(p, model)) continue;
       const key = `${p.id}/${model}`;
       if (seen.has(key)) continue;
       seen.add(key);

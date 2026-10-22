@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel } from '../types'
+import type { McpServerConfig, McpTransport, PluginInfo, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
 import { getSkillFile, listSkills, syncSkill } from '../lib/api'
+import { deletePlugin, listPlugins, togglePlugin } from '../lib/plugins'
 import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateSkillsList } from '../lib/skills'
 import { api } from '../lib/fs'
@@ -14,7 +15,7 @@ import { RangeSlider } from './RangeSlider'
 import { ProviderModelSelect } from './ProviderModelSelect'
 import { supportsReasoning } from '../lib/thinking'
 import { STT_LANGUAGES } from '../lib/stt'
-import { OTHER_SLOTS, otherSlotLevel, otherSlotModel } from '../lib/toolSlots'
+import { OTHER_SLOTS, moveFallback, otherSlotFallbacks, otherSlotLevel, otherSlotModel, toolChainRows, toolChainSet, toolFallbackToModel, toolFallbackValue } from '../lib/toolSlots'
 import { modelReasoning } from '../lib/context'
 import {
   THINKING_OPTIONS,
@@ -104,9 +105,10 @@ function useMainModel(): { providerId: string; model: string } {
   return { providerId: p?.id ?? '', model: ch?.model ?? p?.model ?? '' }
 }
 
-/** Per-tool Settings row: a title + hint, the composer's own model picker
- *  (controlled, so it never touches the active chat) and the slot's own
- *  reasoning-effort slider. */
+/** Per-tool Settings card: a group head naming the tool and its purpose, then a
+ *  row per setting — the composer's own model picker (controlled, so it never
+ *  touches the active chat), the slot's own reasoning-effort bar, and the
+ *  ordered list of fallback models that only this tool may fall back on. */
 function ToolSlotRow({
   agent,
   label,
@@ -115,6 +117,8 @@ function ToolSlotRow({
   level,
   onSelectModel,
   onSelectLevel,
+  fallbacks,
+  onFallbacks,
 }: {
   agent: string
   label: string
@@ -123,6 +127,11 @@ function ToolSlotRow({
   level: ThinkingLevel
   onSelectModel: (agent: string, model: string) => void
   onSelectLevel: (agent: string, level: ThinkingLevel) => void
+  /** Ordered fallback models for THIS tool (empty = the tool only runs its own
+   *  model). A fallback inherits the row's reasoning level, so it has no effort
+   *  control of its own. */
+  fallbacks?: ToolFallback[]
+  onFallbacks?: (rows: ToolFallback[]) => void
 }) {
   const providers = useStore((s) => s.settings.providers)
   const activeProviderId = useStore((s) => s.settings.activeProviderId)
@@ -147,28 +156,46 @@ function ToolSlotRow({
     ? modelReasoning(effProvider, effModel) ?? supportsReasoning(effModel, effProvider.kind)
     : false
   return (
-    <div className="field tool-slot" data-agent={agent}>
-      <div className="field-head tool-slot-head">
-        <label>{label}</label>
+    <div
+      className="slot-card"
+      data-agent={agent}
+      data-reasoning={reasoning ? 'on' : 'off'}
+    >
+      <div className="slot-card-head">
+        <span className="slot-card-title">{label}</span>
+        <span className="slot-card-desc">{desc}</span>
       </div>
-      <div className="hint">{desc}</div>
-      <ProviderModelSelect
-        value={model}
-        onSelect={(v) => onSelectModel(agent, v)}
-        noneLabel="Main model"
-      />
-      {/* Reasoning effort as a Codex-style progress bar: the bar fills up to
-          the chosen level and is click/drag steppable — no popup menu. */}
-      <ThinkingBar
-        label={label}
-        level={level}
-        onSelect={(lv) => onSelectLevel(agent, lv)}
-      />
-      {!reasoning && (
-        <div className="hint thinking-bar-note">
-          This model does not advertise reasoning support; the level is still
-          sent to providers that accept it.
-        </div>
+
+      {/* ONE list of two FIXED columns: the picker starts at the same x on every
+          row of every card, which is what makes four cards read as one table
+          instead of four unrelated forms. */}
+      {onFallbacks && (
+        <>
+          {/* The effort bar governs the WHOLE list (a fallback inherits it), so
+              it sits above the rows instead of inside one of them. */}
+          <div className="slot-card-effort slot-chain-effort">
+            {/* Codex-style progress bar: it fills up to the chosen level and is
+                click/drag steppable — no popup menu. */}
+            <ThinkingBar
+              label={label}
+              level={level}
+              onSelect={(lv) => onSelectLevel(agent, lv)}
+            />
+          </div>
+          <div className="slot-card-sub">
+            <span className="slot-card-sub-title">Models</span>
+            <span className="slot-card-sub-hint">
+              tried top to bottom — row 1 is this tool's own model
+            </span>
+          </div>
+          <FallbackRows
+            label={label}
+            own={model}
+            onOwn={(v) => onSelectModel(agent, v)}
+            rows={fallbacks ?? []}
+            onChange={onFallbacks}
+          />
+        </>
       )}
     </div>
   )
@@ -292,6 +319,109 @@ const SEARCH_ENGINE_KINDS: Array<{ kind: SearchPluginKind; label: string; needsK
   { kind: 'tavily', label: 'Tavily', needsKey: true },
 ]
 
+/** Settings → Plugins: folder bundles of skills + MCP connectors.
+ *
+ *  The list is read from the data folder on open instead of being mirrored in
+ *  settings.json: the folder IS the source of truth (the agent's `/plugin`
+ *  command writes to the same place), so a persisted copy would only go stale.
+ */
+function PluginBundleEditor() {
+  const [plugins, setPlugins] = useState<PluginInfo[] | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState('')
+
+  const refresh = useCallback(async () => {
+    const out = await listPlugins()
+    if ('error' in out) {
+      setError(out.error)
+      setPlugins([])
+      return
+    }
+    setError('')
+    setPlugins(out)
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const flip = async (p: PluginInfo) => {
+    setBusy(p.slug)
+    const out = await togglePlugin(p.slug)
+    setBusy('')
+    if ('error' in out) setError(out.error)
+    else
+      setPlugins((cur) =>
+        (cur ?? []).map((x) => (x.slug === out.slug ? out : x)),
+      )
+  }
+
+  const remove = async (p: PluginInfo) => {
+    if (!window.confirm(`Delete plugin "${p.name}"? Its skills and connectors go with it.`)) return
+    setBusy(p.slug)
+    const out = await deletePlugin(p.slug)
+    setBusy('')
+    if ('error' in out) setError(out.error)
+    else setPlugins((cur) => (cur ?? []).filter((x) => x.slug !== p.slug))
+  }
+
+  return (
+    <div className="field">
+      <div className="field-head">
+        <label>Plugins</label>
+        <button className="btn tiny" onClick={() => void refresh()} disabled={busy !== ''}>
+          Refresh
+        </button>
+      </div>
+      <div className="hint">
+        A plugin bundles skills and MCP connectors behind one switch: turning it off removes
+        its skills from the catalog and its connectors from the tools, without deleting anything.
+        Create or edit one by typing <code>/plugin &lt;description&gt;</code> in the chat.
+      </div>
+      {error ? <div className="hint" style={{ color: 'var(--danger)' }}>{error}</div> : null}
+      {plugins === null ? (
+        <div className="hint">Loading…</div>
+      ) : plugins.length === 0 ? (
+        <div className="hint">No plugins installed yet. Add one with <code>/plugin &lt;description&gt;</code>.</div>
+      ) : (
+        <div className="mcp-list">
+          {plugins.map((p) => (
+            <div key={p.slug} className="mcp-card">
+              <div className="mcp-card-head">
+                <label className="mcp-card-title">
+                  <input
+                    type="checkbox"
+                    checked={p.enabled}
+                    disabled={busy === p.slug}
+                    onChange={() => void flip(p)}
+                  />{' '}
+                  {p.name}
+                  {p.version ? <span className="mcp-type">{p.version}</span> : null}
+                </label>
+                <div className="mcp-card-actions">
+                  <button
+                    className="btn tiny secondary"
+                    disabled={busy === p.slug}
+                    onClick={() => void remove(p)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+              {p.description ? <div className="hint">{p.description}</div> : null}
+              <div className="hint">
+                <code>{p.slug}</code> · {(p.skills ?? []).length} skills ·{' '}
+                {(p.mcp ?? []).length} connectors
+                {(p.skills ?? []).length > 0 ? ` — ${(p.skills ?? []).join(', ')}` : ''}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** Settings → Plugins: web-search engine priority. */
 function PluginEditor() {
   const searchPlugins = useStore((s) => s.searchPlugins)
@@ -339,14 +469,14 @@ function PluginEditor() {
 
   return (
     <>
-      <div className="field">
-        <div className="field-head">
-          <label>Web Search engines</label>
-        </div>
-        <div className="hint">
-          The top engine is the <strong>primary</strong>; the ones below are tried in order as
-          fallbacks until one returns results. DuckDuckGo needs no API key; a disabled engine is
-          never used.
+      <div className="panel-card">
+        <div className="panel-card-head">
+          <span className="panel-card-title">Search engines</span>
+          <span className="panel-card-desc">
+            The top engine is the <strong>primary</strong>; the ones below are
+            tried in order as fallbacks until one returns results. DuckDuckGo
+            needs no API key, and a disabled engine is never used.
+          </span>
         </div>
         <div className="plugin-list">
           {plugins.map((p, i) => {
@@ -426,18 +556,17 @@ function PluginEditor() {
           under Settings → Auth automatically, and DuckDuckGo needs no key.
         </div>
       </div>
-      <div className="field">
-        <div className="field-head">
-          <label>Results per search</label>
+      <div className="panel-card">
+        <div className="panel-card-head">
+          <span className="panel-card-title">Results per search</span>
+          <span className="panel-card-desc">
+            How many results <b>web_search</b> returns, and how many of them get
+            their <b>real page content</b> fetched before the distiller reads
+            them. <code>0</code> keeps results but skips the fetch. Range{' '}
+            <code>0</code>–<code>10</code>. Default: <code>5</code>.
+          </span>
         </div>
-        <div className="hint">
-          One number for every <b>web_search</b>: how many results it returns, and how many of
-          those top results get their <b>real page content</b> fetched (not just a snippet)
-          before the result distiller reads them. <code>0</code> still returns results but skips
-          the page fetch, so the model only sees snippets. Range <code>0</code>–
-          <code>10</code>; values outside it are clamped. Default: <code>5</code>.
-        </div>
-        <div className="settings-row-control" style={{ marginTop: 10 }}>
+        <div className="settings-row-control">
           <input
             type="number"
             min={0}
@@ -497,6 +626,144 @@ export async function fetchProviderModels(
   }
 }
 
+/** Ordered per-tool fallback list (Settings → Tools): the models a tool falls
+ *  back on, top to bottom. Row 1 is the tool's OWN model and every row below
+ *  it is tried after that one; the list order IS the try order, which is why
+ *  row 1 carries the same reorder buttons as the rest — moving a model into
+ *  row 1 is exactly how it becomes the tool's model. Each row is the
+ *  composer's own model picker, so a rung may live on another provider, and a
+ *  row naming nothing means "the composer's model". Only the CURRENT call walks
+ *  the list; the next call starts at row 1 again. */
+function FallbackRows({
+  label,
+  own,
+  onOwn,
+  rows,
+  onChange,
+}: {
+  label: string
+  /** The tool's OWN model (rung 1). `''` = whatever the composer is running. */
+  own: string
+  onOwn: (model: string) => void
+  rows: ToolFallback[]
+  onChange: (rows: ToolFallback[]) => void
+}) {
+  const providers = useStore((s) => s.settings.providers)
+  const activeProviderId = useStore((s) => s.settings.activeProviderId)
+  // A new row starts on a REAL provider. The store drops rows that name only
+  // half a target, so "+ Add" inserting a fully blank row committed nothing and
+  // looked like a dead button. The model stays empty until the picker fills it
+  // in, and a half-filled row never reaches the wire.
+  const defaultProviderId =
+    providers.find((p) => p.id === activeProviderId)?.id ?? providers[0]?.id ?? ''
+  // ONE list drives both the tool's own model and its fallbacks, so row 1 can
+  // be moved like any other rung. Writing back is the inverse: whatever ends up
+  // in row 1 is the tool's model, the rest is its fallback list.
+  const chain = toolChainRows(own, rows)
+  const commit = (next: ToolFallback[]) => {
+    const split = toolChainSet(next)
+    if (split.own !== own) onOwn(split.own)
+    if (!sameRows(split.fallbacks, rows)) onChange(split.fallbacks)
+  }
+  return (
+    <div className="slot-fallbacks">
+      {chain.map((fb, i) => {
+        const isOwn = i === 0
+        return (
+          <div
+            key={isOwn ? 'own' : i}
+            className={`slot-fallback-row${isOwn ? ' slot-fallback-row-own' : ''}`}
+          >
+            {/* The position in the try order, so a long list stays readable at
+                a glance. aria-hidden: the buttons already announce it. */}
+            <span className="slot-fallback-order" aria-hidden="true">
+              {i + 1}
+            </span>
+            <div className="slot-fallback-picker">
+              <ProviderModelSelect
+                value={isOwn ? own : toolFallbackValue(fb)}
+                onSelect={(v) => {
+                  // The picker reports "providerId/model". `''` is the
+                  // composer's own model, and a value without the separator is a
+                  // bare model id that keeps the row's provider.
+                  const slash = v.indexOf('/')
+                  const target: ToolFallback = !v
+                    ? { providerId: '', model: '' }
+                    : slash > 0
+                      ? { providerId: v.slice(0, slash), model: v.slice(slash + 1) }
+                      : { ...fb, model: v }
+                  if (isOwn) {
+                    onOwn(toolFallbackToModel(target))
+                    return
+                  }
+                  commit(chain.map((r, j) => (j === i ? target : r)))
+                }}
+                noneLabel="Main model"
+              />
+            </div>
+            <div className="slot-fallback-actions">
+              <button
+                type="button"
+                className="icon-btn"
+                title="Move up — tried earlier"
+                aria-label={`Move ${label} model ${i + 1} up`}
+                disabled={i === 0}
+                onClick={() => commit(moveFallback(chain, i, -1))}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6" /></svg>
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                title="Move down — tried later"
+                aria-label={`Move ${label} model ${i + 1} down`}
+                disabled={i === chain.length - 1}
+                onClick={() => commit(moveFallback(chain, i, 1))}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+              </button>
+              {/* Row 1 always exists: dropping the tool's model is done by
+                  pointing it at the composer's model, not by deleting a row. */}
+              {!isOwn && (
+                <button
+                  type="button"
+                  className="icon-btn slot-fallback-remove"
+                  title="Remove this model from the list"
+                  aria-label={`Remove ${label} model ${i + 1}`}
+                  onClick={() => commit(chain.filter((_, j) => j !== i))}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })}
+      <button
+        type="button"
+        className="slot-fallback-add"
+        disabled={!defaultProviderId}
+        title={
+          defaultProviderId
+            ? undefined
+            : 'Add a provider first — a fallback must name one'
+        }
+        onClick={() => onChange([...rows, { providerId: defaultProviderId, model: '' }])}
+      >
+        + Add fallback
+      </button>
+    </div>
+  )
+}
+
+/** Row-by-row equality, so a reorder that leaves one side untouched does not
+ *  rewrite (and re-persist) it. */
+function sameRows(a: ToolFallback[], b: ToolFallback[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((r, i) => r.providerId === b[i].providerId && r.model === b[i].model)
+  )
+}
 export function SettingsModal({ onClose, initialTab }: { onClose: () => void; initialTab?: string }) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
@@ -540,6 +807,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const subagentThinking = useStore((s) => s.subagentThinking)
   const setSubagentThinking = useStore((s) => s.setSubagentThinking)
+  const toolFallbacks = useStore((s) => s.toolFallbacks)
+  const setToolFallbacks = useStore((s) => s.setToolFallbacks)
   // The "Other" Tools row drives the small side-task slots together (context
   // compaction summariser, web-search distiller, chat-title generator): they
   // are all short, cheap calls where one model choice is what the user wants,
@@ -556,6 +825,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   }
   const setOtherLevel = (_agent: string, level: ThinkingLevel) => {
     for (const k of OTHER_SLOTS) setSubagentThinking(k, level)
+  }
+  // The "Other" group's fallback list, read/written through the SAME three keys
+  // as its model row — one row, one list.
+  const otherFallbacks = otherSlotFallbacks(toolFallbacks)
+  const setOtherFallbacks = (rows: ToolFallback[]) => {
+    for (const k of OTHER_SLOTS) setToolFallbacks(k, rows)
   }
   const cacheTtlMinutes = useStore((s) => s.cacheTtlMinutes)
   const setMemoryTtlConfig = useStore((s) => s.setMemoryTtlConfig)
@@ -609,7 +884,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'extensions' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
   // Search Console OAuth (Settings → Auth) — the ONLY Google sign-in. Gemini
   // models authenticate with an API key like every other provider.
   const searchConsole = useStore((s) => s.searchConsole)
@@ -826,10 +1101,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     })
     setSkillsMsg(res.ok ? 'Saved ✓' : `Save failed: ${res.note ?? 'unknown error'}`)
     if (res.ok && (res.fa_keyword_count ?? 0) === 0) {
-      // Without keywords the skill is invisible to auto-match: the catalog line
-      // is the only trigger, and the settings list gives no other signal.
+      // Without keywords the catalog line is English-only, so a Persian request
+      // carries no trigger to find this skill by.
       setSkillsMsg(
-        'Saved ✓ but no Persian keywords: this skill will never be auto-selected from a request. Add keywords above.',
+        'Saved ✓ but no Persian keywords: a Persian request has nothing to find this skill by. Add keywords above.',
       )
     }
     if (res.ok) {
@@ -1275,6 +1550,16 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
           <rect x="6" y="6" width="12" height="12" rx="2.5" />
+        </svg>
+      ),
+    },
+    {
+      id: 'extensions',
+      label: 'Plugins',
+      group: 'Knowledge',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4 7h4V3a2 2 0 1 1 4 0v4h4V5a2 2 0 1 1 4 0v2h2a1 1 0 0 1 1 1v4h-4a2 2 0 1 0 0 4h4v4a1 1 0 0 1-1 1h-4v-4a2 2 0 1 0-4 0v4H8a1 1 0 0 1-1-1v-4H3a2 2 0 1 0 0-4h4V8a1 1 0 0 1 1-1z" />
         </svg>
       ),
     },
@@ -1982,6 +2267,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         </>
         )}
 
+        {tab === 'extensions' && (
+        <>
+          <PluginBundleEditor />
+        </>
+        )}
+
         {tab === 'skills' && (
         <>
             <div className="field">
@@ -2324,16 +2615,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         {tab === 'tools' && (
         <>
           <div className="field">
-            <div className="field-head">
-              <label>Tool Models</label>
-            </div>
-            <div className="hint">
-              Give a tool its own model, or leave the row on the main model to
-              follow whatever the composer is using. The slider under each row
-              sets that tool's own reasoning effort — None sends no reasoning
-              parameter at all. The {`"Other"`} row drives the small side tasks
-              (context compaction summariser, web-search result distiller and
-              chat-title generator) together.
+            <div className="slot-intro">
+              Each tool can run on a model of its own — leave a card on the main
+              model to follow the composer. A tool whose own model fails tries
+              its own fallback list, top to bottom, for that call only; a
+              fallback keeps the tool's reasoning level, and the next call starts
+              at the tool's own model again. The {`"Other"`} card drives the
+              small side tasks (context compaction summariser, web-search result
+              distiller and chat-title generator) together.
             </div>
 
             <ToolSlotRow
@@ -2344,6 +2633,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               level={subagentThinking.explore || 'low'}
               onSelectModel={setSubagentModel}
               onSelectLevel={setSubagentThinking}
+              fallbacks={toolFallbacks.explore ?? []}
+              onFallbacks={(rows) => setToolFallbacks('explore', rows)}
             />
             <ToolSlotRow
               agent="vision"
@@ -2353,6 +2644,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               level={subagentThinking.vision || 'none'}
               onSelectModel={setSubagentModel}
               onSelectLevel={setSubagentThinking}
+              fallbacks={toolFallbacks.vision ?? []}
+              onFallbacks={(rows) => setToolFallbacks('vision', rows)}
             />
             <ToolSlotRow
               agent="schedule"
@@ -2362,6 +2655,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               level={subagentThinking.schedule || 'none'}
               onSelectModel={setSubagentModel}
               onSelectLevel={setSubagentThinking}
+              fallbacks={toolFallbacks.schedule ?? []}
+              onFallbacks={(rows) => setToolFallbacks('schedule', rows)}
             />
             <ToolSlotRow
               agent="other"
@@ -2371,6 +2666,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               level={otherLevel as ThinkingLevel}
               onSelectModel={setOtherModel}
               onSelectLevel={setOtherLevel}
+              fallbacks={otherFallbacks}
+              onFallbacks={setOtherFallbacks}
             />
           </div>
         </>
@@ -2379,13 +2676,11 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         {tab === 'models' && (
         <>
             <div className="field models-tab">
-              <div className="field-head">
-                <label>Media Providers</label>
-              </div>
-              <div className="hint models-intro">
-                Speech uses your configured providers — no models run on-device.
-                STT posts audio to {'<base_url>/audio/transcriptions'} and TTS to
-                {' '}{'<base_url>/audio/speech'}.
+              <div className="slot-intro">
+                <b>Media Providers</b> — speech runs on your own providers,
+                nothing on-device. STT posts audio to{' '}
+                {'<base_url>/audio/transcriptions'} and TTS to{' '}
+                {'<base_url>/audio/speech'}.
               </div>
 
               <div className="model-card model-card-voice">

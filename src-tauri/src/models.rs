@@ -734,6 +734,13 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
         Ok(v) => v,
         Err(e) => return bad_request(format!("failed to fetch models from {url}: {e}")),
     };
+    // A 2xx is not proof the catalog arrived: a gateway that refuses the call in
+    // the BODY (`{"error": {"message": "invalid api key"}}`) left the list empty
+    // and every model silently vanished from the picker. The reason is provider
+    // -worded, so it is read by shape, not by provider name.
+    if let Some(msg) = crate::llm::provider_error_message(&data) {
+        return bad_request(format!("failed to fetch models from {url}: {msg}"));
+    }
 
     let mut rows: Vec<Row> = Vec::new();
     if format == "tags" {

@@ -14,7 +14,22 @@ use base64::Engine;
 use rand::RngCore;
 use tauri::Manager;
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+
 const PREFIX_PLAIN: &str = "raw:";
+
+/// Marker of an at-rest encrypted value (`enc:v1:<b64 iv>.<b64 ct+tag>`),
+/// written by the renderer's `secrets.ts`.
+const PREFIX_ENC: &str = "enc:v1:";
+
+/// Process-global copy of the install key.
+///
+/// `get_secrets_key` needs an `AppHandle`, but the scheduler runs on its own
+/// thread (and the axum router on a runtime) with no handle. Primed once at
+/// startup so handle-free code can decrypt provider keys from settings.json
+/// instead of shipping ciphertext as a bearer token.
+static CACHED_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn plain_key_file(app: &tauri::AppHandle) -> PathBuf {
     app.path()
@@ -95,4 +110,88 @@ pub fn get_secrets_key(app: &tauri::AppHandle) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     write_plain_fallback(app, &b64);
     b64
+}
+
+/// Resolve the install key once and remember it for handle-free callers.
+///
+/// Called from the Tauri setup hook, where an `AppHandle` still exists. Safe to
+/// call more than once; the first call wins so a later one cannot swap the key
+/// under a value that was encrypted with the first.
+pub fn prime_key(app: &tauri::AppHandle) {
+    if let Ok(g) = CACHED_KEY.lock() {
+        if g.is_some() {
+            return;
+        }
+    }
+    let key = get_secrets_key(app);
+    if let Ok(mut g) = CACHED_KEY.lock() {
+        *g = Some(key);
+    }
+}
+
+fn cached_key() -> Option<String> {
+    CACHED_KEY.lock().ok().and_then(|g| g.clone())
+}
+
+/// Decrypt one at-rest secret with the primed install key.
+///
+/// A value without the `enc:v1:` prefix is legacy plaintext and passes through
+/// untouched. An undecryptable value yields `""` (a rotated key or a foreign
+/// install) rather than the ciphertext: handing ciphertext to a provider only
+/// produces an opaque 401 that hides the real cause.
+pub fn decrypt_at_rest(value: &str) -> String {
+    if !value.starts_with(PREFIX_ENC) {
+        return value.to_string();
+    }
+    let Some(key_b64) = cached_key() else {
+        return String::new();
+    };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let Some(body) = value.strip_prefix(PREFIX_ENC) else {
+        return String::new();
+    };
+    let Some((iv_b64, ct_b64)) = body.split_once('.') else {
+        return String::new();
+    };
+    let (Ok(key), Ok(iv), Ok(ct)) = (b64.decode(&key_b64), b64.decode(iv_b64), b64.decode(ct_b64))
+    else {
+        return String::new();
+    };
+    if iv.len() != 12 {
+        return String::new();
+    }
+    let Ok(cipher) = Aes256Gcm::new_from_slice(&key) else {
+        return String::new();
+    };
+    match cipher.decrypt(Nonce::from_slice(&iv), ct.as_ref()) {
+        Ok(pt) => String::from_utf8(pt).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Decrypt every provider's API key inside a raw settings document, in place.
+///
+/// The renderer encrypts `apiKeys`/`apiKey` before writing settings.json, so a
+/// backend path that reads that file directly (the scheduler) must decrypt it
+/// first — otherwise the "key" it sends is the `enc:v1:` ciphertext.
+pub fn decrypt_provider_secrets(doc: &mut serde_json::Value) {
+    let Some(providers) = doc.get_mut("providers").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    for p in providers {
+        if let Some(keys) = p.get_mut("apiKeys").and_then(|k| k.as_array_mut()) {
+            for k in keys.iter_mut() {
+                if let Some(s) = k.as_str() {
+                    let plain = decrypt_at_rest(s);
+                    *k = serde_json::Value::String(plain);
+                }
+            }
+        }
+        if let Some(s) = p.get("apiKey").and_then(|k| k.as_str()) {
+            let plain = decrypt_at_rest(s);
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert("apiKey".into(), serde_json::Value::String(plain));
+            }
+        }
+    }
 }

@@ -244,16 +244,34 @@ pub struct CompactOutcome {
 pub async fn compact_history(
     client: &reqwest::Client,
     model: &LlmConfig,
-    fallback: Option<&LlmConfig>,
+    fallbacks: &[LlmConfig],
     history: &[Value],
     ctx: usize,
     max_output: usize,
     force: bool,
 ) -> Result<Option<CompactOutcome>, String> {
     compact_history_with_progress(
-        client, model, fallback, history, ctx, max_output, force, &mut |_| {},
+        client, model, fallbacks, history, ctx, max_output, force, &mut |_| {},
     )
     .await
+}
+
+/// Full try order for one compaction: the summariser's own model first, then the
+/// configured fallbacks in the user's order. The same target is kept ONCE
+/// (a caller may list its chat model both ways), so no rung is asked twice and a
+/// short list is not spent re-failing a model that already answered.
+pub fn compact_chain<'a>(model: &'a LlmConfig, fallbacks: &'a [LlmConfig]) -> Vec<&'a LlmConfig> {
+    let mut chain: Vec<&LlmConfig> = Vec::with_capacity(fallbacks.len() + 1);
+    chain.push(model);
+    for fb in fallbacks {
+        let seen = chain.iter().any(|c| {
+            c.provider == fb.provider && c.model == fb.model && c.base_url == fb.base_url
+        });
+        if !seen {
+            chain.push(fb);
+        }
+    }
+    chain
 }
 
 /// Same as [`compact_history`], but reports live progress (`CompactProgress`) so
@@ -264,7 +282,7 @@ pub async fn compact_history(
 pub async fn compact_history_with_progress(
     client: &reqwest::Client,
     model: &LlmConfig,
-    fallback: Option<&LlmConfig>,
+    fallbacks: &[LlmConfig],
     history: &[Value],
     ctx: usize,
     max_output: usize,
@@ -388,29 +406,31 @@ pub async fn compact_history_with_progress(
     // fallback retries kept the "Compacting…" banner alive for many minutes
     // with no summary ever arriving.
     let mut outcome: Option<CompactOutcome> = None;
-    let mut last_err = String::new();
-    let fallbacks: Vec<&LlmConfig> = if std::ptr::eq(model, fallback.unwrap_or(model)) {
-        Vec::new()
-    } else {
-        fallback.iter().copied().collect()
-    };
+    // Every rung's reason, in try order. Reporting only the LAST failure is what
+    // made a working fallback list look like it was never used: the banner
+    // showed the chat model's 401 while the user's own fallbacks had already
+    // been tried and rejected too.
+    let mut tried: Vec<String> = Vec::new();
+    let chain = compact_chain(model, fallbacks);
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(COMPACT_TOTAL_BUDGET_SECS);
-    // Attempts this run may make in total: 1 on the primary + the fallback
-    // retries. Reported so the UI can say "attempt 2 of 2" instead of guessing.
-    let attempts_total = 1
-        + if std::ptr::eq(model, fallback.unwrap_or(model)) {
-            0
-        } else {
-            COMPACT_FALLBACK_ATTEMPTS
-        };
+    // Attempts this run may make in total: one per rung plus the retries the
+    // fallback rungs may spend. Reported so the UI can say "attempt 2 of 3"
+    // instead of guessing.
+    let attempts_total = 1 + chain.len().saturating_sub(1) * COMPACT_FALLBACK_ATTEMPTS;
     let mut attempt_no = 0usize;
-    for m in std::iter::once(model).chain(fallbacks.into_iter()) {
-        let attempts = if std::ptr::eq(m, model) { 1 } else { COMPACT_FALLBACK_ATTEMPTS };
+    'rungs: for (rung, m) in chain.into_iter().enumerate() {
+        // The summariser's own model gets a single attempt — retrying it is
+        // exactly what the fallback list exists to avoid. A fallback rung gets
+        // the retry budget, because a transient error there is worth one repeat.
+        let attempts = if rung == 0 { 1 } else { COMPACT_FALLBACK_ATTEMPTS };
+        // This rung's own failure. Kept per rung so the aggregated message can
+        // name WHICH model said what.
+        let mut rung_err = String::new();
         for _attempt in 0..attempts {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                break;
+                break 'rungs;
             }
             attempt_no += 1;
             progress_tick(
@@ -426,18 +446,26 @@ pub async fn compact_history_with_progress(
             {
                 Ok(Ok(r)) if !r.text.trim().is_empty() => {
                     outcome = Some(CompactOutcome { summary: r.text.trim().to_string(), keep: recent.len(), usage: r.usage });
-                    break;
+                    break 'rungs;
                 }
-                Ok(Ok(_)) => last_err = "summarizer returned an empty summary".into(),
-                Ok(Err(e)) => last_err = e,
+                Ok(Ok(_)) => rung_err = "returned an empty summary".into(),
+                Ok(Err(e)) => rung_err = e,
                 Err(_) => {
-                    last_err =
-                        format!("summarizer gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s")
+                    rung_err =
+                        format!("gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s")
                 }
             }
         }
-        if outcome.is_some() {
-            break;
+        if !rung_err.is_empty() {
+            tried.push(format!("{}: {rung_err}", m.model));
+            // ONLY a model-side rejection may hand the work to the next model.
+            // A timeout, a 5xx, a dropped connection or a rate limit is not the
+            // model's fault: the next model cannot fix the network, so the walk
+            // stops here and reports the real reason instead of hiding it behind
+            // the last rung's error.
+            if !llm::should_fall_back(&rung_err) {
+                break 'rungs;
+            }
         }
     }
     match outcome {
@@ -445,7 +473,13 @@ pub async fn compact_history_with_progress(
             progress_tick(on_progress, started, "merging", attempt_no, attempts_total, &model.model);
             Ok(Some(o))
         }
-        None => Err(if last_err.is_empty() { "summarizer failed".into() } else { last_err }),
+        // The aggregate names every model that was tried, so a banner can no
+        // longer hide a fallback list that did run and did fail.
+        None => Err(if tried.is_empty() {
+            "summarizer failed".to_string()
+        } else {
+            format!("every summarizer model failed — {}", tried.join("; "))
+        }),
     }
 }
 
@@ -533,7 +567,217 @@ mod tests {
         };
         let hist: Vec<Value> = (0..3).map(|i| msg("user", &format!("m{i}"))).collect();
         let out = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(compact_history(&client, &model, None, &hist, 1_000_000, 0, false));
+            .block_on(compact_history(&client, &model, &[], &hist, 1_000_000, 0, false));
         assert!(matches!(out, Ok(None)));
+    }
+
+    // A summariser whose own model is rejected must FALL THROUGH the configured
+    // fallback list, in order, and stop at the first rung that answers — the
+    // behaviour a user expects from Settings → Tools (fallback used the moment a
+    // call fails). The chain helper is what the retry loop walks, so this pins
+    // the order and the duplicate handling the loop depends on.
+    fn cfg(provider: &str, model: &str, base: &str) -> LlmConfig {
+        LlmConfig {
+            provider: provider.into(),
+            model: model.into(),
+            base_url: base.into(),
+            api_keys: vec!["k".into()],
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: 1,
+            reasoning_level: String::new(),
+            model_reasoning: false,
+            auto_think: false,
+        }
+    }
+
+    #[test]
+    fn chain_tries_own_model_then_each_fallback_in_order() {
+        let model = cfg("openai", "primary", "https://a.example");
+        let fallbacks = vec![
+            cfg("openai", "fb-1", "https://a.example"),
+            cfg("custom", "fb-2", "http://127.0.0.1:9"),
+        ];
+        let chain = compact_chain(&model, &fallbacks);
+        let ids: Vec<&str> = chain.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(ids, vec!["primary", "fb-1", "fb-2"]);
+        // The whole list is walked, not just its first rung: a rejected key on
+        // `primary` and a dead `fb-1` must still leave `fb-2` reachable.
+        assert_eq!(chain.len(), 3);
+    }
+
+    #[test]
+    fn chain_keeps_a_target_once() {
+        let model = cfg("openai", "primary", "https://a.example");
+        // The manual path can list the chat model as a fallback while the
+        // summariser already runs on it: asking it twice would burn the budget
+        // re-failing a model that already answered.
+        let fallbacks = vec![
+            cfg("openai", "primary", "https://a.example"),
+            cfg("openai", "fb-1", "https://a.example"),
+            cfg("openai", "fb-1", "https://a.example"),
+        ];
+        let chain = compact_chain(&model, &fallbacks);
+        let ids: Vec<&str> = chain.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(ids, vec!["primary", "fb-1"]);
+    }
+
+    #[test]
+    fn chain_is_just_the_own_model_without_fallbacks() {
+        let model = cfg("openai", "primary", "https://a.example");
+        let chain = compact_chain(&model, &[]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].model, "primary");
+    }
+
+    /// A tiny OpenAI-compatible stub: answers the Nth request with the Nth
+    /// scripted (status, body), repeating the LAST one if the walk needs more.
+    /// Two requests are all it takes to prove a rejected key on one model hands
+    /// the call to the next.
+    fn stub_server(responses: Vec<(u16, String)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { break };
+                // Drain the request head (and body) before replying, so the
+                // client never sees a connection reset mid-send.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let (status, body) = responses
+                    .get(i)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or((500, String::new()));
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = conn.write_all(reply.as_bytes());
+                let _ = conn.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A CONNECTION failure must not walk the fallback list: the next model
+    /// cannot fix the network, so the compaction fails with the real reason
+    /// instead of billing every configured model and reporting the last one.
+    #[tokio::test]
+    async fn connection_failure_does_not_try_the_fallbacks() {
+        // Nothing listens on the discard port, so the primary cannot connect at
+        // all — the transport error path, not a model rejection.
+        let dead = "http://127.0.0.1:9";
+        let healthy = stub_server(vec![(
+            200,
+            r#"{"choices":[{"message":{"content":"SHOULD NOT BE CALLED"}}]}"#.to_string(),
+        )]);
+        let mut primary = cfg("custom", "primary-model", dead);
+        primary.timeout_secs = 5;
+        let mut fallback = cfg("custom", "healthy-fallback", &healthy);
+        fallback.timeout_secs = 5;
+        let hist: Vec<Value> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &primary,
+            &[fallback],
+            &hist,
+            1_000_000,
+            0,
+            true,
+            &mut |_| {},
+        )
+        .await;
+        let err = match out {
+            Ok(_) => panic!("a connection failure must fail the compaction"),
+            Err(e) => e,
+        };
+        assert!(
+            !err.contains("healthy-fallback"),
+            "the fallback must not be tried for a connection failure, got: {err}"
+        );
+    }
+
+    /// The user's field failure: the summariser's own provider answers
+    /// `401 Invalid API key`. The configured fallback must be tried and answer
+    /// the compaction instead of the whole call failing.
+    #[tokio::test]
+    async fn rejected_key_falls_through_to_the_next_fallback() {
+        let url = stub_server(vec![
+            (
+                401,
+                r#"{"error":{"message":"Invalid API key","type":"invalid_request_error"}}"#
+                    .to_string(),
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"SUMMARY FROM FALLBACK"}}]}"#.to_string(),
+            ),
+        ]);
+        let mut primary = cfg("custom", "dead-model", &url);
+        primary.timeout_secs = 5;
+        let mut fallback = cfg("custom", "good-model", &url);
+        fallback.timeout_secs = 5;
+        let hist: Vec<Value> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &primary,
+            &[fallback],
+            &hist,
+            1_000_000,
+            0,
+            true,
+            &mut |_| {},
+        )
+        .await;
+        let outcome = out
+            .expect("a rejected key on the primary must not fail the compaction")
+            .expect("the fallback rung answered, so a summary must exist");
+        assert_eq!(outcome.summary, "SUMMARY FROM FALLBACK");
+    }
+
+    /// When every rung is rejected the call still fails — with the provider's
+    /// real reason, because that text becomes the banner the user reads.
+    #[tokio::test]
+    async fn every_rung_rejected_surfaces_the_reason() {
+        let url = stub_server(vec![(
+            401,
+            r#"{"error":{"message":"Invalid API key"}}"#.to_string(),
+        )]);
+        let mut primary = cfg("custom", "dead-model", &url);
+        primary.timeout_secs = 5;
+        let mut fallback = cfg("custom", "also-dead", &url);
+        fallback.timeout_secs = 5;
+        let hist: Vec<Value> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let out = compact_history_with_progress(
+            &llm::http_client(),
+            &primary,
+            &[fallback],
+            &hist,
+            1_000_000,
+            0,
+            true,
+            &mut |_| {},
+        )
+        .await;
+        match out {
+            Ok(_) => panic!("every rung was rejected, so the call must fail"),
+            Err(e) => {
+                assert!(e.contains("401"), "expected the 401 reason, got: {e}");
+                // The banner must be able to prove the fallback list RAN. Before
+                // this only the last rung's reason survived, so a working list
+                // that also failed was indistinguishable from one that was
+                // never tried.
+                assert!(e.contains("dead-model"), "the summariser's own model must be named, got: {e}");
+                assert!(e.contains("also-dead"), "the fallback model must be named too, got: {e}");
+            }
+        }
     }
 }

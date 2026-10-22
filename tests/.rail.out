@@ -1,0 +1,89 @@
+1) ViewerTabBar renders as a vertical icon rail:
+  ok rail-owned pages get no row, plain tabs do
+  ok the inbox tab is not drawn as a row
+  ok bar carries the rail class
+  ok bar announces a vertical tablist
+  ok every tab shows an icon
+  ok every tab keeps its label in the DOM (hidden by CSS until hover)
+  ok the rail wraps the tabs, not the other way round
+2) markup + CSS keep the rail fixed on the pane's right edge:
+  ok the pane body wraps the header
+  ok the header (rail) comes after the content in the body
+  ok the rail block exists in the stylesheet
+  ok rail stacks its tabs vertically
+  ok rail is pinned to the pane's right edge at a fixed width
+  ok the rail is never a window drag region
+  FAIL hovering never widens the rail or repaints it [
+  '.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover {\n' +
+    '  transform: none;\n' +
+    '}',
+  '.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover,\n' +
+    '.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:focus-visible {\n' +
+    '  color: var(--text);\n' +
+    '  background: color-mix(in srgb, var(--text) 14%, var(--bg-hover));\n' +
+    '  border-color: color-mix(in srgb, currentColor 22%, transparent);\n' +
+    '}',
+  '.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close,\n' +
+    '.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-close,\n' +
+    '.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .editor-tab-close {\n' +
+    '  opacity: 1;\n' +
+    '  pointer-events: auto;\n' +
+    '}',
+  '.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close:hover {\n' +
+    '  transform: translate(-50%, -50%) scale(1.08);\n' +
+    '  color: var(--danger);\n' +
+    '  background: color-mix(in srgb, var(--danger) 18%, transparent);\n' +
+    '}',
+  '.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .viewer-tab-icon,\n' +
+    '.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .viewer-tab-icon,\n' +
+    '.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .viewer-tab-icon {\n' +
+    '  opacity: 0;\n' +
+    '  pointer-events: none;\n' +
+    '}'
+]
+  ok the collapsed width is never overridden
+  ok viewer content keeps a constant rail gutter
+  ok tab labels stay hidden in the rail
+  FAIL a hovered tab unfolds its title over the content 
+  FAIL the unfolded title opens beside the tab, leaving its icon visible 
+  FAIL hovering never hides the tab's icon 
+  ok drag/keyboard reordering runs on the vertical axis
+3) panel icons lead the rail, tabs follow below them:
+  ok the panel action icons render inside the rail
+  ok panel icons come before the tab-list chevron
+  ok panel icons come before the tabs
+  ok nothing is stacked above the panel icons
+  ok the spacer drops below the tabs
+  ok no "+" add button is left in the rail
+  ok the add button component is gone from the app
+  ok the rail action container fills the rail width
+  ok rail icon buttons share one width
+4) every page owns one rail icon, in a fixed order:
+  ok the terminal toggle renders in the rail
+  ok fill every page icon
+  ok fullscreen sits directly below the tab-list chevron
+  ok files leads the rest of the page icons
+  ok todos sits below files and above artifacts
+  ok artifacts follows todos and sits above the terminal
+  ok the terminal follows artifacts
+  ok schedule follows the terminal, inbox follows schedule
+  ok review, trace and browser close the icon list
+  ok the rail rows and the tabs come last
+  ok the todos page owns a rail icon (not raw markup in App)
+  ok the rail button is a plain titlebar icon button
+  ok it starts unpressed
+  ok its label offers to open the terminal here
+  ok the tooltip and the label agree
+  ok it paints a stroke glyph instead of a filled app badge
+  ok the first press reveals the side pane
+  ok it requests the side dock
+  ok it opens the terminal
+  ok the effective dock really is the pane
+  ok pressing it again closes the terminal
+  ok a stale side request still opens the terminal
+  ok a hidden pane degrades the dock (so the icon reads unpressed)
+5) a page icon is pressed only while its page is ON SCREEN:
+  ok the icon of the shown page is pressed
+  ok …and offers to close it
+  ok the icon of an open-but-hidden page is not pressed
+  ok …and still offers to open it

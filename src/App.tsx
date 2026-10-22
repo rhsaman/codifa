@@ -17,7 +17,7 @@ import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
 import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs, visibleTabs } from './lib/viewerTabs'
-import { ViewerBrowserButton, ViewerFilesButton, ViewerInboxButton, ViewerPaneFullscreenButton, ViewerReviewButton, ViewerScheduleButton, ViewerTabListButton, ViewerTerminalButton, ViewerTodosButton, ViewerTraceButton } from './components/ViewerTabBar'
+import { ViewerArtifactsButton, ViewerBrowserButton, ViewerFilesButton, ViewerInboxButton, ViewerPaneFullscreenButton, ViewerReviewButton, ViewerScheduleButton, ViewerTabListButton, ViewerTerminalButton, ViewerTodosButton, ViewerTraceButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
@@ -673,7 +673,7 @@ export default function App() {
                   {/* Pane body: viewer content beside a vertical icon rail
                       pinned to the pane's right edge. Canonical rail order, top
                       to bottom: [collapse | tab list | fullscreen | files |
-                      todos | terminal | schedule | inbox | review | trace |
+                      todos | artifacts | terminal | schedule | inbox | review | trace |
                       browser]. Every page owns exactly ONE rail icon and no
                       "+" menu exists, so a page can never be reachable from two
                       differently-worded entry points. */}
@@ -709,21 +709,28 @@ export default function App() {
                       </div>
                       <ViewerTabListButton />
                       {/* Canonical rail order, top to bottom:
-                          [collapse | tab list | fullscreen | files | todos |
+                          [collapse | tab list | fullscreen | files |
+                          todos | artifacts |
                           terminal | schedule | inbox | review | trace |
                           browser]. Every page reachable from the rail owns
                           exactly ONE icon here and no "+" menu exists, so a
                           page can never appear twice (an icon plus its own
                           tab row) and read as two different pages. */}
                       <ViewerPaneFullscreenButton />
-                      <ViewerFilesButton />
-                      <ViewerTodosButton />
-                      <ViewerTerminalButton />
-                      <ViewerScheduleButton />
-                      <ViewerInboxButton />
-                      <ViewerReviewButton />
-                      <ViewerTraceButton />
-                      <ViewerBrowserButton />
+                      {/* Page icons wrap inside the rail's top area; the tab
+                          list owns the rows BELOW them, so a new tab can never
+                          land on top of a fixed icon. */}
+                      <div className="viewer-pane-icons">
+                        <ViewerFilesButton />
+                        <ViewerTodosButton />
+                        <ViewerArtifactsButton />
+                        <ViewerTerminalButton />
+                        <ViewerScheduleButton />
+                        <ViewerInboxButton />
+                        <ViewerReviewButton />
+                        <ViewerTraceButton />
+                        <ViewerBrowserButton />
+                      </div>
                       <ViewerTabBar />
                       <span className="viewer-pane-spacer" aria-hidden="true" />
                     </div>

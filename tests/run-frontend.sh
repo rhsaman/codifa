@@ -76,6 +76,7 @@ readingMode|tests/readingMode.ssr.test.tsx|--jsx=automatic --packages=external -
 loadingScreen|tests/loadingScreen.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 updater-core|tests/updater-core.test.ts|-
 retry|tests/retry.test.ts|-
+errorText|tests/errorText.test.ts|-
 retryRetired|tests/retryRetired.test.ts|-
 retryStore|tests/retryStore.test.ts|--packages=external --external:electron
 retryStream|tests/retryStream.test.ts|--packages=external --external:electron
@@ -102,6 +103,7 @@ contextBudget|tests/contextBudget.test.ts|--packages=external --external:electro
 compactChat|tests/compactChat.test.ts|--packages=external --external:electron
 emptyChats|tests/emptyChats.test.ts|--packages=external --external:electron
 messageWindow|tests/messageWindow.test.ts|-
+transcriptWindow|tests/transcriptWindow.test.ts|-
 renderCap|tests/renderCap.test.ts|-
 queue-during-compact|tests/queue-during-compact.test.ts|--packages=external --external:electron
 chatLeaks|tests/chatLeaks.test.ts|--packages=external --external:electron
@@ -111,6 +113,7 @@ usage|tests/usage.test.ts|-
 bidi|tests/bidi.test.ts|-
 fileTypes|tests/fileTypes.test.ts|-
 tabBar|src/lib/tabBar.test.ts|
+slash|src/lib/slash.test.ts|--packages=external --external:electron
 chatTree|src/lib/chatTree.test.ts|
 webkitDeadKey|src/lib/webkitDeadKey.test.ts|
 fileDrag|src/lib/fileDrag.test.ts|
@@ -136,7 +139,10 @@ explorePanel|tests/explorePanel.ssr.test.tsx|--jsx=automatic --packages=external
 tracePanel|tests/tracePanel.ui.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 exploreVisual|tests/exploreVisual.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolOutputPanel|tests/toolOutputPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+messageFold|tests/messageFold.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+turnUsage|tests/turnUsage.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+toolSkillCard|tests/toolSkillCard.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 terminalPanel|tests/terminalPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalPanelClosed|tests/terminalPanelClosed.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
@@ -188,6 +194,8 @@ viewerFilesKind|tests/viewerFilesKind.test.ts|--packages=external --external:ele
 viewerPages|tests/viewerPages.test.ts|--packages=external --external:electron
 toolSlots|src/lib/toolSlots.test.ts|
 filesPanel|tests/filesPanel.ssr.test.tsx|--jsx=automatic --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+artifactPanel|tests/artifactPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+artifactsPage|tests/artifactsPage.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 tabOrder|tests/tabOrder.test.ts|-
 stt|src/lib/stt.test.ts|
 localLive|src/lib/localLive.test.ts|

@@ -156,7 +156,13 @@ console.log('5) On-device models UI (Models tab):')
 {
   networkCalls = 0
   const toolsHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="tools" />)
-  check('Tools tab renders the tool-model selectors', toolsHtml.includes('Tool Models'))
+  // The tab's copy is asserted, not a heading: the per-tool cards ARE the model
+  // selectors, and coupling this to a title string broke the test as soon as
+  // the intro was rewritten.
+  check(
+    'Tools tab renders the tool-model selectors',
+    toolsHtml.includes('Each tool can run on a model of its own'),
+  )
   const modelsHtml = renderToString(<SettingsModal onClose={() => {}} initialTab="models" />)
   check('Models tab shows the STT card', modelsHtml.includes('Speech to Text'))
   // The on-device models (and their Download button) were removed with the

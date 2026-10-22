@@ -4,6 +4,9 @@
 // bridge (window.coder.openExternal); internal anchors (#, mailto:, etc.)
 // keep their default in-app behaviour.
 
+/** Any URI scheme prefix (`https:`, `mailto:`, `tel:`, `file:` …). */
+const SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i
+
 /** True when `href` points to an http(s) URL that should open externally. */
 export function isExternalHref(href: string | undefined): boolean {
   return typeof href === 'string' && /^https?:\/\//i.test(href)
@@ -22,6 +25,14 @@ export function handleLinkClick(
   if (isExternalHref(href)) {
     e.preventDefault()
     openExternal(href as string)
+    return true
+  }
+  // A relative href has no page to land on inside the app: letting the default
+  // navigation run replaced the whole webview with a dead URL, so the click is
+  // swallowed and the label stays inert. `#anchor` and `mailto:`/`tel:` keep
+  // their native behaviour.
+  if (href && !href.startsWith('#') && !SCHEME_RE.test(href)) {
+    e.preventDefault()
     return true
   }
   return false

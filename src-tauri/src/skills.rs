@@ -85,7 +85,7 @@ fn sha1_hex(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-fn safe_file(name: &str, fallback: &str) -> String {
+pub fn safe_file(name: &str, fallback: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars() {
         if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
@@ -123,6 +123,66 @@ fn strip_frontmatter(raw: &str) -> String {
     }
 }
 
+/// Public wrappers for the repo reader (`repo.rs`): a skill fetched from a git
+/// repo must follow the SAME frontmatter rules as a stored one, so the parser
+/// and the stripper live only here.
+pub fn parse_frontmatter_pub(raw: &str) -> (String, String, String, Vec<String>) {
+    parse_frontmatter(raw)
+}
+
+pub fn strip_frontmatter_pub(raw: &str) -> String {
+    strip_frontmatter(raw)
+}
+
+/// Fold YAML block scalars onto their key's own line.
+///
+/// The reader below is a line-oriented `key: value` splitter, so a `skill.md`
+/// written in the usual style — `description: >` followed by indented text, or
+/// `fa_keywords:` followed by `- item` lines — used to store the literal `>` as
+/// its description and throw the text away. Folding first keeps the splitter
+/// simple and makes those files readable.
+fn fold_block_scalars(block: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    // The key line being built, plus what separates the next folded line.
+    let mut open: Option<(String, &'static str)> = None;
+    for line in block.lines() {
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if let Some((mut key, sep)) = open.take() {
+            let text = line.trim().trim_start_matches('-').trim();
+            if indented || text.is_empty() {
+                if !text.is_empty() {
+                    key.push_str(if key.ends_with(':') { " " } else { sep });
+                    key.push_str(text);
+                }
+                open = Some((key, sep));
+                continue;
+            }
+            out.push(key);
+        }
+        if !indented {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                match v.trim() {
+                    ">" | "|" | ">-" | "|-" | ">+" | "|+" => {
+                        open = Some((format!("{key}:"), " "));
+                        continue;
+                    }
+                    "" if key.eq_ignore_ascii_case("fa_keywords") => {
+                        open = Some((format!("{key}:"), ","));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if let Some((key, _)) = open {
+        out.push(key);
+    }
+    out.join("\n")
+}
+
 /// Parse `name`, `slug`, `description`, `fa_keywords` from skill.md frontmatter.
 fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    let mut name = String::new();
     let mut slug = String::new();
@@ -130,7 +190,7 @@ fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    le
     let mut fa_keywords: Vec<String> = Vec::new();
     if let Some(rest) = raw.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
-            for line in rest[..end].lines() {
+            for line in fold_block_scalars(&rest[..end]).lines() {
                 let Some((key, val)) = line.split_once(':') else {
                     continue;
                 };
@@ -217,7 +277,9 @@ pub fn find_skill_dir_pub(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     find_skill_dir(root, name_or_slug)
 }
 
-fn sanitize_extra_filename(filename: &str) -> Option<String> {
+/// Whether a file may travel with a skill: one flat, safe file name.
+/// Public so the repo reader can flatten nested paths the same way.
+pub fn sanitize_extra_filename(filename: &str) -> Option<String> {
     let raw = filename.trim().trim_matches(|c| c == '/' || c == '\\');
     if raw.is_empty() || raw.eq_ignore_ascii_case("skill.md") {
         return None;
@@ -300,18 +362,27 @@ pub fn list_skills(root: &Path) -> Value {
     json!({ "skills": skills })
 }
 
-/// GET /skills/file?name=...&file=...
-pub fn read_skill_file(root: &Path, name: &str, file: &str) -> Result<Value, String> {
+/// Read one extra file of an ALREADY RESOLVED skill folder.
+///
+/// Split out of `read_skill_file` because a skill's folder is not always under
+/// `<root>/skills`: a plugin's skills live in `<root>/plugins/<slug>/skills/`,
+/// and the caller has to locate the plugin before it can read a file of it.
+pub fn read_extra_file(dir: &Path, name: &str, file: &str) -> Result<Value, String> {
     let Some(safe) = sanitize_extra_filename(file) else {
         return Err("invalid file name".into());
-    };
-    let Some(dir) = find_skill_dir(root, name) else {
-        return Err(format!("skill not found: {name}"));
     };
     match fs::read_to_string(dir.join(&safe)) {
         Ok(content) => Ok(json!({ "name": name, "file": safe, "content": content })),
         Err(_) => Err(format!("file not found: {safe}")),
     }
+}
+
+/// GET /skills/file?name=...&file=...
+pub fn read_skill_file(root: &Path, name: &str, file: &str) -> Result<Value, String> {
+    let Some(dir) = find_skill_dir(root, name) else {
+        return Err(format!("skill not found: {name}"));
+    };
+    read_extra_file(&dir, name, file)
 }
 
 /// POST /skills/sync — create/update/delete a skill (mirror of persist_skill).
@@ -484,8 +555,9 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
         "note": "saved",
         "files": files,
         "renamed_from": renamed_from,
-        // An empty keyword list makes the skill invisible to auto-match: the
-        // callers surface this instead of pretending everything is fine.
+        // An empty keyword list leaves the catalog line English-only, so a
+        // Persian request has no trigger to find the skill by: the callers
+        // surface this instead of pretending everything is fine.
         "fa_keyword_count": fa_keywords.len(),
     }))
 }
@@ -939,12 +1011,13 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_coding_standards_skill_parses_and_is_matchable() {
-        // The generic coding rules are no longer in the prompt text — they live
-        // in this shipped skill, so the file itself is now load-bearing. A
-        // frontmatter typo would leave the skill nameless (unloadable by the
-        // `name=Coding Standards` pointer the system prompt emits) or keyless
-        // (never auto-matched), and both failures are silent at runtime.
+    fn the_shipped_coding_standards_skill_parses_and_is_findable() {
+        // The generic coding rules are no longer written out in the prompt text —
+        // they live in this shipped skill and are inlined into the system prompt
+        // from it, so the file itself is now load-bearing. A frontmatter typo
+        // would leave the skill nameless (unresolvable by `load_skill`) or
+        // keyless (no Persian trigger in the catalog), and both failures are
+        // silent at runtime.
         let raw = include_str!("../skills/coding-standards.md");
         let (name, slug, description, fa_keywords) = parse_frontmatter(raw);
         assert_eq!(name, "Coding Standards");
@@ -953,10 +1026,10 @@ mod tests {
         assert!(
             fa_keywords.len() >= 3,
             "the skill must carry Persian + English keywords so a real request \
-             triggers it: {fa_keywords:?}"
+             can find it in the catalog: {fa_keywords:?}"
         );
-        // The body is what the model is told to follow — an empty one would
-        // make the prompt's pointer a dead end.
+        // The body is what the model is told to follow — and what the system
+        // prompt inlines — so an empty one would make the rules dead letters.
         let body = raw.split("\n---").nth(1).unwrap_or_default();
         assert!(
             body.contains("## 7. Debugging protocol"),
@@ -1275,7 +1348,7 @@ mod tests {
     }
 
     /// `sync_skill` reports the keyword count so callers can warn about a skill
-    /// that auto-match can never pick up.
+    /// that holds no Persian trigger for a request to be found by.
     #[test]
     fn sync_skill_reports_the_keyword_count() {
         let tmp = std::env::temp_dir().join(format!("codifa-kwcount-{}", std::process::id()));

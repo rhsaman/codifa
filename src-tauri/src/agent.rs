@@ -97,7 +97,16 @@ async fn run_slot_distill(
     // a blank Other row leaves the raw results in place, and silently spending
     // the chat model on every search/fetch would contradict that. (`main` is an
     // explicit choice and still resolves to the parent below.)
-    if entry.is_empty() {
+    //
+    // A configured fallback list still counts as a choice: before this, an empty
+    // slot returned early and the list was silently dead — the user could add
+    // fallbacks in Settings and nothing ever used them.
+    let slot_fallbacks = req
+        .tool_fallbacks
+        .get("web")
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if entry.is_empty() && slot_fallbacks.iter().all(|e| e.trim().is_empty()) {
         return None;
     }
     let (model, base, keys, provider_id) = crate::backend_light::resolve_slot_target(
@@ -110,7 +119,7 @@ async fn run_slot_distill(
     );
     // A resolved-but-empty model would send an empty id upstream; treat it as
     // unset so the caller falls back to the raw payload.
-    if model.is_empty() {
+    if model.is_empty() && entry.is_empty() {
         return None;
     }
     let kind = crate::backend_light::resolve_slot_kind(entry, &main.provider, &req.providers);
@@ -120,38 +129,75 @@ async fn run_slot_distill(
         .map(String::as_str)
         .unwrap_or("")
         .trim();
-    let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
-        &kind,
-        // A side call defaults to no reasoning (never inherits the main level).
-        if level.is_empty() { "none" } else { level },
-        provider_model_reasoning(&req.providers, &provider_id, &model),
-    );
-    let cfg = LlmConfig {
-        provider: kind,
-        model,
-        base_url: base,
-        api_keys: keys,
-        temperature: Some(0.2),
-        // A summary is a few hundred tokens; a reasoning model needs room for
-        // its preamble on top of that.
-        max_tokens: Some(1024),
-        timeout_secs: 60,
-        reasoning_level: reasoning,
-        model_reasoning,
-        auto_think,
-    };
-    match crate::llm::complete(client, &cfg, system, user).await {
-        Ok(res) => {
-            let text = res.text.trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
+    // One rung per candidate: the slot's own model first, then the slot's own
+    // fallback list (Settings → Tools). A fallback inherits the slot's reasoning
+    // level — only the model and its routing change.
+    //
+    // An UNSET slot contributes no rung of its own: blank means "no distiller",
+    // and the main model must not be spent on one. A configured fallback list is
+    // still honoured, because it is an explicit choice.
+    let mut chain: Vec<(String, String, Vec<String>, String, String)> = Vec::new();
+    if !entry.is_empty() {
+        chain.push((model, base, keys, provider_id, kind));
+    }
+    for step in crate::backend_light::resolve_slot_chain(
+        entry,
+        slot_fallbacks,
+        &main.model,
+        &main.base_url,
+        &main.api_keys,
+        &req.provider_id,
+        &main.provider,
+        &req.providers,
+    )
+    .into_iter()
+    .skip(1)
+    {
+        chain.push(step);
+    }
+    // The distiller is a best-effort optimisation: try each rung once and hand
+    // the caller the raw payload when they all fail.
+    for (m, b, keys, pid, k) in chain {
+        let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
+            &k,
+            // A side call defaults to no reasoning (never inherits the main level).
+            if level.is_empty() { "none" } else { level },
+            provider_model_reasoning(&req.providers, &pid, &m),
+        );
+        let cfg = LlmConfig {
+            provider: k,
+            model: m,
+            base_url: b,
+            api_keys: keys,
+            temperature: Some(0.2),
+            // A summary is a few hundred tokens; a reasoning model needs room for
+            // its preamble on top of that.
+            max_tokens: Some(1024),
+            timeout_secs: 60,
+            reasoning_level: reasoning,
+            model_reasoning,
+            auto_think,
+        };
+        match crate::llm::complete(client, &cfg, system, user).await {
+            Ok(res) => {
+                let text = res.text.trim().to_string();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            // The distiller is an optimisation: a failure must not fail the
+            // call. But only a model-side rejection moves to the next model — a
+            // timeout or a dropped connection is not the model's fault, and the
+            // caller's raw payload is a better answer than a second paid call
+            // that cannot succeed either.
+            Err(e) => {
+                if !crate::llm::should_fall_back(&e) {
+                    return None;
+                }
             }
         }
-        // The distiller is an optimisation: a failure must not fail the call.
-        Err(_) => None,
     }
+    None
 }
 
 /// How many history entries may be re-described by the Vision slot in ONE turn.
@@ -270,7 +316,19 @@ async fn run_vision_slot(
         &req.provider_id,
         &req.providers,
     );
-    if v_model.is_empty() || v_model == main_model {
+    // A configured fallback list counts as configuring the slot: an unset slot
+    // returned NotConfigured here and the list was silently dead, so fallbacks
+    // added in Settings → Tools never ran for vision.
+    let slot_fallbacks = req
+        .tool_fallbacks
+        .get("vision")
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let has_fallbacks = slot_fallbacks.iter().any(|e| !e.trim().is_empty());
+    // "Resolves to the main model" only means "nothing to do" when the slot is
+    // genuinely unset. A slot explicitly pointed at the main model still has its
+    // own fallback list, and that list is the reason the row exists.
+    if v_model.is_empty() || (v_model == main_model && !has_fallbacks) {
         return VisionOutcome::NotConfigured;
     }
     let v_kind = crate::backend_light::resolve_slot_kind(slot_entry, main_kind, &req.providers);
@@ -280,51 +338,97 @@ async fn run_vision_slot(
         .map(String::as_str)
         .unwrap_or("")
         .trim();
-    let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
-        &v_kind,
-        // A side call defaults to no reasoning (never inherits the main level).
-        if v_level.is_empty() { "none" } else { v_level },
-        provider_model_reasoning(&req.providers, &v_provider_id, &v_model),
-    );
-    let v_cfg = LlmConfig {
-        provider: v_kind,
-        model: v_model.clone(),
-        base_url: v_base,
-        api_keys: v_keys,
-        temperature: Some(0.2),
-        max_tokens: Some(2048),
-        timeout_secs: crate::llm::NO_TIMEOUT_SECS,
-        reasoning_level: v_reasoning,
-        model_reasoning: v_model_reasoning,
-        auto_think: v_auto_think,
-    };
-    // Same model + same text + same image bytes = the same question, so a
-    // repeat of a screenshot this chat already sent is answered from the cache
-    // instead of a second paid round-trip. The key is the hash of the exact
-    // inputs, so a hit can never describe a different picture.
-    let cache_key = vision_cache_key(&v_cfg.model, text, images);
-    if let Some(desc) = vision_cache_get(cache_key) {
-        return VisionOutcome::Ok(desc);
+    // The slot's own model first, then the slot's own fallback list
+    // (Settings → Tools). A fallback inherits the slot's reasoning level: the
+    // model and its routing change, never the effort the user picked.
+    //
+    // A slot that inherits the main model contributes no rung of its own (the
+    // main model already handles the images inline), so only the fallbacks are
+    // tried — they are the explicit choice.
+    let mut chain: Vec<(String, String, Vec<String>, String, String)> = Vec::new();
+    if !slot_entry.trim().is_empty() && v_model != main_model {
+        chain.push((v_model, v_base, v_keys, v_provider_id, v_kind));
     }
-    match crate::llm::complete_with_images(client, &v_cfg, VISION_SYSTEM_PROMPT, text, images).await {
-        Ok(res) => {
-            let desc = res.text.trim().to_string();
-            if desc.is_empty() {
-                VisionOutcome::Failed {
-                    model: v_model,
-                    error: "the model returned an empty description".into(),
+    chain.extend(
+        crate::backend_light::resolve_slot_chain(
+            slot_entry,
+            slot_fallbacks,
+            main_model,
+            main_base,
+            main_keys,
+            &req.provider_id,
+            main_kind,
+            &req.providers,
+        )
+        .into_iter()
+        .skip(1),
+    );
+    let mut failed_model = String::new();
+    let mut failed_error = String::new();
+    for (c_model, c_base, c_keys, c_provider_id, c_kind) in chain {
+        let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
+            &c_kind,
+            // A side call defaults to no reasoning (never inherits the main level).
+            if v_level.is_empty() { "none" } else { v_level },
+            provider_model_reasoning(&req.providers, &c_provider_id, &c_model),
+        );
+        let v_cfg = LlmConfig {
+            provider: c_kind,
+            model: c_model.clone(),
+            base_url: c_base,
+            api_keys: c_keys,
+            temperature: Some(0.2),
+            max_tokens: Some(2048),
+            timeout_secs: crate::llm::NO_TIMEOUT_SECS,
+            reasoning_level: v_reasoning,
+            model_reasoning: v_model_reasoning,
+            auto_think: v_auto_think,
+        };
+        // Same model + same text + same image bytes = the same question, so a
+        // repeat of a screenshot this chat already sent is answered from the cache
+        // instead of a second paid round-trip. The key is the hash of the exact
+        // inputs, so a hit can never describe a different picture.
+        let cache_key = vision_cache_key(&v_cfg.model, text, images);
+        if let Some(desc) = vision_cache_get(cache_key) {
+            return VisionOutcome::Ok(desc);
+        }
+        match crate::llm::complete_with_images(client, &v_cfg, VISION_SYSTEM_PROMPT, text, images)
+            .await
+        {
+            Ok(res) => {
+                let desc = res.text.trim().to_string();
+                if !desc.is_empty() {
+                    // Only a real answer is cached: a failure or an empty reply
+                    // must still be retried on the next turn.
+                    vision_cache_put(cache_key, &desc);
+                    return VisionOutcome::Ok(desc);
                 }
-            } else {
-                // Only a real answer is cached: a failure or an empty reply must
-                // still be retried on the next turn.
-                vision_cache_put(cache_key, &desc);
-                VisionOutcome::Ok(desc)
+                if failed_error.is_empty() {
+                    failed_model = v_cfg.model.clone();
+                    failed_error = "the model returned an empty description".into();
+                }
+            }
+            Err(e) => {
+                if failed_error.is_empty() {
+                    failed_model = v_cfg.model.clone();
+                    failed_error = e.clone();
+                }
+                // Only a model-side rejection justifies calling the NEXT model.
+                // A timeout or a dropped connection stops here with its own
+                // reason: the next model cannot fix the transport, and the caller
+                // must learn why the screenshot was skipped.
+                if !crate::llm::should_fall_back(&e) {
+                    return VisionOutcome::Failed {
+                        model: v_cfg.model.clone(),
+                        error: e,
+                    };
+                }
             }
         }
-        Err(e) => VisionOutcome::Failed {
-            model: v_model,
-            error: e,
-        },
+    }
+    VisionOutcome::Failed {
+        model: failed_model,
+        error: failed_error,
     }
 }
 
@@ -575,6 +679,15 @@ const COMPACT_TIMEOUT_SECS: u64 = 90;
 /// The explore sub-agent must answer in seconds, not minutes — a much smaller
 /// step budget than the main agent's, with a forced final report (below).
 const SUBAGENT_MAX_STEPS: usize = 12;
+
+/// The step budget the explore prompt itself promises ("a fixed 3-step
+/// budget"). The model overshoots it: in the last traced corpus 45 of 63
+/// explore runs entered round 4, and those rounds alone cost 853_902 of the
+/// 1_758_022 uncached explore tokens (48.6%) — every one of them re-sending a
+/// conversation that was already large. The near-exhaustion nudge below only
+/// fires at step 9 of 12, far too late to change the shape of a run, so the
+/// reminder has to land where the promised budget actually runs out.
+const EXPLORE_BUDGET_STEPS: usize = 3;
 /// How many times ONE explore sub-agent may be attempted before the parent
 /// gives up on it.
 ///
@@ -585,6 +698,15 @@ const SUBAGENT_MAX_STEPS: usize = 12;
 /// must therefore look EXACTLY like a failed main-model attempt — same attempt
 /// count, same delay, same `retry`/`retry_giveup` events, same UI banner — so
 /// the user sees one consistent retry story no matter which model hiccuped.
+/// How many attempts a rung may spend before the ladder's budget is used up.
+///
+/// Purely a BUDGET multiplier: a rung only moves down the chain when its
+/// failure says the model itself is unusable (see [`subagent_error_is_fatal`]),
+/// so a slow-but-working model can retry for the whole budget without losing
+/// the user's fallbacks. The multiplier keeps a long list fully reachable when
+/// its rungs fail non-fatally.
+const SUBAGENT_RUNG_ATTEMPTS: usize = 2;
+
 const SUBAGENT_MAX_ATTEMPTS: usize = 10;
 /// Fixed backoff between explore attempts — mirrors the main agent's fixed
 /// 10s cadence (RECONNECT_DELAY_MS in api.ts). The ATTEMPT COUNT, not a clock,
@@ -848,7 +970,15 @@ fn clip_trace_text(s: &str, cap: usize) -> String {
 /// row of a long turn would push the conversation itself out of the cap.
 fn trace_prompt_text(messages: &[Value]) -> String {
     let mut out = String::new();
+    // Where the LAST message's block starts. `clip_trace_text` keeps the head,
+    // so an over-cap row used to drop exactly the newest thing the model had to
+    // act on — and because the per-step batching hint is appended to that last
+    // message, the trace could not show whether a hint was delivered at all
+    // (every before/after comparison of that lever had to be inferred from
+    // round counts). The cap is therefore spent here as head + newest block.
+    let mut last_block_start = 0usize;
     for (i, m) in messages.iter().enumerate() {
+        last_block_start = out.len();
         let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
         let content = match m.get("content") {
             Some(Value::String(s)) => s.clone(),
@@ -882,7 +1012,47 @@ fn trace_prompt_text(messages: &[Value]) -> String {
         }
         out.push('\n');
     }
-    out.trim_end().to_string()
+    let trimmed = out.trim_end().to_string();
+    if trimmed.len() <= LLM_TRACE_PROMPT_CAP {
+        return trimmed;
+    }
+    let tail = out.get(last_block_start..).unwrap_or_default().trim_end();
+    bounded_trace_text(&trimmed, tail, LLM_TRACE_PROMPT_CAP)
+}
+
+/// Clip `s` to the LAST `cap` bytes, on a UTF-8 char boundary.
+fn tail_trace_text(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut start = s.len() - cap;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Bound a trace body to `cap` bytes while KEEPING its newest block.
+///
+/// `clip_trace_text` truncates the tail, which for a wire-prompt echo is the
+/// wrong end: the newest tool result (and any hint riding on it) is the part a
+/// reader needs to explain the next call's tokens. The middle is what gets
+/// elided instead, so the head still shows the conversation and the tail still
+/// shows what the model was asked to do next.
+fn bounded_trace_text(full: &str, tail: &str, cap: usize) -> String {
+    const MARK: &str = "\n… (elided middle) …\n";
+    // Nothing to do when the body already fits: an unconditional elision would
+    // rewrite a short prompt into "head + marker + duplicate tail".
+    if full.len() <= cap {
+        return full.to_string();
+    }
+    let tail_budget = tail.len().min(cap / 2);
+    let head_budget = cap.saturating_sub(tail_budget + MARK.len());
+    let mut end = head_budget.min(full.len());
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARK}{}", &full[..end], tail_trace_text(tail, tail_budget))
 }
 
 /// Fold a history message's non-prose state into its content so the model can
@@ -1044,7 +1214,7 @@ pub struct AgentRequest {
     /// The app data root (~/.codifa) where the skill store lives. Skills are
     /// NOT workspace files: `/skills` reads them from the data root, so the
     /// router must look there too — reading the workspace root found nothing
-    /// and silently disabled both auto-match and the decision model.
+    /// and silently shipped an empty catalog.
     #[serde(default)]
     pub data_root: String,
     /// The composer's Computer Use switch. When false the `computer` tool is
@@ -1104,6 +1274,14 @@ pub struct AgentRequest {
     /// title). A missing key means "inherit the main model's level".
     #[serde(default)]
     pub subagent_thinking: std::collections::HashMap<String, String>,
+    /// Per-tool FALLBACK models from Settings → Tools, keyed by the same slot
+    /// names as `subagent_models`: each value is an ordered list of
+    /// "providerId/model" entries tried top-to-bottom while THAT tool's own
+    /// model fails. Purely per-call — nothing is remembered between calls, so
+    /// every new call starts at the tool's own model again — and a fallback
+    /// inherits the calling tool's reasoning level rather than carrying one.
+    #[serde(default)]
+    pub tool_fallbacks: std::collections::HashMap<String, Vec<String>>,
     /// Inline images attached to THIS turn, as `data:<mime>;base64,…` URLs (or
     /// bare paths, which are read from disk). Owned by the user message: they
     /// are sent to the main model and to the vision model, never echoed back
@@ -1333,6 +1511,7 @@ impl AgentRequest {
             thinking_level: self.thinking_level.clone(),
             model_reasoning: self.model_reasoning,
             subagent_thinking: self.subagent_thinking.clone(),
+            tool_fallbacks: self.tool_fallbacks.clone(),
             // A research sub-agent is text-only: images stay with the parent.
             images: Vec::new(),
             // A research sub-agent searches the web the same way the parent does.
@@ -1808,8 +1987,11 @@ pub enum AgentEvent {
     /// body) — the frontend renders it as the Plan card and the docked
     /// Plan viewer tab.
     PlanCard { title: String, body: String },
-    /// Auto-matched / attached skills for this turn (the frontend renders
-    /// them as ⚡ chips on the assistant message).
+    /// An `@mention`ed skill that is not in the store any more: `note` carries
+    /// the warning the renderer shows (a deleted or renamed attachment would
+    /// otherwise fail silently). `skills` is empty and `manual` is always true —
+    /// nothing is auto-picked for the model any more, so this is the only
+    /// `Skills` event left.
     Skills { skills: Vec<String>, manual: bool, note: Option<String> },
     /// Mid-turn steer messages were injected into the running turn. `ids` are
     /// the renderer's user-message ids so it can move each bubble inline (right
@@ -1904,6 +2086,15 @@ pub enum AgentEvent {
     },
     Done { aborted: bool },
     Error { content: String },
+    /// A chat artifact was created or updated: the renderer docks a card in the
+    /// transcript and can open the body in the sandboxed preview panel.
+    Artifact {
+        id: String,
+        title: String,
+        kind: String,
+        content: String,
+        version: u64,
+    },
 }
 
 impl AgentEvent {
@@ -2035,6 +2226,16 @@ impl AgentEvent {
             AgentEvent::Plan { items, chat_id } => json!({
                 "kind": "plan", "items": items, "chat_id": chat_id,
             }),
+            AgentEvent::Artifact { id, title, kind, content, version } => json!({
+                "kind": "artifact",
+                "id": id,
+                "title": title,
+                // The document format travels as `artifact_kind`: `kind` is
+                // already the event's own discriminator.
+                "artifact_kind": kind,
+                "content": content,
+                "version": version,
+            }),
             AgentEvent::Ask { id, question, options } => json!({
                 "kind": "ask", "id": id, "question": question, "options": options,
             }),
@@ -2087,15 +2288,18 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "create_skill",
-            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH fields: `description` — ONE short line of ENGLISH saying WHEN to use the skill — and `fa_keywords` — the user's own PERSIAN phrases for when it applies (comma-separated, e.g. \"ترجمه کن, translate this\"). The skill catalog shows both, so a Persian request finds the skill without any embedding. To EDIT an existing skill call `load_skill` first and send the revised body back; pass previous_name when renaming so its extra files survive.",
+            "Create or update a stored skill (the Codex/Claude create_skill flow). ALWAYS pass BOTH: `description` — one short ENGLISH line saying WHEN to use it — and `fa_keywords` — the user's PERSIAN phrases (comma-separated). To install from a repo pass `repo` instead of `content`. To EDIT, `load_skill` first then send the revised body; pass previous_name when renaming.",
             json!({
                 "name": {"type": "string", "description": "Skill name (also the folder slug)"},
                 "description": {"type": "string", "description": "REQUIRED. One-line ENGLISH summary of when to use this skill"},
                 "content": {"type": "string", "description": "The skill body: step-by-step instructions the agent follows"},
-                "fa_keywords": {"type": "string", "description": "REQUIRED. Comma-separated PERSIAN phrases the user would say to trigger this skill"},
-                "previous_name": {"type": "string", "description": "Old name when renaming an existing skill"},
+                "fa_keywords": {"type": "string", "description": "REQUIRED. Comma-separated PERSIAN phrases that trigger this skill"},
+                "previous_name": {"type": "string", "description": "Old name when renaming"},
+                "repo": {"type": "string", "description": "Install from a repo instead of `content`: `owner/repo`, a GitHub URL, or a local folder"},
+                "repo_path": {"type": "string", "description": "install: sub-folder holding SKILL.md (default: discover)"},
+                "repo_ref": {"type": "string", "description": "install: branch/tag/commit (default: default branch)"},
                 "extra_files": {"type": "object", "description": "Optional extra files: filename -> content"},
-                "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete from the skill folder"},
+                "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete"},
                 "delete": {"type": "boolean", "description": "Delete the skill instead of writing it"}
             }),
         ),
@@ -2109,7 +2313,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": {"type": "string", "description": "Short imperative item (name the file it touches)"},
+                            "content": {"type": "string", "description": "Short imperative item the user can understand, in the user's language: what this step does (and the file it touches). Never bare jargon."},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
                         },
                         "required": ["content", "status"]
@@ -2148,10 +2352,77 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "load_skill",
-            "Load the FULL body of one stored skill by name (or one of its extra files via `file`). Skills that obviously match the request are already inlined in your prompt — call this only for a skill you need but were not given.",
+            "Load a skill's FULL body BEFORE work it covers; `query` finds one the list omits.",
             json!({
-                "name": {"type": "string", "description": "Skill name or slug"},
-                "file": {"type": "string", "description": "Optional extra file of that skill"}
+                "name": {"type": "string", "description": "Name or slug"},
+                "query": {"type": "string", "description": "Words when the name is unknown"},
+                "file": {"type": "string", "description": "Extra file of that skill"}
+            }),
+        ),
+        // Plugins bundle skills + MCP connectors into ONE switchable unit. The
+        // `action` multiplexer (same shape as `computer`) keeps the tool list
+        // short: create/update/toggle/delete/list instead of four tools.
+        (
+            "plugin",
+            "Create/edit a plugin — a folder bundling skills and MCP connectors that enable/disable together. `install` reads a bundle from a git repo or local folder; create fails on an existing slug; update patches only the fields sent; toggle flips `enabled`; delete removes it.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete"]},
+                "repo": {"type": "string", "description": "install: `owner/repo`, GitHub URL, or local path"},
+                "repo_path": {"type": "string", "description": "install: sub-folder holding the bundle"},
+                "repo_ref": {"type": "string", "description": "install: branch/tag/commit"},
+                "name": {"type": "string", "description": "Plugin name (also the slug)"},
+                "slug": {"type": "string", "description": "Folder slug; defaults to the lowercased name"},
+                "description": {"type": "string"},
+                "version": {"type": "string", "description": "Defaults to 1.0.0"},
+                "enabled": {"type": "boolean", "description": "toggle: the value to set; omit to flip"},
+                "skills": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "content": {"type": "string"},
+                            "description": {"type": "string"},
+                            "fa_keywords": {"type": "string"}
+                        },
+                        "required": ["name", "content"]
+                    }
+                },
+                "deleted_skills": {"type": "array", "items": {"type": "string"}},
+                "mcp": {"type": "object", "description": "Connectors: {name: {command,args}|{url}}"},
+                "deleted_mcp": {"type": "array", "items": {"type": "string"}}
+            }),
+        ),
+        // Artifacts are versioned documents the renderer previews in a sandboxed
+        // right-hand panel instead of dumping raw markup into the bubble.
+        (
+            "artifact",
+            "Create, update or delete a chat artifact: a versioned HTML/Markdown document shown in a sandboxed preview panel.",
+            json!({
+                "action": {"type": "string", "enum": ["create", "update", "delete"]},
+                "title": {"type": "string"},
+                "id": {"type": "string", "description": "Derived from title; needed to update"},
+                "kind": {"type": "string", "enum": ["html", "md"]},
+                "content": {"type": "string", "description": "Self-contained; inline CSS/JS, no network"},
+                "chat_id": {"type": "string", "description": "Owning chat id"}
+            }),
+        ),
+        // Schedules as data: the agent creates the task, the panel only shows it.
+        (
+            "schedule",
+            "Create, edit, toggle or delete a scheduled task (cron prompt that runs headless in the background).",
+            json!({
+                "action": {"type": "string", "enum": ["list", "create", "update", "toggle", "delete"]},
+                "id": {"type": "string", "description": "Needed for update/toggle/delete"},
+                "name": {"type": "string"},
+                "prompt": {"type": "string", "description": "What the run should do"},
+                "cron": {"type": "string", "description": "5-field UTC cron; empty = run once"},
+                "enabled": {"type": "boolean", "description": "toggle: value to set; omit to flip"},
+                "root": {"type": "string", "description": "Workspace root the run works in"},
+                "mode": {"type": "string"},
+                "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills attached to every run"},
+                "mcp_servers": {"type": "array", "items": {"type": "string"}, "description": "MCP connector names for every run"},
+                "plugins": {"type": "array", "items": {"type": "string"}, "description": "Plugins every run gets"}
             }),
         ),
         (
@@ -2203,7 +2474,11 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // The skill/connector authoring tools are bound only for a turn that
         // actually asked for them (see AgentRequest::allow_create).
         .filter(|(name, _, _)| {
-            allow_create || !matches!(*name, "create_skill" | "create_mcp")
+            allow_create
+                || !matches!(
+                    *name,
+                    "create_skill" | "create_mcp" | "plugin" | "artifact" | "schedule"
+                )
         })
         .map(|(name, desc, props)| {
             json!({
@@ -2545,49 +2820,33 @@ pub async fn run_turn(
     // The skill store lives in the DATA root, not the workspace. A caller that
     // omits `data_root` (e.g. a scheduled run) must still find the store, so
     // fall back to the native data root rather than the workspace — reading the
-    // workspace found no skills at all, which silently disabled auto-loading.
+    // workspace found no skills at all, which silently shipped an empty catalog.
     let skill_root = if req.data_root.is_empty() {
         native_data_root()
     } else {
         req.data_root.clone()
     };
-    // Skills: the MAIN agent keeps the catalog + auto-match exactly as before
-    // (its skill auto-loading is unchanged). The explore sub-agent does NOT get
-    // it: its work is read/grep/find_symbol, it can never attach a skill, and
-    // the catalog is ~5.8 KB of prompt re-sent on EVERY step of EVERY explore
-    // run — the largest single fixed cost in sub-agent tokens. `ATTACHED
-    // SKILLS` is empty for a sub-agent anyway (run_subagent hard-codes
+    // Skills: the catalog ONLY. WHICH skill applies is the model's call through
+    // `load_skill` (the Codex/Claude pattern) — nothing is picked for it from
+    // the wording of the request. The explore sub-agent does NOT get the
+    // catalog: its work is read/grep/find_symbol, it can never attach a skill,
+    // and the catalog is ~5.8 KB of prompt re-sent on EVERY step of EVERY
+    // explore run — the largest single fixed cost in sub-agent tokens.
+    // `ATTACHED SKILLS` is empty for a sub-agent anyway (run_subagent hard-codes
     // `skills: Vec::new()`), so nothing is lost here.
-    let (matched_skills, missing_skills, volatile_skills) = if req.mode == "subagent" {
-        (Vec::new(), Vec::new(), String::new())
+    let missing_skills = if req.mode == "subagent" {
+        Vec::new()
     } else {
+        // The catalog is the byte-stable part: it lives on the system prompt,
+        // so it must not depend on the current message — the router builds it
+        // from the skill store alone.
         let skill_section =
             crate::skill_router::build_section(&req.prompt, &skill_root, &req.skills);
         if !skill_section.text.is_empty() {
             system.push_str(&skill_section.text);
         }
-        // The auto-matched bodies are PER-TURN text: they ride the trailing
-        // context message, never `system`. Pushing them onto the system prompt
-        // made the cached prefix depend on which keywords the current message
-        // happened to carry — a traced chat lost 96 460 tokens on one call
-        // because turn N matched `summarization` and turn N+1 matched `Test UI`.
-        (
-            skill_section.matched,
-            skill_section.missing,
-            skill_section.volatile,
-        )
+        skill_section.missing
     };
-    // Tell the renderer which skills this turn actually picked up, so the user
-    // sees ⚡ chips on the assistant message. `manual: false` is what makes the
-    // frontend stamp `autoSkills` (a `manual: true` event is the missing-attach
-    // warning and carries no names).
-    if !matched_skills.is_empty() {
-        emit(&AgentEvent::Skills {
-            skills: matched_skills,
-            manual: false,
-            note: None,
-        });
-    }
     // Read the saved plan + live checklist BACK FROM DISK. The native loop only
     // ever wrote them (plans.rs), so after an app restart (or on the next turn)
     // the agent had forgotten the plan it was executing and re-planned from
@@ -2848,11 +3107,12 @@ pub async fn run_turn(
     if let Some(m) = plan_context_message(&main_plan_section) {
         messages.push(m);
     }
-    // Auto-matched skill bodies are per-turn text for the same reason the plan
-    // is: they are recomputed from the current message, so on the system prompt
-    // they would rewrite the cached prefix whenever the keywords change.
-    if let Some(m) = trailing_context_message(SKILL_CONTEXT_HEAD, &volatile_skills) {
-        messages.push(m);
+    // The last message gets a weak model's attention, so the duty to load a
+    // matching skill rides at the very tail, right under the request. MAIN AGENT
+    // ONLY: a sub-agent has no `load_skill` (research_schemas), so the reminder
+    // would be an instruction it cannot follow.
+    if req.mode != "subagent" {
+        messages.push(skills_context_message());
     }
     // Separate context/autocompact for the explore sub-agent (user request):
     // its message list is compacted against its OWN budget — never the main
@@ -2896,10 +3156,24 @@ pub async fn run_turn(
     retain_allowed_tools(&mut schemas, &caps);
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
-    // tools/list. A connector that fails to start contributes no tools — but
-    // the reason is surfaced as a warning, so "the agent has no browser tool"
-    // is never a silent mystery again.
-    let (mut mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&req.mcp_servers);
+    // tools/list. An ENABLED plugin's connectors ride along without the user
+    // adding each one in Settings → MCP: a plugin is ONE unit, so its connectors
+    // come with its skills (scheduled runs already resolved them that way, so a
+    // plugin that was "on" looked half-applied in a chat turn). A name the user
+    // configured themselves wins over the bundle's.
+    // A connector that fails to start contributes no tools — but the reason is
+    // surfaced as a warning, so "the agent has no browser tool" is never a
+    // silent mystery again.
+    let mcp_servers = {
+        let mut merged = crate::plugins::enabled_connectors(std::path::Path::new(&skill_root));
+        if let Some(own) = req.mcp_servers.as_object() {
+            for (name, cfg) in own {
+                merged.insert(name.clone(), cfg.clone());
+            }
+        }
+        Value::Object(merged)
+    };
+    let (mut mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&mcp_servers);
     for failure in mcp_failures {
         emit(&AgentEvent::Warn { content: failure });
     }
@@ -3043,6 +3317,11 @@ pub async fn run_turn(
     // context meter's denominator) can never disagree.
     let effective_ctx = effective_context_window(req);
 
+    // Single-call hints delivered so far this run. The hint rides on an
+    // already-sent tool result, so it produced no row of its own and the lever
+    // was invisible in the trace: whether it fired had to be inferred from
+    // round counts. One counter makes "did the nudge reach the model" a fact.
+    let mut nudges: usize = 0;
     for step in 0..max_steps {
         // Drain any mid-turn steer BEFORE this model call: the steer is appended
         // as an extra user message, so the model keeps the whole conversation
@@ -3066,6 +3345,18 @@ pub async fn run_turn(
             messages.push(json!({
                 "role": "user",
                 "content": "Tool budget nearly exhausted — report your findings in your NEXT answer; only call a tool if it is essential."
+            }));
+        }
+        // Spent-budget nudge (explore only), placed where the prompt's own
+        // "fixed 3-step budget" runs out. It asks for ONE last batch plus the
+        // report, never for a stop: 15 of 63 traced runs still ended on a fetch
+        // call because something genuinely was missing, so a hard cut would
+        // trade report quality for tokens. Batching the remainder keeps the
+        // information while dropping the per-round conversation re-send.
+        if req.mode == "subagent" && step == EXPLORE_BUDGET_STEPS {
+            messages.push(json!({
+                "role": "user",
+                "content": "The 3-step budget is spent. Write the report NOW from what you already have. If a specific fact is still missing, fetch ALL of it in ONE batch of calls next to the report — do not keep fetching one thing per round."
             }));
         }
 
@@ -3156,6 +3447,25 @@ pub async fn run_turn(
                     &req.providers,
                 );
                 let has_slot = !slot_model.is_empty() && slot_model != cfg.model;
+                // The "Other" group's own fallback list (Settings → Tools): when
+                // the summariser's model fails, the chat model is tried next and
+                // these rungs after it. Resolved through the same chain helper as
+                // the other tools, so a cross-provider fallback brings its own
+                // base URL / keys / endpoint kind.
+                let fallback_rungs: Vec<(String, String, Vec<String>, String, String)> =
+                    crate::backend_light::resolve_slot_chain(
+                        crate::backend_light::other_slot_entry(&req.subagent_models),
+                        crate::backend_light::other_slot_fallbacks(&req.tool_fallbacks),
+                        &cfg.model,
+                        &cfg.base_url,
+                        &cfg.api_keys,
+                        &req.provider_id,
+                        &cfg.provider,
+                        &req.providers,
+                    )
+                    .into_iter()
+                    .skip(1)
+                    .collect();
                 // The summarizer may carry its own reasoning level; an empty
                 // entry inherits the main model's level for this turn.
                 let compact_level = crate::backend_light::other_slot_level(&req.subagent_thinking);
@@ -3185,10 +3495,30 @@ pub async fn run_turn(
                     model_reasoning: compact_model_reasoning,
                     auto_think: compact_auto_think,
                 };
-                // Fallback = the active chat model, mirroring the manual path's
-                // subagent -> main-model retry.
-                let compact_fallback = if has_slot {
-                    Some(LlmConfig {
+                // Fallback = the "Other" slot's own fallback rungs (Settings →
+                // Tools, each carrying its own routing but the slot's reasoning
+                // level) in the user's order, then the active chat model as the
+                // last resort — mirroring the manual path's
+                // subagent -> main-model retry. The whole list is built, not just
+                // its first rung: a rejected key or a dead model must fall
+                // through the remaining fallbacks before the turn gives up.
+                let mut compact_fallbacks: Vec<LlmConfig> = fallback_rungs
+                    .iter()
+                    .map(|(m, b, keys, pid, k)| LlmConfig {
+                        provider: k.clone(),
+                        model: m.clone(),
+                        base_url: b.clone(),
+                        api_keys: keys.clone(),
+                        temperature: Some(0.2),
+                        max_tokens: Some(COMPACT_MAX_OUTPUT as u32),
+                        timeout_secs: COMPACT_TIMEOUT_SECS,
+                        reasoning_level: compact_reasoning.clone(),
+                        model_reasoning: provider_model_reasoning(&req.providers, pid, m),
+                        auto_think: crate::models::auto_think_for(k),
+                    })
+                    .collect();
+                if has_slot {
+                    compact_fallbacks.push(LlmConfig {
                         provider: cfg.provider.clone(),
                         model: cfg.model.clone(),
                         base_url: cfg.base_url.clone(),
@@ -3199,10 +3529,8 @@ pub async fn run_turn(
                         reasoning_level: req.thinking_level.clone(),
                         model_reasoning: req.model_reasoning,
                         auto_think: crate::models::auto_think_for(&cfg.provider),
-                    })
-                } else {
-                    None
-                };
+                    });
+                }
                 emit(&AgentEvent::CompactStart {});
                 // Bind the result first: a temporary closure borrowing `emit`
                 // would otherwise stay alive across the whole `match` and block
@@ -3210,7 +3538,7 @@ pub async fn run_turn(
                 let compact_result = crate::compact::compact_history_with_progress(
                     &client,
                     &compact_model,
-                    compact_fallback.as_ref(),
+                    compact_fallbacks.as_slice(),
                     &older,
                     ctx,
                     COMPACT_MAX_OUTPUT,
@@ -3341,7 +3669,14 @@ the Vision model's description instead.\n"
                         continue;
                     }
                 }
-                emit(&AgentEvent::Error { content: e });
+                emit(&AgentEvent::Error {
+                    content: name_the_provider_in_error(
+                        e,
+                        &req.providers,
+                        &req.provider_id,
+                        &req.provider,
+                    ),
+                });
                 // Terminal `done` after the error: the event protocol requires
                 // it (the client treats an EOF without `done` as a dropped
                 // connection). Without it the stream ended silently and the UI
@@ -3466,11 +3801,13 @@ the Vision model's description instead.\n"
             // only say "N tokens" and the panel looked like the model had been
             // asked nothing at all.
             prompt: {
+                // `trace_prompt_text` already bounds itself (keeping the newest
+                // block); clipping again here would cut that block back off.
                 let wire = trace_prompt_text(&messages);
                 if wire.is_empty() {
                     None
                 } else {
-                    Some(clip_trace_text(&wire, LLM_TRACE_PROMPT_CAP))
+                    Some(wire)
                 }
             },
             detail: Some(serde_json::json!({
@@ -3481,6 +3818,11 @@ the Vision model's description instead.\n"
                 "reasoning_chars": acc.reasoning_len,
                 "reply_chars": reply_text.chars().count(),
                 "tool_calls": tool_names,
+                // Hints actually delivered up to this call: the only direct
+                // evidence that the single-call batching lever reached the
+                // model (see `single_call_hint`). The counter is cumulative, so
+                // a hint appended to step N's result shows on step N+1's row.
+                "hints_delivered": nudges,
                 "prompt_messages": messages.len(),
                 // Local estimate of the wire prompt for THIS call. The provider
                 // reports `input` AFTER the fact and that number includes the
@@ -4246,6 +4588,65 @@ call fetch_url again with offset={next} for the rest]",
                     }
                     Err(e) => (format!("ERROR fetching {url}: {e}"), false),
                 }
+            } else if name == "artifact" {
+                // Artifacts must emit an event so the transcript grows a card
+                // while the turn is still running — that is why this one is
+                // handled inline instead of in `tools::dispatch`.
+                let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+                let data_root = if req.data_root.trim().is_empty() {
+                    native_data_root()
+                } else {
+                    req.data_root.clone()
+                };
+                let store = std::path::Path::new(&data_root);
+                let chat_id = if req.chat_id.trim().is_empty() {
+                    args["chat_id"].as_str().unwrap_or_default()
+                } else {
+                    req.chat_id.as_str()
+                };
+                match action.as_str() {
+                    // Delete removes the document instead of saving a version:
+                    // the caller names an existing id, and the artifact tool is
+                    // the only writer of this folder tree.
+                    "delete" => {
+                        let id = args["id"].as_str().unwrap_or("").trim();
+                        if id.is_empty() {
+                            ("artifact delete requires id".to_string(), false)
+                        } else {
+                            match crate::artifacts::delete(store, chat_id, id) {
+                                Ok(_) => (format!("Artifact deleted: {id}"), true),
+                                Err(e) => (e, false),
+                            }
+                        }
+                    }
+                    "create" | "update" => {
+                        let create = action == "create";
+                        match crate::artifacts::save(store, chat_id, &args, create) {
+                            Ok(saved) => {
+                                emit(&AgentEvent::Artifact {
+                                    id: saved["id"].as_str().unwrap_or_default().to_string(),
+                                    title: saved["title"].as_str().unwrap_or_default().to_string(),
+                                    kind: saved["kind"].as_str().unwrap_or_default().to_string(),
+                                    content: saved["content"].as_str().unwrap_or_default().to_string(),
+                                    version: saved["version"].as_u64().unwrap_or(1),
+                                });
+                                (
+                                    format!(
+                                        "Artifact saved: {} (v{})\nIt is now shown in the chat; open it to preview.",
+                                        saved["title"].as_str().unwrap_or_default(),
+                                        saved["version"].as_u64().unwrap_or(1)
+                                    ),
+                                    true,
+                                )
+                            }
+                            Err(e) => (e, false),
+                        }
+                    }
+                    other => (
+                        format!("artifact requires action create, update or delete (got {other:?})"),
+                        false,
+                    ),
+                }
             } else {
                 match tools::dispatch_with_data_root(
                     &root,
@@ -4303,6 +4704,7 @@ call fetch_url again with offset={next} for the rest]",
                 if last["role"].as_str() == Some("tool") {
                     if let Some(c) = last["content"].as_str() {
                         last["content"] = json!(format!("{c}\n\n{hint}"));
+                        nudges += 1;
                     }
                 }
             }
@@ -4432,6 +4834,40 @@ pub(crate) fn provider_model_reasoning(
     model_id_looks_reasoning(model)
 }
 
+/// Rewrite a provider error so it names the provider the user CONFIGURED
+/// ("9router") instead of its wire KIND ("custom").
+///
+/// `LlmConfig::provider` is the endpoint kind: every OpenAI-compatible custom
+/// endpoint is literally `"custom"`, so `finish_stream` prefixes its errors with
+/// it and the retry banner read "custom reported an error mid-stream: …". The
+/// user answered "I don't have this provider in my fallback list" — precisely
+/// because the message named a kind they had never configured, not the provider
+/// that actually failed. The model is already shown in the banner, so the
+/// missing half is WHICH provider to fix.
+pub(crate) fn name_the_provider_in_error(
+    err: String,
+    providers: &std::collections::HashMap<String, Value>,
+    provider_id: &str,
+    kind: &str,
+) -> String {
+    let label = providers
+        .get(provider_id)
+        .and_then(|cfg| cfg.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let Some(label) = label else {
+        return err;
+    };
+    // `finish_stream` always starts with the kind followed by a space, so only
+    // that exact prefix is rewritten — never a word deeper in the message (a
+    // gateway body may mention "custom" itself).
+    match err.strip_prefix(&format!("{kind} ")) {
+        Some(rest) => format!("{label} {rest}"),
+        None => err,
+    }
+}
+
 /// Resolve the explore slot's target: `(model, base_url, api_keys,
 /// provider_id)`. The provider id is the EFFECTIVE one — the provider the
 /// request is really routed to — so the usage event can attribute the tokens
@@ -4444,6 +4880,21 @@ fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>, 
         .get("explore")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    resolve_slot_target(req, &entry)
+}
+
+/// Resolve one Tool Models entry ("providerId/model", a bare model id, or empty
+/// for the parent model) against the request's provider configs.
+///
+/// Split out of `resolve_subagent_target` because the retry ladder re-resolves
+/// it before EVERY attempt: a model the user changes while the sub-agent is
+/// retrying reaches us as a live entry (see `LIVE_SLOT_ENTRIES`), never in the
+/// turn's request body.
+fn resolve_slot_target(
+    req: &AgentRequest,
+    entry: &str,
+) -> (String, String, Vec<String>, String) {
+    let entry = entry.trim();
     if entry.is_empty() || entry == "main" || entry == "main_model" || entry == "main model" {
         return (
             req.model.clone(),
@@ -4454,7 +4905,7 @@ fn resolve_subagent_target(req: &AgentRequest) -> (String, String, Vec<String>, 
     }
     let (provider_id, model) = match entry.split_once('/') {
         Some((pid, m)) => (pid.trim().to_string(), m.trim().to_string()),
-        None => (String::new(), entry),
+        None => (String::new(), entry.to_string()),
     };
     if provider_id.is_empty() {
         // Bare model id: same provider as the parent.
@@ -5284,6 +5735,16 @@ fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'
             "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
         );
     }
+    // Read-only natives are the ONE group that really does run concurrently, so
+    // they get the parallelism wording instead of the ordering one. In the last
+    // traced corpus 6 lone `read`, 1 lone `fetch_url` (65_694 uncached tokens on
+    // its own) and 1 lone `load_skill` round sat outside the whitelist, i.e. the
+    // hint could not fire on any of them.
+    if matches!(name, "read" | "fetch_url" | "load_skill") {
+        return Some(
+            "[hint] That step had ONE call. Every step re-sends the whole conversation: these read-only calls run CONCURRENTLY, so fetch everything you already know you need IN THE SAME STEP.",
+        );
+    }
     // Native write/terminal/browser tools. Traced main-agent turns spent 76% of
     // their steps on a SINGLE call (210 of 277, measured from tool rows) — 61 of
     // them a lone `run_terminal`, 54 a lone `browser_evaluate`, 43 a lone
@@ -5297,6 +5758,7 @@ fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'
         "run_terminal"
             | "edit_file"
             | "write_file"
+            | "artifact"
             | "browser_navigate"
             | "browser_evaluate"
             | "browser_snapshot"
@@ -5305,6 +5767,8 @@ fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'
             | "browser_fill_form"
             | "browser_press_key"
             | "browser_select_option"
+            | "browser_resize"
+            | "browser_emulate_media"
     )
     .then_some(
         "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: issue all the file edits and shell commands you already know you need together (they run IN ORDER, one after another) instead of spending a step on each. Several replacements in one file go in a SINGLE edit_file call as edits:[{path, old_string, new_string, replace_all}].",
@@ -5339,19 +5803,30 @@ const PLAN_SECTION_CAP: usize = 6_000;
 const PLAN_CONTEXT_HEAD: &str =
     "=== CONTEXT: current plan/checklist state (NOT a new request) ===";
 
+/// Opening line of the trailing skills reminder message.
+///
+/// Wire-only like the plan context: the renderer never stores it, so it must not
+/// count toward the fold instruction (see `plan_context_keep`).
+const SKILLS_CONTEXT_HEAD: &str =
+    "=== REMINDER: load a matching skill first (NOT a new request) ===";
+
+/// True for a message that exists ONLY on the wire (the renderer never stores
+/// it): the trailing plan/checklist context and the skills reminder. Both are
+/// pushed after the user prompt to stay off the cached prefix, so the fold count
+/// must ignore both.
+fn is_wire_only_context(content: &str) -> bool {
+    content.starts_with(PLAN_CONTEXT_HEAD) || content.starts_with(SKILLS_CONTEXT_HEAD)
+}
+
 /// Number of messages in a compaction tail that the RENDERER can actually fold.
 ///
-/// Everything in the tail is stored by the renderer except the plan/checklist
-/// context message, which exists only on the wire. Passing `tail.len()` straight
-/// through made the renderer keep one message too many verbatim — re-sending
-/// content the summary already covers.
+/// Everything in the tail is stored by the renderer except the wire-only context
+/// messages (`is_wire_only_context`). Passing `tail.len()` straight through made
+/// the renderer keep one message too many verbatim — re-sending content the
+/// summary already covers.
 fn plan_context_keep(tail: &[Value]) -> usize {
     tail.iter()
-        .filter(|m| {
-            !m["content"].as_str().is_some_and(|c| {
-                c.starts_with(PLAN_CONTEXT_HEAD) || c.starts_with(SKILL_CONTEXT_HEAD)
-            })
-        })
+        .filter(|m| !m["content"].as_str().is_some_and(is_wire_only_context))
         .count()
 }
 
@@ -5359,8 +5834,34 @@ fn plan_context_message(section: &str) -> Option<Value> {
     trailing_context_message(PLAN_CONTEXT_HEAD, section)
 }
 
-/// Opening line of the trailing auto-matched-skills context message.
-const SKILL_CONTEXT_HEAD: &str = "=== CONTEXT: skills auto-matched to this message ===";
+/// The per-turn skills reminder, pushed at the TAIL of the request.
+///
+/// The catalog cannot move out of the system prompt without re-billing the whole
+/// cached prefix, and it is not the catalog the model is missing — it is the
+/// DUTY. Real traces: an 11 KB catalog in `messages[0]`, 2 `load_skill` calls in
+/// ~250 steps. Restating the duty immediately under the request is what makes a
+/// weak model act, and the text is constant so it churns nothing it sits next
+/// to. It never names a skill: picking one from the wording of the request was
+/// removed on purpose (see `skill_router::build_section`).
+fn skills_context_message() -> Value {
+    json!({
+        "role": "user",
+        "content": format!(
+            "{SKILLS_CONTEXT_HEAD}\n\
+             The `=== AVAILABLE SKILLS ===` catalog is in your system prompt. Before \
+             your first tool call of this turn, check it: if the request falls under \
+             one of those skills — including a match on its `[fa: …]` Persian \
+             keywords — call `load_skill` with that skill's name FIRST and follow its \
+             instructions for the rest of the turn. If the catalog has no entry for \
+             the task, do not read that as `no skill exists`: a large store cannot \
+             all fit there, so call `load_skill` with a `query` of the task's words \
+             and it searches every installed skill. Do not answer from memory when a \
+             skill covers the task, and do not load a skill that does not apply.\n\
+             --- end of reminder ---"
+        ),
+    })
+}
+
 
 /// Wrap a PER-TURN section as a trailing context message, or `None` when there
 /// is nothing to send.
@@ -5453,10 +5954,15 @@ The main agent waits on you and cannot search itself, so be fast and precise. \
 Every model round trip re-sends the WHOLE conversation: measured on real traces, \
 an explore ROUND costs ~7.7K uncached tokens and an unfocused 9-round run paid \
 ~78K. ROUNDS are the price, not calls. So work in a fixed 3-step budget:\n\
-STEP 1 - LOCATE (ONE step, many calls): issue every search you can already \
-foresee together — a grep per directory/keyword variant, lsp_symbols for likely \
-files, find_symbol for the identifiers the question names. Do not read yet: you \
-only need paths and line ranges.\n\
+STEP 1 - LOCATE (ONE step, many calls) — SKIP this step entirely when the \
+question already names the files and line windows, or asks for verbatim code \
+from given ranges: read those windows immediately in ONE step. A locate round \
+then only re-discovers paths you were handed; on real traces the runs that \
+located anyway paid 8.7K uncached tokens each against 6.7K for the ones that \
+read straight away. Otherwise issue every search you can already foresee \
+together — a grep per directory/keyword variant, lsp_symbols for likely files, \
+find_symbol for the identifiers the question names. Do not read yet: you only \
+need paths and line ranges.\n\
 STEP 2 - READ (ONE step, many calls): read EVERY window step 1 pointed at, \
 together. Earlier results stay cached only while they remain an identical \
 PREFIX of your next request, so a cheap read now costs almost nothing, while a \
@@ -5608,61 +6114,72 @@ fn retry_nudge() -> u64 {
     RETRY_NUDGE.load(Ordering::Relaxed)
 }
 
-/// Whether a sub-agent failure can NEVER be fixed by retrying the SAME model.
+/// Latest Tool Models entry the renderer reported per slot ("explore" →
+/// "providerId/model", or "" for the parent model), with the sequence number at
+/// which it was reported.
 ///
-/// The retry ladder exists for TRANSIENT failures: a timeout, a 5xx, a dropped
-/// connection, a rate limit. A FATAL one is different — an invalid API key, a
-/// model the provider does not serve, or a rejected request fails identically
-/// on every one of the 10 attempts, so the ladder only bought ~90s of dead
-/// banner and then dumped the raw provider body on the user ("the auto-retry on
-/// error does not work"). Those fall back to the main chat model instead, which
-/// is what the renderer's 'sub-agent failed — using main model' banner was
-/// always meant to report.
-fn subagent_error_is_fatal(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    // Deliberately NOT matching 429/"rate limit"/5xx: those are transient, and
-    // retrying the same model is exactly right for them.
-    let needles = [
-        "invalid api key",
-        "incorrect api key",
-        "invalid_api_key",
-        "api key not valid",
-        "no api key configured",
-        "unauthorized",
-        "unauthenticated",
-        "authentication",
-        "model not found",
-        "model_not_found",
-        "unknown model",
-        "no such model",
-        "not a valid model",
-        "does not exist",
-        "forbidden",
-        "permission",
-        "insufficient",
-        "no credit",
-        "not supported",
-    ];
-    if needles.iter().any(|needle| e.contains(needle)) {
-        return true;
+/// `subagent_models` arrives as a snapshot in the turn's request body, so a
+/// model the user fixes WHILE a sub-agent is retrying was invisible to the
+/// running ladder — it kept hammering the very model they had just replaced
+/// ("I change the sub-agent model and it still retries with the old one"). The
+/// renderer posts every change here; the ladder compares it against the entry
+/// it last applied and re-resolves before the next attempt.
+///
+/// The sequence number matters: an entry reported BEFORE a ladder started is
+/// already reflected in that turn's snapshot, so honouring it would only let a
+/// stale value from an earlier turn clobber the current one.
+static LIVE_SLOT_ENTRIES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
+> = std::sync::OnceLock::new();
+
+/// Monotonic clock for `LIVE_SLOT_ENTRIES`.
+static LIVE_SLOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn live_slot_entries() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, u64)>> {
+    LIVE_SLOT_ENTRIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Current live-slot sequence — a ladder captures this when it starts.
+fn live_slot_seq() -> u64 {
+    LIVE_SLOT_SEQ.load(Ordering::Relaxed)
+}
+
+/// Record a slot's CURRENT model — see `LIVE_SLOT_ENTRIES`.
+pub fn set_live_slot_entry(slot: &str, entry: &str) {
+    let Ok(mut map) = live_slot_entries().lock() else {
+        return;
+    };
+    let slot = slot.trim();
+    if slot.is_empty() {
+        return;
     }
-    // "model `gpt-x` not found" / "model `gpt-x` is unavailable": the model
-    // NAME sits between the two halves, so no single substring can ever match.
-    // Pair the halves instead — every provider words this one differently, but
-    // they all name the model AND say it is missing.
-    let names_a_model = e.contains("model");
-    let says_missing = [
-        "not found",
-        "not available",
-        "unavailable",
-        "unknown",
-        "invalid",
-        "unsupported",
-        "rejected",
-    ]
-    .iter()
-    .any(|needle| e.contains(needle));
-    names_a_model && says_missing
+    let seq = LIVE_SLOT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    map.insert(slot.to_string(), (entry.trim().to_string(), seq));
+}
+
+/// The slot's entry if it was reported AFTER `since` — i.e. after the calling
+/// ladder started, so it is genuinely newer than the turn's snapshot.
+fn live_slot_entry_since(slot: &str, since: u64) -> Option<String> {
+    let map = live_slot_entries().lock().ok()?;
+    match map.get(slot) {
+        Some((entry, seq)) if *seq > since => Some(entry.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a failed attempt means "THIS model cannot serve us" — the only case
+/// where moving down to the next configured fallback is right.
+///
+/// The rule itself lives in [`crate::llm::should_fall_back`] and is shared by
+/// every model chain (tools, compaction, titles, schedules), so the user sees
+/// ONE rule no matter which call failed: a fallback replaces a model that does
+/// not work — a refused key, an unknown model, an empty answer — and never a
+/// transport problem. A dropped connection, a timeout, a 5xx or a 429 keeps the
+/// SAME model, because another model cannot fix the network, and spending the
+/// whole list on one provider hiccup hides the real reason behind the last
+/// rung's error.
+fn subagent_error_is_fatal(err: &str) -> bool {
+    crate::llm::should_fall_back(err)
 }
 
 async fn run_subagent(
@@ -5701,10 +6218,25 @@ async fn run_subagent(
         .unwrap_or("")
         .trim()
         .to_string();
+    // The explore slot's reasoning level, applied to EVERY rung of the call
+    // chain: a fallback model runs at the TOOL's effort, never a level of its
+    // own. (`sub_level` itself is moved into the sub-request below.)
+    let chain_level = sub_level.clone();
     let sub_model_reasoning =
         provider_model_reasoning(&parent.providers, &sub_provider_id, &sub_model);
+    // The slot's OWN endpoint kind. `parent.provider` is the kind of the CHAT's
+    // provider while rung 0 belongs to the SLOT: a slot on a different provider
+    // kind (an Anthropic row while the chat runs on a custom gateway) must not
+    // be called with the chat's URL shape and auth header.
+    let slot_entry = parent
+        .subagent_models
+        .get("explore")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let sub_provider_kind =
+        crate::backend_light::resolve_slot_kind(&slot_entry, &parent.provider, &parent.providers);
     let mut sub_req = AgentRequest {
-        provider: parent.provider.clone(),
+        provider: sub_provider_kind,
         provider_id: sub_provider_id,
         model: sub_model,
         base_url: sub_base,
@@ -5750,6 +6282,9 @@ async fn run_subagent(
         },
         model_reasoning: sub_model_reasoning,
         subagent_thinking: std::collections::HashMap::new(),
+        // The explore sub-agent carries its OWN fallback ladder (a fresh copy:
+        // the slot list is re-read per call from the parent request).
+        tool_fallbacks: parent.tool_fallbacks.clone(),
         // A research sub-agent is text-only — images belong to the parent turn.
         images: Vec::new(),
         // A sub-agent inherits the parent's auto-fetch count.
@@ -5766,9 +6301,17 @@ async fn run_subagent(
     // bounded by the model call itself, never by a wall-clock timer: a slow
     // but healthy provider is NOT a failure.
     let mut last: (String, bool) = (String::new(), false);
-    // Set once the sub-agent's own model proved UNUSABLE and the request was
-    // re-aimed at the parent's model. Kept outside the loop so the ladder can
-    // tell "the slot model is broken" from "the fallback is broken too".
+    // The explore slot's full call chain, rebuilt from scratch for EVERY explore
+    // call (this function is called once per explore): the slot's own model
+    // first, then `tool_fallbacks["explore"]` in the user's order. Nothing about
+    // it survives the call, which is what keeps a fallback an escape hatch for
+    // ONE failing call instead of a new default.
+    let mut chain: Vec<(String, String, Vec<String>, String, String)> = vec![];
+    // Index of the rung `sub_req` currently points at. 0 = the slot's own model.
+    let mut chain_idx = 0usize;
+    // Set once a rung BEYOND the slot's own model has been applied. Kept outside
+    // the loop so the ladder can tell "the slot model is broken" from "the
+    // fallback is broken too".
     let mut using_fallback = false;
     // How ONE attempt ended. A user-requested restart is distinct from both a
     // failure and a hang: nothing is wrong with the model, we simply stopped
@@ -5788,6 +6331,17 @@ async fn run_subagent(
     // it again at each backoff (the original bug) threw away every click that
     // landed while an attempt was running.
     let mut consumed_nudge = retry_nudge();
+    // The Tool Models entry this ladder last applied. The turn's request body
+    // carries only a SNAPSHOT of Tool Models, so this is what lets the ladder
+    // notice that the user replaced the slot's model WHILE it is retrying.
+    let mut applied_slot = parent
+        .subagent_models
+        .get("explore")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    // Anything reported at or before this sequence is already part of the turn's
+    // snapshot, so only a LATER entry can be a change made mid-turn.
+    let slot_seq_at_start = live_slot_seq();
     // Ref-counted "a ladder is live for this chat" marker, dropped on EVERY exit
     // path below (success, give-up, break, cancel). It exists so the Retry
     // endpoint can answer honestly instead of always claiming it was accepted.
@@ -5796,9 +6350,96 @@ async fn run_subagent(
     // nudge select watches from the FIRST attempt, so a click is honoured
     // wherever the ladder happens to be.
     live.arm();
-    for attempt in 1..=SUBAGENT_MAX_ATTEMPTS {
+    // Build the chain HERE, before the budget is derived from it. It used to be
+    // built lazily inside the loop, which meant the budget was computed against
+    // an EMPTY chain and always collapsed to SUBAGENT_MAX_ATTEMPTS — so a long
+    // fallback list could never be walked, because the attempts ran out before
+    // the tail was reached. The in-loop build below is kept for the mid-turn
+    // slot change, which clears the chain and rebuilds it around the model the
+    // user just picked.
+    chain = crate::backend_light::resolve_slot_chain(
+        applied_slot.as_str(),
+        parent
+            .tool_fallbacks
+            .get("explore")
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &parent.model,
+        &parent.base_url,
+        &parent.api_keys,
+        &parent.provider_id,
+        &parent.provider,
+        &parent.providers,
+    );
+    // The ladder's attempt budget is DERIVED from the chain, not fixed at 10.
+    // Every rung costs up to SUBAGENT_RUNG_ATTEMPTS attempts, so the budget
+    // covers each rung plus one spare, and never drops below the old 10 so a
+    // short chain keeps exactly the retry story it had.
+    let max_attempts = SUBAGENT_MAX_ATTEMPTS
+        .max(chain.len().saturating_add(usize::from(
+            !parent.model.trim().is_empty()
+                && !(parent.model == sub_req.model && parent.provider_id == sub_req.provider_id),
+        )) * SUBAGENT_RUNG_ATTEMPTS);
+    // Attempts spent on the rung `sub_req` currently points at, reset whenever
+    // the rung changes. The budget belongs to ONE model, not to the ladder.
+    let mut rung_attempts = 0usize;
+    for attempt in 1..=max_attempts {
         let mut report = String::new();
         let mut sub_error = String::new();
+        // Re-resolve the slot BEFORE every attempt. The user fixing the
+        // sub-agent model while it retries expects the NEXT attempt to use it,
+        // not the next turn — before this the ladder kept hammering the very
+        // model they had just replaced, because the request body's snapshot
+        // never changes mid-turn.
+        if let Some(live) = live_slot_entry_since("explore", slot_seq_at_start) {
+            if live != applied_slot {
+                applied_slot = live.clone();
+                let (m, base, keys, pid) = resolve_slot_target(parent, &live);
+                sub_req.model = m;
+                sub_req.base_url = base;
+                sub_req.api_keys = keys;
+                sub_req.provider_id = pid.clone();
+                // The row the user just picked may live on a different provider
+                // KIND: routing it with the old kind builds the wrong URL path
+                // and the wrong auth header.
+                sub_req.provider = crate::backend_light::resolve_slot_kind(
+                    &live,
+                    &parent.provider,
+                    &parent.providers,
+                );
+                sub_req.model_reasoning =
+                    provider_model_reasoning(&parent.providers, &pid, &sub_req.model);
+                // A freshly chosen model deserves a clean ladder: the earlier
+                // "the slot model is broken" verdict was about the OLD one.
+                using_fallback = false;
+                // …and the chain is rebuilt around the new model, so the
+                // fallbacks follow the row the user just picked.
+                chain.clear();
+                chain_idx = 0;
+                rung_attempts = 0;
+            }
+        }
+        // Build the chain lazily, on the first attempt: `sub_req` already holds
+        // rung 0 (the slot's own model, resolved above), and the fallback list is
+        // re-read here so a mid-turn edit is picked up together with the swap
+        // above.
+        if chain.is_empty() {
+            chain = crate::backend_light::resolve_slot_chain(
+                applied_slot.as_str(),
+                parent
+                    .tool_fallbacks
+                    .get("explore")
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &parent.model,
+                &parent.base_url,
+                &parent.api_keys,
+                &parent.provider_id,
+                &parent.provider,
+                &parent.providers,
+            );
+            chain_idx = 0;
+        }
         // Liveness clock for the idle guard below: EVERY event this attempt
         // emits bumps it, so what the guard measures is real silence — a
         // blocking tool call that never returns, or a provider that accepted
@@ -5845,8 +6486,21 @@ async fn run_subagent(
                 // not a wedge — aborting it would kill a healthy cold start.
                 let mut seen_lsp = crate::lsp::activity();
                 let mut silent_since = std::time::Instant::now();
+                let started = std::time::Instant::now();
+                // …but the heartbeat is GLOBAL, so LSP work that has nothing to
+                // do with this attempt (another turn, a background pre-warm, a
+                // wedged call from an earlier tool) resets the silence clock
+                // forever and no amount of silence ever trips the guard. That is
+                // how an explore attempt sat "Contacting model" for 11 minutes
+                // while the retry banner counted up. So the heartbeat may only
+                // EXTEND the attempt up to a hard ceiling; past it the attempt is
+                // declared hung no matter how much unrelated LSP traffic there is.
+                let cap = std::time::Duration::from_secs(subagent_idle_secs() + 120);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if started.elapsed() >= cap {
+                        return;
+                    }
                     let now = guard_pulse.load(Ordering::Relaxed);
                     let now_lsp = crate::lsp::activity();
                     if now != seen || now_lsp != seen_lsp {
@@ -5906,10 +6560,14 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         // deliberately leave `last` untouched: if the ladder later gives up it
         // must still report the REAL failure reason, never an empty "requested".
         if was_nudged {
+            // A manual retry is a fresh attempt at the SAME model: it must not
+            // count against the rung's budget, or pressing the button twice
+            // would jump to a fallback the user never asked for.
+            rung_attempts = 0;
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            if attempt == SUBAGENT_MAX_ATTEMPTS {
+            if attempt == max_attempts {
                 // A manual retry on the final attempt: nothing is left to try, so
                 // end with a truthful reason instead of silently looping.
                 last = (
@@ -5920,7 +6578,11 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                 break;
             }
             emit(&AgentEvent::Retry {
-                attempt,
+                // NEXT attempt, not the one just abandoned: re-emitting the
+                // current number left the badge frozen on the same "6/10" after
+                // a click, which reads as "the button did nothing at all" even
+                // though the ladder had already restarted.
+                attempt: attempt + 1,
                 max_attempts: SUBAGENT_MAX_ATTEMPTS,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
@@ -5937,44 +6599,90 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             Err(reason) => (reason, false),
         };
         last = failed;
-        // A FATAL failure (invalid key, unknown model, rejected request) can
-        // never be fixed by retrying the same model: re-aim the request at the
-        // PARENT's model instead — the escape hatch the compact slot already
-        // uses. Only if the fallback fails too do we give up, and immediately
-        // rather than burning the remaining attempts on a model that cannot
-        // answer.
-        if subagent_error_is_fatal(&last.0) && attempt < SUBAGENT_MAX_ATTEMPTS {
-            let same_target =
-                parent.model == sub_req.model && parent.provider_id == sub_req.provider_id;
-            if using_fallback || parent.model.trim().is_empty() || same_target {
-                // Either the fallback already ran and failed, or there is no
-                // DIFFERENT main model to fall back to: the failure is final.
-                break;
+        // Attempts spent on the CURRENT rung; reset whenever the rung moves.
+        rung_attempts = rung_attempts.saturating_add(1);
+        // A rung is abandoned when its failure says the MODEL ITSELF is unusable
+        // (a refused key, an unknown model, an empty answer) — OR when the rung
+        // has spent its own attempt budget without producing a report.
+        //
+        // That second half is the bug the user reported. A slot model answering
+        // 429 on every single call is NOT fixed by retrying it forever: the
+        // fallback list exists for exactly this, but every rate limit was
+        // classified "transient", so the ladder kept the same model and burned
+        // all ten attempts on it — Settings → Tools → Explore → Fallbacks was
+        // never reached. Retrying a slow-but-working provider is still right,
+        // which is what SUBAGENT_RUNG_ATTEMPTS buys it before the chain moves on.
+        let rung_spent = rung_attempts >= SUBAGENT_RUNG_ATTEMPTS;
+        let advance = attempt < max_attempts && (subagent_error_is_fatal(&last.0) || rung_spent);
+        if advance {
+            let parent_is_current = parent.model == sub_req.model
+                && parent.provider_id == sub_req.provider_id;
+            // The parent model is appended once, as the final rung of a slot
+            // whose chain is exhausted (or of a slot that has no fallbacks).
+            let parent_as_rung = !parent.model.trim().is_empty() && !parent_is_current;
+            let next = chain_idx + 1;
+            let parent_rung = chain.len() + usize::from(parent_as_rung);
+            if next >= parent_rung {
+                // Nothing left to try. A FATAL failure is final right away; a
+                // TRANSIENT one keeps retrying this LAST rung with the remaining
+                // budget, so a slot with no fallback configured stays exactly as
+                // patient as it was before.
+                if subagent_error_is_fatal(&last.0) {
+                    break;
+                }
+                rung_attempts = 0;
+            } else {
+                // Moving down the chain: the NEXT fallback model, then the next,
+                // with the PARENT's model as the last resort. Each rung is
+                // applied with the SLOT's reasoning level — a fallback changes
+                // the model and its routing, never the effort the user chose.
+                chain_idx = next;
+                rung_attempts = 0;
+                if next == chain.len() && parent_as_rung {
+                    using_fallback = true;
+                    sub_req.model = parent.model.clone();
+                    sub_req.provider_id = parent.provider_id.clone();
+                    sub_req.base_url = parent.base_url.clone();
+                    sub_req.api_key = parent.api_key.clone();
+                    sub_req.api_keys = parent.api_keys.clone();
+                    // The last rung IS the parent's model, so it must also use
+                    // the parent's endpoint kind — otherwise it inherits the
+                    // kind of the rung that just failed.
+                    sub_req.provider = parent.provider.clone();
+                    sub_req.model_reasoning = parent.model_reasoning;
+                    // The main model's own level is what the parent turn uses.
+                    sub_req.thinking_level = parent.thinking_level.clone();
+                } else if let Some((m, b, keys, pid, kind)) = chain.get(next) {
+                    using_fallback = true;
+                    sub_req.model = m.clone();
+                    sub_req.provider_id = pid.clone();
+                    sub_req.base_url = b.clone();
+                    sub_req.api_keys = keys.clone();
+                    sub_req.provider = kind.clone();
+                    sub_req.model_reasoning = provider_model_reasoning(&parent.providers, pid, m);
+                    // The slot's level, unchanged: only the model moves down the
+                    // list.
+                    sub_req.thinking_level = chain_level.clone();
+                }
+                // Tell the renderer straight away, so the user sees WHICH model
+                // stopped working instead of watching a silent 90s of retries.
+                emit(&AgentEvent::Retry {
+                    attempt,
+                    max_attempts,
+                    delay_secs: 0,
+                    reason: format!("{} — trying the next model", last.0),
+                    agent: "explore subagent".into(),
+                    tool: tool.to_string(),
+                    model: sub_req.model.clone(),
+                    reconnecting: true,
+                    fallback: true,
+                });
+                continue;
             }
-            using_fallback = true;
-            sub_req.model = parent.model.clone();
-            sub_req.provider_id = parent.provider_id.clone();
-            sub_req.base_url = parent.base_url.clone();
-            sub_req.api_key = parent.api_key.clone();
-            sub_req.api_keys = parent.api_keys.clone();
-            // Tell the renderer straight away, so the user sees WHICH model
-            // stopped working instead of watching a silent 90s of retries.
-            emit(&AgentEvent::Retry {
-                attempt,
-                max_attempts: SUBAGENT_MAX_ATTEMPTS,
-                delay_secs: 0,
-                reason: format!("{} — switching to the main model", last.0),
-                agent: "explore subagent".into(),
-                tool: tool.to_string(),
-                model: sub_req.model.clone(),
-                reconnecting: true,
-                fallback: true,
-            });
-            continue;
         }
         // Stop aborts the ladder too: never spawn another sub-agent after the
         // user cancelled the turn.
-        if attempt == SUBAGENT_MAX_ATTEMPTS || cancel.load(Ordering::Relaxed) {
+        if attempt == max_attempts || cancel.load(Ordering::Relaxed) {
             break;
         }
         // Same ladder, same events, same banner as a main-model retry: the
@@ -5984,7 +6692,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         let reason = last.0.clone();
         emit(&AgentEvent::Retry {
             attempt,
-            max_attempts: SUBAGENT_MAX_ATTEMPTS,
+            max_attempts,
             delay_secs: SUBAGENT_RETRY_BACKOFF_MS / 1000,
             reason: reason.clone(),
             agent: "explore subagent".into(),
@@ -6013,9 +6721,12 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         }
         if forced {
             // Instant feedback: restart the banner so the user sees the click
-            // registered, then retry right away.
+            // registered, then retry right away. The badge must report the
+            // attempt that is about to START: re-emitting the number that was
+            // just abandoned left the counter frozen on its old value, which
+            // reads as "the button did nothing".
             emit(&AgentEvent::Retry {
-                attempt,
+                attempt: attempt + 1,
                 max_attempts: SUBAGENT_MAX_ATTEMPTS,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
@@ -6032,8 +6743,8 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
     // button up instead of clearing them on `done`.
     if !cancel.load(Ordering::Relaxed) && !last.1 {
         emit(&AgentEvent::RetryGiveup {
-            attempt: SUBAGENT_MAX_ATTEMPTS,
-            max_attempts: SUBAGENT_MAX_ATTEMPTS,
+            attempt: max_attempts,
+            max_attempts,
             reason: last.0.clone(),
             agent: "explore subagent".into(),
             tool: tool.to_string(),
@@ -6095,6 +6806,20 @@ fn cache_read_tuple(acc: &StreamAcc) -> u64 {
         .unwrap_or(0)
 }
 
+/// The generic coding rules, inlined into the shared body of every system
+/// prompt.
+///
+/// Sourced from the shipped skill instead of being copied here: `include_str!`
+/// compiles the markdown into the binary, so `src-tauri/skills/coding-standards.md`
+/// stays the single source and the prompt cannot drift from it. The frontmatter
+/// is stripped because only the body is instructions — the catalog is what
+/// carries the name and the Persian keywords.
+fn coding_rules() -> String {
+    crate::skills::strip_frontmatter_pub(include_str!("../skills/coding-standards.md"))
+        .trim()
+        .to_string()
+}
+
 /// The main agent's system prompt.
 ///
 /// Everything before the FINAL sentence must stay byte-identical across turns:
@@ -6148,12 +6873,16 @@ new text and say that Build mode applies it."
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
 commit, package installs), so describe changes instead of applying them — inspection is \
 otherwise wide open (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck). The \
-deliverable is a SHORT, \
-scannable plan: one '## Plan' heading, then one line per step naming the file it touches \
-(and the line when you know it) — no essay, no restating the request, no code blocks, no \
-prose between steps. Keep the whole plan under ~25 lines: a longer plan means the steps are \
-too fine, so merge them. Name the mode each out-of-scope item belongs to instead of \
-expanding on it."
+deliverable is a plan the USER can understand, not a note to yourself: one '## Plan' \
+heading, then one line per step, in the user's language — name the file it touches, then \
+say in plain words WHAT that step changes and WHY it is needed, written so that someone \
+who did not read this chat understands what will happen to their app. A bare jargon line \
+like 'types.ts: add types' is a failed step. No essay, no restating the request, no code \
+blocks, no prose between steps; keep the whole plan under ~25 lines — a longer plan means \
+the steps are too fine, so merge them. END the plan with a short summary section (a '## ' \
+heading in the user's language): 2-4 plain sentences saying what will be done overall and \
+what the user gets when it is finished. Name the mode each out-of-scope item belongs to \
+instead of expanding on it."
     } else {
         "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
@@ -6161,6 +6890,7 @@ commit, package installs); every read-only command still runs. Answer with the c
 change instead — which file, which line, the exact old text -> new text — and tell the user \
 to switch to Build mode to apply it."
     };
+    let rules = coding_rules();
     format!(
         "You are Codifa, a coding agent inside the user's desktop IDE. \
 You have NO search/read tools: delegate ALL file reading, searching and \
@@ -6179,11 +6909,9 @@ the same port and produce conflicting logs. Only start it once when nothing \
 is running, and never verify against a release build. \
 Use the tools this mode binds to make changes, and never claim a change you \
 did not make. \
-The generic coding rules — project structure, smallest correct diff, no \
-hard-coding, efficiency, explicit errors, tests, and the debugging protocol — \
-live in the built-in `Coding Standards` skill: call load_skill with \
-name=Coding Standards before writing, changing or reviewing code, and follow \
-what it says. \
+CODING RULES — apply to every write, edit and review (already inlined from the \
+built-in `Coding Standards` skill; there is no need to load it again):\n\
+{rules}\n\
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \
 A system message holding a compacted summary is AUTHORITATIVE history: every \
@@ -6250,6 +6978,31 @@ mod tests {
         assert!(text.contains("[tool]\nline 1"));
         // An empty conversation must not produce a row body of whitespace.
         assert_eq!(trace_prompt_text(&[]), "");
+    }
+
+    #[test]
+    fn trace_prompt_text_keeps_the_newest_block_within_the_cap() {
+        // `clip_trace_text` keeps the HEAD, so an over-cap wire prompt used to
+        // drop the newest tool result — and with it any batching hint appended
+        // to that same message, which made the single-call lever impossible to
+        // verify from a trace. The newest block must survive the cap.
+        let big = "x".repeat(9_000);
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "older turn"}),
+            serde_json::json!({"role": "tool", "content": big}),
+            serde_json::json!({"role": "tool", "content": "NEWEST-RESULT\n\n[hint] That step had ONE call."}),
+        ];
+        let text = trace_prompt_text(&messages);
+        assert!(text.len() <= LLM_TRACE_PROMPT_CAP, "row body must stay capped: {}", text.len());
+        assert!(text.contains("NEWEST-RESULT"), "newest block was cut: {text}");
+        assert!(text.contains("[hint] That step had ONE call."), "hint was cut: {text}");
+        // The head is still there, and the elision is explicit rather than silent.
+        assert!(text.contains("[system] 3 chars"), "head lost: {text}");
+        assert!(text.contains("elided middle"), "elision must be visible: {text}");
+        // Under the cap nothing is elided at all.
+        let small = trace_prompt_text(&[serde_json::json!({"role": "user", "content": "hi"})]);
+        assert!(!small.contains("elided middle"), "{small}");
     }
 
     /// Model id the live explore test asserts on (mirror of the backend_light
@@ -6847,19 +7600,40 @@ mod tests {
         // already calling for it), so it costs its description on every turn
         // rather than staying a ghost tool.
         let chars = |v: &Vec<Value>| serde_json::to_string(v).unwrap().chars().count();
+        // Report EVERY label at once: asserting inside the loop showed only the
+        // first over-budget set, so one run could not tell how far the others
+        // were from their limit.
+        //
+        // The two `+authoring` budgets grew from 9_900/14_200 because three
+        // tools joined the authoring set — `plugin`, `artifact` and `schedule`
+        // — and they measure ~2_7OO chars AFTER the prose was cut back to the
+        // parameter names and enum values (they first landed at ~3_500, which
+        // broke both budgets: 12_721/12_000 and 18_303/17_600). They are BOUND
+        // only on a turn whose text asked for one of those capabilities
+        // (`AgentRequest::allow_create`), so the base `main` turn still pays
+        // 5_868 chars and never sees them. Every char here is re-sent on every
+        // round-trip OF SUCH A TURN (~2_913 tokens for the authoring set),
+        // which is why the descriptions were trimmed as well as accommodated:
+        // the model needs the parameter names and enum values, not the prose.
+        let mut report = String::new();
+        let mut over = false;
         for (label, schemas, budget) in [
             ("main", tool_schemas(false, false), 7_900usize),
             ("main+browser", tool_schemas(false, true), 11_500),
-            ("main+authoring", tool_schemas(true, false), 9_900),
-            ("main+authoring+browser", tool_schemas(true, true), 14_200),
+            ("main+authoring", tool_schemas(true, false), 12_000),
+            ("main+authoring+browser", tool_schemas(true, true), 17_600),
             ("explore", research_schemas(), 8_400),
         ] {
             let got = chars(&schemas);
-            assert!(
-                got <= budget,
-                "{label} tool schemas serialize to {got} chars, over the {budget} budget"
-            );
+            if got > budget {
+                over = true;
+            }
+            report.push_str(&format!("{label}={got}/{budget} "));
         }
+        assert!(
+            !over,
+            "tool schemas over budget (chars/budget): {report}"
+        );
     }
 
     #[test]
@@ -6932,6 +7706,14 @@ mod tests {
         assert!(p.contains("PREFIX"), "{p}");
         // The old "aim for 2-3 rounds" wish is gone — replaced by a budget.
         assert!(!p.contains("Aim for 2-3 rounds"), "{p}");
+        // STEP 1 must be skippable. On a real trace, 31 of 37 explore runs whose
+        // question ALREADY named the file and line window still spent a round
+        // locating: 8.7K uncached tokens per run against 6.7K for the runs that
+        // read straight away (87% of that group's cost). "Do not read yet" was
+        // an unconditional command, so the model obeyed it against the evidence
+        // in front of it.
+        assert!(p.contains("SKIP this step entirely"), "{p}");
+        assert!(p.contains("already names the files and line windows"), "{p}");
     }
 
     #[test]
@@ -7043,8 +7825,39 @@ mod tests {
             assert!(hint.contains("IN ORDER"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
+        // Phase 6.28: 18 single-call main rounds sat OUTSIDE this whitelist
+        // (110_995 uncached tokens), so the hint could never fire on them.
+        for name in ["browser_resize", "browser_emulate_media", "artifact"] {
+            let hint = single_call_hint("agent", &one(name))
+                .unwrap_or_else(|| panic!("{name} has no hint"));
+            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
+            assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
+        }
+        // Read-only natives are the one group that DOES batch concurrently.
+        for name in ["read", "fetch_url", "load_skill"] {
+            let hint = single_call_hint("agent", &one(name))
+                .unwrap_or_else(|| panic!("{name} has no hint"));
+            assert!(hint.contains("CONCURRENTLY"), "{name}: {hint}");
+        }
+        // Interactive / whole-state tools legitimately stand alone: hinting at
+        // them would push the model to fire a second blocking question or a
+        // second full checklist rewrite in one step, so they stay silent.
+        for name in ["ask_user", "update_plan"] {
+            assert!(
+                single_call_hint("agent", &one(name)).is_none(),
+                "{name} must stay silent"
+            );
+        }
         // A tool the hint has nothing useful to say about must stay silent.
         assert!(single_call_hint("agent", &one("glob")).is_none());
+    }
+
+    #[test]
+    fn the_explore_spent_budget_nudge_lands_before_the_exhaustion_nudge() {
+        // The round-3 nudge only helps while rounds remain, and it has to be
+        // distinguishable from the "nearly exhausted" one (step + 3 == max).
+        assert!(EXPLORE_BUDGET_STEPS < SUBAGENT_MAX_STEPS);
+        assert!(EXPLORE_BUDGET_STEPS < SUBAGENT_MAX_STEPS - 3);
     }
 
     #[test]
@@ -7096,6 +7909,49 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_error_names_the_provider_not_its_wire_kind() {
+        // The reported bug: the banner said "custom reported an error
+        // mid-stream", and the user answered "I don't have this provider in my
+        // fallback list". `custom` is the KIND every OpenAI-compatible endpoint
+        // shares, so the message named nothing they had ever configured.
+        let providers: std::collections::HashMap<String, Value> = serde_json::from_value(json!({
+            "p9": {
+                "kind": "custom",
+                "name": "9router",
+                "baseUrl": "https://x/v1",
+                "apiKeys": ["k"]
+            }
+        }))
+        .unwrap();
+        let err = "custom reported an error mid-stream: Failed to create stream";
+        assert_eq!(
+            name_the_provider_in_error(err.to_string(), &providers, "p9", "custom"),
+            "9router reported an error mid-stream: Failed to create stream"
+        );
+        // A later mention deeper in the body is left alone: the gateway may name
+        // "custom" itself and rewriting it would corrupt the provider's message.
+        assert_eq!(
+            name_the_provider_in_error(
+                "custom returned no content — rejected by custom".to_string(),
+                &providers,
+                "p9",
+                "custom"
+            ),
+            "9router returned no content — rejected by custom"
+        );
+        // Unknown provider id, a nameless provider and a mismatched kind all
+        // leave the message exactly as the provider wrote it.
+        assert_eq!(
+            name_the_provider_in_error(err.to_string(), &providers, "", "custom"),
+            err
+        );
+        assert_eq!(
+            name_the_provider_in_error(err.to_string(), &providers, "p9", "anthropic"),
+            err
+        );
+    }
+
+    #[test]
     fn fatal_subagent_errors_are_told_apart_from_transient_ones() {
         // Fatal: retrying the SAME model can never help, so the ladder must
         // fall back to the main model instead of burning all 10 attempts.
@@ -7115,6 +7971,63 @@ mod tests {
         assert!(!subagent_error_is_fatal("sub-agent hung: no activity for 300s"));
         assert!(!subagent_error_is_fatal("explore returned no findings: empty"));
         assert!(!subagent_error_is_fatal(""));
+    }
+
+    /// The explore ladder's attempt budget must scale with the configured chain.
+    ///
+    /// With the fixed 10-attempt budget and a rung that fails non-fatally (a
+    /// timeout, a 5xx) costing SUBAGENT_RUNG_ATTEMPTS attempts, only the first
+    /// five rungs were ever reachable — a six-model fallback list was silently
+    /// truncated and the models at its tail were never called, so the user saw
+    /// "all my fallbacks are ignored".
+    #[test]
+    fn explore_attempt_budget_covers_every_rung_of_a_long_chain() {
+        // Mirrors the expression in `run_subagent`: every rung gets its own
+        // retry budget, and a short chain keeps the original 10 attempts.
+        let budget = |chain_len: usize, parent_is_rung: bool| {
+            SUBAGENT_MAX_ATTEMPTS.max(
+                chain_len.saturating_add(usize::from(parent_is_rung)) * SUBAGENT_RUNG_ATTEMPTS,
+            )
+        };
+        // A long list is fully reachable: 1 slot model + 8 fallbacks + parent.
+        let rungs = 1 + 8 + 1;
+        assert_eq!(budget(1 + 8, true), rungs * SUBAGENT_RUNG_ATTEMPTS);
+        assert!(
+            budget(1 + 8, true) >= rungs,
+            "every rung must be reachable, got {} attempts for {rungs} rungs",
+            budget(1 + 8, true)
+        );
+        // Non-fatal failures cost a full rung budget each, and even then the
+        // whole chain fits.
+        assert!(budget(1 + 8, true) / SUBAGENT_RUNG_ATTEMPTS >= rungs);
+        // A short chain is unchanged: the historical 10 attempts still apply.
+        assert_eq!(budget(1, false), SUBAGENT_MAX_ATTEMPTS);
+        assert_eq!(budget(1, true), SUBAGENT_MAX_ATTEMPTS);
+        assert_eq!(budget(2, true), SUBAGENT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_rate_limited_slot_model_still_falls_back() {
+        // The reported bug: the banner sat on "Sub-agent retrying (7/10) … key
+        // rejected (429)" while the user's configured Fallbacks were never
+        // tried. A rate limit is correctly classified TRANSIENT (retrying the
+        // same model is right for a hiccup), but that must not mean "retry it
+        // forever": once the rung has spent its own budget the chain has to move
+        // on, or the fallback list is unreachable for the one failure it exists
+        // for.
+        let budget_spent = |rung_attempts: usize, fatal: bool, can_advance: bool| {
+            can_advance && (fatal || rung_attempts >= SUBAGENT_RUNG_ATTEMPTS)
+        };
+        // A 429 stays transient, so it never forces an immediate jump…
+        assert!(!subagent_error_is_fatal(
+            "key rejected (429): Rate limit exceeded. Please try again later."
+        ));
+        // …but the rung's second failure DOES advance to the next model.
+        assert!(budget_spent(SUBAGENT_RUNG_ATTEMPTS, false, true));
+        // A single failure still retries the same model first.
+        assert!(!budget_spent(1, false, true));
+        // A fatal error advances immediately, without waiting for the budget.
+        assert!(budget_spent(1, true, true));
     }
 
     #[test]
@@ -7186,6 +8099,47 @@ mod tests {
         assert!(nudge_subagent_retry("chat-live"));
         drop(live);
         assert!(!nudge_subagent_retry("chat-live"));
+    }
+
+    #[test]
+    fn a_slot_model_change_is_visible_to_a_running_ladder() {
+        // The reported bug: "I change the sub-agent model while it is retrying
+        // and it still retries with the old one". `subagent_models` reaches the
+        // backend only as a snapshot in the turn's request body, so the ladder
+        // must be able to see a change made afterwards — and must notice that it
+        // differs from the entry it last applied.
+        let mut req = base_req();
+        req.providers.insert(
+            "p2".into(),
+            json!({"kind": "custom", "baseUrl": "http://other/v1", "apiKeys": ["k2"]}),
+        );
+        req.model = "parent-model".into();
+
+        // Anything reported BEFORE the ladder started is already in the turn's
+        // snapshot, so it must be ignored — otherwise a stale entry from an
+        // earlier turn would clobber this turn's own value.
+        let stale = live_slot_seq();
+        set_live_slot_entry("explore", "p2/new-model");
+        assert_eq!(live_slot_entry_since("explore", stale).as_deref(), Some("p2/new-model"));
+        // …but it is invisible to a ladder that started AFTERWARDS.
+        let later = live_slot_seq();
+        assert_eq!(live_slot_entry_since("explore", later), None);
+
+        // The ladder resolves the LIVE entry, not the request snapshot.
+        let live = live_slot_entry_since("explore", stale).unwrap_or_default();
+        let (model, base, keys, pid) = resolve_slot_target(&req, &live);
+        assert_eq!(model, "new-model");
+        assert_eq!(pid, "p2");
+        assert_eq!(base, "http://other/v1");
+        assert_eq!(keys, vec!["k2".to_string()]);
+
+        // Clearing the slot ("" = parent model) must resolve to the parent, so a
+        // user who removes their override stops hit the broken model too.
+        set_live_slot_entry("explore", "");
+        let live = live_slot_entry_since("explore", stale).unwrap_or_default();
+        let (model, _, _, pid) = resolve_slot_target(&req, &live);
+        assert_eq!(model, "parent-model");
+        assert_eq!(pid, req.provider_id);
     }
 
     #[tokio::test]
@@ -7305,7 +8259,8 @@ mod tests {
         let section = crate::skill_router::build_section("", root, &[]);
         assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
 
-        // A skill saved with NO keywords is one auto-match can never pick, and
+        // A skill saved with NO keywords is one a Persian request can never
+        // find, and
         // the tool says so instead of reporting a plain success.
         let out = dispatch(
             root,
@@ -7404,6 +8359,104 @@ mod tests {
         assert!(err.contains("Movie Finder"), "{err}");
         assert!(dispatch(root, "load_skill", &json!({}), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skill_query_finds_a_skill_a_huge_store_cannot_list() {
+        use crate::tools::dispatch;
+        // The prompt's catalog is byte-capped, so a store with hundreds of
+        // skills cannot be listed there. `query` is the way to the ones it had
+        // to leave out: scoring runs over EVERY installed skill.
+        let dir = std::env::temp_dir().join(format!("codifa-skill-query-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..40 {
+            let name = format!("Bulk Skill {i}");
+            let sdir = dir.join("skills").join(name.to_lowercase().replace(' ', "-"));
+            std::fs::create_dir_all(&sdir).unwrap();
+            // One distinctive English description, one Persian keyword set, the
+            // rest filler — the two things a real query has to find.
+            let (description, keywords) = match i {
+                39 => ("bewildering xylophone maintenance", ""),
+                38 => ("earthquake drill", "fa_keywords: زلزله\n"),
+                _ => ("a filler skill", ""),
+            };
+            std::fs::write(
+                sdir.join("skill.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {description}\n{keywords}---\nBODY OF {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let root = dir.to_str().unwrap();
+
+        // Exactly one match returns its body: the model never guesses a name.
+        let hit = dispatch(root, "load_skill", &json!({"query": "xylophone"}), None).unwrap();
+        assert!(hit.contains("BODY OF 39"), "{hit}");
+        // The user's own Persian word finds its skill, exactly as in the catalog.
+        let fa = dispatch(root, "load_skill", &json!({"query": "زلزله"}), None).unwrap();
+        assert!(fa.contains("BODY OF 38"), "{fa}");
+        // Several matches list the candidates instead of inlining a wrong body.
+        let many = dispatch(root, "load_skill", &json!({"query": "filler"}), None).unwrap();
+        assert!(many.contains("Bulk Skill 0"), "{many}");
+        assert!(!many.contains("BODY OF"), "an ambiguous query must not inline a body: {many}");
+        // A miss answers with a HINT, not with 40 names: a store with hundreds
+        // of skills would spend a turn's worth of tokens on a failed lookup.
+        let miss = dispatch(root, "load_skill", &json!({"query": "zzzz"}), None).unwrap_err();
+        assert!(miss.contains("no skill matches"), "{miss}");
+        assert!(miss.contains("and 10 more"), "the hint must say it is truncated: {miss}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skill_reaches_a_skill_that_lives_inside_a_plugin() {
+        // Regression: the catalog advertises enabled-plugin skills, but this
+        // tool read only the standalone store, so a plugin skill answered
+        // "skill not found: … Available: (none)" right after being listed.
+        use crate::tools::dispatch_with_data_root;
+        let root = std::env::temp_dir().join(format!("codifa-plugin-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::plugins::create_plugin(
+            &root,
+            &json!({
+                "name": "Release Notes",
+                "skills": [{
+                    "name": "Release Notes",
+                    "content": "READ THE GIT LOG",
+                    "fa_keywords": "یادداشت انتشار",
+                    "extra_files": {"checklist.md": "- tag it"}
+                }]
+            }),
+        )
+        .unwrap();
+        let r = root.to_str().unwrap();
+
+        // Part of the catalog…
+        let section = crate::skill_router::build_section("", r, &[]);
+        assert!(section.text.contains("- Release Notes"), "{}", section.text);
+        // …loadable by name and by slug…
+        let body = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap();
+        assert!(body.contains("READ THE GIT LOG"), "{body}");
+        let by_slug = dispatch_with_data_root(r, "load_skill", &json!({"name": "release-notes"}), None, Some(r)).unwrap();
+        assert!(by_slug.contains("READ THE GIT LOG"), "{by_slug}");
+        // …and its extra files are readable too.
+        let extra = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes", "file": "checklist.md"}), None, Some(r)).unwrap();
+        assert_eq!(extra, "- tag it");
+        // A plugin skill is listed in the catalog (with its clipped detail), so
+        // the model can load it by name — and the catalog never carries a body,
+        // however precisely the prompt echoes the skill's own keywords.
+        let cat = crate::skill_router::build_section("یادداشت انتشار", r, &[]);
+        assert!(cat.text.contains("- Release Notes"), "{}", cat.text);
+        assert!(!cat.text.contains("READ THE GIT LOG"), "{}", cat.text);
+
+        // Disabled plugin = gone from the catalog AND unloadable.
+        crate::plugins::toggle_plugin(&root, &json!({"slug": "release-notes", "enabled": false})).unwrap();
+        assert!(!crate::skill_router::build_section("", r, &[]).text.contains("- Release Notes"));
+        let err = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes"}), None, Some(r)).unwrap_err();
+        assert!(err.contains("skill not found"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7807,6 +8860,7 @@ mod tests {
             thinking_level: String::new(),
             model_reasoning: false,
             subagent_thinking: std::collections::HashMap::new(),
+            tool_fallbacks: std::collections::HashMap::new(),
             images: Vec::new(),
             web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
             // No renderer to send a table: derive it from the mode instead.
@@ -7943,6 +8997,64 @@ mod tests {
             bodies.lock().unwrap().is_empty(),
             "an unset Other row must not spend the chat model on a side call"
         );
+    }
+
+    /// An UNSET web slot with a configured fallback list must still distil.
+    ///
+    /// The empty slot used to return early before the list was ever read, so a
+    /// fallback added in Settings → Tools was silently dead: the row looked
+    /// configured and nothing ever called it.
+    #[tokio::test]
+    async fn slot_distill_runs_the_fallback_list_of_an_unset_slot() {
+        let (mock_base, rx) = spawn_json_mock_upstream("distilled by fallback").await;
+        let bodies = drain_bodies(rx);
+
+        let mut req = base_req();
+        // No `web` model at all — only a fallback list.
+        req.tool_fallbacks.insert(
+            "web".into(),
+            vec![format!("slot-prov/{MOCK_MODEL}")],
+        );
+        req.providers.insert(
+            "slot-prov".into(),
+            json!({
+                "kind": "custom",
+                "baseUrl": format!("{mock_base}/v1"),
+                "apiKeys": ["sk-slot"],
+            }),
+        );
+        let main = LlmConfig {
+            provider: "custom".into(),
+            model: "main-model".into(),
+            base_url: "http://parent/v1".into(),
+            api_keys: vec!["pk".into()],
+            temperature: Some(0.2),
+            max_tokens: Some(1024),
+            timeout_secs: 10,
+            reasoning_level: "high".into(),
+            model_reasoning: false,
+            auto_think: false,
+        };
+
+        let out = run_slot_distill(
+            &reqwest::Client::new(),
+            &req,
+            &main,
+            WEB_DISTILL_SYSTEM_PROMPT,
+            "QUERY: x\n\nSEARCH RESULTS:\n- a",
+        )
+        .await;
+        assert_eq!(
+            out.as_deref(),
+            Some("distilled by fallback"),
+            "a configured fallback list must be used even when the slot model is empty"
+        );
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "exactly one rung, got {sent:?}");
+        assert_eq!(sent[0]["model"], MOCK_MODEL);
+        // The unset slot contributes NO rung of its own: the main model must not
+        // be spent on a side call the user never asked for.
+        assert_ne!(sent[0]["model"], "main-model");
     }
 
     #[test]
@@ -9253,6 +10365,37 @@ mod tests {
     }
 
     #[test]
+    fn skills_reminder_rides_the_tail_and_is_excluded_from_the_fold() {
+        // The reminder exists to make the model CALL the tool, so it must name
+        // the tool and the catalog it refers to — and it must stay out of the
+        // renderer's fold count, exactly like the plan context message.
+        let m = skills_context_message();
+        assert_eq!(m["role"], "user");
+        let text = m["content"].as_str().unwrap();
+        assert!(text.starts_with(SKILLS_CONTEXT_HEAD), "{text}");
+        assert!(text.contains("load_skill"), "{text}");
+        assert!(text.contains("AVAILABLE SKILLS"), "{text}");
+        // A capped catalog cannot list a large store, so the reminder must name
+        // the way to reach what it left out — otherwise "no entry" reads as
+        // "no such skill" and the model answers from memory.
+        assert!(text.contains("query"), "{text}");
+        // It must NOT pick a skill for the model: no skill name is embedded.
+        assert!(!text.contains("name="), "{text}");
+        assert!(!text.contains("query="), "{text}");
+
+        let tail = vec![
+            json!({"role": "assistant", "content": "a"}),
+            plan_context_message("\n\n=== SAVED PLAN (from disk) ===\nstep one\n").unwrap(),
+            skills_context_message(),
+        ];
+        assert_eq!(tail.len(), 3);
+        // Only the stored assistant message counts toward the fold.
+        assert_eq!(plan_context_keep(&tail), 1);
+        // A plain message is still counted.
+        assert!(!is_wire_only_context("just a question"));
+    }
+
+    #[test]
     fn plan_context_keep_excludes_the_wire_only_plan_message() {
         // The renderer stores every message of the tail EXCEPT the plan context,
         // which exists only on the wire. Counting it would tell the renderer to
@@ -9363,10 +10506,12 @@ mod tests {
         // Build: the edit is the artifact, the reply is a short report of it.
         assert!(build.contains("IS the artifact"));
         assert!(build.contains("never paste whole files"));
-        // Plan: the plan itself is capped and step-shaped.
-        assert!(plan.contains("SHORT"));
+        // Plan: the plan itself is capped, step-shaped, and written for the
+        // user — each step says WHAT changes and a summary section closes it.
+        assert!(plan.contains("the USER can understand"));
         assert!(plan.contains("under ~25 lines"));
         assert!(plan.contains("one line per step"));
+        assert!(plan.contains("summary section"));
         // Ask: short by default, detail is opt-in.
         assert!(ask.contains("2-4 short lines"));
 
@@ -9388,25 +10533,27 @@ mod tests {
     }
 
     #[test]
-    fn every_mode_points_at_the_coding_standards_skill() {
-        // The generic coding rules were MOVED OUT of the prompt's display copy
-        // (`appstate::system_prompts`) into a skill, because that text is
-        // display-only and never reaches the model. Extracting rules into a
-        // skill only pays off if the model is actually told to load it, so the
-        // pointer lives in the SHARED body: every mode must carry it, and byte
-        // for byte (the body is the cached prefix — a per-mode pointer would
-        // re-bill the whole prompt on every mode switch).
+    fn every_mode_inlines_the_coding_standards_rules() {
+        // The generic coding rules live in the shipped `Coding Standards` skill,
+        // but the prompt INLINES them instead of pointing at the skill: a
+        // pointer only applied when the model chose to spend a `load_skill`
+        // call, and a rule that is never read is not a rule. They sit in the
+        // SHARED body, byte for byte, because that body is the cached prefix — a
+        // per-mode copy would re-bill the whole prompt on every mode switch.
         let root = "/tmp/x";
         let mut seen: Option<String> = None;
         for mode in ["build", "ask", "plan"] {
             let p = default_system_prompt(mode, root);
             assert!(
-                p.contains("`Coding Standards` skill"),
-                "{mode} must point at the Coding Standards skill"
+                p.contains("CODING RULES"),
+                "{mode} must carry the coding rules"
             );
+            // Spot-check the real rule TEXT, not just the header: the body is
+            // compiled in from the shipped markdown, so an empty or renamed file
+            // would otherwise still read as "rules present".
             assert!(
-                p.contains("name=Coding Standards"),
-                "{mode} must name the skill exactly as load_skill resolves it"
+                p.contains("Smallest correct change") && p.contains("Never hard-code"),
+                "{mode} must inline the real rule body, not a bare header"
             );
             let body = p.split("Workspace root:").next().unwrap_or_default();
             match &seen {
@@ -9419,9 +10566,8 @@ mod tests {
             }
         }
 
-        // The pointer names the skill by NAME and `load_skill` resolves by exact
-        // name or slug, so a rename in the shipped markdown would silently turn
-        // every pointer into a dangling call that answers "not found".
+        // The rules are read from the shipped markdown by `include_str!`, so a
+        // truncated or frontmatter-less file would silently ship an empty block.
         let shipped = include_str!("../skills/coding-standards.md");
         assert!(
             shipped.starts_with("---"),
@@ -9431,12 +10577,13 @@ mod tests {
             shipped.contains("name: Coding Standards"),
             "the shipped skill must keep the exact name the prompt points at"
         );
-        // Matching is keyword-driven (name hits cap at 2, a whole fa_keyword
-        // phrase scores 3). Without keywords the skill would only ever load when
-        // the model chooses to — never because the request itself was about code.
+        // The catalog line is the model's only trigger for calling load_skill,
+        // and an English description cannot be found from a Persian request:
+        // the keywords are what make a shipped skill findable from the way the
+        // user actually writes.
         assert!(
             shipped.contains("fa_keywords:"),
-            "fa_keywords are what make the skill auto-matchable from a Persian request"
+            "fa_keywords are what make a shipped skill findable from a Persian request"
         );
     }
 

@@ -50,6 +50,7 @@ calamine = "0.36.1"
 csv = "1.4.0"
 roxmltree = "0.21.1"
 zip = "9.0.5"
+aes-gcm = "0.10"
 
 # Release profile tuned for an 8 GB machine.
 #

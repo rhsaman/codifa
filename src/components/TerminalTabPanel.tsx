@@ -177,24 +177,30 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell }: TerminalT
           </button>
         </div>
       </div>
-      <div
-        className="terminal-screen"
-        /* One terminal tab is mounted at a time, so its screen is always the
-           active one (the shared rule hides inactive screens). */
-        data-active="true"
-        ref={(el) => {
-          screenRef.current = el
-          const entry = peekTerminalSession(tabId)
-          if (entry) attachTerminalScreen(entry, el)
-        }}
-        aria-label="Terminal"
-      />
-      {error ? (
-        <div className="terminal-tab-error" role="alert">
-          <strong>{program || 'shell'}: </strong>
-          {error}
-        </div>
-      ) : null}
+      {/* The screen must sit in its own relative BODY (exactly like the bottom
+          panel's .terminal-body): .terminal-screen is position:absolute, so
+          directly under the panel it would stretch over the strip above and
+          paint OVER it — the strip appeared for one frame and vanished. */}
+      <div className="terminal-body">
+        <div
+          className="terminal-screen"
+          /* One terminal tab is mounted at a time, so its screen is always the
+             active one (the shared rule hides inactive screens). */
+          data-active="true"
+          ref={(el) => {
+            screenRef.current = el
+            const entry = peekTerminalSession(tabId)
+            if (entry) attachTerminalScreen(entry, el)
+          }}
+          aria-label="Terminal"
+        />
+        {error ? (
+          <div className="terminal-tab-error" role="alert">
+            <strong>{program || 'shell'}: </strong>
+            {error}
+          </div>
+        ) : null}
+      </div>
     </div>
   )
 }

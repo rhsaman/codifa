@@ -38,6 +38,25 @@
         stub.probeSidecar = function () {
           return Promise.resolve(true);
         };
+        // A minimal WORKING pty: the right-pane terminal needs terminal_create
+        // to resolve a session id, or terminalSessions rejects and xterm never
+        // paints — which hid real paint-order bugs (the screen covering the tab
+        // bar) from every in-harness check. Captured data callbacks are exposed
+        // so a driver can push pty output through window.__ptyData(text).
+        var dataCbs = [];
+        stub.terminalCreate = function () {
+          return Promise.resolve({ id: 'harness-pty-1' });
+        };
+        stub.terminalWrite = function () { return Promise.resolve(true); };
+        stub.terminalResize = function () { return Promise.resolve(true); };
+        stub.onTerminalData = function (cb) {
+          dataCbs.push(cb);
+          return function () {};
+        };
+        stub.onTerminalExit = function () { return function () {}; };
+        window.__ptyData = function (text) {
+          dataCbs.forEach(function (cb) { cb('harness-pty-1', text); });
+        };
         window.coder = stub;
       })();
     </script>

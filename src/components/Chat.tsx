@@ -26,7 +26,13 @@ import {
   loadCommandUsage,
   recordCommandUsage,
   bottomAnchoredByUsage,
+  slashBody,
+  SUBCOMMANDS,
+  slashCaretAt,
+  migrateCommandNames,
+  type SlashCaret,
 } from "../lib/slash";
+import { didYouMean, rankMatches } from "../lib/fuzzy";
 import {
   applyToolEvent,
   diffStatsFromUnified,
@@ -55,6 +61,7 @@ import {
   modelContextWindow,
   contextWarn,
   modelReasoning,
+  modelThinkingLevels,
   priceForModel,
   computeUsageCost,
   buildContextBreakdown,
@@ -73,6 +80,9 @@ import {
   respondAsk,
   listSkills,
   listAvailableSkills,
+  listSchedules,
+  deleteSchedule,
+  runScheduleNow,
   fetchSystemPrompts,
   listMcp,
   triggerCompact,
@@ -80,10 +90,18 @@ import {
   retrySubagentNow,
   gitDiscard,
   gitPush,
+  syncSkill,
   type CompactResult,
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
+import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills, runPluginScript } from "../lib/plugins";
+import { fillKeywordsAfterInstall, fillKeywordsFromToolResult } from "../lib/keywordFill";
+import type { PluginInfo } from "../types";
+import { looksLikeRepoAddress } from "../lib/repoAddress";
+import { forgetPluginCommands } from "../lib/skills";
+import { listArtifacts, deleteArtifact, getArtifact, type ArtifactSummary } from "../lib/artifacts";
+import { artifactContext, connectorContext } from "../lib/cmdContext";
 import { playAlarm } from "../lib/alarm";
 import { isBrowserTool } from "../lib/mcpTools";
 
@@ -92,6 +110,8 @@ import {
   THINKING_OPTIONS,
   THINKING_LABELS,
   THINKING_DESCS,
+  levelFromSource,
+  thinkingOptionsFor,
 } from "../lib/thinking-options";
 import { isWireHistoryMessage, projectHistoryMessage } from "../lib/historyPayload";
 import { applyHistoryLimit } from "../lib/historyWindow";
@@ -105,11 +125,12 @@ import {
   recordSkillUsage,
   getAvailableSkills,
   ensureAvailableSkills,
+  refreshAvailableSkills,
   invalidateAvailableSkills,
   setAvailableSkillsFetcher,
-  pluginSkillCommands,
+  pluginCommands,
   mentionCatalog,
-  type PluginSkillCommand,
+  type PluginCommand,
 } from "../lib/skills";
 import { detectDir, prepareContent } from "../lib/bidi";
 import {
@@ -179,14 +200,13 @@ import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
 import { isFileDrag } from "../lib/fileDrag";
 import { useViewerTabs } from "../lib/viewerTabs";
-import { listPlugins, togglePlugin } from "../lib/plugins";
 
 // Sentinels the plan-approval card sends as the ask answer — must match
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
 import { LocalLiveSession, sanitizeLocalTranscript } from "../lib/localLive";
-import { blobToWav16k, buildSttPrompt, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
+import { blobToWav16k, buildSttPrompt, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
 import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
 import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
 import { buildLiveSpeakSuffix } from "../lib/livePrompt";
@@ -209,27 +229,45 @@ const COMMANDS: Array<{ name: string; hint: string }> = [
   { name: "undo", hint: "Undo the last exchange (stops a running turn first)" },
   { name: "redo", hint: "Redo the last undone exchange" },
   {
-    name: "create-skill",
-    hint: "Create or edit a skill (describe what you want after the command)",
+    name: "skill",
+    hint: "Create, edit, install or delete a skill — type a sub-command (e.g. /skill update <name>)",
   },
   {
-    name: "create-mcp",
-    hint: "Create an MCP connector (describe what you want after the command)",
+    name: "mcp",
+    hint: "Create, edit or delete an MCP connector — type a sub-command (e.g. /mcp list)",
   },
   {
     name: "plugin",
-    hint: "Create, edit, toggle or delete a plugin — skills + connectors as one bundle (e.g. /plugin list)",
+    hint: "Create, install, edit, toggle or delete a plugin — skills + connectors as one bundle (e.g. /plugin install <repo>)",
   },
   {
     name: "artifact",
-    hint: "Build an artifact — a previewable HTML/Markdown document (describe what you want after the command)",
+    hint: "Build or manage an artifact — a previewable HTML/Markdown document (e.g. /artifact create <description>)",
   },
   {
     name: "schedule",
-    hint: "Create, edit, pause or delete a scheduled task (describe it after the command)",
+    hint: "Create, edit, run or delete a scheduled task (e.g. /schedule create every day at 9am …)",
   },
   { name: "goal", hint: "Set a persistent goal (e.g. /goal all tests pass); /goal clear clears it" },
 ];
+
+/** The argument a sub-command's token expects, and where it lives in the line. */
+type CmdArg = "name" | "repo" | "free";
+
+/**
+ * Permissions the Computer Use card has to report, plus the signing identity
+ * macOS keyed them to. `identity` is null off macOS, where there is no TCC.
+ */
+type PermInfo = {
+  screen: boolean;
+  accessibility: boolean;
+  identity: { id: string; name: string; path: string; adhoc: boolean } | null;
+};
+
+/** How long the named values behind the third level are reused before a refetch.
+ *  Short enough that a plugin just installed appears, long enough that opening
+ *  the palette costs no request. */
+const ARG_VALUE_TTL_MS = 15_000;
 
 /** True when a message asks to create/edit/install/import skills or MCP connectors,
  *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
@@ -428,6 +466,14 @@ function CompactBanner({ progress }: { progress: ChatCompactProgress | null }) {
     const iv = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(iv);
   }, []);
+  // The provider the running model is routed to, as the user knows it: the row
+  // they configured. The backend reports the provider ID because its wire KIND
+  // ("custom") names nothing the user would recognise.
+  const providerName = useStore((s) => {
+    const pid = progress?.providerId;
+    if (!pid) return "";
+    return s.settings.providers.find((p) => p.id === pid)?.name || pid;
+  });
 
   if (!progress) {
     return (
@@ -492,7 +538,12 @@ function CompactBanner({ progress }: { progress: ChatCompactProgress | null }) {
           {overBudget
             ? "Taking longer than the summary budget — will stop on its own."
             : "Older messages are being summarized…"}
-          {progress.model ? <span className="notice-compact-model">{progress.model}</span> : null}
+          {progress.model ? (
+            <span className="notice-compact-model">
+              {providerName ? `${providerName}/` : ""}
+              {progress.model}
+            </span>
+          ) : null}
         </span>
       </span>
     </div>
@@ -543,6 +594,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     );
   });
   const activeModel = chat?.model ?? provider.model;
+  // Thinking levels the ACTIVE model really supports, straight from its
+  // provider's payload (`null` = no source described it). The composer offers
+  // exactly these — never a level the model cannot be asked for.
+  const activeThinkingLevels = provider
+    ? modelThinkingLevels(provider, activeModel)
+    : null;
   const allProviders = useStore((s) => s.settings.providers);
 
   // Live provider balance (OpenRouter). STRICTLY click-to-refresh — NO
@@ -865,10 +922,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [cmdOpen, setCmdOpen] = useState<{ at: number } | null>(null);
   const [cmdQuery, setCmdQuery] = useState("");
   const [cmdIndex, setCmdIndex] = useState(0);
-  // One `/`-command per skill an ENABLED plugin ships. Seeded from the module
-  // cache so a remount (chat switch) keeps the commands without a refetch.
-  const [skillCmds, setSkillCmds] = useState<PluginSkillCommand[]>(() =>
-    pluginSkillCommands(getAvailableSkills()),
+  // Which LEVEL of the slash line the palette is completing (0 = the command,
+  // 1 = its sub-command, 2+ = a value) plus the caret's own word. The palette
+  // used to close as soon as a space arrived, so `/plugin ` could never offer
+  // `list|install|update` the way nvim offers its sub-commands.
+  const [cmdCaret, setCmdCaret] = useState<SlashCaret | null>(null);
+  // Named values the third level offers (plugin names, skills, connectors,
+  // documents, tasks, and the repos plugins were installed from).
+  const [cmdArgValues, setCmdArgValues] = useState<Record<string, string[]>>({});
+  const cmdArgFetchedAt = useRef(0);
+  // One `/`-command per ENABLED PLUGIN (the bundle's slug), with its skills as
+  // the sub-command level. Seeded from the module cache so a remount (chat
+  // switch) keeps the commands without a refetch.
+  const [pluginCmds, setPluginCmds] = useState<PluginCommand[]>(() =>
+    pluginCommands(getAvailableSkills()),
   );
   // Prompt history popup (ArrowUp): previous prompts + up to 3 pinned
   // commands. History/pins persist in localStorage (see src/lib/slash).
@@ -998,7 +1065,127 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // enabled plugin ships. Plugin skills are the only ones that earn a command:
   // the standalone store is what `@mention` already covers, and a bundle that
   // advertises "try /<skill>" must not answer "Unknown command".
-  const commands = useMemo(() => [...COMMANDS, ...skillCmds], [skillCmds]);
+  // Bundles are the commands: the popup lists plugins, not the skills inside
+  // them — a 26-skill library would otherwise bury every real command.
+  const commands = useMemo(
+    () => [
+      ...COMMANDS,
+      ...pluginCmds.map((p) => ({
+        name: p.name,
+        hint: p.skills.length === 1 ? '1 skill' : `${p.skills.length} skills`,
+        plugin: p,
+      })),
+    ],
+    [pluginCmds],
+  );
+
+  /** One selectable row of the palette, whatever level it belongs to. */
+  type PaletteRow = { key: string; label: string; hint: string; insert: string };
+
+  /** Fetch the named values a value-level menu can offer. Each list that fails
+   *  stays empty instead of breaking the palette, and the TTL keeps a cached set
+   *  from turning a keypress into a request. */
+  const ensureCmdArgValues = useCallback(async () => {
+    if (Date.now() - cmdArgFetchedAt.current < ARG_VALUE_TTL_MS) return;
+    cmdArgFetchedAt.current = Date.now();
+    const next: Record<string, string[]> = {};
+    const plugins = await listPlugins();
+    if (!Array.isArray(plugins)) {
+      // A failed list must not empty a menu that already had values.
+      cmdArgFetchedAt.current = 0;
+      return;
+    }
+    next.plugin = plugins.map((p) => p.slug);
+    // The repo a bundle came from is the only install history the app keeps.
+    next.repo = Array.from(
+      new Set(plugins.map((p) => p.source).filter((s): s is string => !!s)),
+    );
+    const skills = await listAvailableSkills();
+    next.skill = Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)));
+    const connectors = await listMcp();
+    next.mcp = Object.keys(connectors.mcpServers ?? {});
+    // Documents and tasks belong to ONE chat, so they are read from the active
+    // chat id the same way their own panels do.
+    const artifacts = await listArtifacts(activeChatId || undefined);
+    next.artifact = Array.isArray(artifacts) ? artifacts.map((a) => a.id) : [];
+    const tasks = await listSchedules();
+    next.schedule = Array.isArray(tasks) ? tasks.map((t) => t.id) : [];
+    setCmdArgValues(next);
+  }, [activeChatId]);
+
+  /** The rows the palette shows: the level the caret is on, filtered by its
+   *  own word. Level 3+ completes the value the chosen sub-command expects —
+   *  `install` takes three tokens in a row (repo, sub-folder, branch), which is
+   *  exactly the `repo`/`repo_path`/`repo_ref` trio the backend reads. */
+  const paletteRows: PaletteRow[] = useMemo(() => {
+    if (!cmdOpen) return [];
+    const caret = cmdCaret;
+    const q = cmdQuery.toLowerCase();
+    if (!caret || caret.index === 0) {
+      // Ranked by name so a typo or an abbreviation still finds its command
+      // (`/plu`, `/plugni`). The long prose hints only fill in when no NAME
+      // matched — otherwise a word inside a hint (`skills` in the plugin hint)
+      // surfaces a command unrelated to what was typed.
+      const byName = rankMatches(commands, q, (c) => c.name);
+      const matched =
+        !q || byName.length > 0
+          ? byName
+          : commands.filter((c) => c.hint.toLowerCase().includes(q));
+      // Bottom-anchored like the recent-prompt popup: oldest on top, newest
+      // just above the bottom (closest to the input).
+      return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name).map((c) => ({
+        key: `cmd:${c.name}`,
+        label: `/${c.name}`,
+        hint: c.hint,
+        insert: `/${c.name}`,
+      }));
+    }
+    const verb = caret.prev[0] ?? "";
+    if (caret.index === 1) {
+      // A bundle's second level is its OWN skills: the first level spends one
+      // row on the plugin (however many skills it carries), and the skill is
+      // picked here. `/<plugin> <skill>` is then how one skill is attached.
+      const plug = pluginCmds.find((p) => p.name === verb);
+      if (plug) {
+        const ranked = rankMatches(plug.skills, caret.word, (s) => s.word);
+        return ranked.map((s) => ({
+          key: `plu:${plug.name}:${s.word}`,
+          label: s.word,
+          hint: s.hint,
+          insert: s.word,
+        }));
+      }
+      // Ranked by NAME, not filtered by name-or-hint: a hint-only hit ("List
+      // installed bundles" also contains "ins") must not outrank the real
+      // prefix match, or typing `ins` highlights the wrong row. Hints only fill
+      // in when no name matched at all.
+      const all = SUBCOMMANDS[verb] ?? [];
+      const ranked = rankMatches(all, caret.word, (s) => s.name);
+      const subs =
+        !q || ranked.length > 0
+          ? ranked
+          : all.filter((x) => x.hint.toLowerCase().includes(q));
+      return subs.map((s) => ({
+        key: `sub:${verb}:${s.name}`,
+        label: s.name,
+        hint: s.hint,
+        insert: s.name,
+      }));
+    }
+    const sub = (SUBCOMMANDS[verb] ?? []).find((s) => s.name === (caret.prev[1] ?? ""));
+    if (!sub) return [];
+    const kind: CmdArg | undefined = caret.index === 2 ? sub.arg : sub.rest;
+    if (!kind || kind === "free") return [];
+    const values = (kind === "repo" ? cmdArgValues.repo : cmdArgValues[verb]) ?? [];
+    // `rankMatches` already drops what does not match, so a plain `includes`
+    // pre-filter here would throw a typo away before the fuzzy metric saw it.
+    return rankMatches(values, caret.word, (v) => v).map((v) => ({
+      key: `val:${kind}:${v}`,
+      label: v,
+      hint: kind === "repo" ? "repo" : verb,
+      insert: v,
+    }));
+  }, [cmdOpen, cmdCaret, cmdQuery, commandUsage, commands, cmdArgValues, pluginCmds]);
   const slashParsed = parseSlashInput(input);
   const slashActive =
     !!slashParsed?.name && commands.some((c) => c.name === slashParsed.name);
@@ -1253,28 +1440,83 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
-  const mcpEnabled = useStore((s) => s.settings.mcpEnabled ?? []);
-  const setMcpEnabled = useStore((s) => s.setMcpEnabled);
+  // A connector has no switch of its own any more: it belongs to a plugin
+  // bundle, and THAT switch is what takes it away from the agent. So the popup
+  // lists bundles, not connectors, and remembers their enabled state here.
+  const [pickerPlugins, setPickerPlugins] = useState<PluginInfo[]>([]);
+  const [skillsVersion, setSkillsVersion] = useState(0);
   const computerUse = useStore((s) => s.computerUse);
   const setComputerUse = useStore((s) => s.setComputerUse);
+  // macOS hands back a wallpaper instead of the desktop when Screen Recording
+  // is not granted, and no click lands without Accessibility — both fail
+  // SILENTLY, so the state is fetched and shown on the Computer Use card
+  // instead of letting the agent report an empty desktop. Refreshed whenever
+  // the plugin popup opens, and again on window focus: the user leaves for
+  // System Settings, flips the switch and comes back, which is exactly a focus
+  // event — re-reading there picks the new grant up without a restart.
+  const [perm, setPerm] = useState<PermInfo | null>(null);
+  const [grantBusy, setGrantBusy] = useState(false);
+  const refreshPerm = useCallback(() => {
+    let live = true;
+    void api
+      .computerPermissions()
+      .then((p) => {
+        if (live) setPerm(p);
+      })
+      .catch(() => {
+        // An older bridge without the command: stay quiet rather than warn
+        // about a permission we could not actually read.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!skillOpen) return;
+    const drop = refreshPerm();
+    window.addEventListener("focus", refreshPerm);
+    return () => {
+      drop();
+      window.removeEventListener("focus", refreshPerm);
+    };
+  }, [skillOpen, refreshPerm]);
+  // Raise macOS's own prompt (the only path that puts the app in the System
+  // Settings list) and re-read right after: a grant that was already live takes
+  // effect at once, so the warning clears without the user doing anything else.
+  const grantScreenRecording = () => {
+    setGrantBusy(true);
+    void api
+      .requestScreenRecording()
+      .then(() => refreshPerm())
+      .catch(() => undefined)
+      .finally(() => setGrantBusy(false));
+  };
   const browserUse = useStore((s) => s.browserUse);
   const setBrowserUse = useStore((s) => s.setBrowserUse);
   const skillQ = skillQuery.trim().toLowerCase();
-  // The composer's connector grid = the two built-in cards (Computer Use, and
-  // the agent's Browser) plus every user MCP connector. All three are the same
-  // hard on/off switch: OFF means the matching tool is never bound, so the agent
-  // cannot launch Chromium or control the desktop behind the user's back.
+  // The composer's tool grid = the two built-in cards (Computer Use, and the
+  // agent's Browser) plus every installed plugin. The built-ins are a hard
+  // on/off switch: OFF means the matching tool is never bound, so the agent
+  // cannot launch Chromium or control the desktop behind the user's back. A
+  // plugin's own switch does the same for the whole bundle — its skills and its
+  // connectors together — which is why a disabled bundle contributes nothing.
   const mcpCards: Array<{
     name: string;
     label: string;
-    kind: "computer" | "browser" | "mcp";
+    kind: "computer" | "browser" | "plugin";
+    enabled: boolean;
+    hint?: string;
   }> = [
-    { name: "computer", label: "Computer Use", kind: "computer" },
-    { name: "browser", label: "Browser", kind: "browser" },
-    ...Object.keys(mcpConnectors).map((name) => ({
-      name,
-      label: name,
-      kind: "mcp" as const,
+    { name: "computer", label: "Computer Use", kind: "computer", enabled: computerUse },
+    { name: "browser", label: "Browser", kind: "browser", enabled: browserUse },
+    ...pickerPlugins.map((p) => ({
+      name: p.slug,
+      // The census is the point of showing a bundle here: it says what turning
+      // this switch off would actually take away.
+      label: `${p.name}  ·  ${(p.skills ?? []).length} skills · ${(p.mcp ?? []).length} connectors`,
+      kind: "plugin" as const,
+      enabled: p.enabled,
+      hint: p.description || undefined,
     })),
   ];
   const filteredMcpCards = mcpCards.filter(
@@ -1410,6 +1652,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const CHAT_ERROR_MAX_RETRIES = 10;
   const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
   const autoRetryMapRef = useRef<Map<string, AutoRetryScheduler>>(new Map());
+  // Auto error-retries THIS chat has already spent. Kept in a per-chat ref and
+  // NOT on the message: the resend goes through `send()`, which clears `retry`
+  // on the continuation bubble, and the static banner written just before the
+  // read reports `attempt: 1` anyway — so the message-level count re-derived to
+  // 1 on every cycle and the ladder re-armed at "2/10" forever while the turn
+  // restarted every 10s and never reached its cap.
+  const autoRetryCountRef = useRef<Map<string, number>>(new Map());
   const autoRetryFor = (chatId: string): AutoRetryScheduler => {
     let sched = autoRetryMapRef.current.get(chatId);
     if (!sched) {
@@ -1418,6 +1667,34 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     return sched;
   };
+  // Release per-chat bookkeeping once a chat is gone.
+  //
+  // Every map above is keyed by chat id and nothing ever removed an entry: each
+  // chat the session ever touched left an AbortController, stop flags, an
+  // auto-retry scheduler (holding a live timer handle) and message
+  // fingerprints behind, forever. Subscribing to the joined id LIST (not the
+  // chat array) means this only re-runs when a chat is added or removed, never
+  // per streamed token.
+  const chatIdKey = useStore((s) => s.chats.map((c) => c.id).join("\u0000"));
+  useEffect(() => {
+    const live = new Set(chatIdKey ? chatIdKey.split("\u0000") : []);
+    const prune = <T,>(m: Map<string, T>) => {
+      for (const k of Array.from(m.keys())) if (!live.has(k)) m.delete(k);
+    };
+    // A deleted chat can never retry: clear the pending timer before dropping
+    // the scheduler, or it would still fire against a chat that no longer exists.
+    for (const [k, sched] of Array.from(autoRetryMapRef.current.entries())) {
+      if (!live.has(k)) sched.stop();
+    }
+    prune(abortMapRef.current);
+    prune(stoppedMapRef.current);
+    prune(autoRetryMapRef.current);
+    prune(autoRetryCountRef.current);
+    prune(goalAutoRef.current);
+    prune(lastSeenFpRef.current);
+    for (const k of Array.from(goalInitRef.current)) if (!live.has(k)) goalInitRef.current.delete(k);
+    for (const k of Array.from(goalSendingRef.current)) if (!live.has(k)) goalSendingRef.current.delete(k);
+  }, [chatIdKey]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Reply-to-selection: floating reply button over selected transcript text.
   // activeQuote is the pinned quote shown above the composer until sent.
@@ -2458,16 +2735,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id, chat?.mode, wroot]);
 
-  const filteredCmds = useMemo(() => {
-    if (!cmdOpen) return [];
-    const q = cmdQuery.toLowerCase();
-    const matched = commands.filter(
-      (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
-    );
-    // Bottom-anchored like the recent-prompt popup: oldest on top, newest
-    // just above the bottom (closest to the input). Shows all matches.
-    return bottomAnchoredByUsage(matched, commandUsage, (c) => c.name);
-  }, [cmdOpen, cmdQuery, commandUsage, commands]);
+  // The rows the keydown handler navigates. A small alias so the popup, the
+  // index clamping and `acceptCmd` all read the SAME list.
+  const filteredCmds = paletteRows;
+
+  // The highlighted row, clamped: the index is seeded from the COMMAND list, so
+  // at a shorter level (a sub-command or value list) it can point past the end.
+  // Reading it raw threw "cannot read properties of undefined" on Tab.
+  const cmdSel = Math.min(cmdIndex, Math.max(0, filteredCmds.length - 1));
 
   // Always a number: `modelContextWindow` applies the capacity rule
   // (models.dev → provider metadata → DEFAULT_CONTEXT_WINDOW), so the meter and
@@ -3237,9 +3512,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       const row = skillsList.find((s) => s.name === name || s.slug === name);
       if (row) skillsChars += row.content.length;
     }
+    // A connector has no switch of its own any more: it belongs to a bundle, so
+    // the cost of one is counted only while its bundle is switched ON.
     const mcpCfg = settings.mcpServers ?? {};
     let mcpChars = 0;
-    for (const name of mcpEnabled) {
+    for (const name of Object.keys(mcpCfg)) {
       const cfg = mcpCfg[name];
       if (cfg) mcpChars += JSON.stringify(cfg).length;
     }
@@ -3256,7 +3533,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     usable,
     input,
     skillsList,
-    mcpEnabled,
     settings.mcpServers,
     historyLimit,
   ]);
@@ -3358,7 +3634,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // path guarded against this. A controller that is already aborted belongs to
     // a dead turn (Stop / watchdog), so it never blocks the retry.
     const inFlight = abortMapRef.current.get(chatId);
-    if (inFlight && !inFlight.signal.aborted) return;
+    if (inFlight && !inFlight.signal.aborted) {
+      // Single-flight must never DROP a spoken turn silently. The live pipeline
+      // aborts the previous turn and can arrive before that turn's `finally`
+      // released the slot, which used to make the utterance vanish with no
+      // message and no error. Wait for the release, then report a real failure
+      // instead of returning mute. Automatic drains keep the old behaviour:
+      // returning lets their own scheduler retry.
+      const liveSend = Boolean(overrides?.liveSuffix);
+      if (liveSend) {
+        const slotPollMs = 150;
+        const slotWaitTicks = 20;
+        for (let i = 0; i < slotWaitTicks && !inFlight.signal.aborted; i++) {
+          await new Promise((r) => setTimeout(r, slotPollMs));
+        }
+        if (!inFlight.signal.aborted) {
+          useStore
+            .getState()
+            .setChatLiveError(
+              chatId,
+              "Could not start the turn: the previous response is still shutting down. Please try again.",
+            );
+        }
+      }
+      if (!inFlight.signal.aborted) return;
+    }
     // Persistent goal: when active and not paused, the condition rides along
     // with every model prompt (the visible bubble stays clean). `stopped`
     // does NOT detach the goal — a manual send after Stop still pursues it.
@@ -3387,6 +3687,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Fresh turn: invalidate any retry armed by the previous turn and allow
     // auto-retry again (an explicit Stop bumps the epoch via stop() below).
     autoRetryFor(chatId).beginTurn();
+    // A genuine new turn — not a continuation of a failed one — starts the
+    // automatic error-retry ladder over from its first attempt.
+    if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0);
     // Per-turn local state (was shared refs — now locals so concurrent chats
     // don't race). stop() coordinates via stoppedMapRef + chatAborts store.
     let mcpChanged = false;
@@ -3867,6 +4170,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               delay: 0,
               reason:
                 "Connection stalled — the model is taking a while; auto-retrying…",
+              model: activeProvider.model,
+              providerId: activeProvider.id,
               reconnecting: true,
             },
           });
@@ -4189,6 +4494,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           delay: event.delay ?? 0,
           reason: event.reason ?? "",
           model: event.model ?? "",
+          providerId: event.provider_id ?? "",
           agent: event.agent ?? "",
           tool: event.tool ?? "",
           fallback: event.fallback,
@@ -4236,6 +4542,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             reason: event.reason ?? "",
             gaveUp: true,
             model: event.model ?? "",
+            providerId: event.provider_id ?? "",
             agent: event.agent ?? "",
             tool: event.tool ?? "",
             fallback: event.fallback,
@@ -4284,6 +4591,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           invalidateAvailableSkills();
           void ensureSkills();
           void refreshPluginCmds();
+        }
+        // A bundle the AGENT wrote (action=create/update/install) is filled from
+        // here, because `/plugin create` hands the job to the model: that write is
+        // only a tool result in the stream, so no other path ever sees it. The
+        // call is fire-and-forget — the write already succeeded, and the model was
+        // told about any bare skills by the tool's own WARNING line.
+        if (event.tool === "plugin") {
+          const action = String((event.args as { action?: unknown } | undefined)?.action ?? "");
+          void fillKeywordsFromToolResult(action, event.result).then((fill) => {
+            if (fill && fill.filled > 0) {
+              invalidateSkillsList();
+              window.dispatchEvent(new CustomEvent("coder:plugins-changed"));
+            }
+          }).catch(() => { });
         }
       } else if (event.kind === "diff") {
         clearTransientRetry();
@@ -4347,6 +4668,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           attempt: event.attempt ?? 0,
           attempts: event.attempts ?? 0,
           model: event.model ?? "",
+          providerId: event.provider_id ?? "",
           percent: event.percent ?? 0,
           budgetSecs: event.budget_secs ?? 0,
           elapsedSecs: event.elapsed_secs ?? 0,
@@ -4557,6 +4879,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             delay: 0,
             reason: event.content ?? "The backend returned an error.",
             gaveUp: true,
+            model: activeProvider.model,
+            providerId: activeProvider.id,
           },
         });
         // Fold the completed tool calls into content too — the backend fatal
@@ -4572,15 +4896,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const liveChat = useStore.getState().chats.find((c) => c.id === chat.id);
         const liveMsgs = liveChat?.messages ?? [];
         const lastUserMsg = [...liveMsgs].reverse().find((m) => m.role === "user");
-        const seenAttempts =
-          liveMsgs.find((m) => m.id === assistantMsg.id)?.retry?.attempt ?? 1;
-        if (lastUserMsg && seenAttempts < CHAT_ERROR_MAX_RETRIES) {
+        // Count from the per-chat REF, never from the message: the resend clears
+        // `retry` on the continuation bubble and the static give-up banner
+        // written just above reports `attempt: 1`, so a message-derived count
+        // always re-read 1 and the ladder re-armed at "2/10" on every cycle —
+        // the turn restarted every 10s forever and never reached its cap.
+        const spent = autoRetryCountRef.current.get(chat.id) ?? 1;
+        if (lastUserMsg && spent < CHAT_ERROR_MAX_RETRIES) {
+          autoRetryCountRef.current.set(chat.id, spent + 1);
           useStore.getState().updateMessage(assistantMsg.id, {
             retry: {
-              attempt: seenAttempts + 1,
+              attempt: spent + 1,
               maxAttempts: CHAT_ERROR_MAX_RETRIES,
               delay: CHAT_ERROR_RETRY_DELAY_MS / 1000,
               reason: event.content ?? "The backend returned an error.",
+              model: activeProvider.model,
+              providerId: activeProvider.id,
               reconnecting: true,
             },
           });
@@ -4728,6 +5059,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // message badge / context meter (that made the meter bounce between
         // the parent's large request and each small sub-agent request). It
         // still accrues into the chat-wide session totals above.
+        //
+        // Ground truth about reasoning, learned from the response itself (see
+        // `observedReasoningMap`): reasoning content arrived, so this
+        // provider+model really reasons. NVIDIA NIM and most custom gateways
+        // describe no capability in their `/models` payload at all, so this is
+        // the only evidence that exists — and it is proof, not a name-based
+        // guess. The RAW wire id is used: a gateway's id can itself be
+        // vendor-namespaced ("nvidia/nemotron-…"), so it must not be
+        // normalized the way the usage ledger's display id is.
+        if ((event.reasoning_chars ?? 0) > 0) {
+          store.learnModelReasoning(providerId, (event.model || "").trim())
+        }
         if (!event.sub) {
           store.updateMessage(assistantMsg.id, {
             usage: {
@@ -4844,13 +5187,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // own custom prompt is untouched and typed turns send nothing at all
           // (their request stays byte-identical to before).
           systemSuffix: overrides?.liveSuffix ?? "",
-          thinkingLevel: supportsReasoning(
-            activeProvider.model,
-            activeProvider.kind,
-            modelReasoning(activeProvider, activeProvider.model),
-          )
-            ? originThinking
-            : "",
+          // Only a level a source enumerated for this model may be sent: a chat
+          // keeps its level across model switches, and a level nobody described
+          // is what the gateway answered with 400.
+          thinkingLevel: levelFromSource(
+            modelThinkingLevels(activeProvider, activeProvider.model),
+            supportsReasoning(
+              activeProvider.model,
+              activeProvider.kind,
+              modelReasoning(activeProvider, activeProvider.model),
+            )
+              ? originThinking
+              : "",
+          ),
           modelReasoning:
             modelReasoning(activeProvider, activeProvider.model) ??
             supportsReasoning(
@@ -4905,6 +5254,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               "The connection went silent for too long and was closed automatically — the backend may have crashed or lost connectivity. Tap Retry to try again.",
             gaveUp: true,
             watchdog: true,
+            model: activeProvider.model,
+            providerId: activeProvider.id,
           },
         });
         preserveToolActivity();
@@ -5157,26 +5508,39 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
     // Route the primary summarizer through the user's configured Tools →
     // "Other" model GROUP (compact / web / title share one settings row), when
-    // set, else the active provider. The active provider is always the
-    // fallback — the backend retries the compact subagent on it, mirroring
-    // opencode's subagent -> main-model fallback. Reading only the `compact`
-    // key left the row's model unused whenever the pick had been stored under
-    // `web`/`title`, so the summariser silently ran on the main model.
+    // set, else the active provider. A tool falls back only to the models the
+    // user picked for it, so the chat's own fallback is NOT sent. Reading only
+    // the `compact` key left the row's model unused whenever the pick had been
+    // stored under `web`/`title`, so the summariser silently ran on the main
+    // model.
     const activeProvider = getChatProvider(ch.id);
     const compactEntry = otherSlotModel(s.subagentModels);
     let compactProvider = activeProvider;
     if (compactEntry) {
+      // A slash is a provider prefix ONLY when its head names a configured
+      // provider: "oc/deepseek-v4.1-flash-free" is a MODEL id, not `oc` plus a
+      // model. Slicing at the first slash sent the remainder to the wrong
+      // provider (the 404 "page not found" the user saw).
       const slash = compactEntry.indexOf("/");
       const prefix = slash > 0 ? compactEntry.slice(0, slash) : "";
       const modelName =
         slash > 0 ? compactEntry.slice(slash + 1) : compactEntry;
       const explicitProvider = prefix
-        ? s.settings.providers.find((p) => p.id === prefix || p.kind === prefix)
+        ? s.settings.providers.find((p) => p.id === prefix)
         : undefined;
-      compactProvider = {
-        ...(explicitProvider ?? compactProvider),
-        model: modelName,
-      };
+      if (explicitProvider) {
+        compactProvider = { ...explicitProvider, model: modelName };
+      } else {
+        // No known prefix: the whole entry is the model id, and the provider
+        // that LISTS it is the one that serves it.
+        const owners = s.settings.providers.filter((p) =>
+          (p.models ?? []).includes(compactEntry),
+        );
+        compactProvider = {
+          ...(owners.length === 1 ? owners[0] : compactProvider),
+          model: compactEntry,
+        };
+      }
     }
 
     // Call the backend's opencode-style compaction (structured summary,
@@ -5195,6 +5559,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       attempt: 0,
       attempts: 0,
       model: compactProvider.model,
+      providerId: compactProvider.id ?? "",
       percent: 0,
       budgetSecs: 0,
       elapsedSecs: 0,
@@ -5223,12 +5588,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // the chat. Sending the slot picks plus every provider config lets the
         // backend resolve that model with its own keys and base URL, instead of
         // calling it with the chat's — the cause of "key rejected (401)".
+        // The chat's own fallback pair is NOT sent: a tool falls back only to
+        // the models picked for it in Settings.
         subagentModels: s.subagentModels,
         providers: Object.fromEntries(
           (s.settings.providers ?? []).map((p) => [p.id, p]),
         ),
         toolFallbacks: toolFallbackEntries(s.toolFallbacks),
-        thinkingLevel: compactLevelSupported ? compactThinkingLevel : "",
+        thinkingLevel: levelFromSource(
+          modelThinkingLevels(compactProvider, compactProvider.model),
+          compactLevelSupported ? compactThinkingLevel : "",
+        ),
         modelReasoning:
           modelReasoning(compactProvider, compactProvider.model) ??
           compactLevelSupported,
@@ -5240,6 +5610,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             attempt: p.attempt,
             attempts: p.attempts,
             model: p.model,
+            providerId: p.providerId,
             percent: p.percent,
             budgetSecs: p.budgetSecs,
             elapsedSecs: p.elapsedSecs,
@@ -5321,6 +5692,320 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // continues). The messages-change effect below keeps the view pinned to
     // the bottom; do NOT yank the view up to the summary — that reads as the
     // chat "suddenly scrolling to top" after every compact.
+  };
+
+  /** Run a sub-command whose work is already implemented locally and report the
+   *  outcome. Returns true when it handled the command: list/install/remove/
+   *  toggle/run are pure state changes, so spending a whole model turn (and a
+   *  prompt of its own) on them was pure waste. Anything that AUTHORS content
+   *  (create/update from a description) returns false and falls to the model. */
+  const runCmdAction = async (word: string, sub: string, arg: string, rest: string) => {
+    const s = useStore.getState();
+    const ch = s.chats.find((c) => c.id === s.activeChatId);
+    const say = (content: string) => {
+      if (ch) s.addMessage(ch.id, { role: "assistant", content });
+      else setNotice(content);
+      return true;
+    };
+    const wantList = sub === "list";
+    const wantRemove = sub === "remove" || sub === "delete";
+    if (word === "/plugin") {
+      if (wantList) {
+        const out = await listPlugins();
+        if (!Array.isArray(out)) return say(`Could not list plugins: ${out.error}`);
+        return say(
+          out.length === 0
+            ? "No plugins installed yet — create one with `/plugin create <description>`."
+            : out
+                .map(
+                  (p) =>
+                    `- **${p.name}** (\`${p.slug}\`) — ${p.enabled ? "on" : "off"} · ${(p.skills ?? []).length} skills · ${(p.mcp ?? []).length} connectors`,
+                )
+                .join("\n"),
+        );
+      }
+      if (sub === "install" && arg) {
+        // A bare word is the NAME of a bundle the user wants made, not a repo to
+        // read: `install` would only fail with "cannot read a repo from …", which
+        // reads as a bug. Hand it to `create` instead of spending a turn on it.
+        if (!looksLikeRepoAddress(arg)) {
+          // Sending a prompt needs a chat to record it in. Without one there is
+          // nothing to fall back to either — and falling through would run the
+          // doomed install this guard exists to prevent, so report and stop.
+          if (!ch) {
+            return say(
+              `\`${arg}\` is a name, not a repo address. Open a chat and run ` +
+                `\`/plugin create ${rest || arg}\` to make it.`,
+            );
+          }
+          const created = s.addMessage(ch.id, {
+            role: "user",
+            content: prettySlashLabel(`/plugin create ${rest}`),
+            ...(ch.mode ? { mode: ch.mode } : {}),
+          });
+          void send(
+            `Create a plugin named "${arg}"${rest ? ` from this description: "${rest}"` : ""}. ` +
+              `Call the plugin tool with action=create and pass: "name": "${arg}", a one-line ` +
+              `"description", "fa_keywords" (the user's own Persian phrases, comma-separated), ` +
+              `its "skills" (each with name, content and its OWN fa_keywords), and any ` +
+              `"scripts" the description calls for. Scripts are Rust by default — omit ` +
+              `"language" unless the user asked for python, node or bash — and the content ` +
+              `must be a complete, compiling program that prints its result to stdout.`,
+            [],
+            [],
+            true,
+            created.id,
+            undefined,
+            false,
+            undefined,
+            ch.id,
+          );
+          return true;
+        }
+        // The words after the repo are the sub-folder and the ref — exactly the
+        // `repo`/`repo_path`/`repo_ref` trio the backend reads.
+        const [path, ref] = rest.split(/\s+/).filter(Boolean);
+        const out = await installPlugin({
+          repo: arg,
+          ...(path ? { repo_path: path } : {}),
+          ...(ref ? { repo_ref: ref } : {}),
+        });
+        if ("error" in out) return say(`Plugin install failed: ${out.error}`);
+        invalidateAvailableSkills();
+        cmdArgFetchedAt.current = 0;
+        await ensureCmdArgValues();
+        // A bundle whose skills ship keyword-free is unreachable from a Persian
+        // request, so the phrases are written now. It costs one model call and
+        // only happens when the repo (or its index) carried none — the install
+        // itself already stands, so a failure just amends what is reported.
+        const fill = await fillKeywordsAfterInstall(out.slug);
+        if (fill.filled > 0) {
+          invalidateAvailableSkills();
+          cmdArgFetchedAt.current = 0;
+          await ensureCmdArgValues();
+        }
+        return say(
+          `Plugin **${out.plugin?.name ?? out.slug}** ${out.installed}.\n` +
+            `Skills: ${(out.skills ?? []).join(", ") || "none"}\n` +
+            `Connectors: ${(out.mcp ?? []).join(", ") || "none"}\n` +
+            `Scripts: ${(out.scripts ?? []).join(", ") || "none"}` +
+            (fill.filled > 0
+              ? `\nPersian keywords filled for ${fill.filled} skill(s).`
+              : fill.error
+                ? `\nPersian keywords not filled: ${fill.error}`
+                : ""),
+        );
+      }
+      if (sub === "run" && arg) {
+        // `<slug> <script> [args…]`: running code already on disk costs no turn.
+        const [script, ...scriptArgs] = rest.split(/\s+/).filter(Boolean);
+        if (!script) return say("Usage: `/plugin run <plugin> <script> [args…]`.");
+        const out = await runPluginScript({ slug: arg, name: script, args: scriptArgs });
+        if ("error" in out) return say(`Plugin script failed: ${out.error}`);
+        return say(
+          `\`${out.plugin}/${out.script}\` (${out.language}) in \`${out.cwd}\`:\n\n` +
+            "```\n" +
+            out.output.trimEnd() +
+            "\n```",
+        );
+      }
+      if (sub === "update" && arg) {
+        if (!rest) return say("Usage: `/plugin update <slug> <change>`.");
+        if (!ch) return say(`Open a chat to edit plugin \`${arg}\`.`);
+        // Stated as an update OF a named bundle rather than as "a description":
+        // the generic prompt dropped the slug into the description text, so the
+        // model had to guess which bundle the words named. Listing first is what
+        // keeps the patch safe — `update` keeps every field the call omits.
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(`${word} ${sub} ${arg}`),
+          ...(ch.mode ? { mode: ch.mode } : {}),
+        });
+        void send(
+          `Edit the existing plugin "${arg}": ${rest}. Call the plugin tool with ` +
+            `action=list first to read that bundle's CURRENT manifest (description, ` +
+            `version, fa_keywords, skills, scripts, mcp), then action=update with the ` +
+            `SAME slug and send ONLY the fields that change — an omitted field keeps ` +
+            `its stored value, so never resend what you did not touch. To edit one ` +
+            `skill send that skill's name with its new content; to rename a skill or ` +
+            `script pass previous_name; to remove skills, connectors or scripts pass ` +
+            `deleted_skills / deleted_mcp / deleted_scripts. Scripts are Rust unless ` +
+            `"language" says otherwise, and their content must be a complete program ` +
+            `that prints its result to stdout.`,
+          [],
+          [],
+          true,
+          created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
+        );
+        return true;
+      }
+      if ((sub === "on" || sub === "off") && arg) {
+        const out = await togglePlugin(arg, sub === "on");
+        invalidateAvailableSkills();
+        return say(
+          "error" in out
+            ? `Plugin ${arg}: ${out.error}`
+            : `Plugin \`${out.slug}\` is now ${out.enabled ? "on" : "off"}.`,
+        );
+      }
+      if (wantRemove && arg) {
+        if (!window.confirm(`Delete plugin "${arg}"? Its skills and connectors go with it.`)) {
+          return true;
+        }
+        // The bundle's skills name the `/`-commands to forget, and they must be
+        // read BEFORE the delete — afterwards nothing is left to name them by.
+        const out = await deletePlugin(arg);
+        forgetPluginCommands(arg);
+        invalidateSkillsList();
+        invalidateAvailableSkills();
+        void refreshPluginCmds();
+        cmdArgFetchedAt.current = 0;
+        return say(
+          "error" in out ? `Plugin ${arg}: ${out.error}` : `Plugin \`${arg}\` deleted.`,
+        );
+      }
+      return false;
+    }
+    if (word === "/skill") {
+      if (wantList) {
+        const rows = await listAvailableSkills();
+        return say(
+          rows.length === 0
+            ? "No skills installed yet. Create one with `/skill create <description>`."
+            : rows
+                .map(
+                  (r) =>
+                    `- **${r.name}**${r.plugin ? ` (from ${r.plugin})` : ""} — ${r.description || "no description"}`,
+                )
+                .join("\n"),
+        );
+      }
+      if (wantRemove && arg) {
+        const res = await syncSkill({ name: arg, delete: true });
+        invalidateSkillsList();
+        invalidateAvailableSkills();
+        cmdArgFetchedAt.current = 0;
+        return say(
+          res.ok ? `Skill \`${arg}\` deleted.` : `Delete failed: ${res.note ?? "unknown error"}`,
+        );
+      }
+      // `install <repo>` still needs the model: only the tool can read a repo.
+      return false;
+    }
+    if (word === "/mcp") {
+      if (wantList) {
+        const rows = await listMcp();
+        const names = Object.keys(rows.mcpServers ?? {});
+        return say(
+          names.length === 0
+            ? "No MCP connectors yet. Add one with `/mcp create <description>`."
+            : names.map((n) => `- \`${n}\``).join("\n"),
+        );
+      }
+      return false;
+    }
+    if (word === "/artifact") {
+      if (wantList) {
+        const rows = await listArtifacts(ch?.id);
+        if (!Array.isArray(rows)) return say(`Could not list artifacts: ${rows.error}`);
+        return say(
+          rows.length === 0
+            ? "No artifacts in this chat yet. Build one with `/artifact create <description>`."
+            : rows
+                .map((r: ArtifactSummary) => `- **${r.title}** (\`${r.id}\`)`)
+                .join("\n"),
+        );
+      }
+      if (sub === "update" && arg && ch) {
+        if (!rest) return say("Usage: `/artifact update <id> <change>`.");
+        // The body is injected: the artifact tool has no read action and `read`
+        // cannot reach the app's data folder, so the model used to rebuild the
+        // document from memory and the edit silently lost the rest of it.
+        const doc = await getArtifact(ch.id, arg);
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(`${word} ${sub} ${arg}`),
+          ...(ch.mode ? { mode: ch.mode } : {}),
+        });
+        void send(
+          `Edit the existing artifact "${arg}": ${rest}.${artifactContext(doc)} ` +
+            `Use the artifact tool with action=update and this same id "${arg}".`,
+          [],
+          [],
+          true,
+          created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
+        );
+        return true;
+      }
+      if (wantRemove && arg && ch) {
+        const out = await deleteArtifact(ch.id, arg);
+        return say("error" in out ? `Delete failed: ${out.error}` : `Artifact \`${arg}\` deleted.`);
+      }
+      return false;
+    }
+    if (word === "/schedule") {
+      if (wantList) {
+        const rows = await listSchedules();
+        if (!Array.isArray(rows)) return say(`Could not list schedules: ${rows.error}`);
+        return say(
+          rows.length === 0
+            ? "No scheduled tasks yet. Create one with `/schedule create <description>`."
+            : rows
+                .map(
+                  (t) =>
+                    `- **${t.name}** (\`${t.id}\`) — ${t.enabled ? "on" : "paused"} · ${t.cron || "one-shot"}`,
+                )
+                .join("\n"),
+        );
+      }
+      if (sub === "update" && arg) {
+        if (!rest) return say("Usage: `/schedule update <id|name> <change>`.");
+        if (!ch) return say(`Open a chat to edit task \`${arg}\`.`);
+        // Listing first is what makes the patch safe: `update` keeps every
+        // field the call omits, so the model only has to send what changed —
+        // and it is also how a task given by NAME resolves to its file id.
+        const created = s.addMessage(ch.id, {
+          role: "user",
+          content: prettySlashLabel(`${word} ${sub} ${arg}`),
+          ...(ch.mode ? { mode: ch.mode } : {}),
+        });
+        void send(
+          `Edit the existing scheduled task "${arg}": ${rest}. Call the schedule tool ` +
+            `with action=list first to find that task — it is the id or the name the ` +
+            `user gave — and read its CURRENT prompt, cron, root, mode and attached ` +
+            `skills/mcp_servers/plugins. Then call action=update with the SAME id and ` +
+            `send only the fields that change (an omitted field keeps its stored ` +
+            `value). The cron is 5 fields in UTC, and an empty cron makes it run once.`,
+          [],
+          [],
+          true,
+          created.id,
+          undefined,
+          false,
+          undefined,
+          ch.id,
+        );
+        return true;
+      }
+      if (sub === "run" && arg) {
+        const out = await runScheduleNow(arg);
+        return say("error" in out ? `Run failed: ${out.error}` : `Task \`${arg}\` started.`);
+      }
+      if (wantRemove && arg) {
+        const out = await deleteSchedule(arg);
+        return say("error" in out ? `Delete failed: ${out.error}` : `Task \`${arg}\` deleted.`);
+      }
+      return false;
+    }
+    return false;
   };
 
   const handleCommand = async (v: string) => {
@@ -5416,7 +6101,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               .map((m) => `- **${m.label}** — ${m.description}`)
               .join("\n") +
             "\n\n**Commands**\n\n" +
-            commands.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n") +            "\n\n**Keyboard shortcuts**\n\n" +
+            commands
+              .map((c) => {
+                // Sub-commands come from the SAME table the palette offers, so
+                // the help text can never drift away from the menu.
+                const subs = SUBCOMMANDS[c.name];
+                const body = subs
+                  ? "\n" +
+                    subs
+                      .map(
+                        (x) =>
+                          `  - \`/${c.name} ${x.name}${x.arg === "free" ? "" : x.arg === "repo" ? " <repo> [path] [ref]" : " <name>"}\` — ${x.hint}`,
+                      )
+                      .join("\n")
+                  : "";
+                return `- \`/${c.name}\` — ${c.hint}${body}`;
+              })
+              .join("\n") +
+            "\n\n**Keyboard shortcuts**\n\n" +
             GLOBAL_SHORTCUTS.map((s) => `- ${formatGlobalShortcut(s)}`).join(
               "\n",
             ) +
@@ -5426,19 +6128,98 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               .join("\n"),
         });
         break;
-      case "/create-skill":
-      case "/create-mcp": {
+      case "/skill":
+      case "/mcp": {
         if (!ch) break;
-        const target =
-          word === "/create-skill" ? "skill" : "MCP connector";
+        const target = word === "/skill" ? "skill" : "MCP connector";
         const rest = v.slice(word.length).trim();
+        // An explicit sub-command either does its own work here (no turn spent)
+        // or names exactly WHAT the model should author.
+        if (rest) {
+          const [sub, ...tail] = rest.split(/\s+/);
+          const verb = sub.toLowerCase();
+          if (await runCmdAction(word, verb, tail[0] ?? "", tail.slice(1).join(" "))) break;
+          if (verb === "install" && tail.length > 0) {
+            const first = tail[0];
+            const path = tail[1] ?? "";
+            const ref = tail[2] ?? "";
+            // A bare word is a NAME, not a repo to read — the same distinction
+            // `/plugin install` makes. Sent as a repo it only produces "cannot
+            // read a repo from …", which reads as a bug when what the user wants
+            // is that skill/connector MADE, and it costs a whole turn to find
+            // out. So only an address-shaped argument takes the install prompt.
+            const address = looksLikeRepoAddress(first);
+            const cmd = target === "skill" ? "skill" : "mcp";
+            const what = tail.slice(1).join(" ");
+            const created = s.addMessage(ch.id, {
+              role: "user",
+              content: prettySlashLabel(address ? v : `/${cmd} create ${what || first}`),
+              ...(ch.mode ? { mode: ch.mode } : {}),
+            });
+            // Store the pretty label (no leading slash) as the visible bubble;
+            // the prompt below is what the model actually receives.
+            const prompt = address
+              ? target === "skill"
+                ? `Install a skill from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Call create_skill with "repo"${path ? `, "repo_path": "${path}"` : ""}${ref ? `, "repo_ref": "${ref}"` : ""} and let it read the SKILL.md itself instead of writing the instructions from memory.`
+                : `Install an MCP connector bundle from this repo: "${first}"${path ? `, sub-folder "${path}"` : ""}${ref ? `, ref "${ref}"` : ""}. Read its manifest and call create_mcp with the connector's own name plus its command/args (or url) so it is saved like any other connector.`
+              : target === "skill"
+                ? `Create a skill named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_skill with "name": "${first}", one short ENGLISH "description" saying WHEN to use it, "fa_keywords" (the user's own Persian phrases, comma-separated), and the instructions themselves as "content". Do not pass "repo" — there is no repository here, the skill is written from scratch.`
+                : `Create an MCP connector named "${first}"${what ? ` from this description: "${what}"` : ""}. Call create_mcp with that same "name" plus EITHER "command" (+ "args"/"env") for a stdio server OR "url" for an HTTP one, so it is saved like any other connector.`;
+            void send(
+              prompt,
+              [],
+              [],
+              true,
+              created.id,
+              undefined,
+              false,
+              undefined,
+              ch.id,
+            );
+            break;
+          }
+          if (verb === "update" && tail.length > 1) {
+            const name = tail[0];
+            const change = tail.slice(1).join(" ");
+            // The connector's CURRENT record is stated, not described:
+            // `create_mcp` REPLACES the whole config and no tool can read it
+            // back (`read` refuses any path outside the project root, and
+            // connectors live in the app's data folder), so "read its current
+            // config first" was unimplementable — env/args came back dropped.
+            // The skill branch needs no injection: `load_skill` is bound for
+            // this turn, and the prompt tells the model to use it.
+            const current =
+              target === "skill"
+                ? " Call load_skill first to read its current instructions."
+                : connectorContext(name, (await listMcp()).mcpServers ?? {});
+            const created = s.addMessage(ch.id, {
+              role: "user",
+              content: prettySlashLabel(v),
+              ...(ch.mode ? { mode: ch.mode } : {}),
+            });
+            void send(
+              target === "skill"
+                ? `Edit the existing skill "${name}": ${change}.${current} Write it back with create_skill using the SAME name so it is overwritten instead of duplicated, keeping BOTH frontmatter fields ("description" in English and "fa_keywords" as comma-separated Persian phrases).`
+                : `Edit the existing MCP connector "${name}": ${change}.${current} Call create_mcp with the SAME name to overwrite it in place (or previous_name when it must be renamed).`,
+              [],
+              [],
+              true,
+              created.id,
+              undefined,
+              false,
+              undefined,
+              ch.id,
+            );
+            break;
+          }
+        }
         if (!rest) {
           s.addMessage(ch.id, {
             role: "assistant",
             content:
-              word === "/create-skill"
-                ? `Usage: \`/create-skill <description>\` — describe the skill you want after the command, e.g. \`/create-skill summarize a project's git log into release notes\`.`
-                : `Usage: \`/create-mcp <description>\` — describe the tool/connector you want after the command, e.g. \`/create-mcp a way to search YouTube\`.`,
+              word === "/skill"
+                ? "Usage: `/skill list`, `/skill install <repo> [path] [ref]`, `/skill create <description>`, `/skill update <name> <change>`, `/skill remove <name>`."
+                : "Usage: `/mcp list`, `/mcp install <repo> [path] [ref]`, `/mcp create <description>`, `/mcp update <name> <change>`, `/mcp remove <name>`.",
           });
           return;
         }
@@ -5449,10 +6230,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           content: prettySlashLabel(v),
           ...(ch.mode ? { mode: ch.mode } : {}),
         });
+        // The description, not the raw tail: `rest` still began with the
+        // sub-command word (`/skill create ترجمه کن`), which reached the model
+        // inside a sentence that already said "Create a new skill …".
+        const body = slashBody(word, rest)
+        if (!body) {
+          s.addMessage(ch.id, {
+            role: "assistant",
+            content: `Usage: \`/${target === "skill" ? "skill" : "mcp"} create <description>\`.`,
+          });
+          break;
+        }
         void send(
           target === "skill"
-            ? `Create a new skill or edit an existing one from this description: "${rest}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
-            : `Create a new MCP connector or edit an existing one from this description: "${rest}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
+            ? `Create a new skill or edit an existing one from this description: "${body}". If it names or describes an existing skill, first call load_skill to read its current instructions, then call create_skill with the SAME name to overwrite it with the updated instructions. Otherwise use the create_skill tool to set it up with a good name/slug and the instructions. ALWAYS pass BOTH frontmatter fields, in ENGLISH and PERSIAN: "description" — ONE short line of English saying WHEN to use this skill — and "fa_keywords" — the user's own Persian phrases for when it applies (comma-separated, e.g. "ترجمه کن, translate this"). Without them the skill shows up with no description and cannot be found by a Persian request. When EDITING an existing skill, always send BOTH fields again (read them from the current skill with load_skill first) — omitting one keeps the old value but never leave them out on purpose. If the user gives a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), pass it as "repo" (with "repo_path" for a sub-folder and "repo_ref" for a branch) and let create_skill read the SKILL.md itself instead of writing the instructions from memory. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files outside creating/editing this skill.`
+            : `Create a new MCP connector or edit an existing one from this description: "${body}". Use the create_mcp tool, choosing a good name and command/URL/config that fits the description. To edit an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it. Ask me only for anything essential that is genuinely missing; otherwise just create or update it. Do not modify files for this.`,
           [],
           [],
           true,
@@ -5471,54 +6263,36 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const rest = v.slice(word.length).trim();
         const usage: Record<string, string> = {
           "/plugin":
-            "Usage: `\/plugin <description>` to create or edit a plugin bundle, `\/plugin list` to list them, or `\/plugin on|off <slug>` to toggle one.",
+            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin run <slug> <script> [args…]`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`. `install` reads an existing bundle from a repo; to make one, use `create`.",
           "/artifact":
-            "Usage: `\/artifact <description>` — describe the document you want (e.g. `\/artifact a sales dashboard`).",
+            "Usage: `\/artifact list`, `\/artifact create <description>`, `\/artifact update <id> <change>`, `\/artifact remove <id>`.",
           "/schedule":
-            "Usage: `\/schedule <description>` to create or edit a scheduled task (e.g. `\/schedule every day at 9am summarize open PRs`).",
+            "Usage: `\/schedule list`, `\/schedule create <description>`, `\/schedule update <id|name> <change>`, `\/schedule run <id>`, `\/schedule remove <id>`.",
         };
         if (!rest) {
           s.addMessage(ch.id, { role: "assistant", content: usage[word] });
           return;
         }
-        // Two actions of these commands are pure state and must not cost a
-        // turn: listing plugins and flipping one on/off.
-        if (word === "/plugin") {
-          const [sub, arg] = rest.split(/\s+/);
-          const slug = (arg ?? "").trim();
-          if (sub === "list") {
-            const out = await listPlugins();
-            if ("error" in out) {
-              s.addMessage(ch.id, {
-                role: "assistant",
-                content: `Could not list plugins: ${out.error}`,
-              });
-              break;
-            }
-            s.addMessage(ch.id, {
-              role: "assistant",
-              content:
-                out.length === 0
-                  ? "No plugins installed yet — create one with `/plugin <description>`."
-                  : out
-                      .map(
-                        (p) =>
-                          `- **${p.name}** (\`${p.slug}\`) — ${p.enabled ? "on" : "off"} · ${(p.skills ?? []).length} skills · ${(p.mcp ?? []).length} connectors`,
-                      )
-                      .join("\n"),
-            });
-            setNotice(`Loaded ${out.length} plugin${out.length === 1 ? "" : "s"}.`);
+        // A sub-command whose work is already implemented locally runs here and
+        // costs no turn; only authoring new content reaches the model.
+        {
+          const [sub, ...tail] = rest.split(/\s+/);
+          if (await runCmdAction(word, sub.toLowerCase(), tail[0] ?? "", tail.slice(1).join(" "))) {
             break;
           }
-          if ((sub === "on" || sub === "off") && slug) {
-            const out = await togglePlugin(slug, sub === "on");
-            setNotice(
-              "error" in out
-                ? `Plugin ${slug}: ${out.error}`
-                : `Plugin ${slug} is now ${out.enabled ? "on" : "off"}.`,
-            );
-            break;
-          }
+        }
+        // The description, not the raw tail: `rest` still began with the
+        // sub-command word (`/schedule create هر روز…`), which reached the model
+        // inside a sentence that already said "Create or edit a scheduled task …".
+        // Checked BEFORE the bubble is added, so a bare sub-command does not
+        // leave a stray user message behind.
+        const desc = slashBody(word, rest)
+        if (!desc) {
+          s.addMessage(ch.id, {
+            role: "assistant",
+            content: `${usage[word]} Give the description after the sub-command.`,
+          });
+          break;
         }
         const created = s.addMessage(ch.id, {
           role: "user",
@@ -5526,9 +6300,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           ...(ch.mode ? { mode: ch.mode } : {}),
         });
         const prompts: Record<string, string> = {
-          "/plugin": `Create or edit a plugin from this description: "${rest}". A plugin is a folder bundling skills AND MCP connectors so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass the skills (name + content + description + fa_keywords in English AND Persian) and/or the mcp map. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
-          "/artifact": `Build an artifact from this description: "${rest}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
-          "/schedule": `Create or edit a scheduled task from this description: "${rest}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode, and the skills/mcp_servers/plugins the run needs. To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
+          "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass "fa_keywords" (the Persian phrases the WHOLE bundle answers to, comma-separated) plus the skills (name + content + description + fa_keywords in English AND Persian), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
+          "/artifact": `Build an artifact from this description: "${desc}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
+          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode, and the skills/mcp_servers/plugins the run needs. To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
         };
         void send(
           prompts[word],
@@ -5587,28 +6361,39 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         break;
       }
       default: {
-        // A skill shipped by an enabled plugin is invocable as `/<slug>` — the
-        // bundle advertises exactly that. Attaching it through `overrides`
-        // inlines its body, so the turn runs the skill instead of answering
-        // "Unknown command".
-        const pluginCmd = skillCmds.find((c) => `/${c.name}` === word);
-        if (pluginCmd && ch) {
+        // `/<plugin>` alone names what the bundle holds; `/<plugin> <skill>`
+        // attaches that one skill through `overrides`, so the turn runs it
+        // instead of answering "Unknown command".
+        const plug = pluginCmds.find((c) => `/${c.name}` === word);
+        if (plug && ch) {
           const rest = v.slice(word.length).trim();
+          const [head = '', ...tail] = rest.split(/\s+/);
+          const picked = plug.skills.find((s) => s.word === head.toLowerCase());
+          if (!picked) {
+            // `/<plugin>` alone is a question, not a turn: answer with what the
+            // bundle holds so the second level is discoverable.
+            s.addMessage(ch.id, {
+              role: 'assistant',
+              content:
+                `**${plug.hint}** holds ${plug.skills.length} skill(s):\n` +
+                plug.skills.map((sk) => `- \`/${plug.name} ${sk.word}\` — ${sk.hint}`).join('\n'),
+            });
+            break;
+          }
           const created = s.addMessage(ch.id, {
             role: "user",
             content: prettySlashLabel(v),
             ...(ch.mode ? { mode: ch.mode } : {}),
           });
           void send(
-            rest ||
-              `Apply the ${pluginCmd.skill} skill to this turn's task.`,
+            tail.join(' ') || `Apply the ${picked.skill} skill to this turn's task.`,
             [],
             [],
             false,
             created.id,
             undefined,
             false,
-            { skills: [pluginCmd.skill] },
+            { skills: [picked.skill] },
             ch.id,
           );
           break;
@@ -5617,11 +6402,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // only patches an existing chat), so surface it as a transient notice
         // instead of silently swallowing the typo.
         if (ch) {
+          // Offer the closest real commands: a typo used to leave the user with
+          // an error and no way to guess the intended spelling.
+          const near = didYouMean(
+            word.replace(/^\//, ""),
+            commands.map((c) => c.name),
+            3,
+          );
+          const hint = near.length
+            ? ` Did you mean ${near.map((n) => `\`/${n}\``).join(", ")}?`
+            : "";
           useStore
             .getState()
             .setChatCmdError(
               ch.id,
-              `Unknown command \`${word}\`. Type \`/help\` to see available commands.`,
+              `Unknown command \`${word}\`.${hint} Type \`/help\` to see available commands.`,
             );
         } else {
           setNotice(`Unknown command \`${word}\`. Type \`/help\` to see available commands.`);
@@ -6203,8 +6998,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     );
   };
 
-  const captureRegion = async () => {
-    const shot = await api.captureRegion().catch(() => null);
+  const captureScreen = async () => {
+    const shot = await api.captureScreen().catch(() => null);
     if (shot) addShot(shot);
   };
 
@@ -6385,7 +7180,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           if (lastError) throw lastError;
           // Drop any echo of the prompt we sent: a provider that continues the
           // prompt would otherwise auto-send our own glossary back as a turn.
-          const finalText = stripSttPromptEcho((text ?? "").trim(), sttPromptText);
+          const finalText = normalizeTranscript(stripSttPromptEcho((text ?? "").trim(), sttPromptText));
           // A gateway HTML error page must never land in the composer.
           // Errors surface in the banner under messages, never in the input.
           if (finalText && (isHtmlTranscriptJunk(finalText) || /<\/?[a-z]/i.test(finalText) || finalText.includes('&lt;') || finalText.includes('/_next/') || /preload|fetchpriority/i.test(finalText) || /<[a-z][^<>]*$/i.test(finalText))) {
@@ -6848,10 +7643,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // what I say never becomes text". Subscribing to the real TTS status
       // raises the gate only while audio is actually coming out of the
       // speakers, and drops it the moment playback stops (barge-in included,
-      // because a stop flips the status to idle).
+      // because a stop flips the status to idle). `loading` is NOT playback: it
+      // covers fetching the audio, which for a long answer is most of the turn.
+      // Counting it left the mic deaf exactly while the agent worked, so the
+      // user's next sentence only became text once the turn had ended.
       liveTtsUnsubRef.current?.();
       liveTtsUnsubRef.current = subscribeTts((status) => {
-        const playing = status === 'speaking' || status === 'loading';
+        const playing = status === 'speaking';
         const session = liveSessionRef.current;
         if (!session) return;
         session.notifySpeaking(playing);
@@ -6899,23 +7697,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             return;
           }
           const targetChatId = chatIdRef.current;
-          try {
-            const st0 = useStore.getState();
-            const liveChat = st0.chats.find((c) => c.id === targetChatId);
-            const liveStreaming = liveChat?.messages.some((m) => m.streaming) ?? false;
-            if (liveStreaming) {
-              const userMsg = st0.addMessage(targetChatId, {
-                role: "user",
-                content: text,
-                steerPending: true,
-              });
-              forceScrollToBottom();
-              await steerChat(targetChatId, userMsg.id, text, [], [], {});
-              return;
-            }
-          } catch {
-            // Fall through to normal send.
-          }
+          // Barge-in, never steer: a steer only reaches the model at its NEXT
+          // tool call, so while the agent was writing a long answer the
+          // utterance sat inert until the turn ended — "I have to wait for it
+          // to finish". A spoken utterance therefore CANCELS the running turn
+          // (below) and becomes a fresh turn, like ChatGPT voice mode.
           // Ensure a still-streaming answer is cancelled before the new
           // live turn starts (barge-in must not wait for the agent).
           try {
@@ -7105,30 +7891,69 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Fresh usage on every open so the order is always recent-first.
     setCommandUsage(loadCommandUsage());
     setCmdOpen({ at: pos });
+    setCmdCaret({ start: pos, end: pos + 1, word: "", index: 0, prev: [] });
     setSkillMention(null);
     setCmdQuery("");
     // Bottom-anchored like history: newest sits just above the bottom.
     setCmdIndex(Math.max(0, commands.length - 1));
   };
 
-  const acceptCmd = (name: string) => {
+  /** Insert a palette row, replacing exactly the caret's own word.
+   *
+   *  Level 1 replaces `/plu`; level 2 replaces `ins` so `/plugin ins` becomes
+   *  `/plugin install`; level 3 replaces the typed value. The caret lands just
+   *  past the inserted word, and the next level's menu opens from the trailing
+   *  space — which is what makes the chain continue like nvim's. */
+  const acceptCmd = (insert: string) => {
     if (!cmdOpen) return;
-    // Record usage on pick (like skills) so the next open sorts recent-last
-    // at the bottom even before the command runs via handleCommand.
-    setCommandUsage(recordCommandUsage(`/${name}`));
-    const before = input.slice(0, cmdOpen.at);
-    const after = input.slice(cmdOpen.at + 1 + cmdQuery.length);
-    const next = `${before}/${name} ${after}`;
+    const caret = cmdCaret;
+    const start = caret ? caret.start : cmdOpen.at;
+    const end = caret ? caret.end : cmdOpen.at + 1 + cmdQuery.length;
+    // Record usage on pick (like skills) so the next open sorts recent-last at
+    // the bottom even before the command runs via handleCommand.
+    setCommandUsage(recordCommandUsage(insert));
+    const next = `${input.slice(0, start)}${insert} ${input.slice(end)}`;
+    const pos = start + insert.length + 1;
     setInput(next);
     setCmdOpen(null);
+    setCmdCaret(null);
+    // The trailing space starts the NEXT level, so the palette is re-seeded for
+    // the fresh caret — leaving it closed broke the chain after one step.
+    // `syncCmdPalette` closes it again for a level with nothing to offer.
+    syncCmdPalette(next, pos);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (el) {
         el.focus();
-        const pos = before.length + name.length + 2;
         el.setSelectionRange(pos, pos);
       }
     });
+  };
+
+  /** Re-seed the palette for the caret's current word (used after typing). */
+  const syncCmdPalette = (value: string, caretAt: number) => {
+    const caret = slashCaretAt(value, caretAt);
+    if (!caret) {
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    // A level the app has nothing to offer for closes rather than showing an
+    // empty box over the composer.
+    const known = caret.index === 0 || !!SUBCOMMANDS[caret.prev[0] ?? ""];
+    if (!known) {
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    setCmdOpen({ at: 0 });
+    setCmdCaret(caret);
+    setCmdQuery(caret.word.toLowerCase());
+    // At a value level the rows are ranked by match quality, so the best one is
+    // highlighted (bottom-anchoring a fuzzy-ranked list would point at the
+    // worst match). The command level keeps its recent-first bottom anchor.
+    if (caret.index > 0) setCmdIndex(0);
+    if (caret.index > 0) void ensureCmdArgValues();
   };
 
   // Populate the attach list from the FULL catalog (store + enabled plugins).
@@ -7147,6 +7972,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // (e.g. after a skill is saved in Settings) without re-importing.
   useEffect(() => {
     setSkillsFetcher(listSkills);
+    // The command names changed (`/create-skill` → `/skill`), so the stored
+    // history/pins/usage are rewritten once: otherwise the recent-command order
+    // loses its history and the popup keeps offering a command that no longer
+    // exists.
+    migrateCommandNames();
+    setPromptHistory(loadHistory());
   }, []);
 
   // Plugin skills are invocable as `/`-commands, which means the composer needs
@@ -7154,14 +7985,33 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // install/toggle: seeding `skillCmds` at mount alone ran before the fetch
   // resolved, so `/ponytail` stayed missing from the popup.
   const refreshPluginCmds = useCallback(async () => {
-    const rows = await ensureAvailableSkills();
-    setSkillCmds(pluginSkillCommands(rows));
+    const rows = await refreshAvailableSkills();
+    setPluginCmds(pluginCommands(rows));
   }, []);
 
   useEffect(() => {
     setAvailableSkillsFetcher(listAvailableSkills);
     void refreshPluginCmds();
   }, [refreshPluginCmds]);
+
+  // A plugin was deleted (or toggled) in Settings, which lives OUTSIDE this
+  // panel. Both catalogs are module caches and the `/`-command list is a piece
+  // of React state, so without this the dead command stayed in the menu and in
+  // the @mention list until a full reload — the reported bug.
+  useEffect(() => {
+    const onPluginsChanged = () => {
+      invalidateSkillsList();
+      // `refreshAvailableSkills` clears the cache and THEN fetches: clearing it
+      // and reading it in the same tick re-cached the pre-install list, so a
+      // new bundle's command never reached `/` or `@` without a reload.
+      void refreshPluginCmds();
+      void ensureSkills();
+      setPinnedCmds(loadPins());
+      setCommandUsage(loadCommandUsage());
+    };
+    window.addEventListener("coder:plugins-changed", onPluginsChanged);
+    return () => window.removeEventListener("coder:plugins-changed", onPluginsChanged);
+  }, [refreshPluginCmds, ensureSkills]);
 
   // Load the skill list up-front (once) so manual @mentions typed/pasted
   // before the picker ever opens — or sent before the async fetch resolves —
@@ -7234,9 +8084,35 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setAttachments((a) => a.filter((x) => x !== rel));
   };
 
+  /** Flip one bundle's switch from the composer popup.
+   *
+   *  The same call Settings' plugin card makes, so the two can never disagree.
+   *  An optimistic local flip keeps the switch responsive; the reply is
+   *  authoritative and replaces the row. */
+  const togglePickerPlugin = async (slug: string) => {
+    setPickerPlugins((cur) =>
+      cur.map((p) => (p.slug === slug ? { ...p, enabled: !p.enabled } : p)),
+    );
+    const out = await togglePlugin(slug);
+    if (!("error" in out)) {
+      setPickerPlugins((cur) => cur.map((p) => (p.slug === out.slug ? out : p)));
+    }
+    // The `/`-commands and the `@` catalog are built from the FULL plugin
+    // catalog, so a switch here must invalidate them like the Settings toggle does.
+    invalidateAvailableSkills();
+    setSkillsVersion((v) => v + 1);
+  };
+
   const openSkillPicker = () => {
     setSkillOpen((o) => {
-      if (!o) setSkillQuery("");
+      if (!o) {
+        setSkillQuery("");
+        // Refresh on open: the marketplace may have installed or switched one
+        // since this popup was last used, and a stale switch would lie.
+        void listPlugins().then((out) => {
+          if (!("error" in out)) setPickerPlugins(out);
+        });
+      }
       return !o;
     });
     setSkillIdx(0);
@@ -7296,20 +8172,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
 
     if (cmdOpen) {
-      if (v[cmdOpen.at] !== "/") {
-        setCmdOpen(null);
-      } else {
-        const after = v.slice(cmdOpen.at + 1);
-        if (after.search(/\s/) !== -1) {
-          setCmdOpen(null);
-        } else {
-          setCmdQuery(after);
-          const q = after.toLowerCase();
-          const count = commands.filter(
-            (c) => c.name.includes(q) || c.hint.toLowerCase().includes(q),
-          ).length;
-          setCmdIndex(Math.max(0, count - 1));
-        }
+      // The caret decides the level, so moving it between the words of a line
+      // like `/plugin install x` re-targets the menu instead of closing it.
+      const el = e.target;
+      syncCmdPalette(v, el.selectionStart ?? v.length);
+      if (v.length === prev.length + 1 && v[v.length - 1] === "/") {
+        // A fresh "/" restarts the palette at the command level.
+        setCmdIndex(Math.max(0, commands.length - 1));
       }
     }
 
@@ -7386,7 +8255,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (filteredCmds.length > 0 && (e.key === "Enter" || e.key === "Tab")) {
         e.preventDefault();
         e.stopPropagation();
-        acceptCmd(filteredCmds[cmdIndex].name);
+        // Clamp on USE: the rows are rebuilt per caret level (a level-2 list is
+        // shorter than the command list), so a stale index would index out of
+        // range and throw instead of completing.
+        const row = filteredCmds[cmdSel];
+        if (row) acceptCmd(row.insert);
         return;
       }
       if (e.key === "Escape") {
@@ -7686,7 +8559,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       ref={panelRef}
       data-chat-id={chat?.id ?? activeChatId}
       data-focused={isFocused ? "true" : "false"}
-      onPointerDown={() => {
+      // Capture phase: focus must land BEFORE any inner pointerdown handler
+      // (file chips open on pointerdown — see FileChip) so the file tab is
+      // scoped to the chat the user actually clicked in.
+      onPointerDownCapture={() => {
         const id = chat?.id ?? (props?.chatId ?? null);
         if (id && useStore.getState().activeChatId !== id) useStore.getState().focusWindow(id);
       }}
@@ -8018,7 +8894,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           role="button"
                           tabIndex={0}
                           title={`${a} — open in the side panel`}
-                          onClick={() => openWorkspaceFile(a)}
+                          // pointerdown, not click: focusing this chat window re-renders
+                          // the list and replaces the node before `click` fires (see FileChip).
+                          onPointerDown={() => openWorkspaceFile(a)}
                           onKeyDown={(e) => {
                             if (e.key === "Enter" || e.key === " ") {
                               e.preventDefault();
@@ -8091,6 +8969,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 gaveUp={effectiveRetry.gaveUp}
                 watchdog={effectiveRetry.watchdog}
                 model={effectiveRetry.model}
+                providerId={effectiveRetry.providerId}
                 agent={effectiveRetry.agent}
                 tool={effectiveRetry.tool}
                 fallback={effectiveRetry.fallback}
@@ -8798,9 +9677,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <div className="ask-card-question" dir={fa ? "rtl" : "ltr"}>
                   {prepareContent(permissionReq.action, fa ? "rtl" : "ltr")}
                 </div>
-                {permissionReq.path ? (
+                {permissionReq.path || permissionReq.folder ? (
                   <code className="perm-path" dir="ltr">
-                    {permissionReq.path}
+                    {permissionReq.path || permissionReq.folder}
                   </code>
                 ) : null}
                 {permissionReq.reason ? (
@@ -8946,15 +9825,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   // Reasoning effort follows the "Other" group's own slider
                   // when the message runs on that group's model; with no slot
                   // set the call is a main-model call and uses the chat's level.
-                  thinkingLevel: supportsReasoning(
-                    commitModel,
-                    commitProvider.kind,
-                    modelReasoning(commitProvider, commitModel),
-                  )
-                    ? otherEntry
-                      ? otherSlotLevel(st.subagentThinking)
-                      : chat.thinkingLevel ?? thinkingLevel
-                    : "",
+                  // Same rule as a chat turn: only a level a source enumerated
+                  // for this model may leave the process.
+                  thinkingLevel: levelFromSource(
+                    modelThinkingLevels(commitProvider, commitModel),
+                    supportsReasoning(
+                      commitModel,
+                      commitProvider.kind,
+                      modelReasoning(commitProvider, commitModel),
+                    )
+                      ? otherEntry
+                        ? otherSlotLevel(st.subagentThinking)
+                        : chat.thinkingLevel ?? thinkingLevel
+                      : "",
+                  ),
                   modelReasoning:
                     modelReasoning(commitProvider, commitModel) ??
                     supportsReasoning(
@@ -8962,7 +9846,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       commitProvider.kind,
                       modelReasoning(commitProvider, commitModel),
                     ),
-                });
+                }, Object.fromEntries(st.settings.providers.map((p) => [p.id, p])));
                 if ("error" in res) {
                   useStore.getState().setChatCmdError(chatId, res.error);
                 } else if (res.usage) {
@@ -9130,12 +10014,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 )}
                 {filteredCmds.map((c, i) => (
                   <div
-                    key={c.name}
-                    className={`hist-card${i === cmdIndex ? " kbd" : ""}`}
+                    key={c.key}
+                    className={`hist-card${i === cmdSel ? " kbd" : ""}`}
                     onMouseEnter={() => setCmdIndex(i)}
                     onMouseDown={(e) => {
                       e.preventDefault();
-                      acceptCmd(c.name);
+                      acceptCmd(c.insert);
                     }}
                   >
                     <div className="hist-card-head">
@@ -9145,14 +10029,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       >
                         ✦
                       </span>
-                      <span className="hist-card-title">/{c.name}</span>
+                      <span className="hist-card-title">{c.label}</span>
                     </div>
                     <div className="hist-card-sub">{c.hint}</div>
                   </div>
                 ))}
                 {filteredCmds.length > 0 && (
                   <div className="hist-hint">
-                    ↑↓ navigate · Enter insert · Esc close
+                    ↑↓ navigate · Tab/Enter select · Esc close
                   </div>
                 )}
               </div>
@@ -9164,7 +10048,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 )}
                 {!skillsLoading && skillsList.length === 0 && (
                   <div className="mention-empty">
-                    No skills — create one with /create-skill or in Settings → Skills
+                    No skills — create one with /skill or in Settings → Skills
                   </div>
                 )}
                 {skillsList.length > 0 && filteredSkills.length === 0 && (
@@ -9206,7 +10090,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             {skillOpen && (
               <div className="mention-popup" ref={skillPopupRef} dir="ltr">
                 <div className="mention-head">
-                  <span>MCP tools</span>
+                  <span>Plugins</span>
                   <span className="mention-head-count">
                     {filteredMcpCards.length}
                   </span>
@@ -9214,7 +10098,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 <input
                   className="mention-search"
                   type="text"
-                  placeholder="Search connectors…"
+                  placeholder="Search plugins…"
                   value={skillQuery}
                   onChange={(e) => {
                     setSkillQuery(e.target.value);
@@ -9240,8 +10124,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       const opt = skillOptions[skillIdx];
                       if (opt?.kind === "computer") setComputerUse(!computerUse);
                       else if (opt?.kind === "browser") setBrowserUse(!browserUse);
-                      else if (opt)
-                        setMcpEnabled(opt.name, !mcpEnabled.includes(opt.name));
+                      else if (opt) void togglePickerPlugin(opt.name);
                       return;
                     }
                     if (e.key === "Escape") {
@@ -9252,30 +10135,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   }}
                   autoFocus
                 />
-                {Object.keys(mcpConnectors).length === 0 && (
+                {pickerPlugins.length === 0 && (
                   <div className="mention-empty">
-                    No MCP connectors — add them in Settings → MCP
+                    No plugins installed — browse the marketplace in Settings → Plugins
                   </div>
                 )}
-                {Object.keys(mcpConnectors).length > 0 &&
+                {pickerPlugins.length > 0 &&
                   filteredMcpCards.length === 0 && (
                     <div className="mention-empty">
-                      No connectors match “{skillQuery.trim()}”
+                      No plugins match “{skillQuery.trim()}”
                     </div>
                   )}
                 {filteredMcpCards.length > 0 && (
                   <div className="mcp-grid">
                     {filteredMcpCards.map((c, i) => {
-                      const on =
-                        c.kind === "computer"
-                          ? computerUse
-                          : c.kind === "browser"
-                            ? browserUse
-                            : mcpEnabled.includes(c.name);
+                      const on = c.enabled;
                       const toggle = () => {
                         if (c.kind === "computer") setComputerUse(!on);
                         else if (c.kind === "browser") setBrowserUse(!on);
-                        else setMcpEnabled(c.name, !on);
+                        else void togglePickerPlugin(c.name);
                       };
                       return (
                         <div
@@ -9286,7 +10164,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                               ? "Desktop control — when off, the agent never gets the computer tool"
                               : c.kind === "browser"
                                 ? "Agent browsing — when off, no browser tool is bound and no browser window is opened"
-                                : undefined
+                                : c.hint
                           }
                           onMouseEnter={() => setSkillIdx(i)}
                           onMouseDown={(e) => {
@@ -9295,7 +10173,49 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           }}
                         >
                           <span className="mention-rel">{c.label}</span>
-                          <span className="mcp-switch">
+                          {c.kind === "computer" && perm && !perm.screen && (
+                            <span className="mcp-warn" role="alert">
+                              {perm.identity?.adhoc
+                                ? "Screen Recording denied — this build is ad-hoc signed, so macOS forgets the grant on every rebuild. Sign with a stable certificate to stop re-granting it."
+                                : "Screen Recording denied — screenshots show only the wallpaper"}
+                              <button
+                                className="mcp-warn-grant"
+                                disabled={grantBusy}
+                                title="Ask macOS for Screen Recording, then flip Codifa on in System Settings"
+                                onMouseDown={(e) => {
+                                  // The card itself toggles the tool on mousedown;
+                                  // keep this button from flipping it too.
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  grantScreenRecording();
+                                }}
+                              >
+                                {grantBusy ? "Asking…" : "Grant"}
+                              </button>
+                              {perm.identity && (
+                                <span className="mcp-warn-id">
+                                  {`Allow “${perm.identity.name || perm.identity.id}” in System Settings → Privacy & Security → Screen Recording`}
+                                </span>
+                              )}
+                            </span>
+                          )}
+                          {c.kind === "computer" &&
+                            perm &&
+                            perm.screen &&
+                            !perm.accessibility && (
+                              <span className="mcp-warn">
+                                Accessibility denied — clicks and typing are ignored
+                              </span>
+                            )}
+                          <span
+                            className={`mcp-switch${on ? " on" : ""}`}
+                            role="switch"
+                            aria-checked={on}
+                            aria-label={`Turn ${on ? "off" : "on"} ${c.label}`}
+                          >
                             <span className="mcp-switch-track">
                               <span className="mcp-switch-knob" />
                             </span>
@@ -9527,7 +10447,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         role="menuitem"
                         onClick={() => {
                           setPlusMenuOpen(false);
-                          void captureRegion();
+                          void captureScreen();
                         }}
                       >
                         <svg
@@ -9586,13 +10506,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           <path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
                           <path d="M12 17v5" />
                         </svg>
-                        <span>MCP connectors</span>
-                        {mcpEnabled.length +
-                          (computerUse ? 1 : 0) +
-                          (browserUse ? 1 : 0) >
-                          0 && (
+                        <span>Tools &amp; plugins</span>
+                        {(pickerPlugins.filter((p) => p.enabled).length > 0 ||
+                          computerUse ||
+                          browserUse) && (
                           <span className="plus-menu-badge">
-                            {mcpEnabled.length +
+                            {pickerPlugins.filter((p) => p.enabled).length +
                               (computerUse ? 1 : 0) +
                               (browserUse ? 1 : 0)}
                           </span>
@@ -9855,6 +10774,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 onChange={changeMode}
               />
               {provider &&
+                thinkingOptionsFor(activeThinkingLevels).length > 0 &&
                 (modelReasoning(provider, activeModel) ??
                   supportsReasoning(activeModel, provider.kind)) && (
                   <span
@@ -9878,7 +10798,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     </button>
                     {thinkingOpen && (
                       <div className="mode-menu thinking-menu">
-                        {THINKING_OPTIONS.map(([v, label]) => (
+                        {thinkingOptionsFor(activeThinkingLevels).map(([v, label]) => (
                           <button
                             key={v}
                             type="button"

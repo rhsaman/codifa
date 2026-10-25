@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
-import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
+import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, flexWeights, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
 import { focusChatInput } from "../lib/chatFocus";
 import { workspaceDisplayFor } from "../lib/chatWindowMeta";
 import { physicalKey } from "../lib/shortcuts";
@@ -681,6 +681,21 @@ function SplitView({
   // read as an extra window. Other children keep the original drop so a
   // nested drag source still vacates (its own space counts as empty).
   const kids: React.ReactNode[] = [];
+  // Weights normalized across the children that actually take part in layout:
+  // a slot hidden by fullscreen (or vacated by a drag) is display:none and
+  // contributes no flex, which could drop the visible total below 1 and leave
+  // the tail of the row/column blank. Normalizing keeps the panes covering the
+  // whole track while preserving their relative sizes.
+  const visibleSizes = node.children
+    .filter((child) => {
+      const ids = collectChatIds(child);
+      if (fullscreenId && !ids.includes(fullscreenId)) return false;
+      if (fullscreenId || !drag.drop || drag.drop.pos === "center") return true;
+      return !isVacatedByDrag(ids, drag.dragId);
+    })
+    .map((child) => child.size);
+  const weights = flexWeights(visibleSizes);
+  let weightIdx = 0;
   node.children.forEach((child, i) => {
     if (showGhost && ghostAt === i) kids.push(ghostEl);
     const isGhostTarget = (showGhost || showNestedGhost) && i === ghostTargetIdx;
@@ -701,7 +716,7 @@ function SplitView({
       <div
         key={child.id}
         className={"chat-split-child" + (hidden ? " window-hidden" : "")}
-        style={{ flexGrow: anyGhost && !hidden ? 1 : child.size, flexShrink: 0, flexBasis: 0, ...(hidden ? { display: "none" } : null) } as CSSProperties}
+        style={{ flexGrow: anyGhost && !hidden ? 1 : hidden ? child.size : weights[weightIdx++], flexShrink: 0, flexBasis: 0, ...(hidden ? { display: "none" } : null) } as CSSProperties}
         aria-hidden={hidden}
       >
         {i > 0 && (

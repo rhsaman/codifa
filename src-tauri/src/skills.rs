@@ -134,6 +134,51 @@ pub fn strip_frontmatter_pub(raw: &str) -> String {
     strip_frontmatter(raw)
 }
 
+/// Fold a Persian/Arabic phrase for COMPARISON only.
+///
+/// Matching raw bytes failed on the spelling differences that are invisible to
+/// the user: the Arabic yeh/kaf (`ي`, `ك`) against the Persian ones (`ی`, `ک`),
+/// the zero-width non-joiner inside compound words, the Arabic diacritics and
+/// the Arabic-Indic digits. Folding BOTH sides through this before comparing is
+/// what makes a Persian keyword find the skill the user typed it into.
+/// The stored text is never rewritten — only the key used for matching.
+pub fn fold_fa(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = match c {
+            'ي' | 'ی' | 'ى' => 'ی',
+            'ك' | 'ک' => 'ک',
+            'أ' | 'إ' | 'آ' | 'ٱ' | 'ا' => 'ا',
+            'ؤ' => 'و',
+            'ئ' => 'ی',
+            'ة' => 'ه',
+            // Zero-width and directional marks carry no sound: a keyword typed
+            // with a ZWNJ and the same one typed with a space must match.
+            '\u{200c}' | '\u{200d}' | '\u{200e}' | '\u{200f}' | '\u{0640}' => continue,
+            '\u{064b}'..='\u{0652}' | '\u{0670}' => continue,
+            '۰'..='۹' => char::from_u32(c as u32 - '۰' as u32 + '0' as u32).unwrap_or(c),
+            _ => c,
+        };
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+    }
+    out
+}
+
+/// Split a `fa_keywords` field into its phrases.
+///
+/// Shared by the skill frontmatter parser and the plugin manifest reader so both
+/// stores accept the same syntax: the ASCII comma, the Persian comma (U+060C)
+/// and a YAML-style `- item` entry. Deduped on the folded form, first wins.
+pub fn split_fa_keywords(raw: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    raw.split([',', '،'])
+        .map(|k| k.trim().trim_start_matches('-').trim().to_string())
+        .filter(|k| !k.is_empty() && seen.insert(fold_fa(k)))
+        .collect()
+}
+
 /// Fold YAML block scalars onto their key's own line.
 ///
 /// The reader below is a line-oriented `key: value` splitter, so a `skill.md`
@@ -199,22 +244,11 @@ fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    le
                     "name" => name = val,
                     "slug" => slug = val,
                     "description" => description = val,
-                    "fa_keywords" => {
-                        // Split on the ASCII comma AND the Persian one (U+060C):
-                        // a list typed as `فیلم، سریال` used to collapse into a
-                        // single garbled keyword that could never match a real
-                        // request. A YAML-style `- item` entry is tolerated too.
-                        fa_keywords = val
-                            .split([',', '،'])
-                            .map(|k| k.trim().trim_start_matches('-').trim().to_string())
-                            .filter(|k| !k.is_empty())
-                            .collect();
-                        // Dedupe case-insensitively, first occurrence wins, so a
-                        // repeated phrase cannot bloat the catalog line.
-                        let mut seen: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        fa_keywords.retain(|k| seen.insert(k.to_lowercase()));
-                    }
+                    // Split on the ASCII comma AND the Persian one (U+060C):
+                    // a list typed as `فیلم، سریال` used to collapse into a
+                    // single garbled keyword that could never match a real
+                    // request. A YAML-style `- item` entry is tolerated too.
+                    "fa_keywords" => fa_keywords = split_fa_keywords(&val),
                     _ => {}
                 }
             }
@@ -245,6 +279,12 @@ fn find_skill_dir(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     let q = name_or_slug.trim();
     if q.is_empty() {
         return None;
+    }
+    // A DATA root owns no skills directly; they belong to bundles, so the lookup
+    // goes through the bundle tree. A plugin folder still serves the direct scan
+    // below, because that folder IS the store.
+    if !root.join(crate::plugins::MANIFEST).is_file() {
+        return crate::plugins::skill_dir_for(root, q);
     }
     let slug = raw_slug(q);
     if !slug.is_empty() {
@@ -277,6 +317,12 @@ pub fn find_skill_dir_pub(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     find_skill_dir(root, name_or_slug)
 }
 
+/// Public wrapper: the store folder a standalone skill lives in, so an install
+/// from a marketplace's Skills tab lands where `/skills` and `@` read from.
+pub fn skills_dir_pub(root: &Path) -> PathBuf {
+    skills_dir(root)
+}
+
 /// Whether a file may travel with a skill: one flat, safe file name.
 /// Public so the repo reader can flatten nested paths the same way.
 pub fn sanitize_extra_filename(filename: &str) -> Option<String> {
@@ -301,7 +347,15 @@ pub fn sanitize_extra_filename(filename: &str) -> Option<String> {
 // --- skills endpoints --------------------------------------------------------
 
 /// GET /skills — list all skills (frontmatter-stripped content).
+///
+/// Two roots answer this: a BUNDLE folder (`plugin.json` beside `skills/`) lists
+/// what that one bundle holds, which is how the plugin view renders its tags; a
+/// DATA root lists every skill of every bundle, which is the catalog Settings
+/// edits. A standalone store no longer exists, so there is no third case.
 pub fn list_skills(root: &Path) -> Value {
+    if !root.join(crate::plugins::MANIFEST).is_file() {
+        return json!({ "skills": crate::plugins::all_plugin_skills(root) });
+    }
     let base = skills_dir(root);
     let mut skills: Vec<Value> = Vec::new();
     let Ok(entries) = fs::read_dir(&base) else {
@@ -387,6 +441,13 @@ pub fn read_skill_file(root: &Path, name: &str, file: &str) -> Result<Value, Str
 
 /// POST /skills/sync — create/update/delete a skill (mirror of persist_skill).
 pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
+    // A DATA root is not a skill-store root any more: skills live inside
+    // bundles, so a write aimed at the data root goes through the bundle writer,
+    // which finds the owning bundle (or makes a single-part one). A plugin
+    // folder still takes the direct path below, because it IS the store.
+    if !root.join(crate::plugins::MANIFEST).is_file() {
+        return crate::plugins::save_bundle_skill(root, body.clone());
+    }
     let name = body["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
         return Err("skill name is required".into());
@@ -467,13 +528,16 @@ pub fn sync_skill(root: &Path, body: &Value) -> Result<Value, String> {
     // file with `description:` blank and DROPPED the `fa_keywords:` line, so the
     // skill lost its catalog description and became unfindable from Persian
     // (the reported "fa_keywords/description get wiped on save" bug).
-    // An omitted (or empty) value now means "keep what the file already has".
+    // An ABSENT value means "keep what the file already has"; an explicitly
+    // empty one means the caller wants the keywords gone — that is the only way
+    // the Settings editor can remove a keyword, since it always sends the field
+    // it shows. A call that carries no `fa_keywords` at all still preserves it.
     let existing_raw = fs::read_to_string(dir.join("skill.md")).unwrap_or_default();
     let (existing_name, _, existing_desc, existing_fa) = parse_frontmatter(&existing_raw);
     if description.is_empty() {
         description = existing_desc;
     }
-    if fa_keywords.is_empty() {
+    if !body.get("fa_keywords").is_some_and(|v| !v.is_null()) {
         fa_keywords = existing_fa;
     }
     // An EMPTY body follows the same rule: keep the stored text. A caller that
@@ -613,7 +677,8 @@ fn fingerprint(description: &str, body: &str, fa_keywords: &[String]) -> String 
 /// SHIPPED text, so any user edit to a shipped skill looked like "the store is
 /// stale" and was silently reverted on the next launch. A user's edit is not
 /// staleness. With this marker the seed can tell the two apart.
-const SHIPPED_MARKER: &str = ".shipped";
+/// Public alias: the migration must skip this file when it walks a skill folder.
+pub const SHIPPED_MARKER: &str = ".shipped";
 
 struct ShippedMarker {
     origin: String,
@@ -674,6 +739,14 @@ pub fn marker_origin(dir: &Path) -> Option<String> {
     read_marker(dir).map(|m| m.origin)
 }
 
+/// `true` when a skill folder holds the USER's own text rather than a stale seed.
+///
+/// The rename cleanup asks this: a shipped skill that changed name must not take
+/// a version the user edited with it. Same provenance rule the seeder uses.
+pub fn skill_is_user_owned(dir: &Path) -> bool {
+    read_marker(dir).map(|m| m.origin == "user").unwrap_or(false)
+}
+
 /// Locate the shipped built-in skills directory (the `*.md` files that ship
 /// with the app). They live in `src-tauri/skills` in the repo and are bundled
 /// as the `skills/` resource in a packaged build, so they no longer depend on
@@ -712,7 +785,7 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(shipped_dir) else {
         return Vec::new();
     };
-    let existing = list_skills(root);
+    let existing = json!({ "skills": crate::plugins::all_plugin_skills(root) });
     let rows = existing["skills"].as_array().cloned().unwrap_or_default();
     // Map name/slug -> (description, body, fa_keywords) so a shipped change to
     // any of the three triggers a re-sync below.
@@ -786,7 +859,8 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
         // 1. no stored copy            -> seed it
         // 2. the user owns the copy    -> NEVER overwrite (their text wins)
         // 3. we wrote it, shipped moved -> re-seed so official fixes land
-        let dir = find_skill_dir(root, &name).or_else(|| find_skill_dir(root, &slug));
+        let dir = crate::plugins::skill_dir_for(root, &name)
+            .or_else(|| crate::plugins::skill_dir_for(root, &slug));
         let stored_dir_exists = dir
             .as_ref()
             .map(|d| d.join("skill.md").is_file())
@@ -842,8 +916,17 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
             "content": body,
             "fa_keywords": fa_keywords,
         });
-        if sync_skill(root, &payload).is_ok() {
-            if let Some(d) = find_skill_dir(root, &name).or_else(|| find_skill_dir(root, &slug)) {
+        if crate::plugins::save_skill_into_bundle(
+            root,
+            crate::plugins::BUILTIN_BUNDLE_NAME,
+            crate::plugins::BUILTIN_BUNDLE_SLUG,
+            payload,
+        )
+        .is_ok()
+        {
+            if let Some(d) = crate::plugins::skill_dir_for(root, &name)
+                .or_else(|| crate::plugins::skill_dir_for(root, &slug))
+            {
                 let md = fs::read_to_string(d.join("skill.md")).unwrap_or_default();
                 write_marker(&d, "seeded", &shipped_fp, &sha1_hex(md.as_bytes()));
             }
@@ -854,135 +937,6 @@ pub fn seed_builtin_skills(root: &Path, shipped_dir: &Path) -> Vec<String> {
 }
 
 // --- mcp endpoints -----------------------------------------------------------
-
-/// GET /mcp — list connectors as `{name: config}` plus builtins.
-pub fn list_mcp(root: &Path) -> Value {
-    let base = root.join("mcp");
-    let mut servers = serde_json::Map::new();
-    if let Ok(entries) = fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(raw) = fs::read_to_string(&p) {
-                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                    if let (Some(name), Some(cfg)) = (v["name"].as_str(), v.get("config")) {
-                        servers.insert(name.to_string(), cfg.clone());
-                    }
-                }
-            }
-        }
-    }
-    json!({
-        "mcpServers": Value::Object(servers),
-        "builtins": ["docker"],
-    })
-}
-
-/// Built-in MCP connectors installed on first run (mirrors the Python
-/// sidecar's `_BUILTIN_MCP_SERVERS`). They are seeded by NAME: an entry the
-/// user already edited is never overwritten, and a builtin added later is still
-/// seeded on the next start.
-///
-/// The browser is NOT a connector any more: `browser_driver` ships the same
-/// tools natively, so seeding `npx @playwright/mcp` would spawn a Node sidecar
-/// whose entire tool list is then discarded by the native-wins filter — a live
-/// process and a startup round-trip per turn for zero usable tools.
-pub fn builtin_mcp_servers() -> Vec<(&'static str, Value)> {
-    vec![(
-        "docker",
-        json!({"command": "docker", "args": ["mcp", "gateway", "run"]}),
-    )]
-}
-
-/// The connector config that used to be seeded for the browser, kept here only
-/// so an install that already has it can be cleaned up (see
-/// [`retire_builtin_mcp`]).
-const RETIRED_BROWSER_MCP: (&str, &str, &[&str]) =
-    ("playwright", "npx", &["-y", "@playwright/mcp@latest"]);
-
-/// Remove the retired browser connector from an install that was seeded before
-/// the native driver replaced it.
-///
-/// Seeding is name-only and never overwrites, so deleting the entry from
-/// [`builtin_mcp_servers`] does NOT remove the file already on disk — every
-/// existing install would keep a connector that spawns `npx` and contributes
-/// nothing. The file is deleted ONLY while its config still matches the shipped
-/// default; a connector the user edited (a pinned version, their own endpoint)
-/// is left exactly as it is. Returns the names that were retired.
-pub fn retire_builtin_mcp(root: &Path) -> Vec<String> {
-    let (name, command, args) = RETIRED_BROWSER_MCP;
-    let path = root
-        .join("mcp")
-        .join(format!("{}.json", safe_file(name, "server")));
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(record) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
-    let untouched = record["config"]["command"].as_str() == Some(command)
-        && record["config"]["args"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).eq(args.iter().copied()))
-            .unwrap_or(false);
-    if !untouched {
-        return Vec::new();
-    }
-    if fs::remove_file(&path).is_ok() {
-        return vec![name.to_string()];
-    }
-    Vec::new()
-}
-
-/// Install the built-in MCP connectors that are missing. Returns the names
-/// that were seeded (empty when everything was already present).
-pub fn seed_builtin_mcp(root: &Path) -> Vec<String> {
-    let existing = list_mcp(root);
-    let names: Vec<String> = existing["mcpServers"]
-        .as_object()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut seeded = Vec::new();
-    for (name, cfg) in builtin_mcp_servers() {
-        if names.iter().any(|n| n == name) {
-            continue;
-        }
-        if save_mcp(root, &json!({"name": name, "cfg": cfg})).is_ok() {
-            seeded.push(name.to_string());
-        }
-    }
-    seeded
-}
-
-/// POST /mcp — save one connector (`{name, cfg}`).
-pub fn save_mcp(root: &Path, body: &Value) -> Result<Value, String> {
-    let name = body["name"].as_str().unwrap_or("").trim().to_string();
-    if name.is_empty() {
-        return Err("connector name is required".into());
-    }
-    let cfg = body.get("cfg").cloned().unwrap_or(Value::Null);
-    let base = root.join("mcp");
-    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-    let safe = safe_file(&name, "server");
-    let path = base.join(format!("{safe}.json"));
-    let record = json!({ "name": name, "config": cfg });
-    fs::write(&path, record.to_string()).map_err(|e| e.to_string())?;
-    Ok(json!({ "name": name, "ok": true }))
-}
-
-/// POST /mcp/delete — remove one connector.
-pub fn delete_mcp(root: &Path, body: &Value) -> Result<Value, String> {
-    let name = body["name"].as_str().unwrap_or("").trim().to_string();
-    if name.is_empty() {
-        return Err("connector name is required".into());
-    }
-    let safe = safe_file(&name, "server");
-    let path = root.join("mcp").join(format!("{safe}.json"));
-    let removed = fs::remove_file(&path).is_ok();
-    Ok(json!({ "ok": true, "removed": removed }))
-}
 
 // --- system prompts ----------------------------------------------------------
 
@@ -1011,33 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_coding_standards_skill_parses_and_is_findable() {
-        // The generic coding rules are no longer written out in the prompt text —
-        // they live in this shipped skill and are inlined into the system prompt
-        // from it, so the file itself is now load-bearing. A frontmatter typo
-        // would leave the skill nameless (unresolvable by `load_skill`) or
-        // keyless (no Persian trigger in the catalog), and both failures are
-        // silent at runtime.
-        let raw = include_str!("../skills/coding-standards.md");
-        let (name, slug, description, fa_keywords) = parse_frontmatter(raw);
-        assert_eq!(name, "Coding Standards");
-        assert_eq!(slug, "coding-standards");
-        assert!(!description.trim().is_empty(), "a skill needs a description");
-        assert!(
-            fa_keywords.len() >= 3,
-            "the skill must carry Persian + English keywords so a real request \
-             can find it in the catalog: {fa_keywords:?}"
-        );
-        // The body is what the model is told to follow — and what the system
-        // prompt inlines — so an empty one would make the rules dead letters.
-        let body = raw.split("\n---").nth(1).unwrap_or_default();
-        assert!(
-            body.contains("## 7. Debugging protocol"),
-            "the debugging protocol is the reason this skill exists — keep it"
-        );
-    }
-
-    #[test]
     fn frontmatter_parses_like_python() {
         let raw = "---\nname: Test\nslug: test\ndescription: d\nfa_keywords: a, b\n---\n\n# Test\nbody";
         let (name, slug, desc, fa) = parse_frontmatter(raw);
@@ -1060,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_builtin_mcp_no_longer_installs_a_browser_connector() {
+    fn seed_builtin_connectors_no_longer_installs_a_browser_bundle() {
         let tmp = std::env::temp_dir().join(format!("codifa-mcp-seed-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let root = tmp.join("store");
@@ -1068,23 +995,19 @@ mod tests {
 
         // The browser ships as native tools (`browser_driver`), so no connector
         // seeding an `npx` sidecar should appear on a fresh install.
-        let seeded = seed_builtin_mcp(&root);
+        let seeded = crate::plugins::seed_builtin_connectors(&root);
         assert!(
             !seeded.iter().any(|n| n == "playwright"),
             "the retired browser connector was seeded again: {seeded:?}"
         );
-        let installed = list_mcp(&root);
-        assert!(
-            installed["mcpServers"].get("playwright").is_none(),
-            "{installed}"
-        );
-        // ...and it is not listed as a builtin any more, so the user can remove
-        // it from Settings if some other install left one behind.
-        let builtins = installed["builtins"].as_array().cloned().unwrap_or_default();
-        assert!(
-            !builtins.iter().any(|b| b.as_str() == Some("playwright")),
-            "{installed}"
-        );
+        let names: Vec<String> = crate::plugins::list_plugins(&root)["plugins"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!names.iter().any(|n| n == "playwright"), "{names:?}");
     }
 
     /// An install seeded before the native driver replaced the browser keeps a
@@ -1092,33 +1015,176 @@ mod tests {
     /// overwrites, so it has to be retired explicitly — but ONLY while it still
     /// matches the shipped default.
     #[test]
-    fn retire_builtin_mcp_drops_only_the_untouched_default() {
+    fn retire_builtin_connector_drops_only_the_untouched_default() {
         let tmp = std::env::temp_dir().join(format!("codifa-mcp-retire-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let root = tmp.join("store");
-        let mcp_dir = root.join("mcp");
-        fs::create_dir_all(&mcp_dir).unwrap();
+        fs::create_dir_all(&root).unwrap();
 
-        // 1. Untouched default -> retired, file gone.
-        save_mcp(
-            &root,
-            &json!({"name": "playwright", "cfg": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}),
-        )
-        .unwrap();
-        assert_eq!(retire_builtin_mcp(&root), vec!["playwright".to_string()]);
-        assert!(!mcp_dir.join("playwright.json").exists());
+        // A connector now lives inside a bundle, so the shipped default is
+        // written the same way the seed writes it: a single-part bundle.
+        let write = |args: &[&str]| {
+            crate::plugins::install_bundle(
+                &root,
+                "playwright",
+                json!({"mcp": {"playwright": {"command": "npx", "args": args}}}),
+            )
+            .unwrap()
+        };
+
+        // 1. Untouched default -> retired, bundle gone.
+        write(&["-y", "@playwright/mcp@latest"]);
+        assert_eq!(
+            crate::plugins::retire_builtin_connector(&root),
+            vec!["playwright".to_string()]
+        );
+        assert!(crate::plugins::plugin_dir_of(&root, "playwright")
+            .join(crate::plugins::MANIFEST)
+            .exists()
+            .eq(&false));
         // Idempotent: a second run finds nothing and reports nothing.
-        assert!(retire_builtin_mcp(&root).is_empty());
+        assert!(crate::plugins::retire_builtin_connector(&root).is_empty());
 
         // 2. A config the user edited (a pinned version) is LEFT ALONE.
-        save_mcp(
+        write(&["-y", "@playwright/mcp@1.2.3"]);
+        assert!(crate::plugins::retire_builtin_connector(&root).is_empty());
+        assert!(crate::plugins::plugin_dir_of(&root, "playwright")
+            .join(crate::plugins::MANIFEST)
+            .exists());
+    }
+
+    /// The catalog as the tests need it: every bundle's skills.
+    ///
+    /// A skill has no standalone store any more, so `list_skills` reads a BUNDLE
+    /// root (that is how the plugin view lists what one folder holds) — this is
+    /// the data-root view of the same thing.
+    fn catalog(root: &Path) -> Value {
+        json!({ "skills": crate::plugins::all_plugin_skills(root) })
+    }
+
+    #[test]
+    fn shipped_skills_land_in_one_bundle() {
+        // The reported behaviour: Settings showed one card per shipped file, each
+        // reading "1 skill". A shipped skill is not a subscription the user
+        // picked, so the whole library lives behind ONE switch.
+        let tmp = std::env::temp_dir().join(format!("codifa-builtin-one-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        for (file, name) in [("movie-finder", "Movie Finder"), ("brainstorming", "Brainstorming")] {
+            fs::write(
+                shipped.join(format!("{file}.md")),
+                format!("---\nname: {name}\ndescription: does {name}\nfa_keywords: کلمه\n---\n\n# {name}\nbody\n"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(seed_builtin_skills(&store, &shipped).len(), 2);
+
+        let plugins = crate::plugins::list_plugins(&store);
+        let bundles = plugins["plugins"].as_array().unwrap();
+        assert_eq!(bundles.len(), 1, "both shipped skills share one bundle: {plugins}");
+        let bundle = &bundles[0];
+        assert_eq!(bundle["slug"], crate::plugins::builtin_bundle_slug());
+        assert_eq!(bundle["skills"].as_array().unwrap().len(), 2);
+        // The card renders the bundle's own description and trigger, so the fold
+        // has to lift them up from the skills it holds.
+        assert!(!bundle["description"].as_str().unwrap_or("").is_empty());
+        assert!(!bundle["fa_keywords"].as_array().unwrap().is_empty());
+
+        // Both are still reachable: the catalog reads the bundle's skills.
+        let listed = catalog(&store);
+        let names: Vec<&str> = listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Movie Finder") && names.contains(&"Brainstorming"), "{names:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_renamed_shipped_skill_is_retired_unless_the_user_edited_it() {
+        // The rename hazard: seeding only ADDS or updates, so "Playwrite" would
+        // sit in the catalog beside "Browser Automation" forever.
+        let tmp = std::env::temp_dir().join(format!("codifa-retire-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("store");
+        // The stale seed, written the way the seeder writes one.
+        crate::plugins::save_bundle_skill(
             &root,
-            &json!({"name": "playwright", "cfg": {"command": "npx", "args": ["-y", "@playwright/mcp@1.2.3"]}}),
+            json!({"name": "Playwrite", "description": "browser", "content": "# old\nbody"}),
         )
         .unwrap();
-        assert!(retire_builtin_mcp(&root).is_empty());
-        assert!(mcp_dir.join("playwright.json").exists());
-        assert!(list_mcp(&root)["mcpServers"].get("playwright").is_some());
+        let dir = crate::plugins::skill_dir_for(&root, "Playwrite").unwrap();
+        write_marker(&dir, "seeded", "fp", "hash");
+
+        assert_eq!(crate::plugins::retire_builtin_skills(&root), vec!["Playwrite".to_string()]);
+        assert!(
+            crate::plugins::skill_dir_for(&root, "Playwrite").is_none(),
+            "the stale copy is gone"
+        );
+
+        // A version the USER edited keeps their text: the name is retired, the
+        // file is theirs.
+        crate::plugins::save_bundle_skill(
+            &root,
+            json!({"name": "Playwrite", "description": "mine", "content": "# mine\nbody"}),
+        )
+        .unwrap();
+        let dir = crate::plugins::skill_dir_for(&root, "Playwrite").unwrap();
+        write_marker(&dir, "user", "fp", "hash");
+        assert!(
+            crate::plugins::retire_builtin_skills(&root).is_empty(),
+            "a user-edited skill must survive the rename"
+        );
+        assert!(crate::plugins::skill_dir_for(&root, "Playwrite").is_some());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_fold_leaves_a_user_bundle_and_a_connector_api_alone() {
+        // Folding is limited to bundles made ENTIRELY of shipped skills: one the
+        // user built, and a connector's own bundle, keep their own switch.
+        let tmp = std::env::temp_dir().join(format!("codifa-fold-scope-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let shipped = tmp.join("shipped");
+        fs::create_dir_all(&shipped).unwrap();
+        fs::write(
+            shipped.join("movie-finder.md"),
+            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم\n---\n\n# Movie Finder\nbody\n",
+        )
+        .unwrap();
+        seed_builtin_skills(&store, &shipped);
+        // A bundle the user made, and a connector of its own.
+        crate::plugins::install_bundle(
+            &store,
+            "My Own",
+            json!({ "slug": "my-own", "skills": [{"name": "Mine", "content": "# Mine\nbody"}] }),
+        )
+        .unwrap();
+        crate::plugins::install_bundle(
+            &store,
+            "docker",
+            json!({ "slug": "docker", "mcp": {"docker": {"command": "docker"}} }),
+        )
+        .unwrap();
+
+        let moved = crate::plugins::fold_builtin_skills_into_one(&store);
+        assert_eq!(moved, 0, "neither bundle is a shipped-skill library");
+        let slugs: Vec<String> = crate::plugins::list_plugins(&store)["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["slug"].as_str().map(str::to_string))
+            .collect();
+        assert!(slugs.contains(&"my-own".to_string()) && slugs.contains(&"docker".to_string()), "{slugs:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1137,7 +1203,7 @@ mod tests {
         // First run seeds the shipped skill.
         let first = seed_builtin_skills(&store, &shipped);
         assert_eq!(first, vec!["Movie Finder".to_string()]);
-        let listed = list_skills(&store);
+        let listed = catalog(&store);
         assert_eq!(listed["skills"][0]["name"], "Movie Finder");
         assert_eq!(listed["skills"][0]["fa_keywords"][0], "film");
 
@@ -1151,7 +1217,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
-        assert!(list_skills(&store)["skills"][0]["content"]
+        assert!(catalog(&store)["skills"][0]["content"]
             .as_str()
             .unwrap()
             .contains("UPDATED"));
@@ -1192,7 +1258,7 @@ mod tests {
         // Relaunch: the shipped version did NOT change, so nothing is re-seeded
         // and the user's text is still there.
         assert!(seed_builtin_skills(&store, &shipped).is_empty(), "user edit must not be reverted");
-        let after = list_skills(&store);
+        let after = catalog(&store);
         assert_eq!(after["skills"][0]["description"], "my own movies helper");
         assert!(after["skills"][0]["content"].as_str().unwrap().contains("MY OWN BODY"));
 
@@ -1207,7 +1273,7 @@ mod tests {
             seed_builtin_skills(&store, &shipped).is_empty(),
             "an edited shipped skill must stay edited"
         );
-        let after2 = list_skills(&store);
+        let after2 = catalog(&store);
         assert!(after2["skills"][0]["content"].as_str().unwrap().contains("MY OWN BODY"));
         // ...and it stays put on every later launch (marker records the decline).
         assert!(seed_builtin_skills(&store, &shipped).is_empty());
@@ -1237,7 +1303,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
-        assert!(list_skills(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
+        assert!(catalog(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
         assert!(seed_builtin_skills(&store, &shipped).is_empty(), "idempotent again");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1259,7 +1325,7 @@ mod tests {
         let store = tmp.join("store");
         seed_builtin_skills(&store, &shipped);
 
-        let files = list_skills(&store)["skills"][0]["files"].clone();
+        let files = catalog(&store)["skills"][0]["files"].clone();
         assert_eq!(files, json!([]), "the marker is a dotfile, not a skill file");
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1286,7 +1352,7 @@ mod tests {
         fs::write(dir.join("notes").join("inner.md"), "x").unwrap();
         fs::write(dir.join("data.json"), "{}").unwrap();
 
-        let files = list_skills(&store)["skills"][0]["files"].clone();
+        let files = catalog(&store)["skills"][0]["files"].clone();
         assert_eq!(files, json!(["data.json"]));
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1325,7 +1391,7 @@ mod tests {
         .expect("rename write");
         assert_eq!(res["renamed_from"], "Old Name");
 
-        let listed = list_skills(&store);
+        let listed = catalog(&store);
         let names: Vec<&str> = listed["skills"]
             .as_array()
             .unwrap()
@@ -1412,7 +1478,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seed_builtin_skills(&store, &shipped), vec!["Movie Finder".to_string()]);
-        assert!(list_skills(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
+        assert!(catalog(&store)["skills"][0]["content"].as_str().unwrap().contains("v2"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1451,7 +1517,7 @@ mod tests {
         )
         .unwrap();
         assert!(seed_builtin_skills(&store, &shipped).is_empty());
-        assert!(list_skills(&store)["skills"][0]["content"]
+        assert!(catalog(&store)["skills"][0]["content"]
             .as_str()
             .unwrap()
             .contains("MODEL BODY"));

@@ -68,7 +68,7 @@ console.log("2) xterm's hard-coded values are overridden with theme vars:")
   )
   check(
     'the scrollbar thumb follows the theme',
-    /\.terminal-screen \.xterm-viewport::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--bg-raised\)/.test(
+    /\.terminal-screen \.xterm \.xterm-viewport::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--bg-raised\)/.test(
       region,
     ),
   )
@@ -86,28 +86,37 @@ console.log('3) --bg-raised is derived from the theme, not frozen at Rose Pine:'
   )
 }
 
-console.log('4) the side-pane dock reuses the same themed surfaces:')
+console.log('4) terminal tabs reuse the same themed surfaces:')
 {
-  const right = region.match(/\.terminal-panel\.terminal-right\s*\{[^}]*\}/)
-  check('a terminal-right dock rule exists', right !== null, right?.[0])
+  // Terminal tabs in the pane are ORDINARY viewer tabs (kind 'terminal',
+  // src/components/TerminalTabPanel.tsx), so the dock-specific geometry is
+  // gone; what must survive is that their wrapper paints from theme vars.
+  const tab = region.match(/\.terminal-tab-panel\s*\{[^}]*\}/)
+  check('the pane terminal-tab wrapper exists', tab !== null, tab?.[0])
   check(
-    'the side dock keeps the themed panel background and border',
-    right !== null && !/#[0-9a-fA-F]{3,8}/.test(right[0]),
-    right?.[0],
+    'the tab keeps the themed panel background',
+    /background:\s*var\(--bg-alt\)/.test(tab?.[0] ?? ''),
+    tab?.[0],
   )
-  const full = region.match(/\.terminal-panel\.terminal-full\.terminal-right\s*\{[^}]*\}/)
-  check('fullscreen keeps winning over the side dock', full !== null, full?.[0])
-  // The dock is a strip along the pane's bottom edge, so its top border is what
-  // separates it from the viewer content the pane reserves room for above it.
+  // The tab IS the pane body now: it has to be the positioned box the shared
+  // .terminal-screen rule (position: absolute) is inset against.
   check(
-    'the side dock draws a separator against the pane content above it',
-    /border-top:\s*1px solid var\(--border\)/.test(right?.[0] ?? ''),
-    right?.[0],
+    'it is the positioning box for the shared screen rule',
+    /position:\s*relative/.test(tab?.[0] ?? ''),
+    tab?.[0],
   )
   check(
-    'the dock never paints a literal colour',
-    full !== null && !/#[0-9a-fA-F]{3,8}/.test(full[0]),
-    full?.[0],
+    'the wrapper never paints a literal colour',
+    tab !== null && !/#[0-9a-fA-F]{3,8}/.test(tab[0]),
+    tab?.[0],
+  )
+  // A program the backend could not start has to report it inside the tab.
+  const err = region.match(/\.terminal-tab-error\s*\{[^}]*\}/)
+  check('the spawn-error banner exists', err !== null, err?.[0])
+  check(
+    'the banner never paints a literal colour either',
+    err !== null && !/#[0-9a-fA-F]{3,8}/.test(err[0]),
+    err?.[0],
   )
 }
 

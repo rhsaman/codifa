@@ -3,7 +3,7 @@ import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "re
 import { useStore } from "../lib/store";
 import { useViewerTabs, viewerTabTitle } from "../lib/viewerTabs";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
-import { buildFromList, collectChatIds, findNodeById, leafCount } from "../lib/chatTree";
+import { buildFromList, collectChatIds, findNodeById, flexWeights, leafCount } from "../lib/chatTree";
 import { SchedulePage, TodosPage } from "./ViewerPages";
 import { ViewerContent } from "./ViewerContent";
 // Every viewer panel is dispatched by tab kind, so at most ONE of them is ever
@@ -153,6 +153,7 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
     return (
       <BrowserPanel
         key={tab.id}
+        tabId={tab.id}
         chatId={tab.chatId ?? ""}
         initialUrl={tab.browserUrl ?? ""}
       />
@@ -172,6 +173,11 @@ function ViewerLeafBody({ tabId }: { tabId: string }) {
         index={tab.exploreIndex ?? 0}
       />
     );
+  }
+  // The todos page in a split pane: an ordinary tab now (`todos`), so it can be
+  // closed like any other leaf.
+  if (tab.kind === "todos") {
+    return <TodosPage key={tab.id} />;
   }
   // The schedule page in a split pane. Must sit before the fallback below,
   // which is the catch-all inbox return of this dispatcher.
@@ -388,13 +394,16 @@ function ViewerSplitView({
     );
   }
   const isRow = node.dir === "row";
+  // Weights normalized to a total of 1: a stored tree whose sizes sum below 1
+  // would otherwise leave the tail of the split blank (see flexWeights).
+  const weights = flexWeights(node.children.map((c) => c.size));
   return (
     <div className={`viewer-split ${isRow ? "row" : "col"}`} data-viewer-split-id={node.id}>
       {node.children.map((child, i) => (
         <div
           key={child.id}
           className="viewer-split-child"
-          style={{ flexGrow: child.size, flexShrink: 0, flexBasis: 0 } as CSSProperties}
+          style={{ flexGrow: weights[i], flexShrink: 0, flexBasis: 0 } as CSSProperties}
         >
           {i > 0 && (
             <div
@@ -424,7 +433,6 @@ export function ViewerWindows() {
   const focusedId = useViewerTabs((s) => s.focusedViewerId);
   const activeId = useViewerTabs((s) => s.activeId);
   const tabs = useViewerTabs((s) => s.tabs);
-  const panelMode = useViewerTabs((s) => s.panelMode);
   const [dragId, setDragId] = useState<string | null>(null);
   const [drop, setDrop] = useState<DropMark>(null);
   const stackRef = useRef<HTMLDivElement>(null);
@@ -434,7 +442,7 @@ export function ViewerWindows() {
   // leaf in sync with the active tab so a later split starts from it.
   useEffect(() => {
     useViewerTabs.getState().ensureViewerTree();
-  }, [tabs.length, activeId, panelMode]);
+  }, [tabs.length, activeId]);
 
   useEffect(() => {
     const st = useViewerTabs.getState();
@@ -500,10 +508,6 @@ export function ViewerWindows() {
     },
     [],
   );
-
-  if (panelMode) {
-    return <TodosPage />;
-  }
 
   const leaves = tree ? leafCount(tree) : 0;
   // Single pane (or no tree yet): classic behavior with chat filtering.

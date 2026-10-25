@@ -129,6 +129,31 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Retire cached sessions whose connector is no longer in `servers`.
+///
+/// The only evictions used to be "the same server with a different config" and
+/// "the round-trip failed". A connector the user DELETED or DISABLED in Settings
+/// therefore kept its live child process (and its pipes) until the app quit,
+/// because nothing ever called `with_session` for that name again. This is
+/// driven by the enabled-connector map the agent already builds every turn.
+fn retire_disabled(servers: &serde_json::Map<String, Value>) {
+    let Ok(mut guard) = sessions().lock() else {
+        return;
+    };
+    guard.retain(|k, _| session_is_enabled(k, servers));
+}
+
+/// Whether a cached session key still has an enabled connector behind it.
+///
+/// `key()` is `"{server}\u{1}{config-json}"`, and `serde_json` escapes control
+/// characters, so the first `\u{1}` splits at exactly the boundary we wrote.
+fn session_is_enabled(key: &str, servers: &serde_json::Map<String, Value>) -> bool {
+    match key.split('\u{1}').next() {
+        Some(name) => servers.contains_key(name),
+        None => true,
+    }
+}
+
 /// Cache key: the server name plus its config, so editing a connector in
 /// Settings starts a fresh process instead of reusing the old one.
 fn key(server: &str, cfg: &Value) -> String {
@@ -298,8 +323,12 @@ fn list_tools(server: &str, cfg: &Value) -> Result<Vec<Value>, String> {
 /// reached, so the agent loop can warn the user instead of failing silently.
 pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
     let Some(map) = servers.as_object() else {
+        // No connector is enabled at all: every cached session is now orphaned,
+        // so release them rather than keep their child processes alive.
+        retire_disabled(&serde_json::Map::new());
         return (Vec::new(), Vec::new());
     };
+    retire_disabled(map);
     let mut failures = Vec::new();
     // Collect every connector's tools first: the bare/qualified decision needs
     // the whole picture (a name is only short when nothing else claims it).
@@ -448,6 +477,33 @@ mod tests {
     fn tool_schemas_is_empty_without_connectors() {
         assert!(tool_schemas(&Value::Null).0.is_empty());
         assert!(tool_schemas(&json!({})).0.is_empty());
+    }
+
+    /// A connector the user deleted or disabled must lose its cached session.
+    ///
+    /// The map holds a LIVE CHILD PROCESS per connector, and the only evictions
+    /// used to be "same server, edited config" and "the call failed". Nothing
+    /// ever called `with_session` again for a removed connector, so its process
+    /// (and pipes) stayed until the app quit.
+    #[test]
+    fn a_disabled_connector_is_no_longer_considered_enabled() {
+        let mut enabled = serde_json::Map::new();
+        enabled.insert("docker".to_string(), json!({ "command": "docker" }));
+
+        // Keys are `name\u{1}config-json`, exactly as `key()` builds them.
+        let live = format!("docker\u{1}{}", json!({"command": "docker"}));
+        assert!(session_is_enabled(&live, &enabled));
+
+        // The same key once the connector is gone from Settings.
+        let mut without = serde_json::Map::new();
+        without.insert("other".to_string(), json!({ "command": "other" }));
+        assert!(!session_is_enabled(&live, &without));
+
+        // Same NAME with a different config is still that connector: an edited
+        // connector must not be reaped, or every keystroke in Settings would
+        // restart its process.
+        let edited = format!("docker\u{1}{}", json!({"command": "docker", "args": ["--x"]}));
+        assert!(session_is_enabled(&edited, &enabled));
     }
 
     /// A connector that cannot start must be REPORTED, not silently dropped:

@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import type { ProviderConfig } from "../types";
 import { MAX_PINNED_RECENT_MODELS, sortRecentModels, useStore } from "../lib/store";
 import { isForeignModelId } from "../lib/provider-meta";
+import { resolveSlotEntry } from "../lib/toolSlots";
 import { ModelTestButton, PinIcon, RemoveIcon } from "./ModelTestButton";
 import { ProviderTestButton } from "./ProviderTestButton";
 import { RecentTestButton } from "./RecentTestButton";
@@ -250,14 +251,12 @@ export function ProviderModelSelect(props?: {
     if (!controlled) return null as null | { providerId: string; model: string };
     const raw = (props?.value ?? "").trim();
     if (!raw) return null;
-    const slash = raw.indexOf("/");
-    if (slash > 0) {
-      const pid = raw.slice(0, slash);
-      const model = raw.slice(slash + 1);
-      const p = providers.find((x) => x.id === pid);
-      if (p) return { providerId: p.id, model };
-    }
-    return { providerId: activeProviderId, model: raw };
+    // The same resolution the rest of Settings uses: an id prefix, a legacy
+    // KIND prefix, or a bare model id. A slash-bearing entry no row can claim
+    // (`oc/deepseek-…`) must show nothing rather than the wrong provider.
+    const r = resolveSlotEntry(raw, providers);
+    if (r.unowned) return null;
+    return { providerId: r.providerId || activeProviderId, model: r.model };
   })();
   // In controlled mode an EMPTY value is meaningful: the slot inherits the
   // main model. Falling back to the active provider's model there would make an

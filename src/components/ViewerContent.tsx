@@ -35,6 +35,11 @@ const ArtifactsPanel = lazy(() =>
 const ArtifactPanel = lazy(() =>
   import("./ArtifactPanel").then((m) => ({ default: m.ArtifactPanel })),
 );
+// A terminal tab pulls xterm, fit and the pty bridge with it — exactly the kind
+// of weight a chat-only session must never parse, hence the lazy() boundary.
+const TerminalTabPanel = lazy(() =>
+  import("./TerminalTabPanel").then((m) => ({ default: m.TerminalTabPanel })),
+);
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
@@ -51,23 +56,29 @@ export function ViewerContent() {
 function ViewerContentInner() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
-  const panelMode = useViewerTabs((s) => s.panelMode);
   const activeChatId = useStore((s) => s.activeChatId);
   // Chat-scoped viewers: only the active chat's tabs (plus global inbox) show.
   // Same resolution as `shownViewerTabId` in the store — that helper is the
   // shared spelling of this rule behind the rail icons' pressed state, so keep
   // the two in step.
   const visible = visibleTabs(tabs, activeChatId);
-  const active = visible.find((t) => t.id === activeId) ?? visible[0] ?? null;
+  // Same rule as `shownViewerTabId`: the chat's own tab beats a global page tab
+  // (schedule/inbox/…), so an open file never loses the pane to Schedule.
+  const active =
+    visible.find((t) => t.id === activeId) ??
+    visible.find((t) => t.chatId === activeChatId) ??
+    visible[0] ??
+    null;
 
-  // Panel mode replaces ALL viewer tab content; the header's panel toggle
-  // flips back to tabs mode.
-  if (panelMode) return <TodosPage />;
-
-  // Empty pane shows EXACTLY the panel-toggle view (same page the top-right
-  // icon opens): the todos checklist, no chooser. Schedules live on their own
-  // tab now, so they are not stacked here.
+  // Empty pane (no tab of this chat): the todos checklist, no chooser.
+  // Schedules and the rest are their own tabs, so they are not stacked here.
   if (!active) return <TodosPage />;
+
+  if (active.kind === "todos") {
+    // The checklist page opened from the rail's "+": an ordinary tab now, so
+    // it can be closed like any other.
+    return <TodosPage key={active.id} />;
+  }
 
   if (active.kind === "text") {
     const body = active.textBody ?? "";
@@ -168,6 +179,7 @@ function ViewerContentInner() {
     return (
       <BrowserPanel
         key={active.id}
+        tabId={active.id}
         chatId={active.chatId ?? ""}
         initialUrl={active.browserUrl ?? ""}
       />
@@ -191,6 +203,23 @@ function ViewerContentInner() {
     // Every document the agent built, across chats. A row opens the same
     // sandboxed preview the transcript card does.
     return <ArtifactsPanel key={active.id} />;
+  }
+
+  if (active.kind === "terminal") {
+    // An ORDINARY tab, not a dock: it keeps its own pty session
+    // (src/lib/terminalSessions.ts) fully separate from the bottom panel
+    // (Cmd/Ctrl+J). Switching away only unmounts the screen — the shell and its
+    // scrollback stay alive, so coming back shows the same buffer.
+    return (
+      <TerminalTabPanel
+        key={active.id}
+        tabId={active.id}
+        cwd={active.terminalCwd ?? ""}
+        program={active.terminalProgram ?? ""}
+        args={active.terminalArgs ?? []}
+        shell={active.terminalShell ?? ""}
+      />
+    );
   }
 
   if (active.kind === "schedule") {

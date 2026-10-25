@@ -19,7 +19,31 @@ use crate::skills;
 pub const AUTO_MAX_BODY_CHARS: usize = 16_000;
 
 /// Catalog lines are capped so a huge store cannot flood the system prompt.
+///
+/// `build_section` now takes the cap as an argument (Settings → Skills exposes
+/// it), so this constant is the default every caller falls back to.
 const CATALOG_MAX_CHARS: usize = 6_000;
+
+/// Public default for the catalog cap, in BYTES of system prompt per turn.
+pub const CATALOG_MAX_DEFAULT: usize = CATALOG_MAX_CHARS;
+
+/// Floor for a user-chosen cap: below this the catalog cannot even list the
+/// names, which is the one thing this budget must always pay for.
+pub const CATALOG_MAX_MIN: usize = 1_500;
+
+/// Ceiling for a user-chosen cap: 3k tokens of catalog on EVERY step of every
+/// turn is already a lot to re-send, so a typo cannot multiply it further.
+pub const CATALOG_MAX_LIMIT: usize = 12_000;
+
+/// How many skills the keyword matcher may attach on its own.
+///
+/// Small on purpose: every auto-attached body is inlined into the prompt, so
+/// this is the one place where a Persian request could suddenly get expensive.
+const AUTO_ATTACH_MAX: usize = 2;
+
+/// Shortest keyword the matcher accepts. A one- or two-character phrase matches
+/// almost any sentence, which would attach a skill to every single turn.
+const AUTO_ATTACH_MIN_KEYWORD_CHARS: usize = 3;
 
 /// Result of building the SKILLS section for one turn.
 pub struct SkillSection {
@@ -139,7 +163,16 @@ fn catalog_detail(desc: &str, fa: &[&str], room: usize) -> String {
 /// This line IS the trigger for `load_skill`. A skill whose description is
 /// English-only is unreachable from a Persian request, which is why the user's
 /// own keywords are emitted verbatim rather than translated.
+///
+/// Test-only: production goes through `catalog_at` with the user's configured
+/// budget, so this fixed-cap wrapper exists to keep the assertions readable.
+#[cfg(test)]
 fn catalog(all: &[Value]) -> String {
+    catalog_at(all, CATALOG_MAX_CHARS)
+}
+
+/// `catalog` with an explicit byte budget (the value Settings → Skills edits).
+fn catalog_at(all: &[Value], max: usize) -> String {
     let rows: Vec<(&str, &str, Vec<&str>, Option<String>)> = all
         .iter()
         .filter_map(|s| {
@@ -159,16 +192,19 @@ fn catalog(all: &[Value]) -> String {
                         .collect()
                 })
                 .unwrap_or_default();
-            // A skill that ships inside a plugin is ALSO a `/`-command in the
-            // composer, so the catalog has to name it: an installer script that
-            // says "try /ponytail" produced "Unknown command" because the model
-            // had no way to learn the command existed.
+            // A skill that ships inside a plugin is invocable as
+            // `/<plugin-slug> <skill-slug>` in the composer: the command names
+            // the BUNDLE, so a 26-skill library is one palette row instead of
+            // 26 that bury every real command.
             let command = s["plugin"].as_str().and_then(|_| {
+                let plugin_slug = s["plugin_slug"].as_str().unwrap_or_default().trim();
                 let slug = s["slug"].as_str().unwrap_or_default().trim();
-                if slug.is_empty() {
+                if plugin_slug.is_empty() {
                     None
+                } else if slug.is_empty() {
+                    Some(plugin_slug.to_string())
                 } else {
-                    Some(slug.to_string())
+                    Some(format!("{plugin_slug} {slug}"))
                 }
             });
             Some((name, desc, fa, command))
@@ -188,12 +224,11 @@ fn catalog(all: &[Value]) -> String {
             // line names the command: a bundle whose install output says "try
             // /ponytail" left the model unable to explain how to run it, and
             // the user got "Unknown command".
-            Some(cmd) => format!("- {name} (command: /{cmd})"),
-            None => format!("- {name}"),
+            Some(cmd) => format!("- {name} (command: /{cmd})"),            None => format!("- {name}"),
         })
         .collect();
     let bare: usize = heads.iter().map(|h| h.len() + 1).sum();
-    let room = CATALOG_MAX_CHARS.saturating_sub(bare + CATALOG_TRUNCATE_NOTE_RESERVE);
+    let room = max.saturating_sub(bare + CATALOG_TRUNCATE_NOTE_RESERVE);
     let per_row = if rows.is_empty() { 0 } else { (room / rows.len()).min(CATALOG_DETAIL_PER_ROW) };
 
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
@@ -218,7 +253,7 @@ fn catalog(all: &[Value]) -> String {
     for line in &lines {
         // Names are paid for first (see `per_row` above), so by construction a
         // name alone always fits: this is a safety net, not the normal path.
-        if out.len() + line.len() + 1 + CATALOG_TRUNCATE_NOTE_RESERVE > CATALOG_MAX_CHARS {
+        if out.len() + line.len() + 1 + CATALOG_TRUNCATE_NOTE_RESERVE > max {
             dropped = lines.len() - out.lines().count();
             break;
         }
@@ -268,11 +303,7 @@ const SKILLS_CACHE_MAX: usize = 8;
 /// written straight to disk (the app's own writer, a test, or the user's editor)
 /// still invalidates, which a mutation-hook cache would miss.
 fn store_signature(root: &str) -> u64 {
-    let mut acc: u64 = 0;
-    for base in ["skills", "plugins"] {
-        acc = acc.wrapping_add(tree_stamp(&std::path::Path::new(root).join(base), 0));
-    }
-    acc
+    tree_stamp(&std::path::Path::new(root).join("plugins"), 0)
 }
 
 /// Order-independent stamp of one directory tree: the sum of every entry's
@@ -319,20 +350,13 @@ fn skills_cache() -> &'static Mutex<HashMap<String, (u64, Vec<Value>)>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Every skill the prompt may offer: the standalone store first, then the
-/// skills of every enabled plugin.
+/// Every skill the prompt may offer: the skills of every ENABLED plugin.
+///
+/// A plugin bundle is the only container a skill can live in, so the "standalone
+/// store" half of this read is gone — one source means the Settings list, the
+/// prompt catalog and the `@` picker can never disagree about what exists.
 fn read_skills_from_disk(root: &str) -> Vec<Value> {
-    let store = std::path::Path::new(root);
-    let mut all = skills::list_skills(store)["skills"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    for row in crate::plugins::enabled_plugin_skills(store) {
-        if !all.iter().any(|s| s["name"] == row["name"]) {
-            all.push(row);
-        }
-    }
-    all
+    crate::plugins::enabled_plugin_skills(std::path::Path::new(root))
 }
 
 pub fn load_skills(root: &str) -> Vec<Value> {
@@ -357,18 +381,119 @@ pub fn load_skills(root: &str) -> Vec<Value> {
     all
 }
 
+/// Skills whose own `fa_keywords` appear in the prompt, best match first.
+///
+/// Leaving the Persian case entirely to the model did not work: weak models
+/// read the catalog as reference material and never called `load_skill` (real
+/// traces: 2 calls across ~250 steps with the whole catalog in the prompt). The
+/// keywords are the user's OWN phrases, so matching them in code is the same
+/// judgement the model was being asked to make — done where it cannot be
+/// skipped. This never overrides an `@mention`; it only adds.
+///
+/// Deliberately conservative, because every hit is inlined into the prompt:
+/// Every phrase that can trigger one skill.
+///
+/// A skill's OWN list wins outright. Only a skill that carries none falls back
+/// to the keywords of the BUNDLE it ships in (`bundle_keywords`), which is how
+/// a library answers a broad Persian ask — without every skill of that bundle
+/// pretending the same phrases are its own.
+fn keyword_pool(skill: &Value) -> Vec<&str> {
+    let listed = |field: &str| -> Vec<&str> {
+        skill[field]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::trim).collect())
+            .unwrap_or_default()
+    };
+    let own = listed("fa_keywords");
+    if own.is_empty() {
+        listed("bundle_keywords")
+    } else {
+        own
+    }
+}
+
+/// - a keyword shorter than `AUTO_ATTACH_MIN_KEYWORD_CHARS` never matches,
+/// - both sides go through `skills::fold_fa`, so the Arabic yeh/kaf and the
+///   zero-width non-joiner cannot make a real phrase miss,
+/// - at most `AUTO_ATTACH_MAX` skills are attached,
+/// - a skill already attached manually is never counted twice.
+fn match_by_keywords(all: &[Value], prompt: &str, already: &[&Value]) -> Vec<Value> {
+    let folded = skills::fold_fa(prompt);
+    if folded.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, usize, Value)> = Vec::new();
+    for skill in all {
+        let name = skill["name"].as_str().unwrap_or_default().trim();
+        if name.is_empty() || already.iter().any(|p| p["name"].as_str() == Some(name)) {
+            continue;
+        }
+        let keywords = keyword_pool(skill);
+        if keywords.is_empty() {
+            continue;
+        }
+        let mut hits = 0usize;
+        let mut longest = 0usize;
+        for kw in keywords {
+            let kw = kw.trim();
+            // Counted in CHARS: a three-word Persian phrase is few bytes and
+            // would otherwise pass while a two-character one would too.
+            if kw.chars().count() < AUTO_ATTACH_MIN_KEYWORD_CHARS {
+                continue;
+            }
+            let needle = skills::fold_fa(kw);
+            if !needle.trim().is_empty() && folded.contains(&needle) {
+                hits += 1;
+                longest = longest.max(needle.chars().count());
+            }
+        }
+        if hits > 0 {
+            scored.push((hits, longest, skill.clone()));
+        }
+    }
+    // More matched keywords wins; a longer phrase breaks the tie, because a
+    // longer match is the more specific request.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    scored.into_iter().take(AUTO_ATTACH_MAX).map(|(_, _, s)| s).collect()
+}
+
+/// The catalog budget the user configured, in bytes.
+///
+/// The value lives in `settings.json` — the same file a headless scheduled run
+/// reads — so both paths agree on one number. Anything missing, unreadable or
+/// out of range falls back to the default: a broken settings file must never
+/// ship an empty catalog, which is the one failure that hides every skill.
+fn configured_catalog_max(root: &str) -> usize {
+    std::fs::read_to_string(std::path::Path::new(root).join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v| v["skillCatalogMaxChars"].as_u64())
+        .map(|n| (n as usize).clamp(CATALOG_MAX_MIN, CATALOG_MAX_LIMIT))
+        .unwrap_or(CATALOG_MAX_DEFAULT)
+}
+
 /// Build the SKILLS section for one turn: the catalog of installed skills plus
 /// the bodies of the ones the user attached.
 ///
 /// The catalog is what makes on-demand loading possible — without it the model
-/// has no way to know a skill exists. WHICH skill applies is the model's call
-/// (`load_skill`), the way Codex and Claude do it: scoring the prompt against
-/// keywords picked the wrong skill often enough to be worse than no pick at all.
-pub fn build_section(_prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
+/// has no way to know a skill exists. WHICH skill applies is normally the
+/// model's call (`load_skill`), the way Codex and Claude do it — except for the
+/// Persian keywords, which are matched here as well (see `match_by_keywords`).
+pub fn build_section(prompt: &str, root: &str, manual_names: &[String]) -> SkillSection {
+    build_section_with_cap(prompt, root, manual_names, configured_catalog_max(root))
+}
+
+/// `build_section` with an explicit catalog budget and the resolved setting.
+pub fn build_section_with_cap(
+    prompt: &str,
+    root: &str,
+    manual_names: &[String],
+    catalog_max: usize,
+) -> SkillSection {
     let all = load_skills(root);
     let mut text = String::new();
 
-    let listed = catalog(&all);
+    let listed = catalog_at(&all, catalog_max);
     if !listed.is_empty() {
         text.push_str(
             "\n\n=== AVAILABLE SKILLS ===\n\
@@ -417,12 +542,28 @@ pub fn build_section(_prompt: &str, root: &str, manual_names: &[String]) -> Skil
             None => missing.push(n.clone()),
         }
     }
+    // Persian keywords are matched here as well as in the model's head: an
+    // explicit `@mention` always wins, and this only ever ADDS a skill the
+    // prompt's own words already point at.
+    let auto = match_by_keywords(&all, prompt, &picked);
+    let auto_names: Vec<&str> = auto
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let picked: Vec<&Value> = picked.into_iter().chain(auto.iter()).collect();
     if !picked.is_empty() {
         text.push_str(
             "\n\n=== ATTACHED SKILLS ===\n\
              The user attached these skills to this turn — follow their \
              instructions and do NOT call load_skill for them.\n",
         );
+        if !auto_names.is_empty() {
+            text.push_str(&format!(
+                "(Matched from the request's Persian keywords, not attached by hand: {}. \
+                 If one of them is NOT what the request needs, ignore it.)\n",
+                auto_names.join(", ")
+            ));
+        }
         text.push_str(
             &picked
                 .iter()
@@ -450,6 +591,27 @@ mod tests {
         })
     }
 
+    /// One single-skill bundle on disk — the only shape a skill has now.
+    ///
+    /// A skill can no longer sit in a store of its own, so a test that wants one
+    /// installed has to write the bundle that carries it.
+    fn write_bundle(root: &std::path::Path, name: &str, description: &str, fa: &str, body: &str) {
+        let slug = name.to_lowercase().replace(' ', "-");
+        let bundle = root.join("plugins").join(&slug);
+        std::fs::create_dir_all(bundle.join("skills").join(&slug)).unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            json!({ "name": name, "slug": slug, "enabled": true }).to_string(),
+        )
+        .unwrap();
+        let mut md = format!("---\nname: {name}\ndescription: {description}\n");
+        if !fa.is_empty() {
+            md.push_str(&format!("fa_keywords: {fa}\n"));
+        }
+        md.push_str(&format!("---\n{body}\n"));
+        std::fs::write(bundle.join("skills").join(&slug).join("skill.md"), md).unwrap();
+    }
+
     #[test]
     fn catalog_splits_persian_comma_keywords() {
         // A list typed with the Persian comma (`فیلم، سریال`) used to survive as
@@ -457,13 +619,7 @@ mod tests {
         // missing from the catalog line.
         let dir = std::env::temp_dir().join(format!("codifa-skill-fa-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sdir = dir.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم، سریال, سینما\n---\nBODY\n",
-        )
-        .unwrap();
+        write_bundle(&dir, "Movie Finder", "find movies", "فیلم، سریال, سینما", "BODY");
         let root = dir.to_str().unwrap();
 
         let listed = catalog(&load_skills(root));
@@ -475,56 +631,140 @@ mod tests {
     }
 
     #[test]
-    fn build_section_never_picks_a_skill_from_the_prompt() {
-        // Auto-match is GONE on purpose: scoring the prompt against keywords
-        // picked the wrong skill often enough to be worse than no pick at all.
-        // The router only lists the catalog now, and WHICH skill applies is the
-        // model's call through `load_skill` (the Codex/Claude model). A
-        // regression here would silently inline a skill again and move the
-        // cached system-prompt prefix with it.
+    fn build_section_matches_the_prompt_by_persian_keywords() {
+        // Auto-match by SCORING is gone (it picked the wrong skill often enough
+        // to be worse than nothing), but the user's own Persian keywords are now
+        // matched in code: leaving it to the model meant weak models never called
+        // `load_skill` at all. A prompt that carries a skill's own keyword
+        // attaches it; anything else must stay out.
         let dir =
             std::env::temp_dir().join(format!("codifa-skill-nomatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sdir = dir.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم, سینما\n---\nBODY\n",
-        )
-        .unwrap();
+        write_bundle(&dir, "Movie Finder", "find movies", "فیلم, سینما", "BODY");
         let root = dir.to_str().unwrap();
 
-        // The prompt carries the skill's own keyword and still nothing is inlined.
+        // The user's own phrase in the request attaches the skill's body.
         let section = build_section("یه فیلم خوب معرفی کن", root, &[]);
         assert!(section.text.contains("- Movie Finder"), "{}", section.text);
-        assert!(!section.text.contains("BODY"), "{}", section.text);
+        assert!(section.text.contains("BODY"), "{}", section.text);
 
-        // An explicit @mention is the only route to a body.
-        let attached = build_section("یه فیلم خوب معرفی کن", root, &["Movie Finder".into()]);
+        // A request that shares nothing with the keywords stays untouched — the
+        // catalog is still there, the body is not.
+        let unrelated = build_section("این کد را ریفکتور کن", root, &[]);
+        assert!(unrelated.text.contains("- Movie Finder"), "{}", unrelated.text);
+        assert!(!unrelated.text.contains("BODY"), "{}", unrelated.text);
+
+        // An explicit @mention keeps working on its own.
+        let attached = build_section("بدون کلمه کلیدی", root, &["Movie Finder".into()]);
         assert!(attached.text.contains("BODY"), "{}", attached.text);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn catalog_names_the_slash_command_of_a_plugin_skill() {
-        // The plugin's own install output tells the user "try /ponytail", and
-        // the composer only knows a command the full catalog contains. Naming
-        // the command in the catalog is what lets the model explain it — and a
-        // standalone skill has no command, so it must not grow one.
+    fn keyword_match_folds_arabic_letters_and_ignores_short_phrases() {
+        // The Arabic yeh/kaf and the ZWNJ are invisible to the user: a keyword
+        // typed with `ي` must still find the request typed with `ی`.
+        let all = vec![
+            json!({"name": "Translate", "fa_keywords": ["ترجمة كن"]}),
+            json!({"name": "Noisy", "fa_keywords": ["کن"]}),
+            json!({"name": "Silent", "fa_keywords": ["هیچ"]}),
+        ];
+        let hits = match_by_keywords(&all, "این متن را ترجمه کن", &[]);
+        let names: Vec<&str> = hits.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(names, vec!["Translate"], "{names:?}");
+    }
+
+    #[test]
+    fn keyword_match_attaches_at_most_the_cap_and_skips_manual_skills() {
+        // Every auto-attached body is inlined, so the number of hits is bounded:
+        // a shared keyword among many skills must not blow the turn up.
+        let all: Vec<Value> = (0..10)
+            .map(|i| json!({"name": format!("Skill {i}"), "fa_keywords": ["فیلم"]}))
+            .collect();
+        assert!(match_by_keywords(&all, "یه فیلم بده", &[]).len() <= AUTO_ATTACH_MAX);
+
+        // A skill already attached by hand is never counted twice.
+        let manual = vec![all[0].clone()];
+        let refs: Vec<&Value> = manual.iter().collect();
+        for hit in match_by_keywords(&all, "یه فیلم بده", &refs) {
+            assert_ne!(hit["name"], all[0]["name"]);
+        }
+
+        // No keywords in the prompt = nothing attached at all.
+        assert!(match_by_keywords(&all, "", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_custom_catalog_cap_is_honoured() {
+        // Settings → Skills can raise the cap, so the budget must actually be
+        // the argument — and a raised cap must fit MORE names, not the same.
+        let all: Vec<Value> = (0..80)
+            .map(|i| skill(&format!("Skill {i}"), "a description long enough to fill the cap"))
+            .collect();
+        let small = catalog_at(&all, CATALOG_MAX_MIN);
+        let big = catalog_at(&all, CATALOG_MAX_LIMIT);
+        assert!(small.len() <= CATALOG_MAX_MIN, "{} bytes", small.len());
+        assert!(big.len() <= CATALOG_MAX_LIMIT, "{} bytes", big.len());
+        assert!(big.len() > small.len(), "raising the cap must list more");
+        assert!(big.contains("- Skill 79"), "the tail must survive a bigger cap");
+    }
+
+    #[test]
+    fn catalog_names_the_bundle_command_not_one_per_skill() {
+        // The palette offers ONE command per plugin (`/<plugin> <skill>`), and
+        // the catalog has to teach the model the same shape: a library of 26
+        // skills must not read as 26 top-level commands.
         let rows = vec![
             json!({
                 "name": "Ponytail",
                 "slug": "ponytail",
                 "description": "lazy senior dev",
                 "plugin": "Ponytail",
+                "plugin_slug": "ponytail",
+            }),
+            json!({
+                "name": "Ponytail Audit",
+                "slug": "ponytail-audit",
+                "description": "repo audit",
+                "plugin": "Ponytail",
+                "plugin_slug": "ponytail",
             }),
             json!({"name": "Movie Finder", "description": "find movies"}),
         ];
         let listed = catalog(&rows);
-        assert!(listed.contains("- Ponytail (command: /ponytail)"), "{listed}");
-        assert!(!listed.contains("/movie-finder"), "{listed}");
+        assert!(
+            listed.contains("- Ponytail (command: /ponytail ponytail)"),
+            "{listed}"
+        );
+        // The skill's own slug is the SECOND word, never a command of its own.
+        assert!(!listed.contains("/ponytail-audit"), "{listed}");
+        // A standalone skill has no command at all.
         assert!(listed.contains("- Movie Finder: find movies"), "{listed}");
+    }
+
+    #[test]
+    fn bundle_keywords_trigger_a_skill_that_carries_none_of_its_own() {
+        // A library whose skills have no Persian words of their own still has to
+        // answer a Persian ask — through the BUNDLE's list, which the row now
+        // carries separately instead of having it copied onto every skill.
+        let rows = vec![json!({
+            "name": "Bare Skill",
+            "slug": "bare-skill",
+            "bundle_keywords": ["ترجمه", "برگردان"],
+        })];
+        let hit = match_by_keywords(&rows, "این متن را ترجمه کن", &[]);
+        assert_eq!(hit.len(), 1, "the bundle trigger must still reach the skill");
+
+        // A skill's OWN list wins: the bundle's words must not attach it too.
+        let own = vec![json!({
+            "name": "Own Words",
+            "slug": "own-words",
+            "fa_keywords": ["فیلم"],
+            "bundle_keywords": ["ترجمه"],
+        })];
+        assert!(match_by_keywords(&own, "این متن را ترجمه کن", &[]).is_empty());
+        assert_eq!(match_by_keywords(&own, "یک فیلم معرفی کن", &[]).len(), 1);
     }
 
     #[test]
@@ -631,13 +871,7 @@ mod tests {
         let root = dir.to_str().unwrap();
 
         assert!(load_skills(root).is_empty());
-        let sdir = dir.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\n---\nBODY\n",
-        )
-        .unwrap();
+        write_bundle(&dir, "Movie Finder", "find movies", "", "BODY");
         let after = load_skills(root);
         assert_eq!(after.len(), 1, "{after:?}");
         assert_eq!(after[0]["name"], "Movie Finder");
@@ -670,17 +904,11 @@ mod tests {
         // catalog in the prompt. The duty is restated directly UNDER the list.
         let dir = std::env::temp_dir().join(format!("codifa-skill-tail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sdir = dir.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم\n---\nBODY\n",
-        )
-        .unwrap();
+        write_bundle(&dir, "Movie Finder", "find movies", "فیلم", "BODY");
         let root = dir.to_str().unwrap();
 
         let text = build_section("", root, &[]).text;
-        let line = "- Movie Finder: find movies";
+        let line = "- Movie Finder";
         let listed_at = text.find(line).expect("catalog line");
         let restated_at = text.find("call load_skill for it").expect("restated duty");
         assert!(
@@ -696,19 +924,14 @@ mod tests {
     fn build_section_lists_catalog_and_inlines_attached() {
         let dir = std::env::temp_dir().join(format!("codifa-skill-router-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sdir = dir.join("skills").join("movie-finder");
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(
-            sdir.join("skill.md"),
-            "---\nname: Movie Finder\ndescription: find movies\nfa_keywords: فیلم\n---\nBODY HERE\n",
-        )
-        .unwrap();
+        write_bundle(&dir, "Movie Finder", "find movies", "فیلم", "BODY HERE");
         let root = dir.to_str().unwrap();
 
         // The catalog is what lets the model load a skill on demand.
         let plain = build_section("", root, &[]);
         assert!(plain.text.contains("=== AVAILABLE SKILLS ==="), "{}", plain.text);
-        assert!(plain.text.contains("Movie Finder: find movies"), "{}", plain.text);
+        assert!(plain.text.contains("- Movie Finder"), "{}", plain.text);
+        assert!(plain.text.contains("find movies"), "{}", plain.text);
         // The cap is stated, and the escape hatch with it: a store of hundreds
         // of skills overflows this list, and "absent from the list" must not be
         // readable as "not installed".

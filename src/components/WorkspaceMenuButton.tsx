@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/fs";
+import { useViewerTabs } from "../lib/viewerTabs";
 import { FinderIcon, FolderIcon, TerminalIcon, isMacOS } from "./MacAppIcons";
 
 /** Single titlebar control for the two workspace shortcuts: the collapsed
@@ -50,11 +51,14 @@ export function WorkspaceMenuButton({ root }: { root?: string }) {
     void api.openWorkspaceFolder(root).then((res) => {
       if (!res.ok) console.warn("[workspace] reveal failed:", res.error);
     });
-  const terminal = () =>
-    root &&
-    void api.openWorkspaceTerminal(root).then((res) => {
-      if (!res.ok) console.warn("[workspace] terminal failed:", res.error);
-    });
+  // In-app only: the terminal never leaves the app, so this opens a fresh
+  // terminal tab in the right pane sitting at the workspace root.
+  const terminal = () => {
+    if (!root) return;
+    const v = useViewerTabs.getState();
+    v.setPaneOpen(true);
+    v.openTerminal({ cwd: root, fresh: true });
+  };
 
   return (
     <div className="ws-menu-wrap titlebar-ws-menu-wrap" ref={wrapRef}>

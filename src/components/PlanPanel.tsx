@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
-import { latestPlanDoc } from "../lib/planDoc";
+import { isPlanDoc, latestPlanDoc } from "../lib/planDoc";
 import { fetchPlan } from "../lib/api";
 import { prepareContent } from "../lib/bidi";
 import { mdComponents } from "./ChatMessage";
@@ -39,7 +39,11 @@ export function PlanPanel({ chatId }: { chatId?: string } = {}) {
     if (planDoc || !chat?.root) return;
     fetchPlan(chat.root, chat.id)
       .then((p) => {
-        if (alive && p?.content) setDiskPlan({ title: p.title || "", body: p.content });
+        // A plan.md written by the old save can be a conversational answer
+        // rather than the plan — showing it would fill the panel with the chat.
+        if (alive && p?.content && isPlanDoc({ body: p.content })) {
+          setDiskPlan({ title: p.title || "", body: p.content });
+        }
       })
       .catch(() => {});
     return () => {

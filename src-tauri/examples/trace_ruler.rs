@@ -207,6 +207,12 @@ fn report(path: &Path) {
     let mut lookup_dups: BTreeMap<(u64, String), (usize, usize)> = BTreeMap::new();
     let mut unnamed_tools = 0usize;
     let mut errors = 0usize;
+    // Deterministic levers that fired: counted from `detail.levers`, which the
+    // backend writes from the result text itself. Before this flag the only
+    // evidence was the round count, which cannot tell "the lever fired and the
+    // model ignored it" from "the lever never ran" — the exact confusion that
+    // made the textual single-call hint look effective for eight phases.
+    let mut lever_fires: BTreeMap<String, (usize, usize)> = BTreeMap::new();
 
     for row in &rows {
         let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
@@ -294,6 +300,17 @@ fn report(path: &Path) {
                 }
                 if sub {
                     stat.sub_calls += 1;
+                }
+                for lever in detail
+                    .get("levers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    let e = lever_fires.entry(lever.to_string()).or_default();
+                    e.0 += 1;
+                    e.1 += model_chars.unwrap_or(0) as usize;
                 }
                 // Duplicate lookups INSIDE one run: identical arguments to a
                 // read-only tool that the agent's own guard should have answered
@@ -489,6 +506,30 @@ fn report(path: &Path) {
         "   F) reads         : {}",
         tools.get("read").map(|s| s.calls).unwrap_or(0)
     );
+    if !lever_fires.is_empty() {
+        // One line per lever, with the model-side payload it carried: the lever
+        // is only a WIN when the payload it appended replaces a later round.
+        println!("   F2) levers fired (deterministic, backend-decided):");
+        for (lever, (n, chars)) in &lever_fires {
+            println!("      {lever:<26} fired={n:<5} model payload={chars}");
+        }
+    }
+    // The lone-call lever is invisible in `levers` (it rides an existing result
+    // instead of producing one), and `hints_delivered` folds it together with
+    // the discovery-streak nudges — so a rise there cannot answer whether THIS
+    // lever spoke. Pulled from its own counter: a high number means the model
+    // kept spending one call per round despite being told, which is the shape
+    // the lever exists to remove.
+    let lone_hints: u64 = rows
+        .iter()
+        .filter_map(|r| r.get("detail"))
+        .filter_map(|d| d.get("lone_call_hints"))
+        .filter_map(|v| v.as_u64())
+        .max()
+        .unwrap_or(0);
+    if lone_hints > 0 {
+        println!("   F3) lone-call hints: {lone_hints} delivered this run");
+    }
     // The prefix-cache hit rate is the number that says whether the gateway is
     // re-billing the same system prompt + tool array on every round-trip.
     println!("   H) prefix cache  : all   {}", total_usage.cache_line());

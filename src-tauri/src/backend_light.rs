@@ -119,6 +119,11 @@ pub struct ModelTestBody {
     model: String,
     #[serde(default)]
     models: Vec<String>,
+    /// The provider ROW the picker is testing against. A model can be listed by
+    /// several providers, so without it the probe would run on whichever row
+    /// happened to match the kind.
+    #[serde(default)]
+    provider_id: String,
 }
 
 /// Probe one model with a tiny completion; returns the reply or the reason.
@@ -138,6 +143,11 @@ async fn probe_model(body: &ModelTestBody, model: &str) -> Result<String, String
     let (r_level, r_model, r_auto) = crate::llm::reasoning_fields(&body.provider, "", false);
     let cfg = LlmConfig {
         provider: body.provider.clone(),
+        provider_id: if body.provider_id.is_empty() {
+            body.provider.clone()
+        } else {
+            body.provider_id.clone()
+        },
         model: model.to_string(),
         base_url: body.base_url.clone(),
         api_keys: keys,
@@ -324,6 +334,10 @@ pub struct GitAutoCommitBody {
     pub thinking_level: String,
     #[serde(default)]
     pub model_reasoning: bool,
+    /// Provider rows, so the level is checked against the list a source really
+    /// enumerated for this model before it is sent.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, Value>,
 }
 
 /// Stage everything, ask the model for a Conventional-Commits message from the
@@ -367,10 +381,22 @@ async fn git_autocommit(Json(body): Json<GitAutoCommitBody>) -> Response<Body> {
     // this handler then reports as "the model returned an empty commit
     // message". The chat path passes both as None (see agent.rs's LlmConfig),
     // so the provider's own defaults apply.
-    let (r_level, r_model, r_auto) =
-        crate::llm::reasoning_fields(&body.provider, body.thinking_level.trim(), body.model_reasoning);
+    let (r_level, r_model, r_auto) = crate::llm::reasoning_fields(
+        &body.provider,
+        &crate::llm::level_from_source(
+            crate::agent::provider_model_thinking_levels(
+                &body.providers,
+                &body.provider_id,
+                &body.model,
+            )
+            .as_deref(),
+            &body.thinking_level,
+        ),
+        body.model_reasoning,
+    );
     let cfg = LlmConfig {
         provider: body.provider.clone(),
+        provider_id: body.provider_id.clone(),
         model: body.model.clone(),
         base_url: body.base_url.clone(),
         api_keys: keys,
@@ -453,7 +479,9 @@ async fn git_push(Json(body): Json<git::PushBody>) -> Response<Body> {
 // ---------- skills / mcp (native) + system-prompts (native appstate) ----------
 
 async fn skills_list(State(st): State<AppState>) -> Response<Body> {
-    Json(skills::list_skills(&st.root())).into_response()
+    // Every skill there is, from every bundle, enabled or not — a skill has no
+    // store of its own any more, so this IS the list Settings edits.
+    Json(json!({ "skills": crate::plugins::all_plugin_skills(&st.root()) })).into_response()
 }
 
 /// Every skill the agent can actually load: the standalone store PLUS the
@@ -478,14 +506,10 @@ struct SkillFileQuery {
 }
 
 async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>) -> Response<Body> {
-    // A plugin's skills are served from the plugin folder, so resolve that first
-    // — otherwise an extra file of a plugin skill 404s while its skill.md loads.
     let root = st.root();
-    let read = match crate::plugins::plugin_of_skill(&root, &q.name)
-        .and_then(|slug| crate::plugins::find_skill_dir(&root, &slug, &q.name))
-    {
+    let read = match crate::plugins::skill_dir_for(&root, &q.name) {
         Some(dir) => skills::read_extra_file(&dir, &q.name, &q.file),
-        None => skills::read_skill_file(&root, &q.name, &q.file),
+        None => Err(format!("skill not found: {}", q.name)),
     };
     match read {
         Ok(v) => Json(v).into_response(),
@@ -496,25 +520,56 @@ async fn skills_file(State(st): State<AppState>, Query(q): Query<SkillFileQuery>
 }
 
 async fn skills_sync(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::sync_skill(&st.root(), &body) {
+    // A skill lives inside a bundle (its own when it is new), so the writer owns
+    // the routing: it finds the owning bundle — matched on the new name AND the
+    // previous one so a rename stays put — instead of the caller naming a store.
+    let root = st.root();
+    if body["delete"].as_bool().unwrap_or(false) {
+        let name = body["name"].as_str().unwrap_or("");
+        return match crate::plugins::delete_bundle_skill(&root, name) {
+            Ok(v) => Json(v).into_response(),
+            Err(msg) => bad_request(&msg),
+        };
+    }
+    match crate::plugins::save_bundle_skill(&root, body.clone()) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
 }
 
-async fn mcp_list(State(st): State<AppState>) -> Response<Body> {
-    Json(skills::list_mcp(&st.root())).into_response()
+/// Every skill of every plugin, enabled or not, tagged with its owning plugin.
+///
+/// `/skills/available` deliberately returns only what the agent can load RIGHT
+/// NOW, so Settings needed a second source to show (and edit) a switched-off
+/// bundle's contents.
+async fn plugins_skills(State(st): State<AppState>) -> Response<Body> {
+    Json(json!({ "skills": crate::plugins::all_plugin_skills(&st.root()) })).into_response()
 }
 
-async fn mcp_save(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::save_mcp(&st.root(), &body) {
+/// Every connector that exists, tagged with its owning bundle.
+///
+/// A connector belongs to a bundle (one of its own when it was written alone), so
+/// this is the single list Settings and the composer read — there is no second
+/// connector store to merge with.
+async fn plugins_mcp(State(st): State<AppState>) -> Response<Body> {
+    Json(json!({ "connectors": crate::plugins::all_plugin_connectors(&st.root()) }))
+        .into_response()
+}
+
+/// Every script of every plugin, enabled or not, tagged with its owning bundle.
+async fn plugins_scripts(State(st): State<AppState>) -> Response<Body> {
+    Json(json!({ "scripts": crate::plugins::all_plugin_scripts(&st.root()) })).into_response()
+}
+
+async fn plugins_mcp_save(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::save_bundle_connector(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
 }
 
-async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match skills::delete_mcp(&st.root(), &body) {
+async fn plugins_mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    match crate::plugins::delete_bundle_connector(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => bad_request(&msg),
     }
@@ -524,6 +579,21 @@ async fn mcp_delete(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
 
 async fn plugins_list(State(st): State<AppState>) -> Response<Body> {
     Json(crate::plugins::list_plugins(&st.root())).into_response()
+}
+
+/// Query of `GET /plugins/marketplace`: the same three arguments an install
+/// takes, so the address a browse used is exactly the one a later install (and
+/// an "update from source") repeats.
+#[derive(serde::Deserialize)]
+struct MarketplaceQuery {
+    repo: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    git_ref: String,
+    /// Skip a still-fresh disk copy (the explicit Refresh button).
+    #[serde(default)]
+    refresh: bool,
 }
 
 async fn plugins_create(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
@@ -554,11 +624,47 @@ async fn plugins_delete(State(st): State<AppState>, Json(body): Json<Value>) -> 
     }
 }
 
+/// Run one of a plugin's scripts. A Rust script compiles on first use, so this
+/// is a blocking task exactly like the repo read an install does.
+async fn plugins_run(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    let root = st.root();
+    match tokio::task::spawn_blocking(move || crate::plugins::run_plugin_script(&root, &body)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(msg)) => bad_request(&msg),
+        Err(e) => bad_request(&format!("the script runner stopped: {e}")),
+    }
+}
+
 /// Install a bundle from a repo. Reading the repo is blocking (git-less HTTP on
 /// a plain thread), so the handler stays off the async worker.
+/// Read a marketplace INDEX (a repo's plugin catalogue). Read-only: browsing a
+/// marketplace writes nothing, so it needs no `spawn_blocking` guard beyond the
+/// blocking HTTP read a plain install already does.
+async fn plugins_marketplace(
+    State(st): State<AppState>,
+    Query(q): Query<MarketplaceQuery>,
+) -> Response<Body> {
+    let cache = st.root().join("cache");
+    match tokio::task::spawn_blocking(move || {
+        crate::repo::read_index_cached(&cache, &q.repo, &q.path, &q.git_ref, q.refresh)
+    })
+    .await
+    {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(msg)) => bad_request(&msg),
+        Err(e) => bad_request(&format!("marketplace read failed: {e}")),
+    }
+}
+
 async fn plugins_install(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
-    match tokio::task::spawn_blocking(move || crate::plugins::install_plugin(&st.root(), &body))
-        .await
+    // Dispatches on the row's `kind`: a marketplace's Skills tab writes the
+    // skills store and its MCP tab writes the connector store, so an installed
+    // skill actually shows up under Settings → Skills and an installed connector
+    // under Settings → MCP.
+    match tokio::task::spawn_blocking(move || {
+        crate::plugins::install_from_marketplace(&st.root(), &body)
+    })
+    .await
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(msg)) => bad_request(&msg),
@@ -628,33 +734,23 @@ struct CompactBody {
     api_key: String,
     #[serde(default)]
     api_keys: Vec<String>,
-    #[serde(default)]
-    fallback_provider: String,
-    #[serde(default)]
-    fallback_model: String,
-    #[serde(default)]
-    fallback_base_url: String,
-    #[serde(default)]
-    fallback_api_key: String,
-    /// The chat provider's ordered key list. The renderer sends this PLURAL form
-    /// on every other route; without it declared here the field was silently
-    /// dropped and the appended chat-model rung fell back to the summariser
-    /// slot's keys — a different provider's key against the chat's endpoint,
-    /// which is a guaranteed "Invalid API key" 401.
-    #[serde(default)]
-    fallback_api_keys: Vec<String>,
+    // The renderer still sends its chat-level fallback pair (`fallback_*`). It
+    // is deliberately NOT declared: a tool falls back only to the models the
+    // user picked for it in Settings, so the field is accepted and ignored
+    // rather than plumbed into the chain.
     /// Effective provider id of the chat's own provider — the 4th element of
     /// a resolved slot, so cross-provider usage is attributed correctly.
     #[serde(default)]
     provider_id: String,
-    /// Main-model reasoning effort + capability flag, and the per-slot
-    /// overrides (the "compact" entry wins when present).
-    #[serde(default)]
-    thinking_level: String,
+    /// Main-model reasoning capability flag, and the per-slot overrides (the
+    /// "Other" group's entry wins when present).
     #[serde(default)]
     model_reasoning: bool,
     #[serde(default)]
     subagent_thinking: std::collections::HashMap<String, String>,
+    // The renderer also sends `thinking_level` for the chat model. It is NOT
+    // declared on purpose: a side-task call takes its effort from
+    // `subagent_thinking` (missing = OFF) and must never inherit the chat's.
     #[serde(default)]
     history: Vec<Value>,
     #[serde(default)]
@@ -684,6 +780,97 @@ fn default_provider() -> String {
 /// sub-agent slots; mirrors graph.py resolve_subagent_model. The returned
 /// provider id is the EFFECTIVE one (the provider actually called), so usage
 /// events and the Model-usage panel attribute tokens to the right provider.
+/// Split a Tool Models entry into `(provider_id, model)`.
+///
+/// A slash is a provider prefix ONLY when its head names a provider this
+/// request actually configured. Model ids routinely carry a vendor namespace
+/// ("oc/deepseek-v4.1-flash-free", "z-ai/glm-5.3", "deepseek-ai/DeepSeek-…"),
+/// and splitting those at the first slash invented a provider ("oc") that does
+/// not exist: `resolve_slot_target` then fell into its unknown-provider arm and
+/// sent the REMAINDER ("deepseek-v4.1-flash-free") to the parent provider,
+/// which answered `404 page not found` for a model it had never heard of — the
+/// exact failure that made a working model look broken inside a tool.
+///
+/// With an unknown head the whole entry stays the model id and the call keeps
+/// the parent provider.
+pub fn split_slot_entry<'a>(
+    entry: &'a str,
+    providers: &std::collections::HashMap<String, Value>,
+) -> (String, &'a str) {
+    let entry = entry.trim();
+    if let Some((head, rest)) = entry.split_once('/') {
+        let head = head.trim();
+        if !head.is_empty() {
+            if providers.contains_key(head) {
+                return (head.to_string(), rest.trim());
+            }
+            // Legacy KIND prefix ("custom/model"): the settings picker used to
+            // store the endpoint kind instead of the provider id. Resolving it
+            // keeps such a row on the provider it meant; otherwise the whole
+            // string travels as a model id and the endpoint answers 404. Only an
+            // UNAMBIGUOUS kind resolves — two rows of the same kind cannot be
+            // told apart, so there the entry stays a model id.
+            if let Some(id) = kind_owner(head, providers) {
+                return (id, rest.trim());
+            }
+        }
+    }
+    // No known provider prefix: the whole entry IS the model id. A row written
+    // before the pick carried its provider (or by hand) must still reach the
+    // endpoint that serves it, so a model listed by exactly ONE configured
+    // provider is attributed to that provider.
+    (owner_of_model(entry, providers).to_string(), entry)
+}
+
+/// The id of the single configured provider whose `kind` is `kind` — `None`
+/// when no row has that kind or when several share it (ambiguous).
+fn kind_owner(kind: &str, providers: &std::collections::HashMap<String, Value>) -> Option<String> {
+    let mut owner: Option<&String> = None;
+    for (id, cfg) in providers {
+        let matches = cfg
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|k| k == kind);
+        if !matches {
+            continue;
+        }
+        if owner.is_some() {
+            return None;
+        }
+        owner = Some(id);
+    }
+    owner.cloned()
+}
+
+/// The id of the single configured provider whose `/models` list contains
+/// `model` — `""` when none does, or when several claim it (ambiguous, so the
+/// parent provider stays in charge).
+fn owner_of_model<'a>(
+    model: &str,
+    providers: &'a std::collections::HashMap<String, Value>,
+) -> &'a str {
+    let mut owner = "";
+    for (id, cfg) in providers {
+        let listed = cfg
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .any(|m| m.trim() == model)
+            });
+        if !listed {
+            continue;
+        }
+        if !owner.is_empty() {
+            return "";
+        }
+        owner = id.as_str();
+    }
+    owner
+}
+
 pub fn resolve_slot_target(
     entry: &str,
     parent_model: &str,
@@ -701,10 +888,7 @@ pub fn resolve_slot_target(
             parent_provider_id.to_string(),
         );
     }
-    let (provider_id, model) = match entry.split_once('/') {
-        Some((pid, m)) => (pid.trim(), m.trim()),
-        None => ("", entry),
-    };
+    let (provider_id, model) = split_slot_entry(entry, providers);
     if provider_id.is_empty() {
         return (
             model.to_string(),
@@ -713,6 +897,7 @@ pub fn resolve_slot_target(
             parent_provider_id.to_string(),
         );
     }
+    let provider_id = provider_id.trim();
     match providers.get(provider_id) {
         Some(cfg) => {
             let base = cfg
@@ -805,10 +990,7 @@ pub fn resolve_slot_kind(
     parent_kind: &str,
     providers: &std::collections::HashMap<String, Value>,
 ) -> String {
-    let entry = entry.trim();
-    let Some((provider_id, _)) = entry.split_once('/') else {
-        return parent_kind.to_string();
-    };
+    let (provider_id, _) = split_slot_entry(entry, providers);
     let provider_id = provider_id.trim();
     if provider_id.is_empty() {
         return parent_kind.to_string();
@@ -986,6 +1168,7 @@ fn compact_progress_frame(p: &crate::compact::CompactProgress) -> Value {
         "attempt": p.attempt,
         "attempts": p.attempts_total,
         "model": p.model,
+        "provider_id": p.provider_id,
         "percent": p.percent,
         "budget_secs": p.budget_secs,
         "elapsed_secs": p.elapsed_secs,
@@ -1058,10 +1241,22 @@ async fn compact_worker(
     } else {
         compact_level
     };
-    let (r_level, r_model, r_auto) =
-        crate::llm::reasoning_fields(&slot_kind, level, body.model_reasoning);
+    let (r_level, r_model, r_auto) = crate::llm::reasoning_fields(
+        &slot_kind,
+        &crate::llm::level_from_source(
+            crate::agent::provider_model_thinking_levels(
+                &body.providers,
+                &slot_provider_id,
+                &model_name,
+            )
+            .as_deref(),
+            level,
+        ),
+        body.model_reasoning,
+    );
     let model = LlmConfig {
         provider: slot_kind,
+        provider_id: slot_provider_id.clone(),
         model: model_name.clone(),
         base_url,
         api_keys,
@@ -1096,16 +1291,22 @@ async fn compact_worker(
     .skip(1)
     .collect();
     // The full try order this compaction walks after its own model fails: the
-    // "Other" group's own fallback list (Settings → Tools) first, in the user's
-    // order, then the chat model as the last resort. `tool_fallbacks` is a
+    // "Other" group's own fallback list (Settings → Tools), in the user's order,
+    // and NOTHING else — the chat model is never appended. `tool_fallbacks` is a
     // per-CALL list — nothing is remembered, so the next compaction starts at the
     // summariser's own model again. Every rung inherits the SLOT's reasoning
     // level: a fallback changes the model and its routing, never the effort the
     // user chose for the tool.
-    let mut fallbacks: Vec<LlmConfig> = rungs
+    // The chat's own fallback pair (`fallback_*` on the wire) is deliberately
+    // IGNORED: a tool falls back only to the models picked for it in Settings,
+    // top to bottom. Appending the chat model padded every compaction with a
+    // model the user never chose for this tool — and made the visible fallback
+    // list a lie whenever the user's list was empty.
+    let fallbacks: Vec<LlmConfig> = rungs
         .iter()
         .map(|(m, b, keys, pid, k)| LlmConfig {
             provider: k.clone(),
+            provider_id: pid.clone(),
             model: m.clone(),
             base_url: b.clone(),
             api_keys: keys.clone(),
@@ -1117,41 +1318,6 @@ async fn compact_worker(
             auto_think: crate::models::auto_think_for(k),
         })
         .collect();
-    if !body.fallback_model.trim().is_empty() {
-        let fb_kind = if body.fallback_provider.is_empty() {
-            body.provider.clone()
-        } else {
-            body.fallback_provider.clone()
-        };
-        let (fb_level, fb_model, fb_auto) =
-            crate::llm::reasoning_fields(&fb_kind, body.thinking_level.trim(), body.model_reasoning);
-        fallbacks.push(LlmConfig {
-            provider: fb_kind,
-            model: body.fallback_model.clone(),
-            base_url: if body.fallback_base_url.is_empty() { body.base_url.clone() } else { body.fallback_base_url.clone() },
-            api_keys: if !body.fallback_api_keys.is_empty() {
-                body.fallback_api_keys.clone()
-            } else if !body.fallback_api_key.is_empty() {
-                vec![body.fallback_api_key.clone()]
-            } else if !body.api_keys.is_empty() {
-                // The chat's OWN keys, not the summariser slot's: this rung calls
-                // the chat model at the chat endpoint, so a slot key here is a
-                // guaranteed 401 that looks like the fallback never ran.
-                body.api_keys.clone()
-            } else if !body.api_key.is_empty() {
-                vec![body.api_key.clone()]
-            } else {
-                model.api_keys.clone()
-            },
-            temperature: Some(0.2),
-            max_tokens: Some(4096),
-            timeout_secs: 90,
-            // The chat model keeps the level its own turn would use.
-            reasoning_level: fb_level,
-            model_reasoning: fb_model,
-            auto_think: fb_auto,
-        });
-    }
     // The summarizer's token budget: the window the user sees, resolved through
     // the same capacity rule as the mid-turn trigger (a bare 0 must not fall back
     // to a private literal — see `resolve_compact_window`).
@@ -1178,7 +1344,7 @@ async fn compact_worker(
             json!({
                 "summary": out.summary,
                 "keep": out.keep,
-                "usage": normalize_compact_usage(out.usage, &model_name, &slot_provider_id),
+                "usage": normalize_compact_usage(out.usage, &out.model, &out.provider_id),
             }),
         ),
         Ok(None) => send_compact_frame(
@@ -1750,19 +1916,28 @@ pub fn router(state: AppState) -> Router {
         .route("/tts", post(crate::media::tts))
         .route("/skills", get(skills_list))
         .route("/skills/available", get(skills_available))
-        .route("/skills/file", get(skills_file))
+                .route("/skills/file", get(skills_file))
         .route("/skills/sync", post(skills_sync))
-        .route("/mcp", get(mcp_list).post(mcp_save))
-        .route("/mcp/delete", post(mcp_delete))
         // Plugins: one folder bundling skills + connectors behind a single
         // switch. Listed/edited from Settings; the agent writes them through
         // the `plugin` tool, which goes through the same module.
         .route("/plugins", get(plugins_list))
+        .route("/plugins/marketplace", get(plugins_marketplace))
         .route("/plugins/create", post(plugins_create))
         .route("/plugins/install", post(plugins_install))
         .route("/plugins/update", post(plugins_update))
         .route("/plugins/toggle", post(plugins_toggle))
         .route("/plugins/delete", post(plugins_delete))
+        // What is INSIDE the bundles: Settings lists and edits a plugin's own
+        // skills and connectors, enabled or not.
+        .route("/plugins/skills", get(plugins_skills))
+        .route("/plugins/scripts", get(plugins_scripts))
+        .route("/plugins/mcp", get(plugins_mcp))
+        .route("/plugins/mcp/save", post(plugins_mcp_save))
+        .route("/plugins/mcp/delete", post(plugins_mcp_delete))
+        // Run one of a bundle's scripts. Blocking (a `rustc` build on first use),
+        // so it stays off the async worker like the install route.
+        .route("/plugins/run", post(plugins_run))
         .route("/artifacts/get", get(artifact_get))
         .route("/artifacts/list", get(artifact_list))
         .route("/artifacts", delete(artifact_delete))
@@ -1805,6 +1980,13 @@ pub fn router(state: AppState) -> Router {
         .route("/schedule-runs/orphans", delete(crate::appstate::orphan_schedule_runs_clear))
         .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
         .route("/chats/title", post(crate::appstate::chat_title))
+        // Persian trigger phrases for a part's English description. The catalog
+        // matches on keywords, so a skill whose description is English-only is
+        // unreachable from a Persian request until someone writes them down.
+        .route(
+            "/plugins/keywords",
+            post(crate::appstate::persian_keywords),
+        )
         // In-app browser (migrated from the Python sidecar's browser_session):
         // the right-side panel polls frames and posts input here, while the
         // agent drives the same Chromium through the native `browser_driver`.
@@ -2147,8 +2329,16 @@ mod tests {
     async fn skills_and_mcp_serve_natively() {
         // Isolated data root so the test never touches the real ~/.codifa.
         let tmp = std::env::temp_dir().join(format!("codifa-test-{}", std::process::id()));
-        let skills_dir = tmp.join("skills").join("learn-from-docs");
+        // A skill and a connector both live inside a bundle now, so the fixture
+        // builds the folder the writer would.
+        let bundle = tmp.join("plugins").join("learn-from-docs");
+        let skills_dir = bundle.join("skills").join("learn-from-docs");
         std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            r#"{"name":"Learn from Docs","slug":"learn-from-docs","enabled":true}"#,
+        )
+        .unwrap();
         std::fs::write(
             skills_dir.join("skill.md"),
             "---\nname: Learn from Docs\ndescription: d\n---\n\n# Learn from Docs\nbody",
@@ -2177,13 +2367,14 @@ mod tests {
             "# Learn from Docs\nbody"
         );
 
-        // Native MCP save + list + delete round-trip.
+        // Native connector save + list + delete round-trip, through the BUNDLE
+        // routes: a connector is a part of a bundle, not a store entry.
         let res = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/mcp")
+                    .uri("/plugins/mcp/save")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"name":"docker","cfg":{"command":"docker"}}"#))
                     .unwrap(),
@@ -2196,7 +2387,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/mcp")
+                    .uri("/plugins/mcp")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2204,13 +2395,15 @@ mod tests {
             .unwrap();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["mcpServers"]["docker"]["command"], "docker");
+        assert_eq!(body["connectors"][0]["name"], "docker");
+        assert_eq!(body["connectors"][0]["cfg"]["command"], "docker");
 
         let res = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/mcp/delete")
+                    .uri("/plugins/mcp/delete")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"name":"docker"}"#))
                     .unwrap(),
@@ -2218,7 +2411,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
-        assert!(tmp.join("mcp").read_dir().unwrap().next().is_none());
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/plugins/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["connectors"].as_array().map(Vec::len), Some(0));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2413,13 +2617,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_chat_rung_uses_the_chat_key_not_the_slot_key() {
-        // The user's banner: `Compact failed — key rejected (401): Invalid API
-        // key`. The summariser slot ran on provider B while the chat ran on
-        // provider A, and the appended chat-model rung was built with the
-        // SLOT's key against the CHAT's endpoint — a guaranteed 401 that looks
-        // like the fallbacks were never tried. Each rung must carry the key of
-        // the provider it actually calls.
+    async fn compact_walks_the_slots_own_fallbacks_and_never_the_chat_model() {
+        // A tool falls back on the models the user picked FOR IT, top to bottom,
+        // and on nothing else. Two properties proved together:
+        //  * each rung carries the key of the provider it actually calls (a slot
+        //    key on another provider's endpoint is the 401 that looked like the
+        //    fallbacks were never tried);
+        //  * the CHAT model is never appended. It used to be, so a summariser
+        //    that failed on every model the user configured for it still
+        //    "succeeded" on a model they had not chosen for the job.
         let (mock_base, mut rx) = spawn_key_recording_upstream("dead-model").await;
         let app = router(new_state(std::env::temp_dir()));
         let body = json!({
@@ -2428,14 +2634,15 @@ mod tests {
             "model": "chat-model",
             "base_url": format!("{mock_base}/v1"),
             "api_keys": ["sk-chat"],
-            "fallback_provider": "custom",
+            // Sent by the renderer, and deliberately ignored by the route.
             "fallback_model": "chat-model",
-            "fallback_base_url": format!("{mock_base}/v1"),
             "fallback_api_keys": ["sk-chat"],
             "fallback_provider_id": "chat-prov",
-            "subagent_models": { "compact": "slot-prov/dead-model" },
+            "subagent_models": { "compact": "slot-a/dead-model" },
+            "tool_fallbacks": { "compact": ["slot-b/backup-model"] },
             "providers": {
-                "slot-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-slot"] },
+                "slot-a": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-a"] },
+                "slot-b": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-b"] },
                 "chat-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-chat"] }
             },
             "history": [
@@ -2460,15 +2667,66 @@ mod tests {
 
         let first = rx.recv().await.expect("the slot model was never called");
         assert_eq!(first.0, "dead-model");
-        assert_eq!(first.1, "bearer sk-slot", "the slot model must use the SLOT's key");
-        let second = rx.recv().await.expect("the chat-model rung was never reached");
-        assert_eq!(second.0, "chat-model");
-        assert_eq!(
-            second.1, "bearer sk-chat",
-            "the chat rung must use the CHAT's key — a slot key here is the 401 the user saw"
+        assert_eq!(first.1, "bearer sk-a", "rung 0 must use ITS OWN provider's key");
+        let second = rx
+            .recv()
+            .await
+            .expect("the slot's own fallback was never reached");
+        assert_eq!(second.0, "backup-model");
+        assert_eq!(second.1, "bearer sk-b", "rung 1 must use ITS OWN provider's key");
+        assert!(
+            rx.try_recv().is_err(),
+            "the chat model must never be appended to a tool's fallback list"
         );
         assert_eq!(out["summary"], "ok summary");
         assert!(out.get("error").is_none() || out["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn compact_attributes_the_usage_to_the_rung_that_answered() {
+        // Rung 0 dies on a real provider rejection, so the USER's own fallback
+        // answers. The usage event must name THAT provider and THAT model: it
+        // used to report rung 0's pair, which billed a compaction the fallback
+        // served to a provider that never answered.
+        let (mock_base, _rx) = spawn_key_recording_upstream("dead-model").await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "custom",
+            "provider_id": "chat-prov",
+            "model": "chat-model",
+            "base_url": format!("{mock_base}/v1"),
+            "api_keys": ["sk-chat"],
+            "subagent_models": { "compact": "slot-a/dead-model" },
+            "tool_fallbacks": { "compact": ["slot-b/backup-model"] },
+            "providers": {
+                "slot-a": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-a"] },
+                "slot-b": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-b"] }
+            },
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let (_progress, out) = parse_compact_sse(&bytes);
+        assert_eq!(out["summary"], "ok summary");
+        assert_eq!(
+            out["usage"]["provider_id"], "slot-b",
+            "usage must name the rung that answered, got {out}"
+        );
+        assert_eq!(out["usage"]["model"], "backup-model");
     }
 
     #[tokio::test]
@@ -2540,7 +2798,14 @@ mod tests {
             "subagent_thinking": { "compact": "max" },
             "model_reasoning": true,
             "providers": {
-                "slot-prov": { "kind": "custom", "baseUrl": format!("{mock_base}/v1"), "apiKeys": ["sk-slot"] }
+                "slot-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{mock_base}/v1"),
+                    "apiKeys": ["sk-slot"],
+                    // The levels the model was described with. Only a level a
+                    // source named may be sent for it.
+                    "thinkingLevelsMap": { MOCK_MODEL: ["none", "low", "medium", "high", "xhigh"] }
+                }
             },
             "history": [
                 { "role": "user", "content": "hello" },
@@ -2564,7 +2829,7 @@ mod tests {
 
         let sent = rx.recv().await.expect("mock upstream saw no request");
         assert_eq!(sent["model"], MOCK_MODEL, "the slot model must be sent, got {sent}");
-        assert_eq!(sent["reasoning_effort"], "high", "slot thinking=max must map to the strongest accepted token, got {sent}");
+        assert_eq!(sent["reasoning_effort"], "xhigh", "slot thinking=max must reach the wire verbatim, since its source enumerated it, got {sent}");
         let usage = &out["usage"];
         assert_eq!(usage["model"], MOCK_MODEL);
         assert_eq!(usage["provider_id"], "slot-prov", "usage must be attributed to the effective provider, got {usage}");
@@ -2660,6 +2925,47 @@ mod tests {
     }
 
     #[test]
+    fn a_slash_is_a_provider_prefix_only_for_a_configured_provider() {
+        // The user's 404: `oc/deepseek-v4.1-flash-free` was stored bare, then
+        // split at the FIRST slash — provider `oc` (which does not exist) and
+        // the model truncated to `deepseek-v4.1-flash-free`, sent to the chat
+        // provider's endpoint. Only a KNOWN provider id may be taken as a
+        // prefix; otherwise the whole string is the model id.
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "9router".to_string(),
+            serde_json::json!({"kind": "custom", "baseUrl": "http://r/v1", "apiKeys": ["sk-r"]}),
+        );
+        let (pid, model) = split_slot_entry("oc/deepseek-v4.1-flash-free", &providers);
+        assert_eq!(pid, "");
+        assert_eq!(model, "oc/deepseek-v4.1-flash-free");
+
+        // A configured head IS a prefix, and the model keeps its own slashes.
+        let (pid, model) = split_slot_entry("9router/oc/deepseek-v4.1-flash-free", &providers);
+        assert_eq!(pid, "9router");
+        assert_eq!(model, "oc/deepseek-v4.1-flash-free");
+
+        // No slash at all: a bare model id.
+        let (pid, model) = split_slot_entry("z-ai/glm-5.3", &providers);
+        assert_eq!(pid, "");
+        assert_eq!(model, "z-ai/glm-5.3");
+    }
+
+    #[test]
+    fn a_bare_slash_bearing_model_still_routes_to_the_parent() {
+        // End to end through the resolver: the provider id must NOT be invented
+        // from the model's own namespace, or the call lands on a provider that
+        // does not exist (or guesses the parent's endpoint with a truncated id).
+        let providers = std::collections::HashMap::new();
+        let (model, base, keys, pid) =
+            resolve_slot_target("oc/deepseek-v4.1-flash-free", "chat", "http://c/v1", &["sk-c".into()], "chat-prov", &providers);
+        assert_eq!(model, "oc/deepseek-v4.1-flash-free");
+        assert_eq!(base, "http://c/v1");
+        assert_eq!(keys, vec!["sk-c".to_string()]);
+        assert_eq!(pid, "chat-prov");
+    }
+
+    #[test]
     fn slot_chain_keeps_the_arranged_order_without_repeats() {
         // The chain is what a tool's own model failure walks down: the tool's
         // model first, then its fallback list in the order the user arranged it
@@ -2680,8 +2986,10 @@ mod tests {
             "p1/gpt-x".to_string(),
             "p2/fb-b".to_string(),
             "".to_string(),
-            // Unknown provider id: still routable (bare model on the parent),
-            // so it survives as its own rung.
+            // An unknown HEADING is not a provider prefix: `ghost/fb-c` is a
+            // model id that merely contains a slash, routed like any other bare
+            // model. Slicing it would invent provider `ghost` AND truncate the
+            // model to `fb-c` — a 404 on the parent's endpoint.
             "ghost/fb-c".to_string(),
         ];
         let chain = resolve_slot_chain(
@@ -2695,7 +3003,7 @@ mod tests {
             &providers,
         );
         let models: Vec<&str> = chain.iter().map(|s| s.0.as_str()).collect();
-        assert_eq!(models, vec!["gpt-x", "fb-a", "fb-b", "fb-c"]);
+        assert_eq!(models, vec!["gpt-x", "fb-a", "fb-b", "ghost/fb-c"]);
         // Each rung routes to ITS OWN provider — base URL, keys and endpoint
         // kind — exactly like the slot entry itself.
         assert_eq!(chain[1].1, "http://two/v1");
@@ -2821,6 +3129,52 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// The same upstream, answering the user's REAL failure: a 429 whose body
+    /// says the account's free allowance is used up. Distinguished from the 401
+    /// upstream because the two reach the chain by different routes — a 401 is
+    /// already model-side, so a 429 that must ALSO fall through is the case
+    /// worth pinning.
+    async fn spawn_quota_exhausted_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = sock.read(&mut tmp).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let Ok(n) = sock.read(&mut tmp).await else { break };
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = r#"{"error":{"message":"[429]: {\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached.\"}","code":"rate_limit_exceeded"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn compact_live_walks_the_other_slots_fallback_when_the_key_is_rejected() {
         // The live failure this fixes: the "Other" slot's own provider rejects
@@ -2883,6 +3237,69 @@ mod tests {
         assert!(
             out["error"].is_null(),
             "a walked chain must not report an error, got {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_walks_past_a_quota_exhausted_429_to_the_users_own_fallback() {
+        // The exact banner the user reported:
+        // `Compact failed — every summarizer model failed — oc/deepseek-v4.1-flash-free:
+        //  key rejected (429): … FreeUsageLimitError … rate_limit_exceeded`.
+        //
+        // Only ONE model was ever named, although the user had two fallbacks
+        // configured for the "Other" slot. The 429 body carried a quota verdict
+        // (the account's free allowance for that model is gone), but the
+        // rate-limit gate classified it as a temporary hiccup, so the walk
+        // stopped at rung 0 and the user's list was never reached. The rung now
+        // spends its own budget and hands the call to the next model.
+        let exhausted_base = spawn_quota_exhausted_upstream().await;
+        let (good_base, mut rx) = spawn_mock_upstream().await;
+        let app = router(new_state(std::env::temp_dir()));
+        let body = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/m-main",
+            "base_url": "http://chat-provider.example/v1",
+            "api_keys": ["sk-chat"],
+            "subagent_models": { "compact": "oc/deepseek-v4.1-flash-free" },
+            "providers": {
+                "oc": { "kind": "custom", "baseUrl": format!("{exhausted_base}/v1"), "apiKeys": ["sk-oc"] },
+                "zai": { "kind": "custom", "baseUrl": format!("{good_base}/v1"), "apiKeys": ["sk-zai"] }
+            },
+            "tool_fallbacks": {
+                "compact": [format!("zai/{MOCK_MODEL}")]
+            },
+            "history": [
+                { "role": "user", "content": "hello" },
+                { "role": "assistant", "content": "world" }
+            ]
+        });
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let (_progress, out) = parse_compact_sse(&bytes);
+        let sent = rx
+            .recv()
+            .await
+            .expect("the user's own fallback provider saw no request");
+        assert_eq!(sent["model"], MOCK_MODEL);
+        assert_eq!(
+            out["summary"], "ok summary",
+            "a quota-exhausted first model must hand the work to the next, got {out}"
+        );
+        assert!(
+            out["error"].is_null(),
+            "the summary succeeded, so no error may be reported, got {out}"
         );
     }
 }

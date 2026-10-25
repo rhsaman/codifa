@@ -1,6 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api, normPath, resolveWorkspacePath, suggestSimilarFiles, workspaceFiles, type WorkspaceFile } from "../lib/fs";
+import { useViewerTabs } from "../lib/viewerTabs";
+import { NVIM_PROGRAM, nvimArgs } from "../lib/nvimEdit";
 import { readDocumentText } from "../lib/api";
 import { commentFileSelection } from "../lib/fileComments";
 import { selectionBarPos } from "../lib/selectionBar";
@@ -48,10 +50,10 @@ function PdfViewer({ base64, title }: { base64: string; title?: string }) {
  *  log would freeze the tab. Copy keeps the FULL text. */
 const FILE_RENDER_CAP = 400_000;
 
-/** "Open in" destinations. All of them first try a running Neovim instance;
- *  the terminal entries then launch nvim inside that terminal (Warp's URI
- *  scheme cannot run a command, so it opens a tab at the file's folder). */
-type OpenTargetId = "nvim" | "vscode" | "cmux" | "ghostty" | "warp" | "default";
+/** "Open in" destinations. `inapp` keeps the file here (a terminal tab in the
+ *  right pane, no other app involved); VS Code keeps its own path and
+ *  `default` goes to the OS handler. */
+type OpenTargetId = "inapp" | "vscode" | "default";
 
 const OPEN_TARGETS: Array<{
   id: OpenTargetId;
@@ -62,36 +64,15 @@ const OPEN_TARGETS: Array<{
   title: string;
 }> = [
   {
-    id: "nvim",
+    // The ONLY Neovim row: a terminal tab in the right pane running the user's
+    // own nvim in a pty. Neovim never leaves the app, so there is no second row
+    // for an outside terminal any more.
+    id: "inapp",
     icon: "NV",
-    iconClass: "fv-open-icon-nvim",
+    iconClass: "fv-open-icon-inapp",
     label: "Neovim",
-    hint: "Running instance, else new terminal",
-    title: "Open in the running Neovim instance (or a new terminal)",
-  },
-  {
-    id: "cmux",
-    icon: "CM",
-    iconClass: "fv-open-icon-cmux",
-    label: "Neovim in cmux",
-    hint: "New cmux workspace running nvim",
-    title: "Open nvim in a new cmux workspace (opens just the folder in cmux when its CLI refuses external apps)",
-  },
-  {
-    id: "ghostty",
-    icon: "GH",
-    iconClass: "fv-open-icon-ghostty",
-    label: "Neovim in Ghostty",
-    hint: "New Ghostty window running nvim",
-    title: "Open nvim in a new Ghostty window (requires Ghostty)",
-  },
-  {
-    id: "warp",
-    icon: "WP",
-    iconClass: "fv-open-icon-warp",
-    label: "Neovim in Warp",
-    hint: "New Warp tab at the file's folder",
-    title: "Open a new Warp tab at the file's folder (Warp cannot be told to run nvim)",
+    hint: "Runs nvim in a side-pane terminal tab — no other app needed",
+    title: "Edit in Neovim — runs inside the app, using your own config",
   },
   {
     id: "vscode",
@@ -923,6 +904,21 @@ export function FileViewerPanel({
 
   const openExternalFile = async (editor: OpenTargetId) => {
     setExtNote(null);
+    // Neovim NEVER leaves the app: no external process and no IPC round trip — a
+    // terminal tab in the side pane runs `nvim +<line> <file>` in its own pty.
+    // The pane is revealed FIRST because the terminal only lives there while it
+    // is open. VS Code and the OS default editor stay separate targets below.
+    if (editor === "inapp") {
+      const v = useViewerTabs.getState();
+      v.setPaneOpen(true);
+      v.openTerminal({
+        cwd: root || "",
+        program: NVIM_PROGRAM,
+        args: nvimArgs(absPath, fileLine),
+      });
+      setOpenMenu(false);
+      return;
+    }
     setOpening(editor);
     try {
       const res = await api.openFileExternal(absPath, editor);

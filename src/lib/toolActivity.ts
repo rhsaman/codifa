@@ -61,6 +61,16 @@ export function normalizeToolName(tool?: string): string {
   return t === "task" || t === "subagent" ? "explore" : t;
 }
 
+/** True when a tool name means "load a skill", including the foreign names
+ *  models use for it (`skill`, `load_skill_file`). The backend folds those to
+ *  `load_skill` before emitting, but a transcript saved by an older build can
+ *  still carry a raw one, and every skill-specific rule (prose result, no file
+ *  rows) must match it. */
+export function isSkillTool(tool?: string): boolean {
+  const t = (tool ?? "").trim().toLowerCase().replace(/[-\s]/g, "_");
+  return t === "load_skill" || t === "skill" || t === "load_skill_file";
+}
+
 /** Recursively normalize a card and its nested children (one-time, on load). */
 export function normalizeToolActivity(acts: ToolActivity[]): ToolActivity[] {
   return acts.map((a) => {
@@ -340,7 +350,9 @@ export function resolveToolResult(
         // here too: their result is the page/JS value, never a file list.
         resultText:
           typeof event.result === "string" &&
-          (TEXT_RESULT_TOOLS.has(act.tool) || isBrowserTool(act.tool))
+          (TEXT_RESULT_TOOLS.has(act.tool) ||
+            isSkillTool(act.tool) ||
+            isBrowserTool(act.tool))
             ? event.result
             : act.resultText,
       };
@@ -385,6 +397,11 @@ export const TEXT_RESULT_TOOLS = new Set([
   // Terminal output arrives as a plain string in `event.result` — without
   // this the Run-a-command card shows Duration/Args but never its output.
   "run_terminal",
+  // A skill load answers with the skill's own markdown body. Without this the
+  // body was dropped AND the filename scan below turned every file it mentions
+  // into a result chip — a `Test UI` skill showed `harness.html` /
+  // `harness.tsx` rows for files the tool never touched.
+  "load_skill",
 ]);
 
 /** Tools whose result rows come from the BACKEND as structured JSON
@@ -441,6 +458,11 @@ export function filesFromNativeResult(
     tool === "explore" ||
     tool === "search_memory" ||
     tool === "save_memory" ||
+    // A skill load answers with the skill's own markdown body — prose, not a
+    // listing. Scanning it produced chips for every file the text mentions
+    // (`harness.html`, `tauriBridge.ts`, …) that the tool never touched, and
+    // those chips then hid the body itself.
+    isSkillTool(tool) ||
     // A browser tool answers with a page/JS value; scanning it for file-looking
     // tokens produced chips that pointed at files that do not exist.
     isBrowserTool(tool)

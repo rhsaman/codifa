@@ -5,8 +5,8 @@
 //   * `schedule` survives a restart (BOTH load whitelists), while an unknown
 //     kind is still rejected — the whitelist must never widen to "anything".
 //   * `openSchedule` creates exactly ONE global tab and focuses the pane.
-//   * pages that own a rail icon (`RAIL_PAGE_KINDS`) are filtered out of the
-//     "+" menu, so the same page is never reachable from two spellings.
+//   * pages are ORDINARY tabs now: the rail's "+" menu opens them and each one
+//     can be closed from its own row.
 //   * both viewer dispatchers handle `schedule` BEFORE their inbox fall-through
 //     (the catch-all return that silently rendered the schedule inbox for any
 //     kind it did not know).
@@ -79,7 +79,7 @@ const coder = new Proxy(
   head: { appendChild: () => {} },
 }
 
-const { RAIL_PAGE_KINDS, shownViewerTabId, useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('../src/lib/viewerTabs')
+const { shownViewerTabId, useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('../src/lib/viewerTabs')
 
 console.log('1) the schedule kind survives a restart, unknown kinds do not:')
 {
@@ -108,7 +108,7 @@ console.log('2) id, title and visibility follow the shared rules:')
 
 console.log('3) openSchedule creates exactly one tab and reveals the pane:')
 {
-  useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false, panelMode: true } as any)
+  useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as any)
   useViewerTabs.getState().openSchedule()
   const s = useViewerTabs.getState() as any
   const created = s.tabs.filter((t: any) => t.kind === 'schedule')
@@ -116,7 +116,6 @@ console.log('3) openSchedule creates exactly one tab and reveals the pane:')
   check('it is named Schedule', created[0]?.title === 'Schedule', created[0])
   check('it became the active tab', s.activeId === 'schedule', s.activeId)
   check('the pane was revealed', s.paneOpen === true)
-  check('panel mode (todos) was left', s.panelMode === false)
 
   useViewerTabs.getState().openSchedule()
   const again = useViewerTabs.getState() as any
@@ -126,36 +125,36 @@ console.log('3) openSchedule creates exactly one tab and reveals the pane:')
     again.tabs,
   )
 
-  // The todos page is the rail's panel toggle: opening the schedule page must
-  // not leave both page states claiming the pane.
-  useViewerTabs.getState().openSchedule()
-  check('the todos page stays out of the pane', useViewerTabs.getState().panelMode === false)
+  // The page is a plain tab: it has no "pane mode" of its own to exit.
+  check('the page needs no panel mode', !('panelMode' in again))
 }
 
-console.log('4) every rail page owns an icon and exactly one entry point:')
+console.log('4) the "+" menu is the single entry point, and every page is a tab:')
 {
-  check('RAIL_PAGE_KINDS knows the schedule page', RAIL_PAGE_KINDS.has('schedule'))
-  check('RAIL_PAGE_KINDS knows the inbox page', RAIL_PAGE_KINDS.has('inbox'))
-  check('RAIL_PAGE_KINDS owns the pages that used to sit in the "+" menu', RAIL_PAGE_KINDS.has('files') && RAIL_PAGE_KINDS.has('review') && RAIL_PAGE_KINDS.has('trace') && RAIL_PAGE_KINDS.has('browser'))
-
   const barSrc = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
-  // The "+" menu is gone entirely: every page it used to offer now has an icon.
-  check('the "+" menu component was removed', !barSrc.includes('ViewerAddButton') && !barSrc.includes('viewer-add'))
+  check('the "+" menu exists', barSrc.includes('export function ViewerAddButton'))
+  check('it is mounted in the rail', readFileSync('src/App.tsx', 'utf8').includes('<ViewerAddButton />'))
+  // Every page the menu offers must be a REAL tab kind, so the row it lands on
+  // can be closed: the eight fixed icons are gone, nothing is icon-owned.
+  for (const kind of ['files', 'todos', 'artifacts', 'review', 'trace', 'browser', 'schedule', 'inbox']) {
+    check(`the menu can open the ${kind} page`, barSrc.includes(`key: "${kind}"`), kind)
+  }
+  // No page owns a fixed icon any more: those buttons are gone from the file.
   for (const btn of [
     'ViewerFilesButton',
     'ViewerTodosButton',
+    'ViewerArtifactsButton',
     'ViewerScheduleButton',
     'ViewerInboxButton',
     'ViewerReviewButton',
     'ViewerTraceButton',
     'ViewerBrowserButton',
   ]) {
-    check(`${btn} exists`, barSrc.includes(`export function ${btn}`), btn)
+    check(`${btn} is gone`, !barSrc.includes(`export function ${btn}`), btn)
   }
-  // Rail-owned tabs must NOT be drawn as rows: that is what showed an icon and
-  // a tab for the same page (a "second inbox") in the rail.
+  // Every visible tab is a row now — pages included — so each one has a ✕.
   check(
-    'the rail draws rows from viewerTabRows, not visibleTabs',
+    'the rail draws rows from viewerTabRows',
     /const tabs = viewerTabRows\(allTabs, activeChatId\)/.test(barSrc),
     barSrc.slice(0, 0),
   )
@@ -170,8 +169,8 @@ console.log('5) both dispatchers render the schedule page above the inbox fallba
   check('…before its inbox catch-all', scheduleAt !== -1 && fallbackAt !== -1 && scheduleAt < fallbackAt)
   check('it renders the schedule page', contentSrc.includes('<SchedulePage'))
   check(
-    'panel mode renders the todos page only (schedules are their own tab)',
-    /if \(panelMode\) return <TodosPage \/>/.test(contentSrc),
+    'the todos page renders as its own tab kind',
+    /active\.kind === "todos"/.test(contentSrc),
     contentSrc.slice(0, 0),
   )
 
@@ -180,7 +179,7 @@ console.log('5) both dispatchers render the schedule page above the inbox fallba
   const wFallbackAt = windowsSrc.indexOf('<ScheduleInboxDocked')
   check('ViewerLeafBody handles the schedule kind', wScheduleAt !== -1)
   check('…before its inbox catch-all', wScheduleAt !== -1 && wFallbackAt !== -1 && wScheduleAt < wFallbackAt)
-  check('the split-pane panel mode renders the todos page only', /if \(panelMode\) \{\s*return <TodosPage \/>/.test(windowsSrc))
+  check('the split pane renders the todos tab body', /tab\.kind === "todos"/.test(windowsSrc))
 }
 
 console.log('6) the schedule page and the todos page are separate:')
@@ -193,6 +192,16 @@ console.log('6) the schedule page and the todos page are separate:')
   const scheduleBody = pagesSrc.slice(schedulePageAt)
   check('the todos page holds ONLY the todos section', todosBody.includes('<TodosSection') && !todosBody.includes('<ScheduleSection'))
   check('the schedule page holds ONLY the schedule section', scheduleBody.includes('<ScheduleSection') && !scheduleBody.includes('<TodosSection'))
+  // What the turn RAN with leads: the card changes every turn and is the
+  // reason the page is opened, so it sits above the checklist instead of under
+  // a plan that can be a dozen rows long.
+  const usageAt = todosBody.indexOf('<TurnUsagePanel')
+  const todosAt = todosBody.indexOf('<TodosSection')
+  check(
+    'the usage card sits above the plan checklist',
+    usageAt !== -1 && todosAt !== -1 && usageAt < todosAt,
+    { usageAt, todosAt },
+  )
 
   const todosSrc = readFileSync('src/components/TodosPanel.tsx', 'utf8')
   check(
@@ -224,42 +233,34 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
   })
   const tabs: any[] = [tab('files:c1', 'files', { chatId: 'c1' }), tab('inbox', 'inbox')]
 
-  check('the active tab is the shown one', shownViewerTabId(tabs, 'inbox', false, 'c1') === 'inbox')
+  check('the active tab is the shown one', shownViewerTabId(tabs, 'inbox', 'c1') === 'inbox')
   check(
     'an open tab that is not active is NOT shown',
-    shownViewerTabId(tabs, 'inbox', false, 'c1') !== 'files:c1',
+    shownViewerTabId(tabs, 'inbox', 'c1') !== 'files:c1',
   )
   check(
     'promoting the open tab makes it the shown one',
-    shownViewerTabId(tabs, 'files:c1', false, 'c1') === 'files:c1',
+    shownViewerTabId(tabs, 'files:c1', 'c1') === 'files:c1',
   )
-  check('panel mode shows no page', shownViewerTabId(tabs, 'inbox', true, 'c1') === null)
-  check('an empty pane shows no page', shownViewerTabId([], null, false, 'c1') === null)
+  check('an empty pane shows no page', shownViewerTabId([], null, 'c1') === null)
   check(
     'a stale activeId falls back to the first visible tab',
-    shownViewerTabId(tabs, 'gone', false, 'c1') === 'files:c1',
+    shownViewerTabId(tabs, 'gone', 'c1') === 'files:c1',
   )
   check(
     "another chat's tab is not the shown one",
-    shownViewerTabId([tab('review:c2', 'review', { chatId: 'c2' })], 'review:c2', false, 'c1') === null,
+    shownViewerTabId([tab('review:c2', 'review', { chatId: 'c2' })], 'review:c2', 'c1') === null,
   )
 
-  // …and the rail really consumes that rule: both the pressed state and the
-  // click hang off "is it on screen", never off "does a tab with this id
-  // exist" — which is what made the first press close the page.
+  // …and the rail really consumes that rule: the shown tab is the one the pane
+  // paints. A page opened from the "+" menu is a normal tab in that list, so
+  // it can be closed from its own row like any other.
   const barSrc = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
   check(
-    'the rail icons derive their state from the shared rule',
-    barSrc.includes('shownViewerTabId(tabs, activeId, panelMode, activeChatId)'),
+    'the highlighted row comes from the shared "shown tab" rule',
+    barSrc.includes('shownViewerTabId(allTabs, activeId, activeChatId)'),
   )
-  const shellAt = barSrc.indexOf('function PageRailButton')
-  const shell = barSrc.slice(shellAt, shellAt + 1400)
-  check('the rail shell no longer keys off "a tab exists"', !shell.includes('hasTab'), shell)
-  check(
-    'a second press closes only the page that is on screen',
-    shell.includes('onClick={() => (shown ? close() : open())}'),
-    shell,
-  )
+  check('rows are drawn from every visible tab', barSrc.includes('viewerTabRows('))
   check(
     'no page icon tests for an open tab instead of a shown one',
     !barSrc.includes('s.tabs.some((t) => t.id === id)') &&

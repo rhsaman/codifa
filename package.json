@@ -37,6 +37,7 @@
     "preview": "vite preview",
     "test:frontend": "bash tests/run-frontend.sh",
     "clean": "node -e \"import('fs').then(f=>f.rmSync('src-tauri/target',{recursive:true,force:true}))\"",
+    "signing:export": "bash scripts/export-signing-cert.sh",
     "dist": "npm run tauri build",
     "dist:mac": "npm run tauri build -- --target aarch64-apple-darwin",
     "dist:win": "npm run tauri build -- --target x86_64-pc-windows-msvc",

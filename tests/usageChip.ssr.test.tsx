@@ -136,6 +136,21 @@ console.log("۳) UsagePopover رندر SSR با view seed شده:")
   check("dir=ltr روی پاپ‌اور", html.includes('dir="ltr"'))
 }
 
+console.log("۳-ب) نام کامل مدل (با namespace) نمایش داده می‌شود:")
+{
+  // نام مدل هرگز به آخرین سگمنت کوتاه نمی‌شود: "oc/glm-5.3-flash-free" باید
+  // کامل دیده شود، نه فقط "glm-5.3-flash-free".
+  const usage: ChatUsage = {
+    entries: [
+      { providerId: "p1", model: "oc/glm-5.3-flash-free", input: 100, output: 20, lastUsed: 3 },
+      { providerId: "p2", model: "anthropic/claude-3-5-sonnet", input: 10, output: 2, lastUsed: 2 },
+    ],
+  }
+  const html = renderToString(<UsagePopover view={buildUsageView(usage, providers)} />)
+  check("نام کامل مدل با اسلش نمایش داده می‌شود", html.includes("oc/glm-5.3-flash-free"), html.slice(0, 600))
+  check("namespace مدل حفظ می‌شود", html.includes("anthropic/claude-3-5-sonnet"))
+}
+
 console.log("۴) ردیف صفرتوکنی (از جمله laya لوکال) نمایش داده نمی‌شود:")
 {
   // ردیف صفرتوکنی laya (لوکال) حذف می‌شود — مدل بدون مصرف توکن دیده نمی‌شود.

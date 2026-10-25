@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import type { ChatMessage, PluginInfo } from "../types";
 import type { SkillRow } from "../lib/api";
 import { ensureSidecar } from "../lib/api";
+import { ensureChatHydrated, useStore } from "../lib/store";
 import { listPlugins } from "../lib/plugins";
 import { ensureSkillsList, getSkillsList } from "../lib/skills";
 import {
+  skillOwner,
   turnStart,
   turnUsage,
   usagePlugins,
@@ -78,7 +80,50 @@ export function TurnUsageSection({
     }
   }
 
+  // Used first: the card answers "what did this turn actually RUN with", so a
+  // skill the agent loaded must never sit below one that was only attached.
+  const skills = [...usage.skills].sort(
+    (a, b) => Number(b.used) - Number(a.used),
+  );
+  const connectors = usage.mcp.map((name) => ({
+    name,
+    tools: connectorTools.get(name) ?? [],
+  }));
+  // Split ONCE: the Used row states what ran, so the groups below carry only
+  // what was attached/enabled and left untouched. Listing a used skill in both
+  // places was the panel's real noise (the same chip appeared twice).
+  const unusedSkills = skills.filter((s) => !s.used);
+  const unusedConnectors = connectors.filter((c) => c.tools.length === 0);
+
   const total = usage.skills.length + usage.mcp.length + owners.length;
+
+  // The Used row: exactly what the turn ran, listed here ONCE and never again
+  // in the groups below (those keep the untouched inventory). A skill's owning
+  // plugin rides along as its meta suffix ("Ponytail · Dev Kit").
+  const usedChips: Array<{
+    key: string;
+    name: string;
+    meta?: string;
+    title: string;
+  }> = [];
+  for (const s of skills) {
+    if (!s.used) continue;
+    usedChips.push({
+      key: `used-skill-${s.name}`,
+      name: s.name,
+      meta: skillOwner(s.name, catalog) || undefined,
+      title: "Loaded by the agent this turn",
+    });
+  }
+  for (const c of connectors) {
+    if (c.tools.length === 0) continue;
+    usedChips.push({
+      key: `used-mcp-${c.name}`,
+      name: c.name,
+      meta: `· ${c.tools.length}`,
+      title: c.tools.join(", "),
+    });
+  }
 
   return (
     <div
@@ -104,43 +149,83 @@ export function TurnUsageSection({
       </div>
       {!collapsed && (
         <div className="turn-usage-body">
-          {usage.skills.length > 0 && (
-            <section className="turn-usage-group">
-              <h4 className="turn-usage-label">Skills</h4>
+          {/* What the turn ACTUALLY ran with, first and as one row of chips:
+              the card's job is answering that before listing the inventory
+              below. An entry repeats its own group on purpose — the same skill
+              is both "attached" and "used", and only this row says so at a
+              glance. */}
+          {usedChips.length > 0 && (
+            <section className="turn-usage-group turn-usage-group-used">
+              <h4 className="turn-usage-label">
+                Used
+                <span className="turn-usage-count">{usedChips.length}</span>
+              </h4>
               <ul className="turn-usage-list">
-                {usage.skills.map((s) => (
+                {usedChips.map((c) => (
                   <li
-                    className={`turn-usage-chip${s.used ? " used" : ""}`}
-                    key={`skill-${s.name}`}
-                    title={s.used ? "Loaded by the agent this turn" : "Attached to this turn"}
+                    className="turn-usage-chip used"
+                    key={c.key}
+                    title={c.title}
                   >
                     <span className="turn-usage-dot" aria-hidden="true" />
-                    <span className="turn-usage-name">{s.name}</span>
+                    <span className="turn-usage-name">{c.name}</span>
+                    {c.meta && <span className="turn-usage-meta">{c.meta}</span>}
                   </li>
                 ))}
               </ul>
             </section>
           )}
-          {usage.mcp.length > 0 && (
+          {unusedSkills.length > 0 && (
             <section className="turn-usage-group">
-              <h4 className="turn-usage-label">MCP</h4>
+              <h4
+                className="turn-usage-label"
+                title="Attached to this turn but never loaded"
+              >
+                Skills
+                <span className="turn-usage-count">{unusedSkills.length}</span>
+              </h4>
               <ul className="turn-usage-list">
-                {usage.mcp.map((name) => {
-                  const tools = connectorTools.get(name) ?? [];
+                {unusedSkills.map((s) => {
+                  // The owning plugin tells a store skill from a bundled one
+                  // without opening Settings ("Ponytail · Dev Kit").
+                  const owner = skillOwner(s.name, catalog);
                   return (
                     <li
                       className="turn-usage-chip"
-                      key={`mcp-${name}`}
-                      title={tools.length > 0 ? tools.join(", ") : "Enabled for this turn"}
+                      key={`skill-${s.name}`}
+                      title="Attached to this turn, not loaded"
                     >
                       <span className="turn-usage-dot" aria-hidden="true" />
-                      <span className="turn-usage-name">{name}</span>
-                      {tools.length > 0 && (
-                        <span className="turn-usage-meta">· {tools.length}</span>
-                      )}
+                      <span className="turn-usage-name">{s.name}</span>
+                      {owner && <span className="turn-usage-meta">{owner}</span>}
                     </li>
                   );
                 })}
+              </ul>
+            </section>
+          )}
+          {unusedConnectors.length > 0 && (
+            <section className="turn-usage-group">
+              <h4
+                className="turn-usage-label"
+                title="Enabled for this turn but never called"
+              >
+                MCP
+                <span className="turn-usage-count">
+                  {unusedConnectors.length}
+                </span>
+              </h4>
+              <ul className="turn-usage-list">
+                {unusedConnectors.map(({ name }) => (
+                  <li
+                    className="turn-usage-chip"
+                    key={`mcp-${name}`}
+                    title="Enabled for this turn, never called"
+                  >
+                    <span className="turn-usage-dot" aria-hidden="true" />
+                    <span className="turn-usage-name">{name}</span>
+                  </li>
+                ))}
               </ul>
             </section>
           )}
@@ -165,5 +250,31 @@ export function TurnUsageSection({
         </div>
       )}
     </div>
+  );
+}
+
+/** Docked "This turn" card — the right panel's variant. It reads the ACTIVE
+ *  chat and dir from the store exactly like TodosSection does, so the panel
+ *  never pipes messages through and switching chats switches both cards at
+ *  once. */
+export function TurnUsagePanel() {
+  const chat = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId) ?? null,
+  );
+  const dir = useStore((s) => s.dir);
+  // The index row carries no `messages` — TodosSection hydrates the active
+  // chat, but this card can mount first (panel reopened, chat just switched)
+  // and would then report an empty turn while the transcript is full. Ask for
+  // the body too; the call resolves immediately when it is already loaded.
+  const needsBody = chat?.hydrated === false;
+  const chatId = chat?.id ?? "";
+  useEffect(() => {
+    if (chatId && needsBody) void ensureChatHydrated(chatId);
+  }, [chatId, needsBody]);
+  return (
+    <TurnUsageSection
+      messages={needsBody ? [] : (chat?.messages ?? [])}
+      dir={dir}
+    />
   );
 }

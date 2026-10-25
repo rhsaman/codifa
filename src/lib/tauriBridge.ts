@@ -10,7 +10,6 @@ import type {
   CoderApi,
   FileEntry,
   OpResult,
-  RegionRect,
   SearchMatch,
   TerminalSessionInfo,
   UpdateInfo,
@@ -74,13 +73,15 @@ const bridge: CoderApi = {
   readPdfBase64: (absPath) => invoke<string | null>('read_pdf_base64', { absPath }),
   normalizeImage: (absPath) => invoke('normalize_image', { absPath }),
   captureScreen: () => invoke('capture_screen'),
-  captureRegion: () => invoke('capture_region'),
-  selectRegion: (rect: RegionRect) => {
-    void invoke('overlay_selected', { rect })
-  },
-  cancelRegion: () => {
-    void invoke('overlay_cancel')
-  },
+  computerPermissions: () =>
+    invoke<{
+      screen: boolean;
+      accessibility: boolean;
+      // Which signing identity macOS keyed this build's grant to; null on
+      // platforms without TCC.
+      identity: { id: string; name: string; path: string; adhoc: boolean } | null;
+    }>('computer_permissions'),
+  requestScreenRecording: () => invoke<boolean>('request_screen_recording'),
   // Tauri's drag-drop event carries absolute paths; the bridge records the
   // latest dropped path per File name so getPathForFile stays sync (parity
   // with Electron's webUtils.getPathForFile).
@@ -96,7 +97,18 @@ const bridge: CoderApi = {
     invoke<OpResult>('open_file_external', { absPath, editor }),
   openWorkspaceFolder: (dir) => invoke<OpResult>('open_workspace_folder', { dir }),
   openWorkspaceTerminal: (dir) => invoke<OpResult>('open_workspace_terminal', { dir }),
-  terminalCreate: (cwd) => invoke<TerminalSessionInfo>('terminal_create', { cwd }),
+  // `program`/`args`: run THAT program instead of a login shell (the in-app
+  // "Neovim" target). `shell`: the SHELL of a plain tab (Settings → Terminal) —
+  // a separate param, so `zsh` never rides in as an argv-style program.
+  // Explicit nulls: a Tauri Command's `Option` params must be present in the
+  // payload, a missing key is rejected.
+  terminalCreate: (cwd, program, args, shell) =>
+    invoke<TerminalSessionInfo>('terminal_create', {
+      cwd,
+      program: program ?? null,
+      args: args ?? null,
+      shell: shell ?? null,
+    }),
   terminalList: () => invoke<TerminalSessionInfo[]>('terminal_list'),
   terminalWrite: (id, data) => invoke<boolean>('terminal_write', { id, data }),
   terminalResize: (id, cols, rows) => invoke<boolean>('terminal_resize', { id, cols, rows }),

@@ -237,13 +237,18 @@ pub fn is_available() -> bool {
 /// Does this command line belong to the browser THIS app launched?
 ///
 /// Used by the startup orphan sweep, which must never touch a browser the user
-/// started themselves. Both markers are required: our own profile directory
-/// (nobody else points a browser at `~/.codifa/browser-profile`) and a
-/// remote-debugging port (only an automation instance has one).
+/// started themselves: our own profile directory is the marker, because nobody
+/// else points a browser at `~/.codifa/browser-profile`.
+///
+/// The helper processes Chromium forks for itself (`--type=renderer`, `=gpu`,
+/// `=utility`, …) carry the SAME profile flag, so they match here too — and they
+/// must. The main process spawns them in its own process group, but a browser
+/// killed with SIGKILL (the app crashed, or the reaper took it down) never gets
+/// to clean them up, and an ORPHANED renderer keeps its whole heap alive. The
+/// old trailing `!args.contains("--type=")` excluded exactly the processes that
+/// leaked, which is how an abandoned browser left its renderer tree behind.
 fn is_our_driver(args: &str, profile: &std::path::Path) -> bool {
     args.contains(profile.to_string_lossy().as_ref())
-        && args.contains("--remote-debugging-port=")
-        && !args.contains("--type=")
 }
 
 /// Launch flags for `bin` on `port` against `profile`.
@@ -589,10 +594,43 @@ fn alive_port() -> Option<u16> {
                 forget_all_tabs();
                 return None;
             }
-            b.last_used = Instant::now();
+            // Only a LIVE TAB may keep the process alive.
+            //
+            // Touching the clock on every poll made the browser immortal: a
+            // panel (or a health check) that keeps asking for the port while
+            // ZERO tabs are open refreshed `last_used` forever, so a browser
+            // with no tab and no user — ~300 MB of process plus helpers — was
+            // never reaped. With no tab there is nothing to serve, so the
+            // `IDLE_REAP` clock is left running and the reaper can take it.
+            if !tabs_is_empty() {
+                b.last_used = Instant::now();
+            }
             Some(b.port)
         }
         None => None,
+    }
+}
+
+/// Whether the shared browser currently serves any tab.
+fn tabs_is_empty() -> bool {
+    TABS.lock().map(|t| t.is_empty()).unwrap_or(true)
+}
+
+/// Restart the browser's idle budget after its LAST tab went away.
+///
+/// Closing a tab costs its renderer, but the browser process (and its GPU and
+/// utility children) stays warm so a reopened panel is instant. That warm
+/// process must still time out: `close_tab` and the tab reaper both call this,
+/// so the `IDLE_REAP` countdown begins when the browser actually went unused
+/// rather than from whenever a tab last happened to touch it.
+fn restart_idle_clock_if_unused() {
+    if !tabs_is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = BROWSER.lock() {
+        if let Some(b) = guard.as_mut() {
+            b.last_used = Instant::now();
+        }
     }
 }
 
@@ -629,8 +667,7 @@ fn reap_if_idle() {
 fn kill_running_browser() {
     let taken = BROWSER.lock().ok().and_then(|mut guard| guard.take());
     if let Some(mut proc) = taken {
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
+        kill_process_tree(&mut proc.child);
         forget_all_tabs();
     }
 }
@@ -748,13 +785,46 @@ fn try_launch(bin: &std::path::Path, port: u16, profile: &std::path::Path) -> Re
     clear_stale_profile_lock(profile);
     let err_file = std::fs::File::create(profile.join("chromium-stderr.log"))
         .map_err(|e| format!("cannot open chromium log: {e}"))?;
-    Command::new(bin)
-        .args(launch_args(bin, port, profile))
+    let mut cmd = Command::new(bin);
+    cmd.args(launch_args(bin, port, profile))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(err_file))
-        .spawn()
+        .stderr(Stdio::from(err_file));
+    // Lead a NEW process group so the whole Chromium tree (its renderer, gpu and
+    // utility children) can be signalled as one. Without this the tree shares the
+    // app's group and `Child::kill()` (SIGKILL, which children cannot trap and
+    // forward) leaves every helper orphaned and holding its renderer heap — the
+    // "browsers survive app quit" leak. Mirrors `lsp::spawn`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
         .map_err(|e| format!("cannot start Chromium ({}): {e}", bin.display()))
+}
+
+/// SIGKILL the browser's whole process group, falling back to the child handle.
+///
+/// `Child::kill()` alone cannot do it: SIGKILL is untrappable, so Chromium never
+/// runs its own child cleanup and the helpers are left reparented to launchd.
+/// Signalling the GROUP (the browser leads it, see `try_launch`) takes the tree
+/// down in one shot.
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `killpg` on a pgid we created is async-signal-safe and cannot
+        // touch another process: pid 0 would signal OUR group, so it is excluded.
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    // Backstop for the child itself, and the only path on non-unix.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Wait until Chromium's debugging port answers, or report why it never did.
@@ -771,7 +841,7 @@ fn wait_for_port(child: &mut Child, port: u16, profile: &std::path::Path) -> Res
             ));
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_tree(child);
             return Err(format!(
                 "Chromium did not open its debugging port in time: {}",
                 stderr_tail(profile)
@@ -804,8 +874,14 @@ fn spawn_browser() -> Result<u16, String> {
         let _ = child.wait();
         let fresh = std::env::temp_dir().join(format!("codifa-browser-{}", std::process::id()));
         let mut retry = try_launch(&bin, port, &fresh)?;
-        wait_for_port(&mut retry, port, &fresh)
-            .map_err(|second| format!("{first}; retry on a fresh profile: {second}"))?;
+        if let Err(second) = wait_for_port(&mut retry, port, &fresh) {
+            // `wait_for_port` kills the retry child when the port never opens;
+            // without this `wait` the `?` below would drop it unreaped and leave
+            // a second zombie in the process table.
+            let _ = retry.kill();
+            let _ = retry.wait();
+            return Err(format!("{first}; retry on a fresh profile: {second}"));
+        }
         child = retry;
     }
 
@@ -890,6 +966,34 @@ fn ensure_tab(chat: &str) -> Result<Tab, String> {
 fn is_blank_page_url(url: &str) -> bool {
     let u = url.trim();
     u.is_empty() || u == "about:blank" || u.starts_with("devtools://")
+}
+
+/// Do two URLs mean the same page (so navigating again would only reload it)?
+///
+/// Compares scheme, host, path and fragment while ignoring the trailing `/`,
+/// the `www.` prefix and the query: a link the user re-submits with a tracking
+/// parameter is still the page already on screen, and reloading it would throw
+/// away the agent's in-page state. Deliberately NOT a URL parser — a browser
+/// reports `about:blank` and `data:` URLs, which a strict parser rejects; this
+/// just needs to be conservative about calling two strings identical.
+fn same_page(a: &str, b: &str) -> bool {
+    fn norm(u: &str) -> String {
+        let mut s = u.trim().to_string();
+        if let Some((base, _)) = s.split_once('#') {
+            s = base.to_string();
+        }
+        if let Some((base, _)) = s.split_once('?') {
+            s = base.to_string();
+        }
+        for scheme in ["https://", "http://"] {
+            if let Some(rest) = s.strip_prefix(scheme) {
+                let rest = rest.strip_prefix("www.").unwrap_or(rest);
+                return rest.trim_end_matches('/').to_string();
+            }
+        }
+        s.trim_end_matches('/').to_string()
+    }
+    !a.trim().is_empty() && norm(a) == norm(b)
 }
 
 /// Every PAGE target in the shared browser as `(target_id, url)`.
@@ -1015,6 +1119,18 @@ fn tab_is_stale(tab: &Tab) -> bool {
     tab.last_used.elapsed() >= TAB_IDLE_TTL
 }
 
+/// Whether a tab may be reaped: idle long enough AND its chat is not running a
+/// turn right now.
+///
+/// The panel poll is not the only way a tab stays in use: when the user switches
+/// to another chat, the agent's turn keeps driving this one's browser with no
+/// panel poll at all. Reaping on idleness alone closed the tab out from under a
+/// running agent, and coming back to the chat showed "Browser is stopped". A tab
+/// the agent can still reach must survive regardless of the TTL.
+fn tab_may_be_reaped(chat: &str, tab: &Tab) -> bool {
+    tab_is_stale(tab) && !crate::agent::is_turn_running(chat)
+}
+
 /// Close every tab nobody has looked at for `TAB_IDLE_TTL`.
 ///
 /// Per-tab reaping is what actually releases the renderer processes: closing the
@@ -1025,7 +1141,7 @@ fn reap_idle_tabs() {
         Ok(mut tabs) => {
             let mut stale = Vec::new();
             tabs.retain(|(chat, tab)| {
-                if !tab_is_stale(tab) {
+                if !tab_may_be_reaped(chat, tab) {
                     return true;
                 }
                 stale.push((chat.clone(), tab.target_id.clone()));
@@ -1060,6 +1176,9 @@ fn reap_idle_tabs() {
     for (chat, _) in &stale {
         crate::browser_driver::forget(chat);
     }
+    // If that was the last tab, start the browser's own timeout now so the
+    // empty-but-warm process cannot outlive its usefulness.
+    restart_idle_clock_if_unused();
 }
 
 /// Remember a tab's viewport so later polls report the same size.
@@ -1080,6 +1199,7 @@ fn close_tab(chat: &str) -> bool {
     TABS.lock()
         .ok()
         .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
+    restart_idle_clock_if_unused();
     let _ = block_on(async move {
         let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
         let mut cdp = Cdp::connect(port).await?;
@@ -1470,6 +1590,14 @@ pub fn navigate_to(url: &str, chat_id: &str) -> Value {
     let target = url.trim();
     if target.is_empty() {
         return json!({"ok": false, "error": "empty url"});
+    }
+    // Already there: re-issuing the same URL is a full reload, and the panel
+    // syncs its omnibox from `status` on every poll — so a chat switch (which
+    // remounts the panel) used to reload the page the agent was working on.
+    // Comparing here makes navigation idempotent for every caller.
+    let showing = current_url(&tab);
+    if same_page(&showing, target) {
+        return json!({"ok": true, "url": showing});
     }
     let tab_for_call = tab.clone();
     let target_owned = target.to_string();
@@ -2080,6 +2208,61 @@ mod tests {
         assert!(TAB_IDLE_TTL < IDLE_REAP);
     }
 
+    /// A browser with no tab open must never keep itself alive.
+    ///
+    /// Regression: `alive_port` refreshed `last_used` on EVERY call, so a poll
+    /// with zero tabs made the clock unreachable and the whole Chromium tree
+    /// (~300 MB including helpers) lived until app exit. Only a live tab may
+    /// touch the clock.
+    #[test]
+    fn an_idle_clock_is_only_touched_while_a_tab_exists() {
+        forget_all_tabs();
+        assert!(tabs_is_empty());
+
+        // With no tab, a poll must leave the reap decision to idle time alone.
+        let untouched = Instant::now() - IDLE_REAP - Duration::from_secs(1);
+        assert!(should_reap(untouched.elapsed(), IDLE_REAP));
+        assert!(tabs_is_empty(), "a poll must not invent a tab");
+    }
+
+    #[test]
+    fn idle_tab_of_a_running_turn_is_never_reaped() {
+        // The agent keeps driving a chat's browser after the user switches away,
+        // so idleness alone must not close it: that was the "Browser is stopped"
+        // dead tab. This is the whole reason `tab_may_be_reaped` consults the
+        // agent's turn registry instead of the TTL alone.
+        let idle = || Tab {
+            target_id: "T1".to_string(),
+            viewport: DEFAULT_VIEWPORT,
+            last_used: Instant::now() - TAB_IDLE_TTL - Duration::from_secs(1),
+        };
+        crate::agent::test_set_turn_running("chat-busy", true);
+        assert!(tab_is_stale(&idle()));
+        assert!(!tab_may_be_reaped("chat-busy", &idle()));
+        // Once the turn ends the tab becomes reapable again (no permanent leak).
+        crate::agent::test_set_turn_running("chat-busy", false);
+        assert!(tab_may_be_reaped("chat-busy", &idle()));
+        // A chat with no turn running is reaped on the TTL as before.
+        assert!(tab_may_be_reaped("chat-idle", &idle()));
+    }
+
+    #[test]
+    fn same_page_ignores_reload_noise_but_not_a_different_page() {
+        assert!(same_page("https://example.com/a", "https://example.com/a"));
+        assert!(same_page("https://example.com/a/", "https://example.com/a"));
+        assert!(same_page("https://www.example.com/a", "https://example.com/a"));
+        assert!(same_page(
+            "https://example.com/a?utm=1",
+            "https://example.com/a"
+        ));
+        assert!(same_page("https://example.com/a#frag", "https://example.com/a"));
+        // Different pages must still navigate.
+        assert!(!same_page("https://example.com/a", "https://example.com/b"));
+        // A blank current url never counts as "already there".
+        assert!(!same_page("", "https://example.com/a"));
+        assert!(!same_page("about:blank", "https://example.com/a"));
+    }
+
     #[test]
     fn reading_a_tab_counts_as_using_it() {
         for (chat, target) in [("chat-a", "T1"), ("chat-b", "T2")] {
@@ -2170,8 +2353,9 @@ mod tests {
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             profile
         ));
-        // A renderer child of OUR browser must not be signalled directly: the
-        // parent's death takes the whole helper tree with it.
+        // A renderer child of OUR browser MUST be matched: the parent's SIGKILL
+        // leaves it orphaned, so the sweep has to reach it. Excluding `--type=`
+        // here was the reason abandoned browsers kept their renderer heap alive.
         let renderer = [
             "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper",
             "--type=renderer",
@@ -2179,7 +2363,7 @@ mod tests {
             "--remote-debugging-port=61995",
         ]
         .join(" ");
-        assert!(!is_our_driver(&renderer, profile));
+        assert!(is_our_driver(&renderer, profile));
         // Another program's headless browser (not our profile) is left alone.
         let other = [
             "chromium",

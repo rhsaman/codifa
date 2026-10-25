@@ -598,6 +598,12 @@ export function FileChip({
    *  stopped so dense rows (tool cards, accordions) don't also toggle. */
   onClick?: () => void;
 }) {
+  // Open on POINTERDOWN, not click: pointerdown already re-focuses the chat
+  // window (see Chat.tsx), which re-renders the list and replaces this very
+  // node before the browser fires `click` — a click on the replaced node
+  // bubbles to the parent instead and the file never opened (the pane kept
+  // showing the previous page, e.g. Trace). Pointerdown runs before any
+  // re-render, so the open always lands.
   const handle = (e: ReactMouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -611,6 +617,10 @@ export function FileChip({
       className={`file-chip${className ? ` ${className}` : ""}`}
       dir="ltr"
       title={`${path}${line ? `:${line}` : ""} — click to open`}
+      onPointerDown={handle}
+      // Click is a BACKUP path: if the pointerdown node got swapped by the
+      // focus re-render, the new node's click still opens the file. Re-opening
+      // the same path is idempotent (an in-place refresh).
       onClick={handle}
     >
       <FileIcon path={path} size={20} />

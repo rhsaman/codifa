@@ -405,13 +405,13 @@ console.log('13) a hanging provider delays a turn, it never freezes live voice:'
   const done = (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   await Promise.race([
     done,
-    new Promise((resolve) => setTimeout(resolve, LOCAL_LIVE_DEFAULTS.drainTimeoutMs + 2000)),
+    new Promise((resolve) => setTimeout(resolve, LOCAL_LIVE_DEFAULTS.turnDeliverBudgetMs + 2000)),
   ])
   const elapsed = Date.now() - started
   check(
     'the turn gives up instead of hanging',
-    elapsed < LOCAL_LIVE_DEFAULTS.drainTimeoutMs + 1500,
-    { elapsed, cap: LOCAL_LIVE_DEFAULTS.drainTimeoutMs },
+    elapsed < LOCAL_LIVE_DEFAULTS.turnDeliverBudgetMs + 1500,
+    { elapsed, cap: LOCAL_LIVE_DEFAULTS.turnDeliverBudgetMs },
   )
   check('the session is usable again', priv['transcribing'] === false, {
     transcribing: priv['transcribing'],
@@ -499,10 +499,17 @@ console.log('16) the agent\'s own voice cannot interrupt it:')
     raised: echoSafeThreshold(0.01, true),
   })
   check('the gate is unchanged when it is quiet', echoSafeThreshold(0.01, false) === 0.01)
-  // Speaker bleed after echo cancellation is ~0.01-0.04 RMS: it must stay below
-  // the gate, otherwise the agent cuts itself off mid-sentence.
-  check('typical speaker bleed cannot open the gate', 0.04 < echoSafeThreshold(0.008, true), {
-    bleed: 0.04,
+  // Speaker bleed after echo cancellation sits up to ~0.02 RMS: it must stay
+  // below the gate, otherwise the agent cuts itself off mid-sentence.
+  check('typical speaker bleed cannot open the gate', 0.02 < echoSafeThreshold(0.008, true), {
+    bleed: 0.02,
+    gate: echoSafeThreshold(0.008, true),
+  })
+  // Regression: the floor used to sit at 0.06, ABOVE ordinary speech on a quiet
+  // laptop mic (~0.03), so while the agent was working the mic was deaf and the
+  // user's sentence only became text after the turn had ended.
+  check('quiet speech opens the gate while the agent speaks', 0.03 >= echoSafeThreshold(0.008, true), {
+    speech: 0.03,
     gate: echoSafeThreshold(0.008, true),
   })
   check('onset needs a longer streak while speaking', onsetFramesRequired(true) === TTS_ONSET_FRAMES)

@@ -1,4 +1,4 @@
-export type ProviderKind = 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'tokenrouter' | 'anthropic'
+export type ProviderKind = 'openrouter' | 'ollama' | 'custom' | 'google' | 'nvidia' | 'cloudflare' | 'anthropic'
 
 export type AgentMode = string
 
@@ -89,6 +89,9 @@ export interface ProviderConfig {
   /** Legacy single key (migrated into apiKeys on load). */
   apiKey?: string
   baseUrl: string
+  /** Account id of an account-scoped gateway (Cloudflare): its base URL is
+   *  built from this id, so it is the field the user fills in. */
+  accountId?: string
   model: string
   enabled?: boolean
   /** Live per-model context windows (tokens) reported by the provider's /models endpoint. */
@@ -110,6 +113,23 @@ export interface ProviderConfig {
   /** Live per-model USD-per-million-token pricing reported by the provider's /models endpoint. */
   pricingMap?: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>
   reasoningMap?: Record<string, boolean>
+  /** Reasoning capability LEARNED from the model's own output: its response
+   *  streamed reasoning content, so this provider+model demonstrably reasons.
+   *  Only `true` is ever recorded — a call that produced no reasoning proves
+   *  nothing, since a short prompt need not trigger it. Kept apart from
+   *  `reasoningMap` because a `/models` fetch replaces that map wholesale and
+   *  would erase observed facts. This is how a gateway that describes no
+   *  capability at all — NVIDIA NIM reports only `id`/`object`/`created`/
+   *  `owned_by` — still ends up with exactly the right models marked, with no
+   *  model list anywhere in the code. */
+  observedReasoningMap?: Record<string, boolean>
+  /** Thinking LEVELS each model really supports, as the provider /models payload
+   *  or the models.dev catalog reported them (e.g. `['none','high']` for a model
+   *  whose gateway says thinking is a plain switch). A missing key means NO
+   *  source described that model, so the composer keeps its full list rather
+   *  than hiding options nobody ruled out; an empty array means the model has no
+   *  thinking mode at all. */
+  thinkingLevelsMap?: Record<string, ThinkingLevel[]>
   thinkingLevel?: ThinkingLevel
   models?: string[]
   /** Models the user explicitly removed; hidden from the live /models catalog. */
@@ -175,6 +195,13 @@ export interface Settings {
    *  `computerUse`: when off, no `browser_*` tool is bound to the model. */
   browserUse?: boolean
   fontSize?: number
+  /** Point size of CODE opened in the side-pane file viewer. Independent of
+   *  `fontSize` (the chat transcript) so reading a long file never forces the
+   *  chat to grow with it. */
+  viewerFontSize?: number
+  /** Point size of every terminal screen (bottom panel and side-pane tabs).
+   *  Independent of `fontSize`, like `viewerFontSize`. */
+  terminalFontSize?: number
   root?: string
   dir?: 'rtl' | 'ltr'
   compact?: boolean
@@ -260,10 +287,29 @@ export interface Settings {
    *  restores each field's original attributes. Default: true (suggestions are
    *  OFF) — the platform defaults are wrong for a code editor. */
   disableTextSuggestions?: boolean
+  /** Which terminal Neovim (and "open terminal here") launches into. Ids live in
+   *  `src/lib/nvimTerminals.ts`; the Rust side reads the SAME key out of
+   *  settings.json so a backend-only open follows it too. Default: 'inapp'. */
+  nvimTerminal?: string
+  /** Shell the in-app terminal tabs run (Settings → Terminal). Empty = the OS
+   *  login shell ($SHELL). Read straight from settings.json by src-tauri's pty. */
+  terminalShell?: string
   /** History turn limit sent to the model. 0 = full history (default). N > 0 =
    *  last N turns verbatim + a compact summary of the rest. Works with
    *  auto-compact (summary is merged, not re-expanded). */
   historyLimit?: number
+  /** Bytes of skill catalog allowed in the system prompt each turn (see
+   *  skillCatalogMaxChars in Settings → Skills). The agent clamps it to
+   *  [1500, 12000]; 6000 is the cheap default. */
+  skillCatalogMaxChars?: number
+  /** Plugin marketplaces the user added (Settings → Marketplaces). Each one is
+   *  a repo holding an index of installable plugins. */
+  marketplaces?: MarketplaceSource[]
+  /** Which generation of the shipped marketplace defaults this file last saw.
+   *  A current-version file keeps the user's list untouched; an older one gets
+   *  just the newly shipped kinds added once (never a silent re-add of a
+   *  removed source). */
+  marketplaceDefaultsVersion?: number
   /** Tool result cache TTL in minutes (default 60). */
   cacheTtlMinutes?: number
   /** Schedule run ids already seen in the inbox (badge state). Persisted so
@@ -473,7 +519,7 @@ export interface ChatMessage {
   skills?: string[]
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; agent?: string; tool?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean
@@ -668,6 +714,9 @@ export interface ChatCompactProgress {
   attempts: number
   /** Model running the current attempt. */
   model: string
+  /** Provider ROW the model is routed to (id), so the banner can name the
+   *  provider the user configured instead of its wire kind. */
+  providerId: string
   /** Share of the budget already spent, 0-100. */
   percent: number
   /** Wall-clock budget for the WHOLE compaction, in seconds. */
@@ -767,7 +816,10 @@ export interface SidecarEvent {
   /** The user-configured provider id for this usage event — distinct from
    *  `provider` (the kind). Several providers can share the same kind
    *  (e.g. two openrouter accounts with different ids), so the sidebar groups
-   *  per-usage entries by this id. Empty on legacy events. */
+   *  per-usage entries by this id. Empty on legacy events.
+   *  On a `compact_progress` event it names the provider ROW the running
+   *  summarizer is routed to, so the banner can show the provider the user
+   *  configured instead of its wire kind. */
   provider_id?: string
   /** permission/ask request id (echoed back via /permission/respond or /ask/respond) */
   id?: string
@@ -799,6 +851,10 @@ export interface SidecarEvent {
   cache_read_tokens?: number
   cache_write_tokens?: number
   reasoning_tokens?: number
+  /** Characters of reasoning content the backend actually observed in this
+   *  response (0 = none). Positive evidence that the model reasons, recorded
+   *  against provider+model by `learnModelReasoning`. */
+  reasoning_chars?: number
   /** Overflow events are REJECTED (unbilled) requests — never counted in billed totals. */
   unbilled?: boolean
   attempt?: number
@@ -822,6 +878,31 @@ export interface SidecarEvent {
   version?: number
 }
 
+/** One marketplace the user added: a repo holding an index of plugins.
+ *
+ *  The three address fields mirror what an install needs, so a row browsed here
+ *  can be installed (and later updated) without any translation.
+ *  `kind` is the tab the catalogue shows FIRST when this marketplace is opened —
+ *  a skills repo is browsed looking for skills, not plugins.
+ */
+export interface MarketplaceSource {
+  /** `owner/repo`, a GitHub URL, or a local folder. */
+  repo: string
+  /** Display name; falls back to the repo when absent. */
+  label?: string
+  /** Sub-folder holding the index. */
+  path?: string
+  /** Branch/tag/commit of the index. */
+  git_ref?: string
+  /** Which catalogue kind this repo is browsed for. */
+  kind?: MarketplaceKind
+}
+
+/** What a marketplace's rows are browsed as. Every kind still lists the same
+ *  index rows — a skills repo's bundles happen to carry skills, an MCP one
+ *  carries connectors — the kind only picks the default tab and the wording. */
+export type MarketplaceKind = 'plugins' | 'skills' | 'mcp'
+
 /** One plugin folder: skills + MCP connectors bundled behind a single switch. */
 export interface PluginInfo {
   name: string
@@ -833,8 +914,20 @@ export interface PluginInfo {
   skills?: string[]
   /** Connector names the folder currently holds. */
   mcp?: string[]
+  /** Names of the runnable scripts the folder holds (`/plugin run <slug> <name>`). */
+  scripts?: string[]
+  /** Persian phrases the WHOLE bundle answers to. A skill with none of its own
+   *  inherits these (capped), so a bundle of bare skills is still findable from
+   *  a Persian request. */
+  fa_keywords?: string[]
   /** Repo (or folder) the bundle was installed from, when it was. */
   source?: string
+  /** The install ARGUMENTS of `source`, re-runnable as-is. `source` alone is a
+   *  display string and cannot be fed back to an install, so "update from
+   *  source" needs these. */
+  source_repo?: string
+  source_path?: string
+  source_ref?: string
   created_at?: number
   updated_at?: number
 }
@@ -846,6 +939,7 @@ export interface PluginInstallResult {
   source?: string
   skills?: string[]
   mcp?: string[]
+  scripts?: string[]
   plugin?: PluginInfo
 }
 

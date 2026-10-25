@@ -41,7 +41,6 @@
   --provider-google: #9ccfd8;
   --provider-nvidia: #31748f;
   --provider-cloudflare: #c4a7e7;
-  --provider-tokenrouter: #ebbcba;
   --provider-ollama: #6e6a86;
   --provider-custom: #e0def4;
   /* Tool-call category colors are derived from the theme accent via
@@ -51,6 +50,10 @@
   --radius: 14px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
   --focus-ring: 0 0 0 2px color-mix(in srgb, var(--text) 25%, transparent);
+  /* Widest a single-line form control should grow. The settings panel is
+     fullscreen, so an uncapped input stretches to the whole window and stops
+     reading as one field. */
+  --field-max-w: 640px;
   /* Near-invisible separators — the "borderless" replacement for gray/white
      outlines: a hairline tinted from the text color instead of a solid box. */
   --hairline: color-mix(in srgb, var(--text) 10%, transparent);
@@ -69,6 +72,11 @@
     "IRANYekanX", monospace;
 
   --chat-font-size: 14px;
+
+  /* Code surfaces (Settings → Appearance). Kept separate from --chat-font-size
+     so shrinking a code file or the terminal never shrinks the transcript. */
+  --viewer-font-size: 14px;
+  --terminal-font-size: 14px;
 
   /* ── z-index scale ──────────────────────────────────────────────────── */
   --z-sidebar-resize: 20;
@@ -2151,11 +2159,6 @@ textarea {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-ollama) 25%, transparent);
 }
 
-.usage-group[data-provider="tokenrouter"] .usage-group-dot {
-  background: var(--provider-tokenrouter);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-tokenrouter) 25%, transparent);
-}
-
 .usage-group[data-provider="custom"] .usage-group-dot {
   background: var(--provider-custom);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-custom) 25%, transparent);
@@ -2226,11 +2229,11 @@ textarea {
   text-align: right;
 }
 
+/* Full model id (namespaces and all, e.g. "oc/glm-5.3-flash-free") — it wraps
+   onto extra lines instead of being clipped, so no segment is ever lost. */
 .usage-model {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   color: var(--text);
   direction: ltr;
   text-align: left;
@@ -3471,6 +3474,23 @@ textarea {
   display: flex;
   min-height: 0;
   min-width: 0;
+}
+
+/* Safety net: a split whose siblings were all removed keeps its wrapper, but
+   the survivor's stale inline flexGrow (chatTree clamps sizes to [0.25, 4])
+   would leave the rest of the row/col empty. A lone child claims all space. */
+.chat-split > .chat-split-child:only-child {
+  flex-grow: 1 !important;
+}
+
+/* The split wrapper stretches, but in single-leaf tree mode `multi` is false
+   and LeafView emits the .chat-window with NO inline flex — it then sizes to
+   content and leaves the rest of the wrapper empty. A lone (or any) window
+   inside a split child must claim the child's full box. */
+.chat-split-child > .chat-window {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
 }
 
 .chat-split.col > .chat-split-child {
@@ -7973,6 +7993,7 @@ body.coder-dragging .chat-split-child {
 
 .settings-search input[type="search"] {
   width: 100%;
+  max-width: var(--field-max-w);
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -8207,6 +8228,546 @@ body.coder-dragging .chat-split-child {
 
 .plugin-spacer {
   flex: 1;
+}
+
+/* Settings → Marketplaces: the catalogue browser.
+   The selector is a chip row, not a card per marketplace: the interesting
+   content is the CATALOGUE below it, and a 315-row list needs the vertical
+   space a stack of cards would steal. */
+.market-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* Marketplace list row: PLAIN text links with hairline separators — not
+   pills. The row is a roster (reload · remove), and a pill framed it like a
+   badge, which is exactly what the tab above already is. */
+.market-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 0;
+  background: none;
+  padding: 0;
+}
+
+.market-tab + .market-tab::before {
+  content: "";
+  width: 1px;
+  height: 12px;
+  background: var(--border);
+  margin-right: 10px;
+}
+
+.market-tab-name {
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 4px;
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: underline dotted transparent;
+  text-underline-offset: 3px;
+}
+
+.market-tab.active .market-tab-name,
+.market-tab-name:hover {
+  color: var(--text);
+  text-decoration-color: var(--accent);
+}
+
+.market-tab-x {
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.market-tab-x:hover {
+  opacity: 1;
+  color: var(--danger);
+}
+
+/* The add form is ONE row: address (flexes) + optional name + Add. */
+.market-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.market-add-row .market-add-repo {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The optional name takes a bounded share of the row; the Add button
+   follows the name at the end of the row. */
+.market-add-row .market-add-label {
+  width: 28%;
+  max-width: 220px;
+  min-width: 120px;
+  flex: none;
+}
+
+.market-add-row .btn {
+  flex: none;
+}
+
+@media (max-width: 560px) {
+  .market-add-row {
+    flex-wrap: wrap;
+  }
+
+  .market-add-row .market-add-repo {
+    flex-basis: 100%;
+  }
+
+  .market-add-row .market-add-label {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+    max-width: none;
+  }
+}
+
+/* Stacked: a tab row above a single form line. The settings panel is
+   fullscreen, so the form is capped instead of stretching fields across the
+   whole window. */
+.market-add {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: var(--field-max-w);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 12px;
+  margin-top: 10px;
+}
+
+.market-add .market-kinds {
+  margin: 0;
+}
+
+/* A catalogue row shares its top line between the name, its badges and the
+   action; the prose sits BELOW, clamped. An eight-line description must not
+   push the next Install button off the screen. */
+.market-row-desc {
+  padding: 0 12px 12px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.market-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+/* Loading skeleton for the marketplace grid: ghost cards with the SAME shape
+   as the real ones (title line + two body lines), breathing at staggered
+   delays so the wait reads as "data is coming", not "the tab froze". */
+.market-skeleton {
+  min-height: 220px;
+}
+
+.market-skel-card {
+  pointer-events: none;
+}
+
+.skel-line {
+  height: 11px;
+  border-radius: 5px;
+  background: linear-gradient(
+    90deg,
+    var(--border) 25%,
+    var(--accent-dim) 50%,
+    var(--border) 75%
+  );
+  background-size: 200% 100%;
+  animation: skel-sweep 1.3s ease-in-out infinite;
+}
+
+.skel-title {
+  height: 15px;
+  width: 62%;
+  margin-bottom: 6px;
+}
+
+.skel-short {
+  width: 45%;
+}
+
+@keyframes skel-sweep {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skel-line {
+    animation: none;
+  }
+}
+
+.market-pager-count {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Marketplaces tab: card grid + kind tabs + infinite scroll.
+   Catalogue entries differ wildly in name/description length, so a fixed
+   auto-fill grid keeps the rhythm without stretching any single card. */
+.market-kinds {
+  display: flex;
+  gap: 4px;
+  margin: 10px 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.market-kind {
+  appearance: none;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 4px 10px 6px;
+}
+
+.market-kind:hover {
+  color: var(--text);
+}
+
+.market-kind.active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+/* Shared card grid for the Plugins / Skills / MCP settings pages.
+   Same visual language as the marketplace grid, but sized for a list the
+   user OWNS (denser, edit affordances inside each card). */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.settings-grid-more {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 4px;
+}
+
+.pm-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--panel, var(--surface, transparent));
+  min-width: 0;
+}
+
+/* The edge rail IS the state: rose = live, gray = off. Read without any chip. */
+.pm-rail {
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+.pm-card--off .pm-rail {
+  background: var(--border);
+}
+
+.pm-card--off {
+  opacity: 0.62;
+}
+
+/* The bundle census: three counts, each with its number picked out so the row
+   scans as data instead of prose. */
+.pm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.pm-meta-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.pm-meta-item b {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pm-card--off .pm-meta {
+  opacity: 0.75;
+}
+
+.pm-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The bundle's power switch: iOS-style pill with a sliding knob.
+   ON = accent fill (the app's warm rose), OFF = quiet trough; the disabled
+   state keeps the shape so the card never jumps while a turn is in flight. */
+.pm-switch {
+  --sw-w: 34px;
+  --sw-h: 19px;
+  position: relative;
+  flex: 0 0 auto;
+  width: var(--sw-w);
+  height: var(--sw-h);
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent-dim, #403d52);
+  cursor: pointer;
+  transition: background 0.18s ease;
+}
+.pm-switch .pm-switch-knob {
+  position: absolute;
+  top: 2.5px;
+  left: 2.5px;
+  width: calc(var(--sw-h) - 5px);
+  height: calc(var(--sw-h) - 5px);
+  border-radius: 50%;
+  background: var(--text-dim, #9aa0b0);
+  transition: transform 0.18s ease, background 0.18s ease;
+}
+.pm-switch.on {
+  background: var(--accent, #ebbcba);
+}
+.pm-switch.on .pm-switch-knob {
+  transform: translateX(calc(var(--sw-w) - var(--sw-h)));
+  background: #2a2739;
+}
+.pm-switch:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.pm-switch:focus-visible {
+  outline: 2px solid var(--accent, #ebbcba);
+  outline-offset: 2px;
+}
+
+.pm-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-weight: 600;
+  cursor: default;
+}
+
+.pm-card-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-card-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pm-card-desc {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.pm-card-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* (superseded by .pm-meta) kept for skill/mcp cards that still chip stats */
+.pm-stat {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-dim, rgba(128,128,128,0.15));
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.pm-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.pm-tag {
+  font-size: 11px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.pm-tag--fa {
+  direction: rtl;
+}
+
+.pm-tag--more {
+  border-style: dashed;
+}
+
+.pm-chip {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-dim, rgba(128,128,128,0.15));
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+
+.pm-chip--off {
+  opacity: 0.7;
+}
+
+.pm-danger:hover {
+  color: var(--danger, #e06c75);
+  border-color: var(--danger, #e06c75);
+}
+
+/* The per-card editor: collapsed by default so a 50-bundle page stays browsable. */
+.pm-card-edit > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.pm-card-edit > summary:hover {
+  color: var(--text);
+}
+
+.pm-card-edit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 8px;
+}
+
+.pm-card-edit-body .plugin-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.market-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.market-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.market-card-head {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.market-card-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.market-card-desc {
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  color: var(--text-dim);
+  display: -webkit-box;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+.market-card-installed {
+  color: var(--ok, var(--accent));
+  font-size: 11px;
+}
+
+.market-more {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 12px;
+}
+
+.market-more-count {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .plugin-arrows {
@@ -10856,6 +11417,45 @@ body.coder-dragging .chat-split-child {
   align-self: flex-end;
 }
 
+/* A permission the card needs is missing. Warning-colored text, not a badge:
+   it is an explanation of why the switch will not work, so it reads as prose
+   and wraps to as many lines as the card gives it. */
+.mention-item.mcp-toggle .mcp-warn {
+  width: 100%;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--warning, #d9a514);
+  white-space: normal;
+}
+
+/* The way out of the warning above, right next to it: raise macOS's own prompt
+   so the app lands in the System Settings list the message points at. */
+.mention-item.mcp-toggle .mcp-warn-grant {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mention-item.mcp-toggle .mcp-warn-grant:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Which signing identity macOS bound the grant to. An ad-hoc build gets a new
+   one per compile, so naming it is the only way to find the right row. */
+.mention-item.mcp-toggle .mcp-warn-id {
+  display: block;
+  margin-top: 2px;
+  opacity: 0.75;
+  word-break: break-all;
+}
+
 .mcp-switch {
   flex: 0 0 auto;
   display: inline-flex;
@@ -11503,7 +12103,10 @@ body.coder-dragging .chat-split-child {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px;
   color: var(--text-dim);
-  white-space: nowrap;
+  /* `provider/model (agent)` must always be readable IN FULL: a long model id
+     wraps onto the next line instead of overflowing the banner or being cut. */
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .retry-banner .retry-cancel {
@@ -13044,25 +13647,16 @@ body.coder-dragging .chat-split-child {
   min-width: 0;
 }
 
-/* No red/green band behind the code: the tinted row made the source hard to
-   read. The cue is the 3px bar + the −/+ sign on the gutter (rules below), plus
-   a coloured line under every changed line — an inset box-shadow so the row
-   height does not shift. Same thinness and same faintness as the unified rows:
-   0.5px (one device pixel on HiDPI, the thinnest crisp line) faded 50% toward
-   var(--bg) so both themes read it as a hint, not a rule. See the unified rules
-   for the full reasoning.
-   `.diff-col-code .diff-line` already carries width: max-content / min-width:
-   100%, so long lines stay underlined as well. */
+/* Full-row tint (faint green/red, git-diff style) instead of the old underline.
+   The gutter bar + −/+ sign below stay as a second cue. */
 .diff-line-del {
-  background: transparent;
+  background: color-mix(in srgb, #f85149 12%, transparent);
   color: var(--text);
-  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #f85149 50%, var(--bg));
 }
 
 .diff-line-add {
-  background: transparent;
+  background: color-mix(in srgb, #3fb950 12%, transparent);
   color: var(--text);
-  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #3fb950 50%, var(--bg));
 }
 
 /* Side-by-side cells get the same −/+ marker as the unified rows. */
@@ -13183,12 +13777,6 @@ body.coder-dragging .chat-split-child {
    chat — the full data is one scroll away, not a click away in the panel. */
 .file-results {
   max-height: 240px;
-  overflow: auto;
-}
-
-/* The explore report is prose: it scrolls inside the card's own expanded body. */
-.explore-report {
-  max-height: 420px;
   overflow: auto;
 }
 
@@ -13650,19 +14238,19 @@ body.coder-dragging .chat-split-child {
 }
 
 .diff-view .diff-add {
-  background: transparent;
+  /* هایلایت خط اضافه‌شده: پس‌زمینهٔ سبز خیلی کم‌رنگ، بدون نوار کناری */
+  background: color-mix(in srgb, var(--success) 10%, transparent);
   color: var(--success);
   padding: 0 10px;
   white-space: pre;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--success) 65%, transparent);
 }
 
 .diff-view .diff-del {
-  background: transparent;
+  /* هایلایت خط حذف‌شده: پس‌زمینهٔ قرمز خیلی کم‌رنگ، بدون نوار کناری */
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--danger);
   padding: 0 10px;
   white-space: pre;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 65%, transparent);
 }
 
 .diff-view .diff-context {
@@ -13816,30 +14404,19 @@ body.coder-dragging .chat-split-child {
 }
 
 .diff-side-cell.diff-del {
-  /* هایلایت خط حذف‌شده: فقط نوار کناری قرمز + متن تم؛ پس‌زمینه همان تم
-     می‌ماند تا کل ستون قرمز/سبز نشود. */
-  background: transparent;
+  /* هایلایت خط حذف‌شده: پس‌زمینهٔ قرمز خیلی کم‌رنگ (بدون نوار کناری) + متن تم */
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--diff-text, var(--text));
-  box-shadow: inset 2px 0 0 var(--danger);
 }
 
 .diff-side-cell.diff-add {
-  background: transparent;
+  background: color-mix(in srgb, var(--success) 10%, transparent);
   color: var(--diff-text, var(--text));
-  box-shadow: inset 2px 0 0 var(--success);
 }
 
 .diff-side-cell.diff-context {
   color: var(--text-dim);
   opacity: 0.85;
-}
-
-.diff-side-row.mod>.diff-side-cell.diff-del {
-  background: transparent;
-}
-
-.diff-side-row.mod>.diff-side-cell.diff-add {
-  background: transparent;
 }
 
 .diff-side-meta {
@@ -18180,33 +18757,17 @@ body.coder-dragging .chat-split-child {
   white-space: pre;
 }
 
-/* Full-row tint removed for readability: add/del rows keep the theme
-   background and are marked only by the gutter bar + −/+ sign below. */
-.diff-u-row.diff-u-add,
+/* Faint full-row tint (git-diff style): add/del rows get a barely-there green
+   /red background. The gutter bar + −/+ sign below stay as a second cue. */
+.diff-u-row.diff-u-add {
+  background: color-mix(in srgb, #3fb950 12%, transparent);
+}
+
 .diff-u-row.diff-u-del {
-  background: transparent;
+  background: color-mix(in srgb, #f85149 12%, transparent);
 }
 
-/* Second, independent cue: a coloured line under every changed row. The gutter
-   bar above stays exactly as it was — this only adds the line. It is an inset
-   box-shadow, not border-bottom, so the 1.5em line height and the row rhythm
-   are untouched.
-   Thickness: 0.5px is the floor. On a HiDPI display that is exactly ONE device
-   pixel — the thinnest crisp line a browser can draw. Anything below it stops
-   being thinner and just gets antialiased into a grey smear.
-   Colour: faded toward the row's OWN background with `var(--bg)` instead of a
-   literal transparent or a mix with the text colour. Mixing toward --bg keeps
-   the same faintness in both themes (a mix with the text colour went bright in
-   the dark theme and vanished in the light one). 50% is deliberately low: the
-   real cue that a line changed is the −/+ gutter bar, and this line is only a
-   whisper under the code — it must never compete with it. */
-.diff-unified .diff-u-row.diff-u-add {
-  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #3fb950 50%, var(--bg));
-}
-
-.diff-unified .diff-u-row.diff-u-del {
-  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, #f85149 50%, var(--bg));
-}
+/* A row is already tinted (git-diff style, rules above); no underline cue. */
 
 /* A long line makes the content wider than the viewport: without this the row
    box (and therefore its underline) stopped at the container edge while the
@@ -18736,6 +19297,12 @@ mark.diff-hit-active {
 }
 
 .turn-usage-label {
+  /* Row: label left, "used/total" right — the counter is the one thing worth
+     scanning, since a turn can carry ten skills and use one. */
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   margin: 0;
   font-size: 10px;
   font-weight: 700;
@@ -18800,6 +19367,16 @@ mark.diff-hit-active {
   font-variant-numeric: tabular-nums;
 }
 
+/* Owner (plugin) suffix — dimmer than the name, behind a hairline divider, so
+   the row still reads as ONE skill ("Ponytail │ Dev Kit"). */
+.turn-usage-chip .turn-usage-meta {
+  padding-inline-start: 5px;
+  border-inline-start: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  opacity: 0.8;
+}
+
 .turn-usage-empty {
   margin: 0;
   font-size: 11.5px;
@@ -18807,6 +19384,34 @@ mark.diff-hit-active {
   color: var(--text-dim);
   max-width: 42ch;
   overflow-wrap: anywhere;
+}
+
+/* A used chip leads with a filled accent dot and a brighter border: the eye
+   should land on what the turn actually ran, not on the attached inventory. */
+.turn-usage-chip.used .turn-usage-name {
+  font-weight: 600;
+}
+
+.turn-usage-count {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+/* The turn's actual payload — first group in the card and the only one tinted:
+   "what this turn ran with" must read before the attached inventory below it. */
+.turn-usage-group-used {
+  padding: 7px 9px 8px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.turn-usage-group-used .turn-usage-label {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text-dim));
 }
 
 /* ---- بخش زمان‌بندی (بالای تودوها در پنل راست) ---- */
@@ -23497,7 +24102,7 @@ tr[data-search-current] .fv-mark,
   margin: 0;
   padding: 8px 0 16px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--viewer-font-size);
   line-height: 1.55;
   display: block;
 }
@@ -23686,6 +24291,11 @@ tr[data-search-current] .fv-mark,
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.02em;
+}
+
+.fv-open-icon-inapp {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: var(--accent);
 }
 
 .fv-open-icon-nvim {
@@ -23890,7 +24500,11 @@ tr[data-search-current] .fv-mark,
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg-panel);
+  /* Same surface as the chat panel (.chat-panel): --bg-alt gradient with a
+     faint accent tint at the top. */
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
+      var(--bg-alt));
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: var(--shadow-pop);
@@ -23904,7 +24518,7 @@ tr[data-search-current] .fv-mark,
   flex: 0 0 auto;
   padding: 7px 11px;
   border-bottom: 1px solid var(--hairline);
-  background: var(--bg-raised);
+  background: transparent;
   font-size: 11.5px;
   color: var(--text-dim);
   font-family: var(--font-mono);
@@ -23993,32 +24607,53 @@ tr[data-search-current] .fv-mark,
   display: none;
 }
 
-/* Terminal docked in the side pane (Viewer → Move to side pane). It renders as
-   a STRIP along the pane's bottom edge, not as an overlay across the pane: App
-   reserves exactly this height as padding on .viewer-group, so the viewer tabs
-   and the file tree stay visible above the shell. The strip's left/top/width/
-   height are measured from the pane and applied inline (the pane is resized by
-   its own split handle, which CSS cannot know), so these rules only shape the
-   panel itself. The vertical drag handle is hidden here because the pane's own
-   split handle owns the width. */
-.terminal-panel.terminal-right {
-  position: fixed;
-  z-index: 120;
+/* Terminal tabs in the side pane are ORDINARY viewer tabs now (kind
+   'terminal', see src/components/TerminalTabPanel.tsx): the pane's normal body
+   sizing applies, so no dock-specific geometry is left here. This wrapper only
+   has to be the positioned box that the shared .terminal-screen rule (position:
+   absolute) is inset against. */
+.terminal-tab-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--bg-alt);
   overflow: hidden;
-  border-top: 1px solid var(--border);
-  border-left: 1px solid var(--border);
+  /* Same inherited xterm variables as the bottom panel (see .terminal-panel):
+     xterm.css paints its scroll-area inset shadows with a hard-coded black
+     fallback, and nothing in the app defines that variable — so a pane hosted
+     terminal showed a BLACK strip along its edge. Defined here too, because this
+     host is outside `.terminal-panel`. */
+  --vscode-scrollbar-shadow: var(--bg-alt);
 }
 
-/* The drag handle stays VISIBLE in the side dock: the strip sits along the
-   pane's bottom edge, so grabbing its top edge is exactly how the user resizes
-   it (App supplies maxDockHeight as the ceiling). */
+/* xterm.css sets `.xterm .xterm-viewport { background-color: #000 }` (the macOS
+   opaque-scrollbar trick). The app's override has the SAME specificity
+   (0,2,0) but xterm.css is injected later by the lazy xterm import, so it won —
+   leaving a black band under the canvas. Bumping to (0,3,0) makes the themed
+   background win regardless of injection order, in BOTH hosts. */
+.terminal-screen .xterm .xterm-viewport {
+  background-color: var(--bg-alt);
+}
 
-/* Fullscreen outranks the side-pane dock: it re-claims the whole viewport and
-   drops the side border. (The component never sets both classes — it also
-   drops the dock's inline geometry — but the precedence stays explicit.) */
-.terminal-panel.terminal-full.terminal-right {
+/* A program the backend could not start (a missing `nvim`, a bad cwd) must say
+   so INSIDE the tab — an empty pane reads as broken. Overlays the (still blank)
+   screen so an early xterm paint cannot hide the reason. */
+.terminal-tab-error {
+  position: absolute;
   inset: 0;
-  border-left: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--danger);
+  background: var(--bg-alt);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .terminal-resize-handle {
@@ -24208,11 +24843,11 @@ tr[data-search-current] .fv-mark,
   display: none !important;
 }
 
-.terminal-screen .xterm-viewport::-webkit-scrollbar {
+.terminal-screen .xterm .xterm-viewport::-webkit-scrollbar {
   width: 8px;
 }
 
-.terminal-screen .xterm-viewport::-webkit-scrollbar-thumb {
+.terminal-screen .xterm .xterm-viewport::-webkit-scrollbar-thumb {
   background: var(--bg-raised);
   border-radius: 4px;
 }
@@ -24227,6 +24862,23 @@ tr[data-search-current] .fv-mark,
   font-size: 12.5px;
   color: var(--text-dim);
   text-align: center;
+}
+
+/* A requested program ("Edit in nvim") the backend could not start: the panel
+   would otherwise sit open and empty with no visible reason. */
+.terminal-spawn-error {
+  position: absolute;
+  inset: 8px 10px auto;
+  z-index: 2;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-panel));
+  color: var(--danger);
+  font-size: 12px;
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* ============================================================
@@ -24690,8 +25342,12 @@ tr[data-search-current] .fv-mark,
   border: 0;
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: none;
-  /* Visible so a widened tab's label can escape the rail. */
-  overflow: visible;
+  /* The hovered tab's name is position:fixed, so it escapes this box even
+     with clipping; scrolling keeps the icons + tab rows inside the pane when
+     the pane is shorter than the icon column. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: none;
   z-index: 2;
   /* The rail overlays the viewer content: it must never act as the frameless
      window's drag region, or hovering/clicking its icons gets swallowed. */
@@ -24707,6 +25363,7 @@ tr[data-search-current] .fv-mark,
 
 /* Panel/collapse icons lead the rail: pinned to its top edge. */
 .viewer-pane-body .viewer-pane-actions {
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -24716,18 +25373,8 @@ tr[data-search-current] .fv-mark,
   padding: 0;
 }
 
-/* The page icons wrap into compact rows above the tab list: stacked one per
-   row they would eat the rail's whole height before the first tab. */
-.viewer-pane-body .viewer-pane-icons {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  width: 100%;
-  margin: 0;
-  padding: 0;
-}
-
+/* The tab rows own the rail's free height below the fixed header buttons, so a
+   new tab can never be laid over one. */
 .viewer-pane-body .viewer-tabs-rail {
   display: flex;
   flex-direction: column;
@@ -24735,7 +25382,9 @@ tr[data-search-current] .fv-mark,
   gap: 2px;
   flex: 1 1 auto;
   width: 100%;
-  min-height: 0;
+  /* Never collapse to 0 when the icon column fills the pane: a new tab row
+     must stay reachable (the rail scrolls inside itself). */
+  min-height: 64px;
   /* A hairline + breathing room separates the tab rows from the page icons
      above: a new tab must never read as one more icon button. */
   margin-top: 6px;
@@ -24816,9 +25465,13 @@ tr[data-search-current] .fv-mark,
   display: none;
 }
 
+/* HOVER ONLY. `:focus-within` used to keep the card painted after a click —
+   mouse focus stays on the row, so a stale card hovered over content and could
+   eat the next click. Keyboard users still get it through `:focus-visible`
+   (which mouse clicks do not trigger) and `:has(:focus-visible)` for the ✕. */
 .viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-label,
 .viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-label,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .editor-tab-label {
+.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .editor-tab-label {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -24877,7 +25530,7 @@ tr[data-search-current] .fv-mark,
 
 .viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close,
 .viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-close,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .editor-tab-close {
+.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .editor-tab-close {
   opacity: 1;
   pointer-events: auto;
 }
@@ -24896,7 +25549,7 @@ tr[data-search-current] .fv-mark,
    per square, nothing drawn on top of anything else. */
 .viewer-pane-body .viewer-tabs-rail .editor-tab:hover .viewer-tab-icon,
 .viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .viewer-tab-icon,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-within .viewer-tab-icon {
+.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .viewer-tab-icon {
   opacity: 0;
   pointer-events: none;
 }
@@ -24938,9 +25591,7 @@ tr[data-search-current] .fv-mark,
 .viewer-pane-body .viewer-pane-head .tab-list-btn,
 .viewer-pane-body .viewer-pane-head .editor-tab-new,
 .viewer-pane-body .viewer-pane-head .editor-tab-full,
-.viewer-pane-body .viewer-pane-head .titlebar-icon-btn,
-.viewer-pane-body .viewer-pane-head .viewer-schedule-btn,
-.viewer-pane-body .viewer-pane-head .viewer-inbox-btn {
+.viewer-pane-body .viewer-pane-head .titlebar-icon-btn {
   width: 30px;
   height: 30px;
   flex: 0 0 auto;
@@ -24955,6 +25606,14 @@ tr[data-search-current] .fv-mark,
   width: 30px;
 }
 
+/* One entry point for every page: the rail's "+" menu. It reuses the shared
+   tab-list dropdown shell (`.tab-list-btn`), which already carries this row's
+   geometry, so the glyph lands on the same center line as the icons above. */
+.viewer-pane-body .viewer-pane-head .viewer-add-btn {
+  width: 30px;
+  height: 30px;
+}
+
 /* The wraps keep their horizontal-bar paddings otherwise; in the rail every
    button must fill the row so its glyph lands on the shared center line. */
 .viewer-pane-body .viewer-pane-head .tab-list-wrap {
@@ -24965,7 +25624,7 @@ tr[data-search-current] .fv-mark,
    strip; inside the overlaying rail that swallows hover/click on the icons. */
 .viewer-pane-body .viewer-pane-head .tab-bar.viewer-tabs {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: 64px;
   /* Tab rows own the rail's free height: the page icons keep their fixed box
      above, so a new tab can never be laid over an icon. */
   -webkit-app-region: no-drag;
@@ -25781,4 +26440,478 @@ tr[data-search-current] .fv-mark,
   border-radius: 10px;
   background: var(--bg-inset);
   border-color: var(--hairline);
+}
+/* A skill that ships inside a plugin: the label is the owning bundle name, so a
+   mixed list of own skills and plugin skills stays readable at a glance. */
+.badge.plugin-skill-badge {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A bundle that is switched off contributes nothing to the agent, so its
+   skills are listed but visibly inert. */
+.badge.plugin-skill-badge.off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* A connector owned by a plugin keeps its own name (the bundle owns the file),
+   so the name field is locked and the badge says who owns it. Its settings are
+   still editable and the row is still deletable. */
+.mcp-card-title .badge.plugin-skill-badge {
+  margin-left: 6px;
+}
+
+/* ---------------------------------------------------------------------------
+   Plugin detail page (src/components/PluginDetail.tsx)
+
+   The card in the grid answers "is this on, and what does it carry"; this page
+   answers "what exactly is inside it, and what are those things FOR". It is a
+   full-screen overlay rather than an expander because three lists with their
+   own forms do not fit in a grid column. Sits above the settings modal (100)
+   and the reading panel (120), and is portalled to <body> so no ancestor can
+   clip it.
+   --------------------------------------------------------------------------- */
+
+/* The way in, on every bundle card: one full-width hit area under the meta row,
+   so the whole card body reads as openable without a hunt for a small link. */
+.pm-card-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: auto;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.pm-card-open:hover {
+  background: var(--accent-dim, rgba(128, 128, 128, 0.12));
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.pm-card-open-hint {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pm-card-open .pd-chevron {
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.pd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: modal-fade-in 0.15s ease;
+}
+
+.pd-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(980px, 100%);
+  max-height: min(88vh, 900px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-panel, var(--bg-alt));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+/* Header: the bundle's identity on the left, its census on the right. */
+.pd-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 10%, transparent),
+    transparent
+  );
+}
+
+.pd-head-title {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+.pd-head-title h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-slug {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.pd-badge {
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.pd-badge--off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+.pd-head-meta {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-close {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.pd-close:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Tabs: pills, so the active room is a filled shape instead of an underline. */
+.pd-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.pd-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.pd-tab:hover {
+  color: var(--text);
+  background: var(--accent-dim, rgba(128, 128, 128, 0.12));
+}
+
+.pd-tab.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.pd-count {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-alt);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.pd-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pd-source {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding-bottom: 2px;
+}
+
+/* One part (skill / connector / script): a row that opens into its editor.
+   Closed rows stay quiet; the open one gets the accent rail so the page shows
+   at a glance how many editors are live.
+
+   `flex: 0 0 auto` is what keeps a row ROW-sized: `.pd-content` is a flex
+   column that scrolls, and a scroll container SHRINKS its children to fit
+   (shrink defaults to 1). A bundle with 26 skills asked for ~700px inside a
+   ~600px box, so flex divided the overflow by the row count and every row came
+   out a few px shorter than its own text — 13px instead of 57px. The head is
+   `overflow: hidden` on the row, so each name lost its top and bottom the way
+   the screenshot showed. The page scrolls through `.pd-content`'s
+   `overflow-y: auto`; the rows just have to keep their natural height. */
+.pd-part {
+  position: relative;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+
+.pd-part.open {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.pd-part.open::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent);
+}
+
+/* Two lines per row: the name/badge/action line gets the full width, and the
+   description sits UNDER it. Side by side, the description — which is long by
+   nature — squeezed the name down to "Anthronic Fronten…". */
+.pd-part-head {
+  display: grid;
+  flex: none;
+  grid-template-columns: auto 1fr;
+  column-gap: 9px;
+  row-gap: 3px;
+  align-items: center;
+  width: 100%;
+  padding: 10px 13px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pd-part-head:hover {
+  background: var(--accent-dim, rgba(128, 128, 128, 0.1));
+}
+
+.pd-part-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.pd-part-name {
+  font-weight: 600;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-part-sub {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+  /* Two lines, then it is cut. `max-height` + `overflow: hidden` clamps the
+     same way in every engine — the WebKit-only `-webkit-line-clamp` behaves
+     differently under WKWebView, where this app actually runs. A paragraph-long
+     description must not push the next row off screen, and it must never be
+     hidden outright: it is the one thing that tells two parts apart. */
+  max-height: calc(2 * 1.4em);
+  overflow: hidden;
+}
+
+.pd-part-action {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.pd-chevron {
+  flex: 0 0 auto;
+  font-size: 8px;
+  color: var(--text-dim);
+  transition: transform 0.18s ease;
+}
+
+.pd-chevron.open {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+
+.pd-part-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 13px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+/* The bulk pass over a bundle's untranslated skills: the sentence explains why
+   the button matters (no Persian keyword = unreachable from a Persian ask), so
+   the row reads as a fix, not as another toolbar. */
+.pd-bulk {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* The per-row "Translate description" affordance under the keyword field. */
+.pd-field-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pd-bundle {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+/* Forms: two labelled fields shared by all three part types, then a row of
+   actions. Inputs are styled here rather than inherited, so a part editor looks
+   the same wherever it is opened. */
+.pd-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pd-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.pd-panel input,
+.pd-panel textarea,
+.pd-panel select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  resize: vertical;
+}
+
+.pd-panel input:focus,
+.pd-panel textarea:focus,
+.pd-panel select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.pd-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pd-error {
+  color: var(--danger);
+}
+
+.pd-msg {
+  position: sticky;
+  bottom: 0;
+  align-self: flex-start;
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  background: var(--bg-panel, var(--bg-alt));
+  color: var(--text);
+  font-size: 12px;
+}
+
+.pd-content .mcp-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+@media (max-width: 720px) {
+  .pd-overlay {
+    padding: 10px;
+  }
+
+  .pd-panel {
+    max-height: 94vh;
+  }
+
+  /* The description is NOT hidden on a narrow window. It used to be
+     `display: none` here, which is why a smaller window rendered every row as a
+     bare name with no way to tell two parts apart; the two-line clamp above
+     already keeps the row short. */
 }

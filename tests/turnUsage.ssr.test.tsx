@@ -103,6 +103,17 @@ console.log("3) load_skill marks a skill as used (case-insensitive):");
   check("no duplicate row for the loaded name", u.skills.length === 1, u.skills)
 }
 
+console.log("3b) the foreign `skill` name counts as a load:");
+{
+  const msgs = [
+    user("u2", { skills: ["Ponytail"] }),
+    assistant("a2", {
+      toolActivity: [{ tool: "skill", args: { name: "ponytail" }, status: "done" }],
+    }),
+  ]
+  check("the `skill` alias marks the attached skill used", turnUsage(msgs).skills[0].used === true, turnUsage(msgs).skills)
+}
+
 console.log("4) a skill the agent loaded on its own is listed:");
 {
   const msgs = [
@@ -116,17 +127,48 @@ console.log("4) a skill the agent loaded on its own is listed:");
   const u = turnUsage(msgs)
   check("an unattached loaded skill still appears", u.skills.length === 1, u.skills)
   check("and it counts as used", u.skills[0].used === true)
-  check("nothing before the turn counts: old calls are ignored", (() => {
-    const late = turnUsage([
-      user("u1"),
-      assistant("a1", {
-        toolActivity: [{ tool: "load_skill", args: { name: "old" }, status: "done" }],
-      }),
-      user("u2"),
-      assistant("a2"),
-    ])
-    return late.skills.length === 0
-  })())
+  // Scope is the LAST turn. A turn that has a later turn after it is not
+  // reported, so an old load never leaks into the current card.
+  const superseded = turnUsage([
+    user("u1"),
+    assistant("a1", {
+      toolActivity: [{ tool: "load_skill", args: { name: "old" }, status: "done" }],
+    }),
+    user("u2"),
+    assistant("a2", {
+      toolActivity: [{ tool: "load_skill", args: { name: "new" }, status: "done" }],
+    }),
+  ])
+  check(
+    "a superseded turn's calls are not reported",
+    superseded.skills.length === 1 && superseded.skills[0].name === "new",
+    superseded.skills,
+  )
+}
+
+console.log("4b) trailing user messages do not empty the turn:");
+{
+  // The right panel said "runs without skills" whenever a queued steer or a
+  // follow-up was typed BELOW the last answer: turnStart anchored on the LAST
+  // user message, so the window after it held nothing while the transcript one
+  // row above still showed the `Load Skill` card.
+  const msgs = [
+    user("u1", { skills: ["Test UI"] }),
+    assistant("a1", {
+      content: "done",
+      toolActivity: [{ tool: "load_skill", args: { name: "Test UI" }, status: "done" }],
+    }),
+    user("u2"),
+    user("u3"),
+  ]
+  check("the turn still opens at its own user message", turnStart(msgs) === 0, turnStart(msgs))
+  const u = turnUsage(msgs)
+  check(
+    "the loaded skill is still reported as used",
+    u.skills.length === 1 && u.skills[0].used === true,
+    u.skills,
+  )
+  check("no phantom skill comes from the trailing rows", u.skills.length === 1, u.skills)
 }
 
 console.log("5) a load_skill call inside a sub-agent belongs to the turn:");
@@ -171,6 +213,35 @@ console.log("6) skillOwner + usagePlugins map names back to plugins:");
   check("skill owner is included", owners.includes("Dev Kit"), owners)
   check("connector owner is included", owners.includes("Git Tools"), owners)
   check("an unowned connector adds nothing", owners.length === 2, owners)
+}
+
+console.log("7) a re-spelled name is the same skill, not a second row:");
+{
+  // Models re-spell the name when they call the tool: the attached `Test UI`
+  // comes back as `test-ui`. Keying on case alone listed the SAME skill twice —
+  // one attached-but-unused row and one loaded row (seen live in the panel).
+  for (const spelled of ["test-ui", "test_ui", "Test UI", "TESTUI"]) {
+    const u = turnUsage([
+      user("u1", { skills: ["Test UI"] }),
+      assistant("a1", {
+        toolActivity: [
+          { tool: "load_skill", args: { name: spelled }, status: "done" },
+        ],
+      }),
+    ])
+    check(
+      `\`${spelled}\` collapses into the attached row`,
+      u.skills.length === 1 && u.skills[0].name === "Test UI" && u.skills[0].used,
+      u.skills,
+    )
+  }
+  const u = turnUsage([
+    user("u1", { skills: ["plain"] }),
+    assistant("a1", {
+      toolActivity: [{ tool: "load_skill", args: { name: "other" }, status: "done" }],
+    }),
+  ])
+  check("a different skill still gets its own row", u.skills.length === 2, u.skills)
 }
 
 if (failed > 0) {

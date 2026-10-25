@@ -8,36 +8,51 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
-import type { ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
-import { useViewerTabs } from '../lib/viewerTabs'
 import { focusChatInput } from '../lib/chatFocus'
 import { isApplePlatform } from '../lib/shortcuts'
 import { suppressField } from '../lib/inputSuppress'
 import { WebKitDeadKeyAddon } from '../lib/webkitDeadKey'
+import { findOpenRunTarget } from '../lib/nvimEdit'
+import { TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE, registerTerminalScreen, xtermTheme } from '../lib/xtermTheme'
+import { isReservedTerminalChord } from '../lib/terminalKeys'
 
 interface TerminalTab {
   id: string
   shell: string
   cwd: string
+  /** Command line for the tab tooltip (`nvim +42 /w/a.ts`). */
+  program?: string
+  /** The REQUESTED argv of a run target (`["nvim","+42","/w/a.ts"]`), kept for
+   *  reuse: the backend reports the RESOLVED command line (absolute path, joined
+   *  with spaces), which cannot be matched against a fresh request. */
+  argv?: string[]
 }
 
 interface XtermEntry {
   term: Terminal
   fit: FitAddon
   el: HTMLElement | null
+  /** Detaches this screen from the live-font registry (Settings → Appearance). */
+  offFont: () => void
 }
 
-/** Cmd/Ctrl + one of these is an APP chord, never shell input (J = panel,
- *  W = close tab, M = fullscreen, X = prefix). Checked on `keypress` too —
- *  see the custom key handler in attachScreen. */
-const RESERVED_TERMINAL_CHORDS = ['j', 'w', 'm', 'x']
+/** Cmd/Ctrl + one of the reserved chords is an APP chord, never shell input —
+ *  the shared guard lives in src/lib/terminalKeys.ts so the bottom panel and the
+ *  right-pane terminal tabs cannot drift apart. */
 
 function hasTerminalApi(): boolean {
   return typeof window !== 'undefined' && typeof window.coder?.terminalCreate === 'function'
+}
+
+/** Does a freshly opened panel owe the user a login shell? Only when it has no
+ *  tab at all: a panel that adopted surviving ptys must not start a second
+ *  shell. Pure, for tests. */
+export function shouldSpawnShell(tabCount: number): boolean {
+  return tabCount === 0
 }
 
 function cwdBasename(cwd: string): string {
@@ -45,118 +60,17 @@ function cwdBasename(cwd: string): string {
   return parts[parts.length - 1] || cwd || '~'
 }
 
-/** Map the app's active theme CSS variables onto the xterm palette so the
- *  terminal never looks bolted-on. Falls back to the Rose Pine defaults
- *  (DEFAULT_THEME) for the pre-hydration paint.
- *
- *  The ANSI slots below are deliberately spelled out instead of left to xterm:
- *  any slot the caller omits falls back to xterm's built-in Tango palette, whose
- *  greys are GREEN-TINTED (`#2e3436` for `black`, `#555753` for `brightBlack`).
- *  Both zsh-autosuggestions and zsh-syntax-highlighting paint their overlay text
- *  with `fg=8` (brightBlack), so an unset slot made every shell suggestion read
- *  as green instead of muted grey on these dark themes. Deriving the greys from
- *  the theme (`--bg-alt` / `--text-dim` / `--text`) fixes that, and mapping red /
- *  green / yellow onto `--danger` / `--success` / `--thinking` makes the
- *  terminal's git + ls output match the diff colours the app paints elsewhere. */
-export function xtermTheme(): ITheme {
-  const cs = getComputedStyle(document.documentElement)
-  const v = (name: string, fallback: string): string => cs.getPropertyValue(name).trim() || fallback
-  const bg = v('--bg-alt', '#21202e')
-  const fg = v('--text', '#e0def4')
-  return {
-    background: bg,
-    foreground: fg,
-    cursor: fg,
-    cursorAccent: bg,
-    selectionBackground: v('--accent-dim', '#403d52'),
-    selectionForeground: fg,
-    // Inactive selection (terminal unfocused): xterm's default is the same
-    // bright selection colour at half opacity, which still reads as "selected"
-    // — the theme's hover surface is the honest unfocused state.
-    selectionInactiveBackground: v('--bg-hover', '#403d52'),
-    // Scrollbar slider + overview-ruler border. Left unset, xterm derives the
-    // slider from the FOREGROUND at 20/40/50% alpha, which ties the scrollbar
-    // to the text colour instead of the theme's own structure colours. Only
-    // plain CSS vars may be used here — xterm parses these as colour values and
-    // cannot read a `color-mix()` expression.
-    scrollbarSliderBackground: v('--border', '#524f67'),
-    // Same var as `brightBlack` above, so it must carry the same fallback —
-    // one CSS variable with two different fallbacks is how a palette drifts.
-    scrollbarSliderHoverBackground: v('--text-dim', '#6e6a86'),
-    scrollbarSliderActiveBackground: v('--text', '#e0def4'),
-    overviewRulerBorder: v('--border', '#524f67'),
-    // The whole 16-slot ANSI palette, every slot derived from the app theme, so
-    // no xterm default leaks through and shell output matches the UI. Leaving a
-    // slot out is not neutral: xterm falls back to its own GitHub-ish default
-    // for that slot alone.
-    //
-    // `brightBlack` (slot 8) is the one that matters most here — it is what
-    // zsh-autosuggestions asks for by default (`ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE
-    // ='fg=8'`), so the inline suggestion renders as muted theme text rather
-    // than the bright default grey. It only gets used this way once the pty has
-    // a real TERM (see shell env in src-tauri/src/pty.rs); before that the shell
-    // could not even resolve slot 8.
-    black: bg,
-    brightBlack: v('--text-dim', '#6e6a86'),
-    red: v('--danger', '#eb6f92'),
-    brightRed: v('--danger', '#eb6f92'),
-    green: v('--success', '#3fb950'),
-    brightGreen: v('--success', '#3fb950'),
-    yellow: v('--thinking', '#f6c177'),
-    brightYellow: v('--thinking', '#f6c177'),
-    // Directories and prompt paths are the most common blue output; the app
-    // already has a blue for links/paths, so reuse it instead of xterm's dull
-    // `#3465a4`.
-    blue: v('--link', '#4a9bc0'),
-    brightBlue: v('--link', '#4a9bc0'),
-    magenta: v('--accent', '#ebbcba'),
-    brightMagenta: v('--accent', '#ebbcba'),
-    // The app palette has no separate cyan tone, so cyan shares the success
-    // colour rather than falling back to an unrelated xterm default.
-    cyan: v('--success', '#3fb950'),
-    brightCyan: v('--success', '#3fb950'),
-    white: fg,
-    brightWhite: fg,
-  }
-}
-
-/** Viewport-space rectangle of the docked strip inside the side pane. */
-export interface TerminalDockRect {
-  left: number
-  top: number
-  width: number
-  height: number
-}
-
-interface TerminalPanelProps {
-  /** EFFECTIVE dock, decided by App (see resolveTerminalPlacement in the
-   *  store): 'right' only while the side pane is really on screen. */
-  placement?: 'bottom' | 'right'
-  /** The pane strip the dock occupies, in viewport px. Only read when
-   *  placement is 'right'; null makes the panel fall back to the bottom dock
-   *  instead of painting at 0/0. */
-  dock?: TerminalDockRect | null
-  /** Ceiling for a drag inside the side pane (pane height minus the content
-   *  that must stay visible). App owns the number because only App measures
-   *  the pane. */
-  maxDockHeight?: number
-}
-
-export function TerminalPanel({
-  placement = 'bottom',
-  dock = null,
-  maxDockHeight,
-}: TerminalPanelProps = {}) {
+export function TerminalPanel() {
   const open = useStore((s) => s.terminalPanelOpen)
   const fullscreen = useStore((s) => s.terminalFullscreen)
   const theme = useStore((s) => s.theme)
   const [tabs, setTabs] = useState<TerminalTab[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
-  // Height lives in the STORE, not in local state: App reserves the very same
-  // strip as padding on the side pane, so both sides must read one number.
+  // Height lives in the store (persisted) so a fresh render restores the size.
   const height = useStore((s) => s.terminalHeight)
-
-  const right = placement === 'right' && dock !== null
+  // Reason a program could not be started. Shown in the panel instead of
+  // failing silently.
+  const [spawnError, setSpawnError] = useState<string | null>(null)
 
   // Once the panel has been opened in this session it stays mounted (hidden
   // via CSS) so the xterm buffers and the shells behind it survive toggling.
@@ -228,8 +142,20 @@ export function TerminalPanel({
     })
   }, [activeId, fitActive])
 
-  const spawnSession = useCallback(async (cwd?: string) => {
+  const spawnSession = useCallback(async (cwd?: string, program?: string, args?: string[]) => {
     if (!hasTerminalApi()) return
+    // Reuse a run target that is already open instead of starting a second one.
+    // A run target can be heavy — the user's own Neovim with its LSP plugins
+    // measured ~600 MB for ONE instance — so asking for the same file again must
+    // focus that editor rather than pay for another whole process tree.
+    if (program) {
+      const open = findOpenRunTarget(tabsRef.current, [program, ...(args ?? [])])
+      if (open) {
+        setSpawnError(null)
+        setActiveId(open.id)
+        return
+      }
+    }
     // Default to the focused chat's workspace, resolved at call time — a
     // workspace switched while the panel was open must still apply to the
     // next new shell. Empty root falls back to home in the main process.
@@ -239,15 +165,21 @@ export function TerminalPanel({
       useStore.getState().root ??
       ''
     try {
-      const info = await window.coder.terminalCreate(dir || '')
+      const requested = program ? [program, ...(args ?? [])] : undefined
+      const info = await window.coder.terminalCreate(dir || '', program, args)
       // A bridge that RESOLVES null instead of rejecting (web build, a stub,
       // or a create that found no shell) must not push a null tab: the render
       // below reads `tab.id` and a null entry would crash the whole tree.
       if (!info || typeof info.id !== 'string') return
-      setTabs((prev) => [...prev, info])
+      setTabs((prev) => [...prev, requested ? { ...info, argv: requested } : info])
       setActiveId(info.id)
+      setSpawnError(null)
     } catch (err) {
       console.error('[terminal] spawn failed:', err)
+      // A requested program (in-app nvim) that the backend could not start
+      // would otherwise leave the panel open and empty with the reason only in
+      // the console — the user asked for an editor and got nothing.
+      if (program) setSpawnError(err instanceof Error ? err.message : String(err))
     }
   }, [])
 
@@ -272,7 +204,7 @@ export function TerminalPanel({
       if (adopt.length > 0) {
         setTabs((prev) => [...prev, ...adopt])
         setActiveId((cur) => cur ?? adopt[0].id)
-      } else if (tabsRef.current.length === 0) {
+      } else if (shouldSpawnShell(tabsRef.current.length)) {
         await spawnSession()
       }
     })()
@@ -291,6 +223,7 @@ export function TerminalPanel({
     const offExit = window.coder.onTerminalExit((id) => {
       const entry = entries.current.get(id)
       if (entry) {
+        entry.offFont()
         entry.term.dispose()
         entries.current.delete(id)
         screens.current.delete(id)
@@ -311,7 +244,10 @@ export function TerminalPanel({
   // handler keeps writing to live ptys after a remount adopts the sessions.
   useEffect(() => {
     return () => {
-      for (const entry of entries.current.values()) entry.term.dispose()
+      for (const entry of entries.current.values()) {
+        entry.offFont()
+        entry.term.dispose()
+      }
       entries.current.clear()
       screens.current.clear()
     }
@@ -357,7 +293,7 @@ export function TerminalPanel({
     scheduleFit()
     const t = window.setTimeout(() => fitActive(activeId), 50)
     return () => window.clearTimeout(t)
-  }, [right, open, activeId, scheduleFit, fitActive])
+  }, [open, activeId, scheduleFit, fitActive])
 
   const activate = useCallback(
     (id: string) => {
@@ -371,6 +307,7 @@ export function TerminalPanel({
   const closeSession = useCallback((id: string) => {
     const entry = entries.current.get(id)
     if (entry) {
+      entry.offFont()
       entry.term.dispose()
       entries.current.delete(id)
       screens.current.delete(id)
@@ -387,7 +324,6 @@ export function TerminalPanel({
     useStore.getState().setTerminalPanelOpen(true)
     void spawnSession()
   }, [spawnSession])
-
   // Cmd/Ctrl+W (routed from App.tsx while the terminal has focus) closes the
   // active terminal tab — closing the last one also hides the panel.
   useEffect(() => {
@@ -397,6 +333,7 @@ export function TerminalPanel({
     window.addEventListener('coder:close-terminal-tab', onCloseTab)
     return () => window.removeEventListener('coder:close-terminal-tab', onCloseTab)
   }, [closeSession])
+
 
   // Fullscreen toggle changes geometry while sessions keep running — refit
   // the active screen so the pty adopts the new size.
@@ -423,13 +360,9 @@ export function TerminalPanel({
     dragRef.current = { startY: e.clientY, startH: height }
     const onMove = (ev: MouseEvent) => {
       if (!dragRef.current) return
-      // Side dock: the ceiling comes from App (pane height minus the content
-      // that must stay visible), so a drag can never swallow the tabs and the
-      // file tree above the dock. The bottom dock keeps the viewport cap.
-      const max = maxDockHeight ?? window.innerHeight * 0.7
+      const max = window.innerHeight * 0.7
       const next = Math.min(max, dragRef.current.startH - (ev.clientY - dragRef.current.startY))
-      // The store clamps to the minimum and persists; App reads the same value
-      // back to reserve the strip, so the two sides never drift apart.
+      // The store clamps to the minimum and persists it.
       useStore.getState().setTerminalHeight(next)
     }
     const onUp = () => {
@@ -457,12 +390,16 @@ export function TerminalPanel({
         // the pty twice (duplicated typing). Dispose the stale instance and
         // rebuild on the new element.
         existing.term.dispose()
+        existing.offFont()
         entries.current.delete(tab.id)
       }
       if (!hasTerminalApi()) return
       const term = new Terminal({
-        fontSize: 12.5,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, 'Cascadia Mono', 'Courier New', monospace",
+        // Live size from Settings → Appearance (same setting the right-pane
+        // terminal tabs read, so both hosts stay in step).
+        fontSize: useStore.getState().terminalFontSize || TERMINAL_FONT_SIZE,
+        // Shared stack: the two terminal hosts must render identically.
+        fontFamily: TERMINAL_FONT_FAMILY,
         cursorBlink: true,
         allowProposedApi: true,
         scrollback: 4000,
@@ -526,17 +463,18 @@ export function TerminalPanel({
         //
         // This covers `keypress` as well as `keydown`: xterm's `_keyPress`
         // emits the chord character from `charCode` on its own, so gating on
-        // keydown alone still leaked ^J/^M/^X into the shell. `code` is
-        // checked too so the chords survive non-Latin layouts.
-        const physical = (ev.code || '').replace(/^Key/, '').toLowerCase()
-        const pressed = (ev.key || '').toLowerCase()
-        if (!RESERVED_TERMINAL_CHORDS.some((k) => pressed === k || physical === k)) {
-          return true
-        }
+        // keydown alone still leaked ^J/^M/^X into the shell. `code` is checked
+        // too so the chords survive non-Latin layouts.
+        if (!isReservedTerminalChord(ev)) return true
         ev.preventDefault()
         return false
       })
-      entries.current.set(tab.id, { term, fit, el })
+      entries.current.set(tab.id, {
+        term,
+        fit,
+        el,
+        offFont: registerTerminalScreen({ term, refit: () => fitActive(tab.id) }),
+      })
       scheduleFit()
     },
     [scheduleFit],
@@ -547,24 +485,13 @@ export function TerminalPanel({
 
   const toggleLabel = isApplePlatform() ? '⌘J' : 'Ctrl+J'
 
-  // Side dock: needs BOTH the effective placement and a measured strip —
-  // without the strip the panel would paint at 0/0, so it falls back to the
-  // bottom dock instead.
-  //
-  // The panel never changes its place in the React tree; `terminal-right` is
-  // what moves it. Moving the element instead would unmount the xterm screens
-  // and take every shell buffer with it.
-
   return (
     <section
-      className={
-        'terminal-panel' + (fullscreen ? ' terminal-full' : '') + (right ? ' terminal-right' : '')
-      }
+      className={'terminal-panel' + (fullscreen ? ' terminal-full' : '')}
       data-open={open}
       data-fullscreen={fullscreen}
-      data-placement={right ? 'right' : 'bottom'}
       dir="ltr"
-      style={fullscreen ? undefined : right ? dock : { height }}
+      style={fullscreen ? undefined : { height }}
       aria-label="Terminal"
     >
       <div className="terminal-resize-handle" title="Drag to resize" onMouseDown={startResize} />
@@ -580,6 +507,7 @@ export function TerminalPanel({
               className={
                 'terminal-tab' + (tab.id === activeId ? ' terminal-tab-active' : '')
               }
+              title={tab.program}
               onClick={() => activate(tab.id)}
             >
               <span className="terminal-tab-shell">{tab.shell}</span>
@@ -629,33 +557,9 @@ export function TerminalPanel({
             )}
           </button>
           <button
-            className="terminal-action-btn terminal-move-btn"
-            aria-label={right ? 'Move terminal to the bottom panel' : 'Move terminal to the side pane'}
-            title={right ? 'Move to bottom panel' : 'Move to side pane'}
-            aria-pressed={right}
-            onClick={() => {
-              const next = right ? 'bottom' : 'right'
-              // Choosing the side pane implies wanting to see it, so reveal the
-              // pane instead of parking the terminal back at the bottom.
-              if (next === 'right') useViewerTabs.getState().setPaneOpen(true)
-              useStore.getState().setTerminalPlacement(next)
-            }}
-          >
-            {right ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M12 3v9m0 0-3.5-3.5M12 12l3.5-3.5M4 20h16" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                <path d="M15 4v16" />
-              </svg>
-            )}
-          </button>
-          <button
             className="terminal-action-btn"
-            aria-label={right ? 'Hide terminal panel' : `Hide terminal panel (${toggleLabel})`}
-            title={right ? 'Hide panel' : `Hide panel (${toggleLabel})`}
+            aria-label="Hide terminal panel"
+            title={`Hide panel (${toggleLabel})`}
             onClick={() => useStore.getState().setTerminalPanelOpen(false)}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
@@ -671,14 +575,21 @@ export function TerminalPanel({
             system terminal instead.
           </div>
         ) : (
-          tabs.map((tab) => (
+          <>
+            {spawnError && (
+              <div className="terminal-spawn-error" role="alert">
+                {spawnError}
+              </div>
+            )}
+            {tabs.map((tab) => (
             <div
               key={tab.id}
               className="terminal-screen" 
               data-active={tab.id === activeId}
               ref={(el) => attachScreen(tab, el)}
             />
-          ))
+            ))}
+          </>
         )}
       </div>
     </section>

@@ -322,9 +322,57 @@ console.log("۹) latestPlanDoc — آخرین planDoc چت فعال، جدیدت
   check("planDoc بدون body رد می‌شود", latestPlanDoc([{ id: "c3", messages: [{ planDoc: { title: "t", body: "" } }] }] as any, "c3") === null)
   check("چت ناموجود → null", latestPlanDoc(chats, "nope") === null)
   check("چت بدون planDoc → null", latestPlanDoc([{ id: "c4", messages: [{ content: "hi" }] }] as any, "c4") === null)
+  // یک planDoc یک‌خطی (توضیح پایانیِ پلن، نه خودِ پلن) نباید به‌عنوان سند
+  // برگردد؛ وگرنه پنل همان یک خط را نشان می‌دهد.
+  check(
+    "planDoc یک‌خطی رد می‌شود",
+    latestPlanDoc(
+      [{ id: "c5", messages: [{ planDoc: { title: "", body: "پلن نوشته شد و چک‌لیست ذخیره شد." } }] }] as any,
+      "c5",
+    ) === null,
+  )
+  check(
+    "planDoc یک‌خطیِ هدردار پذیرفته می‌شود",
+    latestPlanDoc([{ id: "c6", messages: [{ planDoc: { title: "", body: "## Plan" } }] }] as any, "c6") !== null,
+  )
+  // چت‌های قدیمی: planDoc فقط همان یک خط است، ولی خودِ پلن هنوز در استریم
+  // پیام هست — از آنجا بازیابی می‌شود، نه از هیچ.
+  const legacy = {
+    id: "c7",
+    messages: [
+      {
+        mode: "plan",
+        planDoc: { title: "", body: "پلن نوشته شد و چک‌لیست ذخیره شد." },
+        content: "بررسی…\n" + BODY + "\nپلن نوشته شد و چک‌لیست ذخیره شد.",
+        segments: [
+          { kind: "tool", index: 0 },
+          { kind: "text", text: BODY },
+          { kind: "tool", index: 1 },
+        ],
+      },
+    ],
+  } as any
+  const rec = latestPlanDoc([legacy], "c7")
+  check("پلن از استریم پیام بازیابی شد", rec?.body === BODY, rec)
+  check(
+    "پیام غیر plan بازیابی نمی‌شود",
+    latestPlanDoc(
+      [{ id: "c8", messages: [{ mode: "build", content: BODY, segments: [{ kind: "text", text: BODY }] }] }] as any,
+      "c8",
+    ) === null,
+  )
 }
 
-console.log("۱۰) PlanPanel — SSR رندر بدون کرش (زوستاند در SSR از initial state می‌خواند):")
+console.log("۱۰) planDisplay — planDoc یک‌خطی حباب را دست نمی‌زند:")
+{
+  // The old save could store only the closing note. That is not a plan: the
+  // bubble must keep its prose instead of losing it to a fake plan card.
+  const msg = { planDoc: { title: "", body: "پلن نوشته شد و چک‌لیست ذخیره شد." }, content: "## Plan\n1. step" } as any
+  const d = planDisplay(msg)
+  check("متن پیام دست‌نخورده ماند", d.content === "## Plan\n1. step", d.content)
+}
+
+console.log("۱۱) PlanPanel — SSR رندر بدون کرش (زوستاند در SSR از initial state می‌خواند):")
 {
   const React = (await import("react")).default
   const { renderToString } = await import("react-dom/server")
@@ -332,6 +380,43 @@ console.log("۱۰) PlanPanel — SSR رندر بدون کرش (زوستاند د
   const html = renderToString(React.createElement(PlanPanel))
   check("کروم پنل رندر شد", html.includes("review-panel") && html.includes("Plan"))
   check("حالت خالی نشان داده می‌شود", html.includes("No plan yet"), html.slice(0, 200))
+}
+
+console.log("۱۲) planDisplay — planDoc بدون هدر (پاسخ چت) روی پلن ذخیره‌شده بازنویسی نشده:")
+{
+  // The old save overwrote plan.md with whatever the last plan-mode turn said,
+  // so a chat ANSWER ended up as the stored planDoc. It must not swallow the
+  // real plan: the card shows the document from the message's own stream and
+  // the answer stays in the bubble.
+  const answer = "بله — مارکت‌پلیس در تنظیمات است:\n- تب تازه\n- فرم افزودن"
+  const msg = {
+    mode: "plan",
+    planDoc: { title: "", body: answer },
+    content: answer + "\n" + BODY,
+    segments: [{ kind: "text", text: answer + "\n" + BODY }],
+  } as any
+  const d = planDisplay(msg)
+  check("کارت، پلن واقعی را نشان می‌دهد", d.planDoc?.body === BODY, d.planDoc?.body)
+  check("پاسخ در حباب می‌ماند", d.content === answer, d.content)
+}
+
+console.log("۱۳) latestPlanDoc — پلن هدردار بر فهرست بدون هدر مقدم است:")
+{
+  const { latestPlanDoc } = await import("../src/lib/planDoc")
+  const chats = [
+    {
+      id: "h1",
+      messages: [
+        { mode: "plan", planDoc: { title: "", body: BODY } },
+        { mode: "plan", planDoc: { title: "", body: "- یک\n- دو" } },
+      ],
+    },
+  ] as any
+  const d = latestPlanDoc(chats, "h1")
+  check("پلن هدردار انتخاب شد", d?.body === BODY, d?.body)
+  // هیچ سند هدرداری نیست → همان فهرست، به‌عنوان آخرین راه حل.
+  const only = latestPlanDoc([{ id: "h2", messages: [{ planDoc: { title: "", body: "- یک\n- دو" } }] }] as any, "h2")
+  check("بدون سند هدردار، فهرست قدم‌ها برمی‌گردد", only?.body === "- یک\n- دو", only?.body)
 }
 
 if (failed > 0) {

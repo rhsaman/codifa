@@ -32,7 +32,6 @@ fn provider_env_names(provider: &str) -> &'static [&'static str] {
         "google" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         "nvidia" => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
         "cloudflare" => &["CLOUDFLARE_API_KEY", "CLOUDFLARE_API_TOKEN"],
-        "tokenrouter" => &["TOKENROUTER_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
         _ => &["OPENROUTER_API_KEY"],
@@ -62,6 +61,21 @@ pub fn env_key(provider: &str, env_var: &str) -> String {
     String::new()
 }
 
+/// Decode the JSON text the renderer puts in `api_keys`.
+///
+/// A query-string value is always a string, so `JSON.stringify(keys)` arrives
+/// as the literal TEXT `["k"]` — never as an array. Pushing that verbatim sent
+/// the brackets and quotes to the provider as the credential, and Google
+/// answered `400 "Please pass a valid API key"` for a key that was valid.
+/// Returns `None` for a plain key (no real key starts with `[` or `{`).
+fn decode_key_json(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('[') && !trimmed.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
+}
+
 /// Ordered API keys for a provider, first tried first. Accepts the renderer's
 /// `api_keys` JSON (list, or a single string) plus the legacy single `api_key`,
 /// with the environment as a last resort — mirrors providers.py `resolve_keys`.
@@ -86,7 +100,23 @@ pub fn resolve_keys(
                 }
             }
         }
-        Some(Value::String(s)) => push(s, &mut out),
+        // `api_keys` over a query string is text, so the JSON list the renderer
+        // sends has to be decoded before its items can be used as keys.
+        Some(Value::String(s)) => match decode_key_json(s) {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Some(k) = item.as_str() {
+                        push(k, &mut out);
+                    }
+                }
+            }
+            Some(Value::Object(map)) => {
+                if let Some(k) = pick_from_map(&map, provider) {
+                    push(&k, &mut out);
+                }
+            }
+            _ => push(s, &mut out),
+        },
         _ => {}
     }
     push(api_key, &mut out);
@@ -228,26 +258,21 @@ fn resolve_realtime_key(b: &RealtimeBody) -> String {
                 if !trimmed.is_empty() {
                     // A JSON-encoded string arrives as text; decode it so
                     // `JSON.stringify(["k"])` works like the list form.
-                    if trimmed.starts_with('[') || trimmed.starts_with('{') {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                            match parsed {
-                                Value::Array(items) => {
-                                    if let Some(found) = items.iter().find_map(|v| {
-                                        v.as_str().map(str::trim).filter(|s| !s.is_empty())
-                                    }) {
-                                        return found.to_string();
-                                    }
-                                }
-                                Value::Object(map) => {
-                                    if let Some(found) = pick_from_map(&map, &b.provider) {
-                                        return found;
-                                    }
-                                }
-                                _ => return trimmed.to_string(),
+                    match decode_key_json(trimmed) {
+                        Some(Value::Array(items)) => {
+                            if let Some(found) = items.iter().find_map(|v| {
+                                v.as_str().map(str::trim).filter(|s| !s.is_empty())
+                            }) {
+                                return found.to_string();
                             }
                         }
-                    } else {
-                        return trimmed.to_string();
+                        Some(Value::Object(map)) => {
+                            if let Some(found) = pick_from_map(&map, &b.provider) {
+                                return found;
+                            }
+                        }
+                        Some(_) => return trimmed.to_string(),
+                        None => return trimmed.to_string(),
                     }
                 }
             }
@@ -455,6 +480,26 @@ mod tests {
 
         let single = resolve_keys("openrouter", "", "", Some(&json!("only")));
         assert_eq!(single, vec!["only"]);
+
+        // A query-string value is TEXT, so the renderer's `JSON.stringify(keys)`
+        // arrives as the literal `["k"]`. Pushing that verbatim sent the brackets
+        // and quotes as the credential: Google answered 400 "Please pass a valid
+        // API key" for a key that was perfectly valid.
+        let encoded = resolve_keys("google", "", "", Some(&json!("[\"AIzaSy-real\"]")));
+        assert_eq!(encoded, vec!["AIzaSy-real"]);
+
+        // A key map (the realtime shape) decodes to the matching entry.
+        let mapped = resolve_keys(
+            "nvidia",
+            "",
+            "",
+            Some(&json!("{\"nvidia\":\"nvapi-x\",\"default\":\"other\"}")),
+        );
+        assert_eq!(mapped, vec!["nvapi-x"]);
+
+        // A plain key is left alone — nothing legitimately starts with `[`.
+        let plain = resolve_keys("google", "", "", Some(&json!("AIzaSy-plain")));
+        assert_eq!(plain, vec!["AIzaSy-plain"]);
 
         // The environment is the LAST resort: an explicitly configured key
         // always outranks it. Assert on an env var name that cannot be set so

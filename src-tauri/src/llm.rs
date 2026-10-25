@@ -16,7 +16,14 @@ use tokio::sync::Notify;
 /// Resolved per-call LLM configuration (mirrors llm.py's build_chat_model args).
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
+    /// The wire KIND ("custom", "anthropic", …): it selects the URL path and
+    /// the auth header, nothing else.
     pub provider: String,
+    /// The provider ROW this call is routed to — the Tool Models slot's own
+    /// provider id, or the chat's. A kind cannot name what the user
+    /// configured (every OpenAI-compatible endpoint is literally "custom"),
+    /// so banners, error text and the usage panel must use this instead.
+    pub provider_id: String,
     pub model: String,
     pub base_url: String,
     pub api_keys: Vec<String>,
@@ -34,7 +41,7 @@ pub struct LlmConfig {
     /// a reasoning effort when this is true (e.g. ollama `deepseek-r1`).
     pub model_reasoning: bool,
     /// True for cloud gateway kinds that auto-route to reasoning-capable
-    /// models (openrouter / nvidia / cloudflare / tokenrouter).
+    /// models (openrouter / nvidia / cloudflare).
     /// Gates the reasoning param the same way the Python `auto_think` did.
     pub auto_think: bool,
 }
@@ -59,49 +66,60 @@ pub fn reasoning_fields(
     )
 }
 
+/// The level a call may actually send: the level itself when a SOURCE
+/// enumerated it for this model, otherwise nothing.
+///
+/// `None` means no source described the model, and a level nobody described is a
+/// guess about the wire — the composer never offers one, so a stored level from
+/// before the model changed (or one picked for a different model in Settings)
+/// must not be sent either. `"none"` and `""` both mean "no reasoning
+/// parameter", so neither needs a token to be legal.
+pub fn level_from_source(allowed: Option<&[String]>, level: &str) -> String {
+    let level = level.trim();
+    if level.is_empty() || level == "none" {
+        return String::new();
+    }
+    // `max` and `xhigh` are one option in the UI, so either spelling counts.
+    let wanted = if level == "max" { "xhigh" } else { level };
+    match allowed {
+        Some(levels) if levels.iter().any(|l| l == wanted) => level.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Map a UI thinking level to the OpenAI-standard `reasoning_effort` token.
 /// Returns None when reasoning is off or the level is unknown.
-/// Note: `xhigh` / `max` are UI-only levels — OpenAI-family endpoints 400 on
-/// them, so they are mapped to the strongest accepted token ("high").
+///
+/// The token is passed through verbatim: the composer only ever offers levels a
+/// SOURCE enumerated for the model (its `/models` payload or models.dev), so a
+/// level that cannot be guessed never reaches this function. Collapsing `xhigh`
+/// onto `high` here is what made an enumerated gateway answer 400.
 pub fn reasoning_effort_for(level: &str) -> Option<&'static str> {
     match level.trim() {
         "none" => None,
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
-        // UI-only levels collapse to the strongest token the API accepts.
-        "xhigh" | "max" => Some("high"),
+        "xhigh" | "max" => Some("xhigh"),
         // "minimal" is a valid OpenAI token but not exposed in the UI today.
         _ => None,
     }
 }
 
-/// Like `reasoning_effort_for`, but the top UI level is passed through
-/// verbatim for the kinds whose endpoints accept it, and collapsed to `high`
-/// for the OpenAI-family kinds that reject it with 400.
+/// Like `reasoning_effort_for`, but the level is only sent when the KIND has an
+/// effort wire at all. Budget providers (Anthropic / Google) carry their scale
+/// in a token budget instead, so they return None here.
+///
+/// Every token is passed through verbatim: the level reaching this function was
+/// enumerated by a source for that model (see `models::resolve_thinking_levels`),
+/// so renaming it would send a token the gateway never offered.
 ///
 /// The UI exposes ONE top option ("Max", stored as `xhigh`); the legacy `max`
-/// value is an exact alias, so BOTH fold to the same token per kind — a stored
-/// `max` and a stored `xhigh` must never produce different requests.
-/// - OpenRouter / TokenRouter / Nvidia / Cloudflare forward the token to the
-///   upstream model and accept `xhigh`.
-/// - OpenAI itself (`gpt-5`, `o*`) accepts only low/medium/high/minimal, so
-///   both top values collapse to "high" (the strongest defined token).
-/// - Anthropic and Google use budget mappings (see `thinking_budget_for`),
-///   where xhigh/max already map to the same budget.
+/// value is an exact alias, so BOTH fold to `xhigh` — a stored `max` and a
+/// stored `xhigh` must never produce different requests.
 pub fn reasoning_effort_for_kind(kind: &str, level: &str) -> Option<&'static str> {
-    let level = level.trim();
-    // UI merge: 'max' and 'xhigh' are the same level.
-    let level = if level == "max" { "xhigh" } else { level };
     match kind {
-        // Token-budget providers: no `reasoning_effort` token is sent at all.
         "anthropic" | "google" => None,
-        // Gateways that forward the effort string upstream accept `xhigh`.
-        "openrouter" | "tokenrouter" | "nvidia" | "cloudflare" => match level {
-            "xhigh" => Some("xhigh"),
-            _ => reasoning_effort_for(level),
-        },
-        // OpenAI-family and everything else: top UI levels collapse to "high".
         _ => reasoning_effort_for(level),
     }
 }
@@ -379,6 +397,15 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value
             if let Some(t) = tools {
                 body["tools"] = json!(t);
             }
+            // Opt into usage reporting on the stream. This is the OpenAI
+            // standard way to ask; without it most OpenAI-compatible gateways
+            // omit `usage` from EVERY frame (NVIDIA NIM and the gateways behind
+            // it), so a call that really billed tokens arrived with none and
+            // the Model-usage panel showed a flat zero. Measured against NIM:
+            // 0 of 25 frames carried `usage` without this field, exactly one
+            // did with it. A gateway that rejects the field instead of
+            // ignoring it gets one retry without it (`stream_with_key`).
+            body["stream_options"] = json!({ "include_usage": true });
         }
     }
     apply_prompt_cache(cfg, &mut body);
@@ -584,12 +611,19 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
 /// `"code":"rate_limit_exceeded"`), which reads like "come back later" and
 /// keeps a model that cannot serve the request at all. The body names the
 /// failure, so the body decides.
-const UPSTREAM_DOWN: [&str; 5] = [
+const UPSTREAM_DOWN: [&str; 8] = [
     "upstream request failed",
     "endpoint is unavailable",
     "endpoint unavailable",
     "no available endpoint",
     "upstream is unavailable",
+    // LiteLLM-style routers answer "No ready deployment" / "No deployments
+    // available for selected model" when every backend of a model is down. The
+    // model itself cannot serve us, so the next rung must take the call instead
+    // of the same dead model being retried for the whole budget.
+    "no ready deployment",
+    "no healthy deployment",
+    "no deployment",
 ];
 
 /// Whether a provider response says the model's upstream endpoint is down.
@@ -613,6 +647,17 @@ fn is_key_error(status: u16, body: &str) -> bool {
         || body.to_ascii_lowercase().contains("quota")
 }
 
+/// Whether a rejected request is complaining about the optional
+/// `stream_options` field specifically.
+///
+/// Some strict OpenAI-compatible servers reject an unknown field instead of
+/// ignoring it. That is not a broken model — dropping the field still gets the
+/// answer, only the token accounting is lost — so the request is retried once
+/// without it rather than failing the step.
+fn rejects_stream_options(status: u16, body: &str) -> bool {
+    status == 400 && body.to_ascii_lowercase().contains("stream_options")
+}
+
 /// Whether a failed model call means "THIS model cannot serve us", i.e. the only
 /// case where trying the next configured fallback is the right move.
 ///
@@ -627,6 +672,10 @@ fn is_key_error(status: u16, body: &str) -> bool {
 /// * the provider's upstream endpoint for the model is unavailable — some
 ///   gateways report that on a 429, so [`upstream_is_down`] is checked BEFORE
 ///   the rate-limit gate and the body wins over the status;
+/// * the account's allowance for the model is EXHAUSTED ("usage limit
+///   reached", `insufficient_quota`) — also checked BEFORE the rate-limit gate,
+///   because a 429 carrying it means "this will never answer", not "come back
+///   later";
 /// * the model answered with nothing usable (an empty summary/title/description)
 ///   — the model itself is not working, which is not a transport problem.
 ///
@@ -667,6 +716,23 @@ pub fn should_fall_back(err: &str) -> bool {
     if upstream_is_down(&e) {
         return true;
     }
+    // An EXHAUSTED allowance is not "come back later". The account or the model
+    // has no quota left and no number of repeats will change that, while the
+    // next configured model may live on an entirely different account. The
+    // observed body is opencode's `FreeUsageLimitError` ("Free usage limit
+    // reached. Subscribe to OpenCode Go to keep going") carried on a 429: the
+    // rate-limit gate below reads that as a temporary hiccup, keeps the same
+    // model and leaves the user's whole fallback list unused.
+    const EXHAUSTED: [&str; 5] = [
+        "usage limit",
+        "insufficient_quota",
+        "exceeded your current quota",
+        "quota has been exceeded",
+        "credit balance",
+    ];
+    if EXHAUSTED.iter().any(|needle| e.contains(needle)) {
+        return true;
+    }
     // The provider asking us to come back later is not a broken model: retrying
     // the SAME model is exactly right, so a genuine 429 must never consume a
     // fallback.
@@ -694,12 +760,18 @@ pub fn should_fall_back(err: &str) -> bool {
     {
         return true;
     }
-    const REJECTED: [&str; 19] = [
+    const REJECTED: [&str; 20] = [
         "invalid api key",
         "incorrect api key",
         "invalid_api_key",
         "api key not valid",
         "no api key configured",
+        // A gateway that holds no credential for its own UPSTREAM can never
+        // serve this model — asking again is pure waste, so it must fall
+        // through to the next rung. (Observed from a 9router gateway:
+        // "No active credentials for provider: openrouter" on every `oc/*`
+        // model. The message is the GATEWAY's, not ours — we only classify it.)
+        "credential",
         "unauthorized",
         "unauthenticated",
         "authentication",
@@ -1323,25 +1395,42 @@ async fn stream_with_key(
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
 
-    let mut req = client
-        .post(&url)
-        .header(header_name, header_value)
-        .json(body);
-    if cfg.provider == "anthropic" {
-        req = req.header("anthropic-version", "2023-06-01");
-    }
-    // No header deadline — see the one-shot path above. The transport reports a
-    // genuinely dead connection (TCP error) immediately; the clock never does.
-    let resp = tokio::select! {
-        biased;
-        _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
-        r = req.send() => r.map_err(|e| (0u16, e.to_string()))?,
-    };
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
+    // Set only after a gateway refused `stream_options`: see the retry below.
+    let mut without_stream_options: Option<Value> = None;
+    let resp = loop {
+        let send_body = without_stream_options.as_ref().unwrap_or(body);
+        let mut req = client
+            .post(&url)
+            .header(header_name, header_value.as_str())
+            .json(send_body);
+        if cfg.provider == "anthropic" {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        // No header deadline — see the one-shot path above. The transport
+        // reports a genuinely dead connection (TCP error) immediately; the
+        // clock never does.
+        let resp = tokio::select! {
+            biased;
+            _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
+            r = req.send() => r.map_err(|e| (0u16, e.to_string()))?,
+        };
+        let status = resp.status().as_u16();
+        if (200..300).contains(&status) {
+            break resp;
+        }
         let text = resp.text().await.unwrap_or_default();
-        return Err((status, text));
-    }
+        // Losing `stream_options` costs only the token accounting, so a server
+        // that rejects the field still deserves the answer — but only one
+        // retry (a second rejection is a real error).
+        if without_stream_options.is_some() || !rejects_stream_options(status, &text) {
+            return Err((status, text));
+        }
+        let mut stripped = body.clone();
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.remove("stream_options");
+        }
+        without_stream_options = Some(stripped);
+    };
 
     let mut acc = StreamAcc::default();
     // Stamp this request with the signal's current generation: only a raise that
@@ -1490,6 +1579,7 @@ mod tests {
     fn cfg(provider: &str, base: &str, keys: &[&str]) -> LlmConfig {
         LlmConfig {
             provider: provider.into(),
+            provider_id: provider.into(),
             model: "m".into(),
             base_url: base.into(),
             api_keys: keys.iter().map(|s| s.to_string()).collect(),
@@ -1554,6 +1644,33 @@ mod tests {
         assert!(body["tools"][0].get("cache_control").is_none());
         assert_eq!(body["messages"][0]["content"], "SYS");
         assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn openai_compatible_body_asks_the_gateway_to_report_stream_usage() {
+        let c = cfg("custom", "http://localhost:20128/v1", &["k"]);
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_request_body(&c, &msgs, None);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        // Token counting is an OpenAI-stream concern only: the Anthropic and
+        // Google arms speak their own protocols and must not gain the field.
+        for kind in ["anthropic", "google"] {
+            let other = build_request_body(&cfg(kind, "https://x.example", &["k"]), &msgs, None);
+            assert!(
+                other.get("stream_options").is_none(),
+                "{kind} must not carry stream_options"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_stream_options_field_is_recognized() {
+        assert!(rejects_stream_options(400, "unknown field \"stream_options\""));
+        assert!(rejects_stream_options(400, "Unexpected property: STREAM_OPTIONS"));
+        // Only a rejection OF THAT FIELD is retried: any other 400, and the
+        // same text on a transport/server status, is a real failure.
+        assert!(!rejects_stream_options(400, "context length exceeded"));
+        assert!(!rejects_stream_options(500, "stream_options"));
     }
 
     #[test]
@@ -1761,24 +1878,28 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_for_kind_merges_max_into_xhigh() {
+    fn reasoning_effort_follows_the_merge_and_keeps_every_named_token() {
         // The UI exposes ONE top option (stored as `xhigh`); a legacy stored
         // `max` must produce the EXACT same token for every kind — otherwise
         // the same visible "Max" level sends different requests.
-        for kind in ["openrouter", "tokenrouter", "nvidia", "cloudflare", "custom", "ollama", "openai"] {
+        for kind in ["openrouter", "nvidia", "cloudflare", "custom", "ollama", "openai"] {
             assert_eq!(
                 reasoning_effort_for_kind(kind, "xhigh"),
                 reasoning_effort_for_kind(kind, "max"),
                 "xhigh and max must map identically for kind {kind}"
             );
         }
-        // Gateways that forward the token send the strongest verbatim.
-        assert_eq!(reasoning_effort_for_kind("openrouter", "xhigh"), Some("xhigh"));
-        // OpenAI-family collapses both to the strongest defined token.
-        assert_eq!(reasoning_effort_for_kind("custom", "max"), Some("high"));
+        // A level only reaches this mapping when a source enumerated it for the
+        // model, so the token travels unchanged — collapsing `xhigh` to `high`
+        // sent a token such a gateway rejects.
+        for kind in ["openrouter", "nvidia", "cloudflare", "custom"] {
+            assert_eq!(reasoning_effort_for_kind(kind, "xhigh"), Some("xhigh"));
+        }
+        assert_eq!(reasoning_effort_for_kind("custom", "medium"), Some("medium"));
         // Budget providers carry no effort token at all.
         assert_eq!(reasoning_effort_for_kind("anthropic", "xhigh"), None);
         assert_eq!(reasoning_effort_for_kind("google", "max"), None);
+        assert_eq!(reasoning_effort_for_kind("custom", "none"), None);
         // Budgets for the two spellings are identical too.
         assert_eq!(thinking_budget_for("xhigh"), thinking_budget_for("max"));
     }
@@ -1892,7 +2013,6 @@ mod tests {
         for provider in [
             "nvidia",
             "openrouter",
-            "tokenrouter",
             "cloudflare",
             "custom",
             "ollama",
@@ -2181,10 +2301,13 @@ mod tests {
             .is_none());
         c.model_reasoning = true;
         assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "high");
-        // The top UI level is UI-only for the OpenAI family: it collapses to
-        // the strongest token those endpoints accept.
+        // A level only reaches this mapping when a source enumerated it for the
+        // model, so the top level travels verbatim on every kind.
         c.reasoning_level = "xhigh".into();
-        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "high");
+        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "xhigh");
+        // A legacy stored `max` is the same option and sends the same token.
+        c.reasoning_level = "max".into();
+        assert_eq!(build_request_body(&c, &msgs, None)["reasoning_effort"], "xhigh");
         // Gateways that FORWARD the effort string keep it verbatim.
         let mut g = cfg("openrouter", "https://openrouter.ai/api/v1", &["k"]);
         g.auto_think = true;
@@ -2363,6 +2486,13 @@ mod tests {
         assert!(should_fall_back(
             r#"explore failed: {"error":{"message":"[503]: {\"error\":{\"type\":\"server_error\",\"message\":\"Upstream request failed: Endpoint is unavailable.\"}}","type":"server_error","code":"service_unavailable"}}"#
         ));
+        // A router with no live backend for the model (the user's banner:
+        // `explore failed: No ready deployment`) cannot serve it either: the next
+        // fallback takes the call instead of the same dead model being retried.
+        assert!(should_fall_back("explore failed: No ready deployment"));
+        assert!(should_fall_back(
+            "{\"error\":{\"message\":\"No deployments available for selected model\"}}"
+        ));
         // A BARE 5xx with no such body is the provider breaking, not the model:
         // it keeps the SAME model and retries it.
         assert!(!should_fall_back("503 Service Unavailable"));
@@ -2372,5 +2502,34 @@ mod tests {
         // A 5xx key rejection is the PROVIDER breaking, not the model.
         assert!(!should_fall_back("key rejected (500): upstream exploded"));
         assert!(!should_fall_back(""));
+    }
+
+    /// The user's banner: `Compact failed — every summarizer model failed —
+    /// oc/deepseek-v4.1-flash-free: key rejected (429): {"error":{"message":"[429]:
+    /// {\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached.
+    /// Subscribe to OpenCode Go to keep going\"}","code":"rate_limit_exceeded"}}`
+    ///
+    /// The status says "rate limit" and the gateway appends
+    /// `rate_limit_exceeded`, so the plain rate-limit gate read it as a
+    /// temporary hiccup — but the body says the account's allowance for THAT
+    /// model is gone. No number of repeats brings it back, while the next
+    /// configured model may live on a different account entirely, so this must
+    /// hand the call on. The chat model was the only model ever tried.
+    #[test]
+    fn an_exhausted_allowance_moves_to_the_next_model_despite_the_429() {
+        assert!(should_fall_back(
+            r#"key rejected (429): {"error":{"message":"[429]: {\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Subscribe to OpenCode Go to keep going\"}","code":"rate_limit_exceeded"}}"#
+        ));
+        // The OpenAI-shaped wording of the same verdict, and the plain quota
+        // body a 429 often carries.
+        assert!(should_fall_back(
+            "{\"error\":{\"message\":\"You exceeded your current quota\",\"code\":\"insufficient_quota\"}}"
+        ));
+        assert!(should_fall_back("insufficient_quota"));
+        // A genuine rate limit is still NOT a fallback: waiting fixes it, and
+        // another model cannot clear it. The route/anthropic wording has no
+        // quota signal in it, so it must keep the same model.
+        assert!(!should_fall_back("key rejected (429): Rate limit reached for gpt-x"));
+        assert!(!should_fall_back("key rejected (429): too many requests"));
     }
 }

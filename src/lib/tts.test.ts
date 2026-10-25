@@ -596,6 +596,38 @@ console.log('۲۱) همه ۵ تلاش fail → throw:')
   }
 }
 
+console.log('۲۲) پاسخ کوتاه بدون نقطه، پس از مکث خوانده می‌شود (نه فقط در پایان):')
+{
+  // Regression for "the whole text arrives and only then it talks": a one- or
+  // two-sentence Persian answer has no boundary until its final character, so
+  // holding the trailing run until `done` kept live voice mute for the whole
+  // turn. The tail must be spoken once it has stopped growing.
+  MockAudio.instances = []
+  ttsCall = 0
+  const src = { snapshot: () => ({ text: 'این یک پاسخ کوتاه فارسی است', done: false }) }
+  const p = playTtsStream(src, opts, 110)
+  await sleep(200)
+  const beforeSettle = MockAudio.instances.length
+  check('پیش از مکث هنوز حرف نمی‌زند', beforeSettle === 0, beforeSettle)
+  await sleep(1100)
+  const afterSettle = MockAudio.instances.length
+  check('پس از مکث قطعهٔ ناتمام خوانده شد (بدون done)', afterSettle >= 1, afterSettle)
+  stopTts()
+  void p.catch(() => {})
+}
+
+console.log('۲۳) مرزهای جدید سگمنت: خط جدید و ویرگول فارسی:')
+{
+  const lines = splitTtsSentences('سطر اول است\nسطر دوم است')
+  check('خط جدید مرز جمله است', lines.length === 2, lines)
+  const long =
+    'این یک جملهٔ فارسی است که کمی طولانی‌تر نوشته شده، و ادامهٔ آن بعد می‌آید'
+  const byComma = splitTtsSentences(long)
+  check('ویرگول در قطعهٔ بلند مرز می‌شود', byComma.length === 2, byComma)
+  const short = splitTtsSentences('الف، ب، ج')
+  check('ویرگول در قطعهٔ کوتاه مرز نمی‌شود', short.length === 1, short)
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست شکست خورد`)
   process.exit(1)

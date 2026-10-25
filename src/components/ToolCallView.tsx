@@ -11,7 +11,7 @@ import {
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
-import { diffStatsFromUnified, terminalOutputText } from "../lib/toolActivity";
+import { diffStatsFromUnified, isSkillTool, terminalOutputText } from "../lib/toolActivity";
 import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
@@ -793,6 +793,19 @@ export const TerminalResultText = function TerminalResultText({
  *  آیتم‌های این ابزارها فیلد `url` ندارند، پس نباید از WebResultLinks (مخصوص
  *  web_search/fetch_url) استفاده شوند؛ وگرنه به‌جای مسیر فایل فقط آیکون 🔗
  *  نمایش داده می‌شد. */
+/** File rows a card may render. A `load_skill` card NEVER lists files: its
+ *  result is the skill's markdown body (a filename scan once turned every path
+ *  it mentions into a chip), and transcripts saved before that fix still carry
+ *  those bogus rows — the body is the real payload, so drop them here as well
+ *  as at ingest. */
+function resultRows(activity: ToolActivity): Array<Record<string, unknown>> {
+  if (isSkillTool(activity.tool)) return [];
+  const rows = activity.items ?? activity.results;
+  return Array.isArray(rows)
+    ? (rows as unknown as Array<Record<string, unknown>>)
+    : [];
+}
+
 export const FileResultLinks = memo(function FileResultLinks({
   tool,
   items,
@@ -2060,7 +2073,18 @@ function subArgSummary(activity: ToolActivity): string {
   // avoid the duplicated "filePaths:a,b ranges:a:1:200,b:350:70" line.
   const rangesRaw = (args as Record<string, unknown>).ranges;
   if (Array.isArray(rangesRaw) && rangesRaw.length > 0) {
-    const rs = rangesRaw.map((r) => String(r)).filter(Boolean);
+    // Range items are objects ({path, offset, limit}): flatten each to its
+    // "path:offset:limit" (or bare "path") so they never render as [object Object].
+    const rs = rangesRaw
+      .map((r) => {
+        if (typeof r === "string") return r;
+        if (r && typeof r === "object" && "path" in r) {
+          const o = r as { path?: unknown; offset?: unknown; limit?: unknown };
+          return [o.path, o.offset, o.limit].filter((v) => v != null).join(":");
+        }
+        return "";
+      })
+      .filter(Boolean);
     if (rs.length > 0) parts.push(rs.length > 2 ? `${rs.slice(0, 2).join(", ")} +${rs.length - 2} more` : rs.join(", "));
   } else if (typeof rangesRaw === "string" && rangesRaw) {
     parts.push(rangesRaw);
@@ -2298,7 +2322,7 @@ const TraceRow = memo(function TraceRow({
           {/* The `Results` section below is the FILE-path list (read / grep /
               terminal); web rows already rendered their links above. */}
           {!isWebRow(activity) &&
-            (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
+            (resultRows(activity).length > 0 ||
               (activity.tool === "run_terminal" &&
                 Boolean(activity.resultText))) && (
             <div className="trace-expand-section">
@@ -2309,15 +2333,7 @@ const TraceRow = memo(function TraceRow({
                   fallbackText={activity.resultText}
                 />
               ) : (
-                <FileResultLinks
-                  tool={activity.tool}
-                  items={
-                    (activity.items ??
-                      activity.results) as unknown as Array<
-                      Record<string, unknown>
-                    >
-                  }
-                />
+                <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
               )}
             </div>
           )}
@@ -2362,16 +2378,11 @@ const ToolTimelineRow = memo(function ToolTimelineRow({
       )}
       <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
-      {(activity.items ?? activity.results) &&
-        (activity.items ?? activity.results)!.length > 0 &&
+      {resultRows(activity).length > 0 &&
         (activity.tool === "web_search" || activity.tool === "fetch_url" ? (
           <WebResultLinks items={activity.items ?? activity.results!} />
         ) : (
-          <FileResultLinks
-            tool={activity.tool}
-            items={(activity.items ??
-              activity.results) as unknown as Array<Record<string, unknown>>}
-          />
+          <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
         ))}
     </div>
   );
@@ -2658,7 +2669,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
           {/* The `Results` section below is the FILE-path list (read / grep /
               terminal); web rows already rendered their links above. */}
           {!isWebRow(activity) &&
-            (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
+            (resultRows(activity).length > 0 ||
               (activity.tool === "run_terminal" &&
                 Boolean(activity.resultText))) && (
             <div className="trace-expand-section">
@@ -2669,15 +2680,7 @@ export const ToolSingleRow = memo(function ToolSingleRow({
                   fallbackText={activity.resultText}
                 />
               ) : (
-                <FileResultLinks
-                  tool={activity.tool}
-                  items={
-                    (activity.items ??
-                      activity.results) as unknown as Array<
-                      Record<string, unknown>
-                    >
-                  }
-                />
+                <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
               )}
             </div>
           )}
@@ -2771,9 +2774,16 @@ export const ToolCallView = memo(function ToolCallView({
     activity.tool === "write_file" || activity.tool === "edit_file";
   /** مسیر فایلِ کارت نوشتن (path یا filePath) — برای هدر و پنل Review. */
   const writePath = reviewPathOf(activity);
-  const readPaths = Array.isArray(activity.args?.paths)
-    ? (activity.args.paths as string[])
-    : [];
+  // `read` names each file INSIDE `ranges` (one entry per file and window), so
+  // the chip row follows ranges first; the bare `paths` list remains only as a
+  // fallback for transcripts written before the schema dropped it.
+  const readPaths: string[] = Array.isArray(activity.args?.ranges)
+    ? (activity.args.ranges as Array<Record<string, unknown>>)
+        .map((r) => (typeof r?.path === "string" ? r.path : ""))
+        .filter(Boolean)
+    : Array.isArray(activity.args?.paths)
+      ? (activity.args.paths as string[])
+      : [];
 
   const fetchSummary = activity.tool === "fetch_url" ? activity.summary : "";
   /** The skill a `load_skill` call loaded. The label only says "Load Skill", and
@@ -3034,6 +3044,19 @@ export const ToolCallView = memo(function ToolCallView({
               {activity.resultText}
             </pre>
           )}
+          {/* A skill load's result IS its body. The head only says "Load Skill
+              · <name>" and the backend summary repeats the tool name, so the
+              card body used to be empty while the prose leaked out as file
+              chips. Clamp it like terminal output — the body can be long. */}
+          {canonicalTool(activity.tool) === "load_skill" &&
+            activity.resultText && (
+              <pre
+                className="trace-expand-val trace-expand-pre trace-terminal-output"
+                dir="auto"
+              >
+                {activity.resultText}
+              </pre>
+            )}
           {activity.tool === "explore" &&
             activity.children &&
             activity.children.length > 0 && (

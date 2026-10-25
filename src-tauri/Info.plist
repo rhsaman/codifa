@@ -4,5 +4,9 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Codifa uses the microphone for voice dictation in the chat composer.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Codifa takes a screenshot so the agent can see the desktop when you enable Computer Use in the composer.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Codifa controls other apps with System Events so the agent can click and type when you enable Computer Use in the composer.</string>
 </dict>
 </plist>

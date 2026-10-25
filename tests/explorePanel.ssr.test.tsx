@@ -27,7 +27,6 @@ function resetViewer() {
     tabs: [],
     activeId: null,
     paneOpen: false,
-    panelMode: false,
   } as never);
 }
 

@@ -54,6 +54,69 @@ export function toolFallbackEntries(
   return out
 }
 
+/** A tools row's stored entry, split into `(providerId, model)`.
+ *
+ *  A slash is a provider PREFIX only when its head names a provider that
+ *  actually exists: `9router/oc/deepseek-v4.1-flash-free` is provider `9router`
+ *  + model `oc/deepseek-v4.1-flash-free`, while a legacy bare
+ *  `oc/deepseek-v4.1-flash-free` is a MODEL id and must be attributed to the
+ *  provider that owns it — never mis-read as provider `oc` with the model
+ *  truncated to `deepseek-v4.1-flash-free`, which sent the call to the wrong
+ *  endpoint and surfaced as `404 page not found`. */
+export function splitSlotEntry(
+  entry: string,
+  providerIds: ReadonlySet<string>,
+): { providerId: string; model: string } {
+  const raw = (entry ?? '').trim()
+  const slash = raw.indexOf('/')
+  if (slash > 0) {
+    const head = raw.slice(0, slash)
+    if (providerIds.has(head)) return { providerId: head, model: raw.slice(slash + 1) }
+  }
+  return { providerId: '', model: raw }
+}
+
+/** The provider that owns a bare model id: the single provider whose catalog
+ *  lists it. Ambiguous (`null`) when nobody lists it or several do, which is
+ *  what keeps a multi-vendor aggregator from stealing a model it merely
+ *  proxies. */
+export function ownerOfModel(
+  model: string,
+  providers: ReadonlyArray<{ id: string; models?: string[] }>,
+): string {
+  const owners = providers.filter((p) => (p.models ?? []).includes(model))
+  return owners.length === 1 ? owners[0].id : ''
+}
+
+/** Resolve a stored slot entry against the real provider rows, every legacy
+ *  shape included: an id prefix (`custom-abc123/model`), a legacy KIND prefix
+ *  (`custom/model`, what the picker used to store), or a bare model id that one
+ *  provider's catalog lists.
+ *
+ *  `unowned` marks a slash-bearing entry NO row can claim. Such a string is a
+ *  model id from a provider we do not have (`oc/deepseek-v4.1-flash-free`), so
+ *  attributing it to the active provider is a wrong answer — the caller has to
+ *  say "no row" instead of guessing. */
+export function resolveSlotEntry(
+  entry: string,
+  providers: ReadonlyArray<{ id: string; kind?: string; models?: string[] }>,
+): { providerId: string; model: string; unowned: boolean } {
+  const raw = (entry ?? '').trim()
+  const { providerId, model } = splitSlotEntry(raw, new Set(providers.map((p) => p.id)))
+  if (providerId) return { providerId, model, unowned: false }
+  const slash = raw.indexOf('/')
+  if (slash <= 0) {
+    return { providerId: ownerOfModel(raw, providers), model: raw, unowned: false }
+  }
+  // Legacy kind prefix: the provider's KIND stood in for its id before ids were
+  // stored explicitly.
+  const head = raw.slice(0, slash)
+  const byKind = providers.find((p) => p.kind === head)
+  if (byKind) return { providerId: byKind.id, model: raw.slice(slash + 1), unowned: false }
+  const owner = ownerOfModel(raw, providers)
+  return { providerId: owner, model: raw, unowned: owner === '' }
+}
+
 /** What a row's model picker must show: `providerId/model` when both are set,
  *  the provider alone while its model is still unpicked, a bare model id for
  *  legacy rows, and `''` (which the picker renders as "Main model") when the
@@ -72,7 +135,10 @@ export function toolFallbackValue(row: ToolFallback): string {
 export function toolFallbackToModel(row: ToolFallback): string {
   const pid = row.providerId.trim()
   const model = row.model.trim()
-  if (pid && model) return model.includes('/') ? model : `${pid}/${model}`
+  // The provider id is ALWAYS kept: dropping it because the model id happens to
+  // contain a vendor slash stored the row as a bare `oc/deepseek-…`, which the
+  // backend then split into provider `oc` + a truncated model (404).
+  if (pid && model) return `${pid}/${model}`
   return pid ? '' : model
 }
 
@@ -93,13 +159,10 @@ export function mainModelRow(): ToolFallback {
 export function toolChainRows(
   own: string,
   fallbacks: ToolFallback[],
+  providerIds: ReadonlySet<string> = new Set(),
 ): ToolFallback[] {
-  const entry = own.trim()
-  const slash = entry.indexOf('/')
-  const head: ToolFallback =
-    slash > 0
-      ? { providerId: entry.slice(0, slash), model: entry.slice(slash + 1) }
-      : { providerId: '', model: entry }
+  const { providerId, model } = splitSlotEntry(own, providerIds)
+  const head: ToolFallback = { providerId, model }
   return [head, ...fallbacks]
 }
 

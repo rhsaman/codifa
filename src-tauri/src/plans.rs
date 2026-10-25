@@ -270,6 +270,75 @@ pub fn save_checklist(data_root: &str, workspace: &str, chat_id: &str, items: &V
     let _ = atomic_write(&d.join("checklist.json"), &serde_json::to_string(&clean).unwrap_or_default());
 }
 
+/// True when the prose contains a markdown heading line.
+///
+/// This is the plan-vs-chat criterion: the plan prompt makes every plan open
+/// with a heading, while a plan-mode turn can also be a plain answer ("where
+/// does the marketplace belong?") that happens to carry a few bullets. Saving
+/// such an answer as the plan overwrote the real `plan.md` and the panel ended
+/// up showing the chat.
+pub fn has_heading(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with('#'))
+}
+
+/// Build the plan DOCUMENT out of the prose a plan-mode turn produced, round by
+/// round, in order.
+///
+/// A plan-mode turn streams several rounds: the reads come first, then the round
+/// that writes the plan (heading + steps + the closing summary section), and
+/// finally a round that only reports "the plan is saved, switch to Build".
+/// Saving just the last round made `plan.md` — the document the Plan panel
+/// renders — that one-line note. Joining every round fixed that but kept the
+/// per-round narration ("دو نکته پیدا شد که پلن را عوض میکند …") in the
+/// document, above the plan.
+///
+/// So: keep the rounds that carry a heading (that is what the plan prompt asks
+/// the plan to open with), drop the narrated rounds around them, and drop the
+/// lines before the first heading inside the first kept round. Rounds repeated
+/// verbatim (a steer-continue resend) are dropped so the body never doubles.
+/// When no round has a heading at all, every round is kept — a plan written as
+/// a bare list is still better than an empty file.
+pub fn plan_text(parts: &[&str]) -> String {
+    let mut rounds: Vec<String> = Vec::new();
+    for part in parts {
+        let text = part.trim();
+        if text.is_empty() || rounds.iter().any(|r| r == text) {
+            continue;
+        }
+        rounds.push(text.to_string());
+    }
+    let heady: Vec<usize> = rounds
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| has_heading(t))
+        .map(|(i, _)| i)
+        .collect();
+    // Narration rounds (`Read done, now I know…`) sit around the plan: keep the
+    // span from the first heading round to the last one, drop the rest.
+    let kept: Vec<String> = match (heady.first(), heady.last()) {
+        (Some(&first), Some(&last)) => rounds[first..=last].to_vec(),
+        _ => rounds,
+    };
+    kept.iter()
+        .enumerate()
+        .map(|(i, round)| match i {
+            0 => {
+                // Inside the first kept round, everything above its first
+                // heading is narration that belongs to the chat, not the doc.
+                let start = round
+                    .lines()
+                    .position(|l| l.trim_start().starts_with('#'))
+                    .unwrap_or(0);
+                round.lines().skip(start).collect::<Vec<_>>().join("\n")
+            }
+            _ => round.clone(),
+        })
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Load the persisted checklist for a workspace+chat (or []).
 pub fn get_checklist(data_root: &str, workspace: &str, chat_id: &str) -> Value {
     let d = plan_dir(data_root, workspace, chat_id);
@@ -314,6 +383,45 @@ mod tests {
         // be a real SHA-1 (Python hashlib), not a custom hash.
         let slug = workspace_slug_for_root("/Users/saman/Documents/code/codifa");
         assert_eq!(slug, "codifa-73cc528b");
+    }
+
+    #[test]
+    fn plan_text_keeps_only_the_plan_rounds() {
+        // Real shape of a plan-mode turn: a read round, narrating rounds around
+        // the plan, then the closing note "switch to Build".
+        let narration = "دو نکته پیدا شد که پلن را عوض می‌کند: …";
+        let plan = "## Plan\n1. `a.rs` — چیزی را عوض می‌کند\n\n## خلاصه\nپلن آماده است.";
+        let note = "پلن نوشته شد و چک‌لیست روی دیسک ذخیره شد.";
+        let out = plan_text(&["", narration, plan, note]);
+        assert!(out.starts_with("## Plan"), "{out}");
+        assert!(!out.contains("دو نکته پیدا شد"), "{out}");
+        assert!(!out.contains("چک‌لیست روی دیسک"), "{out}");
+    }
+
+    #[test]
+    fn plan_text_drops_leading_narration_inside_a_round() {
+        // The plan round itself can open with a line of prose before the heading.
+        let plan = "یک بررسی هم روی تست‌ها کردم.\n## Plan\n1. گام";
+        assert_eq!(plan_text(&[plan]), "## Plan\n1. گام");
+    }
+
+    #[test]
+    fn plan_text_falls_back_to_every_round_without_a_heading() {
+        // A plan written as a bare list has no heading — keep it instead of
+        // saving an empty document.
+        let out = plan_text(&["1. first", "2. second"]);
+        assert_eq!(out, "1. first\n\n2. second");
+    }
+
+    #[test]
+    fn has_heading_separates_a_plan_from_a_chat_answer() {
+        // The plan prompt makes a plan open with a heading; an answer to a plan-
+        // mode QUESTION carries no heading even when it is bulleted, which is
+        // what must not overwrite the saved plan.
+        assert!(has_heading("## Plan\n1. گام"));
+        assert!(has_heading("مقدمه\n### قدم‌ها\n- یک"));
+        assert!(!has_heading("بله — مارکت‌پلیس در تنظیمات است:\n- تب تازه\n- فرم افزودن"));
+        assert!(!has_heading(""));
     }
 
     #[test]

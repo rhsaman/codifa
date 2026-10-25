@@ -1,6 +1,7 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, TraceEntry, TraceKind, TracePage } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, RealtimeSessionRequest, RealtimeSessionResponse, ScheduleRun, ScheduledTask, SearchPluginConfig, SearchResultItem, SidecarEvent, ThinkingLevel, TraceEntry, TraceKind, TracePage } from '../types'
 import { api } from './fs'
 import { modelContextWindow } from './context'
+import { sttDecodeFields } from './stt'
 
 let sidecarUrl: string | null = null
 // In-flight `ensureSidecar` resolution. Shared by every concurrent caller so
@@ -65,7 +66,14 @@ export async function ensureSidecar(): Promise<string | null> {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       const url = await Promise.race([
-        api.getSidecarUrl(),
+        // The IPC itself can throw when the bridge is missing (a bare browser,
+        // a harness without the preload) — and it throws SYNCHRONOUSLY, so a
+        // bare `.catch()` would never attach. Wrapping it in a promise keeps
+        // the contract below: this function never rejects, and a missing
+        // bridge is just "no backend", which every caller already handles.
+        Promise.resolve()
+          .then(() => api.getSidecarUrl())
+          .catch(() => null),
         new Promise<null>((resolve) => {
           timer = setTimeout(() => resolve(null), SIDECAR_RESOLVE_TIMEOUT_MS)
         }),
@@ -126,6 +134,10 @@ export interface ModelsResult {
   pricing: Record<string, ModelPricing>
   /** Per-model reasoning-support flag (models.dev limit.reasoning / provider payload). */
   reasoning: Record<string, boolean>
+  /** Thinking LEVELS each model really supports, verbatim from the provider's
+   *  `/models` payload or the models.dev catalog. A key that is ABSENT means no
+   *  source described the model; `[]` means it has no thinking mode. */
+  thinkingLevels: Record<string, ThinkingLevel[]>
 }
 
 /** Ordered keys for a provider (top = tried first). Sent as api_keys. */
@@ -334,14 +346,47 @@ async function postTtsChunks(
   }
 }
 
+/** Characters that end a spoken sentence. */
+const SENTENCE_END_RE = /[.!?…؟!]/
+/** Chunk length at which a comma may end a chunk (see {@link splitTtsSentences}). */
+const COMMA_SPLIT_MIN_CHARS = 40
+
 /** Split long text into sentence chunks for queued TTS playback. */
 export function splitTtsSentences(text: string, maxLen = 160): string[] {
-  const clean = (text ?? '').replace(/\s+/g, ' ').trim()
+  // Paragraph breaks are real boundaries — a heading, a list item or a topic
+  // change ends a thought even without punctuation — so they are preserved.
+  // Collapsing every whitespace run into a space (the old `\s+` → ' ') deleted
+  // them, and a markdown answer then had NO boundary before its last character:
+  // nothing could be spoken until the whole answer had arrived.
+  const clean = (text ?? '')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n+ */g, '\n')
+    .trim()
   if (!clean) return []
-  // Only true sentence boundaries (. ! ? … ؟) — splitting on colon/semicolon
-  // chopped mid-sentence phrases into tiny chunks, multiplying requests and
-  // making playback choppy. Colons/semicolons stay inside the chunk.
-  const parts = clean.split(/(?<=[.!?…؟!])/u).map((s) => s.trim()).filter(Boolean)
+  // Boundaries: sentence ends (. ! ? … ؟), paragraph breaks, and the Persian
+  // comma (،) once the chunk is already long enough to be worth speaking on its
+  // own. Splitting on EVERY comma is wrong for Persian, which is comma-heavy:
+  // one normal «الف، ب، ج» sentence would become a swarm of two-word requests.
+  // Colons/semicolons never split — doing so chopped mid-sentence phrases into
+  // tiny chunks, multiplying requests and making playback choppy.
+  const parts: string[] = []
+  let cur = ''
+  const flush = () => {
+    const t = cur.trim()
+    if (t) parts.push(t)
+    cur = ''
+  }
+  for (const ch of clean) {
+    if (ch === '\n') {
+      flush()
+      continue
+    }
+    cur += ch
+    if (SENTENCE_END_RE.test(ch) || (ch === '،' && cur.trim().length >= COMMA_SPLIT_MIN_CHARS)) {
+      flush()
+    }
+  }
+  flush()
   const sentences = parts.length > 0 ? parts : [clean]
   const out: string[] = []
   for (const s of sentences) {
@@ -395,6 +440,11 @@ export async function transcribeAudio(
     const sttKeys = (opts.apiKeys ?? []).filter((k) => typeof k === 'string' && k)
     if (sttKeys.length > 0) form.append('api_keys', JSON.stringify(sttKeys))
     if (opts.model) form.append('model', opts.model)
+    // Greedy decoding, so the same clip cannot come back as a different word on
+    // a retry (see sttDecodeFields for why a non-whisper model opts out).
+    for (const [field, value] of Object.entries(sttDecodeFields(opts.model))) {
+      form.append(field, value)
+    }
   }
   if (onModelLoading) onModelLoading(true)
   try {
@@ -477,19 +527,31 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
       throw new Error((body as { detail?: string }).detail || `models request failed (${res.status})`)
     }
     const data = (await res.json()) as {
-      models: Array<{ id: string; context: number | null; pricing?: ModelPricing | null; reasoning?: boolean | null }>
+      models: Array<{
+        id: string
+        context: number | null
+        pricing?: ModelPricing | null
+        reasoning?: boolean | null
+        thinking_levels?: string[] | null
+      }>
     }
     const models: string[] = []
     const context: Record<string, number> = {}
     const pricing: Record<string, ModelPricing> = {}
     const reasoning: Record<string, boolean> = {}
+    const thinkingLevels: Record<string, ThinkingLevel[]> = {}
     for (const m of data.models ?? []) {
       models.push(m.id)
       if (m.context) context[m.id] = m.context
       if (m.pricing) pricing[m.id] = m.pricing
       if (typeof m.reasoning === 'boolean') reasoning[m.id] = m.reasoning
+      // `null` (no source knows the model) is kept ABSENT rather than stored as
+      // an empty list: "unknown" and "no thinking mode" must stay distinct.
+      if (Array.isArray(m.thinking_levels)) {
+        thinkingLevels[m.id] = m.thinking_levels as ThinkingLevel[]
+      }
     }
-    return { models, context, pricing, reasoning }
+    return { models, context, pricing, reasoning, thinkingLevels }
   })()
   modelsInFlight.set(sig, p)
   // Clear the cache entry once the request settles, but keep a short "fresh"
@@ -1044,6 +1106,9 @@ export interface CompactProgress {
   attempts: number
   /** Model running the current attempt. */
   model: string
+  /** Provider ROW the model is routed to (id), so the banner can name the
+   *  provider the user configured instead of its wire kind. */
+  providerId: string
   /** Share of the budget already spent, 0-100. */
   percent: number
   /** Wall-clock budget for the WHOLE compaction, in seconds. */
@@ -1184,6 +1249,7 @@ export async function triggerCompact(params: {
           attempt: Number(payload.attempt ?? 0),
           attempts: Number(payload.attempts ?? 0),
           model: String(payload.model ?? ''),
+          providerId: String(payload.provider_id ?? ''),
           percent: Number(payload.percent ?? 0),
           budgetSecs: Number(payload.budget_secs ?? 0),
           elapsedSecs: Number(payload.elapsed_secs ?? 0),
@@ -1501,6 +1567,10 @@ export interface SkillRow {
   files?: string[]
   /** Owning plugin's display name, when the skill ships inside a plugin. */
   plugin?: string
+  /** Owning plugin's folder slug — what a save/delete must target. */
+  plugin_slug?: string
+  /** False when the owning plugin is switched off (Settings still lists it). */
+  plugin_enabled?: boolean
 }
 
 export interface SkillSyncResult {
@@ -1552,12 +1622,17 @@ export async function listAvailableSkills(): Promise<SkillRow[]> {
   return fetchSkillRows('/skills/available', 'listAvailableSkills')
 }
 
-/** Fetch one extra (Codex-style) file of a skill. Null when missing. */
-export async function getSkillFile(name: string, file: string): Promise<string | null> {
+/** Fetch one extra (Codex-style) file of a skill. Null when missing.
+ *
+ *  `plugin` names the owning bundle: Settings edits a plugin's skill while the
+ *  bundle may be switched OFF, and the backend's owner lookup only searches
+ *  enabled plugins, so the caller that already knows says so. */
+export async function getSkillFile(name: string, file: string, plugin?: string): Promise<string | null> {
   const url = await ensureSidecar()
   if (!url) return null
   try {
-    const res = await fetch(`${url}/skills/file?name=${encodeURIComponent(name)}&file=${encodeURIComponent(file)}`)
+    const owner = plugin ? `&plugin=${encodeURIComponent(plugin)}` : ''
+    const res = await fetch(`${url}/skills/file?name=${encodeURIComponent(name)}&file=${encodeURIComponent(file)}${owner}`)
     if (!res.ok) return null
     const data = (await res.json()) as { content?: string }
     return typeof data.content === 'string' ? data.content : null
@@ -1614,6 +1689,9 @@ export async function syncSkill(params: {
   delete?: boolean
   files?: Record<string, string>
   deletedFiles?: string[]
+  /** Owning plugin's slug. Present = write into that bundle's skill folder
+   *  instead of the user's own store (a plugin folder is a skill-store root). */
+  plugin?: string
 }): Promise<SkillSyncResult> {
   const url = await ensureSidecar()
   if (!url) return { ok: false, note: "the local backend is not ready" }
@@ -1626,8 +1704,11 @@ export async function syncSkill(params: {
         previous_name: params.previousName ?? "",
         content: params.content ?? "",
         description: params.description ?? "",
-        fa_keywords: params.faKeywords ?? "",
+        // Omitted = "keep what the file already has"; an explicit empty string
+        // = the user cleared the field, which must remove the keywords.
+        ...(params.faKeywords !== undefined ? { fa_keywords: params.faKeywords } : {}),
         delete: params.delete ?? false,
+        ...(params.plugin ? { plugin: params.plugin } : {}),
         // Multi-file (Codex-style) skills: extra file contents to upsert.
         // Omitted when undefined so single-file skills are unaffected.
         // Send both spellings for backend compatibility.
@@ -1648,35 +1729,48 @@ export async function syncSkill(params: {
   }
 }
 
-/** List MCP connectors (+ builtin names) from the app's user data folder. */
+/** Every MCP connector that exists, flattened to the composer's shape.
+ *
+ *  Connectors live inside plugin bundles now, so this is a read of `/plugins/mcp`
+ *  (the single list Settings and the composer both use) presented the way the
+ *  picker and the per-turn send already expect: one `{name: cfg}` map. A bundle
+ *  that is switched OFF contributes nothing — the switch is the on/off control,
+ *  so a disabled bundle must not silently keep feeding the agent tools. */
 export async function listMcp(): Promise<{
   mcpServers: Record<string, McpServerConfig>
   builtins: string[]
 }> {
+  // Read directly (not through lib/plugins) so this module keeps importing
+  // nothing from a sibling that already imports it.
   const url = await ensureSidecar()
   if (!url) return { mcpServers: {}, builtins: [] }
   try {
-    const res = await fetch(`${url}/mcp`)
+    const res = await fetch(`${url}/plugins/mcp`)
     if (!res.ok) return { mcpServers: {}, builtins: [] }
     const data = (await res.json()) as {
-      mcpServers?: Record<string, McpServerConfig>
-      builtins?: string[]
+      connectors?: Array<{
+        name?: string
+        cfg?: McpServerConfig
+        plugin_enabled?: boolean
+      }>
     }
-    return {
-      mcpServers: data.mcpServers ?? {},
-      builtins: Array.isArray(data.builtins) ? data.builtins : [],
+    const out: Record<string, McpServerConfig> = {}
+    for (const r of data.connectors ?? []) {
+      if (!r.name || r.plugin_enabled === false) continue
+      out[r.name] = r.cfg ?? {}
     }
+    return { mcpServers: out, builtins: [] }
   } catch {
     return { mcpServers: {}, builtins: [] }
   }
 }
 
-/** Save an MCP connector to the app's user data folder. */
+/** Save an MCP connector into the bundle that owns it (a new one if it has none). */
 export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void> {
   const url = await ensureSidecar()
   if (!url) return
   try {
-    await fetch(`${url}/mcp`, {
+    await fetch(`${url}/plugins/mcp/save`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, cfg }),
@@ -1686,12 +1780,12 @@ export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void>
   }
 }
 
-/** Remove an MCP connector from the app's user data folder. */
+/** Remove an MCP connector from its bundle (the bundle goes when it was alone). */
 export async function deleteMcp(name: string): Promise<void> {
   const url = await ensureSidecar()
   if (!url) return
   try {
-    await fetch(`${url}/mcp/delete`, {
+    await fetch(`${url}/plugins/mcp/delete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -1992,6 +2086,9 @@ export async function gitAutoCommit(
     thinkingLevel?: string
     modelReasoning?: boolean
   },
+  /** Provider rows keyed by id, so the backend checks the level against the
+   *  list a source really enumerated for this model (same rule as a turn). */
+  providers: Record<string, unknown> = {},
 ): Promise<GitAutoCommitResult | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: "the local backend is not ready" }
@@ -2008,6 +2105,7 @@ export async function gitAutoCommit(
         provider_id: provider.id ?? "",
         thinking_level: provider.thinkingLevel ?? "",
         model_reasoning: provider.modelReasoning ?? false,
+        providers,
       }),
     })
     if (!res.ok) {

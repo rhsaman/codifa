@@ -56,9 +56,9 @@ export {}
 const React = await import("react")
 const { renderToStaticMarkup } = await import("react-dom/server")
 const { readFileSync } = await import("node:fs")
-const { ViewerTabBar, ViewerFilesButton, ViewerInboxButton, ViewerTerminalButton, toggleTerminalInSidePane } = await import("../src/components/ViewerTabBar")
-const { resolveTerminalPlacement, useStore } = await import("../src/lib/store")
-const { useViewerTabs } = await import("../src/lib/viewerTabs")
+const { ViewerTabBar, ViewerAddButton, openTerminalTab } = await import("../src/components/ViewerTabBar")
+const { useStore } = await import("../src/lib/store")
+const { useViewerTabs, viewerTabRows } = await import("../src/lib/viewerTabs")
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -74,10 +74,10 @@ console.log("1) ViewerTabBar renders as a vertical icon rail:")
 {
   const html = renderToStaticMarkup(React.createElement(ViewerTabBar))
   const tabCount = (html.match(/role="tab"/g) ?? []).length
-  // The seed holds an inbox tab (icon-owned: represented by its rail icon, so
-  // NO row) and a legacy global file tab (no icon: still a row).
-  check("rail-owned pages get no row, plain tabs do", tabCount === 1, html)
-  check("the inbox tab is not drawn as a row", !html.includes('kind-inbox'), html)
+  // The seed holds TWO tabs (an inbox page and a legacy global file tab). Pages
+  // are ordinary tabs now, so BOTH are rows, each with its own ✕.
+  check("every open tab gets a row", tabCount === 2, html)
+  check("a page is drawn as a row like any other tab", html.includes('kind-inbox'), html)
   check("bar carries the rail class", html.includes("viewer-tabs-rail"), html.slice(0, 160))
   check("bar announces a vertical tablist", html.includes('aria-orientation="vertical"'))
   check("every tab shows an icon", (html.match(/viewer-tab-icon/g) ?? []).length === tabCount)
@@ -209,6 +209,20 @@ console.log("2) markup + CSS keep the rail fixed on the pane's right edge:")
     "the rail keeps its one-icon width",
     /--viewer-rail-width:\s*42px/.test(railCss),
   )
+  // Regression: the name/✕ card must be hover-only. `:focus-within` kept it
+  // painted after a click, so a stale card floated over content and swallowed
+  // the next click (it closed the OTHER row's tab, and the pane fell back to
+  // the Schedule page).
+  const railStateRules = railCss.match(/\.viewer-pane-body[^{}]*\.editor-tab[^{}]*\{[^}]*\}/g) ?? []
+  check(
+    "the name card is never painted from :focus-within",
+    !railStateRules.some((r) => /:focus-within/.test(r) && /editor-tab-label|editor-tab-close|viewer-tab-icon/.test(r)),
+    railStateRules.filter((r) => /:focus-within/.test(r)),
+  )
+  check(
+    "keyboard focus can still reveal the card",
+    /\.editor-tab:focus-visible \.editor-tab-label/.test(railCss),
+  )
 
   const barSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
   // The ✕ lives INSIDE the name card: one surface, two behaviors.
@@ -226,6 +240,53 @@ console.log("2) markup + CSS keep the rail fixed on the pane's right edge:")
     "drag/keyboard reordering runs on the vertical axis",
     /dropSide\(e\.clientY, rect, "y"\)/.test(barSrc) && /tabMove\(.*"y"\)/.test(barSrc),
   )
+
+  // Regression: a rail icon only ever OPENED/FOCUSED its page. It must never
+  // carry a `close` prop, or a second press closed an open tab and the pane
+  // fell back to whatever page was left (the reported "clicking trace closed
+  // the file tab"). The page icons are gone, so the same rule now binds the
+  // "+" menu entries: opening a page never closes any other tab.
+  check(
+    "the rail never carries a close-prop for a page",
+    !/closeTitle=/.test(barSrc) && !/\n\s+close=\{/.test(barSrc),
+    (barSrc.match(/closeTitle=|\n\s+close=\{/g) ?? []).slice(0, 4),
+  )
+  check(
+    "opening a page from the \"+\" menu never closes a tab",
+    /export function ViewerAddButton\(\)[\s\S]*?\n\}/.test(barSrc) &&
+      !/onClose:/.test((barSrc.match(/export function ViewerAddButton\(\)[\s\S]*?\n\}/) ?? [""])[0]),
+  )
+
+  // Regression: the card's ✕ lands exactly on the row's icon square (hover
+  // replaces the kind icon), so the click meant to SWITCH to a tab hit the ✕
+  // and closed the tab the user wanted — the reported "clicking a file closed
+  // the previous tab and showed Trace/Schedule". Only the SHOWN tab's ✕ closes;
+  // an inactive row is activated instead.
+  check(
+    "the ✕ of an inactive row switches to it instead of closing it",
+    /if \(!active\) \{[\s\S]{0,160}?setActiveViewer\(t\.id\)[\s\S]{0,80}?return/.test(barSrc) &&
+      /closeViewer\(t\.id\)/.test(barSrc),
+    (barSrc.match(/if \(!active\) \{[\s\S]{0,160}?setActiveViewer/g) ?? []).slice(0, 2),
+  )
+
+  // Regression: a file chip opens on POINTERDOWN. The chat window refocuses on
+  // pointerdown, which re-renders the message list and replaces the chip node
+  // before the browser fires `click` — that swallowed the open and the pane
+  // kept the previous page (Trace/Schedule).
+  const fileIconSrc = readFileSync("src/components/FileIcon.tsx", "utf8")
+  check(
+    "file chips open on pointerdown (a focus re-render cannot swallow it)",
+    /<button[\s\S]{0,600}?onPointerDown=\{handle\}/.test(fileIconSrc),
+  )
+  check(
+    "click stays as the backup path for a swapped node",
+    /onPointerDown=\{handle\}[\s\S]{0,400}?onClick=\{handle\}/.test(fileIconSrc),
+  )
+  const chatSrc = readFileSync("src/components/Chat.tsx", "utf8")
+  check(
+    "the chat panel focuses on the CAPTURE phase so the file is scoped right",
+    /onPointerDownCapture=\{/.test(chatSrc),
+  )
 }
 
 console.log("3) panel icons lead the rail, tabs follow below them:");
@@ -242,10 +303,13 @@ console.log("3) panel icons lead the rail, tabs follow below them:");
   check("panel icons come before the tabs", actionsAt !== -1 && actionsAt < barAt)
   check("nothing is stacked above the panel icons", !head.slice(headAt === -1 ? 0 : 0, actionsAt).includes("<button"))
   check("the spacer drops below the tabs", spacerAt > barAt)
-  // Every page owns an icon now, so the "+" menu is gone: a page could
-  // otherwise be reachable from two differently-worded entries.
-  check("no \"+\" add button is left in the rail", !head.includes("ViewerAddButton"))
-  check("the add button component is gone from the app", !appSrc.includes("ViewerAddButton"))
+  // One entry point for every page: the rail's "+" menu. Fixed page icons are
+  // gone, so no page owns a button of its own any more.
+  check("the \"+\" menu trigger is in the rail", head.includes("<ViewerAddButton"))
+  check(
+    "no fixed page icon is mounted",
+    !head.includes("ViewerFilesButton") && !head.includes("ViewerInboxButton"),
+  )
 
   const css = readFileSync("src/styles/global.css", "utf8")
   const actions = css.match(/\.viewer-pane-body \.viewer-pane-actions\s*\{[^}]*\}/)
@@ -253,127 +317,87 @@ console.log("3) panel icons lead the rail, tabs follow below them:");
   check("rail icon buttons share one width", /\.viewer-pane-head \.titlebar-icon-btn/.test(css))
 }
 
-console.log("4) every page owns one rail icon, in a fixed order:");
+console.log("4) one \"+\" menu instead of fixed page icons:");
 {
   const appSrc = readFileSync("src/App.tsx", "utf8")
   const headAt = appSrc.indexOf('className="viewer-pane-head"')
   const head = appSrc.slice(headAt, appSrc.indexOf("</section>", headAt))
   const listAt = head.indexOf("<ViewerTabListButton")
   const fullAt = head.indexOf("<ViewerPaneFullscreenButton")
-  const filesAt = head.indexOf("<ViewerFilesButton")
-  const todosAt = head.indexOf("<ViewerTodosButton")
-  const artifactsAt = head.indexOf("<ViewerArtifactsButton")
-  const termAt = head.indexOf("<ViewerTerminalButton")
-  const schedAt = head.indexOf("<ViewerScheduleButton")
-  const inboxAt = head.indexOf("<ViewerInboxButton")
-  const reviewAt = head.indexOf("<ViewerReviewButton")
-  const traceAt = head.indexOf("<ViewerTraceButton")
-  const browserAt = head.indexOf("<ViewerBrowserButton")
+  const addAt = head.indexOf("<ViewerAddButton")
   const barAt = head.indexOf("<ViewerTabBar")
   const spacerAt = head.indexOf("viewer-pane-spacer")
 
-  check("the terminal toggle renders in the rail", termAt !== -1, head.slice(0, 1200))
-  check("fill every page icon", [fullAt, filesAt, todosAt, artifactsAt, schedAt, inboxAt, reviewAt, traceAt, browserAt].every((i) => i !== -1), head)
+  check("the \"+\" menu renders in the rail", addAt !== -1, head.slice(0, 1200))
   check("fullscreen sits directly below the tab-list chevron", listAt !== -1 && fullAt > listAt)
-  // The requested order: files, then todos, then artifacts, then the terminal dock.
-  check("files leads the rest of the page icons", filesAt > fullAt && filesAt < todosAt)
-  check("todos sits below files and above artifacts", todosAt > filesAt && todosAt < artifactsAt)
-  check("artifacts follows todos and sits above the terminal", artifactsAt > todosAt && artifactsAt < termAt)
-  check("the terminal follows artifacts", termAt > artifactsAt)
-  check("schedule follows the terminal, inbox follows schedule", schedAt > termAt && inboxAt > schedAt)
-  check("review, trace and browser close the icon list", reviewAt > inboxAt && traceAt > reviewAt && browserAt > traceAt)
-  check("the rail rows and the tabs come last", barAt > browserAt && spacerAt > barAt)
-  // The todos page is the pane's fallback body, so its icon must be a real
-  // toggle button, not a one-off <button> markup in App.
+  check("the \"+\" menu follows the fullscreen toggle", addAt > fullAt)
+  check("the rail rows and the tabs come last", barAt > addAt && spacerAt > barAt)
+  // The pane can be expanded with NO tab open (its body then falls back to the
+  // todos page), so the toggle must never be gated on the tab count.
   check(
-    "the todos page owns a rail icon (not raw markup in App)",
-    !head.includes('className="titlebar-icon-btn panel-toggle"'),
+    "the fullscreen toggle is not gated on open tabs",
+    /viewerFull && !chatFull/.test(appSrc),
+    appSrc.match(/viewerFull &&[^?]*\?/)?.[0],
   )
 
-  // Nothing docked yet: unpressed, announcing the OPEN action.
-  const html = renderToStaticMarkup(React.createElement(ViewerTerminalButton))
-  check(
-    "the rail button is a plain titlebar icon button",
-    html.includes('class="titlebar-icon-btn viewer-terminal-btn"'),
-    html,
-  )
-  check("it starts unpressed", html.includes('aria-pressed="false"'), html)
-  check(
-    "its label offers to open the terminal here",
-    html.includes("Open the terminal in the side pane"),
-    html,
-  )
-  check(
-    "the tooltip and the label agree",
-    (html.match(/Open the terminal in the side pane/g) ?? []).length === 2,
-    html,
-  )
-  check(
-    "it paints a stroke glyph instead of a filled app badge",
-    html.includes('stroke="currentColor"') && !html.includes("mac-app-badge"),
-    html,
-  )
+  const barSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
+  // Every page the menu offers must be a real tab kind, so the row it lands on
+  // can be closed: nothing is icon-owned any more.
+  for (const kind of ["files", "todos", "artifacts", "review", "trace", "browser", "schedule", "inbox"]) {
+    check(`the "+" menu opens the ${kind} page`, barSrc.includes(`key: "${kind}"`), kind)
+  }
+  const addHtml = renderToStaticMarkup(React.createElement(ViewerAddButton))
+  check("the trigger carries its own \"+\" glyph", addHtml.includes('class="tab-list-btn viewer-add-btn"'), addHtml)
+  check("and announces itself as the page menu", addHtml.includes('aria-label="Open a page"'), addHtml)
 
-  // Drive the real action: the button is a thin wrapper around it.
+  // Drive the real action behind the menu's terminal entry: it opens an
+  // ORDINARY viewer tab in the pane (the old dock-into-the-pane mode is gone).
+  useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
   useViewerTabs.getState().setPaneOpen(false)
-  useStore.getState().setTerminalPanelOpen(false)
-  useStore.getState().setTerminalPlacement('bottom')
 
-  toggleTerminalInSidePane()
+  openTerminalTab()
   const v1 = useViewerTabs.getState()
-  const a1 = useStore.getState()
-  check("the first press reveals the side pane", v1.paneOpen === true)
-  check("it requests the side dock", a1.terminalPlacement === 'right', a1.terminalPlacement)
-  check("it opens the terminal", a1.terminalPanelOpen === true)
+  check("the menu opens a terminal TAB", v1.tabs.some((t) => t.kind === 'terminal'), v1.tabs)
+  check("it reveals the side pane", v1.paneOpen === true)
   check(
-    "the effective dock really is the pane",
-    resolveTerminalPlacement(a1.terminalPlacement, v1.paneOpen, a1.chatFullscreen) === 'right',
+    "the tab carries the workspace root as its cwd",
+    v1.tabs.find((t) => t.kind === 'terminal')?.terminalCwd === useStore.getState().root,
   )
-
-  toggleTerminalInSidePane()
-  check("pressing it again closes the terminal", useStore.getState().terminalPanelOpen === false)
-
-  // A stale 'right' request left behind while the panel was closed must not
-  // turn the first press into a no-op: the panel is shut, so it must OPEN.
-  useStore.getState().setTerminalPlacement('right')
-  useStore.getState().setTerminalPanelOpen(false)
-  toggleTerminalInSidePane()
-  check("a stale side request still opens the terminal", useStore.getState().terminalPanelOpen === true)
-
-  // …and the pressed state needs the pane to be on screen, or the icon would
-  // claim "docked here" for a terminal that fell back to the bottom dock.
   check(
-    "a hidden pane degrades the dock (so the icon reads unpressed)",
-    resolveTerminalPlacement('right', false, false) === 'bottom',
+    "pressing it again focuses the same tab instead of stacking one",
+    (() => {
+      openTerminalTab()
+      return useViewerTabs.getState().tabs.filter((t) => t.kind === 'terminal').length === 1
+    })(),
   )
 }
 
-console.log("5) a page icon is pressed only while its page is ON SCREEN:")
+console.log("5) every page opened from the \"+\" menu is a closable tab:");
 {
-  // The seeded store has TWO tabs open (inbox + a legacy global file tab) with
-  // the inbox active. The inbox icon must read pressed and offer to close…
-  const inboxHtml = renderToStaticMarkup(React.createElement(ViewerInboxButton))
+  // The rail renders ONE ROW PER TAB — pages included — and every row carries
+  // the ✕: that is what makes a page opened from the menu deletable like a file.
+  useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as never)
+  const vt = useViewerTabs.getState()
+  vt.openSchedule()
+  vt.openInbox()
+  const tabs = useViewerTabs.getState().tabs
+  check("each page became its own tab", tabs.length === 2, tabs.map((t) => t.kind))
   check(
-    "the icon of the shown page is pressed",
-    inboxHtml.includes('aria-pressed="true"'),
-    inboxHtml,
+    "both pages are drawn as rail rows",
+    viewerTabRows(tabs, useStore.getState().activeChatId).length === 2,
   )
-  check("…and offers to close it", inboxHtml.includes("Close the inbox"), inboxHtml)
 
-  // …while the files icon, whose tab is open too but NOT on screen, must read
-  // unpressed and offer to OPEN (focus) it. Keying it off "a tab exists" made
-  // this press look like a toggle and CLOSE the page instead.
-  const filesHtml = renderToStaticMarkup(React.createElement(ViewerFilesButton))
+  const html = renderToStaticMarkup(React.createElement(ViewerTabBar))
+  check("both rows render", (html.match(/role="tab"/g) ?? []).length === 2, html)
   check(
-    "the icon of an open-but-hidden page is not pressed",
-    filesHtml.includes('aria-pressed="false"'),
-    filesHtml,
+    "every row carries a close button",
+    (html.match(/editor-tab-close/g) ?? []).length === 2,
+    html,
   )
-  check(
-    "…and still offers to open it",
-    filesHtml.includes("Open the file explorer") && !filesHtml.includes("Close the file explorer"),
-    filesHtml,
-  )
+
+  useViewerTabs.getState().closeViewer("schedule")
+  const left = useViewerTabs.getState().tabs
+  check("closing the row removes exactly that page", left.length === 1 && left[0].kind === "inbox", left)
 }
 
 if (failed) process.exit(1)

@@ -49,6 +49,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long `diagnostics` drains pushed `publishDiagnostics` notifications.
 ///
+/// How long the AUTOMATIC post-edit diagnostics may listen.
+///
+/// Much shorter than the explicit `lsp_diagnostics` window (3s): this one is
+/// not the model's deliberate question, it is a freebie riding on an edit
+/// result, so it must never delay the edit. A warm server answers in
+/// milliseconds — a shorter window only drops a slow answer, which the model
+/// still covers with its own build command.
+const POST_EDIT_DIAGNOSTICS_WINDOW: Duration = Duration::from_millis(1500);
+
+/// The same window for a file the server had NOT seen before the edit.
+///
+/// MEASURED with a real client against `typescript-language-server`: the first
+/// `publishDiagnostics` after `didOpen` arrives in 1.99s, the re-lint after
+/// `didChange` in 0.40s. The warm 1.5s window above is therefore too short for
+/// exactly the first edit of every file — the one that matters most, because a
+/// new file has never been checked at all. Paid only in that case, and only
+/// when the server was already warm (`diagnostics_if_warm`).
+const POST_EDIT_DIAGNOSTICS_WINDOW_COLD: Duration = Duration::from_millis(3000);
+
+/// How long `diagnostics` drains pushed `publishDiagnostics` notifications.
+///
 /// A soft window: diagnostics are a bonus, and this call must never wedge the
 /// turn — it triggers a pull without waiting for the response (`request_nowait`)
 /// and then only listens for as long as this.
@@ -410,8 +431,9 @@ struct Server {
     /// resumes draining for the answer to the request already in flight instead
     /// of restarting the handshake (servers ignore a second `initialize`).
     initialize_sent: bool,
-    /// Open documents (uri -> version) to keep didOpen/didChange bookkeeping.
-    open_docs: HashMap<String, u64>,
+    /// Open documents: uri -> (version, on-disk signature). The signature is
+    /// what makes a STALE open document detectable — see `ensure_open`.
+    open_docs: HashMap<String, (u64, (u64, u64))>,
     /// When a call last used this server. Drives idle eviction so a long session
     /// that opens many projects does not keep a language-server process — with
     /// its whole project index in memory — alive for every one of them.
@@ -614,39 +636,31 @@ impl Server {
             return Ok(());
         }
         let root_uri = path_to_uri(root);
-        // Per-server initialization options. Servers not listed here get none and
-        // keep their own defaults, exactly as before.
+        // Per-server initialization options. A language not listed here gets
+        // none and keeps its own defaults.
         //
-        // `rust-analyzer` is the only server that needed this: with no options at
-        // all it primes its caches for the WHOLE dependency graph, which measured
-        // 1921 MB of physical footprint for one workspace — twice this app's
-        // entire memory budget. These three settings cut the index it keeps
-        // resident without changing a single answer it gives:
-        //   * cachePriming.enable — the dependency-graph pre-build (the biggest
-        //     single consumer; on-demand analysis still works without it)
-        //   * checkOnSave off — the `cargo check` diagnostics pass, which loads
-        //     the full crate graph a second time
-        //   * numThreads — bounds the peak allocation of the parallel indexer
+        // HISTORY: these options used to switch off rust-analyzer's
+        // `diagnostics` and `cargo.buildScripts`, plus an `lruCapacity` cut, to
+        // save memory. That was the wrong fix — both of those CHANGE WHAT THE
+        // USER GETS (no diagnostics for Rust files at all, and no analysis of
+        // the build-script / proc-macro generated code a Tauri project is full
+        // of), and the LRU cut traded resident memory for repeated re-parses.
+        // They are gone: full analysis quality is the priority.
+        //
+        // The real leak was LIFETIME, not configuration: `prewarm` started a
+        // server for every project ever opened and each agent turn refreshed its
+        // idle timer, so a 1921 MB index lived forever. That is fixed in the
+        // lifecycle policy (`HEAVY_LANGUAGES`, `should_prewarm`,
+        // `LSP_HEAVY_IDLE_TTL`), so a heavy server now costs memory only while
+        // it is actually in use.
+        //
+        // `cachePriming` is the one entry that stays off: it changes no answer
+        // at all — it is a speculative pre-build of the whole dependency graph
+        // and the single biggest measured allocation. On-demand analysis
+        // produces identical results, just without the eager warm-up.
         let initialization_options = if self.language == "rust" {
             json!({
                 "cachePriming": { "enable": false },
-                // The `cargo check` diagnostics pass is the single biggest
-                // memory consumer after the index itself: it loads the full
-                // crate graph a SECOND time, in a child process. Diagnostics
-                // for a file are still available on demand through
-                // `textDocument/diagnostic`; this only stops the whole-workspace
-                // background pass nobody asked for.
-                "diagnostics": { "enable": false },
-                // Build scripts (Tauri pulls `tauri-build` -> a whole
-                // gtk/glib build-dependency graph) force rust-analyzer to load
-                // and compile the BUILD dependency graph on top of the normal
-                // one. Disabling it keeps user-code analysis intact and drops
-                // the largest remaining block of resident memory.
-                "cargo": { "buildScripts": { "enable": false } },
-                // 128 syntax trees retained is a lot of parsed source; halving
-                // it costs a re-parse and saves tens of MB.
-                "lruCapacity": 64,
-                "numThreads": 2,
             })
         } else {
             Value::Null
@@ -655,13 +669,7 @@ impl Server {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "initializationOptions": initialization_options,
-            // Without hierarchicalDocumentSymbolSupport servers answer
-            // documentSymbol with flat SymbolInformation (handled in `symbols`).
-            "capabilities": {
-                "textDocument": {
-                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
-                }
-            },
+            "capabilities": initialize_capabilities(),
         });
         // Send the handshake request only ONCE per process: a later retry must
         // keep draining for the answer to the request already in flight rather
@@ -704,11 +712,39 @@ impl Server {
         Ok(())
     }
 
-    fn ensure_open(&mut self, abs: &Path) -> Result<(), String> {
+    /// Make sure the server has the CURRENT text of `abs`.
+    ///
+    /// Returns whether a `didOpen` was sent, i.e. whether this is the server's
+    /// FIRST sight of the file. That is not a detail: MEASURED (probe against
+    /// `typescript-language-server` on a real workspace file) a first lint after
+    /// `didOpen` takes 1.99s while a re-lint after `didChange` takes 0.40s, so a
+    /// caller that budgets the same window for both inevitably drops every
+    /// first-time answer.
+    fn ensure_open(&mut self, abs: &Path) -> Result<bool, String> {
         self.drain_pending();
         let uri = path_to_uri(abs);
-        if self.open_docs.contains_key(&uri) {
-            return Ok(());
+        let sig = file_sig(abs);
+        // An already-open document is re-checked against the DISK before it is
+        // trusted. `didOpen` used to be sent once and never revisited, so after
+        // the agent's own `edit_file` every later definition / references /
+        // diagnostics call was answered about the PRE-EDIT text — a silent
+        // quality loss (the server described a file that no longer existed).
+        if let Some((version, prev)) = self.open_docs.get(&uri).copied() {
+            if prev == sig {
+                return Ok(false);
+            }
+            let text = std::fs::read_to_string(abs)
+                .map_err(|e| format!("cannot read {}: {e}", abs.display()))?;
+            let next = version + 1;
+            write_message(&mut self.stdin, &json!({
+                "jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": next},
+                    "contentChanges": [{"text": text}]
+                }
+            }))?;
+            self.open_docs.insert(uri, (next, sig));
+            return Ok(false);
         }
         if self.open_docs.len() >= MAX_OPEN_DOCS {
             // Evict an arbitrary open doc to stay bounded.
@@ -734,8 +770,8 @@ impl Server {
             "jsonrpc": "2.0", "method": "textDocument/didOpen",
             "params": {"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}
         }))?;
-        self.open_docs.insert(uri, 1);
-        Ok(())
+        self.open_docs.insert(uri, (1, sig));
+        Ok(true)
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -780,6 +816,25 @@ impl Server {
     }
 }
 
+/// Cheap on-disk fingerprint (mtime + length) of a file, or `(0, 0)` when it
+/// cannot be stat'd.
+///
+/// Used by `Server::ensure_open` to notice that the file changed under an OPEN
+/// document. Content is not hashed: this runs before every LSP call, and an
+/// mtime+length pair moves on any real edit while costing one `stat`.
+fn file_sig(abs: &Path) -> (u64, u64) {
+    let Ok(meta) = std::fs::metadata(abs) else {
+        return (0, 0);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (mtime, meta.len())
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         // Signal the whole process GROUP, not just the direct child.
@@ -812,6 +867,36 @@ fn path_to_uri(path: &Path) -> String {
     format!("file://{s}")
 }
 
+/// The `capabilities` the client declares at `initialize`.
+///
+/// MEASURED against `typescript-language-server` with a real workspace file and a
+/// 2x2 factor matrix (capabilities vs the answers given to server->client
+/// requests), same `didOpen` every time:
+///
+/// | declared capabilities                        | first `publishDiagnostics` |
+/// |----------------------------------------------|----------------------------|
+/// | `documentSymbol` only (what this client sent) | **never** (10s window)     |
+/// | `+ textDocument.publishDiagnostics`           | 0.00s                      |
+/// | `+ textDocument.synchronization`              | never                      |
+/// | `+ workspace.configuration/workspaceFolders`  | never                      |
+///
+/// So the push is gated on the CLIENT declaring `publishDiagnostics`: without it
+/// the server stays silent no matter how the client answers its requests, which
+/// is why the post-edit diagnostics lever fired on only 3 of 99 traced edits and
+/// even an explicit `lsp_diagnostics` was told "no report arrived". Declaring a
+/// capability that was already required to RECEIVE these notifications costs
+/// nothing and starts no work — the server simply keeps doing what it did.
+fn initialize_capabilities() -> Value {
+    json!({
+        "textDocument": {
+            // Without hierarchicalDocumentSymbolSupport servers answer
+            // documentSymbol with flat SymbolInformation (handled in `symbols`).
+            "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+            "publishDiagnostics": { "relatedInformation": true },
+        },
+    })
+}
+
 /// Per-root singleton: (root realpath) -> language -> server.
 #[derive(Default)]
 pub struct LspRegistry {
@@ -822,6 +907,31 @@ pub struct LspRegistry {
 }
 
 impl LspRegistry {
+    /// The existing server for `root`+`language`, but ONLY if it is live right
+    /// now — never starts one.
+    ///
+    /// Used by the automatic post-edit diagnostics, where a cold start would be
+    /// a stall (see `lsp::diagnostics_if_warm`): the edit is cheap, so anything
+    /// that costs a project index must be skipped and left to the model.
+    fn warm_server(&self, root: &Path, language: &str) -> Option<Arc<Mutex<Server>>> {
+        let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let entry = {
+            let roots = self.roots.lock().unwrap();
+            roots.get(&key).and_then(|langs| langs.get(language)).cloned()
+        }?;
+        // A held lock means another call is inside a request: BUSY is exactly a
+        // warm, working server, so probing must not block. Only a dead one is
+        // refused here.
+        let alive = match entry.try_lock() {
+            Ok(mut guard) => {
+                guard.last_used = Instant::now();
+                !guard.is_dead()
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        };
+        alive.then_some(entry)
+    }
     /// Acquire exclusive use of a root+language server within `SERVER_LOCK_WAIT`.
     ///
     /// A timeout keeps the server: the holder is almost always a HEALTHY call
@@ -1511,20 +1621,63 @@ fn symbol_kind_name(kind: u64) -> String {
 
 /// lsp_diagnostics: publishDiagnostics for the target file.
 pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
+    diagnostics_within(root, file_path, DIAGNOSTICS_WINDOW)
+}
+
+/// Automatic post-edit diagnostics: ONLY when a server for that language is
+/// already warm.
+///
+/// MEASURED: `lsp_diagnostics` was never called once in the traced corpus,
+/// while the model ran 37 manual typecheck/build commands (12 of them in the
+/// round right after an edit) — a whole round-trip each, on a question the
+/// language server already has the answer to. Relying on the model to pick the
+/// tool did not work (the same reason the prompt-level hints were refuted), so
+/// the cheap case is decided in the backend instead: if the file's language
+/// server is live, its diagnostics ride along with the edit result.
+///
+/// Crucially it NEVER starts a server: a cold start (rust-analyzer reached
+/// 1921 MB and takes minutes to index) would turn a cheap edit into a stall, so
+/// a cold language returns `None` and the model keeps its own build command.
+pub fn diagnostics_if_warm(root: &str, file_path: &str) -> Option<String> {
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, None).ok()?);
+    let language = detect_language(&abs).ok()?;
+    registry().warm_server(&PathBuf::from(root), language)?;
+    diagnostics_within(root, file_path, POST_EDIT_DIAGNOSTICS_WINDOW).ok()
+}
+
+fn diagnostics_within(
+    root: &str,
+    file_path: &str,
+    budget: Duration,
+) -> Result<String, String> {
     let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;
     let mut srv = registry().lock_server(&root_path, language, &srv)?;
-    srv.ensure_open(&abs)?;
+    // A FIRST `didOpen` lints the whole file (measured 1.99s against
+    // `typescript-language-server`) while a re-lint after `didChange` answers in
+    // 0.40s. Budgeting both the same made every FIRST edit of every file drop
+    // its answer — exactly the case where nothing had checked that file yet.
+    let first_open = srv.ensure_open(&abs)?;
+    let budget = if first_open {
+        budget.max(POST_EDIT_DIAGNOSTICS_WINDOW_COLD)
+    } else {
+        budget
+    };
     let uri = path_to_uri(&abs);
     // Trigger a pull WITHOUT waiting for its response, then drain notifications
     // for a short window. Waiting for the response here would make this
     // best-effort call block for the full request budget on servers that do not
     // implement pull diagnostics at all.
     let _ = srv.request_nowait("textDocument/diagnostic", json!({"textDocument": {"uri": uri}}));
-    let deadline = Instant::now() + DIAGNOSTICS_WINDOW;
+    let deadline = Instant::now() + budget;
     let mut diags: Vec<Value> = Vec::new();
+    // Whether the server actually ANSWERED for this uri. Without this, a window
+    // that expires while the server is still indexing was reported as "No
+    // diagnostics." — indistinguishable from a clean file, so a turn that
+    // trusted it would skip the real typecheck on code that does not compile.
+    let mut reported = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1547,6 +1700,7 @@ pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
                             .and_then(Value::as_array)
                             .cloned()
                             .unwrap_or_default();
+                        reported = true;
                         break;
                     }
                 }
@@ -1554,8 +1708,21 @@ pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
             Err(_) => break,
         }
     }
+    if !reported {
+        return Ok(format!(
+            "No diagnostics report arrived within {}s for {} — the language server may still be \
+indexing, so this is NOT a clean result: treat the file as unchecked and run your own \
+build/typecheck command for it.",
+            budget.as_secs(),
+            abs.display()
+        ));
+    }
     if diags.is_empty() {
-        return Ok("No diagnostics.".into());
+        return Ok(format!(
+            "No diagnostics for {} — the language server parsed it and reported no errors or \
+warnings.",
+            abs.display()
+        ));
     }
     let severity_name = |s: u64| match s {
         1 => "error",
@@ -1614,6 +1781,59 @@ mod tests {
         for lang in HEAVY_LANGUAGES {
             assert!(!should_prewarm(lang), "{lang} must not be pre-warmed");
         }
+    }
+
+    /// A FIRST `didOpen` needs more budget than a re-lint, and the code must
+    /// actually use the wider one.
+    ///
+    /// MEASURED with a real client against `typescript-language-server` on a
+    /// workspace file: the first `publishDiagnostics` after `didOpen` arrived in
+    /// 1.99s, the re-lint after `didChange` in 0.40s. The automatic post-edit
+    /// window was 1.5s for both, so every FIRST edit of a file silently dropped
+    /// its answer — the trace showed the marker on 2 of 56 edits, and only for
+    /// files another call had opened earlier.
+    #[test]
+    fn a_first_open_gets_more_diagnostics_time_than_a_relint() {
+        assert!(
+            POST_EDIT_DIAGNOSTICS_WINDOW_COLD > POST_EDIT_DIAGNOSTICS_WINDOW,
+            "the first-open window must be wider than the warm one, or the \
+             measured 1.99s first lint is dropped again"
+        );
+        // The widening is bounded: this window rides on an EDIT result, so it may
+        // never approach the explicit `lsp_diagnostics` budget (3s) — it is
+        // allowed to match it at most.
+        assert!(POST_EDIT_DIAGNOSTICS_WINDOW_COLD <= DIAGNOSTICS_WINDOW);
+        // And it must stay above the measured 0.40s re-lint, so a warm answer is
+        // never dropped either.
+        assert!(POST_EDIT_DIAGNOSTICS_WINDOW >= Duration::from_millis(400));
+    }
+
+    /// The client MUST declare `publishDiagnostics`, or the server never pushes.
+    ///
+    /// MEASURED with a 2x2 factor matrix (declared capabilities x the answers
+    /// given to server->client requests) against `typescript-language-server`,
+    /// same `didOpen` every time: `documentSymbol`-only (what this client used to
+    /// send) produced NO `publishDiagnostics` in a 10s window, adding
+    /// `textDocument.publishDiagnostics` produced it in 0.00s, and adding
+    /// `synchronization` or `workspace.configuration` changed nothing.
+    ///
+    /// The blast radius was measured on real traces: the post-edit lever fired on
+    /// 3 of 99 edits and an explicit `lsp_diagnostics` answered "no report
+    /// arrived" — a silent, permanent quality hole that read as a slow server.
+    #[test]
+    fn the_client_declares_the_capability_the_push_requires() {
+        let caps = initialize_capabilities();
+        assert_eq!(
+            caps.pointer("/textDocument/publishDiagnostics/relatedInformation"),
+            Some(&Value::Bool(true)),
+            "without textDocument.publishDiagnostics the server pushes nothing"
+        );
+        // The one capability that was already there and is load-bearing for
+        // `symbols`: flat SymbolInformation is unusable as an outline.
+        assert_eq!(
+            caps.pointer("/textDocument/documentSymbol/hierarchicalDocumentSymbolSupport"),
+            Some(&Value::Bool(true))
+        );
     }
 
     #[test]

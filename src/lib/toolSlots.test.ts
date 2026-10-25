@@ -9,6 +9,8 @@ import {
   otherSlotFallbacks,
   otherSlotLevel,
   otherSlotModel,
+  ownerOfModel,
+  splitSlotEntry,
   toolChainRows,
   toolChainSet,
   toolFallbackEntries,
@@ -152,10 +154,16 @@ check("the Other row has no list for undefined", otherSlotFallbacks(undefined)?.
 
 // ---- one list: the tool's own model IS row 1 -------------------------------
 
-const chain = toolChainRows("prov-a/own-model", [
-  { providerId: "prov-b", model: "backup-1" },
-  { providerId: "", model: "" },
-]);
+const PROVIDER_IDS = new Set(["prov-a", "prov-b", "prov-c"])
+
+const chain = toolChainRows(
+  "prov-a/own-model",
+  [
+    { providerId: "prov-b", model: "backup-1" },
+    { providerId: "", model: "" },
+  ],
+  PROVIDER_IDS,
+);
 check(
   "row 1 is the tool's own model",
   chain[0].providerId === "prov-a" && chain[0].model === "own-model",
@@ -188,7 +196,7 @@ check(
 );
 
 const round = toolChainSet(
-  toolChainRows("prov-a/own-model", [{ providerId: "prov-b", model: "b" }]),
+  toolChainRows("prov-a/own-model", [{ providerId: "prov-b", model: "b" }], PROVIDER_IDS),
 );
 check(
   "settings → list → settings is lossless",
@@ -200,11 +208,60 @@ check(
 
 check(
   "a bare model id keeps the provider resolved at call time",
-  toolChainSet(toolChainRows("own-model", [])).own === "own-model",
-  toolChainSet(toolChainRows("own-model", [])),
+  toolChainSet(toolChainRows("own-model", [], PROVIDER_IDS)).own === "own-model",
+  toolChainSet(toolChainRows("own-model", [], PROVIDER_IDS)),
 );
 
-const inheriting = toolChainRows("", []);
+// ---- a slash in a model id is NOT a provider prefix ------------------------
+//
+// The user's bug: `oc/deepseek-v4.1-flash-free` was cut at its own vendor
+// slash, so the call went to a provider named `oc` (or the chat's) with the
+// model truncated to `deepseek-v4.1-flash-free` — `404 page not found`.
+check(
+  "an unknown head keeps the whole string as the model",
+  splitSlotEntry("oc/deepseek-v4.1-flash-free", PROVIDER_IDS).providerId === "" &&
+    splitSlotEntry("oc/deepseek-v4.1-flash-free", PROVIDER_IDS).model ===
+      "oc/deepseek-v4.1-flash-free",
+  splitSlotEntry("oc/deepseek-v4.1-flash-free", PROVIDER_IDS),
+);
+check(
+  "a known head is a provider prefix, and later slashes stay in the model",
+  splitSlotEntry("prov-a/oc/deepseek-v4.1-flash-free", PROVIDER_IDS).providerId === "prov-a" &&
+    splitSlotEntry("prov-a/oc/deepseek-v4.1-flash-free", PROVIDER_IDS).model ===
+      "oc/deepseek-v4.1-flash-free",
+);
+check(
+  "a bare model with no slash is unchanged",
+  splitSlotEntry("z-ai/glm-5.3", PROVIDER_IDS).providerId === "" &&
+    splitSlotEntry("z-ai/glm-5.3", PROVIDER_IDS).model === "z-ai/glm-5.3",
+);
+check(
+  "the provider prefix is never dropped when the model has its own slash",
+  toolFallbackToModel({ providerId: "prov-a", model: "oc/deepseek-v4.1-flash-free" }) ===
+    "prov-a/oc/deepseek-v4.1-flash-free",
+  toolFallbackToModel({ providerId: "prov-a", model: "oc/deepseek-v4.1-flash-free" }),
+);
+check(
+  "a bare model is attributed to the ONE provider whose catalog lists it",
+  ownerOfModel("oc/deepseek-v4.1-flash-free", [
+    { id: "prov-a", models: ["other"] },
+    { id: "prov-b", models: ["oc/deepseek-v4.1-flash-free"] },
+  ]) === "prov-b",
+);
+check(
+  "an ambiguous or unlisted model has no owner",
+  ownerOfModel("m", [{ id: "a" }, { id: "b" }]) === "" &&
+    ownerOfModel("m", [{ id: "a", models: ["m"] }, { id: "b", models: ["m"] }]) === "",
+);
+check(
+  "a slash-bearing model survives a round trip through the settings rows",
+  toolChainSet(
+    toolChainRows("prov-a/oc/deepseek-v4.1-flash-free", [], PROVIDER_IDS),
+  ).own === "prov-a/oc/deepseek-v4.1-flash-free",
+  toolChainSet(toolChainRows("prov-a/oc/deepseek-v4.1-flash-free", [], PROVIDER_IDS)),
+);
+
+const inheriting = toolChainRows("", [], PROVIDER_IDS);
 check(
   "a tool on the composer's model still shows one row",
   inheriting.length === 1 && toolFallbackToModel(inheriting[0]) === "",

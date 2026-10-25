@@ -603,7 +603,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     let task_skills: Vec<String> = string_list(&task, "skills");
     let plugin_slugs: Vec<String> = string_list(&task, "plugins");
     let mut task_mcp = crate::plugins::mcp_of(data_root, &plugin_slugs);
-    let stored_mcp = crate::skills::list_mcp(data_root)["mcpServers"].clone();
+    // A named connector now lives in a bundle, so the lookup is by name across
+    // every ENABLED bundle — the `plugins` list already carries what the task
+    // needs, and a disabled bundle contributes nothing (it is the off switch).
+    let stored_mcp = crate::plugins::enabled_connectors(data_root);
     for name in string_list(&task, "mcp_servers") {
         // A connector that disappeared from the store is skipped instead of
         // failing the whole run: the task keeps working with what still exists.
@@ -670,6 +673,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // Nor do they author skills/connectors: a schedule has no user turn
         // asking for it, so the authoring tools stay unbound.
         allow_create: false,
+        // Headless: there is nobody to ask, so no out-of-workspace grant can be
+        // given. The workspace, the OS temp roots and `~/.codifa` stay open.
+        allow_outside: false,
+        allow_outside_folders: Vec::new(),
         // A scheduled run has no UI session, so it uses the default engine
         // chain (DuckDuckGo) rather than a user's Settings → Plugins order.
         search_plugins: Vec::new(),

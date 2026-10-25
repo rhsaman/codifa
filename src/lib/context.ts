@@ -1,4 +1,4 @@
-import type { Chat, TokenUsage } from '../types'
+import type { Chat, ThinkingLevel, TokenUsage } from '../types'
 import { PERSIAN_RANGE } from './bidi'
 import { applyHistoryLimit } from './historyWindow'
 
@@ -275,7 +275,9 @@ export function modelContextWindow(
 /** Resolve a model's reasoning-support flag, trying both the bare and
  *  provider-prefixed id forms (see modelContextWindow). Resolution order:
  *  ۱) مقدار دستی کاربر (manualReasoningMap — تاگل دستی در Settings)
- *  ۲) مقدار زنده‌ی reasoningMap (گزارش‌شده از /models یا models.dev).
+ *  ۲) شاهدِ مشاهده‌شده (observedReasoningMap — پاسخِ خودِ مدل reasoning تولید
+ *     کرده؛ قوی‌ترین شاهد، چون هیچ حدسی در آن نیست)
+ *  ۳) مقدار زنده‌ی reasoningMap (گزارش‌شده از /models یا models.dev).
  *  Returns null when neither knows the model — callers then fall back
  *  to the name-based heuristic. */
 export function modelReasoning(
@@ -283,6 +285,7 @@ export function modelReasoning(
     id?: string
     reasoningMap?: Record<string, boolean>
     manualReasoningMap?: Record<string, boolean>
+    observedReasoningMap?: Record<string, boolean>
   } | null | undefined,
   model: string,
 ): boolean | null {
@@ -292,11 +295,41 @@ export function modelReasoning(
   if (typeof directManual === 'boolean') return directManual
   const prefixedManual = manual[`${provider.id ?? ''}/${model}`]
   if (typeof prefixedManual === 'boolean') return prefixedManual
+  // Observed evidence outranks a reported flag: the model proved it reasons.
+  const observed = provider.observedReasoningMap ?? {}
+  const directObserved = observed[model]
+  if (typeof directObserved === 'boolean') return directObserved
+  const prefixedObserved = observed[`${provider.id ?? ''}/${model}`]
+  if (typeof prefixedObserved === 'boolean') return prefixedObserved
   const map = provider.reasoningMap ?? {}
   const direct = map[model]
   if (typeof direct === 'boolean') return direct
   const prefixed = map[`${provider.id ?? ''}/${model}`]
   return typeof prefixed === 'boolean' ? prefixed : null
+}
+
+/** Resolve the thinking LEVELS a model really supports, as its provider's
+ *  `/models` payload or the models.dev catalog enumerated them (see
+ *  `thinkingLevelsMap` in types.ts). Tries both the bare and provider-prefixed
+ *  id forms, like `modelReasoning`.
+ *
+ *  Returns `null` when no source ENUMERATED levels for the model — callers then
+ *  keep their full option list, and `levelFromSource` still stops a level that
+ *  nobody described from reaching the wire. An empty array means the model has
+ *  no thinking mode at all; a non-empty array is the exact set a source named. */
+export function modelThinkingLevels(
+  provider: {
+    id?: string
+    thinkingLevelsMap?: Record<string, ThinkingLevel[]>
+  } | null | undefined,
+  model: string,
+): ThinkingLevel[] | null {
+  if (!provider) return null
+  const map = provider.thinkingLevelsMap ?? {}
+  const direct = map[model]
+  if (Array.isArray(direct)) return direct
+  const prefixed = map[`${provider.id ?? ''}/${model}`]
+  return Array.isArray(prefixed) ? prefixed : null
 }
 
 /** Format a USD amount for the context-meter cost chip. Tiny amounts (most

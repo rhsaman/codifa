@@ -1,6 +1,6 @@
 // SSR test: a long tool result never AUTO-opens the right-hand panel.
 //
-// The panel opens only from an explicit user click (a very long CHAT MESSAGE,
+// The panel opens only from an explicit user click (a long CHAT MESSAGE,
 // the Review pill, openText). Tool rows never send their output there: they
 // expand in place and their long bodies scroll (trace-expand-pre /
 // .file-results carry max-height + overflow). These checks pin that.

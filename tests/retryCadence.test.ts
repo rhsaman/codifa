@@ -128,6 +128,29 @@ console.log('2) the chat panel error ladder matches the transport cadence:')
     'the error branch actually arms that retry',
     chatSrc.includes('autoRetryFor(originId).schedule(CHAT_ERROR_RETRY_DELAY_MS'),
   )
+  // The count must live in a per-chat REF, never be re-derived from the message.
+  // The resend clears `retry` on the continuation bubble and the give-up banner
+  // written just before the read reports attempt 1, so a message-derived count
+  // re-read 1 on every cycle: the banner sat at "2/10" forever while the turn
+  // restarted every 10s and never reached its cap.
+  check(
+    'the error ladder counts retries in a ref that survives the resend',
+    /autoRetryCountRef = useRef<Map<string, number>>\(new Map\(\)\)/.test(
+      chatSrc,
+    ) &&
+      chatSrc.includes(
+        'const spent = autoRetryCountRef.current.get(chat.id) ?? 1',
+      ) &&
+      !chatSrc.includes(
+        'liveMsgs.find((m) => m.id === assistantMsg.id)?.retry?.attempt',
+      ),
+  )
+  check(
+    'only a genuinely new turn (no continuation) resets that count',
+    chatSrc.includes(
+      'if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0)',
+    ),
+  )
 }
 
 // The mid-turn steer must interrupt an in-flight model reply, so the panel has

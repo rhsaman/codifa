@@ -6,6 +6,13 @@ authors = ["rhsaman"]
 license = "MIT"
 edition = "2021"
 
+# The app ships as the `codifa` binary; this lib is the SAME module tree behind
+# a `lib` target so benches/examples (`agent_bench`) can call `agent::run_turn`
+# headless. `src/lib.rs` mirrors `main.rs`'s module list.
+[lib]
+name = "codifa"
+path = "src/lib.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -39,6 +46,15 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (UTC).
 chrono = "0.4"
+
+# Desktop control needs what the `screenshots` crate cannot do: read the cursor
+# position, preflight the Screen Recording permission (macOS silently returns an
+# image with every OTHER app's windows removed without it) and inject mouse
+# events — drag, right-click and a real scroll wheel are impossible through
+# System Events. `highsierra` is required for CGEventCreateScrollWheelEvent2,
+# the only scroll constructor Rust can call (the other one is variadic).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.23.2", features = ["highsierra"] }
 # DuckDuckGo's HTML endpoint refuses a plain TLS client (anti-bot challenge /
 # handshake timeout — verified with curl, reqwest and httpx alike). The Python
 # `ddgs` package solves this with `primp`'s browser TLS impersonation, and

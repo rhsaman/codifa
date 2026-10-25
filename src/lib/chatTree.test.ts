@@ -9,6 +9,7 @@ import {
   containsChat,
   dropOnto,
   dropOntoRoot,
+  flexWeights,
   ghostInsertIndex,
   isVacatedByDrag,
   leafCount,
@@ -208,6 +209,16 @@ console.log("12) minimize preserves instances — no collapse on remove/normaliz
   );
   const singleSplit = makeSplit("row", [makeLeaf("a")]);
   check("normalize keeps single-child split reference", normalizeTree(singleSplit, new Set(["a"])) === singleSplit);
+  const staleSplit = makeSplit("row", [{ ...makeLeaf("a"), size: 0.25 }]);
+  const fixed = normalizeTree(staleSplit, new Set(["a"]));
+  check(
+    "normalize resets lone child's stale size to 1 (no empty gap)",
+    fixed !== staleSplit &&
+      fixed !== null &&
+      fixed.kind === "split" &&
+      (fixed as unknown as { children: Array<{ size: number }> }).children[0].size === 1,
+    fixed,
+  );
 }
 
 console.log("13) isVacatedByDrag — dragged slot counts as empty:");
@@ -250,6 +261,22 @@ console.log("16) six-window max — reorder/swap/replace work, edge add blocked:
   check("external edge blocked at max", blocked === six);
   const replaced = dropOnto(six, "g", "b", "center");
   check("external center replaces at max", JSON.stringify(collectChatIds(replaced)) === JSON.stringify(["a", "g", "c", "d", "e", "f"]) && leafCount(replaced) === 6);
+}
+
+console.log("17) flex weights — a split always covers its whole track:");
+{
+  const sum = (a: number[]) => a.reduce((n, v) => n + v, 0);
+  check("plain ratio preserved", JSON.stringify(flexWeights([1, 1])) === JSON.stringify([1, 1]));
+  check("below-one total is scaled up to 1", Math.abs(sum(flexWeights([0.25, 0.25])) - 1) < 1e-9);
+  // Total must be >= 1 for CSS to fill the track; a pair that already sums
+  // above 1 is left untouched (its ratio is what the user dragged).
+  const stale = flexWeights([0.912658769801627, 1.0873412301983731]);
+  check("stale fractional pair covers the track", sum(stale) >= 1 - 1e-9);
+  check("weights above one are never shrunk", JSON.stringify(stale) === JSON.stringify([0.912658769801627, 1.0873412301983731]));
+  const uneven = flexWeights([0.3, 0.4]);
+  check("relative sizes kept when scaled", Math.abs(uneven[0] / uneven[1] - 0.3 / 0.4) < 1e-9 && Math.abs(sum(uneven) - 1) < 1e-9);
+  check("lone child claims the track", JSON.stringify(flexWeights([0.25])) === JSON.stringify([1]));
+  check("degenerate sizes fall back to equal", JSON.stringify(flexWeights([0, 0])) === JSON.stringify([1, 1]));
 }
 
 if (failed > 0) {

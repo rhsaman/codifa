@@ -1,11 +1,13 @@
 import { create } from 'zustand'
 import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
+import { runTargetKey } from './nvimEdit'
+import { DEFAULT_TERMINAL_SHELL, shellLabel } from './nvimTerminals'
 import { registerChatDeleteHook, useStore } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
-import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
+import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, replaceChat as replaceViewerLeafTab, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'terminal'
 
 /** Kinds that belong to ONE chat. File tabs are chat-scoped too
  *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
@@ -13,23 +15,16 @@ export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'plan' | 'b
  *  stay global: an artifact is opened from the Artifacts page and from a
  *  transcript card, and hiding it whenever another chat had focus made the
  *  row look broken (the document opened onto a tab that chat could not show). */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'files'])
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'files', 'todos', 'terminal'])
 
-/** Pages that own a dedicated icon in the pane rail. Opening them goes
- *  through that icon, and `viewerTabRows` never renders them as a rail ROW:
- *  one entry point per page, and exactly one representation of it. Showing
- *  both an icon and its own tab row made the same page look like two pages
- *  (literally two inboxes in the rail). The Todos page is the rail's own
- *  toggle and never had a tab entry at all. */
-export const RAIL_PAGE_KINDS: ReadonlySet<ViewerKind> = new Set<ViewerKind>([
-  'files',
-  'artifacts',
-  'schedule',
-  'inbox',
-  'review',
-  'trace',
-  'browser',
-])
+/** Kinds that are NEVER written to localStorage. A terminal tab is a live pty:
+ *  restoring one after a restart would spawn a shell (or an editor) the user
+ *  never asked for, and the session id in storage would be meaningless. */
+const EPHEMERAL_KINDS = new Set<ViewerKind>(['terminal'])
+
+/** Monotonic counter behind "new terminal tab" ids — Date.now alone could
+ *  collide when two clicks land in the same millisecond. */
+let shellCounter = 0
 
 export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): string {
   if (kind === 'file') {
@@ -37,6 +32,14 @@ export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): st
     // Chat-scoped file id `file:<chatId>:<path>` (one tab per file per chat).
     // Without a path keep the `file:<chatId>` prefix so existing callers keep working.
     return clean ? `file:${chatId}:${clean}` : `file:${chatId}`
+  }
+  if (kind === 'terminal') {
+    // `target` is the run target (a bare shell, or the argv of an editor
+    // request). It is part of the ID so re-opening the SAME file focuses the
+    // tab that already edits it instead of starting a second Neovim — the whole
+    // point, since one nvim with a plugin stack costs hundreds of MB.
+    const target = (path ?? '').trim()
+    return target ? `terminal:${chatId}:${target}` : `terminal:${chatId}`
   }
   return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
 }
@@ -49,6 +52,7 @@ const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
   'trace',
   'inbox',
   'schedule',
+  'todos',
   'plan',
   'browser',
   'file',
@@ -57,6 +61,7 @@ const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
   'files',
   'artifact',
   'artifacts',
+  'terminal',
 ])
 
 
@@ -65,6 +70,8 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   trace: 'Trace',
   inbox: 'Inbox',
   schedule: 'Schedule',
+  // Unused: a todos tab keeps its own title.
+  todos: 'Todos',
   plan: 'Plan',
   browser: 'Browser',
   // Unused: file tabs keep their per-path title (the file name).
@@ -77,6 +84,9 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   // Fallback only: artifact tabs keep their own document title (see
   // viewerTabTitle), otherwise every artifact tab reads "Artifact".
   artifact: 'Artifact',
+  // Unused: a terminal tab keeps its own title ("nvim — a.ts", "zsh"), so two
+  // terminal tabs are tellable apart.
+  terminal: 'Terminal',
 }
 
 /** Display title for a viewer tab. File/text/explore tabs, artifact tabs and
@@ -87,6 +97,9 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
 export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId'>): string {
   if (t.kind === 'file' || t.kind === 'text' || t.kind === 'explore') return t.title
   if (t.kind === 'artifact') return t.title || VIEWER_KIND_LABEL.artifact
+  // A terminal tab carries its own title ("nvim — a.ts" / "zsh"), so two of
+  // them are tellable apart in the rail.
+  if (t.kind === 'terminal') return t.title || VIEWER_KIND_LABEL.terminal
   if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return t.title
   return VIEWER_KIND_LABEL[t.kind] ?? t.title
 }
@@ -97,50 +110,41 @@ export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskI
 export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
   return tabs.filter((t) => {
     if (t.kind === 'file' && !t.chatId) return true
+    // A terminal tab hosts a LIVE pty that no chat owns: hiding it with the
+    // chat that happened to spawn it would strand a running shell (and the
+    // pane fell back to the todos page — a blank-looking pane).
+    if (t.kind === 'terminal') return true
     return !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId
   })
 }
 
 /** Id of the tab the pane body is showing RIGHT NOW, or `null` when the pane
- *  shows the todos page instead (panel mode, or no visible tab at all — the
- *  body's own fallback).
+ *  has no visible tab at all — the body then falls back to the todos page.
  *
- *  This mirrors the body rule in ViewerContent/ViewerWindows exactly, and it is
- *  the single source of truth for the rail icons' pressed state: an icon must
- *  mark the page that is ON SCREEN, never merely "a tab with this id exists".
- *  Those two differ as soon as a second tab is open — the page behind it read
- *  as pressed and its click CLOSED it, so "show me that page" needed a second
- *  click. Pure, for tests. */
+ *  Mirrors the body rule in ViewerContent/ViewerWindows exactly. Pure, for
+ *  tests. */
 export function shownViewerTabId(
   tabs: ViewerTab[],
   activeId: string | null,
-  panelMode: boolean,
   chatId: string,
 ): string | null {
-  if (panelMode) return null
   const visible = visibleTabs(tabs, chatId)
-  const active = visible.find((t) => t.id === activeId) ?? visible[0] ?? null
+  // Falls back to the chat's own tab before a global page tab, so the pane
+  // never lands on Schedule while the chat still has a file open.
+  const active =
+    visible.find((t) => t.id === activeId) ??
+    visible.find((t) => t.chatId === chatId) ??
+    visible[0] ??
+    null
   return active?.id ?? null
 }
 
-/** True when a tab is drawn as a ROW in the pane rail.
- *
- *  Rail-owned pages are represented by their icon (pressed while open), so
- *  drawing their tab as well made ONE page read as two — an icon plus a tab,
- *  which looked like two inboxes. The one exception is a sub-agent trace tab:
- *  it shares the `trace` kind with the main chat trace but is a separate tab
- *  that has no icon of its own, so dropping it would make it unreachable.
- *  Pure, for tests. */
-export function isRailRow(t: ViewerTab): boolean {
-  if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return true
-  return !RAIL_PAGE_KINDS.has(t.kind)
-}
-
-/** Tabs the pane rail draws as ROWS (visible tabs minus the icon-owned pages).
- *  Opening, closing and the tab-list dropdown still go through the real tab;
- *  only the rail row is dropped. Pure, for tests. */
+/** Tabs the pane rail draws as ROWS: every tab visible in the active chat.
+ *  A page opened from the rail's "+" menu is an ordinary tab, so it is
+ *  closable and reorderable exactly like a file tab — no page owns a fixed
+ *  icon any more. Pure, for tests. */
 export function viewerTabRows(tabs: ViewerTab[], chatId: string): ViewerTab[] {
-  return visibleTabs(tabs, chatId).filter(isRailRow)
+  return visibleTabs(tabs, chatId)
 }
 
 /** True when the viewer tab-list has anything to show inline (visible open
@@ -199,7 +203,42 @@ export interface ViewerTab {
    *  separate from the tab id so the panel can re-read the body after a
    *  restart without parsing the id back apart. */
   artifactId?: string
+  /** Terminal tab: the pty's working directory, and the program + argv that run
+   *  instead of a login shell (`nvim` + `+42 /w/a.ts` for the "Neovim here"
+   *  target). Kept on the tab because the session is created when the tab
+   *  mounts — the tab IS the request. */
+  terminalCwd?: string
+  terminalProgram?: string
+  terminalArgs?: string[]
+  /** Shell a program-less terminal tab runs ("" = the OS login shell). The
+   *  session is created when the tab mounts, so the tab carries the choice. */
+  terminalShell?: string
   createdAt: number
+}
+
+/** A tab that is gone for good. Modules that own a RESOURCE per tab (a pty
+ *  session) register here instead of viewerTabs importing them: viewerTabs is
+ *  in the startup chunk and must not pull xterm into it. */
+type ViewerTabCloseHook = (tabId: string) => void
+const tabCloseHooks: ViewerTabCloseHook[] = []
+
+export function registerViewerTabCloseHook(hook: ViewerTabCloseHook): () => void {
+  tabCloseHooks.push(hook)
+  return () => {
+    const at = tabCloseHooks.indexOf(hook)
+    if (at !== -1) tabCloseHooks.splice(at, 1)
+  }
+}
+
+function notifyTabClosed(tabId: string): void {
+  for (const hook of tabCloseHooks) {
+    // One failing hook must never break closing a tab.
+    try {
+      hook(tabId)
+    } catch {
+      /* the tab is closed either way */
+    }
+  }
 }
 
 /** Chat a new chat-scoped tab belongs to (empty string when no chat is open). */
@@ -260,6 +299,27 @@ interface ViewerTabsState {
   /** Open the workspace file explorer of a chat (one tab per chat). The tree
    *  itself is read lazily from disk by the panel. */
   openFiles: (chatId?: string) => void
+  /** Open the chat's Todos page (turn usage + plan checklist) as its own
+   *  closable tab: pages are ordinary tabs now, opened from the rail's "+". */
+  openTodos: (chatId?: string) => void
+  /** Open a TERMINAL tab in the side pane — an ordinary tab with its own pty
+   *  (its own session, separate from the bottom panel's). With `program`/`args`
+   *  the tab runs that program instead of a login shell, which is how the
+   *  viewer's "Neovim here" target edits a file in the user's own Neovim.
+   *  Re-requesting the same target FOCUSES the existing tab: two Neovim
+   *  instances for one file would double the RAM and confuse the undo history. */
+  openTerminal: (opts?: {
+    cwd?: string
+    program?: string
+    args?: string[]
+    title?: string
+    chatId?: string
+    /** Which shell a plain (program-less) tab runs. "" = the OS login shell. */
+    shell?: string
+    /** Force a BRAND NEW shell tab instead of focusing the one already open
+     *  (the pane's "new terminal" action, like the bottom panel's +). */
+    fresh?: boolean
+  }) => void
   closeViewer: (id: string) => void
   /** Close all viewer tabs, or only the tabs visible in one chat.
    *  Closed tabs land in the "Recently closed" list so they can be
@@ -304,12 +364,6 @@ interface ViewerTabsState {
   paneOpen: boolean
   setPaneOpen: (v: boolean) => void
   togglePane: () => void
-  /** Panel mode: the side pane shows the todos page INSTEAD of viewer tab
-   *  content. Toggled from the pane's todos icon; activating any tab drops
-   *  back to tabs mode. Persisted. */
-  panelMode: boolean
-  setPanelMode: (v: boolean) => void
-  togglePanelMode: () => void
 }
 
 const STORAGE_KEY = 'coder:viewerTabs'
@@ -330,6 +384,20 @@ const TOTAL_TAB_CAP = 30
 const FILE_TAB_CAP = 20
 
 function capTabs(tabs: ViewerTab[]): ViewerTab[] {
+  const next = capTabsRaw(tabs)
+  // A dropped tab is a CLOSED tab: it leaves `tabs`, so anything it owned (a
+  // terminal tab's pty) has to be released here. Without this, capping is a
+  // silent leak — the session would outlive every trace of its tab.
+  if (next.length !== tabs.length) {
+    const kept = new Set(next.map((t) => t.id))
+    for (const t of tabs) {
+      if (!kept.has(t.id)) notifyTabClosed(t.id)
+    }
+  }
+  return next
+}
+
+function capTabsRaw(tabs: ViewerTab[]): ViewerTab[] {
   let next = tabs
   // File-tab cap first: a file-open spree never squeezes out
   // review/trace/plan/browser tabs. Oldest file tabs drop first.
@@ -393,7 +461,9 @@ function loadPersisted(): {
       closed?: ClosedViewerTab[]
     }
     const valid = Array.isArray(parsed.tabs)
-      ? parsed.tabs.filter((t) => t && typeof t.id === 'string' && VALID_KINDS.has(t.kind))
+      ? parsed.tabs.filter(
+          (t) => t && typeof t.id === 'string' && VALID_KINDS.has(t.kind) && !EPHEMERAL_KINDS.has(t.kind),
+        )
       : []
     // One tab per kind per chat (one per sub-agent for trace tabs).
     // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
@@ -456,13 +526,18 @@ function persist(tabs: ViewerTab[], activeId: string | null, closed: ClosedViewe
     // Text bodies stay in memory only: a pasted log can be megabytes and
     // would blow the localStorage quota. The tab (title/owner) persists so
     // the tab bar survives a restart; the body is re-opened from the chat.
-    const slim = tabs.map((t) => slimTab(t))
+    //
+    // EPHEMERAL tabs (a terminal's live pty) are dropped ENTIRELY: restoring
+    // one would spawn a fresh shell or editor on the next launch, and its
+    // session id would point at nothing.
+    const keep = (t: ViewerTab) => !EPHEMERAL_KINDS.has(t.kind)
+    const slim = tabs.filter(keep).map((t) => slimTab(t))
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         tabs: slim,
-        activeId,
-        closed: closed.map((c) => ({ tab: slimTab(c.tab), closedAt: c.closedAt })),
+        activeId: tabs.some((t) => t.id === activeId && keep(t)) ? activeId : (slim[0]?.id ?? null),
+        closed: closed.filter((c) => keep(c.tab)).map((c) => ({ tab: slimTab(c.tab), closedAt: c.closedAt })),
       }),
     )
   } catch {
@@ -516,26 +591,40 @@ function persistPaneOpen(v: boolean) {
   }
 }
 
-const PANEL_MODE_KEY = 'coder:panelMode'
-
-function loadPanelMode(): boolean {
-  try {
-    return localStorage.getItem(PANEL_MODE_KEY) === '1'
-  } catch {
-    return false
-  }
-}
-
-function persistPanelMode(v: boolean) {
-  try {
-    localStorage.setItem(PANEL_MODE_KEY, v ? '1' : '0')
-  } catch {
-    /* storage unavailable */
-  }
-}
-
 const VIEWER_TREE_KEY = 'coder:viewerTree'
 const VIEWER_WINDOW_MAX = 4
+
+/**
+ * Make `activeId` visible in the pane group's split tree.
+ *
+ * The panes paint ONLY tree leaves, so a tab that has no leaf renders nowhere.
+ * That is what made a file click look like it "closed the previous tab and
+ * opened Schedule": the tab was in `tabs` and `activeId` pointed at it, but the
+ * resumed/split tree still held the old leaves, so the pane kept painting the
+ * previous page. Opening or re-activating a tab replaces the content of the
+ * FOCUSED pane (it never splits — splitting stays an explicit gesture), so the
+ * tab always lands where the user is looking.
+ *
+ * Pure + identity-stable: returns the inputs untouched when nothing changes.
+ */
+function revealViewerTab(
+  tree: ChatTreeNode | null,
+  activeId: string | null,
+  focusedId: string | null,
+  knownIds: Set<string>,
+): { tree: ChatTreeNode | null; focusedId: string | null } | null {
+  if (!activeId || !knownIds.has(activeId)) return null
+  if (!tree) return { tree: buildViewerTree([activeId], 'row'), focusedId: activeId }
+  if (viewerTreeContains(tree, activeId)) return { tree, focusedId: activeId }
+  const anchor =
+    focusedId && viewerTreeContains(tree, focusedId)
+      ? focusedId
+      : (collectViewerTabIds(tree)[0] ?? null)
+  const nextTree = anchor
+    ? replaceViewerLeafTab(tree, anchor, activeId)
+    : buildViewerTree([activeId], 'row')
+  return { tree: nextTree, focusedId: activeId }
+}
 
 function loadViewerTree(): ChatTreeNode | null {
   try {
@@ -588,17 +677,6 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persistPaneOpen(!s.paneOpen)
       return { paneOpen: !s.paneOpen }
     }),
-  panelMode: typeof window !== 'undefined' ? loadPanelMode() : false,
-  setPanelMode: (v) =>
-    set(() => {
-      persistPanelMode(v)
-      return { panelMode: v }
-    }),
-  togglePanelMode: () =>
-    set((s) => {
-      persistPanelMode(!s.panelMode)
-      return { panelMode: !s.panelMode }
-    }),
   openViewer: (tab) =>
     set((s) => {
       const normalized = tab.kind === 'review' ? { ...tab, title: 'Git' } : tab
@@ -611,7 +689,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const lastActiveByChat = normalized.chatId
         ? { ...s.lastActiveByChat, [normalized.chatId]: normalized.id }
         : s.lastActiveByChat
-      const next = { tabs, activeId: tab.id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: tab.id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -636,7 +714,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -660,7 +738,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ? s.tabs.map((t) => (t.id === id ? tab : t))
         : [...s.tabs, tab])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -698,7 +776,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
           )
         : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -714,7 +792,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       // User-gesture open: show the pane. Automatic (stream-driven) opens
       // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const next = { tabs, activeId: id, paneOpen: true }
       persist(next.tabs, next.activeId)
       // Pre-open the inbox flag BEFORE the docked pane mounts: its content
       // renders on the first paint and the docked close-watcher never sees
@@ -733,7 +811,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const next = { tabs, activeId: id, paneOpen: true }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -747,7 +825,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false }
+      const next = { tabs, activeId: id, paneOpen: true }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -765,7 +843,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -803,7 +881,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
           : [...s.tabs, entry],
       )
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -825,12 +903,28 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
-  openFile: (path, line, root, chatId) =>
-    set((s) => {
+  openFile: (path, line, root, chatId) => {
+    // An explicit `chatId` means a chat's OWN surface opened the file (its file
+    // explorer / files panel). The pane group paints the FOCUSED chat's tabs, so
+    // without focusing the owner the new tab was scoped to a chat that is not
+    // on screen: `visibleTabs` filtered it out and the pane kept showing the
+    // other chat's page (the reported "clicking a file in the explorer shows
+    // Trace"). Focus the owner so the pane, the rail and the new tab agree.
+    const owner = (chatId ?? '').trim()
+    if (owner) {
+      const st = useStore.getState()
+      if (
+        owner !== st.activeChatId &&
+        (st.openChatIds.includes(owner) || st.visibleChatIds.includes(owner))
+      ) {
+        st.focusWindow(owner)
+      }
+    }
+    return set((s) => {
       const clean = path.trim()
       if (!clean) return {}
       // Chat-scoped file tab: each chat keeps its own open files, so live
@@ -853,10 +947,20 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         : [...s.tabs, entry]
       const tabs = capTabs(raw)
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
+      // The panes paint ONLY tree leaves: without this the new tab stayed
+      // invisible whenever a resumed/split tree existed, so the pane kept the
+      // previous page (e.g. Schedule) on screen while the rail marked this tab.
+      const revealed = revealViewerTab(s.viewerTree, id, s.focusedViewerId, new Set(tabs.map((t) => t.id)))
+      if (revealed?.tree && revealed.tree !== s.viewerTree) persistViewerTree(revealed.tree)
       persist(next.tabs, next.activeId)
-      return next
-    }),
+      return {
+        ...next,
+        viewerTree: revealed?.tree ?? s.viewerTree,
+        focusedViewerId: revealed?.focusedId ?? s.focusedViewerId,
+      }
+    })
+  },
   openText: (title, body, format) =>
     set((s) => {
       if (!body) return {}
@@ -877,7 +981,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ? s.tabs.map((t) => (t.id === id ? entry : t))
         : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -900,7 +1004,25 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         ? s.tabs.map((t) => (t.id === id ? { ...t, ...entry } : t))
         : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  openTodos: (chatId) =>
+    set((s) => {
+      // One todos tab per chat: the page reads that chat's own usage + plan.
+      const cid = chatId ?? currentChatId()
+      const id = viewerTabId('todos', cid)
+      const entry: ViewerTab = {
+        id,
+        kind: 'todos',
+        chatId: cid,
+        title: 'Todos',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
     }),
@@ -918,15 +1040,91 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
       return next
+    }),
+  openTerminal: (opts) =>
+    set((s) => {
+      const cid = opts?.chatId ?? currentChatId()
+      const program = (opts?.program ?? '').trim()
+      const args = opts?.args ?? []
+      // The run target is the tab's IDENTITY, not just its payload: re-asking
+      // for the same file must land on the tab already editing it. Two Neovim
+      // instances for one file is exactly the RAM blow-up this avoids.
+      //
+      // A PLAIN SHELL is the exception: "new terminal" means a genuinely new
+      // shell (like the bottom panel's +), so it gets a unique target instead of
+      // re-focusing the one already open.
+      const target = program
+        ? runTargetKey([program, ...args])
+        : opts?.fresh
+          ? `shell-${Date.now()}-${shellCounter++}`
+          : 'shell'
+      const id = viewerTabId('terminal', cid, target)
+      // Reuse ANY tab already running this run target, not just one with an
+      // identical id: the id is scoped per chat, so opening the same file from
+      // two chats (or a second window) minted a second tab and a SECOND nvim
+      // for one file. Neovim is ~600 MB with its language servers, so the
+      // identity that matters is the program + argv, exactly as the bottom
+      // panel's reuse guard treats it (src/lib/nvimEdit.ts).
+      const existing = program
+        ? s.tabs.find(
+            (t) =>
+              t.kind === 'terminal' &&
+              t.terminalProgram != null &&
+              runTargetKey([t.terminalProgram, ...(t.terminalArgs ?? [])]) === target,
+          ) ?? s.tabs.find((t) => t.id === id)
+        : s.tabs.find((t) => t.id === id)
+      if (existing) {
+        // Focus (and re-title) the tab that already runs this target.
+        const title = opts?.title ?? existing.title
+        const tabs = title === existing.title ? s.tabs : s.tabs.map((t) => (t === existing ? { ...t, title } : t))
+        const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: existing.id } : s.lastActiveByChat
+        return { tabs, activeId: existing.id, paneOpen: true, lastActiveByChat, focusedViewerId: existing.id }
+      }
+      const cwd = opts?.cwd ?? useStore.getState().root ?? ''
+      const entry: ViewerTab = {
+        id,
+        kind: 'terminal',
+        chatId: cid,
+        // A terminal tab shows WHAT it runs ("nvim — a.ts", "zsh — codifa"):
+        // "Terminal" for every one of them would make the rail unreadable.
+        title: opts?.title || (program ? program : shellLabel(opts?.shell || DEFAULT_TERMINAL_SHELL)),
+        terminalCwd: cwd,
+        ...(program
+          ? { terminalProgram: program, terminalArgs: args }
+          : { terminalShell: (opts?.shell ?? '').trim() || DEFAULT_TERMINAL_SHELL }),
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      // NOT persisted (see EPHEMERAL_KINDS): a restored terminal tab would
+      // spawn a shell nobody asked for.
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
+      // The panes paint ONLY tree leaves — the same rule openFile documents
+      // above. Without revealing the new tab here it existed in `tabs`, showed
+      // up in the rail for one render, and was then dropped from the tree as an
+      // unknown leaf: the "+" tab looked like it appeared and vanished. The
+      // bottom panel never had this problem because it keeps no tree at all.
+      const revealed = revealViewerTab(s.viewerTree, id, s.focusedViewerId, new Set(tabs.map((t) => t.id)))
+      if (revealed?.tree && revealed.tree !== s.viewerTree) persistViewerTree(revealed.tree)
+      persist(next.tabs, next.activeId)
+      return {
+        ...next,
+        viewerTree: revealed?.tree ?? s.viewerTree,
+        focusedViewerId: revealed?.focusedId ?? s.focusedViewerId,
+      }
     }),
   closeViewer: (id) =>
     set((s) => {
       const idx = s.tabs.findIndex((t) => t.id === id)
       if (idx === -1) return {}
       const removed = s.tabs[idx]
+      // A tab that owned a resource (a pty session) must release it HERE: the
+      // tab object leaving `tabs` is the only "closed for good" signal, and a
+      // plain unmount also happens when the user merely switches tabs.
+      notifyTabClosed(id)
       const tabs = s.tabs.filter((t) => t.id !== id)
       let activeId = s.activeId
       if (s.activeId === id) {
@@ -966,6 +1164,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const toClose = chatId ? visibleTabs(s.tabs, chatId) : s.tabs
       if (toClose.length === 0) return {}
       const closeIds = new Set(toClose.map((t) => t.id))
+      for (const t of toClose) notifyTabClosed(t.id)
       const tabs = s.tabs.filter((t) => !closeIds.has(t.id))
       const activeId = s.activeId && closeIds.has(s.activeId) ? (tabs[0]?.id ?? null) : s.activeId
       const closedTabs = [
@@ -1011,21 +1210,40 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const lastActiveByChat = tab.chatId
         ? { ...s.lastActiveByChat, [tab.chatId]: id }
         : s.lastActiveByChat
-      // Single-pane focus follows the active tab; split focus stays until clicked.
-      const focusedViewerId = s.viewerTree && viewerLeafCount(s.viewerTree) > 1 ? s.focusedViewerId : id
-      return { activeId: id, panelMode: false, lastActiveByChat, focusedViewerId }
+      // A clicked row must become what the pane SHOWS: the tree paints only its
+      // leaves, so a tab without one would keep the previous page on screen
+      // while the rail marked the clicked tab as active.
+      const revealed = revealViewerTab(s.viewerTree, id, s.focusedViewerId, new Set(s.tabs.map((t) => t.id)))
+      if (!revealed) return { activeId: id, lastActiveByChat }
+      if (revealed.tree !== s.viewerTree) persistViewerTree(revealed.tree)
+      return {
+        activeId: id,
+        lastActiveByChat,
+        viewerTree: revealed.tree,
+        focusedViewerId: revealed.focusedId,
+      }
     }),
   reopenClosedViewerTab: (id) =>
     set((s) => {
       const entry = s.closedTabs.find((c) => c.tab.id === id)
       if (!entry) return {}
+      // A terminal tab's pty dies WITH the tab, so its entry in "Recently
+      // closed" is a tombstone: reopening it would mount a tab whose session id
+      // points at nothing. Drop the entry instead of resurrecting it.
+      if (EPHEMERAL_KINDS.has(entry.tab.kind)) {
+        // Also drop it from the PERSISTED list: a leftover tombstone would come
+        // back after a restart and offer a tab that can never be reopened.
+        const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
+        persist(s.tabs, s.activeId, closedTabs)
+        return { closedTabs }
+      }
       const closedTabs = s.closedTabs.filter((c) => c.tab.id !== id)
       const exists = s.tabs.some((t) => t.id === id)
       const tabs = capTabs(exists ? s.tabs : [...s.tabs, entry.tab])
       const lastActiveByChat = entry.tab.chatId
         ? { ...s.lastActiveByChat, [entry.tab.chatId]: id }
         : s.lastActiveByChat
-      const next = { closedTabs, tabs, activeId: id, paneOpen: true, panelMode: false, lastActiveByChat }
+      const next = { closedTabs, tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId, next.closedTabs)
       return next
     }),
@@ -1070,11 +1288,22 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         const id = s.activeId && valid.has(s.activeId) ? s.activeId : s.tabs[0].id
         tree = buildViewerTree([id], 'row')
       }
+      // The pane group paints ONLY tree leaves, so an active tab without a leaf
+      // renders nowhere: with a split/resumed tree the previous page stayed on
+      // screen and a file click looked like it closed the tab and reopened
+      // Schedule. Reveal the active tab in the FOCUSED leaf — opening a tab
+      // replaces that pane's content, it never splits the pane.
+      let focusedViewerId = s.focusedViewerId
+      const revealed = revealViewerTab(tree, s.activeId, focusedViewerId, valid)
+      if (revealed) {
+        tree = revealed.tree
+        focusedViewerId = revealed.focusedId
+      }
       persistViewerTree(tree)
       const ids = collectViewerTabIds(tree)
-      const focusedViewerId = s.focusedViewerId && ids.includes(s.focusedViewerId)
-        ? s.focusedViewerId
-        : (s.activeId && ids.includes(s.activeId) ? s.activeId : (ids[0] ?? null))
+      if (!focusedViewerId || !ids.includes(focusedViewerId)) {
+        focusedViewerId = s.activeId && ids.includes(s.activeId) ? s.activeId : (ids[0] ?? null)
+      }
       if (tree === s.viewerTree && focusedViewerId === s.focusedViewerId) return {}
       return { viewerTree: tree, focusedViewerId }
     }),
@@ -1092,7 +1321,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       }
       persistViewerTree(tree)
       persist(s.tabs, id, s.closedTabs)
-      return { viewerTree: tree, activeId: id, focusedViewerId: id, paneOpen: true, panelMode: false }
+      return { viewerTree: tree, activeId: id, focusedViewerId: id, paneOpen: true }
     }),
   dropViewerOnto: (dragId, targetId, pos) =>
     set((s) => {
@@ -1108,7 +1337,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       if (!tree) return {}
       persistViewerTree(tree)
       persist(s.tabs, dragId, s.closedTabs)
-      return { viewerTree: tree, activeId: dragId, focusedViewerId: dragId, paneOpen: true, panelMode: false }
+      return { viewerTree: tree, activeId: dragId, focusedViewerId: dragId, paneOpen: true }
     }),
   closeViewerWindow: (id) =>
     set((s) => {
@@ -1134,7 +1363,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const lastActiveByChat = tab?.chatId
         ? { ...s.lastActiveByChat, [tab.chatId]: id }
         : s.lastActiveByChat
-      return { activeId: id, focusedViewerId: id, panelMode: false, lastActiveByChat }
+      return { activeId: id, focusedViewerId: id, lastActiveByChat }
     }),
   resizeViewerPair: (parentId, firstId, secondId, firstSize, secondSize) =>
     set((s) => {
@@ -1156,7 +1385,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
 
 /** Resolve which viewer tab id should be active for a chat (pure, for test).
  *  Prefers the chat's remembered tab when it is still visible, otherwise the
- *  first visible tab, otherwise null. */
+ *  chat's OWN newest tab — never a global page tab. */
 export function resolveViewerForChat(
   visible: ViewerTab[],
   lastActiveByChat: Record<string, string>,
@@ -1165,7 +1394,13 @@ export function resolveViewerForChat(
   if (visible.length === 0) return null
   const remembered = lastActiveByChat[chatId]
   if (remembered && visible.some((t) => t.id === remembered)) return remembered
-  return visible[0].id
+  // Global page tabs (schedule/inbox/…) own a rail icon and outlive the chat
+  // that happened to open them, so they must never win this fallback: doing so
+  // yanked the pane to the Schedule page on every chat switch/mount, and the
+  // file tab the user just opened merely stopped being active — which reads as
+  // "my tab closed and Schedule replaced it".
+  const own = visible.filter((t) => t.chatId === chatId)
+  return own.length ? own[own.length - 1].id : null
 }
 
 /** Switch the viewer group to the tab belonging to a chat (pure helper for
@@ -1175,11 +1410,19 @@ export function syncViewerToChat(chatId: string): void {
   const vt = useViewerTabs.getState()
   const visible = visibleTabs(vt.tabs, chatId)
   if (visible.length === 0) return
+  // The pane already shows a tab of THIS chat: nothing to retarget. This
+  // effect runs AFTER a focus change, i.e. it can land right after the click
+  // that opened a file — without this guard it yanked the pane back to the
+  // chat's remembered tab (trace), which read as "clicking a file opened
+  // trace". A deliberate open/activate always wins over the memory.
+  if (vt.activeId && visible.some((t) => t.id === vt.activeId)) {
+    const shownTab = vt.tabs.find((t) => t.id === vt.activeId)
+    if (shownTab?.chatId === chatId) return
+  }
   const target = resolveViewerForChat(visible, vt.lastActiveByChat, chatId)
   if (target && vt.activeId !== target) {
-    // Chat switch must not exit panel mode (todos/schedules): update the
-    // background active tab so leaving the panel shows the right tab,
-    // but keep panelMode untouched.
+    // A chat switch only retargets the BACKGROUND active tab; nothing else in
+    // the pane's state (tree, focus) is touched.
     const tab = vt.tabs.find((t) => t.id === target)
     const lastActiveByChat = tab?.chatId
       ? { ...vt.lastActiveByChat, [tab.chatId]: target }

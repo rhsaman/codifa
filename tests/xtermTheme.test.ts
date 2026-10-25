@@ -8,7 +8,9 @@
 // each omitted slot from its own defaults, one by one.
 //
 // The function only needs `getComputedStyle` + `document.documentElement`, so
-// the test drives a tiny stand-in DOM instead of jsdom.
+// the test drives a tiny stand-in DOM instead of jsdom. It lives in
+// src/lib/xtermTheme.ts (shared by every terminal host: the bottom panel and the
+// right-pane terminal tabs) so the palette cannot drift between them.
 export {}
 let failures = 0
 function check(name: string, cond: boolean, extra?: unknown): void {
@@ -46,7 +48,7 @@ let vars: Record<string, string> = {}
   getPropertyValue: (n: string) => vars[n] ?? '',
 })
 
-const { xtermTheme } = await import('../src/components/TerminalPanel')
+const { xtermTheme } = await import('../src/lib/xtermTheme')
 
 /** The eight base ANSI slots and their bright counterparts. */
 const ANSI_SLOTS = [

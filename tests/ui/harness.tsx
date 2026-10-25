@@ -9,15 +9,20 @@
  * The real ChatPanel mounts against a stubbed `window.coder` (see
  * harness.html) and the zustand store is seeded per `?scenario=`:
  *
- *   composer — one empty chat; composer/paste tests.
- *   queue    — a long steer-pending user message plus long/short queued and
- *              steer bubbles; folding/clamping tests.
- *   empty    — no active chat; shell/empty-state tests.
+ *   composer    — one empty chat; composer/paste tests.
+ *   queue       — a long steer-pending user message plus long/short queued and
+ *                 steer bubbles; folding/clamping tests.
+ *   empty       — no active chat; shell/empty-state tests.
+ *   longhistory — 300 messages with a saved MID-history scroll position, so the
+ *                 mounted window starts large; scrolling back to the newest
+ *                 message must release those pages (transcript trim).
  *
  * Exposed on `window.__ui` for browser drivers (the app's browser tools, etc.):
  *   __ui.store               zustand store — .getState() / .setState(patch)
  *   __ui.dispatchPaste(text) dispatch a ClipboardEvent paste on .composer-input
  *   __ui.longText            N-line sample text for fold/clamp cases
+ *   __ui.renderedMessages()  ids of the currently MOUNTED messages — the DOM
+ *                            window size, used to assert the transcript trim
  *
  * Notes for drivers:
  *   - React re-renders asynchronously: after any state-changing evaluate, wait
@@ -95,6 +100,30 @@ function initialState(scenario: string | null) {
       };
     case "empty":
       return { root: "/tmp/codifa-ui-harness", activeChatId: "", chats: [] };
+    case "longhistory": {
+      // Long transcript PLUS a saved mid-history scroll position. The restore
+      // path deliberately renders everything from the anchor up, so the panel
+      // mounts a large window on first paint — exactly the state that used to
+      // persist for the rest of the session because `msgLimit` only ever grew.
+      // A driver scrolls back to the newest message and asserts the DOM shrinks.
+      const COUNT = 300;
+      const messages = Array.from({ length: COUNT }, (_, i) => ({
+        id: `m${i + 1}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `message ${i + 1} of the long-history harness scenario`,
+        createdAt: now + i,
+      }));
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages,
+            scrollPos: { id: "m100", offset: 0, atBottom: false },
+          }),
+        ],
+      };
+    }
     case "plan":
       // Plan-mode flow: planner reply (preamble + tool card) collapsed into a
       // Plan card, plus the pending plan-approval ask above the composer.
@@ -401,6 +430,11 @@ const params = new URLSearchParams(window.location.search);
 (window as any).__ui = {
   store: useStore,
   longText,
+  renderedMessages(): string[] {
+    return Array.from(document.querySelectorAll<HTMLElement>("[data-msg-id]")).map(
+      (n) => n.dataset.msgId ?? "",
+    );
+  },
   dispatchPaste(text: string) {
     const ta = document.querySelector<HTMLTextAreaElement>(".composer-input");
     if (!ta) throw new Error(".composer-input not found");
@@ -525,6 +559,17 @@ if (params.get("scenario") === "diff") {
 } else if (params.get("scenario") === "settings") {
   // Standalone Settings modal, so a browser driver can visually check the
   // grouped tabs and the Tools rows. `?tab=<id>` picks the initial tab.
+  //
+  // `?sidecar=<port>` points the marketplace browse at a stub router (see
+  // tests/ui/market-stub.mjs): without it every index read answers "no
+  // backend" and the kind tabs have nothing to show, which is exactly what a
+  // driver must be able to tell apart from a broken tab.
+  const sidecarPort = params.get("sidecar") ?? "";
+  if (sidecarPort) {
+    const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+    coder.getSidecarUrl = () => Promise.resolve(`http://127.0.0.1:${sidecarPort}`);
+    coder.probeSidecar = () => Promise.resolve(true);
+  }
   const { SettingsModal } = await import("../../src/components/SettingsModal");
   root.render(
     <SettingsModal onClose={() => {}} initialTab={params.get("tab") ?? "tools"} />,

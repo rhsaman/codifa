@@ -1,21 +1,41 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { McpServerConfig, McpTransport, PluginInfo, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
-import { useStore, flushStateNow, providerApiKeys } from '../lib/store'
-import { getSkillFile, listSkills, syncSkill } from '../lib/api'
-import { deletePlugin, listPlugins, togglePlugin } from '../lib/plugins'
+import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
+import type { MarketplaceSource, PluginInfo } from '../types'
+import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES } from '../lib/store'
+import { getSkillFile, listMcp, listSkills, syncSkill } from '../lib/api'
+import {
+  deletePlugin,
+  installPlugin,
+  listMarketplace,
+  listPluginConnectors,
+  listPlugins,
+  listPluginSkills,
+  togglePlugin,
+  updatePlugin,
+} from '../lib/plugins'
+import { fillKeywordsAfterInstall } from '../lib/keywordFill'
+import { paginate, PAGE_SIZE } from '../lib/paging'
+import { useInfiniteGrid } from '../lib/useInfiniteGrid'
+import type { MarketplaceEntry, MarketplaceIndex, PluginConnectorRow } from '../lib/plugins'
+import { PluginDetail } from './PluginDetail'
 import { fetchAndPersist } from '../lib/provider-fetch'
-import { invalidateSkillsList } from '../lib/skills'
+import { invalidateAvailableSkills, invalidateSkillsList, forgetPluginCommands } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
-import { PROVIDER_META, providerMeta } from '../lib/provider-meta'
+import { PROVIDER_META, accountScopedBaseUrl, isAccountScoped, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { THEMES } from '../lib/themes'
+import {
+  DEFAULT_TERMINAL_SHELL,
+  SHELL_CHOICES,
+  shellLabel,
+} from '../lib/nvimTerminals'
 import { RangeSlider } from './RangeSlider'
 import { ProviderModelSelect } from './ProviderModelSelect'
 import { supportsReasoning } from '../lib/thinking'
 import { STT_LANGUAGES } from '../lib/stt'
-import { OTHER_SLOTS, moveFallback, otherSlotFallbacks, otherSlotLevel, otherSlotModel, toolChainRows, toolChainSet, toolFallbackToModel, toolFallbackValue } from '../lib/toolSlots'
+import { OTHER_SLOTS, moveFallback, otherSlotFallbacks, otherSlotLevel, otherSlotModel, resolveSlotEntry, splitSlotEntry, toolChainRows, toolChainSet, toolFallbackToModel, toolFallbackValue } from '../lib/toolSlots'
 import { modelReasoning } from '../lib/context'
 import {
   THINKING_OPTIONS,
@@ -27,6 +47,12 @@ const BUILTIN_KINDS: ProviderKind[] = Object.values(PROVIDER_META)
   .filter((m) => m.builtin)
   .map((m) => m.kind)
 const NEW_SKILL_KEY = '__new_skill__'
+
+/** Row key for a skill: a plugin's skills are scoped by their bundle, because
+ *  two bundles (or a bundle and the user's own store) may ship the same name. */
+function skillKey(pluginSlug: string, name: string): string {
+  return pluginSlug ? `${pluginSlug}::${name}` : name
+}
 
 /** بررسی می‌کنه آیا یک پروایدر تنظیم شده (حداقل یک کلید API دارد). */
 function isProviderConfigured(p: ProviderConfig): boolean {
@@ -41,23 +67,13 @@ function isProviderConfigured(p: ProviderConfig): boolean {
 // raw provider id / kind ("custom-xyz/model" → "My Provider/model").
 export function toolModelLabel(current: string, providers: ReadonlyArray<ProviderConfig>): string {
   if (!current) return 'Main model'
-  const slash = current.indexOf('/')
-  if (slash > 0) {
-    const pid = current.slice(0, slash)
-    let modelPart = current.slice(slash + 1)
-    // Match by provider id first, then by kind (legacy "custom/model" values
-    // written before explicit ids existed).
-    const p =
-      providers.find((x) => x.id === pid) ??
-      (pid === 'custom' ? providers.find((x) => x.kind === 'custom') : undefined)
-    if (p) {
-      // Collapse a doubled prefix from a previously saved value
-      // ("providerId/providerId/model") before labelling.
-      if (modelPart.startsWith(`${p.id}/`)) modelPart = modelPart.slice(p.id.length + 1)
-      return `${p.name}/${modelPart}`
-    }
-  }
-  return current
+  const { providerId, model } = resolveSlotEntry(current, providers)
+  const p = providerId ? providers.find((x) => x.id === providerId) : undefined
+  if (!p) return current
+  // Collapse a doubled prefix from a previously saved value
+  // ("providerId/providerId/model") before labelling.
+  const modelPart = model.startsWith(`${p.id}/`) ? model.slice(p.id.length + 1) : model
+  return `${p.name}/${modelPart}`
 }
 
 /** Resolve a stored subagent value to the ONE picker row the backend really
@@ -75,20 +91,17 @@ export function toolModelTarget(
 ): { providerId: string; model: string } | null {
   if (!current) return null
   if (current === 'main model' || current === 'main_model' || current === 'main') return null
-  const slash = current.indexOf('/')
-  if (slash > 0) {
-    const pid = current.slice(0, slash)
-    let modelPart = current.slice(slash + 1)
-    const p =
-      providers.find((x) => x.id === pid) ??
-      (pid === 'custom' ? providers.find((x) => x.kind === 'custom') : undefined)
-    if (p) {
-      if (modelPart.startsWith(`${p.id}/`)) modelPart = modelPart.slice(p.id.length + 1)
-      return { providerId: p.id, model: modelPart }
-    }
-    return null
-  }
-  return { providerId: activeProviderId, model: current }
+  const { providerId, model, unowned } = resolveSlotEntry(current, providers)
+  // A slash-bearing entry no row can claim belongs to a provider we do not
+  // have: no row may light up, which is what `null` means here.
+  if (unowned) return null
+  const p = providerId ? providers.find((x) => x.id === providerId) : undefined
+  const model2 = p && model.startsWith(`${p.id}/`) ? model.slice(p.id.length + 1) : model
+  // A bare model id belongs to the provider whose catalog lists it; only when
+  // no catalog answers does the ACTIVE provider stand in. Attributing it to the
+  // active provider unconditionally is what made a multi-vendor model
+  // (`oc/deepseek-…`) look like it lived on the chat's provider.
+  return { providerId: providerId || activeProviderId, model: model2 }
 }
 
 /** The "main model" a Tool slot inherits when it has no explicit override:
@@ -319,6 +332,473 @@ const SEARCH_ENGINE_KINDS: Array<{ kind: SearchPluginKind; label: string; needsK
   { kind: 'tavily', label: 'Tavily', needsKey: true },
 ]
 
+/** The catalogue kinds a marketplace may declare. Every ROW installs a plugin
+ *  regardless of its kind, so the kind is only stored provenance. */
+/** How many cards the infinite scroll reveals per batch. A few pages of a
+ *  1.5MB index stay cheap; the rest arrives as the user scrolls. */
+const CARD_BATCH = 24
+
+/** A marketplace's stable id — its install address, not its display label. */
+function marketKey(repo: string, path?: string, gitRef?: string): string {
+  return `${repo}|${path ?? ''}|${gitRef ?? ''}`
+}
+
+/** Settings → Marketplaces: the plugin catalogues the user subscribes to.
+ *
+ *  An index is a plain JSON file in a git repo (Claude's `marketplace.json`),
+ *  so "adding a marketplace" is just naming a repo. Browsing one writes nothing
+ *  — a row installs through the SAME `installPlugin` the `/plugin install`
+ *  command uses, which is why a listed plugin and a typed repo cannot diverge.
+ */
+function MarketplaceEditor() {
+  const marketplaces = useStore((s) => s.marketplaces ?? [])
+  const setMarketplaces = useStore((s) => s.setMarketplaces)
+
+  const [repo, setRepo] = useState('')
+  const [label, setLabel] = useState('')
+  const [showAdd, setShowAdd] = useState(false)
+  /** One loaded index per marketplace, keyed by install address: a kind tab
+   *  merges EVERY one of them into one grid, so no chip needs picking first. */
+  const [indexes, setIndexes] = useState<Record<string, MarketplaceIndex>>({})
+  /** Which indexes are mid-fetch (per key) — the merged list stays up while
+   *  the others still load. */
+  const [loadingKeys, setLoadingKeys] = useState<string[]>([])
+  /** Which catalogue tab is open. EVERYTHING scopes to it — the marketplace
+   *  chips, the add form and the cards. */
+  /** How many cards the infinite scroll has revealed so far. */
+  const [visible, setVisible] = useState(CARD_BATCH)
+  const [filter, setFilter] = useState('')
+  const [installed, setInstalled] = useState<PluginInfo[]>([])
+  const [error, setError] = useState('')
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState('')
+
+  /** Which rows are already here, so a browsed plugin can say so and the button
+   *  reads "Update". Matched by the ADDRESS it was installed from, not by name:
+   *  two marketplaces may list the same plugin under different names. */
+  const refreshInstalled = useCallback(async () => {
+    const out = await listPlugins()
+    if (Array.isArray(out)) setInstalled(out)
+  }, [])
+
+  /** Load one marketplace's index into the merged map (each read is cached
+   *  server-side, so a kind tab fills from every catalogue without waiting
+   *  on the slowest repo). */
+  const loadIndex = useCallback(async (m: MarketplaceSource, refresh = false) => {
+    const key = marketKey(m.repo, m.path, m.git_ref)
+    setLoadingKeys((ks) => (ks.includes(key) ? ks : [...ks, key]))
+    setError('')
+    try {
+      const out = await listMarketplace({
+        repo: m.repo,
+        ...(m.path ? { path: m.path } : {}),
+        ...(m.git_ref ? { git_ref: m.git_ref } : {}),
+        ...(refresh ? { refresh: true } : {}),
+      })
+      if ('error' in out) {
+        setError(`${m.label ?? m.repo}: ${out.error}`)
+        return
+      }
+      setIndexes((cur) => ({ ...cur, [key]: out }))
+    } finally {
+      setLoadingKeys((ks) => ks.filter((k) => k !== key))
+    }
+  }, [])
+
+  // EVERY marketplace of the kind loads for its tab: the grid below merges
+  // all of them, so the Skills tab shows the union, not one repo's rows.
+  // A failed read leaves its slot empty (the error line says which repo) and
+  // the chip's click, or Refresh, retries it.
+  const kindMarkets = marketplaces
+  const kindKeyList = kindMarkets.map((m) => marketKey(m.repo, m.path, m.git_ref)).join('\n')
+  /** Latest map for the load-all effect, without re-subscribing it on each
+   *  landed index. */
+  const indexesRef = useRef(indexes)
+  indexesRef.current = indexes
+  useEffect(() => {
+    if (!kindKeyList) return
+    for (const m of kindMarkets) {
+      const key = marketKey(m.repo, m.path, m.git_ref)
+      if (!indexesRef.current[key]) void loadIndex(m)
+    }
+    // kindMarkets is derived from marketplaces + kind; kindKeyList changes
+    // exactly when any of them is added, removed or re-addressed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kindKeyList, loadIndex])
+
+  const addFromForm = () => {
+    let addr = repo.trim()
+    if (!addr) return
+    // One string carries everything: `owner/repo@ref/sub-path`. The ref ends at
+    // the first `/` AFTER the `@` (tags may hold slashes); the rest is the sub.
+    let refPart = ''
+    let subPart = ''
+    const at = addr.indexOf('@')
+    if (at > 0 && !addr.startsWith('/')) {
+      const tail = addr.slice(at + 1)
+      const slash = tail.indexOf('/')
+      refPart = slash === -1 ? tail : tail.slice(0, slash)
+      if (slash !== -1) subPart = tail.slice(slash + 1)
+      addr = addr.slice(0, at)
+    }
+    const source: MarketplaceSource = {
+      repo: addr,
+      kind: 'plugins',
+      ...(label.trim() ? { label: label.trim() } : {}),
+      ...(subPart.trim() ? { path: subPart.trim() } : {}),
+      ...(refPart.trim() ? { git_ref: refPart.trim() } : {}),
+    }
+    const key = marketKey(source.repo, source.path, source.git_ref)
+    if (!marketplaces.some((m) => marketKey(m.repo, m.path, m.git_ref) === key)) {
+      setMarketplaces([...marketplaces, source])
+    }
+    setRepo('')
+    setLabel('')
+    setLabel('')
+    setShowAdd(false)
+    void loadIndex(source)
+  }
+
+  const remove = (m: MarketplaceSource) => {
+    if (!window.confirm(`Remove marketplace "${m.label ?? m.repo}"? Installed plugins stay.`)) return
+    const key = marketKey(m.repo, m.path, m.git_ref)
+    setMarketplaces(
+      marketplaces.filter((x) => marketKey(x.repo, x.path, x.git_ref) !== key),
+    )
+    setIndexes((cur) => {
+      if (!(key in cur)) return cur
+      const next = { ...cur }
+      delete next[key]
+      return next
+    })
+  }
+
+  /** Install (or update) one entry, then make the app see the new bundle.
+   *
+   *  The caches and the command-usage event are the SAME ones a `/plugin
+   *  install` refreshes: without them a freshly installed bundle's skills would
+   *  not appear as `/`-commands until a reload. */
+  const install = async (entry: MarketplaceEntry) => {
+    const key = marketKey(entry.repo, entry.repo_path, entry.repo_ref)
+    setBusy(key)
+    setError('')
+    const out = await installPlugin({
+      repo: entry.repo,
+      ...(entry.repo_path ? { repo_path: entry.repo_path } : {}),
+      ...(entry.repo_ref ? { repo_ref: entry.repo_ref } : {}),
+      // No `kind` is sent: the row decides. A repo with ONE skill and no
+      // manifest becomes a single-skill bundle, a connector-only row a
+      // single-connector one, and a real bundle stays a bundle — so every row
+      // lands somewhere a user can switch it on and off.
+      // Passed through so an English-only bundle still lands with Persian
+      // trigger phrases: the backend seeds fa_keywords from the category when
+      // neither the repo nor a previous install carries any.
+      ...(entry.category ? { category: entry.category } : {}),
+      ...(entry.description ? { description: entry.description } : {}),
+    })
+    setBusy('')
+    if ('error' in out) {
+      setError(`${entry.name}: ${out.error}`)
+      return
+    }
+    const keywords = (out.plugin?.fa_keywords ?? []).length
+    setNote(
+      `${out.installed === 'updated' ? 'Updated' : 'Installed'} ${out.plugin?.name ?? entry.name} — ` +
+        `${(out.skills ?? []).length} skills, ${(out.mcp ?? []).length} connectors` +
+        (keywords === 0
+          ? '. The Persian phrases for its skills are being written from their descriptions.'
+          : `, ${keywords} Persian keywords.`),
+    )
+    void refreshInstalled()
+    invalidateSkillsList()
+    invalidateAvailableSkills()
+    // This editor is a SIBLING of the Skills/MCP tabs, so it cannot refresh
+    // their state directly: the same event a bundle delete fires is what makes
+    // the parent re-read both lists — a freshly installed skill or connector
+    // was otherwise invisible until the modal was reopened.
+    window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
+    // A connector landed in the connector STORE, which the Settings list reads
+    // through the module store, so it is re-hydrated here too.
+    if ((out.mcp ?? []).length > 0) void listMcp().then((db) => {
+      useStore.getState().setMcpServers(db.mcpServers ?? {})
+    }).catch(() => { })
+    // A bundle whose skills shipped keyword-free is unreachable from a Persian
+    // request, so the phrases are written now instead of waiting for its owner
+    // to find the detail page. Fire-and-forget: the install already succeeded,
+    // and a failed translation only amends the note.
+    void fillKeywordsAfterInstall(out.slug).then((fill) => {
+      if (fill.total === 0) return
+      if (fill.error) {
+        setNote((prev) => `${prev} Keywords were not filled: ${fill.error}`)
+        return
+      }
+      if (fill.filled > 0) {
+        invalidateSkillsList()
+        invalidateAvailableSkills()
+        window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
+        setNote((prev) => `${prev} Filled Persian keywords for ${fill.filled} skill(s).`)
+      }
+    })
+  }
+
+  const installedKeys = new Set(
+    installed.map((p) => marketKey(p.source_repo ?? '', p.source_path, p.source_ref)),
+  )
+  const loading = loadingKeys.length > 0
+  // Merge EVERY marketplace of the kind into one list, deduped by install
+  // address: the same plugin advertised by two repos shows once.
+  const seen = new Set<string>()
+  const allEntries = kindMarkets.flatMap(
+    (m) => indexes[marketKey(m.repo, m.path, m.git_ref)]?.plugins ?? [],
+  )
+  const q = filter.trim().toLowerCase()
+  const matches = allEntries.filter((e) => {
+    const key = marketKey(e.repo, e.repo_path, e.repo_ref)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return !q || `${e.name} ${e.description} ${e.author} ${e.category ?? ''}`.toLowerCase().includes(q)
+  })
+  /** Latest hidden-count for the scroll sentinel's callback, without
+   *  re-subscribing the IntersectionObserver on every keystroke. */
+  const hiddenRef = useRef(0)
+  hiddenRef.current = matches.length - Math.min(visible, matches.length)
+  // Infinite scroll: a batch of cards first, more on demand. The count line
+  // says what is still behind the fold so the cut never reads as "end of list".
+  const shown = matches.slice(0, visible)
+  const hidden = matches.length - shown.length
+  const loadMore = () => setVisible((v) => v + CARD_BATCH)
+
+  /** Infinite scroll: a sentinel div at the foot of the grid; touching it
+   *  reveals the next batch. The "Show more" button stays as the no-scroll
+   *  fallback (keyboard/short windows) doing the same reveal. */
+  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!el) return
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting) && hiddenRef.current > 0) loadMore()
+      },
+      { rootMargin: '240px' },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [matches.length])
+
+  return (
+    <>
+      <div className="field">
+        <div className="field-head">
+          <label>Marketplaces</label>
+          <button className="btn tiny secondary" onClick={() => setShowAdd((v) => !v)}>
+            {showAdd ? 'Cancel' : '+ Add marketplace'}
+          </button>
+        </div>
+        <div className="hint">
+          A marketplace is a repo holding an index
+          (<code>.claude-plugin/marketplace.json</code>). Browsing is read-only:
+          nothing installs until you press Install on a card.
+        </div>
+
+        {/* No kind selector: a marketplace row installs a plugin whatever it
+            advertises (a lone skill or a lone connector becomes its own
+            single-part bundle), so splitting the catalogues by kind only hid
+            half of them behind a tab. */}
+
+        {marketplaces.length === 0 ? (
+          <div className="hint">
+            No marketplace yet.{' '}
+            <button className="btn tiny" onClick={() => setMarketplaces(DEFAULT_MARKETPLACES)}>
+              Bring back the defaults
+            </button>
+          </div>
+        ) : (
+          <div className="market-tabs" role="tablist">
+            {marketplaces
+              .map((m) => {
+              const key = marketKey(m.repo, m.path, m.git_ref)
+              const name = m.label ?? m.repo
+              return (
+                <span key={key} className="market-tab">
+                  <button
+                    className="market-tab-name"
+                    onClick={() => void loadIndex(m, true)}
+                    title={`Reload ${m.repo}${m.path ? ` · ${m.path}` : ''}${m.git_ref ? ` @ ${m.git_ref}` : ''}`}
+                  >
+                    {name}
+                  </button>
+                  <button
+                    className="market-tab-x"
+                    aria-label={`Remove ${name}`}
+                    title="Remove this marketplace — plugins already installed stay"
+                    onClick={() => remove(m)}
+                  >
+                    ×
+                  </button>
+                </span>
+              )
+            })}
+          </div>
+        )}
+
+        {showAdd && (
+          <div className="market-add">
+            {/* The whole form is ONE row: address + optional name + Add. Sub-folder
+                and branch all parse from one string (`owner/repo@ref/sub`), so no
+                second field exists to explain. */}
+            <div className="market-add-row">
+              <input
+                className="market-add-repo"
+                value={repo}
+                onChange={(e) => setRepo(e.target.value)}
+                placeholder="owner/repo, a GitHub URL, or a local folder"
+                dir="ltr"
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') addFromForm()
+                }}
+              />
+              <input
+                className="market-add-label"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                placeholder="Name (optional)"
+                dir="auto"
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') addFromForm()
+                }}
+              />
+              <button className="btn" disabled={!repo.trim()} onClick={addFromForm}>
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {error ? <div className="hint" style={{ color: 'var(--danger)' }}>{error}</div> : null}
+      {note ? <div className="hint">{note}</div> : null}
+
+      {/* The body renders even with NO marketplace: the search box and the
+          guidance used to be nested inside the "has a source" branch, so a
+          catalogue that failed to load left nowhere to type. */}
+      <div className="field">
+          <div className="field-head">
+            <label>All plugins from every marketplace</label>
+            <span className="plugin-spacer" />
+            <button
+              className="btn tiny secondary"
+              disabled={loading}
+              onClick={() => kindMarkets.forEach((m) => void loadIndex(m, true))}
+              title="Reread every index from GitHub instead of the saved copies"
+            >
+              Refresh
+            </button>
+          </div>
+          {kindMarkets.some(
+            (m) => indexes[marketKey(m.repo, m.path, m.git_ref)]?.stale,
+          ) ? (
+            <div className="hint" style={{ color: 'var(--warning, #d19a66)' }}>
+              Some marketplaces could not be reached — showing their saved copies.
+              Press Refresh to try again.
+            </div>
+          ) : null}
+          <div className="settings-search">
+            <input
+              type="search"
+              value={filter}
+              onChange={(e) => {
+                setFilter(e.target.value)
+                setVisible(CARD_BATCH)
+              }}
+              placeholder="Search plugins…"
+              dir="ltr"
+            />
+          </div>
+
+          {matches.length === 0 ? (
+            loading ? (
+              /* Skeleton grid while the indexes load: the same card shapes the
+                 real list will fill, so nothing jumps when data lands. */
+              <div className="market-grid market-skeleton" aria-busy="true" aria-live="polite">
+                {Array.from({ length: 9 }, (_, i) => (
+                  <div key={i} className="market-card market-skel-card" style={{ animationDelay: `${i * 90}ms` }}>
+                    <div className="skel-line skel-title" />
+                    <div className="skel-line" />
+                    <div className="skel-line skel-short" />
+                  </div>
+                ))}
+              </div>
+            ) : kindMarkets.length === 0 ? (
+              /* No source at all — say so and offer the one-click way out
+                 instead of a "nothing matches" that blames the query. */
+              <div className="hint">
+                No marketplace yet — add one above, or{' '}
+                <button className="btn tiny" onClick={() => setMarketplaces(DEFAULT_MARKETPLACES)}>
+                  bring back the defaults
+                </button>
+                .
+              </div>
+            ) : (
+              <div className="hint">Nothing matches.</div>
+            )
+          ) : (
+            <>
+              <div className="market-grid">
+                {shown.map((entry) => {
+                  const key = marketKey(entry.repo, entry.repo_path, entry.repo_ref)
+                  const have = installedKeys.has(key)
+                  return (
+                    <div key={key} className="market-card">
+                      <div className="market-card-head">
+                        <span className="market-card-name" dir="ltr">{entry.name}</span>
+                        <button
+                          className={`btn tiny ${have ? 'secondary' : ''}`}
+                          disabled={busy === key}
+                          onClick={() => void install(entry)}
+                        >
+                          {busy === key ? 'Installing…' : have ? 'Update' : 'Install'}
+                        </button>
+                      </div>
+                      {entry.description ? (
+                        <div className="market-card-desc">{entry.description}</div>
+                      ) : null}
+                      {have ? <div className="market-card-installed">Installed</div> : null}
+                    </div>
+                  )
+                })}
+              </div>
+
+              {hidden > 0 && (
+                <div className="market-more">
+                  <button className="btn secondary" onClick={loadMore}>
+                    Show {Math.min(CARD_BATCH, hidden)} more
+                  </button>
+                  <span className="market-more-count">
+                    {shown.length} of {matches.length}
+                  </span>
+                </div>
+              )}
+              {hidden === 0 && matches.length > CARD_BATCH && (
+                <div className="market-more-count">All {matches.length} shown</div>
+              )}
+              <div ref={sentinelRef} />
+            </>
+          )}
+      </div>
+
+      <div className="field">
+        <div className="hint">
+          A bundle installed from here lands in <b>Plugins</b> like any other: edit its
+          description and Persian keywords there, switch it off, or press{' '}
+          <b>Update from source</b> to pull it again.
+        </div>
+      </div>
+    </>
+  )
+}
+
 /** Settings → Plugins: folder bundles of skills + MCP connectors.
  *
  *  The list is read from the data folder on open instead of being mirrored in
@@ -329,6 +809,29 @@ function PluginBundleEditor() {
   const [plugins, setPlugins] = useState<PluginInfo[] | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
+  const [pluginFilter, setPluginFilter] = useState('')
+  /** Outcome of the last update's keyword fill — the update itself already
+   *  stands, so this is a note and never an error. */
+  const [note, setNote] = useState('')
+
+  /** Filter before paging: one query covers the name, its skills and its
+   *  Persian keywords, so `/ترجمه` finds a bundle whose skills translate. */
+  const filteredPlugins = (plugins ?? []).filter((p) => {
+    const q = pluginFilter.trim().toLowerCase()
+    if (!q) return true
+    return (
+      `${p.name} ${p.slug} ${p.description ?? ''} ${(p.skills ?? []).join(' ')} ${(p.fa_keywords ?? []).join(' ')}`
+        .toLowerCase()
+        .includes(q)
+    )
+  })
+  const grid = useInfiniteGrid(filteredPlugins.length, `plugins:${pluginFilter}`)
+  const visiblePlugins = filteredPlugins.slice(0, grid.visible)
+
+  const [draftDesc, setDraftDesc] = useState<Record<string, string>>({})
+  const [draftKeywords, setDraftKeywords] = useState<Record<string, string>>({})
+  /** The bundle whose detail page is open — `null` keeps the grid on screen. */
+  const [detail, setDetail] = useState<PluginInfo | null>(null)
 
   const refresh = useCallback(async () => {
     const out = await listPlugins()
@@ -359,10 +862,88 @@ function PluginBundleEditor() {
   const remove = async (p: PluginInfo) => {
     if (!window.confirm(`Delete plugin "${p.name}"? Its skills and connectors go with it.`)) return
     setBusy(p.slug)
+    // Read the bundle's skills BEFORE the delete: they are the names of the
+    // `/`-commands that must be forgotten, and afterwards nothing is left to
+    // name them by.
     const out = await deletePlugin(p.slug)
     setBusy('')
     if ('error' in out) setError(out.error)
-    else setPlugins((cur) => (cur ?? []).filter((x) => x.slug !== p.slug))
+    else {
+      setPlugins((cur) => (cur ?? []).filter((x) => x.slug !== p.slug))
+      forgetPluginCommands(p.slug)
+      // The composer's `/`-menu and the `@mention` catalog are both built from
+      // the OTHER skill cache, so dropping only this panel's list left the dead
+      // command in the menu until a reload. Settings is one of the two places a
+      // bundle can be deleted from, so both caches are dropped here too.
+      invalidateSkillsList()
+      invalidateAvailableSkills()
+      window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
+    }
+  }
+
+  /** Save the two editable manifest fields of one plugin. An empty keyword field
+   *  clears them (the backend drops an empty list), which is how a user removes
+   *  an inherited trigger they do not want. */
+  const saveMeta = async (p: PluginInfo, name: string, description: string) => {
+    setBusy(p.slug)
+    const out = await updatePlugin({
+      slug: p.slug,
+      name: name.trim() || p.name,
+      description,
+      fa_keywords: draftKeywords[p.slug] ?? p.fa_keywords ?? [],
+    })
+    setBusy('')
+    if ('error' in out) setError(out.error)
+    else {
+      setError('')
+      setPlugins((cur) => (cur ?? []).map((x) => (x.slug === out.slug ? out : x)))
+    }
+  }
+
+  /** Re-read the bundle from the repo it was installed from.
+   *
+   *  The address is the one recorded at install time — the same three arguments
+   *  an install takes — so an update re-fetches the exact sub-folder and ref the
+   *  user originally chose instead of guessing at a repo root. */
+  const reinstall = async (p: PluginInfo) => {
+    if (!p.source_repo) return
+    setBusy(p.slug)
+    const out = await installPlugin({
+      repo: p.source_repo,
+      ...(p.source_path ? { repo_path: p.source_path } : {}),
+      ...(p.source_ref ? { repo_ref: p.source_ref } : {}),
+    })
+    setBusy('')
+    if ('error' in out) {
+      setError(out.error)
+      return
+    }
+    setError('')
+    setNote('')
+    await refresh()
+    // A refresh can add, rename or drop skills, so the composer's command list
+    // and every skill cache have to be rebuilt — same as a fresh install.
+    invalidateSkillsList()
+    invalidateAvailableSkills()
+    window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
+    // Skills an update added (or that the source still ships keyword-free) get
+    // their Persian phrases here, exactly like a fresh install.
+    void fillKeywordsAfterInstall(out.slug).then((fill) => {
+      if (fill.filled > 0) {
+        invalidateSkillsList()
+        invalidateAvailableSkills()
+        window.dispatchEvent(new CustomEvent('coder:plugins-changed'))
+      }
+      // Never swallowed: the update itself stands, but a silent failure would
+      // leave the bundle unreachable from a Persian request with no clue why.
+      setNote(
+        fill.filled > 0
+          ? `Persian keywords filled for ${fill.filled} skill(s).`
+          : fill.error
+            ? `Persian keywords not filled: ${fill.error}`
+            : '',
+      )
+    })
   }
 
   return (
@@ -379,28 +960,59 @@ function PluginBundleEditor() {
         Create or edit one by typing <code>/plugin &lt;description&gt;</code> in the chat.
       </div>
       {error ? <div className="hint" style={{ color: 'var(--danger)' }}>{error}</div> : null}
+      {note ? <div className="hint">{note}</div> : null}
+      {plugins !== null && plugins.length > 12 ? (
+        <div className="settings-search">
+          <input
+            type="search"
+            value={pluginFilter}
+            onChange={(e) => setPluginFilter(e.target.value)}
+            placeholder="Search plugins, skills, keywords…"
+            dir="ltr"
+          />
+        </div>
+      ) : null}
       {plugins === null ? (
         <div className="hint">Loading…</div>
-      ) : plugins.length === 0 ? (
-        <div className="hint">No plugins installed yet. Add one with <code>/plugin &lt;description&gt;</code>.</div>
+      ) : filteredPlugins.length === 0 ? (
+        <div className="hint">No plugin matches.</div>
       ) : (
-        <div className="mcp-list">
-          {plugins.map((p) => (
-            <div key={p.slug} className="mcp-card">
-              <div className="mcp-card-head">
-                <label className="mcp-card-title">
-                  <input
-                    type="checkbox"
-                    checked={p.enabled}
-                    disabled={busy === p.slug}
-                    onChange={() => void flip(p)}
-                  />{' '}
-                  {p.name}
-                  {p.version ? <span className="mcp-type">{p.version}</span> : null}
-                </label>
-                <div className="mcp-card-actions">
+        <div className="settings-grid">
+          {visiblePlugins.map((p) => (
+            <div key={p.slug} className={`pm-card${p.enabled ? '' : ' pm-card--off'}`}>
+              {/* The edge rail IS the state: rose = live, gray = off. A status you
+                  read without reading any chip or label. */}
+              <span className="pm-rail" aria-hidden="true" />
+              <div className="pm-card-head">
+                <div className="pm-card-title">
+                  {/* A real on/off switch, not a checkbox: the state is a power
+                      toggle for the whole bundle, so it reads as one. */}
                   <button
-                    className="btn tiny secondary"
+                    type="button"
+                    role="switch"
+                    aria-checked={p.enabled}
+                    aria-label={`${p.enabled ? 'Turn off' : 'Turn on'} ${p.name}`}
+                    disabled={busy === p.slug}
+                    className={`pm-switch${p.enabled ? ' on' : ''}`}
+                    onClick={() => void flip(p)}
+                  >
+                    <span className="pm-switch-knob" />
+                  </button>
+                  <span className="pm-card-name">{p.name}</span>
+                </div>
+                <div className="pm-card-actions">
+                  {p.source_repo ? (
+                    <button
+                      className="btn tiny secondary"
+                      disabled={busy === p.slug}
+                      title={`Re-read ${p.source ?? p.source_repo}`}
+                      onClick={() => void reinstall(p)}
+                    >
+                      Update
+                    </button>
+                  ) : null}
+                  <button
+                    className="btn tiny secondary pm-danger"
                     disabled={busy === p.slug}
                     onClick={() => void remove(p)}
                   >
@@ -408,19 +1020,74 @@ function PluginBundleEditor() {
                   </button>
                 </div>
               </div>
-              {p.description ? <div className="hint">{p.description}</div> : null}
-              <div className="hint">
-                <code>{p.slug}</code> · {(p.skills ?? []).length} skills ·{' '}
-                {(p.mcp ?? []).length} connectors
-                {(p.skills ?? []).length > 0 ? ` — ${(p.skills ?? []).join(', ')}` : ''}
+              {p.description ? <div className="pm-card-desc">{p.description}</div> : null}
+              {/* The one-glance census of this bundle: how much of each part it
+                  carries. A zero is information too — it says this bundle has
+                  no connectors, so the model gets no MCP tools from it. */}
+              <div className="pm-meta">
+                <span className="pm-meta-item">
+                  <b>{(p.skills ?? []).length}</b>
+                  {(p.skills ?? []).length === 1 ? 'skill' : 'skills'}
+                </span>
+                <span className="pm-meta-item">
+                  <b>{(p.mcp ?? []).length}</b>
+                  MCP
+                </span>
+                <span className="pm-meta-item">
+                  <b>{(p.scripts ?? []).length}</b>
+                  {(p.scripts ?? []).length === 1 ? 'script' : 'scripts'}
+                </span>
               </div>
+              {(p.skills ?? []).length > 0 ? (
+                <div className="pm-card-tags">
+                  {(p.skills ?? []).slice(0, 4).map((name) => (
+                    <code key={name} className="pm-tag">/{name}</code>
+                  ))}
+                  {(p.skills ?? []).length > 4 ? (
+                    <span className="pm-tag pm-tag--more">+{(p.skills ?? []).length - 4}</span>
+                  ) : null}
+                </div>
+              ) : null}
+              {/* One way in, not an expander: what a bundle CONTAINS — its
+                  skills, connectors and scripts with their descriptions and
+                  Persian keywords — is a page of its own. An inline `<details>`
+                  turned the grid card into a column three screens tall. */}
+              <button
+                type="button"
+                className="pm-card-open"
+                onClick={() => setDetail(p)}
+              >
+                <span>View details</span>
+                <span className="pm-card-open-hint">
+                  {(p.skills ?? []).length} skills · {(p.mcp ?? []).length} connectors ·{' '}
+                  {(p.scripts ?? []).length} scripts
+                </span>
+                <span className="pd-chevron" aria-hidden="true">
+                  ▶
+                </span>
+              </button>
             </div>
           ))}
         </div>
       )}
+      {grid.hasMore ? (
+        <div className="settings-grid-more" ref={grid.sentinelRef}>
+          <button className="btn secondary" onClick={grid.loadMore}>
+            Show more ({grid.remaining} left)
+          </button>
+        </div>
+      ) : null}
+      {detail ? (
+        <PluginDetail
+          plugin={detail}
+          onClose={() => setDetail(null)}
+          onChanged={refresh}
+        />
+      ) : null}
     </div>
   )
 }
+
 
 /** Settings → Plugins: web-search engine priority. */
 function PluginEditor() {
@@ -612,7 +1279,9 @@ export async function fetchProviderModels(
         'skipped' in r
           ? r.reason === 'disabled'
             ? 'Fetch skipped — the provider is disabled.'
-            : 'Fetch skipped — set a base URL first.'
+            : isAccountScoped(cfg.kind)
+              ? 'Fetch skipped — enter the account id first.'
+              : 'Fetch skipped — set a base URL first.'
           : `Fetch failed: ${r.error}`,
       )
       return
@@ -659,7 +1328,11 @@ function FallbackRows({
   // ONE list drives both the tool's own model and its fallbacks, so row 1 can
   // be moved like any other rung. Writing back is the inverse: whatever ends up
   // in row 1 is the tool's model, the rest is its fallback list.
-  const chain = toolChainRows(own, rows)
+  const chain = toolChainRows(
+    own,
+    rows,
+    new Set(providers.map((p) => p.id)),
+  )
   const commit = (next: ToolFallback[]) => {
     const split = toolChainSet(next)
     if (split.own !== own) onOwn(split.own)
@@ -684,14 +1357,15 @@ function FallbackRows({
                 value={isOwn ? own : toolFallbackValue(fb)}
                 onSelect={(v) => {
                   // The picker reports "providerId/model". `''` is the
-                  // composer's own model, and a value without the separator is a
-                  // bare model id that keeps the row's provider.
-                  const slash = v.indexOf('/')
+                  // composer's own model; any other value is split on a KNOWN
+                  // provider id, so a lock-breaking model id (`oc/deepseek-…`)
+                  // is kept whole instead of being cut in half.
+                  const split = splitSlotEntry(v, new Set(providers.map((p) => p.id)))
                   const target: ToolFallback = !v
                     ? { providerId: '', model: '' }
-                    : slash > 0
-                      ? { providerId: v.slice(0, slash), model: v.slice(slash + 1) }
-                      : { ...fb, model: v }
+                    : split.providerId
+                      ? split
+                      : { ...fb, model: split.model }
                   if (isOwn) {
                     onOwn(toolFallbackToModel(target))
                     return
@@ -777,6 +1451,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const removeMode = useStore((s) => s.removeMode)
   const fontSize = useStore((s) => s.fontSize)
   const setFontSize = useStore((s) => s.setFontSize)
+  const viewerFontSize = useStore((s) => s.viewerFontSize)
+  const setViewerFontSize = useStore((s) => s.setViewerFontSize)
+  const terminalFontSize = useStore((s) => s.terminalFontSize)
+  const setTerminalFontSize = useStore((s) => s.setTerminalFontSize)
   const dataPath = useStore((s) => s.dataPath)
   const setDataPath = useStore((s) => s.setDataPath)
   const sttProviderId = useStore((s) => s.sttProviderId)
@@ -838,8 +1516,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
+  const skillCatalogMaxChars = useStore((s) => s.skillCatalogMaxChars ?? 6000)
+  const setSkillCatalogMaxChars = useStore((s) => s.setSkillCatalogMaxChars)
   const disableTextSuggestions = useStore((s) => s.settings.disableTextSuggestions ?? true)
   const setDisableTextSuggestions = useStore((s) => s.setDisableTextSuggestions)
+  const terminalShell = useStore((s) => s.settings.terminalShell ?? DEFAULT_TERMINAL_SHELL)
+  const setTerminalShell = useStore((s) => s.setTerminalShell)
   const theme = useStore((s) => s.theme)
   const setTheme = useStore((s) => s.setTheme)
 
@@ -884,7 +1566,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'skills' | 'mcp' | 'extensions' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'extensions' | 'marketplaces' | 'storage' | 'tools' | 'models' | 'general' | 'terminal'>(initialTab as any || 'providers')
   // Search Console OAuth (Settings → Auth) — the ONLY Google sign-in. Gemini
   // models authenticate with an API key like every other provider.
   const searchConsole = useStore((s) => s.searchConsole)
@@ -967,7 +1649,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const builtinMcp = useStore((s) => s.builtinMcp)
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
-  const [skills, setSkills] = useState<Array<{ name: string; path: string; raw: string; files: string[]; description: string; faKeywords: string[] }>>([])
+  const [skills, setSkills] = useState<Array<{ name: string; key: string; plugin: string; pluginName: string; pluginEnabled: boolean; path: string; raw: string; files: string[]; description: string; faKeywords: string[] }>>([])
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set())
   const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
   // Frontmatter fields of the skill being edited, keyed like skillDrafts.
@@ -990,36 +1672,107 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const [skillsMsg, setSkillsMsg] = useState('')
   const [skillFilter, setSkillFilter] = useState('')
   const [mcpFilter, setMcpFilter] = useState('')
+
+  /** Connectors, filtered then paged: one query covers the name, the command
+   *  and its args and the URL, matching what the row shows. */
+  const matchedMcp = Object.entries(mcpServers).filter(([name, cfg]) => {
+    const q = mcpFilter.trim().toLowerCase()
+    if (!q) return true
+    const summary = `${name} ${cfg.command ?? ''} ${(cfg.args ?? []).join(' ')} ${cfg.url ?? ''}`
+    return summary.toLowerCase().includes(q)
+  })
+  const mcpGrid = useInfiniteGrid(matchedMcp.length, `mcp:${mcpFilter}`)
+
+  /** Skills, filtered then paged: one query covers the name, the English
+   *  description, the Persian keywords and the owning plugin. */
+  const matchedSkills = skills.filter((s) => {
+    const q = skillFilter.trim().toLowerCase()
+    if (!q) return true
+    const meta = skillMeta(s.raw)
+    return `${s.name} ${meta.name} ${meta.description} ${s.pluginName} ${(s.faKeywords ?? []).join(' ')}`
+      .toLowerCase()
+      .includes(q)
+  })
+  const skillGrid = useInfiniteGrid(matchedSkills.length, `skills:${skillFilter}`)
+  const pagedSkills = matchedSkills.slice(0, skillGrid.visible)
   const [addingMcp, setAddingMcp] = useState(false)
+  // Connectors owned by a plugin: listed here too, because a bundle is only a
+  // container — its connectors are needs the user wants to SEE and edit next to
+  // their own, not hidden inside the bundle card.
+  const [pluginConns, setPluginConns] = useState<PluginConnectorRow[]>([])
+  const reloadPluginConns = useCallback(async () => {
+    const rows = await listPluginConnectors()
+    setPluginConns(Array.isArray(rows) ? rows : [])
+  }, [])
   const skillListRef = useRef<HTMLDivElement | null>(null)
 
   const reloadSkills = useCallback(async (preferName?: string) => {
-    const rows = await listSkills()
-    const found = rows.map((r) => ({
-      name: r.name,
-      path: r.path,
-      raw: r.content,
-      files: r.files ?? [],
-      // Carried through so a save can send them back: `content` is the
-      // frontmatter-stripped body, so without these the backend would rewrite
-      // `description:`/`fa_keywords:` as empty (see sync_skill).
-      description: r.description ?? '',
-      faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
-    }))
+    // The user's own store PLUS the skills of every plugin, enabled or not:
+    // a bundle that is switched off still has to be inspectable, and editing it
+    // while off is exactly what someone goes to Settings for.
+    const [own, bundled] = await Promise.all([listSkills(), listPluginSkills()])
+    const fromPlugin = 'error' in bundled ? [] : bundled
+    const found = [
+      ...own.map((r) => ({
+        name: r.name,
+        // Two bundles may ship a skill with the same NAME, and a plugin's may
+        // collide with the user's own. The row is keyed by plugin+name, so a
+        // collision can never open, save or delete the wrong skill.
+        key: r.name,
+        plugin: '',
+        pluginName: '',
+        pluginEnabled: true,
+        path: r.path,
+        raw: r.content,
+        files: r.files ?? [],
+        // Carried through so a save can send them back: `content` is the
+        // frontmatter-stripped body, so without these the backend would rewrite
+        // `description:`/`fa_keywords:` as empty (see sync_skill).
+        description: r.description ?? '',
+        faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
+      })),
+      ...fromPlugin.map((r) => {
+        const slug = r.plugin_slug ?? ''
+        return {
+          name: r.name,
+          key: skillKey(slug, r.name),
+          plugin: slug,
+          pluginName: r.plugin ?? slug,
+          pluginEnabled: r.plugin_enabled !== false,
+          path: r.path,
+          raw: r.content,
+          files: r.files ?? [],
+          description: r.description ?? '',
+          faKeywords: (r.fa_keywords ?? []).filter((k) => k.trim().length > 0),
+        }
+      }),
+    ]
     setSkills(found)
     setSkillDrafts((prev) => {
-      const names = new Set(found.map((f) => f.name))
+      // Keep drafts ONLY for rows that still exist, so a rename or a deleted
+      // bundle cannot leave an orphaned edit that later overwrites a real skill.
+      const keys = new Set(found.map((f) => f.key))
       const next: Record<string, string> = {}
-      for (const [k, v] of Object.entries(prev)) if (names.has(k)) next[k] = v
+      for (const [k, v] of Object.entries(prev)) if (keys.has(k)) next[k] = v
       return next
     })
     if (preferName) {
-      setExpandedSkills((prev) => new Set(prev).add(preferName))
-      setSkillDrafts((prev) =>
-        prev[preferName] !== undefined
-          ? prev
-          : { ...prev, [preferName]: found.find((f) => f.name === preferName)?.raw ?? '' },
-      )
+      // Callers pass the row key (already plugin-scoped) so opening a renamed
+      // or freshly saved plugin skill lands on the right card.
+      const hit = found.find((f) => f.key === preferName || f.name === preferName)
+      const key = hit?.key ?? preferName
+      setExpandedSkills((prev) => new Set(prev).add(key))
+      if (hit) {
+        setSkillDrafts((prev) =>
+          prev[key] !== undefined ? prev : { ...prev, [key]: hit.raw },
+        )
+        setSkillDescriptions((prev) =>
+          prev[key] !== undefined ? prev : { ...prev, [key]: hit.description },
+        )
+        setSkillKeywords((prev) =>
+          prev[key] !== undefined ? prev : { ...prev, [key]: hit.faKeywords.join(', ') },
+        )
+      }
     }
   }, [])
 
@@ -1027,33 +1780,54 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     void reloadSkills()
   }, [reloadSkills])
 
-  const toggleSkill = (name: string) => {
+  useEffect(() => {
+    void reloadPluginConns()
+  }, [reloadPluginConns])
+
+  // The Marketplaces tab is a SIBLING of these two, so an install there lands in
+  // the stores without this panel knowing. Both lists are re-read on the same
+  // event a bundle delete fires.
+  useEffect(() => {
+    const onChanged = () => {
+      void reloadSkills()
+      void reloadPluginConns()
+      void listMcp().then((db) => {
+        useStore.getState().setMcpServers(db.mcpServers ?? {})
+      }).catch(() => { })
+    }
+    window.addEventListener('coder:plugins-changed', onChanged)
+    return () => window.removeEventListener('coder:plugins-changed', onChanged)
+  }, [reloadSkills, reloadPluginConns])
+
+  const toggleSkill = (key: string) => {
     setExpandedSkills((prev) => {
       const next = new Set(prev)
-      if (next.has(name)) next.delete(name)
-      else next.add(name)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
       return next
     })
     setSkillDrafts((prev) => {
-      if (prev[name] !== undefined) return prev
-      return { ...prev, [name]: skills.find((x) => x.name === name)?.raw ?? '' }
+      if (prev[key] !== undefined) return prev
+      return { ...prev, [key]: skills.find((x) => x.key === key)?.raw ?? '' }
     })
     // Seed the frontmatter inputs from the list row, once per open. The draft
     // body has no frontmatter, so these values are the ONLY copy of the skill's
     // description/fa_keywords the editor holds.
-    const row = skills.find((x) => x.name === name)
+    const row = skills.find((x) => x.key === key)
     setSkillDescriptions((prev) =>
-      prev[name] !== undefined ? prev : { ...prev, [name]: row?.description ?? '' },
+      prev[key] !== undefined ? prev : { ...prev, [key]: row?.description ?? '' },
     )
     setSkillKeywords((prev) =>
-      prev[name] !== undefined ? prev : { ...prev, [name]: (row?.faKeywords ?? []).join(', ') },
+      prev[key] !== undefined ? prev : { ...prev, [key]: (row?.faKeywords ?? []).join(', ') },
     )
     setSkillsMsg('')
   }
 
   const getSkillServerFiles = (key: string): string[] => {
     if (key === NEW_SKILL_KEY) return []
-    return skills.find((x) => x.name === key)?.files ?? []
+    // Looked up by ROW KEY: a plugin's skill and the user's own may share a
+    // name, and showing the wrong set of files would let a save delete one.
+    return skills.find((x) => x.key === key)?.files ?? []
   }
 
   const getSkillVisibleFiles = (key: string): string[] => {
@@ -1087,15 +1861,20 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     // Description and Persian keywords live in the frontmatter, which the draft
     // body does NOT carry — send them explicitly, or the backend rewrites the
     // file with an empty `description:` and no `fa_keywords:` at all.
-    const row = skills.find((s) => s.name === name)
+    const row = skills.find((s) => s.key === name)
     const description = (skillDescriptions[name] ?? row?.description ?? '').trim()
     const keywords = (skillKeywords[name] ?? (row?.faKeywords ?? []).join(', ')).trim()
+    // A plugin's skill belongs to its bundle: without `plugin` the backend wrote
+    // the edit into the user's own store, so the bundle kept advertising the old
+    // body and the catalog and the file disagreed.
+    const owner = row?.plugin || undefined
     const res = await syncSkill({
       name: newName,
       previousName: name !== NEW_SKILL_KEY && name !== newName ? name : '',
       content: normalized,
       description,
       faKeywords: keywords,
+      ...(owner ? { plugin: owner } : {}),
       ...(extraNames.length > 0 ? { files: extra } : {}),
       ...(deleted.length > 0 ? { deletedFiles: deleted } : {}),
     })
@@ -1109,30 +1888,33 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     }
     if (res.ok) {
       const savedName = res.name || newName
-      const renamed = name === NEW_SKILL_KEY || name !== savedName
+      // The row key follows the plugin scope, not the bare name: a plugin skill
+      // saved in place must land back on ITS card, not on a same-named local one.
+      const savedKey = owner ? skillKey(owner, savedName) : savedName
+      const renamed = name === NEW_SKILL_KEY || name !== savedKey
       setSkillDrafts((prev) => {
         const next = { ...prev }
         if (renamed) delete next[name]
-        next[savedName] = normalized
+        next[savedKey] = normalized
         return next
       })
       // Carry the frontmatter inputs over to the saved (possibly renamed) key.
       setSkillDescriptions((prev) => {
         const next = { ...prev }
         if (renamed) delete next[name]
-        next[savedName] = description
+        next[savedKey] = description
         return next
       })
       setSkillKeywords((prev) => {
         const next = { ...prev }
         if (renamed) delete next[name]
-        next[savedName] = keywords
+        next[savedKey] = keywords
         return next
       })
       setExpandedSkills((prev) => {
         const next = new Set(prev)
         if (renamed) next.delete(name)
-        next.add(savedName)
+        next.add(savedKey)
         return next
       })
       // Move extra-file state to the saved name so renames keep edits.
@@ -1155,7 +1937,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           if (prev[name] === undefined) return prev
           const next = { ...prev }
           delete next[name]
-          next[savedName] = prev[name]
+          next[savedKey] = prev[name]
           return next
         })
         setSkillNewFileName((prev) => {
@@ -1173,8 +1955,12 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
           return next
         })
       }
-      void reloadSkills(savedName)
+      void reloadSkills(savedKey)
+      // The composer's `/`-menu is built from the OTHER catalog (store + enabled
+      // plugins), so it has to be dropped too — otherwise a skill saved here
+      // stays "Unknown command" until the next restart.
       invalidateSkillsList()
+      invalidateAvailableSkills()
     }
   }
 
@@ -1188,7 +1974,10 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     if (local !== undefined) return
     if (key === NEW_SKILL_KEY) return
     if (!getSkillServerFiles(key).includes(next)) return
-    void getSkillFile(key, next).then((content) => {
+    // The plugin must be named: a switched-off bundle is not searched by the
+    // backend's owner lookup, so its extra file would 404 while the row lists it.
+    const owner = skills.find((s) => s.key === key)
+    void getSkillFile(owner?.name ?? key, next, owner?.plugin || undefined).then((content) => {
       if (content === null) {
         setSkillsMsg(`Could not load ${next}.`)
         setSkillActiveFile((prev) => (prev[key] === next ? { ...prev, [key]: '' } : prev))
@@ -1237,11 +2026,19 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     setSkillActiveFile((prev) => (prev[key] === fileName ? { ...prev, [key]: '' } : prev))
   }
 
-  const deleteSkill = async (name: string) => {
-    if (!window.confirm(`Delete skill "${name}"?`)) return
-    const res = await syncSkill({ name, delete: true })
+  const deleteSkill = async (key: string) => {
+    const row = skills.find((s) => s.key === key)
+    const label = row?.name ?? key
+    // A plugin's skill is deleted from ITS bundle — the owner decision lives
+    // here for the same reason it does on save.
+    const owner = row?.plugin || undefined
+    if (!window.confirm(`Delete skill "${label}"${owner ? ` from plugin "${row?.pluginName}"` : ''}?`)) return
+    const res = await syncSkill({ name: label, delete: true, ...(owner ? { plugin: owner } : {}) })
     setSkillsMsg(res.ok ? 'Deleted.' : `Delete failed: ${res.note ?? 'unknown error'}`)
     if (res.ok) {
+      // Every draft/expanded/extra-file map is keyed by the ROW KEY, so all of
+      // them are cleared with it (a bare name left the state behind on rename).
+      const name = key
       setExpandedSkills((prev) => {
         const next = new Set(prev)
         next.delete(name)
@@ -1279,6 +2076,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       })
       void reloadSkills()
       invalidateSkillsList()
+      invalidateAvailableSkills()
     }
   }
 
@@ -1533,27 +2331,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       ),
     },
     {
-      id: 'skills',
-      label: 'Skills',
-      group: 'Knowledge',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
-        </svg>
-      ),
-    },
-    {
-      id: 'mcp',
-      label: 'MCP',
-      group: 'Knowledge',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
-          <rect x="6" y="6" width="12" height="12" rx="2.5" />
-        </svg>
-      ),
-    },
-    {
       id: 'extensions',
       label: 'Plugins',
       group: 'Knowledge',
@@ -1564,9 +2341,23 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       ),
     },
     {
+      /* Its own tab, not a block inside Plugins: subscribing to a catalogue and
+         managing the bundles you already have are two different errands. */
+      id: 'marketplaces',
+      label: 'Marketplaces',
+      group: 'Knowledge',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 9.5 5 4h14l2 5.5" />
+          <path d="M4 9.5h16V20a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" />
+          <path d="M3 9.5a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0" />
+        </svg>
+      ),
+    },
+    {
       id: 'storage',
       label: 'Storage',
-      group: 'Knowledge',
+      group: 'App',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
@@ -1581,6 +2372,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 22a10 10 0 1 1 10-10c0 2-1.5 3-3 3h-2a3 3 0 0 0-3 3v1c0 1.5-1 2-2 2Z" />
+        </svg>
+      ),
+    },
+    {
+      id: 'terminal',
+      label: 'Terminal',
+      group: 'App',
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="m7 9 3 3-3 3" />
+          <path d="M13 15h4" />
         </svg>
       ),
     },
@@ -1743,19 +2546,63 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               </div>
             )}
 
+            {isAccountScoped(cfg.kind) && (
+              <>
+                <div className="field">
+                  <label>Account ID</label>
+                  <input
+                    value={cfg.accountId ?? ''}
+                    onChange={(e) => {
+                      const accountId = e.target.value.trim()
+                      // The row's base URL IS this id applied to the gateway
+                      // template, so the form keeps the two in step: a Fetch
+                      // clicked right after typing already has a full endpoint
+                      // (the store rebuilds the same value on Save).
+                      setCfg({
+                        ...cfg,
+                        accountId,
+                        baseUrl: accountScopedBaseUrl(cfg.kind, accountId) ?? '',
+                      })
+                    }}
+                    placeholder="e.g. 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"
+                    dir="ltr"
+                  />
+                  {providerMeta(cfg.kind).accountIdHint && (
+                    <div className="hint">{providerMeta(cfg.kind).accountIdHint}</div>
+                  )}
+                </div>
+                <div className="field">
+                  <label>Base URL</label>
+                  <div className="hint">
+                    {cfg.baseUrl ||
+                      'Built from the account id — enter one above to get the endpoint.'}
+                  </div>
+                  {providerMeta(cfg.kind).baseUrlDesc && (
+                    <div className="hint">{providerMeta(cfg.kind).baseUrlDesc}</div>
+                  )}
+                  {providerMeta(cfg.kind).extraHint && (
+                    <div className="hint">{providerMeta(cfg.kind).extraHint}</div>
+                  )}
+                </div>
+              </>
+            )}
+
             {providerMeta(cfg.kind).editableBaseUrl && (
               <div className="field">
                 <label>Base URL</label>
                 <input
                   value={cfg.baseUrl}
                   onChange={(e) => setCfg({ ...cfg, baseUrl: e.target.value })}
-                  placeholder={providerMeta(cfg.kind).local ? 'http://localhost:11434' : 'http://localhost:8080/v1'}
+                  placeholder={
+                    providerMeta(cfg.kind).local ? 'http://localhost:11434' : 'http://localhost:8080/v1'
+                  }
                   dir="ltr"
                 />
                 <div className="hint">
-                  {providerMeta(cfg.kind).local
-                    ? 'Local endpoint (llama.cpp-compatible). Also works with Ollama and vLLM.'
-                    : 'Any OpenAI-compatible API (llama.cpp, vLLM, LocalAI, LM Studio, …).'}
+                  {providerMeta(cfg.kind).baseUrlDesc ??
+                    (providerMeta(cfg.kind).local
+                      ? 'Local endpoint (llama.cpp-compatible). Also works with Ollama and vLLM.'
+                      : 'Any OpenAI-compatible API (llama.cpp, vLLM, LocalAI, LM Studio, …).')}
                 </div>
               </div>
             )}
@@ -2188,311 +3035,99 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 نمونه‌ای از متن فارسی و English preview.
               </div>
             </div>
-        </>
-        )}
-
-        {tab === 'mcp' && (
-        <>
             <div className="field">
-              <div className="field-head">
-                <label>MCP Tool Connectors</label>
-                <button
-                  className="btn tiny"
-                  onClick={() => {
-                    setAddingMcp((v) => !v)
-                    setMcpFilter('')
-                  }}
-                >
-                  {addingMcp ? 'Cancel' : '+ Add MCP'}
-                </button>
+              <label>File viewer font size</label>
+              <div className="font-size-row">
+                <span className="font-size-label">A−</span>
+                <input
+                  type="range"
+                  min={9}
+                  max={24}
+                  step={1}
+                  value={viewerFontSize}
+                  onChange={(e) => setViewerFontSize(Number(e.target.value))}
+                />
+                <span className="font-size-label">A+</span>
+                <span className="font-size-value">{viewerFontSize}px</span>
               </div>
               <div className="hint">
-                MCP servers expose extra tools to the agent (filesystem, databases, APIs…). Connectors
-                are stored in the app's user data folder and changes apply on the next message in any mode.
-                Env/header values support{' '}
-                <code>{'${VAR}'}</code> and <code>{'${VAR:-default}'}</code> expansion from your shell
-                environment. Add a new connector by typing <code>/create-mcp &lt;description&gt;</code> in the chat,
-                or press <b>+ Add MCP</b> above.
+                Size of code opened in the side-pane file viewer. Independent of
+                the chat font size.
               </div>
-              <div className="settings-search">
+            </div>
+            <div className="field">
+              <label>Terminal font size</label>
+              <div className="font-size-row">
+                <span className="font-size-label">A−</span>
                 <input
-                  type="search"
-                  value={mcpFilter}
-                  onChange={(e) => setMcpFilter(e.target.value)}
-                  placeholder="Search connectors…"
-                  dir="ltr"
+                  type="range"
+                  min={9}
+                  max={24}
+                  step={1}
+                  value={terminalFontSize}
+                  onChange={(e) => setTerminalFontSize(Number(e.target.value))}
                 />
+                <span className="font-size-label">A+</span>
+                <span className="font-size-value">{terminalFontSize}px</span>
               </div>
-              <div className="mcp-list">
-                {addingMcp && (
-                  <McpEditor
-                    key="__new__"
-                    initialName=""
-                    initialCfg={{}}
-                    defaultOpen
-                    onSave={(_oldName, newName, next) => {
-                      addMcpServer(newName, next)
-                      setAddingMcp(false)
-                    }}
-                    onDelete={() => setAddingMcp(false)}
-                  />
-                )}
-                {Object.entries(mcpServers).length === 0 && !addingMcp && (
-                  <div className="hint">No MCP connectors yet. Add one with <code>/create-mcp &lt;description&gt;</code> in the chat.</div>
-                )}
-                {Object.entries(mcpServers)
-                  .filter(([name, cfg]) => {
-                    const q = mcpFilter.trim().toLowerCase()
-                    if (!q) return true
-                    const summary = `${name} ${cfg.command ?? ''} ${(cfg.args ?? []).join(' ')} ${cfg.url ?? ''}`
-                    return summary.toLowerCase().includes(q)
-                  })
-                  .map(([name, cfg]) => (
-                  <McpEditor
-                    key={name}
-                    initialName={name}
-                    initialCfg={cfg}
-                    builtin={builtinMcp.includes(name)}
-                    onSave={(oldName, newName, next) => {
-                      if (oldName && oldName !== newName) removeMcpServer(oldName)
-                      addMcpServer(newName, next)
-                    }}
-                    onDelete={(n) => {
-                      if (window.confirm(`Delete MCP connector "${n}"?`)) removeMcpServer(n)
-                    }}
-                  />
-                ))}
+              <div className="hint">
+                Size of every terminal in the app (bottom panel and side-pane
+                tabs). Independent of the chat font size.
               </div>
             </div>
         </>
         )}
 
-        {tab === 'extensions' && (
+        {/* Catalogue browsing has its OWN tab under Knowledge. A marketplace row
+            installs a plugin wherever it was listed, so nothing else changed. */}
+        {tab === 'marketplaces' && (
         <>
-          <PluginBundleEditor />
+          <MarketplaceEditor />
         </>
         )}
 
-        {tab === 'skills' && (
+        {tab === 'extensions' && (
         <>
+          {/* ONE tab for everything a plugin is: the bundles themselves, then
+              the connectors and skills living inside them. The old `skills` and
+              `mcp` tabs are gone because a skill or a connector has no life of
+              its own any more — it belongs to a bundle, and the bundle's switch
+              is what turns it on or off. */}
+          <PluginBundleEditor />
+            {/* The one skill knob that is NOT per bundle: how much of the whole
+                catalog rides in every prompt. Everything else a bundle holds —
+                its skills and its connectors — is edited inside its own card. */}
             <div className="field">
               <div className="field-head">
-                <label>Skills</label>
-                <button className="btn tiny" onClick={newSkill}>+ New skill</button>
+                <label>Catalog budget</label>
+                <span className="field-value-badge">{skillCatalogMaxChars} chars</span>
               </div>
               <div className="hint">
-                Skills are stored in the app's user data folder and matched to your messages semantically:
-                when a request matches a skill, the agent follows its instructions. Create or edit skills
-                by typing <code>/create-skill &lt;description&gt;</code> in the chat, or add them here.
+                How many characters of the skill catalog (every name, plus as much
+                description and as many Persian keywords as fit) ride in the system
+                prompt on <b>every</b> turn. Past this the list drops DETAIL first and
+                always keeps each skill's name — so an absent entry never means a
+                missing skill, only that it was not listed. Raise it for a large store
+                (roughly <code>4</code> characters per token, so <code>6000</code> ≈{' '}
+                <code>1500</code> tokens per turn); lower it to save context. Range{' '}
+                <code>1500</code>–<code>12000</code> on the backend as well, so a value
+                typed here is never silently ignored. Default: <code>6000</code>.
               </div>
-              <div className="settings-search">
+              <div className="settings-row-control">
                 <input
-                  type="search"
-                  value={skillFilter}
-                  onChange={(e) => setSkillFilter(e.target.value)}
-                  placeholder="Search skills…"
+                  type="number"
+                  min={1500}
+                  max={12000}
+                  step={500}
+                  value={skillCatalogMaxChars}
+                  onChange={(e) => setSkillCatalogMaxChars(Number(e.target.value))}
                   dir="ltr"
+                  aria-label="Skill catalog budget in characters"
                 />
-              </div>
-              <div className="skill-list" ref={skillListRef}>
-                {skills.length === 0 && (
-                  <div className="hint">No skills yet. Create one with <code>/create-skill &lt;description&gt;</code> in the chat.</div>
-                )}
-                {expandedSkills.has(NEW_SKILL_KEY) && (
-                  <div className="skill-card open">
-                    <div className="skill-card-head">
-                      <span className="skill-chevron open">▶</span>
-                      <span className="skill-card-name">New skill</span>
-                    </div>
-                    <div className="skill-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12, overflow: 'visible' }}>
-                      <textarea
-                        className="system-prompt skill-raw"
-                        value={skillDrafts[NEW_SKILL_KEY] ?? ''}
-                        onChange={(e) =>
-                          setSkillDrafts((prev) => ({ ...prev, [NEW_SKILL_KEY]: e.target.value }))
-                        }
-                        rows={12}
-                        dir="ltr"
-                        spellCheck={false}
-                      />
-                      {/* Same frontmatter inputs as the per-skill pane: the body
-                          textarea holds no frontmatter, so without these a new
-                          skill would be saved with an empty English description
-                          and no Persian keywords — i.e. unreachable from a
-                          Persian request. `newSkill()` seeds both states and
-                          `saveSkill()` already reads them for NEW_SKILL_KEY. */}
-                      <div className="skill-meta-row">
-                        <label className="skill-meta-label">
-                          Description (English, one line)
-                          <input
-                            value={skillDescriptions[NEW_SKILL_KEY] ?? ''}
-                            onChange={(e) =>
-                              setSkillDescriptions((prev) => ({
-                                ...prev,
-                                [NEW_SKILL_KEY]: e.target.value,
-                              }))
-                            }
-                            placeholder="One-line English summary of when to use this skill"
-                            dir="ltr"
-                            spellCheck={false}
-                          />
-                        </label>
-                        <label className="skill-meta-label">
-                          Persian keywords (fa_keywords)
-                          <input
-                            value={skillKeywords[NEW_SKILL_KEY] ?? ''}
-                            onChange={(e) =>
-                              setSkillKeywords((prev) => ({
-                                ...prev,
-                                [NEW_SKILL_KEY]: e.target.value,
-                              }))
-                            }
-                            placeholder="ترجمه کن, ترجمه, translate this"
-                            dir="auto"
-                            spellCheck={false}
-                          />
-                        </label>
-                        <span className="hint">
-                          Comma-separated phrases you would actually say. The skill
-                          catalog shows them, so a Persian request matches this skill
-                          without any embedding.
-                        </span>
-                      </div>
-                      <SkillFilesEditor
-                        serverFiles={[]}
-                        extraFiles={skillExtraFiles[NEW_SKILL_KEY] ?? {}}
-                        deletedFiles={skillDeletedFiles[NEW_SKILL_KEY] ?? []}
-                        activeFile={skillActiveFile[NEW_SKILL_KEY] ?? ''}
-                        newFileName={skillNewFileName[NEW_SKILL_KEY] ?? ''}
-                        onSelect={(f) => selectSkillFile(NEW_SKILL_KEY, f)}
-                        onContentChange={(f, v) =>
-                          setSkillExtraFiles((prev) => ({
-                            ...prev,
-                            [NEW_SKILL_KEY]: { ...(prev[NEW_SKILL_KEY] ?? {}), [f]: v },
-                          }))
-                        }
-                        onNewFileNameChange={(v) =>
-                          setSkillNewFileName((prev) => ({ ...prev, [NEW_SKILL_KEY]: v }))
-                        }
-                        onAdd={() => addSkillFile(NEW_SKILL_KEY)}
-                        onRemove={(f) => removeSkillFile(NEW_SKILL_KEY, f)}
-                      />
-                      <div className="prompt-actions">
-                        <span className="hint">{skillsMsg}</span>
-                        <div className="skill-actions">
-                          <button className="btn tiny" onClick={() => saveSkill(NEW_SKILL_KEY)}>
-                            Save skill
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                {skills
-                  .filter((s) => {
-                    const q = skillFilter.trim().toLowerCase()
-                    if (!q) return true
-                    const meta = skillMeta(s.raw)
-                    return `${s.name} ${meta.name} ${meta.description}`.toLowerCase().includes(q)
-                  })
-                  .map((s) => {
-                    const meta = skillMeta(s.raw)
-                    const desc = meta.description
-                    const isOpen = expandedSkills.has(s.name)
-                    return (
-                      <div
-                        key={s.name}
-                        className={`skill-card ${isOpen ? 'open' : ''}`}
-                      >
-                        <div className="skill-card-head" onClick={() => toggleSkill(s.name)}>
-                          <span className={`skill-chevron ${isOpen ? 'open' : ''}`}>▶</span>
-                          <span className="skill-card-name">{meta.name || s.name}</span>
-                          {desc && <span className="skill-card-desc">{desc}</span>}
-                        </div>
-                        {isOpen && (
-                          <div className="skill-card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12, overflow: 'visible' }}>
-                            <textarea
-                              className="system-prompt skill-raw"
-                              value={skillDrafts[s.name] ?? s.raw}
-                              onChange={(e) =>
-                                setSkillDrafts((prev) => ({ ...prev, [s.name]: e.target.value }))
-                              }
-                              rows={12}
-                              dir="ltr"
-                              spellCheck={false}
-                            />
-                            <div className="skill-meta-row">
-                              <label className="skill-meta-label">
-                                Description (English, one line)
-                                <input
-                                  value={skillDescriptions[s.name] ?? s.description ?? ''}
-                                  onChange={(e) =>
-                                    setSkillDescriptions((prev) => ({
-                                      ...prev,
-                                      [s.name]: e.target.value,
-                                    }))
-                                  }
-                                  placeholder="One-line English summary of when to use this skill"
-                                  dir="ltr"
-                                  spellCheck={false}
-                                />
-                              </label>
-                              <label className="skill-meta-label">
-                                Persian keywords (fa_keywords)
-                                <input
-                                  value={skillKeywords[s.name] ?? (s.faKeywords ?? []).join(', ')}
-                                  onChange={(e) =>
-                                    setSkillKeywords((prev) => ({
-                                      ...prev,
-                                      [s.name]: e.target.value,
-                                    }))
-                                  }
-                                  placeholder="ترجمه کن, ترجمه, translate this"
-                                  dir="auto"
-                                  spellCheck={false}
-                                />
-                              </label>
-                              <span className="hint">
-                                Comma-separated phrases you would actually say. The skill
-                                catalog shows them, so a Persian request matches this skill
-                                without any embedding.
-                              </span>
-                            </div>
-                            <SkillFilesEditor
-                              serverFiles={s.files ?? []}
-                              extraFiles={skillExtraFiles[s.name] ?? {}}
-                              deletedFiles={skillDeletedFiles[s.name] ?? []}
-                              activeFile={skillActiveFile[s.name] ?? ''}
-                              newFileName={skillNewFileName[s.name] ?? ''}
-                              onSelect={(f) => selectSkillFile(s.name, f)}
-                              onContentChange={(f, v) =>
-                                setSkillExtraFiles((prev) => ({
-                                  ...prev,
-                                  [s.name]: { ...(prev[s.name] ?? {}), [f]: v },
-                                }))
-                              }
-                              onNewFileNameChange={(v) =>
-                                setSkillNewFileName((prev) => ({ ...prev, [s.name]: v }))
-                              }
-                              onAdd={() => addSkillFile(s.name)}
-                              onRemove={(f) => removeSkillFile(s.name, f)}
-                            />
-                            <div className="prompt-actions">
-                              <span className="hint">{skillsMsg}</span>
-                              <div className="skill-actions">
-                                <button className="btn tiny danger" onClick={() => deleteSkill(s.name)}>
-                                  Delete
-                                </button>
-                                <button className="btn tiny" onClick={() => saveSkill(s.name)}>
-                                  Save skill
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )
-                  })}
+                <span className="field-unit">chars</span>
+                <span className="field-unit">
+                  ≈ {Math.round(skillCatalogMaxChars / 4).toLocaleString()} tokens per turn
+                </span>
               </div>
             </div>
         </>
@@ -2500,20 +3135,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
 
         {tab === 'storage' && (
         <>
-          {/* ===== Web & Fetch cache ===== */}
-          <div className="settings-group">
-            <div className="settings-group-head">
-              <span className="settings-group-icon">🌐</span>
-              <div>
-                <div className="settings-group-title">Web &amp; Fetch cache</div>
-                <div className="settings-group-desc">
-                  How long web search results and fetched pages stay cached before a re-fetch.
-                  Uses the same TTL as RAG storage (below) — set once, applies everywhere.
-                </div>
-              </div>
-            </div>
-          </div>
-
+          {/* The web/fetch TTL lives on the Web Providers tab next to the
+              engines it throttles — a cache knob alone is dead weight here. */}
           {/* ===== Result cache ===== */}
           <div className="settings-group">
             <div className="settings-group-head">
@@ -2865,6 +3488,45 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         </>
         )}
 
+        {tab === 'terminal' && (
+        <>
+            <div className="field">
+              <div className="field-head">
+                <label>Neovim</label>
+              </div>
+              <div className="hint">
+                <strong>Open with → Neovim</strong> always opens a terminal tab in
+                this app's right pane — no other terminal needs to be installed.
+                Run in the pane is the only target; the editor itself is whatever
+                <code>nvim</code> your login shell resolves.
+              </div>
+            </div>
+
+            <div className="field">
+              <div className="field-head">
+                <label>Shell for the in-app terminal</label>
+              </div>
+              <div className="hint">
+                The shell every terminal TAB of this app runs (the bottom panel and
+                the right-pane tabs). Applies to the next terminal you open;
+                existing sessions keep theirs.
+              </div>
+              <select
+                value={terminalShell}
+                onChange={(e) => setTerminalShell(e.target.value)}
+                dir="ltr"
+              >
+                {SHELL_CHOICES.map((s) => (
+                  <option key={s} value={s}>
+                    {shellLabel(s)}
+                    {s === DEFAULT_TERMINAL_SHELL ? ' (default)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+        </>
+        )}
+
         {tab === 'general' && (
         <>
             <div className="field">
@@ -3112,193 +3774,3 @@ function withSkillName(raw: string, newName: string): string {
   return `---\n${nextBlock}\n---\n${rest}`
 }
 
-function kvToText(kv: Record<string, string>): string {
-  return Object.entries(kv)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('\n')
-}
-
-function parseKV(text: string): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const line of text.split('\n')) {
-    const idx = line.indexOf('=')
-    if (idx <= 0) continue
-    const k = line.slice(0, idx).trim()
-    const v = line.slice(idx + 1).trim()
-    if (k) out[k] = v
-  }
-  return out
-}
-
-function splitArgs(text: string): string[] {
-  return text
-    .split(/\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-}
-
-function McpEditor({
-  initialName,
-  initialCfg,
-  builtin = false,
-  defaultOpen = false,
-  onSave,
-  onDelete,
-}: {
-  initialName: string
-  initialCfg: McpServerConfig
-  builtin?: boolean
-  defaultOpen?: boolean
-  onSave: (oldName: string, newName: string, cfg: McpServerConfig) => void
-  onDelete: (name: string) => void
-}) {
-  const [name, setName] = useState(initialName)
-  const [type, setType] = useState<McpTransport>(
-    initialCfg.command
-      ? 'stdio'
-      : initialCfg.url
-        ? initialCfg.headers
-          ? 'http'
-          : 'sse'
-        : 'stdio',
-  )
-  const [command, setCommand] = useState(initialCfg.command ?? '')
-  const [args, setArgs] = useState((initialCfg.args ?? []).join(' '))
-  const [url, setUrl] = useState(initialCfg.url ?? '')
-  const [env, setEnv] = useState(kvToText(initialCfg.env ?? {}))
-  const [headers, setHeaders] = useState(kvToText(initialCfg.headers ?? {}))
-  const [error, setError] = useState('')
-  const [open, setOpen] = useState(defaultOpen)
-
-  const transportLabel: Record<McpTransport, string> = {
-    stdio: 'stdio',
-    http: 'HTTP',
-    sse: 'SSE',
-  }
-
-  const summary = () =>
-    type === 'stdio'
-      ? (command || '…') + (args ? ' ' + args.trim() : '')
-      : url || '…'
-
-  const build = (): McpServerConfig | null => {
-    if (!name.trim()) {
-      setError('Name is required.')
-      return null
-    }
-    if (type === 'stdio') {
-      if (!command.trim()) {
-        setError('A command is required for stdio servers.')
-        return null
-      }
-      return { command: command.trim(), args: splitArgs(args), env: parseKV(env) }
-    }
-    if (!url.trim()) {
-      setError('A URL is required for HTTP/SSE servers.')
-      return null
-    }
-    return { url: url.trim(), headers: parseKV(headers) }
-  }
-
-  const save = () => {
-    const cfg = build()
-    if (!cfg) return
-    setError('')
-    onSave(initialName, builtin ? initialName : name.trim(), cfg)
-  }
-
-  return (
-    <div className={`mcp-card ${open ? 'open' : ''}`}>
-      <div className="mcp-card-head" onClick={() => setOpen((o) => !o)}>
-        <span className={`mcp-chevron ${open ? 'open' : ''}`}>▶</span>
-        <span className="mcp-card-title">{name || initialName || 'new connector'}</span>
-        {builtin && <span className="badge mcp-builtin">built-in</span>}
-        <span className="mcp-type">{transportLabel[type]}</span>
-        <span className="mcp-summary">{summary()}</span>
-        <span className={`status-dot ${type === 'stdio' ? 'ok' : ''}`} />
-        <div className="mcp-card-actions" onClick={(e) => e.stopPropagation()}>
-          <button className="btn tiny" onClick={save}>
-            Save
-          </button>
-          {initialName && !builtin && (
-            <button className="btn tiny danger" onClick={() => onDelete(initialName)}>
-              Delete
-            </button>
-          )}
-        </div>
-      </div>
-      {open && (
-      <div className="mcp-fields">
-        <label className="field-label">Name</label>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. filesystem"
-          dir="ltr"
-          readOnly={builtin}
-          title={builtin ? 'Built-in connectors keep their name' : undefined}
-        />
-        <label className="field-label">Transport</label>
-        <select value={type} onChange={(e) => setType(e.target.value as McpTransport)}>
-          <option value="stdio">stdio (local command)</option>
-          <option value="http">HTTP / Streamable HTTP</option>
-          <option value="sse">SSE</option>
-        </select>
-        {type === 'stdio' ? (
-          <>
-            <label className="field-label">Command</label>
-            <input
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              placeholder="e.g. npx or /path/to/server"
-              dir="ltr"
-            />
-            <label className="field-label">Args</label>
-            <input
-              value={args}
-              onChange={(e) => setArgs(e.target.value)}
-              placeholder='e.g. -y @modelcontextprotocol/server-filesystem /path'
-              dir="ltr"
-            />
-            <label className="field-label">Environment (KEY=VALUE per line)</label>
-            <textarea
-              className="system-prompt kv-input"
-              value={env}
-              onChange={(e) => setEnv(e.target.value)}
-              rows={2}
-              dir="ltr"
-              spellCheck={false}
-              placeholder="API_KEY=${MY_KEY}"
-            />
-          </>
-        ) : (
-          <>
-            <label className="field-label">URL</label>
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://server.example.com/mcp"
-              dir="ltr"
-            />
-            <label className="field-label">Headers (KEY=VALUE per line)</label>
-            <textarea
-              className="system-prompt kv-input"
-              value={headers}
-              onChange={(e) => setHeaders(e.target.value)}
-              rows={2}
-              dir="ltr"
-              spellCheck={false}
-              placeholder="Authorization=Bearer ${TOKEN}"
-            />
-          </>
-        )}
-        {error && (
-          <div className="hint" style={{ color: 'var(--danger)' }}>
-            {error}
-          </div>
-        )}
-      </div>
-      )}
-    </div>
-  )
-}

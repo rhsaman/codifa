@@ -1,7 +1,8 @@
 //! Native model-catalog endpoint: `GET /models`.
 //!
-//! Ported from `backend/providers.py::list_models`. The renderer needs four
-//! things per model — `id`, `context`, `pricing`, `reasoning` — and the two
+//! Ported from `backend/providers.py::list_models`. The renderer needs five
+//! things per model — `id`, `context`, `pricing`, `reasoning`,
+//! `thinking_levels` — and the two
 //! authoritative sources are the provider's own `/models` payload and the
 //! community-maintained models.dev catalog (used to fill the gaps, and as the
 //! PRIMARY source for gateways that under-report their context window).
@@ -32,11 +33,15 @@ use crate::providers::{resolve_keys, UA_LADDER};
 
 const MODELS_DEV_API: &str = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_SECS: u64 = 3600;
+/// The catalog is ONE ~6MB document: on a slow link the headers land in under a
+/// second while the BODY needs ~20s, so the whole-response timeout has to cover
+/// the download, not just the first byte. At 10s it never completed a single
+/// fetch (every provider silently lost its real context window and pricing).
+const MODELS_DEV_TIMEOUT_SECS_DEFAULT: u64 = 45;
 const MODEL_CACHE_SECS: u64 = 120;
 const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 const OLLAMA_BASE: &str = "http://localhost:11434";
 const NVIDIA_BASE: &str = "https://integrate.api.nvidia.com/v1";
-const TOKENROUTER_BASE: &str = "https://api.tokenrouter.com/v1";
 const GOOGLE_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const CLOUDFLARE_ACCOUNTS_BASE: &str = "https://api.cloudflare.com/client/v4/accounts";
 
@@ -66,12 +71,10 @@ struct Meta {
     format: &'static str,
     models_url: &'static str,
     models_id_field: &'static str,
-    models_query: &'static str,
     /// Google returns `models/<id>`; models.dev keys them bare.
     strip_models_prefix: bool,
     /// Cloud gateways that negotiate a reasoning effort for any model.
     auto_think: bool,
-    editable_base_url: bool,
     models_timeout: u64,
 }
 
@@ -83,10 +86,8 @@ impl Default for Meta {
             format: "openai",
             models_url: "",
             models_id_field: "id",
-            models_query: "",
             strip_models_prefix: false,
             auto_think: false,
-            editable_base_url: true,
             models_timeout: 10,
         }
     }
@@ -138,13 +139,6 @@ fn meta(provider: &str) -> Meta {
             auto_think: true,
             ..Default::default()
         },
-        "tokenrouter" => Meta {
-            env_vars: &["TOKEN_ROUTER_API_KEY", "TOKENROUTER_API_KEY"],
-            base_url: TOKENROUTER_BASE,
-            models_query: "?limit=200",
-            auto_think: true,
-            ..Default::default()
-        },
         _ => Meta::default(),
     }
 }
@@ -168,17 +162,76 @@ fn server_root(base_url: &str) -> String {
     }
 }
 
-fn expand_account(template: &str) -> String {
+fn expand_account(template: &str, base_url: &str) -> String {
     // Cloudflare's endpoint is account-scoped: `{account}` comes from the env.
-    let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap_or_default();
+    let account = cloudflare_account(base_url).unwrap_or_default();
     template.replace("{account}", &account)
+}
+
+/// Cloudflare's model list is account-scoped, so the URL needs the account id.
+/// It comes from `CLOUDFLARE_ACCOUNT_ID` when set, else from the account
+/// segment of the base URL — the endpoint the UI builds from the row's
+/// Account ID field. Without an id the path segment used to collapse to
+/// an empty string (`/accounts//ai/models/search`), which Cloudflare answered with a
+/// routing error (7003) that read like an invalid key.
+fn cloudflare_account(base_url: &str) -> Option<String> {
+    if let Ok(id) = std::env::var("CLOUDFLARE_ACCOUNT_ID") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    // `to_ascii_lowercase` keeps byte offsets, so the index stays valid.
+    let at = base_url.to_ascii_lowercase().find("/accounts/")?;
+    let seg = base_url[at + "/accounts/".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if seg.is_empty() || seg.contains('{') {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
+/// True when `base_url` addresses a machine-local model server (llama.cpp /
+/// LM Studio / vLLM on loopback, a private LAN address or a bare hostname).
+/// ONLY those answer the server-level probes (`/props`, `/api/v1/model(s)`).
+/// Pointing them at a cloud gateway made every row of an 83-model catalog pay
+/// three doomed round-trips — the models list took ~85s instead of ~1s.
+fn is_local_endpoint(base_url: &str) -> bool {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host == "::1" || host == "0.0.0.0" || host.ends_with(".local") {
+        return true;
+    }
+    if !host.contains('.') {
+        // A bare hostname is a LAN box (`gpu-box`), never a public gateway.
+        return true;
+    }
+    if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") {
+        return true;
+    }
+    match host.strip_prefix("172.").and_then(|r| r.split('.').next()) {
+        Some(second) => second.parse::<u8>().is_ok_and(|n| (16..=31).contains(&n)),
+        None => false,
+    }
 }
 
 /// (url, format) for a provider's model list.
 fn models_endpoint(provider: &str, base_url: &str) -> Result<(String, String), String> {
     let m = meta(provider);
     if !m.models_url.is_empty() {
-        return Ok((expand_account(m.models_url), m.format.to_string()));
+        return Ok((expand_account(m.models_url, base_url), m.format.to_string()));
     }
     if provider == "anthropic" {
         let base = normalize_base(provider, base_url);
@@ -196,10 +249,13 @@ fn models_endpoint(provider: &str, base_url: &str) -> Result<(String, String), S
         return Ok((format!("{base}/api/tags"), "tags".to_string()));
     }
     if provider == "cloudflare" {
-        let base = CLOUDFLARE_ACCOUNTS_BASE.to_string();
-        let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap_or_default();
+        let account = cloudflare_account(base_url).ok_or_else(|| {
+            "cloudflare: missing account id — set CLOUDFLARE_ACCOUNT_ID in the app's \
+             environment, or enter your account id in the provider's Account ID field"
+                .to_string()
+        })?;
         return Ok((
-            format!("{base}/{account}/ai/models/search"),
+            format!("{CLOUDFLARE_ACCOUNTS_BASE}/{account}/ai/models/search"),
             "cloudflare_search".to_string(),
         ));
     }
@@ -214,7 +270,7 @@ fn models_endpoint(provider: &str, base_url: &str) -> Result<(String, String), S
             "no base URL configured for provider {provider:?} — set one in Settings → Providers before fetching models"
         ));
     }
-    Ok((format!("{base}/models{}", m.models_query), "openai".to_string()))
+    Ok((format!("{base}/models"), "openai".to_string()))
 }
 
 // ---------- /models entry parsing ----------
@@ -348,6 +404,191 @@ fn entry_reasoning(entry: &Value) -> Option<bool> {
     )
 }
 
+// ---------- per-model thinking LEVELS ----------
+
+/// Canonical UI thinking levels, lowest → highest (mirrors `ThinkingLevel` in
+/// src/types.ts). The legacy `max` alias folds onto `xhigh` and never gets its
+/// own row.
+const UI_THINKING_LEVELS: [&str; 5] = ["none", "low", "medium", "high", "xhigh"];
+
+/// Canonical UI level for a token a source enumerated. Tokens the UI cannot
+/// express (OpenAI's `minimal`, a provider's private name) yield "" and are
+/// dropped rather than invented as an option.
+fn canonical_thinking_level(token: &str) -> &'static str {
+    match token.trim() {
+        "none" => "none",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "max" => "xhigh",
+        _ => "",
+    }
+}
+
+/// The wire signature of one UI level on a provider kind. The mapping tables in
+/// `llm.rs` are the oracle; a second copy of them here would drift the moment a
+/// token changes.
+fn thinking_wire_signature(kind: &str, level: &str) -> Option<String> {
+    match kind {
+        "anthropic" => crate::llm::anthropic_budget_for(level).map(|b| format!("budget:{b}")),
+        "google" => crate::llm::thinking_budget_for(level).map(|b| format!("budget:{b}")),
+        _ => crate::llm::reasoning_effort_for_kind(kind, level).map(|t| format!("effort:{t}")),
+    }
+}
+
+/// What ONE source says about a model's thinking levels. Every field stays
+/// empty/`None` when the source is silent: silence must never read as
+/// "unsupported", or the menu would lose levels for models nobody described.
+#[derive(Default)]
+struct ThinkingCaps {
+    /// Effort tokens enumerated by the source (OpenRouter `supported_efforts`,
+    /// models.dev `reasoning_options[].values`).
+    efforts: Vec<String>,
+    /// `Some(false)` when thinking cannot be switched off.
+    can_disable: Option<bool>,
+    /// The source states thinking is a plain off/on switch with no graded
+    /// effort scale: a gateway's `thinkingEffortSupported: false`, models.dev's
+    /// `toggle`, OpenRouter's mandatory-only entries.
+    switch_only: bool,
+    /// This source's tri-state reasoning flag.
+    reasoning: Option<bool>,
+}
+
+/// Read the thinking capability a single payload entry describes. Keys are
+/// looked up by SHAPE, not by provider or model name, so any gateway adopting
+/// one of these vocabularies is understood without a code change.
+fn thinking_caps(entry: &Value) -> ThinkingCaps {
+    let mut caps = ThinkingCaps {
+        reasoning: entry_reasoning(entry),
+        ..Default::default()
+    };
+    let capabilities = entry.get("capabilities").unwrap_or(&Value::Null);
+    if let Some(b) = capabilities
+        .get("thinkingCanDisable")
+        .and_then(Value::as_bool)
+    {
+        caps.can_disable = Some(b);
+    }
+    if capabilities
+        .get("thinkingEffortSupported")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        caps.switch_only = true;
+    }
+    // OpenAI-compatible gateways style: `reasoning: {supported_efforts, mandatory}`.
+    let reasoning = entry.get("reasoning").unwrap_or(&Value::Null);
+    if let Some(list) = reasoning.get("supported_efforts").and_then(Value::as_array) {
+        caps.efforts = list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(mandatory) = reasoning.get("mandatory").and_then(Value::as_bool) {
+        if caps.can_disable.is_none() {
+            caps.can_disable = Some(!mandatory);
+        }
+        if mandatory && caps.efforts.is_empty() {
+            caps.switch_only = true;
+        }
+    }
+    // models.dev vocabulary: `reasoning_options: [{type, values, min, max}]`.
+    if let Some(opts) = entry.get("reasoning_options").and_then(Value::as_array) {
+        for opt in opts {
+            match opt.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "effort" => {
+                    if let Some(values) = opt.get("values").and_then(Value::as_array) {
+                        caps.efforts.extend(
+                            values.iter().filter_map(Value::as_str).map(str::to_string),
+                        );
+                    }
+                }
+                "toggle" => {
+                    if caps.can_disable.is_none() {
+                        caps.can_disable = Some(true);
+                    }
+                    if caps.efforts.is_empty() {
+                        caps.switch_only = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    caps
+}
+
+/// Per-model thinking levels the composer may offer.
+///
+/// Only what a SOURCE named is offered: the provider's own `/models` payload,
+/// or the models.dev catalogue when the provider stayed silent. Nothing is
+/// estimated — a level no source enumerated is never invented, and a token a
+/// source named is never collapsed onto a different one.
+///
+/// `None` = no source knows the model → no option is offered (never a guess).
+/// `None` = no source ENUMERATED levels (silent payload, or a bare switch/
+/// capability flag): callers keep their full list, because no level was ruled
+/// out and the send path only ever transmits a described one.
+/// `Some(vec![])` = a source stated the model has no thinking mode.
+fn resolve_thinking_levels(caps: &ThinkingCaps, kind: &str) -> Option<Vec<String>> {
+    if caps.reasoning == Some(false) {
+        return Some(Vec::new());
+    }
+    // The enumeration is the authority: a gateway that names `low`, `medium`
+    // and `xhigh` rejects the collapsed `high` with a 400, so every token it
+    // named must reach the composer as-is.
+    let named: Vec<&str> = caps
+        .efforts
+        .iter()
+        .map(|t| canonical_thinking_level(t))
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !caps.efforts.is_empty() {
+        let mut out: Vec<String> = Vec::new();
+        // `none` is not a wire token: it means "send no reasoning parameter".
+        // It is offered only when a source says thinking can be switched OFF, or
+        // names it among the efforts — never invented as a first step.
+        if caps.can_disable == Some(true) || named.contains(&"none") {
+            out.push("none".to_string());
+        }
+        for level in UI_THINKING_LEVELS {
+            // A level this KIND has no wire mapping for cannot be selected: the
+            // mapping tables are the only authority on what leaves the process.
+            if level != "none"
+                && named.contains(&level)
+                && thinking_wire_signature(kind, level).is_some()
+            {
+                out.push(level.to_string());
+            }
+        }
+        return Some(out);
+    }
+    // A plain switch, or a payload that only flags reasoning-capable: the
+    // source named NO level, so no ladder is INVENTED here. It is also not a
+    // verdict of "no thinking" — the composer keeps its full list and the send
+    // path (`level_from_source`) still refuses any level this model was not
+    // described with, so an unenumerated token can never reach the wire.
+    // Returning `None` is what keeps the picker visible for the many gateways
+    // whose `/models` payload has no effort vocabulary at all.
+    let _ = caps.switch_only;
+    None
+}
+
+fn entry_thinking_levels(entry: &Value, kind: &str) -> Option<Vec<String>> {
+    resolve_thinking_levels(&thinking_caps(entry), kind)
+}
+
+fn models_dev_thinking_levels(
+    catalog: &Value,
+    keys: &[String],
+    model_id: &str,
+    kind: &str,
+) -> Option<Vec<String>> {
+    let entry = models_dev_entry(catalog, keys, model_id)?;
+    resolve_thinking_levels(&thinking_caps(&entry), kind)
+}
+
 /// True when a custom gateway aggregates several vendors (ids like
 /// `nvidia/…`, `groq/…`) — such a gateway negotiates reasoning upstream, so a
 /// silent payload is treated as reasoning-capable.
@@ -374,6 +615,16 @@ fn models_dev_cache() -> &'static Mutex<Option<(Instant, Value)>> {
 /// Fetch (and cache) the models.dev catalog. Never fails: a network blip
 /// returns the last good catalog or an empty object, so model listing still
 /// works without metadata.
+/// Whole-response timeout for the models.dev catalog (see the const above).
+/// Override with `CODIFA_MODELS_DEV_TIMEOUT_SECS` on a slow link.
+fn models_dev_timeout_secs() -> u64 {
+    std::env::var("CODIFA_MODELS_DEV_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MODELS_DEV_TIMEOUT_SECS_DEFAULT)
+}
+
 async fn models_dev_catalog(client: &reqwest::Client) -> Value {
     if let Ok(guard) = models_dev_cache().lock() {
         if let Some((at, data)) = guard.as_ref() {
@@ -384,7 +635,7 @@ async fn models_dev_catalog(client: &reqwest::Client) -> Value {
     }
     if let Ok(res) = client
         .get(MODELS_DEV_API)
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(models_dev_timeout_secs()))
         .send()
         .await
     {
@@ -570,6 +821,10 @@ struct Row {
     max_output: Option<i64>,
     pricing: Option<Value>,
     reasoning: Option<bool>,
+    /// Thinking LEVELS the model really supports: `null` when no source knows
+    /// the model (the composer keeps its full list), `[]` when it has no
+    /// thinking mode at all, otherwise the exact levels to offer.
+    thinking_levels: Option<Vec<String>>,
 }
 
 impl Row {
@@ -580,6 +835,7 @@ impl Row {
             "max_output": self.max_output,
             "pricing": self.pricing,
             "reasoning": self.reasoning,
+            "thinking_levels": self.thinking_levels,
         })
     }
 }
@@ -630,6 +886,24 @@ fn apply_models_dev(row: &mut Row, catalog: &Value, provider: &str, base_url: &s
     if row.reasoning.is_none() {
         row.reasoning = models_dev_reasoning(catalog, &dev_keys, &dev_id);
     }
+    if row.thinking_levels.is_none() {
+        row.thinking_levels = models_dev_thinking_levels(catalog, &dev_keys, &dev_id, provider);
+    }
+}
+
+/// Record a freshly fetched catalog, dropping every entry that has gone stale.
+///
+/// The map had NO removal path: it kept one full model catalog per
+/// (provider, url) ever asked for, for the life of the process. An entry past
+/// `MODEL_CACHE_SECS` is already unusable (the read path ignores it and re-queries
+/// the endpoint), so pruning it here costs nothing and bounds the map by the
+/// providers the user actually has.
+fn store_model_catalog(cache_key: String, out: Vec<Value>) {
+    let Ok(mut guard) = model_cache().lock() else {
+        return;
+    };
+    guard.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(MODEL_CACHE_SECS));
+    guard.insert(cache_key, (Instant::now(), Value::Array(out)));
 }
 
 pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
@@ -765,6 +1039,7 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                 max_output: out,
                 pricing: None,
                 reasoning: None,
+                thinking_levels: None,
             });
         }
     } else {
@@ -785,6 +1060,7 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
                 max_output: entry_max_output(entry),
                 pricing: entry_pricing(entry),
                 reasoning: entry_reasoning(entry),
+                thinking_levels: entry_thinking_levels(entry, &provider),
             });
         }
         // Capacity rule for the context window: **models.dev → the provider's
@@ -821,12 +1097,19 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
         }
         // Local servers (llama.cpp / LM Studio) expose their REAL window
         // directly — resolve it from the server, but only for rows nothing else
-        // filled: models.dev and the provider payload both outrank a local probe
-        // (neither is reached when this block runs, and a probe can fail).
-        if meta(&provider).editable_base_url && rows.iter().any(|r| r.context.is_none()) {
+        // filled (models.dev and the provider payload both outrank a probe) AND
+        // only when the endpoint actually IS such a server. Probing a cloud
+        // gateway is guaranteed to 404 and cost a round-trip PER ROW: an
+        // 83-model NVIDIA catalog spent ~75s here after the catalog timed out.
+        let probe_base = if q.base_url.trim().is_empty() {
+            m.base_url
+        } else {
+            q.base_url.as_str()
+        };
+        if is_local_endpoint(probe_base) && rows.iter().any(|r| r.context.is_none()) {
             for row in rows.iter_mut() {
                 if row.context.is_none() {
-                    if let Some(ctx) = local_model_ctx(&client, &q.base_url, &row.id).await {
+                    if let Some(ctx) = local_model_ctx(&client, probe_base, &row.id).await {
                         row.context = Some(ctx);
                     }
                 }
@@ -847,9 +1130,7 @@ pub async fn list_models(Query(q): Query<ModelsQuery>) -> Response {
 
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     let out: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
-    if let Ok(mut guard) = model_cache().lock() {
-        guard.insert(cache_key, (Instant::now(), Value::Array(out.clone())));
-    }
+    store_model_catalog(cache_key, out.clone());
     Json(json!({ "models": out })).into_response()
 }
 
@@ -958,6 +1239,43 @@ async fn local_model_ctx(client: &reqwest::Client, base_url: &str, model_id: &st
 mod tests {
     use super::*;
 
+    /// A stale catalog must be dropped, not merely ignored on read.
+    ///
+    /// The cache had NO removal path: one entry per (provider, url) ever asked
+    /// for stayed for the life of the process, each holding a full model
+    /// catalog. This calls the REAL write path, so the prune cannot silently
+    /// drift away from what production does.
+    #[test]
+    fn a_stale_model_catalog_is_pruned_on_write() {
+        {
+            let mut guard = model_cache().lock().unwrap();
+            guard.clear();
+            guard.insert(
+                "stale-provider|http://x".into(),
+                (
+                    Instant::now() - Duration::from_secs(MODEL_CACHE_SECS + 1),
+                    Value::Array(vec![json!({ "id": "stale" })]),
+                ),
+            );
+        }
+
+        store_model_catalog(
+            "live-provider|http://y".to_string(),
+            vec![json!({ "id": "fresh" })],
+        );
+
+        let guard = model_cache().lock().unwrap();
+        assert!(
+            !guard.contains_key("stale-provider|http://x"),
+            "the stale entry must be gone after a write"
+        );
+        let (at, data) = guard.get("live-provider|http://y").expect("fresh entry");
+        assert!(at.elapsed() < Duration::from_secs(MODEL_CACHE_SECS));
+        assert_eq!(data, &Value::Array(vec![json!({ "id": "fresh" })]));
+        drop(guard);
+        model_cache().lock().unwrap().clear();
+    }
+
     #[test]
     fn context_prefers_provider_fields_then_capabilities() {
         let entry = json!({"context_length": 128000});
@@ -984,6 +1302,56 @@ mod tests {
         ];
         assert!(is_multi_vendor_catalog(&rows));
         assert!(!is_multi_vendor_catalog(&vec![row("llama3"), row("qwen2.5")]));
+    }
+
+    #[test]
+    fn local_probe_is_limited_to_local_endpoints() {
+        for local in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:1234",
+            "http://172.16.5.9:8000/v1",
+            "http://192.168.1.20:8000/v1",
+            "http://10.0.0.7:8000",
+            "http://gpu-box:8000/v1",
+            "http://host.local:11434",
+        ] {
+            assert!(is_local_endpoint(local), "{local} must be probed");
+        }
+        for remote in [
+            "https://integrate.api.nvidia.com/v1",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://172.32.0.1/v1",
+            "https://172.15.0.1/v1",
+            "https://11.0.0.1/v1",
+            "",
+        ] {
+            assert!(!is_local_endpoint(remote), "{remote} must NOT be probed");
+        }
+    }
+
+    #[test]
+    fn cloudflare_account_comes_from_the_base_url_or_the_env() {
+        // The endpoint the UI builds from the row's Account ID field.
+        assert_eq!(
+            cloudflare_account("https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"),
+            Some("abc123".to_string())
+        );
+        // The unexpanded template is not an id — and the UI never sends one.
+        assert_eq!(
+            cloudflare_account("https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"),
+            None
+        );
+        assert_eq!(cloudflare_account("https://api.cloudflare.com/client/v4/accounts//ai/v1"), None);
+        assert_eq!(cloudflare_account("https://api.cloudflare.com/client/v4"), None);
+        assert_eq!(cloudflare_account(""), None);
+    }
+
+    #[test]
+    fn cloudflare_endpoint_requires_an_account_id() {
+        let err = models_endpoint("cloudflare", "https://api.cloudflare.com/client/v4")
+            .expect_err("a missing account id must fail loudly");
+        assert!(err.contains("account id"), "{err}");
     }
 
     fn row(id: &str) -> ModelRow {
@@ -1026,6 +1394,7 @@ mod tests {
             max_output: Some(4_096),
             pricing: None,
             reasoning: None,
+            thinking_levels: None,
         };
         apply_models_dev(&mut provider_says_4k, &catalog, "openai", "");
         assert_eq!(
@@ -1043,6 +1412,7 @@ mod tests {
             max_output: None,
             pricing: None,
             reasoning: None,
+            thinking_levels: None,
         };
         apply_models_dev(&mut provider_says_nothing, &catalog, "openai", "");
         assert_eq!(provider_says_nothing.context, Some(128_000));
@@ -1055,6 +1425,7 @@ mod tests {
             max_output: None,
             pricing: None,
             reasoning: None,
+            thinking_levels: None,
         };
         apply_models_dev(&mut unknown_to_catalog, &catalog, "openai", "");
         assert_eq!(
@@ -1080,6 +1451,7 @@ mod tests {
             max_output: None,
             pricing: None,
             reasoning: None,
+            thinking_levels: None,
         };
         apply_models_dev(&mut row, &catalog, "nvidia", "https://integrate.api.nvidia.com/v1");
         assert_eq!(
@@ -1087,5 +1459,115 @@ mod tests {
             Some(163_840),
             "the prefixed id must resolve to the catalog entry, not fall through"
         );
+    }
+
+    // --- per-model thinking levels -----------------------------------------
+
+    fn levels(entry: Value, kind: &str) -> Option<Vec<String>> {
+        entry_thinking_levels(&entry, kind)
+    }
+
+    fn owned(levels: &[&str]) -> Option<Vec<String>> {
+        Some(levels.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn thinking_levels_are_only_what_a_source_named() {
+        // 9router-style entry: thinking is a switch and the effort is NOT
+        // graded, so the source names no level. No on-token is invented here —
+        // and this is NOT a "no thinking" verdict either: `None` keeps the
+        // composer's list visible while `level_from_source` still refuses any
+        // level this model was not described with.
+        let entry = json!({
+            "id": "minimax-m3.1-flash-free",
+            "capabilities": {
+                "reasoning": true,
+                "thinkingEffortSupported": false,
+                "thinkingCanDisable": true
+            }
+        });
+        assert_eq!(levels(entry, "custom"), None);
+    }
+
+    #[test]
+    fn a_level_the_kind_cannot_encode_is_not_offered() {
+        // Anthropic has no `reasoning_effort` wire: a token its budget tables do
+        // not know cannot be turned into a request, so it is not offered either.
+        let entry = json!({
+            "reasoning_options": [{ "type": "effort", "values": ["low", "minimal"] }]
+        });
+        assert_eq!(levels(entry, "anthropic"), owned(&["low"]));
+    }
+
+    #[test]
+    fn thinking_levels_keep_every_token_a_source_enumerated() {
+        // The source named the levels, so it decides them: collapsing `xhigh`
+        // onto `high` sent a request such a gateway answers with 400.
+        let entry = json!({"reasoning_options": [{
+            "type": "effort",
+            "values": ["none", "low", "medium", "high", "xhigh"]
+        }]});
+        for kind in ["openai", "openrouter", "custom"] {
+            assert_eq!(
+                levels(entry.clone(), kind),
+                owned(&["none", "low", "medium", "high", "xhigh"])
+            );
+        }
+        // An enumeration that omits the switch keeps the picker without it.
+        let sparse = json!({
+            "reasoning": {"supported_efforts": ["low", "medium", "xhigh"], "mandatory": true}
+        });
+        assert_eq!(
+            levels(sparse, "custom"),
+            owned(&["low", "medium", "xhigh"])
+        );
+    }
+
+    #[test]
+    fn thinking_levels_prefer_the_enumerated_tokens() {
+        // `max` is the legacy alias of `xhigh`: the enumeration names it, so the
+        // top step is offered — but only once.
+        let entry = json!({"reasoning_options": [{"type": "effort", "values": ["low", "high", "max"]}]});
+        assert_eq!(levels(entry, "openrouter"), owned(&["low", "high", "xhigh"]));
+    }
+
+    #[test]
+    fn thinking_levels_stay_unknown_when_nothing_describes_the_model() {
+        // Silence must never be guessed into a ladder.
+        assert_eq!(levels(json!({"id": "mystery"}), "openai"), None);
+        // An explicit no-reasoning flag really is an empty set.
+        assert_eq!(levels(json!({"reasoning": false}), "openai"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_source_naming_no_level_keeps_the_full_list() {
+        // A flag alone says the model reasons, not WHICH levels it takes: no
+        // ladder is invented. It is also not a "no thinking" verdict, so the
+        // composer keeps its list and only the enumerated levels may be sent.
+        assert_eq!(levels(json!({"reasoning": true}), "openai"), None);
+        // A bare switch (effort not graded) is the same case: nothing named.
+        assert_eq!(
+            levels(json!({"reasoning_options": [{"type": "toggle"}]}), "openai"),
+            None
+        );
+        // Only an explicit "off" is a verdict, and it hides the picker.
+        assert_eq!(levels(json!({"reasoning": false}), "openai"), Some(Vec::new()));
+    }
+
+    /// A source stated a model reasons but named budgets, not effort tokens:
+    /// that is still no level vocabulary, so no ladder is fabricated here.
+    #[test]
+    fn budget_only_sources_keep_the_full_list() {
+        let effort_budgets = json!({
+            "reasoning": true,
+            "reasoning_options": [{"type": "budget_tokens", "min": 1024}]
+        });
+        assert_eq!(levels(effort_budgets.clone(), "anthropic"), None);
+        // The budget kinds honour an enumeration exactly like any other kind.
+        let enumerated = json!({
+            "reasoning_options": [{"type": "effort", "values": ["low", "high"]}]
+        });
+        assert_eq!(levels(enumerated, "anthropic"), owned(&["low", "high"]));
+        assert_eq!(levels(effort_budgets, "openai"), None);
     }
 }

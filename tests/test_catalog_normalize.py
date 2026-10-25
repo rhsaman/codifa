@@ -1,9 +1,9 @@
 """Regression test: router-gateway model ids resolve to models.dev catalog entries.
 
-TokenRouter serves DATED and FREE variants of upstream models
+Router gateways serve DATED and FREE variants of upstream models
 ("deepseek-v4-pro-0813-free", "deepseek-v4-flash-0731") that models.dev keys
-under the BASE model ("deepseek-v4-pro"). `_normalize_catalog_id` must strip
-the "-free" and date suffixes so the variant's context/reasoning still resolves
+under the BASE model ("deepseek-v4-pro"). `_normalize_catalog_id` must strip the
+"-free" and date suffixes so the variant's context/reasoning still resolves
 against the catalog — otherwise `model_context()` returns 0, the request budget
 falls back to the 32k default, and the UI context meter shows no capacity.
 """
@@ -25,7 +25,7 @@ from providers import (  # noqa: E402
     model_context,
 )
 
-BASE = "https://api.tokenrouter.com/v1"
+BASE = "https://openrouter.ai/api/v1"
 
 
 def test_normalize_strips_free_and_date_suffixes() -> None:
@@ -48,7 +48,7 @@ def test_dated_free_variant_resolves_catalog_context() -> None:
 
 def test_model_context_returns_real_window_for_variant() -> None:
     ctx = asyncio.run(
-        model_context("tokenrouter", "deepseek/deepseek-v4-pro-0813-free", BASE, "test-key")
+        model_context("openrouter", "deepseek/deepseek-v4-pro-0813-free", BASE, "test-key")
     )
     assert ctx and ctx > 0, f"expected a real context window, got {ctx}"
 

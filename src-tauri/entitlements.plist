@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Entitlements applied when the macOS bundle is code signed.
+
+	Only ONE entitlement is needed and it is not optional: the hardened runtime
+	(which Tauri turns on as soon as a signing identity is configured) blocks
+	sending Apple events to other applications unless this is declared. The
+	Computer Use tool drives other apps through System Events, so without it a
+	signed build would work unsigned and fail the moment it is signed.
+
+	Screen Recording needs no entitlement — that is a pure TCC grant, requested
+	at runtime with NSScreenCaptureUsageDescription (see Info.plist).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

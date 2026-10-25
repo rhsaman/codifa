@@ -75,6 +75,87 @@ jobs:
         shell: bash
         run: echo "version=$(node -e "console.log(require('./package.json').version)")" >> "$GITHUB_OUTPUT"
 
+      # A STABLE signature is what makes the Screen Recording grant stick.
+      #
+      # Without an identity Tauri never runs codesign, so the bundle keeps the
+      # linker's ad-hoc signature and its codesign Identifier is a per-build
+      # hash (observed: codifa-4ccb3c493826f993 on one build,
+      # codifa-7e61d69f49952185 on the next). macOS TCC records a permission
+      # against that identity and can never match it again, so Screen Recording
+      # is re-asked — or silently denied, which is what made screenshots come
+      # back as a bare wallpaper with other apps' windows missing.
+      #
+      # Guarded instead of unconditional: until the secrets exist this step does
+      # nothing and the build stays ad-hoc, exactly as it behaves today.
+      - name: Configure macOS signing
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID_VAL: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_VAL: ${{ secrets.APPLE_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Falls back to the identity name baked into tauri.conf.json, so a
+          # build with only the certificate secret still signs with a stable
+          # identity instead of silently going ad-hoc.
+          DEFAULT_IDENTITY: "Coder Dev Signing"
+        run: |
+          # Exported only when an identity really exists: an empty
+          # APPLE_SIGNING_IDENTITY makes the bundler run `codesign -s ""` and
+          # fail, so the unconfigured case has to export nothing at all.
+          if [ -z "$CERT" ] || [ -z "$CERT_PASSWORD" ]; then
+            echo "No Apple signing secrets — building ad-hoc (Screen Recording will not persist)."
+            exit 0
+          fi
+
+          identity="${IDENTITY:-$DEFAULT_IDENTITY}"
+
+          # A dedicated keychain, so the import never touches the runner's login
+          # keychain and cannot prompt for a GUI unlock.
+          keychain="$RUNNER_TEMP/codifa-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          cert_path="$RUNNER_TEMP/codifa-signing.p12"
+
+          # The secret is stored base64-encoded because GitHub secrets are text;
+          # decode it to a file the import can read, and remove it in the
+          # always() step below even if the import fails.
+          printf '%s' "$CERT" | base64 --decode > "$cert_path"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          # -A would grant every app access; -T names only codesign and the
+          # partition list keeps it from prompting during the build.
+          security import "$cert_path" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          if ! security find-identity -v -p codesigning "$keychain" | grep -qF "$identity"; then
+            echo "error: '$identity' is not in the imported certificate." >&2
+            security find-identity -v -p codesigning "$keychain" >&2
+            exit 1
+          fi
+
+          {
+            echo "APPLE_SIGNING_IDENTITY=$identity"
+            echo "APPLE_CERTIFICATE=$CERT"
+            echo "APPLE_CERTIFICATE_PASSWORD=$CERT_PASSWORD"
+            echo "APPLE_ID=$APPLE_ID_VAL"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD_VAL"
+            echo "APPLE_TEAM_ID=$TEAM_ID"
+          } >> "$GITHUB_ENV"
+          echo "Signing as '$identity'."
+
+      # The decoded private key must not outlive the build's setup step. The
+      # shared runner is discarded anyway, but a leaked .p12 in a log or a cache
+      # is the one mistake here that cannot be undone.
+      - name: Remove the decoded signing certificate
+        if: always() && startsWith(matrix.os, 'macos')
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/codifa-signing.p12"
+
       # Builds the renderer (npm run build) and both binaries, then creates or
       # updates the GitHub Release for this version with the installers.
       - name: Build and release

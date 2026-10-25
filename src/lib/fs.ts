@@ -46,7 +46,12 @@ export const api = {
   normalizeImage: (absPath: string): Promise<{ path: string; dataUrl: string } | null> =>
     window.coder.normalizeImage(absPath),
   captureScreen: (): Promise<{ path: string; dataUrl: string } | null> => window.coder.captureScreen(),
-  captureRegion: (): Promise<{ path: string; dataUrl: string } | null> => window.coder.captureRegion(),
+  computerPermissions: (): Promise<{
+    screen: boolean
+    accessibility: boolean
+    identity: { id: string; name: string; path: string; adhoc: boolean } | null
+  }> => window.coder.computerPermissions(),
+  requestScreenRecording: (): Promise<boolean> => window.coder.requestScreenRecording(),
   getPathForFile: (file: File): string => window.coder.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => window.coder.storeGet<T>(key),
   storeSet: (key: string, value: unknown): Promise<boolean> => window.coder.storeSet(key, value),

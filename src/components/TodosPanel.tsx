@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ensureChatHydrated, useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
+import { TurnUsagePanel } from "./TurnUsagePanel";
 import type { ChatMessage } from "../types";
 
 /** آخرین plan غیرخالی بین پیام‌های یک چت (جدیدترین برنده) — منبع دادهٔ پنل.
@@ -377,8 +378,10 @@ function RightPanelContent() {
           overscrollBehavior: "contain",
         }}
       >
-        {/* Todos only: schedules are their own page/tab now, so no section
-            stacks another page's card inside this one. */}
+        {/* What the turn RAN with sits ABOVE the plan: the skills/connectors
+            answer "is the right tool set loaded?" before the checklist of what
+            it did — and it is the card that changes turn to turn. */}
+        <TurnUsagePanel />
         <TodosSection />
       </div>
     </aside>

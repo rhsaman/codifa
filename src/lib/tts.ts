@@ -326,6 +326,30 @@ const LIVE_STREAM_POLL_MS = 350
 // Max consecutive fetch failures for one sentence before it is skipped, so a
 // poisoned sentence never stalls live speech forever.
 const LIVE_STREAM_MAX_FAILS = 2
+// Streaming tail: how long the trailing part of the answer must stop growing
+// before it is spoken without waiting for the turn to finish, and the shortest
+// tail worth a request of its own (a single stray letter is not speech).
+const TAIL_SETTLE_MS = 600
+const TAIL_MIN_CHARS = 8
+// A punctuation-free run this long is spoken even before it pauses (a big code
+// block or a streamed list item would otherwise stay mute until the end).
+// Matches splitTtsSentences' own hard cap, so the cut still lands on a word.
+const TAIL_SPEAK_MAX_CHARS = 160
+/** Chars that end a spoken sentence. */
+const SENTENCE_END_RE = /[.!?…؟!]/
+
+/**
+ * Index just past the last boundary that may be spoken while text still streams:
+ * a sentence end, or a paragraph break (a heading, list item or topic change
+ * ends a thought even without punctuation). 0 when the text holds no boundary.
+ */
+function lastSpokenBoundary(text: string): number {
+  let idx = 0
+  for (let i = 0; i < text.length; i++) {
+    if (SENTENCE_END_RE.test(text[i]) || text[i] === '\n') idx = i + 1
+  }
+  return idx
+}
 
 /** Live text source for progressive speech: current text plus completion flag. */
 export interface TtsStreamSource {
@@ -335,8 +359,11 @@ export interface TtsStreamSource {
 /**
  * Speak a streaming answer progressively (live voice mode).
  * Completed sentences are fetched and played as soon as they arrive instead
- * of waiting for the full text, so speech starts fast. The trailing partial
- * sentence is held back until it completes or the source reports done.
+ * of waiting for the full text, so speech starts fast. The trailing
+ * unpunctuated run is spoken too, once it has stopped growing — a one-sentence
+ * Persian answer has no boundary until its final character, and holding the
+ * tail until `done` is exactly the "the whole text arrives, then it talks"
+ * complaint.
  * Honors the same global owner/sequence protocol as playTts: a newer
  * playback or stop aborts the stream silently.
  */
@@ -361,9 +388,18 @@ export async function playTtsStream(
   let playedAny = false
   let lastErr: unknown = null
   const stale = () => activeSeq !== seq || controller.signal.aborted
-  // Prefetch up to 3 sentences ahead while the current one plays, so the
-  // next sentence starts the moment the current one ends (no dead air
-  // between sentences while a fresh fetch runs).
+  // Chunks ready to speak, in order. The stream is append-only, so an index
+  // stays valid: text is only ever ADDED to this list, never re-chunked.
+  const queue: string[] = []
+  /** Stripped text already handed to `queue` — everything before it is spoken. */
+  let committed = ''
+  // Trailing, not-yet-punctuated run: spoken once it stops growing, so a short
+  // answer does not stay silent until the turn ends.
+  let tailText = ''
+  let tailSince = Date.now()
+  // Prefetch up to 3 chunks ahead while the current one plays, so the
+  // next one starts the moment the current one ends (no dead air
+  // between chunks while a fresh fetch runs).
   const pending = new Map<number, Promise<Blob>>()
   const ensureFetch = (idx: number, sentence: string) => {
     if (idx < played || pending.has(idx) || controller.signal.aborted) return
@@ -376,20 +412,50 @@ export async function playTtsStream(
     for (;;) {
       if (stale()) return
       const snap = source.snapshot()
-      const sentences = splitTtsSentences(stripMarkdownForTts(snap.text ?? ''))
-      // Hold back the trailing sentence while streaming: it is still growing.
-      const ready = snap.done ? sentences.length : Math.max(0, sentences.length - 1)
-      // Keep the prefetch window full: sentences already completed but not
-      // yet played download in the background during playback.
-      for (let i = played; i < Math.min(ready, played + 3); i++) {
-        ensureFetch(i, sentences[i])
+      const full = stripMarkdownForTts(snap.text ?? '')
+      // Cleanup can rewrite ALREADY committed text (a `**` or a code fence that
+      // only closes later). Re-sync on the common prefix instead of re-chunking
+      // the whole answer, which would replay or drop chunks.
+      if (!full.startsWith(committed)) {
+        let n = 0
+        const max = Math.min(full.length, committed.length)
+        while (n < max && full[n] === committed[n]) n++
+        committed = committed.slice(0, n)
       }
-      if (ready > played) {
+      // Speak up to the last finished sentence. The trailing partial run is
+      // spoken too once it has stopped growing for TAIL_SETTLE_MS (or once it
+      // alone would already be hard-split): holding it back until `done` is
+      // what made live voice stay mute while the answer streamed in.
+      const boundary = snap.done ? full.length : lastSpokenBoundary(full)
+      let readyEnd = boundary
+      if (!snap.done && boundary === committed.length) {
+        const tail = full.slice(committed.length)
+        if (tail !== tailText) {
+          tailText = tail
+          tailSince = Date.now()
+        }
+        const speaksTail =
+          tail.length >= TAIL_MIN_CHARS &&
+          (Date.now() - tailSince >= TAIL_SETTLE_MS || tail.length >= TAIL_SPEAK_MAX_CHARS)
+        if (speaksTail) readyEnd = full.length
+      }
+      if (readyEnd > committed.length) {
+        queue.push(...splitTtsSentences(full.slice(committed.length, readyEnd)))
+        committed = full.slice(0, readyEnd)
+        tailText = ''
+        tailSince = Date.now()
+      }
+      // Keep the prefetch window full: chunks already completed but not
+      // yet played download in the background during playback.
+      for (let i = played; i < Math.min(queue.length, played + 3); i++) {
+        ensureFetch(i, queue[i])
+      }
+      if (queue.length > played) {
         let blob: Blob
         const job = pending.get(played)
         pending.delete(played)
         try {
-          blob = job ? await job : await fetchOne(sentences[played], controller.signal)
+          blob = job ? await job : await fetchOne(queue[played], controller.signal)
         } catch (err) {
           if (stale()) return
           lastErr = err

@@ -40,6 +40,8 @@ export function TabListButton({
   footer,
   placement = "bottom",
   menuWidth,
+  icon,
+  className,
 }: {
   sections: TabListSection[];
   label: string;
@@ -50,6 +52,11 @@ export function TabListButton({
   /** Rendered width (px) of the dropdown, used to keep it inside the viewport;
    *  defaults to the width `.tab-list-menu` declares. */
   menuWidth?: number;
+  /** Trigger glyph. Defaults to the tab-list chevron; the pane rail's "+"
+   *  passes its own plus so the same dropdown shell is reused. */
+  icon?: React.ReactNode;
+  /** Extra class on the trigger button, so a caller can style its own glyph. */
+  className?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
@@ -116,26 +123,28 @@ export function TabListButton({
     <span className="tab-list-wrap" ref={wrapRef}>
       <button
         type="button"
-        className="tab-list-btn"
+        className={`tab-list-btn${className ? ` ${className}` : ""}`}
         title={label}
         aria-label={label}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={toggle}
       >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M6 9.5l6 6 6-6" />
-        </svg>
+        {icon ?? (
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M6 9.5l6 6 6-6" />
+          </svg>
+        )}
       </button>
       {open && pos &&
         createPortal(

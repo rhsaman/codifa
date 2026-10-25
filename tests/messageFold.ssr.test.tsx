@@ -1,8 +1,7 @@
 // Folding rule for CHAT MESSAGES (the only place that may open the right-hand
-// panel): a merely long message folds to a preview and unfolds IN PLACE, while
-// a very long one (a pasted log/dump) keeps the preview and sends the full body
-// to the side panel. Tool rows are not involved here — they never leave the
-// transcript.
+// panel): a long message keeps a short preview in the chat and its FULL body
+// opens in the side panel. Tool rows are not involved here — they never leave
+// the transcript.
 ;(globalThis as any).window = {
   addEventListener: () => {},
   coder: new Proxy(
@@ -22,7 +21,7 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { ChatMessageView, isCollapsibleText, opensInPanel } = await import(
+const { ChatMessageView, isCollapsibleText } = await import(
   '../src/components/ChatMessage'
 )
 
@@ -38,15 +37,12 @@ function check(name: string, cond: boolean, extra?: unknown) {
 
 const TAIL = 'tail-marker-not-visible-in-the-folded-bubble'
 
-console.log('1) آستانه‌ها: «قابل تاشدن» جدای از «باز شدن در پنل» است:')
+console.log('1) آستانهٔ تاشدن پیام (۶۰۰ کاراکتر / ۱۰ خط):')
 {
   check('۶۰۰ کاراکتر تاشو نیست', !isCollapsibleText('x'.repeat(600)))
   check('۶۰۱ کاراکتر تاشو است', isCollapsibleText('x'.repeat(601)))
   check('۱۰ خط تاشو نیست', !isCollapsibleText(Array(10).fill('a').join('\n')))
   check('۱۱ خط تاشو است', isCollapsibleText(Array(11).fill('a').join('\n')))
-  check('۴۰۰۰ کاراکتر در پنل باز نمی‌شود', !opensInPanel('x'.repeat(4000)))
-  check('۴۰۰۱ کاراکتر در پنل باز می‌شود', opensInPanel('x'.repeat(4001)))
-  check('۲۰۰۰ کاراکتر فقط تاشو است (در پنل نه)', isCollapsibleText('x'.repeat(2000)) && !opensInPanel('x'.repeat(2000)))
 }
 
 function userMessage(content: string) {
@@ -58,15 +54,16 @@ function userMessage(content: string) {
   }
 }
 
-console.log('2) پیام نسبتاً بلند: در چت تا می‌خورد، پنل باز نمی‌شود:')
+console.log('2) پیام بلند: پیش‌نمایش در چت + دکمهٔ باز کردن در پنل راست:')
 {
   const long = `${'x'.repeat(800)}\n${TAIL}`
   const html = renderToString(<ChatMessageView message={userMessage(long) as never} />)
-  check('دکمهٔ باز کردن هست', html.includes('msg-expand'))
+  check('دکمهٔ «Show more» هست', html.includes('msg-expand'))
+  check('دکمه به پنل راست اشاره می‌کند', html.includes('Open the full text in the side panel'))
   check('متن تا شده است (دُم دیده نمی‌شود)', !html.includes(TAIL))
 }
 
-console.log('3) پیام خیلی بلند: همان دکمه، اما متن کامل در پنل:')
+console.log('3) پیام خیلی بلند: همان دکمه، متن کامل در پنل:')
 {
   const huge = `${'y'.repeat(6000)}\n${TAIL}`
   const html = renderToString(<ChatMessageView message={userMessage(huge) as never} />)

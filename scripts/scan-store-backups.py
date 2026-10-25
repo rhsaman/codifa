@@ -25,7 +25,7 @@ SKIP_DIRS = {
 
 BUILTIN_IDS = {
     "openrouter", "local", "ollama", "google", "nvidia", "cloudflare",
-    "tokenrouter", "openai", "anthropic",
+    "openai", "anthropic",
 }
 
 

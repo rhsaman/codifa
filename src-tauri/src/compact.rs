@@ -17,10 +17,26 @@ const TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
 /// stack into ~15 minutes of waiting for a summary that was never coming.
 const COMPACT_TOTAL_BUDGET_SECS: u64 = 180;
 
-/// Attempts on the fallback model when the primary summarizer fails. One retry
-/// rides out a transient provider error; a second one mostly bought latency,
-/// not summary quality.
-const COMPACT_FALLBACK_ATTEMPTS: usize = 1;
+/// Attempts ONE rung may spend before the walk moves down to the next model.
+///
+/// A rung that fails NON-fatally — a genuine rate limit, a 5xx, a dropped
+/// stream — is worth one repeat on the SAME model. A model-side rejection (a
+/// refused key, a model the provider does not serve, an exhausted allowance)
+/// skips the rest of the rung's budget instead: asking that model again can
+/// only produce the same error. The same budget exists in the sub-agent ladder
+/// (`SUBAGENT_RUNG_ATTEMPTS`), so a tool behaves the same wherever it runs.
+const COMPACT_RUNG_ATTEMPTS: usize = 2;
+
+/// How many times the WHOLE model list is walked top to bottom. After the last
+/// fallback fails the walk starts over from the summariser's own model (a
+/// provider that was down a minute ago is often back), still inside the shared
+/// wall-clock budget. A chain of one model is not rotated: its rung already
+/// repeats on its own.
+const COMPACT_MAX_CYCLES: usize = 3;
+
+/// Pause between two passes over the list, so a list of dead rungs is not
+/// hammered back to back.
+const COMPACT_CYCLE_PAUSE_SECS: u64 = 4;
 
 /// One progress tick from a running compaction.
 ///
@@ -41,6 +57,10 @@ pub struct CompactProgress {
     pub attempts_total: usize,
     /// Model running this attempt.
     pub model: String,
+    /// Provider ROW the model is routed to. A kind cannot name what the user
+    /// configured (every OpenAI-compatible endpoint is literally "custom"), so
+    /// the banner resolves this id to the provider's display name.
+    pub provider_id: String,
     /// Share of the total budget already spent, 0-100.
     pub percent: u8,
     /// Wall-clock budget for the WHOLE compaction, in seconds.
@@ -57,7 +77,7 @@ fn progress_tick(
     phase: &'static str,
     attempt: usize,
     attempts_total: usize,
-    model: &str,
+    cfg: &LlmConfig,
 ) {
     let elapsed_secs = started.elapsed().as_secs();
     let percent = ((elapsed_secs as u128 * 100) / COMPACT_TOTAL_BUDGET_SECS.max(1) as u128)
@@ -66,7 +86,8 @@ fn progress_tick(
         phase,
         attempt,
         attempts_total,
-        model: model.to_string(),
+        model: cfg.model.clone(),
+        provider_id: cfg.provider_id.clone(),
         percent,
         budget_secs: COMPACT_TOTAL_BUDGET_SECS,
         elapsed_secs,
@@ -231,6 +252,15 @@ pub struct CompactOutcome {
     pub summary: String,
     pub keep: usize,
     pub usage: Option<Value>,
+    /// Provider ROW of the rung that ACTUALLY answered, and its model id.
+    ///
+    /// Carried out of the walk because a later rung can be the one that
+    /// answers: reporting the summariser slot's own provider/model there
+    /// attributed the tokens to a provider that never served the request (a
+    /// compaction that fell through to the user's fallback was billed to rung
+    /// 0 in the Model-usage panel).
+    pub provider_id: String,
+    pub model: String,
 }
 
 /// Port of `_compact_history`. Returns Ok(None) when there is nothing to do.
@@ -290,7 +320,7 @@ pub async fn compact_history_with_progress(
     on_progress: &mut (dyn FnMut(&CompactProgress) + Send),
 ) -> Result<Option<CompactOutcome>, String> {
     let started = std::time::Instant::now();
-    progress_tick(on_progress, started, "preparing", 0, 0, &model.model);
+    progress_tick(on_progress, started, "preparing", 0, 0, model);
     // An unknown window must follow the same capacity rule as everything else
     // (models.dev → provider → DEFAULT_CONTEXT_WINDOW), not a private 8k literal:
     // an 8192 window put the verbatim tail at ~3.2k tokens and folded nearly the
@@ -414,20 +444,30 @@ pub async fn compact_history_with_progress(
     let chain = compact_chain(model, fallbacks);
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(COMPACT_TOTAL_BUDGET_SECS);
-    // Attempts this run may make in total: one per rung plus the retries the
-    // fallback rungs may spend. Reported so the UI can say "attempt 2 of 3"
-    // instead of guessing.
-    let attempts_total = 1 + chain.len().saturating_sub(1) * COMPACT_FALLBACK_ATTEMPTS;
+    // Attempts this run may make in total: every rung may spend its own budget.
+    // Reported so the UI can say "attempt 2 of 3" instead of guessing.
+    // After the LAST fallback fails the walk goes back to the top and tries the
+    // list again (see COMPACT_MAX_CYCLES), until the shared deadline.
+    let chain_len = chain.len();
+    let cycles = if chain_len > 1 { COMPACT_MAX_CYCLES } else { 1 };
+    let walk: Vec<&LlmConfig> = (0..cycles).flat_map(|_| chain.iter().copied()).collect();
+    let attempts_total = walk.len().saturating_mul(COMPACT_RUNG_ATTEMPTS);
     let mut attempt_no = 0usize;
-    'rungs: for (rung, m) in chain.into_iter().enumerate() {
-        // The summariser's own model gets a single attempt — retrying it is
-        // exactly what the fallback list exists to avoid. A fallback rung gets
-        // the retry budget, because a transient error there is worth one repeat.
-        let attempts = if rung == 0 { 1 } else { COMPACT_FALLBACK_ATTEMPTS };
+    'rungs: for (pos, m) in walk.into_iter().enumerate() {
+        if pos > 0 && pos % chain_len == 0 {
+            // A new pass over the list: breathe first, and never start one the
+            // deadline cannot finish.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let pause = std::time::Duration::from_secs(COMPACT_CYCLE_PAUSE_SECS);
+            if remaining <= pause {
+                break 'rungs;
+            }
+            tokio::time::sleep(pause).await;
+        }
         // This rung's own failure. Kept per rung so the aggregated message can
         // name WHICH model said what.
         let mut rung_err = String::new();
-        for _attempt in 0..attempts {
+        for _attempt in 0..COMPACT_RUNG_ATTEMPTS {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break 'rungs;
@@ -439,13 +479,20 @@ pub async fn compact_history_with_progress(
                 "summarizing",
                 attempt_no,
                 attempts_total,
-                &m.model,
+                m,
             );
             match tokio::time::timeout(remaining, llm::complete(client, m, SYSTEM, &user_prompt))
                 .await
             {
                 Ok(Ok(r)) if !r.text.trim().is_empty() => {
-                    outcome = Some(CompactOutcome { summary: r.text.trim().to_string(), keep: recent.len(), usage: r.usage });
+                    // Attribute the answer to THIS rung, not to rung 0.
+                    outcome = Some(CompactOutcome {
+                        summary: r.text.trim().to_string(),
+                        keep: recent.len(),
+                        usage: r.usage,
+                        provider_id: m.provider_id.clone(),
+                        model: m.model.clone(),
+                    });
                     break 'rungs;
                 }
                 Ok(Ok(_)) => rung_err = "returned an empty summary".into(),
@@ -455,22 +502,27 @@ pub async fn compact_history_with_progress(
                         format!("gave no answer within {COMPACT_TOTAL_BUDGET_SECS}s")
                 }
             }
-        }
-        if !rung_err.is_empty() {
-            tried.push(format!("{}: {rung_err}", m.model));
-            // ONLY a model-side rejection may hand the work to the next model.
-            // A timeout, a 5xx, a dropped connection or a rate limit is not the
-            // model's fault: the next model cannot fix the network, so the walk
-            // stops here and reports the real reason instead of hiding it behind
-            // the last rung's error.
-            if !llm::should_fall_back(&rung_err) {
-                break 'rungs;
+            // A model-side rejection will not answer better on a repeat, so the
+            // rest of this rung's budget is skipped and the next model takes the
+            // call immediately.
+            if llm::should_fall_back(&rung_err) {
+                break;
             }
+        }
+        // Only the FIRST pass is reported: later passes repeat the same models,
+        // and listing each one again would bury the reasons in the banner.
+        if !rung_err.is_empty() && pos < chain_len {
+            tried.push(format!("{}: {rung_err}", m.model));
+            // This rung spent its budget without an answer, so the walk moves on
+            // regardless of WHY it failed: a rate limit that never clears must
+            // not leave the user's own fallbacks unused, which is the entire
+            // point of the list. Only a success or the shared deadline ends the
+            // walk early.
         }
     }
     match outcome {
         Some(o) => {
-            progress_tick(on_progress, started, "merging", attempt_no, attempts_total, &model.model);
+            progress_tick(on_progress, started, "merging", attempt_no, attempts_total, model);
             Ok(Some(o))
         }
         // The aggregate names every model that was tried, so a banner can no
@@ -555,6 +607,7 @@ mod tests {
         let client = llm::http_client();
         let model = LlmConfig {
             provider: "custom".into(),
+            provider_id: "custom".into(),
             model: "m".into(),
             base_url: "http://127.0.0.1:1".into(),
             api_keys: vec!["k".into()],
@@ -579,6 +632,7 @@ mod tests {
     fn cfg(provider: &str, model: &str, base: &str) -> LlmConfig {
         LlmConfig {
             provider: provider.into(),
+            provider_id: provider.into(),
             model: model.into(),
             base_url: base.into(),
             api_keys: vec!["k".into()],
@@ -667,17 +721,20 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A CONNECTION failure must not walk the fallback list: the next model
-    /// cannot fix the network, so the compaction fails with the real reason
-    /// instead of billing every configured model and reporting the last one.
+    /// A CONNECTION failure still walks the user's own fallback list: that list
+    /// IS the try order they arranged, and its rungs normally live on a
+    /// DIFFERENT provider with a different endpoint — an unreachable primary
+    /// says nothing about them. Stopping at the first transport error is what
+    /// left a configured fallback unused and surfaced the primary's raw network
+    /// error instead of a summary.
     #[tokio::test]
-    async fn connection_failure_does_not_try_the_fallbacks() {
+    async fn connection_failure_still_walks_the_users_fallback_list() {
         // Nothing listens on the discard port, so the primary cannot connect at
         // all — the transport error path, not a model rejection.
         let dead = "http://127.0.0.1:9";
         let healthy = stub_server(vec![(
             200,
-            r#"{"choices":[{"message":{"content":"SHOULD NOT BE CALLED"}}]}"#.to_string(),
+            r#"{"choices":[{"message":{"content":"SUMMARY FROM FALLBACK"}}]}"#.to_string(),
         )]);
         let mut primary = cfg("custom", "primary-model", dead);
         primary.timeout_secs = 5;
@@ -694,15 +751,10 @@ mod tests {
             true,
             &mut |_| {},
         )
-        .await;
-        let err = match out {
-            Ok(_) => panic!("a connection failure must fail the compaction"),
-            Err(e) => e,
-        };
-        assert!(
-            !err.contains("healthy-fallback"),
-            "the fallback must not be tried for a connection failure, got: {err}"
-        );
+        .await
+        .expect("the fallback must answer when the primary cannot connect");
+        let outcome = out.expect("the fallback answered, so the compaction ran");
+        assert_eq!(outcome.summary, "SUMMARY FROM FALLBACK");
     }
 
     /// The user's field failure: the summariser's own provider answers

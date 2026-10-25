@@ -31,6 +31,12 @@ export interface ProviderKindMeta {
   manualContextInput?: boolean
   /** Read-only base-URL hint shown for built-in providers (just the URL). */
   baseUrlHint?: string
+  /** Endpoint TEMPLATE of an account-scoped gateway (`{account}` = the id the
+   *  user types in the row's Account ID field). The row's base URL is BUILT from
+   *  it, so a half-filled `{account}` can never reach a request. */
+  accountScopedBaseUrl?: string
+  /** Hint under the Account ID input of an account-scoped gateway. */
+  accountIdHint?: string
   /** Optional description shown below the base-URL hint. */
   baseUrlDesc?: string
   /** Default base URL for built-in providers (used when user doesn't override). */
@@ -75,20 +81,16 @@ export const PROVIDER_META: Record<ProviderKind, ProviderKindMeta> = {
     name: 'Cloudflare',
     requiresKey: true,
     builtin: true,
-    baseUrlHint: 'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1',
+    // The catalog and the chat endpoint are both account-scoped, so the account
+    // id has to come from the user. It has its OWN field (`accountId`) and the
+    // base URL is built from this template — the row used to carry a read-only
+    // hint holding the literal template, which no user could ever fill in, so
+    // every request died on "missing account id".
+    accountScopedBaseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1',
+    accountIdHint:
+      'Cloudflare dashboard → Workers & Pages → Account ID. The endpoint is built from it.',
     baseUrlDesc: 'Workers AI.',
-    extraHint: 'Also requires CLOUDFLARE_ACCOUNT_ID in your environment.',
-    defaultBaseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1',
-  },
-  tokenrouter: {
-    kind: 'tokenrouter',
-    label: 'TokenRouter',
-    name: 'TokenRouter',
-    requiresKey: true,
-    builtin: true,
-    baseUrlHint: 'https://api.tokenrouter.com/v1',
-    baseUrlDesc: 'Unified AI model hub.',
-    defaultBaseUrl: 'https://api.tokenrouter.com/v1',
+    extraHint: 'The token needs Workers AI read access.',
   },
   ollama: {
     kind: 'ollama',
@@ -124,6 +126,44 @@ export function providerMeta(kind: ProviderKind | undefined | null): ProviderKin
   return PROVIDER_META[kind ?? 'custom'] ?? PROVIDER_META.custom
 }
 
+/** True when the kind's endpoint is account-scoped (Cloudflare): the row needs an
+ *  account id before it has a usable base URL at all. */
+export function isAccountScoped(kind: ProviderKind | undefined | null): boolean {
+  return Boolean(providerMeta(kind).accountScopedBaseUrl)
+}
+
+/** The complete endpoint of an account-scoped gateway, built from the id the
+ *  user typed. `undefined` when the kind is not account-scoped; an EMPTY string
+ *  when the id is still missing — never a half-filled `{account}` template. */
+export function accountScopedBaseUrl(
+  kind: ProviderKind | undefined | null,
+  accountId: string | undefined | null,
+): string | undefined {
+  const template = providerMeta(kind).accountScopedBaseUrl
+  if (!template) return undefined
+  // A pasted URL (or an unexpanded template) is not an id: such a row gets an
+  // EMPTY endpoint — never a broken or half-filled URL.
+  const id = accountIdFromBase(accountId).trim() || (accountId ?? '').trim()
+  if (!id || /[/\\?&#{}\s]/.test(id)) return ''
+  return template.replace('{account}', id)
+}
+
+/** The account segment of a gateway URL (`…/accounts/<id>/…`), or ''.
+ *
+ *  Mirrors `models.rs::cloudflare_account`: an unexpanded `{account}` template is
+ *  not an id. Used to recover the id from rows written by older builds, which
+ *  could only carry it inside a hand-pasted base URL. */
+export function accountIdFromBase(url: string | undefined | null): string {
+  const raw = (url ?? '').trim()
+  const at = raw.toLowerCase().indexOf('/accounts/')
+  if (at < 0) return ''
+  const seg = raw
+    .slice(at + '/accounts/'.length)
+    .split(/[/?#]/)[0]
+    .trim()
+  return seg.includes('{') ? '' : seg
+}
+
 /** Built-in provider kind ids that are known to act as a model-id prefix
  *  on the wire (e.g. OpenRouter returns "openai/gpt-4o"). A model id that
  *  starts with `${kind}/` therefore
@@ -149,7 +189,7 @@ export const FOREIGN_PROVIDER_PREFIXES: ReadonlySet<string> = new Set([
  *  vendor-namespaced ("google/gemini-2.5-flash", "anthropic/claude-…",
  *  "nvidia/nemotron-…") — prefixes that collide with our own kind ids but
  *  are legitimate entries in that row's catalog, not cross-row contamination. */
-const AGGREGATOR_KINDS: ReadonlySet<string> = new Set(['openrouter', 'tokenrouter'])
+const AGGREGATOR_KINDS: ReadonlySet<string> = new Set(['openrouter'])
 
 /** Kind ids used as VENDOR namespaces on aggregator/host wire ids. These get
  *  the multi-vendor exemption; gateway/client identities (opencode, ollama,
@@ -186,13 +226,13 @@ function isAggregatorRow(p: { id: string; kind?: string; baseUrl?: string }): bo
   if (p.id === 'custom' || p.id.startsWith('custom-')) return true
   // Other kinds pointed at a known aggregator gateway share the catalog shape.
   const base = (p.baseUrl || '').toLowerCase()
-  return base.includes('openrouter.ai') || base.includes('tokenrouter.com')
+  return base.includes('openrouter.ai')
 }
 
 /** Kind-colliding prefixes this row may legitimately contain in its OWN
  *  catalog (empty/null = none — foreign prefixes are filtered as usual).
  *
- *  - Aggregators (OpenRouter / TokenRouter, kind or baseUrl) و ردیف‌های
+ *  - Aggregators (OpenRouter, kind or baseUrl) و ردیف‌های
  *    custom (گیت‌وی چندفروشنده‌ی دلخواه مثل 9router): every vendor
  *    namespace above, plus their own wire prefix (custom→openrouter.ai
  *    returns "openrouter/auto" — head !== p.id after bareModel).
@@ -209,7 +249,6 @@ function allowedVendorPrefixes(p: {
     if (AGGREGATOR_KINDS.has(p.id)) own.add(p.id)
     const base = (p.baseUrl || '').toLowerCase()
     if (base.includes('openrouter.ai')) own.add('openrouter')
-    if (base.includes('tokenrouter.com')) own.add('tokenrouter')
     return own
   }
   if (p.kind === 'nvidia' || p.id === 'nvidia') return new Set(['google'])

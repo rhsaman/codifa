@@ -5,13 +5,6 @@
  * bridge (src/lib/tauriBridge.ts) and the web test harness stub conform to it.
  */
 
-export interface RegionRect {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
 export interface FileEntry {
   name: string
   kind: 'file' | 'dir' | 'link'
@@ -29,6 +22,9 @@ export interface TerminalSessionInfo {
   id: string
   /** Shell binary basename (zsh, bash, …) shown in the terminal tab. */
   shell: string
+  /** Command line the tab TOOLTIP shows (`zsh -l`, `nvim +42 /w/a.ts`).
+   *  Optional so a stub/older bridge without it still type-checks. */
+  program?: string
   /** Directory the shell was spawned in. */
   cwd: string
 }
@@ -94,9 +90,17 @@ export interface CoderApi {
   readPdfBase64(absPath: string): Promise<string | null>
   normalizeImage(absPath: string): Promise<{ path: string; dataUrl: string } | null>
   captureScreen(): Promise<{ path: string; dataUrl: string } | null>
-  captureRegion(): Promise<{ path: string; dataUrl: string } | null>
-  selectRegion(rect: RegionRect): void
-  cancelRegion(): void
+  /** Whether macOS grants this build Screen Recording and Accessibility. The
+   *  Computer Use switch is useless without them, so the composer shows this.
+   *  `identity` names the signing identity TCC keyed the grant to — an ad-hoc
+   *  build gets a fresh one per compile, which is why the switch resets. */
+  computerPermissions(): Promise<{
+    screen: boolean
+    accessibility: boolean
+    identity: { id: string; name: string; path: string; adhoc: boolean } | null
+  }>
+  /** Raise macOS's own Screen Recording prompt; true when already granted. */
+  requestScreenRecording(): Promise<boolean>
   getPathForFile(file: File): string
   storeGet<T>(key: string): Promise<T | null>
   storeSet(key: string, value: unknown): Promise<boolean>
@@ -113,7 +117,12 @@ export interface CoderApi {
   ): Promise<OpResult>
   openWorkspaceFolder(dir: string): Promise<OpResult>
   openWorkspaceTerminal(dir: string): Promise<OpResult>
-  terminalCreate(cwd: string): Promise<TerminalSessionInfo>
+  terminalCreate(
+    cwd: string,
+    program?: string | null,
+    args?: string[] | null,
+    shell?: string | null,
+  ): Promise<TerminalSessionInfo>
   terminalList(): Promise<TerminalSessionInfo[]>
   terminalWrite(id: string, data: string): Promise<boolean>
   terminalResize(id: string, cols: number, rows: number): Promise<boolean>

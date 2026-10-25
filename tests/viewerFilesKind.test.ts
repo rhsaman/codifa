@@ -117,7 +117,7 @@ console.log('4) openFiles creates one tab per chat and reveals the pane:')
   check('it is owned by the requested chat', created[0]?.chatId === 'c9', created[0])
   check('it became the active tab', s.activeId === 'files:c9', s.activeId)
   check('the pane was revealed', s.paneOpen === true)
-  check('panel mode was left', s.panelMode === false)
+  check('the page opened as an ordinary tab (no pane mode to exit)', !('panelMode' in s))
 
   useViewerTabs.getState().openFiles('c9')
   const again = useViewerTabs.getState() as any

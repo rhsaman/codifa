@@ -15,6 +15,8 @@
 // valid WAV file, while a sliced webm/opus container cannot be decoded by the
 // provider ("could not process file").
 
+import { fixZwsp, stripBidiMarks } from './bidi'
+
 /** Sampling rate every STT request is normalised to. */
 export const STT_SAMPLE_RATE = 16_000
 
@@ -98,6 +100,26 @@ function tailWords(text: string, maxWords: number, maxChars: number): string {
  * in made the model re-emit it instead of the new audio (a chunk that
  * re-recognized only old text merges to nothing, i.e. "it typed nothing").
  */
+/**
+ * Decoding parameters that make a transcription reproducible.
+ *
+ * Non-streaming ASR is only deterministic when the provider is told so: left at
+ * its own sampling default the SAME audio comes back as a different word on the
+ * next request — the "sometimes it writes the wrong word" complaint. Sending
+ * `temperature: 0` pins greedy decoding, so a re-run can only differ if the
+ * audio differs.
+ *
+ * The field belongs to the whisper-family API surface; newer models
+ * (gpt-4o-transcribe and friends) REJECT unknown fields, so it is sent only for
+ * a whisper model, or when the model is absent (the server then defaults to
+ * whisper-1). Any other model name opts out rather than risk a 400.
+ */
+export function sttDecodeFields(model?: string): Record<string, string> {
+  const m = (model ?? '').trim().toLowerCase()
+  const whisperFamily = m === '' || m.includes('whisper')
+  return whisperFamily ? { temperature: '0' } : {}
+}
+
 export function buildSttPrompt(
   lang: string,
   custom?: string,
@@ -128,6 +150,52 @@ function normalizeWord(word: string): string {
     .replace(/ة/g, 'ه')
     .replace(/[\u060C\u061B\u061F«»"'`.,!?:;()\[\]{}…-]/g, '')
     .toLowerCase()
+}
+
+/**
+ * Arabic spellings of letters that are IDENTICAL to their Persian form in both
+ * shape and reading, so rewriting them cannot change the word.
+ *
+ * Whisper (and every Whisper-compatible endpoint) is trained on Arabic-heavy
+ * Persian text, so it returns «ميروم» with an Arabic yeh and «كتاب» with an
+ * Arabic kaf and «مدرسة» with a ta-marbuta. The words are right, but the
+ * spelling is not Persian: the user reads it as a wrong transcription, and the
+ * text no longer matches what they themselves type.
+ *
+ * Characters whose READING differs are deliberately left alone — hamza-carrying
+ * alef/yeh («أمدم», «مسئله», «ايران») cannot be folded without a dictionary, and
+ * a wrong fold is a new misspelling rather than a fix.
+ */
+const ARABIC_LOOKALIKES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/[يى]/g, 'ی'],
+  [/ك/g, 'ک'],
+  [/ة/g, 'ه'],
+]
+
+/** Harakat (fatha…sukun, dagger alef) and tatweel: never written in normal Persian. */
+const HARAKAT_AND_TATWEEL = /[\u064B-\u0652\u0670\u0640]/g
+
+/**
+ * Normalise a raw STT transcript into the Persian spelling the user expects.
+ *
+ * Deterministic post-processing applied to BOTH dictation and live voice before
+ * the text reaches the composer: no model runs again, so it can only rewrite
+ * characters that carry the same identity — it can never invent a word.
+ *
+ * ZWNJ (U+200C) is deliberately PRESERVED: a half-space is a real word boundary
+ * in Persian («نیم‌فاصله»), and dropping it glues words together. Note that
+ * fuzzy.foldFa() does the opposite — it strips ZWNJ because it folds words for
+ * MATCHING, so it must never be reused on delivered text.
+ */
+export function normalizeTranscript(text: string): string {
+  const raw = text ?? ''
+  if (!raw) return ''
+  // Bidi controls and the invisible word separators a model emits between words
+  // first (bidi.ts owns those rules), then the letter folding.
+  let out = stripBidiMarks(fixZwsp(raw))
+  out = out.replace(HARAKAT_AND_TATWEEL, '')
+  for (const [re, repl] of ARABIC_LOOKALIKES) out = out.replace(re, repl)
+  return out.replace(/\s+/g, ' ').trim()
 }
 
 /**

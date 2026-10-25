@@ -144,8 +144,21 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
         }
     };
     let lang = form_str(&form, "lang").trim().to_lowercase();
-    // Whisper context: the target script + the tail of the current utterance.
+    // The user's glossary is BIASING CONTEXT for the model, never a sentence
+    // instructing it (see buildSttPrompt): an instruction came back as the
+    // transcript instead of the audio.
     let prompt = form_str(&form, "prompt").trim().to_string();
+    // Decoding temperature, forwarded only when it is a real 0..=1 number: the
+    // renderer pins greedy decoding so the same clip cannot transcribe to a
+    // different word, but a malformed value must never reach the provider.
+    let mut temperature = form_str(&form, "temperature").trim().to_string();
+    if temperature
+        .parse::<f32>()
+        .map(|t| !(0.0..=1.0).contains(&t))
+        .unwrap_or(true)
+    {
+        temperature.clear();
+    }
     let mut key = form_str(&form, "api_key").trim().to_string();
     if key.is_empty() {
         // The renderer sends the whole key ring as a JSON array; use the first
@@ -176,6 +189,9 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
     }
     if !prompt.is_empty() {
         out_form = out_form.text("prompt", prompt);
+    }
+    if !temperature.is_empty() {
+        out_form = out_form.text("temperature", temperature);
     }
     let client = crate::llm::http_client();
     let mut req = client

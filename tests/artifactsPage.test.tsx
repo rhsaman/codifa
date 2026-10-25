@@ -76,20 +76,19 @@ const disk = new Map<string, string>([
   removeEventListener: () => {},
 }
 
-const { viewerTabTitle, isRailRow, RAIL_PAGE_KINDS, useViewerTabs, visibleTabs } = await import(
+const { viewerTabTitle, viewerTabRows, useViewerTabs, visibleTabs } = await import(
   '../src/lib/viewerTabs'
 )
 const { listArtifacts } = await import('../src/lib/artifacts')
 const { renderToString } = await import('react-dom/server')
 const { ArtifactsPanel } = await import('../src/components/ArtifactsPanel')
 
-console.log('1) the kind is a global, rail-owned page:')
+console.log('1) the kind is a global page opened as an ordinary tab:')
 {
   const kind = 'artifacts' as const
-  check('the rail owns an icon for it', RAIL_PAGE_KINDS.has(kind))
   check(
-    'it is never drawn as a rail row as well',
-    !isRailRow({ kind, title: 'Artifacts', createdAt: 1 } as any),
+    'it is drawn as a normal rail row (so it can be closed)',
+    viewerTabRows([{ kind, id: kind, title: 'Artifacts', createdAt: 1 } as any], 'c1').length === 1,
   )
   check(
     'its tab shows the page label',
@@ -163,11 +162,12 @@ console.log('5) a missing backend is an error, not a crash:')
   check('the list call reports an error', typeof out === 'object' && 'error' in out, out)
 }
 
-console.log('6) the rail mounts the page button in App:')
+console.log('6) the rail opens the page from its "+" menu:')
 {
   const app = readFileSync('src/App.tsx', 'utf8')
-  check('the button is imported', /ViewerArtifactsButton/.test(app))
-  check('and mounted in the rail', /<ViewerArtifactsButton \/>/.test(app))
+  check('the "+" menu is mounted in the rail', /<ViewerAddButton \/>/.test(app))
+  const bar = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
+  check('the menu offers the artifacts page', bar.includes('key: "artifacts"'))
   // Both dispatchers must handle the kind BEFORE the inbox catch-all return.
   // Match the JSX TAG, not the lazy import at the top of the file.
   const content = readFileSync('src/components/ViewerContent.tsx', 'utf8')

@@ -33,7 +33,8 @@ const memStore = new Map<string, string>()
 ;(globalThis as any).localStorage = (globalThis as any).window.localStorage
 ;(globalThis as any).document = { documentElement: { style: { setProperty: () => {} } } }
 
-const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat } = await import('./viewerTabs')
+const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat, shownViewerTabId } = await import('./viewerTabs')
+const { collectChatIds, leafCount } = await import('./chatTree')
 const { useStore, normalizeVisibleChats, normalizeChatLayout } = await import('./store')
 
 export {}
@@ -297,7 +298,7 @@ console.log('13) openPlan — one chat-scoped plan tab, auto-opens pane:')
   check('plan tab follows its own chat', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${c2}`), v1.map((t) => t.id))
 }
 
-console.log('14) syncViewerToChat — chat switch keeps panel mode:')
+console.log('14) syncViewerToChat — a chat switch follows the focused chat:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
@@ -305,13 +306,83 @@ console.log('14) syncViewerToChat — chat switch keeps panel mode:')
   const c2 = useStore.getState().newChat('ask')
   vt().openGitDiff(c1)
   vt().openGitDiff(c2)
-  vt().setPanelMode(true)
-  check('panel mode on', vt().panelMode === true)
   syncViewerToChat(c2)
-  check('switching chat keeps panel mode', vt().panelMode === true, vt().panelMode)
+  check('switching chat shows its own tab', vt().activeId === `review:${c2}`, vt().activeId)
   syncViewerToChat(c1)
-  check('switching back keeps panel mode', vt().panelMode === true, vt().panelMode)
-  check('background active tab still follows chat', vt().activeId === `review:${c1}`, vt().activeId)
+  check('switching back shows the first chat tab', vt().activeId === `review:${c1}`, vt().activeId)
+}
+
+console.log('14b) a global page tab never takes the pane from an open file:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+  vt().openSchedule()
+  vt().openFile('src/App.tsx', 1, '/root', c1)
+  const fileId = `file:${c1}:src/App.tsx`
+  // An untouched chat (no remembered tab, whose `lastActiveByChat` entry is
+  // gone after a restart) must resolve to the chat's OWN tab, never to the
+  // global schedule tab sitting first in `tabs`.
+  check(
+    'fallback prefers the chat tab over the global page tab',
+    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1) === fileId,
+    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1),
+  )
+  const remembered = { ...vt().lastActiveByChat, [c1]: 'schedule' }
+  check(
+    'a remembered page tab is not reused when the chat owns a tab',
+    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1) === fileId,
+    resolveViewerForChat(visibleTabs(vt().tabs, c1), remembered, c1),
+  )
+  // Sets activeId aside first (as a restart does), then syncs the chat.
+  useViewerTabs.setState({ activeId: 'schedule' })
+  syncViewerToChat(c1)
+  check('syncing the chat restores the file tab', vt().activeId === fileId, vt().activeId)
+  check('the schedule tab is still open (nothing was closed)', vt().tabs.some((t) => t.id === 'schedule'), vt().tabs.map((t) => t.id))
+  check(
+    'the schedule page is not what the pane shows',
+    shownViewerTabId(vt().tabs, vt().activeId, c1) === fileId,
+    shownViewerTabId(vt().tabs, vt().activeId, c1),
+  )
+}
+
+console.log('14c) a reopened/resumed split tree follows the active tab:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const c1 = useStore.getState().newChat('ask')
+  vt().openSchedule()
+  vt().openFile('src/App.tsx', 1, '/root', c1)
+  const fileId = `file:${c1}:src/App.tsx`
+  // A resumed split: the schedule page and a file, side by side. The panes paint
+  // ONLY tree leaves, so a tab without a leaf used to render nowhere and the
+  // previous page stayed on screen — the reported "clicking a file closed the
+  // tab and opened Schedule".
+  useViewerTabs.setState({
+    viewerTree: {
+      id: 'n1', kind: 'split', dir: 'row', size: 1,
+      children: [
+        { id: 'n2', kind: 'leaf', size: 1, chatId: 'schedule' },
+        { id: 'n3', kind: 'leaf', size: 1, chatId: fileId },
+      ],
+    } as any,
+    focusedViewerId: fileId,
+    activeId: fileId,
+  })
+  vt().openFile('src/lib/bidi.ts', undefined, '/root', c1)
+  const bidiId = `file:${c1}:src/lib/bidi.ts`
+  vt().ensureViewerTree()
+  const tree = vt().viewerTree
+  check('opening a file keeps the split pane count', !!tree && leafCount(tree) === 2, tree)
+  check('the new tab is revealed in a pane', !!tree && collectChatIds(tree).includes(bidiId), tree && collectChatIds(tree))
+  check('the focused pane is the new tab', vt().focusedViewerId === bidiId, vt().focusedViewerId)
+  check('nothing was closed by opening it', vt().tabs.some((t) => t.id === fileId) && vt().tabs.some((t) => t.id === 'schedule'), vt().tabs.map((t) => t.id))
+  // Clicking a rail row must show THAT row, not the page that happened to be
+  // painted in the focused pane.
+  vt().setActiveViewer(fileId)
+  check('clicking a row reveals it in the pane', !!vt().viewerTree && collectChatIds(vt().viewerTree as any).includes(fileId), vt().viewerTree && collectChatIds(vt().viewerTree as any))
+  check('clicking a row focuses it', vt().focusedViewerId === fileId, vt().focusedViewerId)
+  check('clicking a row closed nothing', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
 }
 
 console.log('15) closeAllViewers — closes only the active chat tabs, keeps history:')

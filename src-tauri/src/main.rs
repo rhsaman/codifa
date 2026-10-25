@@ -10,11 +10,13 @@ mod artifacts;
 mod browser;
 mod browser_driver;
 mod computer;
+mod screen;
 mod trace;
 mod retention;
 mod scheduler;
 mod lsp;
 mod mcp;
+mod migrate;
 mod memory;
 mod backend_light;
 mod commands;
@@ -32,6 +34,7 @@ mod providers;
 mod repo;
 mod appstate;
 mod pty;
+mod prefs;
 mod secrets;
 mod shell_env;
 mod skills;
@@ -47,6 +50,65 @@ use tauri::{Emitter, Listener, Manager};
 /// Set right before the final close so the re-entrant CloseRequested is
 /// allowed through (the native close then persists the window state).
 struct Quitting(std::sync::atomic::AtomicBool);
+
+/// Stop every child process the app owns: terminals, the shared Chromium and the
+/// language servers.
+///
+/// Called from all three exit routes (window close, `RunEvent::Exit`, and the
+/// SIGTERM/SIGINT handler below). It is IDEMPOTENT and safe to run twice — the
+/// window-close path and the run-event both reach it on a normal quit — because
+/// each underlying `kill` takes its children out of a registry first and a
+/// second call then finds nothing to reap.
+fn shutdown_children(app: &tauri::AppHandle) {
+    pty::kill_all_terminal_sessions(app);
+    // Chromium sessions are per-chat and outlive the panel, so they must be
+    // reaped here or every visited chat leaves a browser process behind.
+    browser::kill_all_sessions();
+    // Language servers are the largest off-process memory the app holds (a warm
+    // tsserver/rust-analyzer keeps a whole project index resident).
+    lsp::shutdown_all();
+}
+
+/// Run `shutdown_children` when the process is asked to terminate by a signal.
+///
+/// `WindowEvent::CloseRequested` and `RunEvent::Exit` cover the quit paths Tauri
+/// controls, but a plain `SIGTERM` (the system logging out, a supervisor, or a
+/// user `kill`) runs NEITHER: the process dies with the whole Chromium tree and
+/// every language server still running, reparented to launchd. Measured: after
+/// `kill <pid>`, four Chromium processes survived with the app gone. This closes
+/// that gap for the two signals that mean "please stop".
+#[cfg(unix)]
+fn install_signal_teardown(app: tauri::AppHandle) {
+    use std::sync::OnceLock;
+    // The handler only ever needs the app handle. `OnceLock` keeps it alive for
+    // the process's whole life, which is what a signal handler requires (it must
+    // not touch a dropped value).
+    static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+    let _ = APP.set(app);
+
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        // Runs on the signal's thread: only async-signal-safe work belongs here.
+        // Reaping children is a `kill(2)` loop, which is safe; the store flush is
+        // deliberately skipped — a signal can land mid-write and the window-close
+        // path already persists state before this point.
+        if let Some(app) = APP.get() {
+            shutdown_children(app);
+        }
+        // Restore the default action and re-raise so the exit status still
+        // reports "terminated by signal" instead of a clean exit 0.
+        unsafe {
+            libc::signal(_sig, libc::SIG_DFL);
+            libc::raise(_sig);
+        }
+    }
+
+    unsafe {
+        // Cast through a pointer: a direct function-item → integer cast is
+        // refused by newer rustc (`function_casts_as_integer`).
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t);
+    }
+}
 
 /// A Finder-launched .app has no usable stdout/stderr, so every `println!` /
 /// `eprintln!` (router, sidecar, mcp, …) was lost. Point both at
@@ -106,9 +168,6 @@ fn main() {
             // dialogs
             commands::select_folder,
             commands::select_file,
-            // overlay
-            commands::overlay_selected,
-            commands::overlay_cancel,
             // files
             commands::fs_list,
             commands::fs_walk,
@@ -128,7 +187,8 @@ fn main() {
             commands::coder_delete,
             // capture
             commands::capture_screen,
-            commands::capture_region,
+            commands::computer_permissions,
+            commands::request_screen_recording,
             // import / clipboard / env
             commands::import_file,
             commands::copy_text,
@@ -176,6 +236,10 @@ fn main() {
             // command serves the store, and before the window loads, so the
             // renderer only ever sees the split layout.
             store::migrate_to_index(app.handle());
+            // Catch the quit routes Tauri does not drive (SIGTERM/SIGHUP), so a
+            // `kill` or a logout cannot strand the Chromium tree.
+            #[cfg(unix)]
+            install_signal_teardown(app.handle().clone());
             // Language servers hold their project's whole index in memory, so
             // release the ones that go unused on a timer (not only on a
             // workspace switch). Never blocks boot: it sweeps in the background.
@@ -187,6 +251,51 @@ fn main() {
             // until the disk fills. Owns its thread, so boot is never blocked.
             {
                 let root = state::get_data_root(app.handle());
+                // Correct any Persian keyword an EARLIER mapper wrote into an
+                // installed bundle: those words came from a category read as
+                // fact, so a bundle filed under the wrong category answered a
+                // Persian ask it has nothing to do with. Only a verbatim
+                // machine seed is remapped — a hand-typed list is left alone.
+                plugins::remap_legacy_keywords(&root);
+                // Fold the two standalone stores into bundles BEFORE any reader
+                // runs: every stored skill and connector becomes a bundle of its
+                // own, so from here on "plugin" is the only concept the rest of
+                // the app has to know about. One-shot and idempotent.
+                let folded = migrate::standalone_stores_to_bundles(&root);
+                if folded > 0 {
+                    println!("[plugins] migrated {folded} stored skill/connector(s) into bundles");
+                }
+                // Take the two store folders away once their content is IN a
+                // bundle. The migration copies (it must not lose the only copy on
+                // a failure) and its marker stops it from ever running again, so
+                // without this the stale `skills/` and `mcp/` folders outlive the
+                // change for good and Settings looks like both worlds exist.
+                let pruned = migrate::prune_migrated_stores(&root);
+                if pruned > 0 {
+                    println!("[plugins] removed {pruned} leftover store entr(ies) now in bundles");
+                }
+                // Collect the shipped library into ONE bundle: the per-skill
+                // folders an older seeder made are folded together when the user
+                // has not touched them, so Settings shows one card for the
+                // built-in skills instead of one per file.
+                let moved = plugins::fold_builtin_skills_into_one(&root);
+                if moved > 0 {
+                    println!("[plugins] folded {moved} builtin skill(s) into one bundle");
+                }
+                // Recompute the library's own description and trigger phrases
+                // even when nothing moved: an earlier version filled them from
+                // whichever skill came first in the folder, so the bundle
+                // answered one topic and every other skill in it was
+                // unreachable. Idempotent, and a hand-typed list is kept.
+                plugins::refresh_builtin_bundle_view(&root);
+                // A shipped skill that was RENAMED would otherwise sit beside its
+                // replacement forever (the seeder only ever adds or updates), so
+                // the withdrawn name is retired here — never a version the user
+                // edited (the marker decides).
+                let gone = plugins::retire_builtin_skills(&root);
+                if !gone.is_empty() {
+                    println!("[plugins] retired renamed builtin skill(s): {gone:?}");
+                }
                 // Prime the at-rest key while a handle still exists: the
                 // scheduler and the router run on handle-free threads and must
                 // still be able to decrypt provider keys from settings.json.
@@ -195,18 +304,17 @@ fn main() {
                 // sidecar's _start_schedule_loop): polls every 30s, runs due
                 // tasks headless through the native agent, records runs.
                 scheduler::start_loop(root.clone());
-                // Install the built-in MCP connector (docker) that is missing
-                // — migrated from the Python sidecar's seed_builtin_mcp, which
-                // ran on every start — then drop the retired browser connector
-                // from installs that were seeded before the native driver
-                // replaced it.
-                let seeded = skills::seed_builtin_mcp(&root);
+                // Install the built-in connector bundle (docker) that is missing
+                // — a connector rides on a bundle like everything else — then drop
+                // the retired browser connector from installs that were seeded
+                // before the native driver replaced it.
+                let seeded = plugins::seed_builtin_connectors(&root);
                 if !seeded.is_empty() {
-                    println!("[mcp] seeded builtin connectors: {}", seeded.join(", "));
+                    println!("[mcp] seeded builtin connector bundles: {}", seeded.join(", "));
                 }
-                let retired = skills::retire_builtin_mcp(&root);
+                let retired = plugins::retire_builtin_connector(&root);
                 if !retired.is_empty() {
-                    println!("[mcp] retired builtin connectors: {}", retired.join(", "));
+                    println!("[mcp] retired builtin connector bundles: {}", retired.join(", "));
                 }
                 // Seed/re-sync the shipped built-in skills (migrated from the
                 // Python sidecar's sync_builtin_skills). The shipped markdown
@@ -272,16 +380,7 @@ fn main() {
                     // Stop terminals, then close for real. The flag lets the
                     // re-entrant CloseRequested through, and the native close
                     // path saves the window state.
-                    pty::kill_all_terminal_sessions(&app);
-                    // Chromium sessions are per-chat and outlive the panel, so
-                    // they must be reaped here or every visited chat leaves a
-                    // browser process behind.
-                    browser::kill_all_sessions();
-                    // Language servers are the largest off-process memory the app
-                    // holds (a warm tsserver/rrust-analyzer keeps a whole project
-                    // index resident). Nothing released them on exit, so they
-                    // survived the window as orphans.
-                    lsp::shutdown_all();
+                    shutdown_children(&app);
                     app.state::<Quitting>()
                         .0
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -302,13 +401,9 @@ fn main() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                     store::flush_pending(app);
                     // Cmd-Q and `app.exit()` also bypass CloseRequested, so the
-                    // Chromium must be reaped here too — otherwise those exits
-                    // left a headless browser running with no window to close.
-                    browser::kill_all_sessions();
-                    // Same for language servers: a Cmd-Q that skipped the
-                    // CloseRequested path left them (and their project indexes)
-                    // running with no window to own them.
-                    lsp::shutdown_all();
+                    // children must be reaped here too. Idempotent: on a normal
+                    // quit the CloseRequested path already ran this.
+                    shutdown_children(app);
                 }
                 _ => {}
             }

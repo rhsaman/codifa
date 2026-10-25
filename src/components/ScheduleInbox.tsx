@@ -794,9 +794,8 @@ export function ScheduleInboxButton() {
   // on the first press instead of being closed by it.
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
-  const panelMode = useViewerTabs((s) => s.panelMode);
   const activeChatId = useStore((s) => s.activeChatId);
-  const shown = shownViewerTabId(tabs, activeId, panelMode, activeChatId) === 'inbox';
+  const shown = shownViewerTabId(tabs, activeId, activeChatId) === 'inbox';
   return (
     <button
       className="titlebar-icon-btn schedule-inbox-btn"

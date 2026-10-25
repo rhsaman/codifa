@@ -1,10 +1,4 @@
----
-name: Coding Standards
-description: Baseline coding rules for writing, changing or reviewing code in any project — structure, smallest correct diff, no hard-coding, efficiency, explicit errors, tests, debugging protocol.
-fa_keywords: coding standards, coding rules, code quality, hard-code, hardcoded, debugging protocol, root cause, استاندارد کد, قوانین کدنویسی, کیفیت کد, هارد کد
----
-
-# Coding Standards
+# Coding Rules
 
 Apply these whenever you write, modify or review code.
 

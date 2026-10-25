@@ -109,7 +109,7 @@ console.log('7) سناریوی کلیدی: p.id=local با entry doubly-prefixed
 console.log('')
 console.log('8) FOREIGN_PROVIDER_PREFIXES همه kindهای built-in را شامل می‌شود:')
 {
-  for (const k of ['openrouter', 'google', 'nvidia', 'cloudflare', 'tokenrouter', 'ollama', 'custom', 'anthropic', 'opencode']) {
+  for (const k of ['openrouter', 'google', 'nvidia', 'cloudflare', 'ollama', 'custom', 'anthropic', 'opencode']) {
     check(`kind "${k}" در مجموعه است`, FOREIGN_PROVIDER_PREFIXES.has(k))
   }
 }

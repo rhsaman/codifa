@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { resolveTerminalPlacement, useStore } from "../lib/store";
+import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { previewSlot } from "../lib/tabOrder";
-import { shownViewerTabId, useViewerTabs, viewerTabId, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
+import { shownViewerTabId, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
@@ -115,11 +115,12 @@ function ArtifactIcon() {
   );
 }
 
-/** Terminal prompt glyph (`>_` inside a pane) for the rail's dock toggle.
- *  Deliberately a currentColor stroke glyph rather than MacAppIcons'
- *  TerminalIcon: that one is a filled app badge with fixed hex fills, so it
- *  would sit off the rail's icon grid and ignore its pressed colour. */
-function TerminalPaneIcon() {
+/** Terminal prompt glyph (`>_` inside a pane) — shared by a terminal tab's rail
+ *  row and the "+" menu entry. Deliberately a currentColor stroke glyph rather
+ *  than MacAppIcons' TerminalIcon: that one is a filled app badge with fixed hex
+ *  fills, so it would sit off the rail's icon grid and ignore its pressed
+ *  colour. */
+export function TerminalIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="16" rx="2.5" />
@@ -134,6 +135,7 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   trace: TraceIcon,
   inbox: InboxIcon,
   schedule: ScheduleIcon,
+  todos: TodosIcon,
   plan: PlanIcon,
   browser: BrowserIcon,
   // File tabs render their own per-path icon (see the map below); this
@@ -144,7 +146,17 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   files: FilesIcon,
   artifact: ArtifactIcon,
   artifacts: ArtifactsIcon,
+  terminal: TerminalIcon,
 };
+
+/** Plus glyph for the rail's page menu trigger. */
+function AddIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
 
 function CloseIcon() {
   return (
@@ -274,51 +286,8 @@ export function ViewerTabListButton() {
  * already lives here. Exported and DOM-free so the rail icon's behaviour is
  * unit-testable — the button below is a thin wrapper around it.
  */
-export function toggleTerminalInSidePane(): void {
-  const view = useViewerTabs.getState();
-  const app = useStore.getState();
-  // "Already docked here" is the EFFECTIVE state, not a bare request: a stale
-  // `placement: 'right'` left behind while the panel was closed must not turn
-  // the first click into a no-op.
-  if (app.terminalPanelOpen && app.terminalPlacement === 'right') {
-    app.setTerminalPanelOpen(false);
-    return;
-  }
-  // The terminal only renders in the pane while the pane is on screen
-  // (resolveTerminalPlacement), so choosing the pane implies showing it.
-  view.setPaneOpen(true);
-  app.setTerminalPlacement('right');
-  app.setTerminalPanelOpen(true);
-}
-
-/**
- * Rail icon for the terminal dock — sits between the todos page icon and the
- * schedule icon. Canonical rail order, top to bottom: [collapse | tab list |
- * fullscreen | files | todos | terminal | schedule | inbox | review | trace |
- * browser]. Pressed while the terminal really is docked in this pane.
- */
-export function ViewerTerminalButton() {
-  const panelOpen = useStore((s) => s.terminalPanelOpen);
-  const placement = useStore((s) => s.terminalPlacement);
-  const paneOpen = useViewerTabs((s) => s.paneOpen);
-  const chatFull = useStore((s) => s.chatFullscreen);
-  // Same rule App uses to place the panel: the request only counts while the
-  // pane is really on screen, or the icon would claim "open" for a terminal
-  // that fell back to the bottom dock.
-  const docked =
-    panelOpen && resolveTerminalPlacement(placement, paneOpen, chatFull) === 'right';
-  return (
-    <button
-      type="button"
-      className="titlebar-icon-btn viewer-terminal-btn"
-      title={docked ? "Close the terminal" : "Open the terminal in the side pane"}
-      aria-label={docked ? "Close the terminal" : "Open the terminal in the side pane"}
-      aria-pressed={docked}
-      onClick={toggleTerminalInSidePane}
-    >
-      <TerminalPaneIcon />
-    </button>
-  );
+export function openTerminalTab(): void {
+  useViewerTabs.getState().openTerminal({ cwd: useStore.getState().root });
 }
 
 /** Publish a rail row's box to CSS so its floating name can be positioned by
@@ -340,10 +309,12 @@ export function ViewerTabBar() {
   const allTabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const activeChatId = useStore((s) => s.activeChatId);
-  // Chat-scoped tabs, minus the pages that own a rail icon: those are
-  // represented by their icon, so a row would show the same page twice.
+  // Every visible tab is a row — pages included, since the "+" menu opens them
+  // as ordinary tabs, so each one can be closed from its own row.
   const tabs = viewerTabRows(allTabs, activeChatId);
-  const shownActiveId = tabs.find((t) => t.id === activeId)?.id ?? tabs[0]?.id ?? null;
+  // Same rule the pane body uses, so the highlighted row is the painted page.
+  const activeRowId = shownViewerTabId(allTabs, activeId, activeChatId);
+  const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : tabs[0]?.id ?? null;
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -518,7 +489,9 @@ export function ViewerTabBar() {
             {/* One card holds BOTH halves: the name (clicking it activates the
                 tab — the event bubbles to the row) and the ✕ at its right end
                 (which closes, and sits where the kind icon was). The card is
-                only painted while hovered; at rest the rail stays icon-only. */}
+                only painted while hovered; at rest the rail stays icon-only.
+                Because that ✕ covers the row's square, it only closes the tab
+                that is ON SCREEN — an inactive row is switched to instead. */}
             <span className="editor-tab-label" dir="ltr">
               <span className="viewer-tab-name">{title}</span>
               <button
@@ -528,6 +501,17 @@ export function ViewerTabBar() {
                 draggable={false}
                 onClick={(e) => {
                   e.stopPropagation();
+                  // The card's ✕ sits exactly on the row's icon square (hover
+                  // replaces the kind icon), so the click that was meant to
+                  // SWITCH to this tab lands on the ✕. Closing the tab the user
+                  // meant to open is how open files kept disappearing from the
+                  // rail. Only the SHOWN tab's ✕ closes; an inactive row is
+                  // activated instead. Other rows close from the tab list
+                  // (its own ✕) or with a middle-click.
+                  if (!active) {
+                    useViewerTabs.getState().setActiveViewer(t.id);
+                    return;
+                  }
                   useViewerTabs.getState().closeViewer(t.id);
                 }}
               >
@@ -541,57 +525,13 @@ export function ViewerTabBar() {
   );
 }
 
-/** Rail icon for the Schedule page: the cron task list. Pressed while a
- *  schedule tab exists — the icon is the page's only entry point (there is no
- *  "+" menu), so it must also act as its toggle. */
-export function ViewerScheduleButton() {
-  const shown = usePageShown('schedule');
-  return (
-    <PageRailButton
-      className="viewer-schedule-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openSchedule()}
-      close={() => useViewerTabs.getState().closeViewer('schedule')}
-      openTitle="Open the schedule page"
-      closeTitle="Close the schedule page"
-    >
-      <ScheduleIcon />
-    </PageRailButton>
-  );
-}
-
-/** Rail icon for the schedule inbox: run history of the cron tasks. Same
- *  toggle contract as the schedule icon; it stays icon-only so the rail keeps a
- *  single visual weight (the unread badge is drawn by the inbox page itself). */
-export function ViewerInboxButton() {
-  const shown = usePageShown('inbox');
-  return (
-    <PageRailButton
-      className="viewer-inbox-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openInbox()}
-      close={() => {
-        useViewerTabs.getState().closeViewer('inbox');
-        useStore.getState().setScheduleInboxOpen(false);
-      }}
-      openTitle="Open the inbox — schedule run history"
-      closeTitle="Close the inbox"
-    >
-      <InboxIcon />
-    </PageRailButton>
-  );
-}
-
 /** Fullscreen toggle for the whole side pane — lives in the pane header,
- *  directly below the tab-list chevron and above the page icons (not inside
+ *  directly below the tab-list chevron and above the "+" page menu (not inside
  *  the tab bar). Canonical rail order, top to bottom: [collapse | tab list |
- *  fullscreen | files | todos | artifacts | terminal | schedule | inbox |
- *  review | trace | browser]. Hidden with no tabs. */
+ *  fullscreen | "+" | tab rows]. ALWAYS rendered: the pane itself can be
+ *  expanded with no tab open (its body then shows the todos fallback). */
 export function ViewerPaneFullscreenButton() {
-  const tabs = useViewerTabs((s) => s.tabs);
-  const activeChatId = useStore((s) => s.activeChatId);
   const viewerFull = useViewerTabs((s) => s.fullscreen);
-  if (visibleTabs(tabs, activeChatId).length === 0) return null;
   return (
     <button
       type="button"
@@ -623,180 +563,50 @@ function TodosIcon() {
   );
 }
 
-/** True while the pane is showing the page that owns the tab `id` — the ONE
- *  rule behind a rail icon's pressed state and behind what its click does.
- *  Pressed therefore marks what is ON SCREEN, not what happens to be open. */
-function usePageShown(id: string | null): boolean {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const tabs = useViewerTabs((s) => s.tabs);
-  const activeId = useViewerTabs((s) => s.activeId);
-  const panelMode = useViewerTabs((s) => s.panelMode);
-  return id !== null && shownViewerTabId(tabs, activeId, panelMode, activeChatId) === id;
-}
-
-/** Shared shell for the rail's PAGE icons. Every page reachable in the pane
- *  owns one of these and exactly one: the icon IS the entry point (there is no
- *  "+" menu), so it must also be the page's toggle — pressed while the pane is
- *  SHOWING that page, closing it on a second press.
+/** Rail trigger: the "+" page menu. Every page reachable in the pane is
+ *  listed here and opens as an ORDINARY tab — closable from its own rail row
+ *  exactly like a file tab, so no page owns a fixed icon any more.
  *
- *  Both the pressed state and the click hang off `shown`, never off "a tab with
- *  this id exists": with several tabs open, a page that is merely open behind
- *  another one used to read as pressed and its click CLOSED the tab, so asking
- *  to "show me that page" made it vanish and took a second click to get it
- *  back. An open-but-not-shown page now re-focuses on the first press. */
-function PageRailButton({
-  className,
-  shown,
-  open,
-  close,
-  openTitle,
-  closeTitle,
-  children,
-}: {
-  className: string;
-  shown: boolean;
-  open: () => void;
-  close: () => void;
-  openTitle: string;
-  closeTitle: string;
-  children: React.ReactNode;
-}) {
-  const title = shown ? closeTitle : openTitle;
-  return (
-    <button
-      type="button"
-      className={`titlebar-icon-btn ${className}`}
-      title={title}
-      aria-label={title}
-      aria-pressed={shown}
-      onClick={() => (shown ? close() : open())}
-    >
-      {children}
-    </button>
-  );
-}
-
-/** Rail icon: the Artifacts page — every document the agent built. Same
- *  toggle contract as the other page icons (the icon is the page's only
- *  entry point, so a second press closes it). */
-export function ViewerArtifactsButton() {
-  const shown = usePageShown('artifacts');
-  return (
-    <PageRailButton
-      className="viewer-artifacts-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openArtifacts()}
-      close={() => useViewerTabs.getState().closeViewer('artifacts')}
-      openTitle="Open the artifacts page"
-      closeTitle="Close the artifacts page"
-    >
-      <ArtifactsIcon />
-    </PageRailButton>
-  );
-}
-
-/** Rail icon: the workspace file explorer of the active chat. */
-export function ViewerFilesButton() {
+ *  OPEN ONLY. Picking an entry never closes another tab: closing belongs to
+ *  the tab strip (its ✕ / the tab list), so the menu can never make a page
+ *  vanish under the user. */
+export function ViewerAddButton() {
   const activeChatId = useStore((s) => s.activeChatId);
-  const id = viewerTabId("files", activeChatId);
-  const shown = usePageShown(id);
+  const vt = () => useViewerTabs.getState();
+  const sections: TabListSection[] = [
+    {
+      label: "Pane",
+      entries: [
+        {
+          key: "terminal",
+          title: "Terminal",
+          icon: <TerminalIcon />,
+          onOpen: openTerminalTab,
+        },
+      ],
+    },
+    {
+      label: "Open a page",
+      entries: [
+        { key: "files", title: "Files", icon: <FilesIcon />, onOpen: () => vt().openFiles(activeChatId) },
+        { key: "todos", title: "Todos", icon: <TodosIcon />, onOpen: () => vt().openTodos(activeChatId) },
+        { key: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onOpen: () => vt().openArtifacts() },
+        { key: "review", title: "Git diff", icon: <ReviewIcon />, onOpen: () => vt().openGitDiff(activeChatId) },
+        { key: "trace", title: "Trace", icon: <TraceIcon />, onOpen: () => vt().openTraces(activeChatId) },
+        { key: "browser", title: "Browser", icon: <BrowserIcon />, onOpen: () => vt().openBrowser(activeChatId) },
+        { key: "schedule", title: "Schedule", icon: <ScheduleIcon />, onOpen: () => vt().openSchedule() },
+        { key: "inbox", title: "Inbox", icon: <InboxIcon />, onOpen: () => vt().openInbox() },
+      ],
+    },
+  ];
   return (
-    <PageRailButton
-      className="viewer-files-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openFiles(activeChatId)}
-      close={() => useViewerTabs.getState().closeViewer(id)}
-      openTitle="Open the file explorer"
-      closeTitle="Close the file explorer"
-    >
-      <FilesIcon />
-    </PageRailButton>
+    <TabListButton
+      sections={sections}
+      label="Open a page"
+      className="viewer-add-btn"
+      icon={<AddIcon />}
+    />
   );
 }
 
-/** Rail icon: the Todos page (panel mode). Not a viewer tab — it swaps the
- *  pane's whole body — but it is a page like the others, so it gets the same
- *  kind of icon and sits in the same column. */
-export function ViewerTodosButton() {
-  const panelMode = useViewerTabs((s) => s.panelMode);
-  const tabs = useViewerTabs((s) => s.tabs);
-  const activeId = useViewerTabs((s) => s.activeId);
-  const activeChatId = useStore((s) => s.activeChatId);
-  // Mirror the pane body's rule exactly (`shownViewerTabId`): the todos page is
-  // on screen in panel mode, or when the pane has no visible tab at all (its
-  // fallback body). Deriving it from "no rail ROWS" instead would light this
-  // icon up while an icon-owned page (files, schedule…) filled the pane,
-  // claiming a page that is not the one being shown.
-  const showing = shownViewerTabId(tabs, activeId, panelMode, activeChatId) === null;
-  return (
-    <button
-      type="button"
-      className="titlebar-icon-btn panel-toggle"
-      title={showing ? "Show viewer tabs" : "Show the todos page"}
-      aria-label={showing ? "Show viewer tabs" : "Show the todos page"}
-      aria-pressed={showing}
-      onClick={() => useViewerTabs.getState().togglePanelMode()}
-    >
-      <TodosIcon />
-    </button>
-  );
-}
-
-/** Rail icon: the git diff (Review) page of the active chat. */
-export function ViewerReviewButton() {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const id = viewerTabId("review", activeChatId);
-  const shown = usePageShown(id);
-  return (
-    <PageRailButton
-      className="viewer-review-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openGitDiff(activeChatId)}
-      close={() => useViewerTabs.getState().closeViewer(id)}
-      openTitle="Open the git diff"
-      closeTitle="Close the git diff"
-    >
-      <ReviewIcon />
-    </PageRailButton>
-  );
-}
-
-/** Rail icon: the MAIN trace of the active chat. Sub-agent traces are separate
- *  tabs of the same kind and still get their own rail row (see isRailRow), so
- *  this icon never claims to represent them. */
-export function ViewerTraceButton() {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const id = viewerTabId("trace", activeChatId);
-  const shown = usePageShown(id);
-  return (
-    <PageRailButton
-      className="viewer-trace-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openTraces(activeChatId)}
-      close={() => useViewerTabs.getState().closeViewer(id)}
-      openTitle="Open the trace"
-      closeTitle="Close the trace"
-    >
-      <TraceIcon />
-    </PageRailButton>
-  );
-}
-
-/** Rail icon: the in-app browser page of the active chat. */
-export function ViewerBrowserButton() {
-  const activeChatId = useStore((s) => s.activeChatId);
-  const id = viewerTabId("browser", activeChatId);
-  const shown = usePageShown(id);
-  return (
-    <PageRailButton
-      className="viewer-browser-btn"
-      shown={shown}
-      open={() => useViewerTabs.getState().openBrowser(activeChatId)}
-      close={() => useViewerTabs.getState().closeViewer(id)}
-      openTitle="Open the browser"
-      closeTitle="Close the browser"
-    >
-      <BrowserIcon />
-    </PageRailButton>
-  );
-}
+/** Plus glyph for the rail's page menu trigger. */

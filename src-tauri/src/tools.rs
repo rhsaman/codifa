@@ -29,6 +29,186 @@ const SKILL_LIST_MAX: usize = 30;
 /// name one.
 const SKILL_SEARCH_MAX: usize = 8;
 const MAX_GREP_ALTERNATIVES: usize = 3;
+
+/// Identifiers are what `find_symbol` takes; anything else is grep-only.
+///
+/// Kept in sync with `find_symbol`'s own input check (bare letters, digits, `_`
+/// or `$`), so the hint never sends the model to a tool that would refuse it.
+fn is_bare_identifier(sym: &str) -> bool {
+    !sym.is_empty() && sym.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Upper bound on the follow-up hint `grep` appends to its own result.
+const GREP_HINT_MAX: usize = 420;
+
+/// Marker prefix of the diagnostics payload `post_edit_diagnostics` appends.
+const POST_EDIT_DIAGNOSTICS_MARK: &str = "[language server]";
+/// Marker prefix of the `find_symbol` payload `identifier_symbol_block` appends.
+const IDENTIFIER_SYMBOL_MARK: &str = "[find_symbol ";
+/// Notes the two read-side levers append to their own result, so the ruler can
+/// count them as FACT instead of inferring them from the round count.
+const READ_MERGED_MARK: &str = "[read] merged ";
+const READ_COVERED_MARK: &str = "already returned above";
+
+/// The one line `grep` appends when its own result shows a cheaper next step.
+///
+/// MEASURED on the traced corpus (118 main grep calls): 53 were followed by a
+/// `read` of a file the grep had just listed — 18 of them a window that already
+/// included a printed hit line, i.e. a whole round to re-fetch what the model
+/// was looking at — and 12 rounds were spent on a pattern that matched NOTHING,
+/// with the only two answers being another grep or a read. Both cases come from
+/// the result itself, so the hint costs no extra call and rides on the result
+/// the model is already reading.
+///
+/// 23% of those patterns were pure identifier alternations (`TracePanel`,
+/// `LLM|TOOL|FOLD`), which `find_symbol` answers in ONE call with definitions,
+/// bodies and usages, and which it refuses for anything else — hence the
+/// identifier-only guard before naming it.
+fn grep_followup_hint(pattern: &str, result: &str) -> String {
+    // A miss is the loudest signal: the file does not contain it, so the next
+    // guess must be a different NAME, not a wider window of the same file.
+    if result.starts_with("no matches") {
+        return clip_hint(
+            "\n[hint] No hit anywhere in that scope — do not re-read the file to confirm. \
+Name the token differently (a sibling symbol, a call site, the type it flows into) or widen \
+path/include once; if the name is one identifier, `find_symbol` also reports every USAGE, \
+which a grep on a single spelling misses.",
+        );
+    }
+    let alts: Vec<&str> = pattern.split('|').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if !alts.is_empty() && alts.iter().all(|a| is_bare_identifier(a)) {
+        return clip_hint(&format!(
+            "\n[hint] This was a plain identifier search. `find_symbol` answers it in ONE call \
+with the definition bodies AND every usage (`symbol`: `{}`), and `lsp_symbols` outlines a file \
+instead of reading it — cheaper than following these hits with a read.",
+            alts.join("` / `")
+        ));
+    }
+    // Many files hit at once: the cheap move is an outline, not one read each.
+    let files: Vec<&str> = result
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.starts_with('>') && l.ends_with(':'))
+        .map(|l| l.trim_end_matches(':'))
+        .collect();
+    if files.len() >= 4 {
+        let shown = files.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        return clip_hint(&format!(
+            "\n[hint] {} files matched: {shown}. Read only the one the task names — \
+`lsp_symbols` outlines it first (or `find_symbol` if you can name the symbol) instead of \
+reading several of them.",
+            files.len()
+        ));
+    }
+    String::new()
+}
+
+/// Diagnostics that ride along with a successful edit, or an empty string.
+///
+/// MEASURED: `lsp_diagnostics` was NEVER called in the traced corpus (0 of
+/// 1_035 tool calls) while the model ran 37 manual typecheck/build commands,
+/// 12 of them in the round right after an edit — each one a whole round-trip
+/// on a question a warm language server already knows. Asking the model to
+/// pick the tool did not work, so the cheap case is decided HERE: a LIVE
+/// server for the file's language answers inline, and a cold one is skipped
+/// entirely (starting rust-analyzer would turn a cheap edit into a stall).
+///
+/// Bounded like every other tool result: the window it rides on is small, and
+/// a server that lists dozens of errors must not blow the edit's own budget.
+fn post_edit_diagnostics(root: &str, path: &str) -> String {
+    const POST_EDIT_DIAGNOSTICS_CAP: usize = 2_000;
+    let Some(text) = crate::lsp::diagnostics_if_warm(root, path) else {
+        return String::new();
+    };
+    // "No diagnostics" is worth saying: it is the answer that saves the
+    // typecheck round. The "did not answer in time" text is NOT — the model
+    // cannot act on it better than on silence, and it would nag on every edit.
+    let useful = !text.contains("No diagnostics report arrived within");
+    if !useful || text.trim().is_empty() {
+        return String::new();
+    }
+    let shown: String = text.chars().take(POST_EDIT_DIAGNOSTICS_CAP).collect();
+    let cut = if shown.chars().count() < text.chars().count() { "…" } else { "" };
+    format!("\n\n{POST_EDIT_DIAGNOSTICS_MARK} {shown}{cut}")
+}
+
+/// The `find_symbol` answer for a pure-identifier grep, appended to the result.
+///
+/// MEASURED: 53 of 118 traced main greps were followed by a `read` of a file
+/// the grep itself had just listed, and 19 of the grep patterns were pure
+/// identifiers — the exact question `find_symbol` answers with definition
+/// bodies AND every usage, without a language server. Naming the tool in prose
+/// was already tried and refuted (423 of 863 rounds carried the hint text and
+/// the following rounds stayed single-call), so the cheap answer is fetched
+/// HERE: the round is spent either way, and this one hands the model the
+/// usages a single-spelling grep cannot see.
+///
+/// Skipped on a miss (the hint covers that case) and bounded, because this
+/// rides on a result the model is already paying for.
+fn identifier_symbol_block(root: &str, pattern: &str, result: &str) -> String {
+    const SYMBOL_BLOCK_CAP: usize = 2_500;
+    if result.starts_with("no matches") {
+        return String::new();
+    }
+    let alts: Vec<&str> = pattern.split('|').map(str::trim).filter(|p| !p.is_empty()).collect();
+    // Several alternatives mean several different questions; only a single
+    // identifier has one definite answer to fetch.
+    if alts.len() != 1 || !is_bare_identifier(alts[0]) {
+        return String::new();
+    }
+    let Ok(text) = find_symbol(Path::new(root), alts[0], "", "") else {
+        return String::new();
+    };
+    if text.starts_with("no matches") {
+        return String::new();
+    }
+    let shown: String = text.chars().take(SYMBOL_BLOCK_CAP).collect();
+    let cut = if shown.chars().count() < text.chars().count() { "\n…(truncated)" } else { "" };
+    format!("\n\n{IDENTIFIER_SYMBOL_MARK}{0} — same round, no extra call]\n{shown}{cut}", alts[0])
+}
+
+/// Which DETERMINISTIC levers fired on this call, for the trace row.
+///
+/// Every lever attaches its payload to the result the model already pays for, so
+/// the marker is right there in the text and reading it back is exact. Inferring
+/// "the hint probably fired" from the round count is what the corpus REFUTED:
+/// 423 of 863 rounds carried the single-call hint and the following rounds were
+/// single-call anyway.
+pub(crate) fn levers_fired(name: &str, result: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if matches!(name, "edit_file" | "write_file") && result.contains(POST_EDIT_DIAGNOSTICS_MARK) {
+        out.push("post_edit_diagnostics");
+    }
+    if name == "grep" && result.contains(IDENTIFIER_SYMBOL_MARK) {
+        out.push("identifier_grep_symbol");
+    }
+    // Read-side levers: several windows of one file collapsed into their union
+    // before a byte was read, and a read whose windows were already on the wire
+    // answered with a pointer instead of the same lines again.
+    if name == "read" && result.contains(READ_MERGED_MARK) {
+        out.push("read_windows_merged");
+    }
+    if name == "read" && result.contains(READ_COVERED_MARK) {
+        out.push("read_already_served");
+    }
+    out
+}
+
+/// Bound a `grep` follow-up hint, on a char boundary.
+///
+/// The hint rides on the tool result the model is already paying for, so a
+/// pathological pattern (hundreds of alternations) must not be able to grow the
+/// result past its own budget.
+fn clip_hint(hint: &str) -> String {
+    if hint.chars().count() <= GREP_HINT_MAX {
+        return hint.to_string();
+    }
+    let cut = hint
+        .char_indices()
+        .nth(GREP_HINT_MAX)
+        .map(|(i, _)| i)
+        .unwrap_or(hint.len());
+    format!("{}…", &hint[..cut])
+}
 const MAX_LINE_LENGTH: usize = 2000;
 
 /// Directories never descended into during workspace scans.
@@ -41,23 +221,53 @@ const SKIP_DIRS: &[&str] = &[
 // Path sandboxing (resolve_safe)
 // ---------------------------------------------------------------------------
 
-/// Resolve `rel` against `root`, rejecting any escape outside the sandbox.
-/// Mirrors tools.py resolve_safe: absolute paths inside root are fine, the OS
-/// temp dir is always allowed, and `permit["folders"]` grants extra folders.
-pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Value>) -> Result<PathBuf, String> {
-    let root_real = fs::canonicalize(root).map_err(|_| format!("root does not exist: {root}"))?;
-    let raw = rel.trim();
+/// The user's own PATH directories, canonicalised once.
+///
+/// MEASURED on the live traces: a plain `node script.js` was classified
+/// OUTSIDE and asked for /opt/homebrew/bin or ~/.nvm/... because the sandbox
+/// only knew the workspace, ~/.codifa and temp. Those are the very binaries
+/// the terminal runs unasked, so they belong to the same trusted set.
+/// Canonicalised because macOS /opt, /tmp and /var are all symlinks and a
+/// lexical compare would miss.
+pub(crate) fn tool_dirs() -> &'static [PathBuf] {
+    static DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        let path = crate::shell_env::shell_path();
+        std::env::split_paths(std::ffi::OsStr::new(&path))
+            .filter_map(|d| fs::canonicalize(&d).ok())
+            .collect()
+    })
+}
+
+/// The absolute, lexically-normalised target `rel` names under `root`, whether
+/// or not it exists. `~` expands to the home dir and a relative path joins the
+/// (already canonical) root. This is the ONE place that rule lives, so the
+/// sandbox check and the outside-path classifier can never drift apart.
+fn absolute_target_from(root_real: &Path, raw: &str) -> Result<PathBuf, String> {
     let expanded = if raw.starts_with('~') {
         let home = dirs::home_dir().ok_or("cannot expand ~")?;
         PathBuf::from(raw.replacen('~', &home.to_string_lossy(), 1))
     } else {
         PathBuf::from(raw)
     };
-    let target = if expanded.is_absolute() {
+    Ok(if expanded.is_absolute() {
         normalize_path(&expanded)
     } else {
         normalize_path(&root_real.join(raw.trim_start_matches(['/', '\\'])))
-    };
+    })
+}
+
+/// `absolute_target_from` for callers that only hold the root string. A missing
+/// root falls back to the lexical path: the caller is CLASSIFYING a path, and a
+/// wrong answer here must not be an error.
+pub fn absolute_target(root: &str, rel: &str) -> Result<PathBuf, String> {
+    let root_real = fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+    absolute_target_from(&root_real, rel.trim())
+}
+
+pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Value>) -> Result<PathBuf, String> {
+    let root_real = fs::canonicalize(root).map_err(|_| format!("root does not exist: {root}"))?;
+    let target = absolute_target_from(&root_real, rel.trim())?;
     // Compare against the canonical root prefix (both sides through the same
     // /var -> /private/var resolution macOS applies).
     let target_canon = fs::canonicalize(&target).unwrap_or_else(|_| {
@@ -105,6 +315,14 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
                 return Ok(target_canon);
             }
         }
+        // The user's own PATH is not "outside": running `node`, `python3` or
+        // `cargo` is exactly what the terminal does without asking, and the
+        // login PATH is already trusted enough to launch every child process.
+        // Without this, a plain `node script.js` asked for /opt/homebrew/bin
+        // or ~/.nvm/... on every round.
+        if target_canon.is_absolute() && tool_dirs().iter().any(|d| target_canon.starts_with(d)) {
+            return Ok(target_canon);
+        }
         if let Some(permit) = permit {
             if permit["outside"].as_bool().unwrap_or(false) {
                 return Ok(target_canon);
@@ -124,6 +342,100 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
         return Err(format!("path escapes project root: {rel}"));
     }
     Ok(target_canon)
+}
+
+/// Whether `rel` resolves INSIDE the workspace root — the one question the shell
+/// gate asks, answered with the same expansion/`~`/normalisation rules as the
+/// sandbox itself. A lexical `starts_with` on the raw argv was the bug that made
+/// `~/.config/x` look like `<root>/~/.config/x` and refused a read the terminal
+/// was the only way to perform.
+pub fn is_inside_root(root: &str, rel: &str) -> bool {
+    let Ok(root_real) = fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(target) = absolute_target(root, rel) else {
+        return false;
+    };
+    let canon = fs::canonicalize(&target).unwrap_or(target);
+    canon == root_real || canon.starts_with(&root_real)
+}
+
+/// Whether a path is reachable WITHOUT asking the user, and — when it is not —
+/// the folder a grant would cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathAccess {
+    /// Workspace, the OS temp roots, or the app data root (`~/.codifa`).
+    Free,
+    /// Outside every allowed root: the nearest existing parent of the request,
+    /// which is what a folder grant approves. Empty when the path cannot be
+    /// expanded at all (a bad `~`) — then the tool itself reports the error.
+    NeedsPermission(PathBuf),
+}
+
+/// Classify a path for the shell gate and the tool loop, using the SAME rules as
+/// `resolve_safe` so a path can never be "allowed" by one and "refused" by the
+/// other. Tmp and `~/.codifa` come back `Free`: they are the agent's own
+/// scratch space (background logs, throwaway fixtures, its skill store), and
+/// asking for them burned a whole round per traced call.
+///
+/// `permit` is the turn's own grant: a folder the user already approved comes
+/// back `Free`, so the pre-flight gate never asks twice inside one turn.
+pub fn path_access(root: &str, rel: &str, permit: Option<&Value>) -> PathAccess {
+    if resolve_safe(root, rel, true, permit).is_ok() {
+        return PathAccess::Free;
+    }
+    let Ok(target) = absolute_target(root, rel) else {
+        return PathAccess::NeedsPermission(PathBuf::new());
+    };
+    let mut anc = target.clone();
+    while !anc.exists() {
+        if !anc.pop() {
+            break;
+        }
+    }
+    if anc.as_os_str().is_empty() {
+        anc = target;
+    }
+    PathAccess::NeedsPermission(anc)
+}
+
+/// The paths a lookup call would touch, for the pre-flight access gate.
+///
+/// Only read-shaped tools appear here: a writer's `path` is a mutation with its
+/// own gate, and gating it twice would make the same rule live in two places.
+/// `read` takes its windows (each entry carries its own file), the rest one
+/// `path`/`filePath`.
+pub fn lookup_paths(name: &str, args: &Value) -> Vec<String> {
+    if !matches!(
+        name,
+        "read"
+            | "grep"
+            | "glob"
+            | "find_symbol"
+            | "lsp_symbols"
+            | "lsp_diagnostics"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+    ) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    if name == "read" {
+        for (file, _, _) in read_windows_of(args) {
+            if !file.is_empty() && !out.contains(&file) {
+                out.push(file);
+            }
+        }
+    } else {
+        for k in ["path", "filePath"] {
+            let p = args[k].as_str().unwrap_or_default().trim();
+            if !p.is_empty() && !out.iter().any(|q| q == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Lexical normalization without requiring the path to exist: collapses `.`
@@ -234,11 +546,142 @@ pub fn read_window(abs: &Path, offset: usize, limit: usize) -> Result<String, St
 /// a line instead of re-reading the file to pin its number down. Directory
 /// listings keep their plain form.
 pub fn read_window_block(abs: &Path, label: &str, offset: usize, limit: usize) -> Result<String, String> {
+    read_window_block_capped(abs, label, offset, limit, usize::MAX)
+}
+
+/// Smallest useful share one window gets inside a batch. Below this a block is
+/// only a header, which reads as "nothing here" and costs a round trip to
+/// disprove — so a batch that cannot afford a real window says so instead.
+const READ_BLOCK_MIN: usize = 1_200;
+
+/// Default window of a `read` that names no offset/limit. One definition, used
+/// by the dispatch arm AND by the repeat-guard's coverage check, so the two can
+/// never disagree about which lines a call actually asked for.
+pub(crate) const DEFAULT_READ_OFFSET: usize = 1;
+pub(crate) const DEFAULT_READ_LIMIT: usize = 400;
+
+/// The (file, offset, limit) entries a `read` call asks for, with the same
+/// defaults the dispatch arm applies.
+///
+/// `ranges` is the batch spelling (an entry without `path` inherits the
+/// top-level one), `paths` is the legacy list that shares one window, and a
+/// bare `filePath` is the single-window form. Empty when the call names no file
+/// at all — the caller decides whether that is an error or simply no coverage.
+pub(crate) fn read_windows_of(args: &Value) -> Vec<(String, usize, usize)> {
+    let top = args["filePath"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| args["path"].as_str().unwrap_or_default())
+        .to_string();
+    let num = |v: &Value, fallback: usize| v.as_u64().map(|n| n as usize).unwrap_or(fallback);
+    let mut out = Vec::new();
+    if let Some(ranges) = args["ranges"].as_array() {
+        for r in ranges {
+            let file = r["path"].as_str().unwrap_or(top.as_str());
+            if file.is_empty() {
+                continue;
+            }
+            out.push((
+                file.to_string(),
+                num(&r["offset"], DEFAULT_READ_OFFSET),
+                num(&r["limit"], DEFAULT_READ_LIMIT),
+            ));
+        }
+        return out;
+    }
+    if let Some(paths) = args["paths"].as_array() {
+        for p in paths.iter().filter_map(Value::as_str) {
+            out.push((
+                p.to_string(),
+                num(&args["offset"], DEFAULT_READ_OFFSET),
+                num(&args["limit"], DEFAULT_READ_LIMIT),
+            ));
+        }
+        return out;
+    }
+    if !top.is_empty() {
+        out.push((
+            top,
+            num(&args["offset"], DEFAULT_READ_OFFSET),
+            num(&args["limit"], DEFAULT_READ_LIMIT),
+        ));
+    }
+    out
+}
+
+/// Collapse a `read` batch into the non-overlapping union of its windows, one
+/// span per file, keeping the order the model asked in.
+///
+/// A batch is one model call and one prompt re-send, so overlapping entries are
+/// paid twice for lines the model asked for once: traced on the real corpus, 42
+/// batches carried overlapping windows of the SAME file (6_928 lines — ~381K
+/// chars — delivered twice inside a single call), because the model stitches a
+/// file together from the pieces a precedent grep or report named. Merging is
+/// lossless — the union contains every requested line, and each line is sent
+/// exactly once — and it needs no state, so nothing can go stale.
+///
+/// Windows separated by no more than `GAP` lines merge too: the joined block
+/// costs a few unrequested lines but saves a second header and, on the corpus,
+/// the extra round the model spent reading the seam between two adjacent spans.
+fn merge_read_targets(targets: Vec<(String, usize, usize)>) -> Vec<(String, usize, usize)> {
+    /// Largest gap between two windows of one file that still merges: adjacent
+    /// (`(1,130)` then `(130,120)`) and near-adjacent windows are what a model
+    /// emits when it walks a file top-down.
+    const GAP: usize = 20;
+    let mut order: Vec<String> = Vec::new();
+    let mut by_file: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for (file, offset, limit) in targets {
+        // The span is offset+limit, with no normalisation: `dispatch` treats an
+        // explicit `limit: 0` as zero lines, so inflating it here would serve
+        // (and charge for) lines the caller did not ask for.
+        let span = (offset, offset.saturating_add(limit));
+        if !by_file.contains_key(&file) {
+            order.push(file.clone());
+        }
+        by_file.entry(file).or_default().push(span);
+    }
+    let mut out = Vec::new();
+    for file in order {
+        let mut spans = by_file.remove(&file).unwrap_or_default();
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 + GAP => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        for (start, end) in merged {
+            out.push((file.clone(), start, end - start));
+        }
+    }
+    out
+}
+
+/// `read_window_block` with a char budget for THIS block.
+///
+/// The turn loop caps every tool result at `agent::MODEL_RESULT_CAP` before it
+/// reaches the model, and that cap is a flat TAIL cut. A batched `read` merges
+/// several windows into one string, so any batch of 4+ windows silently lost
+/// its last windows: traced on the real corpus, 4 of the 5 capped reads were
+/// followed by the SAME file again (10, 7, 6 and 3 extra reads on
+/// backend_light.rs, plugins.ts, repo.rs and TVKit.mq5) — the batch defeated
+/// itself and bought a round trip instead of saving one. Spending the budget
+/// per window keeps every window represented and tells the model exactly how to
+/// fetch the remainder.
+pub fn read_window_block_capped(
+    abs: &Path,
+    label: &str,
+    offset: usize,
+    limit: usize,
+    budget: usize,
+) -> Result<String, String> {
     if abs.is_dir() {
         return read_window(abs, offset, limit);
     }
     match file_window(abs, offset, limit)? {
-        Window::Lines(lines) => Ok(numbered_window(label, offset.max(1), &lines)),
+        Window::Lines(lines) => Ok(numbered_window_capped(label, offset.max(1), &lines, budget)),
         Window::Empty(notice) => Ok(notice),
     }
 }
@@ -263,6 +706,123 @@ pub fn numbered_window(label: &str, first_line: usize, lines: &[String]) -> Stri
         out.push_str(&format!("{:>width$}: {line}\n", first_line + i, width = width));
     }
     out
+}
+
+/// `numbered_window` that never exceeds `budget` chars, and says so when it
+/// cannot show everything.
+///
+/// Without the marker a cut window is indistinguishable from a short file and
+/// the model re-reads it to find out. The marker names the exact next offset, so
+/// the remainder is one cheap call instead of a guess.
+fn numbered_window_capped(label: &str, first_line: usize, lines: &[String], budget: usize) -> String {
+    let full = numbered_window(label, first_line, lines);
+    if full.chars().count() <= budget {
+        return full;
+    }
+    let last = first_line + lines.len() - 1;
+    let width = last.to_string().len();
+    // The header is kept even when the body is cut: without it the block reads
+    // as "this file has nothing here", and the caller cannot even tell WHICH
+    // window answered.
+    let mut out = format!("{label} (lines {first_line}-{last}):\n");
+    let header_len = out.chars().count();
+    for (i, line) in lines.iter().enumerate() {
+        let next = format!("{:>width$}: {line}\n", first_line + i, width = width);
+        // Reserve room for the trailer so the marker itself is never the part
+        // that gets cut: it is the only thing telling the model where to resume.
+        if header_len + out.chars().count() + next.chars().count() + READ_TRUNCATION_RESERVE > budget {
+            let shown_to = first_line + i - 1;
+            // A budget too small for even one line must still say why.
+            if i == 0 {
+                return format!(
+                    "{label} (lines {first_line}-{last}): (window too large for the result budget — \
+read it with a smaller limit, e.g. offset={first_line} limit=80)\n"
+                );
+            }
+            out.push_str(&format!(
+                "… (window truncated at line {shown_to} of {last}: these lines did not fit the \
+result budget. Read the rest with offset={} limit={} — do not re-read what is shown here)\n",
+                shown_to + 1,
+                last - shown_to + 1
+            ));
+            return out;
+        }
+        out.push_str(&next);
+    }
+    out
+}
+
+/// Room kept back for the truncation marker in `numbered_window_capped`.
+const READ_TRUNCATION_RESERVE: usize = 160;
+
+/// Char budget of the current-text window a failed edit may carry.
+///
+/// The window replaces a round-trip, so it must stay small enough that the
+/// failure message itself never trips the model-result cap.
+const NEAREST_HINT_BUDGET: usize = 1_200;
+
+/// Lines of context printed on each side of the closest match.
+const NEAREST_HINT_CONTEXT: usize = 4;
+
+/// Whitespace-insensitive form of a line: runs of whitespace become one space.
+fn squeeze(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A window of the file's CURRENT text around the place a missing `old_string`
+/// was probably taken from, for `edit_file`'s failure message.
+///
+/// MEASURED: of 25 traced edit failures, 20 sent text the file no longer had
+/// (the model was working from a stale copy) and the bare "old_string not found"
+/// gave it nothing to work with — 4 answered by re-reading the whole file, and
+/// the rest by re-sending the same stale batch, at a median of 2 extra rounds
+/// per failure. A small window of the real text costs one call's worth of chars
+/// and lets the model fix the string in place.
+///
+/// Matching is deliberately cheap and local: the first non-blank line of the
+/// missing text is compared with every line (whitespace-normalised, then by
+/// shared-word ratio) and the best line above the floor is shown with its
+/// neighbours under real line numbers. An empty result means "no confident
+/// match", so the caller keeps the plain error instead of printing a window
+/// that would mislead.
+fn nearest_hint(content: &str, old_string: &str) -> String {
+    let probe = match old_string.lines().find(|l| !l.trim().is_empty()) {
+        Some(l) => squeeze(l),
+        None => return String::new(),
+    };
+    if probe.is_empty() {
+        return String::new();
+    }
+    let probe_words: Vec<&str> = probe.split_whitespace().collect();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut best: Option<(f64, usize)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let norm = squeeze(line);
+        if norm.is_empty() {
+            continue;
+        }
+        let score = if norm == probe {
+            1.0
+        } else {
+            let line_words: Vec<&str> = norm.split_whitespace().collect();
+            let shared = probe_words.iter().filter(|w| line_words.contains(w)).count();
+            shared as f64 / probe_words.len().max(line_words.len()) as f64
+        };
+        if score >= 0.5 && best.is_none_or(|(b, _)| score > b) {
+            best = Some((score, i));
+        }
+    }
+    let Some((_, hit)) = best else {
+        return String::new();
+    };
+    let start = hit.saturating_sub(NEAREST_HINT_CONTEXT);
+    let end = (hit + NEAREST_HINT_CONTEXT + 1).min(lines.len());
+    let numbered: Vec<String> = lines[start..end].iter().map(|l| (*l).to_string()).collect();
+    let window = numbered_window_capped("current text", start + 1, &numbered, NEAREST_HINT_BUDGET);
+    format!(
+        " The text you sent is not in the file any more; this is the CURRENT text around the \
+closest match — copy the exact string from here (do NOT re-read the whole file):\n{window}"
+    )
 }
 
 /// Directory listing (one entry per line, subdirs marked with `/`).
@@ -519,6 +1079,22 @@ pub fn grep_scope(
     context: usize,
     ignore_case: bool,
 ) -> Result<String, String> {
+    grep_scope_in(root, scope, pattern, include, max_results, context, ignore_case, None)
+}
+
+/// `grep_scope` with the turn's out-of-workspace permit: a scope the user
+/// approved has to be searchable, or the grant is a promise the backend breaks.
+#[allow(clippy::too_many_arguments)]
+pub fn grep_scope_in(
+    root: &Path,
+    scope: &str,
+    pattern: &str,
+    include: &str,
+    max_results: usize,
+    context: usize,
+    ignore_case: bool,
+    permit: Option<&Value>,
+) -> Result<String, String> {
     // Enforcement lives here (not just in dispatch) so direct callers get the
     // same guard: unscoped multi-alternative patterns are refused.
     if scope.is_empty()
@@ -534,7 +1110,7 @@ pub fn grep_scope(
     let scope_abs = if scope.is_empty() {
         root_real.clone()
     } else {
-        resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
+        resolve_safe(root.to_str().unwrap_or("."), scope, true, permit)?
     };
     // A file scope (grep inside one file) cannot be current_dir — spawning rg
     // there fails with ENOTDIR ("Not a directory"). Search from the file's
@@ -724,11 +1300,22 @@ fn glob_matches(re: &regex::Regex, rel_scope: &str, rel_root: &str, name: &str) 
 
 /// Find files by glob pattern within a scope; returns relative paths.
 pub fn glob_scope(root: &Path, scope: &str, pattern: &str, max_results: usize) -> Result<Vec<String>, String> {
+    glob_scope_in(root, scope, pattern, max_results, None)
+}
+
+/// `glob_scope` with the turn's out-of-workspace permit (see `grep_scope_in`).
+pub fn glob_scope_in(
+    root: &Path,
+    scope: &str,
+    pattern: &str,
+    max_results: usize,
+    permit: Option<&Value>,
+) -> Result<Vec<String>, String> {
     let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let scope_abs = if scope.is_empty() {
         root_real.clone()
     } else {
-        resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
+        resolve_safe(root.to_str().unwrap_or("."), scope, true, permit)?
     };
     // A missing scope used to fall through to an empty walk and answer a
     // plain "no matches" — the model then burned calls guessing path spellings.
@@ -892,7 +1479,10 @@ pub fn edit_file(
 
     let occurrences = content.matches(old_string).count();
     if occurrences == 0 {
-        return Err("old_string not found in file — re-read the file and copy the exact current text".into());
+        return Err(format!(
+            "old_string not found in file.{}",
+            nearest_hint(&content, old_string)
+        ));
     }
     if occurrences > 1 && !replace_all {
         return Err(format!(
@@ -1041,6 +1631,22 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
         }
         text = format!("…[head truncated]\n{}", &text[cut..]);
     }
+    // An empty body is a dead end, not an answer: a traced round ran
+    // `cargo run … 2>/dev/null` with `cargo` off PATH, the redirect threw the
+    // only diagnostic away, and the model spent a whole round-trip (18 160
+    // input tokens, 17 152 cached) to learn nothing. Say so in-band, and name
+    // the redirect as the likely culprit so the next round fixes the command.
+    if text.trim().is_empty() && !timed_out && !overflowed {
+        if status.success() {
+            return Ok(format!(
+                "The command exited successfully but produced NO output (stdout and stderr were both empty). Do not repeat it unchanged: if you redirected a stream (`2>/dev/null`, `>/dev/null`), drop the redirect so the error or result is visible, and check the binary is on PATH."
+            ));
+        }
+        return Ok(format!(
+            "EXIT CODE: {}\nThe command FAILED but produced no output — its stderr was redirected away or empty. Re-run it WITHOUT `2>/dev/null` so the real error is visible.",
+            status.code().unwrap_or(-1)
+        ));
+    }
     if timed_out {
         // In-band timeout (Ok), exactly like before the fix, so the model can
         // react to it instead of seeing a tool error.
@@ -1143,6 +1749,40 @@ fn skill_haystack(sk: &Value) -> String {
     hay.to_lowercase()
 }
 
+/// Warn when a bundle was written with skills no Persian request can reach.
+///
+/// A skill's trigger is its `fa_keywords`, and the model only sees a JSON blob of
+/// names — it cannot tell a bundle that routes from one that does not. So EVERY
+/// write says it outright (install, create AND update), so a bundle made in chat
+/// is as findable as one installed from a marketplace. The warning rides AFTER
+/// the JSON so the reply stays machine-readable up to the first newline.
+fn plugin_keyword_warning(store: &Path, view: &Value) -> String {
+    let Some(slug) = view["slug"].as_str() else {
+        return String::new();
+    };
+    let bare: Vec<String> = view["skills"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|name| crate::plugins::skill_keyword_count(store, slug, name) == 0)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if bare.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nWARNING: these skills have NO fa_keywords, so a Persian request has nothing to find \
+         them by: {}. Send another plugin call with action=update and fa_keywords per skill (the \
+         user's own Persian phrases), or set fa_keywords on the plugin itself so a skill with \
+         none of its own still triggers through the bundle.",
+        bare.join(", ")
+    )
+}
+
 /// Find a skill by words when the prompt's catalog does not cover the task.
 ///
 /// The catalog is byte-capped, so a store with hundreds of skills cannot list
@@ -1206,6 +1846,21 @@ pub fn dispatch_with_data_root(
     data_root: Option<&str>,
 ) -> Result<String, String> {
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
+    // Bounded discovery — the ONE place every search passes through, so no
+    // caller (main agent, sub-agent, MCP) can flood a context by accident.
+    //
+    // Measured on the traced corpus: 67% of all tool calls are raw search, and
+    // the explore sub-agent re-sends every result on each of its ~4 rounds, so
+    // 14.98M result chars (~3.74M tokens) were paid again and again. Two of the
+    // three search verbs also default to a WIDER window than any agent needs:
+    // `grep` handed back 50 hits with a context line each, `glob` up to 100
+    // paths. The model asked for none of that — it asked for one hit list.
+    //
+    // Only the DEFAULT shrinks. An explicit bigger `max_results` still wins, so
+    // nothing becomes impossible; the model pays for size only when it says so.
+    let search = |k: &str, fallback: u64| -> usize {
+        args[k].as_u64().unwrap_or(fallback) as usize
+    };
     // Where the skill/connector store lives for THIS call: the data root when
     // the caller knows it, else the workspace root.
     let store_base = match data_root {
@@ -1218,34 +1873,105 @@ pub fn dispatch_with_data_root(
                 let p = s("filePath");
                 if p.is_empty() { s("path") } else { p }
             };
-            // Single-path discipline: the batch form (filePaths: [...]) is no
-            // longer accepted — several windows of ONE file go through
-            // ranges=[{offset,limit},…] instead (user request).
-            if path.is_empty() && args["filePaths"].is_array() {
-                return Err(
-                    "read takes a single filePath — to read several windows of one file pass ranges=[{\"offset\":1,\"limit\":400},…]".into(),
-                );
-            }
-            let abs = resolve_safe(root, &path, true, permit)?;
-            // Multi-RANGE: several windows of the same file in one call.
+            // Batching lives in `ranges`: every entry carries its own file AND
+            // its own window, so several KNOWN files still cost ONE call (a main
+            // round re-sends the whole conversation for ~7.7K uncached tokens
+            // against ~26K for a narrow `explore` delegation) — and no file can
+            // be named twice with one shared window forced on all of them.
+            //
+            // `paths` is a legacy spelling that is NOT advertised any more. It
+            // is normalised here rather than refused: a stale transcript must
+            // not burn a round trip, and the shared dedupe below removes the
+            // repeated file the old form allowed.
+            let mut targets: Vec<(String, usize, usize)> = Vec::new();
             if let Some(ranges) = args["ranges"].as_array() {
-                let mut out = String::new();
                 for r in ranges {
-                    let offset = r["offset"].as_u64().unwrap_or(1) as usize;
-                    let limit = r["limit"].as_u64().unwrap_or(400) as usize;
+                    let file = r["path"].as_str().unwrap_or(path.as_str()).to_string();
+                    if file.is_empty() {
+                        return Err(
+                            "read: a `ranges` entry names no file — give every entry a `path` (or pass one top-level filePath)".into(),
+                        );
+                    }
+                    targets.push((
+                        file,
+                        r["offset"].as_u64().unwrap_or(DEFAULT_READ_OFFSET as u64) as usize,
+                        r["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize,
+                    ));
+                }
+            } else if let Some(paths) = args["paths"].as_array() {
+                if paths.is_empty() {
+                    return Err("read: `paths` was empty — pass `ranges` entries instead".into());
+                }
+                let offset = args["offset"].as_u64().unwrap_or(DEFAULT_READ_OFFSET as u64) as usize;
+                let limit = args["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+                for p in paths.iter().filter_map(Value::as_str) {
+                    targets.push((p.to_string(), offset, limit));
+                }
+            }
+            if !targets.is_empty() {
+                // Overlapping windows of one file collapse into their union
+                // (see `merge_read_targets`) before a single byte is read, so
+                // the model never pays twice for lines it asked for once.
+                let asked = targets.len();
+                let targets = merge_read_targets(targets);
+                let collapsed = asked.saturating_sub(targets.len());
+                let mut out = String::new();
+                // Every window gets an equal share of the one budget the turn
+                // loop will enforce anyway (`MODEL_RESULT_CAP`): a flat tail cut
+                // would drop the last windows of any 4+ entry batch, which is
+                // what made a traced batch re-read its own file 10 times.
+                let per_block = (crate::agent::MODEL_RESULT_CAP / targets.len().max(1))
+                    .max(READ_BLOCK_MIN);
+                for (file, offset, limit) in targets {
+                    let abs = resolve_safe(root, &file, true, permit)?;
+                    // An image has no text window: hand back a marker the turn
+                    // loop turns into a real image block, instead of the byte-cap
+                    // refusal this read used to end in.
+                    if let Some(note) = crate::commands::image_read_note(&abs.to_string_lossy()) {
+                        if !out.is_empty() {
+                            out.push_str("\n\n");
+                        }
+                        out.push_str(&note);
+                        continue;
+                    }
                     if !out.is_empty() {
                         out.push_str("\n\n");
                     }
-                    out.push_str(&read_window_block(&abs, &path, offset, limit)?);
+                    out.push_str(&read_window_block_capped(&abs, &file, offset, limit, per_block)?);
+                }
+                // The note rides on the result the model already pays for: it
+                // says the collapse happened (so the ruler counts it as FACT) and
+                // stops the model from re-asking for a window it just received.
+                if collapsed > 0 {
+                    out.push_str(&format!(
+                        "\n{READ_MERGED_MARK}{collapsed} overlapping window(s) of the same file \
+into one union — those lines are all above; do NOT re-read them]"
+                    ));
                 }
                 return Ok(out);
             }
-            let offset = args["offset"].as_u64().unwrap_or(1) as usize;
+            // `filePaths` is the oldest batch spelling; it points at `ranges`.
+            if path.is_empty() && args["filePaths"].is_array() {
+                return Err(
+                    "read takes one filePath — to read several files or several windows in ONE call pass ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":400},…]".into(),
+                );
+            }
+            let offset = args["offset"].as_u64().unwrap_or(DEFAULT_READ_OFFSET as u64) as usize;
             // Windowed-read discipline: a whole-file read floods the context
             // and slows the agent down. Cap the default window; larger reads
             // must be explicit (offset/limit).
-            let limit = args["limit"].as_u64().unwrap_or(400) as usize;
-            read_window_block(&abs, &path, offset, limit)
+            let limit = args["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+            let abs = resolve_safe(root, &path, true, permit)?;
+            // Same as the batch path above: an image file is described, never
+            // windowed.
+            if let Some(note) = crate::commands::image_read_note(&abs.to_string_lossy()) {
+                return Ok(note);
+            }
+            // A single window gets the same budget as one batch entry: a file
+            // window larger than the model cap used to be cut by the turn loop
+            // with no marker at all (the traced TVKit.mq5 read came back as
+            // 16_086 of 17_534 chars, and the model re-read it 3 times).
+            read_window_block_capped(&abs, &path, offset, limit, crate::agent::MODEL_RESULT_CAP)
         }
         "grep" => {
             let mut patterns = vec![s("pattern")];
@@ -1274,13 +2000,13 @@ pub fn dispatch_with_data_root(
                     count_grep_alternatives(&joined)
                 ));
             }
-            let max = args["max_results"].as_u64().unwrap_or(50) as usize;
+            let max = search("max_results", 20);
             // Context lines per hit (default 1 — 3 was hardcoded and tripled the
             // output) and case sensitivity (case-SENSITIVE by default; opt in to
             // ignore_case). These two are grep's biggest token levers.
             let context = args["context"].as_u64().unwrap_or(1).min(5) as usize;
             let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
-            grep_scope(
+            let result = grep_scope_in(
                 Path::new(root),
                 &s("path"),
                 &joined,
@@ -1288,9 +2014,17 @@ pub fn dispatch_with_data_root(
                 max,
                 context,
                 ignore_case,
-            )
+                permit,
+            )?;
+            Ok(format!(
+                "{result}{}{}",
+                identifier_symbol_block(root, &joined, &result),
+                grep_followup_hint(&joined, &result)
+            ))
         }
-        "find_symbol" => find_symbol(Path::new(root), &s("symbol"), &s("path"), &s("include")),
+        "find_symbol" => {
+            find_symbol_in(Path::new(root), &s("symbol"), &s("path"), &s("include"), permit)
+        }
         "glob" => {
             let mut patterns = vec![s("pattern")];
             if let Some(extra) = args["patterns"].as_array() {
@@ -1304,8 +2038,8 @@ pub fn dispatch_with_data_root(
             if scope.is_empty() {
                 return Err("Workspace-wide glob is not allowed. Provide path=... to scope the search".into());
             }
-            let max = args["max_results"].as_u64().unwrap_or(100) as usize;
-            let hits = glob_scope(Path::new(root), &scope, &pattern, max)?;
+            let max = search("max_results", 40);
+            let hits = glob_scope_in(Path::new(root), &scope, &pattern, max, permit)?;
             if hits.is_empty() {
                 Ok(format!(
                     "no matches for {pattern:?} under {scope:?}. glob lists FILES only (never directories), skips hidden dirs and node_modules/target/dist/build, and `**/` matches zero or more directories. This answer is final — do not retry variations: use grep, or read a directory path to list its entries."
@@ -1337,44 +2071,85 @@ pub fn dispatch_with_data_root(
                 }
                 let mut content =
                     fs::read_to_string(&target).map_err(|_| "binary file (edit skipped)".to_string())?;
+                // ONE bad entry must not throw away the good ones. Measured on
+                // the live corpus: 8 of 84 batch edits failed this way and each
+                // cost a median of 2 extra rounds (18 rounds total, 4 of them a
+                // blind re-read of the same file) — the model had no idea which
+                // edits had landed, so it re-sent the whole batch. Apply what
+                // applies, write it, and name exactly what did not.
+                let mut applied = 0usize;
+                let mut failures: Vec<String> = Vec::new();
+                // The current-text window rides on the FIRST missing entry only.
+                // One window is what the model needs (it fixes one string at a
+                // time), and keeping the other failures bare bounds the whole
+                // message at ~one window instead of one per failure.
+                let mut hint: Option<String> = None;
                 for (idx, item) in edits.iter().enumerate() {
                     let old = item["old_string"].as_str().unwrap_or_default();
                     let new = item["new_string"].as_str().unwrap_or_default();
                     let all = item["replace_all"].as_bool().unwrap_or(false);
                     if old.is_empty() {
-                        return Err(format!("edit {}/{}: old_string is empty", idx + 1, edits.len()));
+                        failures.push(format!("edit {}/{}: old_string is empty", idx + 1, edits.len()));
+                        continue;
                     }
                     if old == new {
-                        return Err(format!(
+                        failures.push(format!(
                             "edit {}/{}: old_string and new_string are identical",
                             idx + 1,
                             edits.len()
                         ));
+                        continue;
                     }
                     let occ = content.matches(old).count();
                     if occ == 0 {
-                        return Err(format!("edit {}/{}: old_string not found", idx + 1, edits.len()));
+                        failures.push(format!("edit {}/{}: old_string not found", idx + 1, edits.len()));
+                        if hint.is_none() {
+                            hint = Some(nearest_hint(&content, old));
+                        }
+                        continue;
                     }
                     if occ > 1 && !all {
-                        return Err(format!(
+                        failures.push(format!(
                             "edit {}/{}: old_string appears {occ} times — make it unique",
                             idx + 1,
                             edits.len()
                         ));
+                        continue;
                     }
                     content = if all { content.replace(old, new) } else { content.replacen(old, new, 1) };
+                    applied += 1;
                 }
-                fs::write(&target, &content).map_err(|e| format!("cannot write file: {e}"))?;
-                return Ok(format!("Successfully edited {path} ({} edits applied).", edits.len()));
+                if applied > 0 {
+                    fs::write(&target, &content).map_err(|e| format!("cannot write file: {e}"))?;
+                }
+                let suffix = hint.unwrap_or_default();
+                if failures.is_empty() {
+                    return Ok(format!(
+                        "Successfully edited {path} ({} edits applied).{}",
+                        edits.len(),
+                        post_edit_diagnostics(root, &path)
+                    ));
+                }
+                if applied == 0 {
+                    return Err(format!("no edit applied to {path}. {}{suffix}", failures.join("; ")));
+                }
+                return Ok(format!(
+                    "PARTIAL edit of {path}: {applied}/{} edits were applied and WRITTEN; {} failed and were NOT applied — send ONLY the failed one(s) next, copying the text as it is in the file AFTER these edits: {}{suffix}{}",
+                    edits.len(),
+                    failures.len(),
+                    failures.join("; "),
+                    post_edit_diagnostics(root, &path)
+                ));
             }
-            edit_file(
+            let edit = edit_file(
                 root,
                 &path,
                 &s("old_string"),
                 &s("new_string"),
                 args["replace_all"].as_bool().unwrap_or(false),
                 permit,
-            )
+            )?;
+            Ok(format!("{edit}{}", post_edit_diagnostics(root, &path)))
         }
         "run_terminal" => {
             let timeout = args["timeout"].as_u64().unwrap_or(120);
@@ -1527,16 +2302,27 @@ pub fn dispatch_with_data_root(
             if let Some(del) = args["deleted_files"].as_array() {
                 body["deleted_files"] = json!(del);
             }
-            let res = crate::skills::sync_skill(Path::new(store_base), &body)?;
-            let name_out = res["name"].as_str().unwrap_or(&name);
+            // A delete is answered by the bundle writer: the skill's folder is
+            // removed, and a bundle that held ONLY that skill goes with it.
+            if body["delete"].as_bool().unwrap_or(false) {
+                return crate::plugins::delete_bundle_skill(Path::new(store_base), &name)
+                    .map(|_| format!("Skill deleted: {name}"));
+            }
+            let res = crate::plugins::save_bundle_skill(Path::new(store_base), body.clone())?;
+            let name_out = body["name"].as_str().unwrap_or(&name).to_string();
             // A skill the model just wrote is the USER's text: mark it so the
             // startup seeder cannot revert it behind their back.
-            if let Some(dir) = crate::skills::find_skill_dir_pub(Path::new(store_base), name_out) {
+            if let Some(dir) = crate::plugins::skill_dir_for(Path::new(store_base), &name_out) {
                 crate::skills::mark_user_edit(&dir);
             }
             // An empty keyword list leaves the catalog line English-only, so a
             // Persian request has no trigger to find the skill by: the model
             // must be told to fix it instead of believing the save was enough.
+            //
+            // The count is read from the REPLY — it is measured off the file that
+            // was actually written. Reading the request instead warned about an
+            // edit that omits `fa_keywords` on purpose (which KEEPS the stored
+            // list), so the model was told to "fix" a skill that was fine.
             let warning = if res["fa_keyword_count"].as_u64().unwrap_or(0) == 0 {
                 "\nWARNING: this skill has NO fa_keywords, so a Persian request has \
                  nothing to find it by. Call create_skill again with fa_keywords set \
@@ -1545,8 +2331,9 @@ pub fn dispatch_with_data_root(
                 ""
             };
             Ok(format!(
-                "Skill saved: {name_out}\nThe catalog in the system prompt now lists it, so it can be \
-                 loaded on demand in later turns.{warning}"
+                "Skill saved: {name_out} (bundle: {})\nThe catalog in the system prompt now lists \
+                 it, so it can be loaded on demand in later turns.{warning}",
+                res["slug"].as_str().unwrap_or("")
             ))
         }
         // Create or update an MCP connector from a command (the `/create-mcp`
@@ -1577,16 +2364,14 @@ pub fn dispatch_with_data_root(
                 cfg.insert("env".into(), json!(env));
             }
             let prev = s("previous_name");
-            if !prev.is_empty() && prev != name {
-                let _ = crate::skills::delete_mcp(Path::new(store_base), &json!({"name": prev}));
-            }
-            let res = crate::skills::save_mcp(
+            let res = crate::plugins::save_bundle_connector(
                 Path::new(store_base),
-                &json!({"name": name, "cfg": Value::Object(cfg)}),
+                &json!({"name": name, "previous_name": prev, "cfg": Value::Object(cfg)}),
             )?;
             Ok(format!(
-                "Connector saved: {}\nEnable it in the composer's MCP picker to use its tools.",
-                res["name"].as_str().unwrap_or(&name)
+                "Connector saved: {} (bundle: {})\nIt reaches the agent while that bundle is on.",
+                name,
+                res["slug"].as_str().unwrap_or("")
             ))
         }
         // Plugins: one folder bundling skills + MCP connectors behind a single
@@ -1597,16 +2382,29 @@ pub fn dispatch_with_data_root(
             let store = Path::new(store_base);
             match action.as_str() {
                 "list" => Ok(crate::plugins::list_plugins(store).to_string()),
-                "install" => crate::plugins::install_plugin(store, args).map(|v| v.to_string()),
-                "create" => crate::plugins::create_plugin(store, args).map(|v| v.to_string()),
-                "update" => crate::plugins::update_plugin(store, args).map(|v| v.to_string()),
+                "install" => crate::plugins::install_plugin(store, args).map(|v| {
+                    let warning = plugin_keyword_warning(store, &v["plugin"]);
+                    format!("{v}{warning}")
+                }),
+                // Creating and updating a bundle writes skills exactly like an
+                // install does, so both say the same thing when they land bare.
+                "create" => crate::plugins::create_plugin(store, args).map(|v| {
+                    let warning = plugin_keyword_warning(store, &v);
+                    format!("{v}{warning}")
+                }),
+                "update" => crate::plugins::update_plugin(store, args).map(|v| {
+                    let warning = plugin_keyword_warning(store, &v);
+                    format!("{v}{warning}")
+                }),
                 "toggle" => crate::plugins::toggle_plugin(store, args).map(|v| {
                     let on = v["enabled"].as_bool().unwrap_or(false);
                     format!("{}\n{}", if on { "Plugin enabled" } else { "Plugin disabled" }, v)
                 }),
                 "delete" => crate::plugins::delete_plugin(store, args).map(|v| v.to_string()),
+                "run" => crate::plugins::run_plugin_script(store, args).map(|v| v.to_string()),
                 other => Err(format!(
-                    "plugin requires action one of list/install/create/update/toggle/delete (got {other:?})"
+                    "plugin requires action one of list/install/create/update/toggle/delete/run \
+                     (got {other:?})"
                 )),
             }
         }
@@ -1883,6 +2681,17 @@ fn definition_end(lines: &[&str], start: usize) -> usize {
 /// (three model round trips) and needs no language server, so it works for
 /// every language. Case-sensitive, whole-word.
 pub fn find_symbol(root: &Path, symbol: &str, scope: &str, include: &str) -> Result<String, String> {
+    find_symbol_in(root, symbol, scope, include, None)
+}
+
+/// `find_symbol` with the turn's out-of-workspace permit (see `grep_scope_in`).
+pub fn find_symbol_in(
+    root: &Path,
+    symbol: &str,
+    scope: &str,
+    include: &str,
+    permit: Option<&Value>,
+) -> Result<String, String> {
     let symbol = symbol.trim();
     if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
         return Err(format!(
@@ -1893,7 +2702,7 @@ pub fn find_symbol(root: &Path, symbol: &str, scope: &str, include: &str) -> Res
     let scope_abs = if scope.is_empty() {
         root_real.clone()
     } else {
-        resolve_safe(root.to_str().unwrap_or("."), scope, true, None)?
+        resolve_safe(root.to_str().unwrap_or("."), scope, true, permit)?
     };
     let (search_dir, target) = if scope_abs.is_file() {
         (
@@ -1996,6 +2805,233 @@ pub fn find_symbol(root: &Path, symbol: &str, scope: &str, include: &str) -> Res
 mod tests {
     use super::*;
 
+    /// Every `plugin` action that WRITES a bundle must say when it landed bare.
+    ///
+    /// A skill's Persian trigger is its `fa_keywords`, and the model only sees a
+    /// JSON blob of names — so a bundle built by `action=create` (which is what
+    /// `/plugin create` hands to the agent) was written and reported as a plain
+    /// success, leaving a bundle no Persian request could ever reach. The warning
+    /// is what makes the model fill them in the same turn.
+    #[test]
+    fn every_plugin_write_warns_about_skills_left_without_keywords() {
+        let root = std::env::temp_dir().join(format!("codifa-plugin-warn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.to_str().unwrap();
+
+        // create: a skill with a description and NO keywords is exactly the case
+        // the model must be told about.
+        let made = dispatch_with_data_root(
+            base,
+            "plugin",
+            &json!({
+                "action": "create",
+                "name": "Bare Bundle",
+                "skills": [{"name": "Bare Skill", "content": "BODY"}]
+            }),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(made.contains("WARNING"), "create must warn: {made}");
+        assert!(made.contains("Bare Skill"), "the bare skill must be named: {made}");
+        // The reply stays machine-readable: the JSON comes FIRST, the warning after.
+        let first_line = made.lines().next().unwrap();
+        let parsed: Value = serde_json::from_str(first_line).expect("line 1 is still JSON");
+        assert_eq!(parsed["slug"], json!("bare-bundle"));
+
+        // update: fixing the skill through the tool must clear the warning.
+        let fixed = dispatch_with_data_root(
+            base,
+            "plugin",
+            &json!({
+                "action": "update",
+                "name": "Bare Bundle",
+                "skills": [{"name": "Bare Skill", "fa_keywords": "مهارت لخت"}]
+            }),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(!fixed.contains("WARNING"), "keywords now present: {fixed}");
+
+        // A read-only action answers plainly — no warning to react to.
+        let listed = dispatch_with_data_root(
+            base,
+            "plugin",
+            &json!({"action": "list"}),
+            None,
+            Some(base),
+        )
+        .unwrap();
+        assert!(!listed.contains("WARNING"), "list writes nothing: {listed}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A grep result must name the cheaper next step when its own output shows one.
+    ///
+    /// MEASURED: 53 of 118 main greps were followed by a read of a file the grep
+    /// had just listed (18 of them re-fetching a window that already contained a
+    /// printed hit line) and 12 rounds were spent on a pattern that matched
+    /// nothing. The three cases below are exactly those, and the fourth pins the
+    /// silent case so a plain word search never grows a hint it cannot pay for.
+    #[test]
+    fn grep_appends_a_followup_hint_only_when_it_pays() {
+        // A miss: never answer with a re-read of the same file.
+        let miss = grep_followup_hint("no_such_token_xyz", "no matches");
+        assert!(miss.contains("do not re-read"), "{miss}");
+
+        // Identifier-only patterns are what `find_symbol` takes.
+        let ident = grep_followup_hint("TracePanel", "src/a.ts:\n 12: class TracePanel {}\n");
+        assert!(ident.contains("find_symbol"), "{ident}");
+        let alt = grep_followup_hint("LLM|TOOL|FOLD", "src/a.rs:\n 3: const LLM: u8 = 1;\n");
+        assert!(alt.contains("find_symbol"), "{alt}");
+
+        // A regex/word pattern is grep-only: no identifier hint, but a many-file
+        // result still points at an outline instead of one read per file.
+        let many = "a.rs:\n 1: x\nb.rs:\n 2: x\nc.rs:\n 3: x\nd.rs:\n 4: x\ne.rs:\n 5: x\n";
+        let wide = grep_followup_hint("fn\\s+[a-z]+", many);
+        assert!(wide.contains("5 files matched"), "{wide}");
+        assert!(!wide.contains("plain identifier"), "{wide}");
+
+        // A small scoped result needs no advice at all.
+        let quiet = grep_followup_hint("fn\\s+x", "a.rs:\n 1: fn x() {}\n");
+        assert!(quiet.is_empty(), "{quiet}");
+
+        // The hint can never outgrow its budget, whatever the pattern looks like.
+        let huge: String = (0..400).map(|i| format!("sym{i}|")).collect();
+        let clipped = grep_followup_hint(&huge, "a.rs:\n 1: x\n");
+        assert!(clipped.chars().count() <= GREP_HINT_MAX + 1, "{}", clipped.chars().count());
+    }
+
+    /// An identifier grep must arrive WITH its `find_symbol` answer attached.
+    ///
+    /// MEASURED: 53 of 118 main greps were followed by a read of a file the grep
+    /// had just listed, and 19 patterns were bare identifiers — one `find_symbol`
+    /// answers those. Naming the tool in prose was refuted (423 of 863 rounds
+    /// carried the hint and the next rounds stayed single-call), so the answer is
+    /// fetched IN the grep round. The guards below pin why it stays silent for
+    /// everything else: a multi-alternative pattern asks several questions, a
+    /// miss is already covered by the miss hint, and a regex is not an identifier.
+    #[test]
+    fn identifier_grep_carries_the_symbol_answer_in_the_same_round() {
+        let tmp = std::env::temp_dir().join("codifa-ident-block-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("a.rs"),
+            "pub fn resolve_slot_chain() {}\nfn other() { resolve_slot_chain(); }\n",
+        )
+        .unwrap();
+        let root = tmp.to_str().unwrap();
+        let hits = "a.rs:\n 1: pub fn resolve_slot_chain() {}\n";
+
+        // A bare identifier with hits: the block carries definitions AND usages.
+        let block = identifier_symbol_block(root, "resolve_slot_chain", hits);
+        assert!(block.contains("find_symbol resolve_slot_chain"), "{block}");
+        assert!(block.contains("USAGES"), "{block}");
+
+        // A miss is the miss-hint's job — never fetch a symbol twice.
+        assert!(identifier_symbol_block(root, "resolve_slot_chain", "no matches").is_empty());
+        // Several alternatives ask several questions; only one has a definite answer.
+        assert!(identifier_symbol_block(root, "LLM|TOOL", hits).is_empty());
+        // A regex/word pattern is grep-only.
+        assert!(identifier_symbol_block(root, r"fn\s+x", hits).is_empty());
+        // A symbol the workspace does not contain adds nothing.
+        assert!(identifier_symbol_block(root, "no_such_symbol_xyz", hits).is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The trace flag must name EXACTLY the levers whose payload is in the text.
+    ///
+    /// The lever was previously judged by the round count alone, and that is how
+    /// the textual single-call hint looked effective for eight phases (423 of
+    /// 863 rounds carried it and nothing changed). The flag makes "did it fire"
+    /// a recorded fact, so it must track the marker, not the tool name.
+    #[test]
+    fn levers_fired_reads_the_marker_not_the_tool_name() {
+        let diag = format!("Successfully edited a.rs (1 edits applied).\n\n{POST_EDIT_DIAGNOSTICS_MARK} a.rs:1:1 error: nope");
+        assert_eq!(levers_fired("edit_file", &diag), vec!["post_edit_diagnostics"]);
+        // A silent edit (cold server, clean file) must NOT claim the lever.
+        assert!(levers_fired("edit_file", "Successfully edited a.rs").is_empty());
+        // The marker in the WRONG tool's result is not that tool's lever.
+        assert!(levers_fired("read", &diag).is_empty());
+
+        let sym = format!("a.rs:\n 1: fn x() {{}}\n\n{IDENTIFIER_SYMBOL_MARK}x — same round, no extra call]\nUSAGES\n 2: x();");
+        assert_eq!(levers_fired("grep", &sym), vec!["identifier_grep_symbol"]);
+        // The two read-side levers are counted from their own markers, so the
+        // ruler sees "merged N windows" / "already served" as a recorded fact.
+        let merged = format!("a.rs (lines 1-400):\n1: x\n{READ_MERGED_MARK}2 overlapping window(s)");
+        assert_eq!(levers_fired("read", &merged), vec!["read_windows_merged"]);
+        let served = "already returned above — these lines are in your context";
+        assert_eq!(levers_fired("read", served), vec!["read_already_served"]);
+        // The marker in the WRONG tool's result is not that tool's lever.
+        assert!(levers_fired("grep", &merged).is_empty());
+        // `find_symbol` in the schema is the MODEL calling it — a different
+        // thing from the backend attaching the answer to a grep.
+        assert!(levers_fired("grep", "no matches").is_empty());
+    }
+
+    /// Post-edit diagnostics must NEVER start a language server.
+    ///
+    /// A cold `rust-analyzer` (1921 MB, minutes of indexing) would turn a cheap
+    /// edit into a stall, so the helper returns silence unless a server is
+    /// already warm. This test pins that silence — and the bound, so a server
+    /// that lists hundreds of errors cannot blow the edit's own budget.
+    #[test]
+    fn post_edit_diagnostics_stays_silent_without_a_warm_server() {
+        let tmp = std::env::temp_dir().join("codifa-post-edit-diag-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.rs"), "fn a() {}\n").unwrap();
+        let root = tmp.to_str().unwrap();
+
+        // No server has ever run for this throwaway project, so this must return
+        // the empty string instead of spawning one.
+        let quiet = post_edit_diagnostics(root, "a.rs");
+        assert!(quiet.is_empty(), "{quiet}");
+        // An unusable path is silent too — diagnostics are a bonus, not a failure.
+        assert!(post_edit_diagnostics(root, "missing.rs").is_empty());
+        assert!(post_edit_diagnostics(root, "../escape.rs").is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A failed edit must hand the model the CURRENT text, not just a line number.
+    ///
+    /// MEASURED: 20 of 25 traced edit failures sent text the file no longer had,
+    /// and the bare "old_string not found" left the model to answer with a full
+    /// re-read (4 cases) or a re-sent stale batch (median 2 extra rounds per
+    /// failure). Both halves are pinned here: the near-miss comes back as a
+    /// numbered window of the real text, and an unrecognisable miss stays
+    /// EMPTY so the caller keeps the plain error instead of pointing at an
+    /// unrelated line.
+    #[test]
+    fn a_missed_edit_shows_the_current_text_window() {
+        let content = "fn alpha() {}\n\n    let total = compute_total(items);\n";
+
+        // A drifted copy of line 3: same start, different wording later on.
+        let hint = nearest_hint(content, "let total = compute_sum(items);");
+        assert!(hint.contains("current text"), "expected a window, got: {hint}");
+        assert!(hint.contains("compute_total"), "expected the real text, got: {hint}");
+        assert!(hint.contains("3:"), "expected line numbers, got: {hint}");
+        assert!(
+            hint.contains("do NOT re-read the whole file"),
+            "the window must forbid the re-read it replaces, got: {hint}"
+        );
+
+        // Whitespace-only drift: the text IS there, so the real line comes back.
+        let ws = nearest_hint(content, "        let total = compute_total(items);");
+        assert!(
+            ws.contains("compute_total") && ws.contains("current text"),
+            "expected the current text for a whitespace drift, got: {ws}"
+        );
+
+        // Nothing recognisable in the file: stay EMPTY rather than point at an
+        // unrelated line — the caller then keeps its plain error message.
+        let none = nearest_hint(content, "a_completely_unrelated_statement_xyz");
+        assert!(none.is_empty(), "expected an empty hint, got: {none}");
+    }
 
 
     /// delete_memory must remove exactly one note by the id search_memory hands
@@ -2132,6 +3168,178 @@ mod tests {
         assert!(read_window(&empty, 1, 400).unwrap().contains("is empty"));
         // A directory listing past the end explains itself the same way.
         assert!(list_dir(&dir, 999, 10).unwrap().contains("past the end"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_big_batch_keeps_every_window_instead_of_dropping_the_last_ones() {
+        // Measured on the real corpus: 5 of 61 `read` calls hit the flat 16_000
+        // char model cap, and 4 of those were followed by the SAME file again
+        // (backend_light.rs 10x, plugins.ts 7x, repo.rs 6x, TVKit.mq5 3x). The
+        // batch merged several windows into one string and the tail cut removed
+        // the last files outright, so the model re-read what it had just asked
+        // for — a batch that costs a round trip instead of saving one.
+        let dir = std::env::temp_dir().join(format!("codifa-readbig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 8 files x 120 lines of ~60 chars => ~60K chars, far past the 16K cap.
+        let mut ranges = Vec::new();
+        for i in 0..8 {
+            let name = format!("f{i}.txt");
+            let body: String = (1..=120).map(|l| format!("file{i} line{l} {}\n", "x".repeat(40))).collect();
+            fs::write(dir.join(&name), body).unwrap();
+            ranges.push(json!({"path": name, "offset": 1, "limit": 120}));
+        }
+        let root = dir.to_str().unwrap().to_string();
+        let out = dispatch(&root, "read", &json!({"ranges": ranges}), None).unwrap();
+
+        // Every one of the 8 windows is represented — none silently vanished.
+        for i in 0..8 {
+            assert!(
+                out.contains(&format!("f{i}.txt (lines")),
+                "window {i} was dropped from the batch"
+            );
+        }
+        // The whole result still respects the one budget the turn loop enforces.
+        assert!(
+            out.chars().count() <= crate::agent::MODEL_RESULT_CAP,
+            "batch produced {} chars, over the model cap",
+            out.chars().count()
+        );
+        // What had to be cut says exactly where to resume.
+        assert!(
+            out.contains("window truncated at line") && out.contains("offset="),
+            "a cut window must name its resume offset, got: {out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_windows_of_one_file_merge_into_their_union() {
+        // Traced on the real corpus: 42 batches carried overlapping windows of
+        // the SAME file (6_928 lines ~ 381K chars delivered twice inside one
+        // call), because the model stitches a file together from the pieces a
+        // precedent grep or report named. The union is lossless.
+        let merged = merge_read_targets(vec![
+            ("a.rs".into(), 100, 50),
+            ("a.rs".into(), 120, 80),
+            ("a.rs".into(), 9000, 20),
+            ("b.rs".into(), 1, 400),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                ("a.rs".to_string(), 100, 100),
+                ("a.rs".to_string(), 9000, 20),
+                ("b.rs".to_string(), 1, 400),
+            ]
+        );
+        // Adjacent windows (a top-down walk) join too — one header instead of
+        // two, and no seam the model has to re-read.
+        assert_eq!(
+            merge_read_targets(vec![
+                ("a.rs".into(), 1, 130),
+                ("a.rs".into(), 130, 120),
+            ]),
+            vec![("a.rs".to_string(), 1, 249)]
+        );
+        // An exact duplicate collapses (the old dedupe behaviour is preserved).
+        assert_eq!(
+            merge_read_targets(vec![("a.rs".into(), 1, 400), ("a.rs".into(), 1, 400)]),
+            vec![("a.rs".to_string(), 1, 400)]
+        );
+        // Disjoint windows stay separate: a merge must never invent a range
+        // that pulls in lines nobody asked for.
+        assert_eq!(
+            merge_read_targets(vec![("a.rs".into(), 1, 10), ("a.rs".into(), 500, 10)]),
+            vec![("a.rs".to_string(), 1, 10), ("a.rs".to_string(), 500, 10)]
+        );
+        // A zero limit means the DEFAULT window only when it is ABSENT — an
+        // explicit 0 selects no line, and the merge must not inflate it.
+        assert_eq!(
+            merge_read_targets(vec![("a.rs".into(), 5, 0)]),
+            vec![("a.rs".to_string(), 5, 0)]
+        );
+    }
+
+    #[test]
+    fn read_ranges_carry_the_file_and_never_repeat_it() {
+        // A bare `paths` list forced ONE window on every file and could name the
+        // same file twice — the same bytes sent to the model twice. Batches now
+        // live in `ranges`, where every entry carries its own file AND window,
+        // so several known files still cost ONE call with nothing read twice.
+        let dir = std::env::temp_dir().join(format!("codifa-readranges-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a1\na2\n").unwrap();
+        fs::write(dir.join("b.txt"), "b1\nb2\n").unwrap();
+        let root = dir.to_str().unwrap().to_string();
+
+        // ONE call, two files, a different window each.
+        let out = dispatch(
+            &root,
+            "read",
+            &json!({"ranges": [
+                {"path": "a.txt", "offset": 1, "limit": 1},
+                {"path": "b.txt", "offset": 2, "limit": 1}
+            ]}),
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("a1") && out.contains("b2"), "{out}");
+        assert!(!out.contains("a2") && !out.contains("b1"), "{out}");
+
+        // A repeated entry collapses, so identical bytes never go twice. The
+        // collapse is ANNOUNCED (the marker the ruler counts) — strip it before
+        // comparing, so this assertion stays about the payload, not the note.
+        let once = dispatch(&root, "read", &json!({"ranges": [{"path": "a.txt"}]}), None).unwrap();
+        let twice = dispatch(
+            &root,
+            "read",
+            &json!({"ranges": [{"path": "a.txt"}, {"path": "a.txt"}]}),
+            None,
+        )
+        .unwrap();
+        let body = |s: &str| {
+            s.split(READ_MERGED_MARK).next().unwrap_or(s).trim_end().to_string()
+        };
+        assert_eq!(body(&once), body(&twice), "a duplicate range must collapse");
+        assert!(
+            twice.contains(READ_MERGED_MARK),
+            "the collapse is recorded in the result: {twice}"
+        );
+
+        // An entry without `path` inherits the top-level filePath, so a
+        // single-file multi-window read stays short.
+        let inherited = dispatch(
+            &root,
+            "read",
+            &json!({"filePath": "b.txt", "ranges": [{"offset": 2, "limit": 1}]}),
+            None,
+        )
+        .unwrap();
+        assert!(inherited.contains("b2") && !inherited.contains("b1"), "{inherited}");
+
+        // The legacy list form still WORKS (a stale transcript must not burn a
+        // round trip) but is no longer advertised, and the shared dedupe
+        // collapses the repeated file the old shape allowed.
+        let legacy = dispatch(
+            &root,
+            "read",
+            &json!({"paths": ["a.txt", "a.txt", "b.txt"]}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.matches("a1").count(),
+            1,
+            "the legacy list form must not read a file twice: {legacy}"
+        );
+        assert!(legacy.contains("b1"), "{legacy}");
+
+        // A range entry that names no file at all is an explicit error.
+        let err = dispatch(&root, "read", &json!({"ranges": [{"offset": 1}]}), None).unwrap_err();
+        assert!(err.contains("names no file"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2427,10 +3635,24 @@ mod tests {
                 { "old_string": "missing", "new_string": "x" }
             ]
         });
+        // PARTIAL, not all-or-nothing: the good edit is WRITTEN and the bad one
+        // is named. Traced on the live corpus, the old atomic form made 8 of 84
+        // batch edits throw away their good half, and each recovery cost a median
+        // of 2 extra rounds (18 rounds, 4 of them a blind re-read of the file).
+        let msg = dispatch(root, "edit_file", &args, None).unwrap();
+        assert!(msg.contains("PARTIAL"), "{msg}");
+        assert!(msg.contains("1/2"), "{msg}");
+        assert!(msg.contains("edit 2/2: old_string not found"), "{msg}");
+        assert!(msg.contains("send ONLY the failed one"), "{msg}");
+        assert!(fs::read_to_string(&file).unwrap().contains("uno"));
+
+        // A batch where NOTHING applies still fails, so the caller sees an error.
+        let args = json!({
+            "path": "f.txt",
+            "edits": [{ "old_string": "nope", "new_string": "x" }]
+        });
         let err = dispatch(root, "edit_file", &args, None).unwrap_err();
-        assert!(err.contains("edit 2/2: old_string not found"));
-        // Batch is atomic: a failed edit leaves the file untouched.
-        assert!(!fs::read_to_string(&file).unwrap().contains("uno"));
+        assert!(err.contains("no edit applied"), "{err}");
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2454,3 +3676,4 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 }
+

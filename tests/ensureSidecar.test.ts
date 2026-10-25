@@ -127,6 +127,29 @@ console.log('۶) normalizeSystemPromptKeys: legacy backend keys → canonical mo
   check('canonical key wins over legacy', both.ask === 'new prompt', both)
 }
 
+console.log('۷) پل IPC غایب است (window.coder نیست) → رد نمیشود، null برمیگردد:')
+{
+  // A bare browser (or the UI harness without the preload stub) has no
+  // `window.coder`, so `api.getSidecarUrl()` throws instead of returning null.
+  // Before the fix that rejection escaped `ensureSidecar`, and the marketplaces
+  // tab stayed on "Reading the index…" forever because its `setLoading(false)`
+  // never ran. The contract is: this function NEVER rejects.
+  reset()
+  const orig = (globalThis as any).window.coder.getSidecarUrl
+  ;(globalThis as any).window.coder.getSidecarUrl = () => {
+    throw new Error('Cannot read properties of undefined (reading \'getSidecarUrl\')')
+  }
+  let url: string | null | 'rejected' = 'rejected'
+  try {
+    url = await ensureSidecar()
+  } catch {
+    url = 'rejected'
+  }
+  check('reject نمیشود', url !== 'rejected', url)
+  check('null به معنی «بکاند نیست»', url === null, url)
+  ;(globalThis as any).window.coder.getSidecarUrl = orig
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست شکست خورد`)
   process.exit(1)

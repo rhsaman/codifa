@@ -296,8 +296,8 @@ function UsagePopoverImpl({ view, style, onMouseEnter, onMouseLeave }: UsagePopo
                 const itemTitle = splitTooltip(fresh, cached);
                 return (
                   <li key={e.model} className="usage-row">
-                    <span className="usage-model" title={e.model}>
-                      {e.model ? e.model.split("/").pop() : "main"}
+                    <span className="usage-model" title={e.model || "main"}>
+                      {e.model || "main"}
                     </span>
                     <span
                       className="usage-tokens"

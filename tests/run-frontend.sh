@@ -72,6 +72,7 @@ sections|tests/sections.test.ts|-
 browserViewport|tests/browserViewport.test.ts|--packages=external --external:electron
 mcpTools|tests/mcpTools.test.ts|--packages=external --external:electron
 forkSection|tests/forkSection.test.ts|--external:electron
+forkChat|tests/forkChat.test.ts|--packages=external --external:electron
 readingMode|tests/readingMode.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 loadingScreen|tests/loadingScreen.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 updater-core|tests/updater-core.test.ts|-
@@ -90,8 +91,13 @@ contextUsed|tests/contextUsed.test.ts|--packages=external --external:electron
 link|tests/link.test.ts|-
 skills|tests/skills.test.ts|--packages=external --external:electron
 skillsCache|tests/skillsCache.test.ts|--packages=external --external:electron
-thinking|tests/thinking.test.ts|-
+thinking|tests/thinking.test.ts|--packages=external --external:electron
 ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electron
+marketplaceBrowse|tests/marketplaceBrowse.test.ts|--packages=external --external:electron
+marketplaceDefaults|tests/marketplaceDefaults.test.ts|-
+keywordFill|tests/keywordFill.test.ts|--packages=external --external:electron
+repoAddress|tests/repoAddress.test.ts|-
+cmdContext|tests/cmdContext.test.ts|-
 transcribe|tests/transcribe.test.ts|--packages=external --external:electron
 voice|tests/voice.test.ts|-
 webResults|tests/webResults.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
@@ -128,6 +134,7 @@ codeBlock|tests/codeBlock.ssr.test.tsx|--jsx=automatic --packages=external --ali
 lineCaption|tests/lineCaption.test.ts|--external:electron
 watchdog|tests/watchdog.test.ts|-
 fetchAndPersist|tests/fetchAndPersist.test.ts|--packages=external --external:electron
+providerBaseUrl|tests/providerBaseUrl.test.ts|--packages=external --external:electron
 contextCapacityPersist|tests/contextCapacityPersist.test.ts|--packages=external --external:electron
 usageChip|tests/usageChip.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 traceNarration|tests/traceNarration.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -144,8 +151,10 @@ todosPanel|tests/todosPanel.ssr.test.tsx|--jsx=automatic --packages=external --e
 turnUsage|tests/turnUsage.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 toolSkillCard|tests/toolSkillCard.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 terminalPanel|tests/terminalPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
+terminalSpawn|tests/terminalSpawn.test.ts|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalPanelClosed|tests/terminalPanelClosed.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 providerModelSelect|tests/providerModelSelect.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
+toolFallbackAdd|tests/toolFallbackAdd.test.ts|--packages=external --external:electron
 settingsNoFetch|tests/settingsNoFetch.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 modelTest|tests/modelTest.test.tsx|--jsx=automatic --packages=external --external:electron
 manualContext|tests/manualContext.test.ts|--packages=external --external:electron
@@ -176,18 +185,20 @@ fileComment|tests/fileComment.test.ts|
 selectionBar|tests/selectionBar.test.ts|
 workspacePath|tests/workspacePath.test.ts|
 cmuxNvim|tests/cmuxNvim.test.ts|-
+nvimEdit|tests/nvimEdit.test.ts|-
+nvimTerminals|tests/nvimTerminals.test.ts|--packages=external --external:electron
 historySubmit|tests/historySubmit.test.ts|-
 historyPayload|tests/historyPayload.test.ts|-
 historyWindow|src/lib/historyWindow.test.ts|
-viewerTabRail|tests/viewerTabRail.ssr.test.tsx|--jsx=automatic --loader:.mp3=file --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+viewerTabRail|tests/viewerTabRail.ssr.test.tsx|--jsx=automatic --loader:.mp3=file --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --external:electron
 retryCadence|tests/retryCadence.test.ts|--packages=external --external:electron
 undoRedo|tests/undoRedo.test.ts|--packages=external --external:electron
 inputSuppress|src/lib/inputSuppress.test.ts|
 settingsSuggestions|tests/settingsSuggestions.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 xtermTheme|tests/xtermTheme.test.ts|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
+terminalTab|tests/terminalTab.test.ts|--packages=external --external:electron
+terminalSessionKeys|tests/terminalSessionKeys.test.ts|--packages=external --external:electron --alias:@xterm/xterm=./tests/xterm-spy.js --alias:@xterm/addon-fit=./tests/xterm-spy.js --alias:@xterm/addon-web-links=./tests/xterm-spy.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js
 terminalTheme|tests/terminalTheme.test.ts|-
-terminalPlacement|tests/terminalPlacement.test.ts|--packages=external --external:electron
-terminalPlacementSsr|tests/terminalPlacement.ssr.test.tsx|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 fileTree|tests/fileTree.test.ts|--packages=external --external:electron
 fileActions|tests/fileActions.test.ts|--packages=external --external:electron
 viewerFilesKind|tests/viewerFilesKind.test.ts|--packages=external --external:electron
@@ -201,6 +212,10 @@ stt|src/lib/stt.test.ts|
 localLive|src/lib/localLive.test.ts|
 liveSession|src/lib/liveSession.test.ts|
 livePrompt|src/lib/livePrompt.test.ts|
+paging|tests/paging.test.ts|-
+fuzzy|tests/fuzzy.test.ts|-
+pluginDetail|tests/pluginDetail.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+browserPanelMemory|src/lib/browserPanelMemory.test.ts|
 EOF
 
 # Split into per-job files (zero-padded so glob order == list order).

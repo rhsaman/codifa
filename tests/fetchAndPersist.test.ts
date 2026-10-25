@@ -155,6 +155,7 @@ function mkStore(initial: ProviderConfig[]): StoreLike & { calls: { method: stri
     setProviderContextMap: (id, data) => calls.push({ method: 'setProviderContextMap', args: [id, data] }),
     setProviderPricingMap: (id, data) => calls.push({ method: 'setProviderPricingMap', args: [id, data] }),
     setProviderReasoningMap: (id, data) => calls.push({ method: 'setProviderReasoningMap', args: [id, data] }),
+    setProviderThinkingLevelsMap: (id, data) => calls.push({ method: 'setProviderThinkingLevelsMap', args: [id, data] }),
     setProviderModels: (id, models) => calls.push({ method: 'setProviderModels', args: [id, models] }),
     healStaleModels: (id, validModels) => calls.push({ method: 'healStaleModels', args: [id, validModels] }),
     updateProvider: (id, patch) => calls.push({ method: 'updateProvider', args: [id, patch] }),
@@ -176,6 +177,7 @@ function mkResult(models: string[]): ModelsResult {
     context: { [models[0] ?? 'a']: 8192 },
     pricing: { [models[0] ?? 'a']: { input: 0, output: 0 } },
     reasoning: { [models[0] ?? 'a']: false },
+    thinkingLevels: { [models[0] ?? 'a']: ['none', 'high'] },
   }
 }
 
@@ -246,6 +248,7 @@ await run(
       'setProviderContextMap',
       'setProviderPricingMap',
       'setProviderReasoningMap',
+      'setProviderThinkingLevelsMap',
       'setProviderModels',
       // provider بدون model → auto-pick اولین مدل کاتالوگ
       'updateProvider',

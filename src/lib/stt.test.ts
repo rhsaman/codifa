@@ -28,6 +28,8 @@ const {
   decimationKernel,
   trimSilence,
   normalizePeak,
+  normalizeTranscript,
+  sttDecodeFields,
   NORMALIZE_TARGET_PEAK,
   SILENCE_RMS,
 } = await import('./stt')
@@ -254,6 +256,86 @@ console.log('8) the merge sees one Persian word through its spellings:')
   check('harakat do not break the match', mergeTranscripts('این كَتاب', 'کتاب خوب') === 'این كَتاب خوب', {
     got: mergeTranscripts('این كَتاب', 'کتاب خوب'),
   })
+}
+
+console.log('9) a raw transcript is delivered in Persian spelling:')
+{
+  // Whisper returns Arabic look-alike letters for Persian yeh/kaf/heh. The word
+  // is right, the spelling is not — and it never matches what the user types.
+  check('Arabic yeh becomes Persian yeh', normalizeTranscript('ميروم') === 'میروم', {
+    got: normalizeTranscript('ميروم'),
+  })
+  check('alef maqsura becomes Persian yeh', normalizeTranscript('على') === 'علی', {
+    got: normalizeTranscript('على'),
+  })
+  check('Arabic kaf becomes Persian kaf', normalizeTranscript('كتاب') === 'کتاب', {
+    got: normalizeTranscript('كتاب'),
+  })
+  check('ta-marbuta becomes heh', normalizeTranscript('مدرسة') === 'مدرسه', {
+    got: normalizeTranscript('مدرسه'),
+  })
+  check(
+    'a whole sentence is folded',
+    normalizeTranscript('ميروم كتاب را بگيرم') === 'میروم کتاب را بگیرم',
+    { got: normalizeTranscript('ميروم كتاب را بگيرم') },
+  )
+  // Reading-changing characters must survive: folding them would invent a word.
+  check('hamza on alef is never folded away', normalizeTranscript('أمدم') === 'أمدم', {
+    got: normalizeTranscript('أمدم'),
+  })
+  check('hamza on yeh is never folded away', normalizeTranscript('مسئله') === 'مسئله', {
+    got: normalizeTranscript('مسئله'),
+  })
+  // A half-space is a real word boundary in Persian: dropping it glues words.
+  check('ZWNJ is preserved', normalizeTranscript('نیم\u200cفاصله') === 'نیم\u200cفاصله', {
+    got: normalizeTranscript('نیم\u200cفاصله'),
+  })
+  check('harakat are dropped', normalizeTranscript('كَتَبَ') === 'کتب', { got: normalizeTranscript('كَتَبَ') })
+  check('tatweel is dropped', normalizeTranscript('كتـــاب') === 'کتاب', {
+    got: normalizeTranscript('كتـــاب'),
+  })
+  // The invisible separators a model emits between words are word separators,
+  // not something to delete — deleting them glues mixed-script text.
+  check(
+    'an invisible separator becomes a space, not a deletion',
+    normalizeTranscript('سلام\u200bworld') === 'سلام world',
+    { got: normalizeTranscript('سلام\u200bworld') },
+  )
+  check('bidi controls are stripped', normalizeTranscript('س\u2066لام') === 'سلام', {
+    got: normalizeTranscript('س\u2066لام'),
+  })
+  check('whitespace is collapsed', normalizeTranscript('  سلام   خوبی  ') === 'سلام خوبی', {
+    got: normalizeTranscript('  سلام   خوبی  '),
+  })
+  check('empty input stays empty', normalizeTranscript('') === '')
+  check('Latin text is untouched', normalizeTranscript('hello world') === 'hello world')
+  // The merge must see both spellings as one word, so folding happens BEFORE it.
+  const folded = normalizeTranscript('ميروم')
+  check('the folded text still merges on overlap', mergeTranscripts(folded, 'میروم خانه') === 'میروم خانه', {
+    got: mergeTranscripts(folded, 'میروم خانه'),
+  })
+}
+
+console.log('10) decoding is pinned so the same clip cannot flip a word:')
+{
+  check(
+    'a whisper model gets greedy decoding',
+    sttDecodeFields('whisper-1').temperature === '0',
+    { got: sttDecodeFields('whisper-1') },
+  )
+  check(
+    'a faster-whisper / large-v3 style name is still whisper',
+    sttDecodeFields('Systran/faster-whisper-large-v3').temperature === '0',
+  )
+  check(
+    'a missing model defaults to whisper on the server, so it is pinned too',
+    sttDecodeFields(undefined).temperature === '0',
+  )
+  check(
+    'a non-whisper model opts out instead of risking a 400',
+    Object.keys(sttDecodeFields('gpt-4o-transcribe')).length === 0,
+    { got: sttDecodeFields('gpt-4o-transcribe') },
+  )
 }
 
 console.log('\nall stt checks passed')

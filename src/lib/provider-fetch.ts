@@ -13,7 +13,7 @@ import { fetchModels, type ModelsResult } from './api'
 import { DEFAULT_CONTEXT_WINDOW } from './context'
 import { useStore } from './store'
 import { isForeignModelId } from './provider-meta'
-import type { ProviderConfig } from '../types'
+import type { ProviderConfig, ThinkingLevel } from '../types'
 
 export type FetchSkipReason = 'no-base-url' | 'disabled'
 
@@ -30,6 +30,7 @@ export interface StoreLike {
     data: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>,
   ) => void
   setProviderReasoningMap: (id: string, data: Record<string, boolean>) => void
+  setProviderThinkingLevelsMap: (id: string, data: Record<string, ThinkingLevel[]>) => void
   setProviderModels: (id: string, models: string[]) => void
   healStaleModels: (id: string, validModels: string[]) => void
   updateProvider: (id: string, patch: Partial<ProviderConfig>) => void
@@ -189,6 +190,7 @@ export async function fetchAndPersist(
     )
     store.setProviderPricingMap(p.id, res.pricing)
     store.setProviderReasoningMap(p.id, res.reasoning)
+    store.setProviderThinkingLevelsMap(p.id, res.thinkingLevels)
 
     if (res.models.length === 0) return { ok: true, count: 0 }
 

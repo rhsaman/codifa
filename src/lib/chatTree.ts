@@ -37,6 +37,22 @@ export function clampSize(n: number): number {
   return Math.max(0.25, Math.min(4, n))
 }
 
+/** Flex weights for one split's children, normalized so they always sum to 1.
+ *
+ *  CSS distributes free space as `grow / max(1, Σgrow)`, so a split whose
+ *  children happen to sum below 1 (sizes are clamped per child to [0.25, 4],
+ *  and hiding one child with display:none drops its weight from the sum)
+ *  fills only that fraction and leaves the rest of the row/column blank.
+ *  Scaling every weight by the same factor keeps every plain ratio intact
+ *  while guaranteeing a fully covered track. */
+export function flexWeights(sizes: number[]): number[] {
+  let total = 0
+  for (const s of sizes) total += Number.isFinite(s) && s > 0 ? s : 0
+  if (!(total > 0)) return sizes.map(() => 1)
+  const k = Math.max(1, total)
+  return sizes.map((s) => ((Number.isFinite(s) && s > 0 ? s : 0) / total) * k)
+}
+
 /** Minimum pane size in px: below this the chat text and composer break.
  *  Mirrored in CSS (.chat-windows.tree .chat-window and split children). */
 export const CHAT_WINDOW_MIN_W = 400
@@ -242,6 +258,13 @@ export function normalizeTree(
     if (next !== c) changed = true
   }
   if (children.length === 0) return null
+  // A split whose siblings were all removed keeps its wrapper (see above),
+  // but the survivor's stale grow factor (e.g. 0.25) would leave the rest of
+  // the row/col empty — a lone child must claim all the space again.
+  if (children.length === 1 && children[0].size !== 1) {
+    children[0] = { ...children[0], size: 1 }
+    changed = true
+  }
   if (!changed) return node
   return { ...node, children }
 }

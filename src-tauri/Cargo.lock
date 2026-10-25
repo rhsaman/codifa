@@ -780,6 +780,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "chrono",
+ "core-graphics 0.23.2",
  "csv",
  "dirs 5.0.1",
  "futures-util",

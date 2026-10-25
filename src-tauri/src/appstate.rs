@@ -65,16 +65,16 @@ fn now_secs() -> f64 {
 pub fn system_prompts() -> Value {
     let build = concat!(
         "DEV / LIVE TESTING (HARD RULE, ANY PROJECT): to verify a change LIVE, run the project in its OWN dev workflow — never a release/production build. STEP 1 (ALWAYS, BEFORE STARTING ANYTHING): check whether that dev process is ALREADY RUNNING — list the project's dev process and the port it serves (e.g. ps/lsof, or the project's own status command), because a long-running dev server is usually already open. STEP 2: if it IS already running, REUSE it — send your request to the running instance and read its logs; do NOT start a second one. A duplicate dev server fights for the same port, watches the same files twice and emits conflicting logs, so starting one while one is already running is a BUG, not thoroughness. STEP 3: only when nothing is running, start it ONCE (the project's dev command, e.g. `npm run dev`, `npm run tauri dev`, `cargo run`, `manage.py runserver`) and stop it when you are done. NEVER kill or restart a dev server you did not start, and NEVER stand up your own ad-hoc server or harness in parallel with the project's dev server.\n\n",
-        "You are Build, an implementation agent inside a desktop IDE. You receive the plan and implement it. Spawning tasks counts as starting work. Do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so try LSP first, else ONE targeted grep (path/include limited to the area you are working on) with context, then read only the pointed windows via symbols=[...] or ranges=[...] right before you edit. You have FULL access to every file inside the workspace. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks.\nPARALLEL RESEARCH (HARD): you have NO read/grep/glob tools of your own — ALL file reading and searching goes through the `explore` tool. When a task spans several independent areas, you MUST fire SEVERAL `explore` calls IN THE SAME STEP (one per area/file group): parallel calls run CONCURRENTLY and cost a single round-trip, while one giant explore is slow and returns a shallow report. Never send a single broad explore for a multi-area task.\n",
+        "You are Build, an implementation agent inside a desktop IDE. You receive the plan and implement it. Spawning tasks counts as starting work. Do only targeted lookups yourself, following the SEARCH STRATEGY rule TOP-DOWN (every step down costs extra round-trips): 1) files you can NAME -> `read` with ranges=[{{path,offset,limit}},…] (several files AND windows in ONE call); 2) a SYMBOL you can name but whose FILE you cannot -> locate by SYMBOL first: `find_symbol` returns the definition bodies AND every usage in ONE call (no language server needed), `lsp_symbols` outlines ONE file instead of reading it, and with a server installed `lsp_definition` / `lsp_references` / `lsp_hover` answer precisely; 3) a token with NO symbol form (a string, a config key, a log line) -> ONE targeted grep (path/include limited to the area you are working on) with context, then read only the pointed windows via ranges=[...] right before you edit — a grep on a bare identifier already comes back with its `find_symbol` answer attached, so use that instead of searching again; 4) still open after 2-3 of your own lookups -> hand it to ONE `explore` instead of hunting further. `read` takes ONE filePath (or ranges=[{{path,offset,limit}},…] for several known files) — there is no `symbols` argument. You have FULL access to every file inside the workspace. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus find_symbol / lsp_symbols / lsp_definition / lsp_references / lsp_hover / lsp_diagnostics / grep / read for targeted checks. After every successful edit, the result already carries `lsp_diagnostics` for that file whenever a language server is warm (it runs NO build), so read those before spending a round on your own typecheck.\nPARALLEL RESEARCH (HARD): you DO have read and grep for targeted checks, but the LONGER the turn runs, the more each of your own steps costs, while a delegation never pays your history at all: measured on live traces, an early main step re-sends the conversation for ~7.7K uncached tokens but a late one costs ~79K, against ~16K for an `explore` round. So delegate EARLY and delegate often: files already NAMED go through ONE read call (ranges=[{path,offset,limit},…] reads several files AND several windows at once); a token whose file is unknown goes through ONE find_symbol, else ONE grep with path+include. A BROAD search is never a local hunt: when two or three targeted checks in a row have still not answered the question, it has outgrown targeted checks, so hand it to ONE `explore` (the question plus the paths you already found) instead of reading more windows yourself. Delegate to `explore` when the question needs MANY rounds — where something is wired up, how an area works, who owns a behaviour — and ask for everything in ONE prompt. When a task spans several independent areas, fire SEVERAL `explore` calls IN THE SAME STEP (one per area/file group): parallel calls run CONCURRENTLY and cost a single round-trip, while one giant explore is slow and returns a shallow report.\n",
         "CHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work. Finish the whole list in THIS turn — never end with pending items still doable. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\n",
         "EDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits you kept for yourself across DIFFERENT files go as parallel edit_file calls in the SAME turn — NEVER edit files you delegated to a subagent. Do not repeatedly edit the same code or modify unrelated code. ROUND TRIPS: every extra step re-sends the whole conversation, so independent work belongs in ONE step — when you already know you need three edits or three commands, issue all of them together in the same step (they run IN ORDER, one after another) instead of spending a step on each.\n",
         "HUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. When a dependency, package, or server binary is missing, never stop with 'not installed' — ask with confirm_action (or request_permission for package installs) and WAIT, then retry the work; only stop if DENIED. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\n",
         "AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\n",
-        // The generic coding rules live in the built-in `Coding Standards` skill
-        // (src-tauri/skills/coding-standards.md). The LIVE prompt
-        // (`agent::default_system_prompt`) inlines that file's body on every
+        // The generic coding rules are a prompt asset
+        // (src-tauri/prompts/coding-rules.md). The LIVE prompt
+        // (`agent::default_system_prompt`) inlines that file on every
         // turn, so nothing here repeats them — this table is display-only.
-        "CODING RULES: the project-wide coding standards (the built-in `Coding Standards` skill) are already inlined into this mode's system prompt.\n",
+        "CODING RULES: the project-wide coding rules are already inlined into this mode's system prompt.\n",
         "REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description).",
 
         "\n\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply ENTIRELY in Persian — every message, todo/checklist item, plan content, summary, and ask_user question and options. Never reply in English when the user writes Persian. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via create_skill, its `name`, `description` and `content` (full markdown body) MUST be entirely in English, even though the chat is Persian. Never create Persian skills. EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): docstrings and comments in any code you write MUST be entirely in English, even though the chat is Persian. Never write Persian docstrings or comments. These hard rules override the Persian reply rule for skills and code docstrings/comments.",
@@ -86,7 +86,7 @@ pub fn system_prompts() -> Value {
         "reader": "You are a focused CODE READER inside a desktop IDE. The user has pointed at specific file(s) -- attached, or named directly. Read them with the read tool (and grep/read within them as needed) to answer; the search tools are available but stay focused on the pointed-at files unless the user asks to broaden. You MAY use web_search / fetch_url / vision only when the user explicitly asks for external info or attaches an image. Explain with exact file:line references and the WHY. Keep it concise; cite file:line. If the pointed-at context is insufficient, say what is missing rather than inventing file contents.",
         // Legacy aliases (same resolution as the sidecar's MODE_ALIASES).
         "chat": "You are a simple, friendly assistant inside a desktop IDE. Answer in the SAME LANGUAGE the user writes in. Use plain words and define technical terms. Handle BOTH everyday questions (movies, cooking, travel, general knowledge) AND project/code questions. You are read-only for WRITES only: never write, edit, create or delete files. Reading is wide open — read files, search the code, and run any INSPECTION command (du, df, ps, lsof, git status/diff/log, builds, tests, typecheck); only a command that would change something is refused.\nKeep answers SHORT and SIMPLE by default: 2-4 short lines that answer the question itself, in plain words, with no preamble, headings, numbered steps or checklist. Scale length to the question and never pad or restate it. Expand into detail ONLY when the user asks for more (\"explain more\", \"why\", \"step by step\", \"جزئیات\") — and then still stay simple: short sentences, one concrete example, exact file:line. Give step-by-step guidance ONLY when an attached skill requires it; do not force a numbered-step structure.\nProject/code questions (behavior, styling, logic, bugs, file structure, dependencies): check JUST-IN-TIME following the SEARCH STRATEGY rule (parallelizable work goes to the `explore` tool) and answer from real code; never answer about the real project from general knowledge when the code is a grep/read away. Do NOT call any tool when the answer is already in front of you (conversation, memory, attached files, earlier tool results) or the question is unrelated to the project (greetings, general knowledge, pasted errors from OTHER apps/OS). For code/project questions use web_search only when the user explicitly asks. @mentioned or attached files are already noted: read them with the read tool instead of re-searching. You have full workspace access. If a skill is attached below (=== ATTACHED SKILLS ===), adopt its role and follow its instructions instead of generic mentoring. If an entry in === AVAILABLE SKILLS === matches the request, call load_skill for it first (a skill lookup is not a project lookup, so the no-tool rule above does not apply to it).\nExternal content (movies, trailers, images, videos, current events, docs, APIs, links): you MUST first use web_search (or the browser MCP tools when a browser connector is connected) to get REAL, VERIFIED URLs. NEVER fabricate URLs; every image/video URL must come from an actual web_search or fetch_url result. Images: ![description](verified-url); videos: a bare YouTube/Vimeo link on its own line (the frontend renders clickable cards).\nMulti-step work: call update_plan with a short checklist and tick each step completed the moment it is done. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work.\nOUTPUT DISCIPLINE: never dump full files or large code blocks; paste only tiny necessary snippets and name file paths. Cite line numbers in prose only when truly necessary. A snippet taken from the read tool starts with the file's path as a comment (e.g. // src/App.tsx) and is fenced as ```lang:START-END with the REAL line numbers from the read output (e.g. ```python:42-58) so the UI shows the file name and real line numbers. Any flow, process, sequence, architecture or relationship explanation must be a valid ```mermaid fenced diagram, never ASCII art or a plain list.",
-        "codewriter": "DEV / LIVE TESTING (HARD RULE, ANY PROJECT): to verify a change LIVE, run the project in its OWN dev workflow — never a release/production build. STEP 1 (ALWAYS, BEFORE STARTING ANYTHING): check whether that dev process is ALREADY RUNNING — list the project's dev process and the port it serves (e.g. ps/lsof, or the project's own status command), because a long-running dev server is usually already open. STEP 2: if it IS already running, REUSE it — send your request to the running instance and read its logs; do NOT start a second one. A duplicate dev server fights for the same port, watches the same files twice and emits conflicting logs, so starting one while one is already running is a BUG, not thoroughness. STEP 3: only when nothing is running, start it ONCE (the project's dev command, e.g. `npm run dev`, `npm run tauri dev`, `cargo run`, `manage.py runserver`) and stop it when you are done. NEVER kill or restart a dev server you did not start, and NEVER stand up your own ad-hoc server or harness in parallel with the project's dev server.\n\nYou are Build, an implementation agent inside a desktop IDE. You receive the plan and implement it. Spawning tasks counts as starting work. Do only targeted lookups yourself following the SEARCH STRATEGY rule: nothing is pre-read, so try LSP first, else ONE targeted grep (path/include limited to the area you are working on) with context, then read only the pointed windows via symbols=[...] or ranges=[...] right before you edit. You have FULL access to every file inside the workspace. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus grep / glob / read for targeted checks.\nPARALLEL RESEARCH (HARD): you have NO read/grep/glob tools of your own — ALL file reading and searching goes through the `explore` tool. When a task spans several independent areas, you MUST fire SEVERAL `explore` calls IN THE SAME STEP (one per area/file group): parallel calls run CONCURRENTLY and cost a single round-trip, while one giant explore is slow and returns a shallow report. Never send a single broad explore for a multi-area task.\nCHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work. Finish the whole list in THIS turn — never end with pending items still doable. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\nEDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits you kept for yourself across DIFFERENT files go as parallel edit_file calls in the SAME turn — NEVER edit files you delegated to a subagent. Do not repeatedly edit the same code or modify unrelated code. ROUND TRIPS: every extra step re-sends the whole conversation, so independent work belongs in ONE step — when you already know you need three edits or three commands, issue all of them together in the same step (they run IN ORDER, one after another) instead of spending a step on each.\nHUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. When a dependency, package, or server binary is missing, never stop with 'not installed' — ask with confirm_action (or request_permission for package installs) and WAIT, then retry the work; only stop if DENIED. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\nAUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\nCODE QUALITY: write maintainable, readable code following the project's existing structure and conventions: small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean.\nREPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description).\n\nHARD-CODING (ABSOLUTE): NEVER hard-code anything: no magic values or environment-specific assumptions in logic -- no hard-coded paths, credentials, URLs, feature flags, deployment/host settings, project-specific data, or behavior tied to one particular case. Source them from the project's configuration, environment variables, existing constants/registries, data files, or explicit parameters/dependencies, following the project's existing patterns.\n\nDEBUGGING PROTOCOL (when fixing a bug): follow this loop strictly, like a systematic debugger. (1) REPRODUCE first: run the failing test or a minimal script with run_terminal to see the actual error/traceback -- never guess the cause from a description alone. (2) Form a root-cause hypothesis, then confirm or refute it by reading the exact code/log lines it points to. (3) Apply the MINIMAL fix that addresses the root cause, not the symptom. (4) VERIFY by re-running the same test/script (bug gone) and the related test file (no regression); if verification fails, return to step (2) with the new evidence. Never claim a fix without having run it.\n\nPROJECT STRUCTURE AND EFFICIENCY: Read the project structure first and continue the existing pattern; never create duplicate files or needless folders. Group by responsibility: each file has a single responsibility (one reason to change); keep related files together (e.g. agent_registry.py beside agents.py, retrieval.py beside memory_manager.py, git_tools.py beside doc_tools.py); keep UI, logic and helpers separate, never mix them in one place. Write efficient yet readable code: stream/chunk large data instead of holding it all in memory, avoid repeated computation by reusing results, prefer early exit over nested conditions. Use clear names and explicit errors, never put secrets/keys in code, and never add a needless dependency.\n\nCODING RULES (always follow when writing or modifying code):\nWrite simple, readable, maintainable, and idiomatic code.\nFollow the best practices and conventions of the language and framework.\nKeep files, modules, functions, and components small and focused.\nMaintain a clean, logical, and scalable project structure. Organize code by responsibility/domain; do not put unrelated functionality into one file.\nSeparate concerns such as business logic, UI, data access, configuration, and utilities.\nReuse existing project patterns; avoid unnecessary duplication and over-abstraction.\nMake the smallest necessary change and preserve existing behavior.\nWrite CPU- and memory-efficient code. Avoid unnecessary allocations, copies, loops, I/O, network calls, and expensive operations.\nPrefer efficient algorithms and data structures when they materially improve performance.\nHandle errors explicitly and validate external/user input.\nAvoid security vulnerabilities, race conditions, resource leaks, and blocking operations where inappropriate.\nKeep types strict; avoid unnecessary `any`, casts, and disabled checks.\nDo not add dependencies unless clearly necessary.\nAdd or update relevant tests when appropriate.\nBefore finishing, review the code for correctness, structure, readability, security, CPU usage, memory usage, performance, and maintainability.\n\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply ENTIRELY in Persian — every message, todo/checklist item, plan content, summary, and ask_user question and options. Never reply in English when the user writes Persian. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via create_skill, its `name`, `description` and `content` (full markdown body) MUST be entirely in English, even though the chat is Persian. Never create Persian skills. EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): docstrings and comments in any code you write MUST be entirely in English, even though the chat is Persian. Never write Persian docstrings or comments. These hard rules override the Persian reply rule for skills and code docstrings/comments.",
+        "codewriter": "DEV / LIVE TESTING (HARD RULE, ANY PROJECT): to verify a change LIVE, run the project in its OWN dev workflow — never a release/production build. STEP 1 (ALWAYS, BEFORE STARTING ANYTHING): check whether that dev process is ALREADY RUNNING — list the project's dev process and the port it serves (e.g. ps/lsof, or the project's own status command), because a long-running dev server is usually already open. STEP 2: if it IS already running, REUSE it — send your request to the running instance and read its logs; do NOT start a second one. A duplicate dev server fights for the same port, watches the same files twice and emits conflicting logs, so starting one while one is already running is a BUG, not thoroughness. STEP 3: only when nothing is running, start it ONCE (the project's dev command, e.g. `npm run dev`, `npm run tauri dev`, `cargo run`, `manage.py runserver`) and stop it when you are done. NEVER kill or restart a dev server you did not start, and NEVER stand up your own ad-hoc server or harness in parallel with the project's dev server.\n\nYou are Build, an implementation agent inside a desktop IDE. You receive the plan and implement it. Spawning tasks counts as starting work. Do only targeted lookups yourself, following the SEARCH STRATEGY rule TOP-DOWN (every step down costs extra round-trips): 1) files you can NAME -> `read` with ranges=[{{path,offset,limit}},…] (several files AND windows in ONE call); 2) a SYMBOL you can name but whose FILE you cannot -> locate by SYMBOL first: `find_symbol` returns the definition bodies AND every usage in ONE call (no language server needed), `lsp_symbols` outlines ONE file instead of reading it, and with a server installed `lsp_definition` / `lsp_references` / `lsp_hover` answer precisely; 3) a token with NO symbol form (a string, a config key, a log line) -> ONE targeted grep (path/include limited to the area you are working on) with context, then read only the pointed windows via ranges=[...] right before you edit — a grep on a bare identifier already comes back with its `find_symbol` answer attached, so use that instead of searching again; 4) still open after 2-3 of your own lookups -> hand it to ONE `explore` instead of hunting further. `read` takes ONE filePath (or ranges=[{{path,offset,limit}},…] for several known files) — there is no `symbols` argument. You have FULL access to every file inside the workspace. Targeted checks are BOUNDED: after at most 2-3 search batches you MUST start editing in the SAME turn — never keep searching when you already know which files to touch. Tools: edit_file / write_file / run_terminal (read-only build/test/lint) plus find_symbol / lsp_symbols / lsp_definition / lsp_references / lsp_hover / lsp_diagnostics / grep / read for targeted checks. After every successful edit, the result already carries `lsp_diagnostics` for that file whenever a language server is warm (it runs NO build), so read those before spending a round on your own typecheck.\nPARALLEL RESEARCH (HARD): you DO have read and grep for targeted checks, but the LONGER the turn runs, the more each of your own steps costs, while a delegation never pays your history at all: measured on live traces, an early main step re-sends the conversation for ~7.7K uncached tokens but a late one costs ~79K, against ~16K for an `explore` round. So delegate EARLY and delegate often: files already NAMED go through ONE read call (ranges=[{path,offset,limit},…] reads several files AND several windows at once); a token whose file is unknown goes through ONE find_symbol, else ONE grep with path+include. A BROAD search is never a local hunt: when two or three targeted checks in a row have still not answered the question, it has outgrown targeted checks, so hand it to ONE `explore` (the question plus the paths you already found) instead of reading more windows yourself. Delegate to `explore` when the question needs MANY rounds — where something is wired up, how an area works, who owns a behaviour — and ask for everything in ONE prompt. When a task spans several independent areas, fire SEVERAL `explore` calls IN THE SAME STEP (one per area/file group): parallel calls run CONCURRENTLY and cost a single round-trip, while one giant explore is slow and returns a shallow report.\nCHECKLIST: for multi-step work call update_plan (skip it for trivial single-step changes). Always include a 'write and run tests' step for any change that introduces or alters BEHAVIOR or LOGIC (new functions, branches, edge cases, bug fixes); skip tests for pure cosmetic/refactor/doc changes unless they touch existing tested behavior, and prefer extending existing tests over adding trivial new ones. Mark each item 'completed' (and the next 'in_progress') the moment it is finished, before starting the next. NEVER send update_plan alone when there IS next work — always batch it with your next tool calls in the SAME step. Solo is only for the final tick with no further work. Finish the whole list in THIS turn — never end with pending items still doable. When ALL items are completed and new work needs its own steps, call update_plan with a FRESH list.\nEDITING: prefer edit_file (exact old_string/new_string) for existing files; write_file only for brand-new files. NEVER edit files through any command. Implement immediately once you have the needed context. When editing, always copy the clean file text from read (no line numbers, no wrappers or footers); if an edit reports old_string not found, re-read and copy the exact text shown in the error hint. Batch ALL edits to the SAME file in ONE edit_file call via edits=[{'old_string': ..., 'new_string': ...}, ...] (atomic, applied in list order, one checkpoint/diff/verify); edits you kept for yourself across DIFFERENT files go as parallel edit_file calls in the SAME turn — NEVER edit files you delegated to a subagent. Do not repeatedly edit the same code or modify unrelated code. ROUND TRIPS: every extra step re-sends the whole conversation, so independent work belongs in ONE step — when you already know you need three edits or three commands, issue all of them together in the same step (they run IN ORDER, one after another) instead of spending a step on each.\nHUMAN IN THE LOOP: before a hard-to-reverse action (deleting a real file) call confirm_action and WAIT. When a dependency, package, or server binary is missing, never stop with 'not installed' — ask with confirm_action (or request_permission for package installs) and WAIT, then retry the work; only stop if DENIED. At a genuine fork with no clearly-correct default call ask_user with 2-5 short options and WAIT. Do not overuse either.\nAUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\nCODE QUALITY: write maintainable, readable code following the project's existing structure and conventions: small focused files, meaningful names, DRY, no dead/commented-out code, minimal diffs, English comments. Fix any error you introduce and leave the codebase clean.\nREPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description).\n\nHARD-CODING (ABSOLUTE): NEVER hard-code anything: no magic values or environment-specific assumptions in logic -- no hard-coded paths, credentials, URLs, feature flags, deployment/host settings, project-specific data, or behavior tied to one particular case. Source them from the project's configuration, environment variables, existing constants/registries, data files, or explicit parameters/dependencies, following the project's existing patterns.\n\nDEBUGGING PROTOCOL (when fixing a bug): follow this loop strictly, like a systematic debugger. (1) REPRODUCE first: run the failing test or a minimal script with run_terminal to see the actual error/traceback -- never guess the cause from a description alone. (2) Form a root-cause hypothesis, then confirm or refute it by reading the exact code/log lines it points to. (3) Apply the MINIMAL fix that addresses the root cause, not the symptom. (4) VERIFY by re-running the same test/script (bug gone) and the related test file (no regression); if verification fails, return to step (2) with the new evidence. Never claim a fix without having run it.\n\nPROJECT STRUCTURE AND EFFICIENCY: Read the project structure first and continue the existing pattern; never create duplicate files or needless folders. Group by responsibility: each file has a single responsibility (one reason to change); keep related files together (e.g. agent_registry.py beside agents.py, retrieval.py beside memory_manager.py, git_tools.py beside doc_tools.py); keep UI, logic and helpers separate, never mix them in one place. Write efficient yet readable code: stream/chunk large data instead of holding it all in memory, avoid repeated computation by reusing results, prefer early exit over nested conditions. Use clear names and explicit errors, never put secrets/keys in code, and never add a needless dependency.\n\nCODING RULES (always follow when writing or modifying code):\nWrite simple, readable, maintainable, and idiomatic code.\nFollow the best practices and conventions of the language and framework.\nKeep files, modules, functions, and components small and focused.\nMaintain a clean, logical, and scalable project structure. Organize code by responsibility/domain; do not put unrelated functionality into one file.\nSeparate concerns such as business logic, UI, data access, configuration, and utilities.\nReuse existing project patterns; avoid unnecessary duplication and over-abstraction.\nMake the smallest necessary change and preserve existing behavior.\nWrite CPU- and memory-efficient code. Avoid unnecessary allocations, copies, loops, I/O, network calls, and expensive operations.\nPrefer efficient algorithms and data structures when they materially improve performance.\nHandle errors explicitly and validate external/user input.\nAvoid security vulnerabilities, race conditions, resource leaks, and blocking operations where inappropriate.\nKeep types strict; avoid unnecessary `any`, casts, and disabled checks.\nDo not add dependencies unless clearly necessary.\nAdd or update relevant tests when appropriate.\nBefore finishing, review the code for correctness, structure, readability, security, CPU usage, memory usage, performance, and maintainability.\n\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply ENTIRELY in Persian — every message, todo/checklist item, plan content, summary, and ask_user question and options. Never reply in English when the user writes Persian. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via create_skill, its `name`, `description` and `content` (full markdown body) MUST be entirely in English, even though the chat is Persian. Never create Persian skills. EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): docstrings and comments in any code you write MUST be entirely in English, even though the chat is Persian. Never write Persian docstrings or comments. These hard rules override the Persian reply rule for skills and code docstrings/comments.",
     })
 }
 
@@ -283,6 +283,10 @@ pub fn save_state(data_root: &Path, body: StateSaveBody) -> Response {
     }
     if let Some(deleted) = &body.deleted_chats {
         for cid in deleted {
+            // A deleted chat can never answer its popups again: release the
+            // blocked turn's gate so the task (and the whole message history it
+            // is holding) drops instead of parking for the session.
+            crate::agent::forget_chat(cid);
             delete_chat_file_by_id(data_root, cid);
             cleanup_deleted_chat(data_root, cid);
         }
@@ -723,13 +727,13 @@ pub async fn chat_title(
     let client = crate::llm::http_client();
 
     // Fallback chain (title slot -> the title slot's own fallback list -> the
-    // "Other" group's fallback list -> the chat model), mirroring the Python
-    // handler: a slot that is unset, misconfigured or simply unreachable must
-    // not leave the chat untitled. Each attempt is one cheap one-shot
-    // completion, so trying the next candidate costs one round trip. The custom
-    // rungs are per-CALL — nothing is remembered, so the next chat starts at the
-    // title slot's own model again — and each inherits the title slot's
-    // reasoning level.
+    // "Other" group's fallback list) and NOTHING else: a tool falls back only
+    // on the models the user picked for it. The chat model used to be appended
+    // as a last resort, which spent the call on a model the user never chose
+    // here. Each candidate is one cheap one-shot completion, so trying the next
+    // one costs one round trip. The custom rungs are per-CALL — nothing is
+    // remembered, so the next chat starts at the title slot's own model again —
+    // and each inherits the title slot's reasoning level.
     let mut candidates: Vec<(String, String, String, Vec<String>, String)> =
         vec![(kind, model, base_url, api_keys, slot_provider_id)];
     let own_chain = crate::backend_light::resolve_slot_chain(
@@ -767,27 +771,6 @@ pub async fn chat_title(
             candidates.push(cand);
         }
     }
-    for fallback_slot in ["compact", ""] {
-        let entry = if fallback_slot.is_empty() {
-            String::new()
-        } else {
-            body.subagent_models.get(fallback_slot).cloned().unwrap_or_default()
-        };
-        let (f_model, f_base, f_keys, f_provider_id) = crate::backend_light::resolve_slot_target(
-            &entry,
-            &body.model,
-            &body.base_url,
-            &body.api_keys,
-            &body.provider_id,
-            &body.providers,
-        );
-        let f_kind = crate::backend_light::resolve_slot_kind(&entry, parent_kind, &body.providers);
-        let cand = (f_kind, f_model, f_base, f_keys, f_provider_id);
-        if !candidates.iter().any(|c| c.0 == cand.0 && c.1 == cand.1) {
-            candidates.push(cand);
-        }
-    }
-
     // Report the FIRST candidate's failure, not the last: the first candidate
     // is the model the user actually picked (the title slot), so its error is
     // the actionable one. Reporting the last fallback's error hid the real
@@ -804,11 +787,20 @@ pub async fn chat_title(
         let c_level = crate::backend_light::other_slot_level(&body.subagent_thinking);
         let (c_reasoning, c_model_reasoning, c_auto_think) = crate::llm::reasoning_fields(
             &c_kind,
-            if c_level.is_empty() { "none" } else { c_level },
+            &crate::llm::level_from_source(
+                crate::agent::provider_model_thinking_levels(
+                    &body.providers,
+                    &c_provider_id,
+                    &c_model,
+                )
+                .as_deref(),
+                if c_level.is_empty() { "none" } else { c_level },
+            ),
             body.model_reasoning,
         );
         let cfg = crate::llm::LlmConfig {
             provider: c_kind,
+            provider_id: c_provider_id.clone(),
             model: c_model.clone(),
             base_url: c_base,
             api_keys: c_keys,
@@ -858,26 +850,18 @@ pub async fn chat_title(
                 }
             }
             Err(e) => {
-                // Only a model-side rejection moves to the next candidate: a
-                // dropped connection or a timeout cannot be fixed by another
-                // model, and walking the list there would bill every fallback for
-                // a network problem and report the last one's error.
-                let next = crate::llm::should_fall_back(&e);
+                // The chain is the user's own list, so a candidate that failed
+                // hands the title to the NEXT one whatever the reason: the
+                // candidates sit on different providers with different
+                // endpoints, and one unreachable or rate-limited model must not
+                // leave the chat untitled. The FIRST error is reported, so a
+                // truly broken chain still says what went wrong.
                 eprintln!(
-                    "[title] {}/{} failed: {e} — {}",
-                    cfg.provider,
-                    cfg.model,
-                    if next {
-                        "trying the next candidate"
-                    } else {
-                        "stopping (not a model failure)"
-                    }
+                    "[title] {}/{} failed: {e} — trying the next candidate",
+                    cfg.provider, cfg.model
                 );
                 if first_error.is_empty() {
                     first_error = e;
-                }
-                if !next {
-                    break;
                 }
             }
         }
@@ -892,6 +876,295 @@ pub async fn chat_title(
 /// title that has to be cut mid-way reads worse than one the model was asked
 /// to keep short — the prompt and `clean_title` share this number.
 const TITLE_MAX_WORDS: usize = 4;
+
+// --- Persian keywords from a description ------------------------------------
+
+/// One part (a skill, a connector, a script) to translate.
+#[derive(serde::Deserialize)]
+pub struct KeywordItem {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct KeywordsBody {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub subagent_models: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub subagent_thinking: std::collections::HashMap<String, String>,
+    /// Per-tool fallback lists from Settings → Tools, keyed like
+    /// `subagent_models`: the translation shares the "Other" slot, so it
+    /// retries on exactly the models the user gave that group.
+    #[serde(default)]
+    pub tool_fallbacks: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, Value>,
+    #[serde(default)]
+    pub model_reasoning: bool,
+    /// The parts whose description should become Persian trigger phrases.
+    #[serde(default)]
+    pub items: Vec<KeywordItem>,
+}
+
+/// Phrases stored per part. The catalog line spends at most this many, so a
+/// longer list would only bloat what the model has to read.
+const KEYWORDS_MAX_PER_PART: usize = 6;
+
+/// Turn English descriptions into the Persian phrases that should reach a part.
+///
+/// A description is prose the model CAN read, but the catalog is matched by KEY,
+/// not by the model's memory of prose: a trigger has to be written down, and the
+/// only honest source for it is a translation of what the part says it does. A
+/// deterministic mapper cannot do that — it can only guess from the name, which
+/// is how «access» and «configure» ended up keyword-free (and, before that, how
+/// unrelated words got filed onto every skill of a bundle).
+///
+/// One batched call for the whole list, because each item is a few tokens.
+/// Never throws: a failure answers `{ "keywords": {}, "error": … }`, so the
+/// caller can leave the field alone instead of clearing it.
+pub async fn persian_keywords(
+    axum::extract::State(st): axum::extract::State<crate::backend_light::AppState>,
+    Json(body): Json<KeywordsBody>,
+) -> Response {
+    let _ = &st;
+    let items: Vec<&KeywordItem> = body
+        .items
+        .iter()
+        .filter(|i| !i.name.trim().is_empty() && !i.description.trim().is_empty())
+        .collect();
+    if items.is_empty() {
+        return Json(json!({ "keywords": {} })).into_response();
+    }
+    let listing: String = items
+        .iter()
+        .map(|i| format!("{}: {}", i.name.trim(), i.description.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "You turn short English tool descriptions into the Persian search phrases a Persian speaker \
+         would type to reach that tool. Answer with ONE line per input item, in the SAME order, \
+         formatted exactly as `name: phrase one, phrase two, phrase three`. \
+         Give 3 to {} SHORT Persian phrases per line (2-3 words each); keep a well-known product \
+         name as it is written (e.g. Telegram, Docker). No bullets, no numbering, no extra text, \
+         no explanation, no blank lines.",
+        KEYWORDS_MAX_PER_PART
+    );
+    let client = crate::llm::http_client();
+    // The chain, not a single rung: a rate-limited or unreachable model must
+    // hand the translation to the next candidate the user listed for the
+    // "Other" group, exactly as the title call does. One rung meant a busy
+    // model left every keyword field empty while the title call right beside
+    // it succeeded on its second candidate.
+    let mut first_error = String::new();
+    for (c_kind, c_model, c_base, c_keys, c_provider_id) in keyword_candidates(&body) {
+        let c_level = crate::backend_light::other_slot_level(&body.subagent_thinking);
+        let (c_reasoning, c_model_reasoning, c_auto_think) = crate::llm::reasoning_fields(
+            &c_kind,
+            &crate::llm::level_from_source(
+                crate::agent::provider_model_thinking_levels(
+                    &body.providers,
+                    &c_provider_id,
+                    &c_model,
+                )
+                .as_deref(),
+                if c_level.is_empty() { "none" } else { c_level },
+            ),
+            body.model_reasoning,
+        );
+        let cfg = crate::llm::LlmConfig {
+            provider: c_kind,
+            provider_id: c_provider_id.clone(),
+            model: c_model.clone(),
+            base_url: c_base,
+            api_keys: c_keys,
+            temperature: Some(0.2),
+            // Room for a reasoning preamble before the lines themselves.
+            max_tokens: Some(1024),
+            timeout_secs: 45,
+            reasoning_level: c_reasoning,
+            model_reasoning: c_model_reasoning,
+            auto_think: c_auto_think,
+        };
+        match crate::llm::complete(&client, &cfg, &system, &listing).await {
+            Ok(res) => {
+                let map = parse_keyword_lines(&res.text, &items);
+                if !map.is_empty() {
+                    return Json(json!({ "keywords": map })).into_response();
+                }
+                // A reply nothing could be parsed from is a failure of THIS
+                // candidate: another model in the chain may still answer in
+                // the requested shape.
+                eprintln!(
+                    "[keywords] {}/{} answered without usable lines — trying the next candidate",
+                    cfg.provider, cfg.model
+                );
+                if first_error.is_empty() {
+                    first_error = "the model answered without usable lines".into();
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[keywords] {}/{} failed: {e} — trying the next candidate",
+                    cfg.provider, cfg.model
+                );
+                if first_error.is_empty() {
+                    first_error = e;
+                }
+            }
+        }
+    }
+    // The whole chain failed. The FIRST error is reported: it names the model
+    // the user actually picked, which is the actionable one.
+    Json(json!({ "keywords": {}, "error": first_error })).into_response()
+}
+
+/// The ordered call chain for a translation: the Tools → "Other" group's own
+/// model first, then that group's fallback list (Settings → Tools). Same
+/// resolution the title call uses, so the two can never disagree about which
+/// models a failure may hop to.
+fn keyword_candidates(
+    body: &KeywordsBody,
+) -> Vec<(String, String, String, Vec<String>, String)> {
+    let slot = crate::backend_light::other_slot_entry(&body.subagent_models).to_string();
+    let (model, base_url, api_keys, slot_provider_id) = crate::backend_light::resolve_slot_target(
+        &slot,
+        &body.model,
+        &body.base_url,
+        &body.api_keys,
+        &body.provider_id,
+        &body.providers,
+    );
+    let parent_kind = if body.provider.trim().is_empty() {
+        body.provider_id.as_str()
+    } else {
+        body.provider.as_str()
+    };
+    let kind = crate::backend_light::resolve_slot_kind(&slot, parent_kind, &body.providers);
+    let mut out: Vec<(String, String, String, Vec<String>, String)> =
+        vec![(kind, model, base_url, api_keys, slot_provider_id)];
+    let chain = crate::backend_light::resolve_slot_chain(
+        &slot,
+        crate::backend_light::other_slot_fallbacks(&body.tool_fallbacks),
+        &body.model,
+        &body.base_url,
+        &body.api_keys,
+        &body.provider_id,
+        parent_kind,
+        &body.providers,
+    );
+    for (c_model, c_base, c_keys, c_provider_id, c_kind) in chain.into_iter().skip(1) {
+        // The same provider+model reached twice must not be tried twice.
+        if !out.iter().any(|c| c.0 == c_kind && c.1 == c_model) {
+            out.push((c_kind, c_model, c_base, c_keys, c_provider_id));
+        }
+    }
+    out
+}
+
+/// Read `<name>: a, b, c` lines back into `{name: [phrases]}`.
+///
+/// Split from the call so the parse is testable without a model: a model that
+/// bullets, numbers, quotes a name, RENAMES a line or answers a bare list must
+/// still land on the right part: a line that lands on the wrong part stores
+/// someone else's trigger, and a dropped line loses one silently. Two keys, in
+/// order: the name (folded), then POSITION, because the prompt asks for the
+/// same order as the input.
+fn parse_keyword_lines(raw: &str, items: &[&KeywordItem]) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for i in items {
+        by_name.insert(
+            crate::skills::fold_fa(i.name.trim()),
+            i.name.trim().to_string(),
+        );
+    }
+    let mut positional = 0usize;
+    for line in raw.lines() {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', '#', ' '])
+            .trim()
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(['.', ')', ' ', ':'])
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        // A head that names one of the items is the authoritative key.
+        let named = line.split_once(':').and_then(|(head, rest)| {
+            let head = head.trim().trim_matches(['"', '\'', '`', '*']);
+            by_name
+                .get(&crate::skills::fold_fa(head))
+                .map(|owner| (owner.clone(), rest.to_string()))
+        });
+        let (owner, rest) = match named {
+            Some(pair) => pair,
+            None => {
+                // The positional item of this line: either the model renamed the
+                // head, or it answered a bare list with no names at all.
+                let Some(pick) = items.get(positional).map(|i| i.name.trim().to_string()) else {
+                    continue;
+                };
+                // A short LATIN-looking head is a label the model invented, so it
+                // is dropped and only what follows the colon is read as phrases.
+                // Anything else (no colon, or a Persian head) is all phrases.
+                let rest = match line.split_once(':') {
+                    Some((head, rest)) if is_label(head) => rest.to_string(),
+                    _ => line.to_string(),
+                };
+                (pick, rest)
+            }
+        };
+        positional += 1;
+        let phrases: Vec<String> = rest
+            .split([',', '،'])
+            .map(|p| p.trim().trim_matches(['"', '\'', '`', '*']).trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if phrases.is_empty() {
+            continue;
+        }
+        // A part the model answered twice keeps the FIRST line's phrases.
+        if out.contains_key(&owner) {
+            continue;
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let kept: Vec<String> = phrases
+            .into_iter()
+            .filter(|p| seen.insert(crate::skills::fold_fa(p)))
+            .take(KEYWORDS_MAX_PER_PART)
+            .collect();
+        out.insert(owner, json!(kept));
+    }
+    out
+}
+
+/// Whether a line's head is a LABEL the model invented rather than a phrase.
+///
+/// A label is short, has no Persian letters and keeps to a few words — the shape
+/// of a tool name. A Persian head is never a label: dropping it would throw away
+/// a real phrase, which is the kind of silent loss this parser must not make.
+fn is_label(head: &str) -> bool {
+    let head = head.trim();
+    !head.is_empty()
+        && head.chars().count() <= 40
+        && head.split_whitespace().count() <= 4
+        && !head
+            .chars()
+            .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c))
+}
 
 /// Reduce a raw model reply to a usable one-line title.
 ///
@@ -1108,15 +1381,106 @@ mod tests {
     }
 
     #[test]
+    fn keyword_lines_land_on_the_right_part_whatever_decoration() {
+        // The model decorates its answer (bullets, numbers, quotes, a stray
+        // `#`) and the reply must still map to the ITEM the user asked about:
+        // a line that lands on the wrong part stores someone else's trigger.
+        let a = KeywordItem {
+            name: "access".into(),
+            description: "Manage channel access".into(),
+        };
+        let b = KeywordItem {
+            name: "Telegram Configure".into(),
+            description: "Set up the bot".into(),
+        };
+        let items = vec![&a, &b];
+        let raw = "# access: مدیریت دسترسی، تایید کاربر\n\
+                   2) Telegram Configure: راه‌اندازی ربات، تنظیم پیام‌رسان\n\
+                   noise without a colon\n";
+        let map = parse_keyword_lines(raw, &items);
+        assert_eq!(map["access"], json!(["مدیریت دسترسی", "تایید کاربر"]));
+        assert_eq!(
+            map["Telegram Configure"],
+            json!(["راه‌اندازی ربات", "تنظیم پیام‌رسان"])
+        );
+    }
+
+    #[test]
+    fn keyword_lines_fall_back_to_position_and_cap_the_list() {
+        // A model that rewrites the name (or answers a bare list) must not drop
+        // a part's keywords: the prompt asks for the same ORDER, so position is
+        // the second key. Duplicates fold away and the list is capped — the
+        // catalog has a budget and a 20-phrase row would spend it alone.
+        let a = KeywordItem {
+            name: "alpha".into(),
+            description: "first".into(),
+        };
+        let b = KeywordItem {
+            name: "beta".into(),
+            description: "second".into(),
+        };
+        let items = vec![&a, &b];
+        let raw = "یک، دو، یک، سه، چهار، پنج، شش، هفت\n\
+                   beta: بتا\n";
+        let map = parse_keyword_lines(raw, &items);
+        assert_eq!(map["alpha"], json!(["یک", "دو", "سه", "چهار", "پنج", "شش"]));
+        assert_eq!(map["beta"], json!(["بتا"]));
+    }
+
+    #[test]
+    fn keyword_candidates_walk_the_other_groups_fallback_list() {
+        // The reported bug: `/plugins/keywords` ran ONE model, so a rate-limited
+        // "Other" slot left every keyword field empty while the title call
+        // right beside it succeeded on its second candidate. The chain must be
+        // the group's own model first, then the list Settings → Tools holds for
+        // it — and the same provider+model must never be tried twice.
+        let mut body = KeywordsBody {
+            provider: String::new(),
+            provider_id: String::new(),
+            api_keys: Vec::new(),
+            base_url: String::new(),
+            model: "main-model".into(),
+            subagent_models: std::collections::HashMap::new(),
+            subagent_thinking: std::collections::HashMap::new(),
+            tool_fallbacks: std::collections::HashMap::new(),
+            providers: std::collections::HashMap::new(),
+            model_reasoning: false,
+            items: Vec::new(),
+        };
+        // No tool model picked: the chain is the main model alone.
+        assert_eq!(keyword_candidates(&body).len(), 1);
+        // A picked slot plus its fallback list: both rungs are tried, in order.
+        body.subagent_models
+            .insert("title".into(), "p1/cheap-model".to_string());
+        body.tool_fallbacks
+            .insert("title".into(), vec!["p1/backup-model".into()]);
+        let chain = keyword_candidates(&body);
+        let models: Vec<&str> = chain.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(models.len(), 2, "{models:?}");
+        assert!(models[0].contains("cheap-model"), "{models:?}");
+        assert!(models[1].contains("backup-model"), "{models:?}");
+        // The SAME entry listed twice adds no second rung.
+        body.tool_fallbacks
+            .insert("title".into(), vec!["p1/cheap-model".into()]);
+        assert_eq!(keyword_candidates(&body).len(), 1);
+    }
+
+    #[test]
     fn build_prompt_requires_parallel_explore_calls() {
-        // The main agent has no read/grep tools, so the prompt must name the
-        // real tool (`explore`) and demand several calls in ONE step — the
-        // old text pointed at a non-existent `task(subagent_type=...)` tool.
+        // The main agent's own lookups are TARGETED only (read/grep/find_symbol
+        // /lsp_symbols — never glob), so the prompt must name the real tool
+        // (`explore`) and demand several calls in ONE step — the old text
+        // pointed at a non-existent `task(subagent_type=...)` tool.
         let prompts = system_prompts();
         let build = prompts["build"].as_str().unwrap();
         assert!(build.contains("`explore`"), "{build}");
         assert!(build.contains("SEVERAL `explore` calls"), "{build}");
         assert!(!build.contains("subagent_type"), "{build}");
+        // Targeted locate-by-symbol must be the FIRST step named for the main
+        // agent: it is what removes the line-hunting reads (measured 376 extra
+        // same-file reads, 763K tokens) and the grep→read round pairs.
+        assert!(build.contains("`find_symbol`"), "{build}");
+        assert!(build.contains("`lsp_symbols`"), "{build}");
         // Legacy alias must carry the same research contract (old servers
         // answer with the alias keys only).
         let legacy = prompts["codewriter"].as_str().unwrap();

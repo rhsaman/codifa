@@ -113,7 +113,9 @@ console.log('5) every class the new rows use has a style:')
   ]) {
     check(`${cls} is styled`, css.includes(cls), cls)
   }
-  check('the dead "+" menu styles are gone', !css.includes('.viewer-add-'))
+  // The rail's "+" menu is the single entry point for the pages; its trigger
+  // reuses the shared tab-list button shell.
+  check('the "+" menu trigger is styled', css.includes('.viewer-add-btn'), '.viewer-add-btn')
 }
 
 console.log('6) every layer exposes copy and rename:')

@@ -5,6 +5,8 @@
 // Sentence-final detection is done server-side via silence/VAD; this client
 // only reacts to the server's speech_started/stopped + transcript events.
 
+import { normalizeTranscript } from './stt'
+
 export type LiveVoiceState =
   | 'idle'
   | 'connecting'
@@ -132,7 +134,7 @@ export function sanitizeTranscriptText(text: string): string {
   // Keep only clean speech text; never let markup reach the composer.
   const stripped = s.replace(/<[^<>]*>?/g, ' ').replace(/&lt;|&gt;|&amp;/g, ' ').replace(/\s+/g, ' ').trim();
   if (stripped !== s && (s.includes('<') || s.includes('&lt;') || s.includes('/_next/'))) return stripped ? '' : '';
-  return s;
+  return normalizeTranscript(s);
 }
 
 /** True when a transcript payload is an HTML error page, not speech. */

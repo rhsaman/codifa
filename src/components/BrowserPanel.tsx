@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ensureSidecar } from "../lib/api";
+import { browserFitKey, clearBrowserFit, loadBrowserFit, saveBrowserFit } from "../lib/browserPanelMemory";
 import {
   DEFAULT_VIEWPORT_SIZE,
   WIDTH_RULER_STEP,
@@ -48,14 +49,24 @@ export function backendError(body: unknown): string | null {
 export function BrowserPanel({
   chatId = "",
   initialUrl = "",
+  tabId = "",
 }: {
   chatId?: string;
   /** Page the agent's browser tool asked for (the tool's `url` arg). The panel
    *  launches on it instead of about:blank so the agent's work is visible. */
   initialUrl?: string;
+  /** Viewer-tab id: the memory key for this panel's sizing intent, so the
+   *  fit toggle and width cap survive the per-tab remount of a chat switch. */
+  tabId?: string;
 }) {
+  // One key per panel instance: restored below, written on every change.
+  const fitKey = browserFitKey(tabId, chatId);
+  const fitMemory = loadBrowserFit(fitKey);
   const [image, setImage] = useState<string>("");
   const [pageUrl, setPageUrl] = useState<string>("");
+  // Mirror of `pageUrl` for the mount effect: it must know what the live tab is
+  // ALREADY showing without depending on state that the same effect just set.
+  const pageUrlRef = useRef<string>("");
   const [address, setAddress] = useState<string>("");
   // Seeded so the follow-tab effect below skips its FIRST run: the mount effect
   // already attached to the session with this url, and re-issuing it would race
@@ -93,8 +104,12 @@ export function BrowserPanel({
   const [draftH, setDraftH] = useState<string>(String(DEFAULT_VIEWPORT_SIZE.height));
   // Fit-to-pane: the viewport width follows the pane width, capped at the
   // last manually applied width — like Chrome shrinking the layout viewport
-  // when the pane narrows and growing it back up to the set size.
-  const [fitToPane, setFitToPane] = useState<boolean>(true);
+  // when the pane narrows and growing it back up to the set size. OFF by
+  // default, so a size the user picked STICKS: the panel then shows exactly
+  // the width the ruler/backend holds instead of silently re-fitting to the
+  // pane. Seeded from the per-tab memory (this component is remounted per
+  // viewer tab, key=tab id), so a chat switch restores the user's own choice.
+  const [fitToPane, setFitToPane] = useState<boolean>(fitMemory ? fitMemory.fitToPane : false);
   // Pane (stage) box in CSS px. Drives BOTH the fit-to-pane width and the
   // on-screen zoom of the frame, so a splitter drag or a window resize
   // rescales the frame immediately.
@@ -102,12 +117,15 @@ export function BrowserPanel({
   // "..." overflow menu (CDP endpoint for DevTools comes from the backend
   // on demand — see openDevTools).
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
-  const capWRef = useRef<number>(DEFAULT_VIEWPORT_SIZE.width);
+  const capWRef = useRef<number>(fitMemory && fitMemory.capW > 0 ? fitMemory.capW : DEFAULT_VIEWPORT_SIZE.width);
   // Last size WE applied (manual or fit). A status poll that echoes this back
   // is our own resize, not an external one, so it must not touch the cap.
   const appliedRef = useRef<{ w: number; h: number } | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fitTimer = useRef<number | null>(null);
+  // True once this instance ran the mount half of the fit effect; later runs
+  // (follow mode toggled, session became active) take the reactive path.
+  const mountFitApplied = useRef<boolean>(false);
   const sizeRef = useRef(viewport);
   // Live mirrors for the polling interval: the interval closure is created
   // once on mount, so reading state directly would see stale values and
@@ -190,6 +208,7 @@ export function BrowserPanel({
         // Never surface about:blank in the omnibox — it sticks and the
         // user has to delete it before typing (Chrome shows an empty box).
         const clean = st.url === "about:blank" ? "" : st.url;
+        pageUrlRef.current = clean;
         setPageUrl(clean);
         if (!addressRef.current && clean) setAddress(clean);
         if (!clean && addressRef.current === "about:blank") setAddress("");
@@ -266,13 +285,18 @@ export function BrowserPanel({
       const isActive = await refreshStatus();
       if (cancelled) return;
       if (isActive) {
-        // A live session (started by the agent, or still up from this run) —
-        // point it at the page this tab remembers. `navigate` never starts a
-        // browser, so this stays attachment rather than launch.
-        if (initialUrl.trim()) {
+        // ATTACH, do not navigate. A chat switch remounts this panel, and
+        // re-issuing the remembered URL used to send the live tab back to it —
+        // a full reload on every chat switch, wiping whatever the agent had
+        // been doing while the user was away. `refreshStatus` above already
+        // adopted the live page into `pageUrl`, so navigate ONLY when the tab
+        // really is empty (a freshly created target with no page to show).
+        const showing = pageUrlRef.current.trim();
+        const wanted = initialUrl.trim();
+        if (!showing && wanted && wanted !== "about:blank") {
           await sidecarFetch("/browser/navigate", {
             method: "POST",
-            body: JSON.stringify({ url: initialUrl.trim() }),
+            body: JSON.stringify({ url: wanted }),
           }).catch(() => {
             // A dead session reports as inactive below on the next poll.
           });
@@ -573,8 +597,18 @@ export function BrowserPanel({
     ro.observe(host);
     window.addEventListener("resize", onResize);
     // Apply once on mount / when follow mode is switched back on, so the
-    // toggle takes effect without waiting for a pane resize.
-    onResize();
+    // toggle takes effect without waiting for a pane resize. A MOUNT still
+    // does not: this panel is remounted on every chat switch, and applying
+    // here re-fitted a size the user had set before the pane had even been
+    // laid out (pane w=0), snapping the emulated viewport back to the default
+    // width on every return. Follow the pane on layout changes during the
+    // session; restoring a remount is the memory effect's job.
+    if (!mountFitApplied.current) {
+      mountFitApplied.current = true;
+      measure(readPane().w, readPane().h);
+    } else {
+      onResize();
+    }
     return () => {
       ro.disconnect();
       window.removeEventListener("resize", onResize);
@@ -583,6 +617,24 @@ export function BrowserPanel({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitToPane, active]);
+
+  // Persist the sizing intent, and RESTORE an already-fitted viewport after a
+  // remount: the panel is remounted per viewer tab (a chat switch), so without
+  // this the fit state above was reset and the remount re-fitted — the very
+  // "it auto-fits again" the user sees. Runs once the session reports active
+  // (the pane has a real size by then).
+  useEffect(() => {
+    saveBrowserFit(fitKey, { fitToPane, capW: capWRef.current });
+    if (!fitToPane || !active) return;
+    const host = stageRef.current;
+    if (!host) return;
+    const paneW = Math.round(host.clientWidth);
+    if (paneW <= 0) return;
+    const cur = sizeRef.current;
+    const target = fitWidthTarget(paneW, capWRef.current);
+    if (target !== cur.w) void applySize(target, cur.h, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, fitToPane, fitKey]);
 
   // End a ruler drag even when the pointer is released outside the ruler.
   useEffect(() => {
@@ -633,6 +685,10 @@ export function BrowserPanel({
   async function closeSession(): Promise<void> {
     try {
       await sidecarFetch("/browser/close", { method: "POST" });
+      // The session is gone, so its sizing intent is stale: drop the memory
+      // so a fresh launch starts from the backend's own default viewport.
+      clearBrowserFit(fitKey);
+      capWRef.current = DEFAULT_VIEWPORT_SIZE.width;
       setActive(false);
       setImage("");
       setError("");
@@ -987,7 +1043,9 @@ export function BrowserPanel({
         ref={stageRef}
         className="browser-stage"
         tabIndex={0}
-        title="Click the page, then type — keystrokes go to the virtual browser"
+        // No native `title`: its tooltip popped up over the viewer rail while
+        // typing in the page looked intentional. Screen readers keep the hint.
+        aria-description="Click the page, then type — keystrokes go to the virtual browser"
         onKeyDown={stageKeyDown}
         onMouseDown={(e) => e.currentTarget.focus()}
       >

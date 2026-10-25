@@ -1,5 +1,6 @@
 import type { ChatMessage, PluginInfo, ToolActivity } from '../types'
 import type { SkillRow } from './api'
+import { isSkillTool } from './toolActivity'
 
 /** One skill a turn touched: attached up front (@mention / plugin command) or
  *  loaded mid-run by the agent itself through `load_skill`. */
@@ -18,27 +19,61 @@ export interface TurnUsage {
   mcp: string[]
 }
 
-/** Index of the message that opens the current turn (the newest user message),
- *  or -1 when the chat has no user message yet. Pure. */
-export function turnStart(messages: ChatMessage[]): number {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'user') return i
-  }
-  return -1
+/** True when a message carries real work: a tool call, an answer or a thought.
+ *  An aborted/queued assistant row (all three empty) is not work. */
+function ran(m: ChatMessage): boolean {
+  if (m.role === 'user') return false
+  if ((m.toolActivity?.length ?? 0) > 0) return true
+  return Boolean(m.content?.trim() || m.thinking?.trim())
 }
 
-/** Collect the skills a turn's tool calls asked for, keyed by lowercase name so
- *  an attached `@Ponytail` and a loaded `ponytail` count as one skill. */
+/** Index of the message that opens the turn the card describes: the newest
+ *  user message above the newest work, or -1 when the chat has no user message
+ *  yet. Pure.
+ *
+ *  NOT simply the newest user message: queued steers and follow-ups typed
+ *  after the agent finished sit BELOW the work, so anchoring on the last user
+ *  row emptied the window (`slice(lastUser + 1)`) and the right panel reported
+ *  "runs without skills" while the transcript showed a `Load Skill` card one
+ *  message above. A trailing user message with no answer yet belongs to the
+ *  same turn the user is looking at. When nothing has run at all, fall back to
+ *  the newest user message so an attached-but-unused skill still shows. */
+export function turnStart(messages: ChatMessage[]): number {
+  let newestUser = -1
+  let lastWork = -1
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m.role === 'user') newestUser = i
+    else if (ran(m)) lastWork = i
+  }
+  if (lastWork === -1) return newestUser
+  for (let i = lastWork; i >= 0; i--) {
+    if (messages[i].role === 'user') return i
+  }
+  return newestUser
+}
+
+/** Comparison key for a skill name. Models rewrite a name when they call the
+ *  tool — an attached `Test UI` comes back as `test-ui`, `test_ui` or
+ *  `TESTUI` — so keying on case alone listed the same skill twice: one row
+ *  attached-but-unused plus one loaded. Lowercase the name and drop the
+ *  separators; letters outside ASCII (Persian names) are left untouched. */
+function skillKey(name: string): string {
+  return name.trim().toLowerCase().replace(/[\s\-_.]+/g, '')
+}
+
+/** Collect the skills a turn's tool calls asked for, keyed by `skillKey` so an
+ *  attached `@Ponytail` and a loaded `ponytail`/`pony-tail` count as one. */
 function loadedSkills(
   list: ToolActivity[] | undefined,
   out: Map<string, string>,
 ): void {
   for (const a of list ?? []) {
-    if (a.tool === 'load_skill') {
+    if (isSkillTool(a.tool)) {
       const raw = a.args?.name ?? a.args?.file
       if (typeof raw === 'string' && raw.trim()) {
         const name = raw.trim()
-        out.set(name.toLowerCase(), name)
+        out.set(skillKey(name), name)
       }
     }
     // Sub-agent calls live under `children`: a skill loaded inside an explore
@@ -58,7 +93,7 @@ export function turnUsage(messages: ChatMessage[]): TurnUsage {
   const skills: TurnSkill[] = []
   const seen = new Set<string>()
   for (const name of turn.skills ?? []) {
-    const key = name.trim().toLowerCase()
+    const key = skillKey(name)
     if (!key || seen.has(key)) continue
     seen.add(key)
     skills.push({ name, used: loaded.has(key) })
@@ -74,10 +109,10 @@ export function turnUsage(messages: ChatMessage[]): TurnUsage {
 
 /** Plugin that ships a skill ("" when it comes from the store itself). */
 export function skillOwner(name: string, catalog: SkillRow[]): string {
-  const key = name.trim().toLowerCase()
+  const key = skillKey(name)
   if (!key) return ''
   const row = catalog.find(
-    (r) => r.name.toLowerCase() === key || (r.slug ?? '').toLowerCase() === key,
+    (r) => skillKey(r.name) === key || skillKey(r.slug ?? '') === key,
   )
   return row?.plugin ?? ''
 }

@@ -16,6 +16,7 @@
 // display name, not the slug, and strip the @token from the prompt text.
 
 import type { SkillRow } from "./api";
+import { forgetCommands } from "./slash";
 
 // Module-level skill list cache, shared between the chat composer (mention
 // matching) and the settings panel (skill CRUD). Lives here — not in a React
@@ -91,7 +92,17 @@ export async function ensureAvailableSkills(): Promise<SkillRow[]> {
  *  agent installs/edits a plugin, whose skills become new commands. */
 export function invalidateAvailableSkills(): void {
   availableCache = null;
-  void ensureAvailableSkills();
+}
+
+/** Drop the full catalog AND fetch it again.
+ *
+ *  The refetch has to read `availableCache` AFTER it was cleared, so it cannot
+ *  be folded into the invalidator: doing both in one call read the cache before
+ *  the reset and cached the pre-install list again, which is why a freshly
+ *  installed bundle's skills stayed missing from `/` and `@` until a reload. */
+export async function refreshAvailableSkills(): Promise<SkillRow[]> {
+  availableCache = null;
+  return ensureAvailableSkills();
 }
 
 /** The list `@mention` matches against: every ATTACHABLE skill — the store plus
@@ -101,7 +112,10 @@ export function invalidateAvailableSkills(): void {
  *  Settings keeps using `getSkillsList()`: a plugin's skill belongs to its
  *  bundle and must not appear in that panel's edit/delete list. */
 export function mentionCatalog(): SkillRow[] {
-  return availableCache && availableCache.length > 0 ? availableCache : getSkillsList();
+  // ONLY the catalog of ENABLED bundles. The `/skills` list is every bundle's
+  // skills, including the ones the user switched OFF — falling back to it put a
+  // disabled plugin's skills back into `@` and into mention matching.
+  return availableCache ?? [];
 }
 
 /** Test-only: reset the module cache between cases. */
@@ -114,38 +128,63 @@ export function resetAvailableSkillsCacheForTest(): void {
   availableCache = null;
 }
 
-/** One `/`-command per PLUGIN skill: the skill's slug is the command word, so a
- *  bundle's advertised name (`/ponytail`) is invocable instead of answering
- *  "Unknown command". Standalone skills are excluded — they keep being reached
- *  through `@mention`, and the store is unbounded (a command per saved skill
- *  would flood the popup).
+/** One `/`-command per ENABLED PLUGIN.
  *
- *  `name` on the returned row is the skill's display name, which is what the
- *  backend attaches by (case-insensitive on `name`), not the slug. */
-export interface PluginSkillCommand {
-  /** Command word without the leading slash. */
+ *  A plugin is the unit the user installs, switches and deletes, so it is the
+ *  unit the `/`-menu names. A command per SKILL buried every real command: the
+ *  shipped library alone holds 26 of them, so the popup was one long list of
+ *  skills and no bundle anywhere. The bundle's skills are its SECOND level —
+ *  `/<plugin> <skill>` — which the palette offers once the plugin is chosen. */
+export interface PluginCommand {
+  /** Command word without the leading slash: the bundle's folder slug. */
   name: string
   hint: string
-  /** Display name to attach the skill by. */
-  skill: string
+  /** The bundle's skills, in the order the catalog listed them. */
+  skills: Array<{ word: string; skill: string; hint: string }>
 }
 
-export function pluginSkillCommands(rows: SkillRow[]): PluginSkillCommand[] {
-  const out: PluginSkillCommand[] = [];
-  const seen = new Set<string>();
+export function pluginCommands(rows: SkillRow[]): PluginCommand[] {
+  const bySlug = new Map<string, PluginCommand>();
   for (const row of rows) {
     if (!row.plugin) continue;
-    const word = (row.slug || row.name).trim().toLowerCase();
-    if (!word || seen.has(word)) continue;
-    seen.add(word);
-    const description = (row.description || '').trim();
-    out.push({
-      name: word,
-      hint: description ? `${row.plugin}: ${description}` : `Skill from ${row.plugin}`,
-      skill: row.name,
-    });
+    const word = (row.plugin_slug || row.plugin).trim().toLowerCase();
+    if (!word) continue;
+    let cmd = bySlug.get(word);
+    if (!cmd) {
+      cmd = { name: word, hint: row.plugin, skills: [] };
+      bySlug.set(word, cmd);
+    }
+    // `skill` is the display name, which is what the backend attaches by
+    // (case-insensitive on `name`), not the slug.
+    const skillWord = skillCommandWord(row);
+    if (skillWord && !cmd.skills.some((s) => s.word === skillWord)) {
+      cmd.skills.push({
+        word: skillWord,
+        skill: row.name,
+        hint: (row.description || '').trim() || row.name,
+      });
+    }
   }
-  return out;
+  return [...bySlug.values()];
+}
+
+/** The `/`-command word a plugin's skill answers to.
+ *
+ *  ONE definition, used both when the palette is built and when the commands
+ *  are forgotten after a delete — drifting apart would leave the composer
+ *  looking for a name the history no longer matches. */
+export function skillCommandWord(row: SkillRow): string {
+  return (row.slug || row.name).trim().toLowerCase();
+}
+
+/** Forget one bundle's `/`-command.
+ *
+ *  The command word was remembered in the prompt history, the pins and the menu
+ *  order. Deleting the bundle drops it from the palette but NOT from those
+ *  stores, so the dead name kept coming back as a pin and as a history row. */
+export function forgetPluginCommands(pluginSlug?: string): void {
+  const word = (pluginSlug || '').trim().toLowerCase();
+  if (word) forgetCommands([word]);
 }
 
 export interface SkillMention {
@@ -154,7 +193,6 @@ export interface SkillMention {
   /** Canonical slug of the skill. */
   slug: string
 }
-
 export interface ExtractResult {
   /** Display names of the matched skills (backend-facing). */
   skills: string[]

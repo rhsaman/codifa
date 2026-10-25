@@ -9,6 +9,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::llm::{http_client, stream_chat, InterruptSignal, LlmConfig, StreamAcc, StreamSignal};
@@ -140,6 +141,13 @@ async fn run_slot_distill(
     if !entry.is_empty() {
         chain.push((model, base, keys, provider_id, kind));
     }
+    // The slot's own try order, and NOTHING else. A tool falls back only to the
+    // models the user picked for it, in the order they arranged them: the chat
+    // model used to be appended as a last resort, which padded the list with a
+    // model the user never chose for this tool and made the visible fallback
+    // list a lie ("it says it tried my fallbacks; it actually tried the chat").
+    // With nothing configured the call simply fails, which is what an empty
+    // fallback list means.
     for step in crate::backend_light::resolve_slot_chain(
         entry,
         slot_fallbacks,
@@ -160,12 +168,15 @@ async fn run_slot_distill(
     for (m, b, keys, pid, k) in chain {
         let (reasoning, model_reasoning, auto_think) = crate::llm::reasoning_fields(
             &k,
-            // A side call defaults to no reasoning (never inherits the main level).
-            if level.is_empty() { "none" } else { level },
+            &crate::llm::level_from_source(
+                provider_model_thinking_levels(&req.providers, &pid, &m).as_deref(),
+                if level.is_empty() { "none" } else { level },
+            ),
             provider_model_reasoning(&req.providers, &pid, &m),
         );
         let cfg = LlmConfig {
             provider: k,
+            provider_id: pid,
             model: m,
             base_url: b,
             api_keys: keys,
@@ -185,16 +196,13 @@ async fn run_slot_distill(
                     return Some(text);
                 }
             }
-            // The distiller is an optimisation: a failure must not fail the
-            // call. But only a model-side rejection moves to the next model — a
-            // timeout or a dropped connection is not the model's fault, and the
-            // caller's raw payload is a better answer than a second paid call
-            // that cannot succeed either.
-            Err(e) => {
-                if !crate::llm::should_fall_back(&e) {
-                    return None;
-                }
-            }
+            // The distiller is an optimisation, and this chain IS the user's own
+            // list: a rung that did not answer hands the work to the NEXT model
+            // they picked. Its rungs normally live on another provider with
+            // another endpoint, so an unreachable or rate-limited first rung
+            // says nothing about the ones behind it — stopping here is what left
+            // a configured list unused and the raw payload in place.
+            Err(_) => {}
         }
     }
     None
@@ -369,11 +377,15 @@ async fn run_vision_slot(
         let (v_reasoning, v_model_reasoning, v_auto_think) = crate::llm::reasoning_fields(
             &c_kind,
             // A side call defaults to no reasoning (never inherits the main level).
-            if v_level.is_empty() { "none" } else { v_level },
+            &crate::llm::level_from_source(
+                provider_model_thinking_levels(&req.providers, &c_provider_id, &c_model).as_deref(),
+                if v_level.is_empty() { "none" } else { v_level },
+            ),
             provider_model_reasoning(&req.providers, &c_provider_id, &c_model),
         );
         let v_cfg = LlmConfig {
             provider: c_kind,
+            provider_id: c_provider_id,
             model: c_model.clone(),
             base_url: c_base,
             api_keys: c_keys,
@@ -413,16 +425,12 @@ async fn run_vision_slot(
                     failed_model = v_cfg.model.clone();
                     failed_error = e.clone();
                 }
-                // Only a model-side rejection justifies calling the NEXT model.
-                // A timeout or a dropped connection stops here with its own
-                // reason: the next model cannot fix the transport, and the caller
-                // must learn why the screenshot was skipped.
-                if !crate::llm::should_fall_back(&e) {
-                    return VisionOutcome::Failed {
-                        model: v_cfg.model.clone(),
-                        error: e,
-                    };
-                }
+                // The chain is the user's own list, so a rung that did not
+                // answer hands the work to the NEXT model they picked whatever
+                // the reason: the fallbacks sit on other providers with other
+                // endpoints, and one unreachable or rate-limited model must not
+                // strand the screenshots. The FIRST error is the one reported, so
+                // the caller still learns why the slot model failed.
             }
         }
     }
@@ -762,7 +770,20 @@ const LLM_TRACE_PROMPT_CAP: usize = 8_000;
 /// Cap on the tool result forwarded to the MODEL: full multi-MB read/grep
 /// outputs ballooned the context (76k-token turns) and made every LLM
 /// round-trip crawl — the #1 cause of slow explore turns.
-const MODEL_RESULT_CAP: usize = 16_000;
+pub(crate) const MODEL_RESULT_CAP: usize = 16_000;
+
+/// Cap on the unified diff appended to an edit's MODEL-facing result.
+///
+/// Measured over 125 traced `edit_file` calls: the diff p50 is 1_660 chars,
+/// p75 2_586 and p90 5_397 — so 4_000 covers 88% of edits in full, and the rest
+/// still carry the marker plus the changed lines nearest the edit, which is
+/// exactly what the verification re-read was looking for.
+const EDIT_DIFF_CHARS: usize = 4_000;
+
+/// Trailer appended after an edit's diff, so the model reads the diff as the
+/// confirmation instead of spending a round-trip to re-read the file.
+const EDIT_DIFF_TRAILER: &str =
+    "\n(that is the applied change — do NOT re-read the file to verify it)";
 
 /// Cap on an explore/task report forwarded to the model.
 ///
@@ -1235,6 +1256,18 @@ pub struct AgentRequest {
     /// own browsing.
     #[serde(default)]
     pub allow_browser: bool,
+    /// The renderer's session-scoped "allow outside-workspace" grant
+    /// (`store.outsideAllowed`). Sent on every message since the Python era but
+    /// never read by the native loop, so a grant the user made in the popup
+    /// could not reach `resolve_safe` and every out-of-tree path answered
+    /// "path escapes project root" — after the round was already paid for.
+    #[serde(default)]
+    pub allow_outside: bool,
+    /// Folders individually approved with "Always allow" (`store.outsideFolders`,
+    /// the nearest existing parent of what was asked). Only these subtrees open
+    /// up; the flag above opens the whole space.
+    #[serde(default)]
+    pub allow_outside_folders: Vec<String>,
     /// Web-search engines from Settings → Plugins, verbatim and in priority
     /// order: `order` 0 is the primary and higher orders are fallbacks tried in
     /// turn, so the user's list order IS the fallback chain.
@@ -1378,6 +1411,14 @@ fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     let (allowed, action) = match name {
         "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
         "run_terminal" => (caps.run_terminal, "run commands"),
+        // Read/search follows the mode's own read capability, not `web`: a mode
+        // that may not read the workspace must not reach it through `grep`.
+        // The locator tools read the workspace as well (`find_symbol` answers
+        // with file bodies), so they ride the same capability.
+        "read" | "grep" | "glob" | "find_symbol" | "lsp_symbols" | "lsp_definition"
+        | "lsp_references" | "lsp_hover" | "lsp_diagnostics" => {
+            (caps.read_files, "read or search the workspace")
+        }
         "web_search" | "fetch_url" => (caps.web, "search or fetch the web"),
         _ => return None,
     };
@@ -1391,17 +1432,36 @@ exact old text → new text. Tell the user to switch to Build mode if they want 
     ))
 }
 
+/// The `plugin` actions that only an AUTHORING turn may call.
+///
+/// `list` and `run` are not authoring: naming what a bundle ships and running a
+/// script already on disk are acts of the same kind as `run_terminal`, which
+/// Build and Ask already allow — while a scheduled Build run has nobody to ask
+/// and still has to be able to fire a bundle's script. Everything that WRITES a
+/// bundle stays behind the flag.
+fn plugin_action_needs_authoring(action: &str) -> bool {
+    matches!(action, "install" | "create" | "update" | "toggle" | "delete")
+}
+
 /// Mode gating, part one: drop every tool this turn may not use. The model
 /// cannot pick a tool it cannot see, so withholding the schema is the primary
 /// gate; `denied_by_caps` in the loop is the backstop for a stale transcript or
 /// a hallucinated (or connector-supplied) name.
-fn retain_allowed_tools(schemas: &mut Vec<Value>, caps: &ToolCaps) {
+fn retain_allowed_tools(schemas: &mut Vec<Value>, caps: &ToolCaps, mode: &str) {
     schemas.retain(|s| {
-        s["function"]["name"]
-            .as_str()
-            .map(|n| denied_by_caps(caps, n).is_none())
-            .unwrap_or(true)
-    });
+        let Some(n) = s["function"]["name"].as_str() else {
+            return true;
+        };
+        if denied_by_caps(caps, n).is_some() {
+            return false;
+        }
+        // `glob` is pure DISCOVERY: the main agent may read files its step
+        // already named and grep one known token, but finding out WHICH files
+        // exist stays with the sub-agent, whose report is what the main agent
+        // works from (67% of all tool calls are raw search, all of it in
+        // explore). A sub-agent keeps the full set.
+        !(n == "glob" && mode != "subagent")
+    })
 }
 
 /// Accept the renderer's loose image payload and normalise it to data URLs.
@@ -1496,6 +1556,10 @@ impl AgentRequest {
             allow_computer: self.allow_computer,
             allow_create: self.allow_create,
             allow_browser: self.allow_browser,
+            // A read grant is inherited: the user widened THIS TURN's reach, and
+            // a sub-agent the turn delegates to searches the same disk.
+            allow_outside: self.allow_outside,
+            allow_outside_folders: self.allow_outside_folders.clone(),
             search_plugins: self.search_plugins.clone(),
             // Sub-agents never auto-compact mid-turn (they have their own
             // budget), but the snapshot stays a faithful copy of the turn.
@@ -1616,6 +1680,34 @@ fn running_turns() -> &'static std::sync::Mutex<std::collections::HashSet<String
     RUNNING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Is a turn running for `chat_id` right now?
+///
+/// The browser's idle reaper asks this: a tab the AGENT is driving must never be
+/// closed for lack of panel polls. When the user switches chat the panel stops
+/// polling that chat's tab, but the turn keeps using it — reaping it on the 5-min
+/// TTL is what turned a running agent's browser into "Browser is stopped".
+pub fn is_turn_running(chat_id: &str) -> bool {
+    if chat_id.trim().is_empty() {
+        return false;
+    }
+    running_turns()
+        .lock()
+        .map(|r| r.contains(chat_id))
+        .unwrap_or(false)
+}
+
+/// Test-only view of the turn registry, so the browser reaper's policy can be
+/// locked down (a running turn must keep its tab alive) without forging one.
+#[cfg(test)]
+pub(crate) fn test_set_turn_running(chat_id: &str, running: bool) {
+    let mut r = running_turns().lock().unwrap();
+    if running {
+        r.insert(chat_id.to_string());
+    } else {
+        r.remove(chat_id);
+    }
+}
+
 /// Mid-turn steer inbox: chat_id -> messages typed while that turn is running.
 /// The loop drains it before every model call, so a steer lands in the SAME turn
 /// with the whole conversation already in `messages` above it — the model keeps
@@ -1667,13 +1759,43 @@ fn next_gate_id() -> String {
 /// turn. Resolved by POST /ask/respond or /permission/respond (see
 /// `deliver_answer`). The turn BLOCKS on the oneshot until the renderer
 /// answers, so a permission/ask popup really pauses the agent.
+/// Open user-answer gates: gate id -> (chat that owns it, the oneshot that
+/// resumes the waiting turn).
+///
+/// The chat id rides along so a DELETED chat can release its gates. Without it
+/// the only removals were `deliver_answer` and the waiter's own cancel tick, and
+/// a chat deleted while a popup was still open kept the blocked turn task —
+/// together with that chat's entire `Vec<Value>` message history — alive for the
+/// rest of the session.
 fn answer_gates() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>,
+    std::collections::HashMap<String, (String, tokio::sync::oneshot::Sender<Value>)>,
 > {
     static GATES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, (String, tokio::sync::oneshot::Sender<Value>)>,
+        >,
     > = std::sync::OnceLock::new();
     GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Drop every gate belonging to `chat_id`.
+///
+/// Dropping the sender makes the parked `await_answer` observe a closed channel
+/// and return `None`, so the turn unwinds through its normal refusal path and
+/// releases everything it was holding.
+fn release_chat_gates(chat_id: &str) {
+    if chat_id.trim().is_empty() {
+        return;
+    }
+    answer_gates()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, (owner, _)| owner != chat_id);
+}
+
+/// Called when a chat is deleted: nothing will ever answer its popups again.
+pub fn forget_chat(chat_id: &str) {
+    release_chat_gates(chat_id);
 }
 
 /// Deliver an answer to a waiting gate. False when no such gate is open (a
@@ -1682,7 +1804,8 @@ pub fn deliver_answer(id: &str, payload: Value) -> bool {
     let tx = answer_gates()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(id);
+        .remove(id)
+        .map(|(_, tx)| tx);
     match tx {
         Some(tx) => tx.send(payload).is_ok(),
         None => false,
@@ -1694,12 +1817,16 @@ pub fn deliver_answer(id: &str, payload: Value) -> bool {
 /// There is deliberately NO deadline: the user may take as long as they need
 /// (the popup stays open). The 500 ms tick is NOT a timeout — it only re-reads
 /// the cancel flag so the Stop button still ends a wait that nobody answered.
-async fn await_answer(id: &str, cancel: &std::sync::atomic::AtomicBool) -> Option<Value> {
+async fn await_answer(
+    id: &str,
+    chat_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Value> {
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Value>();
     answer_gates()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id.to_string(), tx);
+        .insert(id.to_string(), (chat_id.to_string(), tx));
     loop {
         match tokio::time::timeout(std::time::Duration::from_millis(500), &mut rx).await {
             Ok(res) => return res.ok(),
@@ -1714,6 +1841,110 @@ async fn await_answer(id: &str, cancel: &std::sync::atomic::AtomicBool) -> Optio
             }
         }
     }
+}
+
+/// The turn's out-of-workspace permit, built ONCE from the renderer's grants.
+///
+/// `resolve_safe` has always honoured a `permit` (workspace, tmp and `~/.codifa`
+/// pass without one); the loop simply never built it, so the user's popup answer
+/// dead-ended. Passing `None` when nothing is granted keeps the old refusal text
+/// for a path the user never approved.
+fn outside_permit(req: &AgentRequest) -> Option<Value> {
+    if !req.allow_outside && req.allow_outside_folders.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "outside": req.allow_outside,
+        "folders": req.allow_outside_folders,
+    }))
+}
+
+/// Ask the user to approve an out-of-workspace path, then report whether the
+/// grant covers `path`.
+///
+/// This is what turns a burned round into a served one: the refusal used to
+/// arrive AFTER the model had already paid for the round, then the model spent
+/// another round re-asking with a different tool. Asking first means the answer
+/// is known before the work runs. `scope`/`folder` ride the event so "Always
+/// allow" can register exactly this subtree.
+async fn ask_outside_access(
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    chat_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    action: &str,
+    path: &std::path::Path,
+) -> bool {
+    let gate = next_gate_id();
+    let folder = path.to_string_lossy().to_string();
+    emit(&AgentEvent::Permission {
+        id: gate.clone(),
+        action: action.to_string(),
+        path: folder.clone(),
+        reason: "outside the workspace".to_string(),
+        scope: "outside".to_string(),
+        folder,
+    });
+    match await_answer(&gate, chat_id, cancel).await {
+        Some(v) => v["allowed"].as_bool().unwrap_or(false),
+        None => false,
+    }
+}
+
+/// The folder a grant must cover before a call may touch a path OUTSIDE every
+/// allowed root (the workspace, the OS temp roots, `~/.codifa`, or a folder
+/// already granted this turn).
+///
+/// `None` means the call stays inside that set — or names no path at all — so it
+/// runs with no prompt. This is the pre-flight that ends the old two-round
+/// dance: refuse → the model re-asks with a NATIVE tool → that one fails on the
+/// SAME path, so one answer was billed twice. The user's rule is that every READ
+/// works everywhere and only APPLYING a change needs Build, so an out-of-tree
+/// read needs a GRANT, never a refusal.
+fn outside_target(
+    name: &str,
+    args: &Value,
+    root: &str,
+    permit: Option<&Value>,
+) -> Option<std::path::PathBuf> {
+    let rels = if name == "run_terminal" {
+        shell_targets(args["command"].as_str().unwrap_or_default())
+    } else {
+        crate::tools::lookup_paths(name, args)
+    };
+    for rel in rels {
+        if let crate::tools::PathAccess::NeedsPermission(folder) =
+            crate::tools::path_access(root, &rel, permit)
+        {
+            return Some(folder);
+        }
+    }
+    None
+}
+
+/// Record a folder the user just approved for the rest of THIS turn, so the very
+/// next call in the same round already sees the grant.
+fn grant_folder(permit: &mut Option<Value>, folder: &std::path::Path) {
+    let f = folder.to_string_lossy().to_string();
+    if f.is_empty() {
+        return;
+    }
+    let p = permit.get_or_insert_with(|| json!({"outside": false, "folders": []}));
+    if let Some(arr) = p["folders"].as_array_mut() {
+        if !arr.iter().any(|v| v.as_str() == Some(f.as_str())) {
+            arr.push(json!(f));
+        }
+    }
+}
+
+/// The answer to a DENIED out-of-workspace request. It must not read as a tool
+/// error the model retries: it names what IS reachable instead.
+fn denied_outside(folder: &std::path::Path) -> String {
+    format!(
+        "The user DENIED access to {}. Nothing was read or run — do NOT retry this path. \
+The workspace, the OS temp folder (/tmp) and ~/.codifa stay open; use one of those or ask the \
+user what to do instead.",
+        folder.display()
+    )
 }
 
 /// Map a model-invented tool name onto the REAL advertised one.
@@ -1974,6 +2205,14 @@ pub enum AgentEvent {
         /// 0 for sub-agent requests. The renderer prefers this over its own
         /// lookup so the meter's percentage cannot drift from the trigger's.
         context_window: u64,
+        /// Characters of reasoning content (`reasoning_content`, Anthropic
+        /// `thinking` deltas) this call really produced — 0 when it produced
+        /// none. This is the only GROUND TRUTH that a provider+model reasons:
+        /// NVIDIA NIM and most custom gateways describe no capability at all in
+        /// their `/models` payload (`id`/`object`/`created`/`owned_by` only),
+        /// so the renderer learns the flag from what the model demonstrably
+        /// did instead of parsing the model's name.
+        reasoning_chars: u64,
     },
     /// A tool event tagged with the sub-agent branch it belongs to. Serialized
     /// as the inner event plus `branch` (and `sub`). Without the tags the
@@ -2023,6 +2262,9 @@ pub enum AgentEvent {
         attempt: usize,
         attempts: usize,
         model: String,
+        /// Provider ROW the model is routed to, so the banner can name the
+        /// provider the user configured instead of its wire kind.
+        provider_id: String,
         percent: u8,
         budget_secs: u64,
         elapsed_secs: u64,
@@ -2043,7 +2285,18 @@ pub enum AgentEvent {
     Ask { id: String, question: String, options: Value },
     /// The agent is waiting for permission to run a destructive /
     /// out-of-workspace action (POST /permission/respond).
-    Permission { id: String, action: String, path: String, reason: String, scope: String },
+    Permission {
+        id: String,
+        action: String,
+        path: String,
+        reason: String,
+        scope: String,
+        /// The subtree a "Always allow" would register (the nearest existing
+        /// parent of `path`). Empty for a request with no path. The renderer
+        /// shows it so the user can see exactly what they are widening — the
+        /// field the frontend already declares as `folder` in `PermissionReq`.
+        folder: String,
+    },
     /// A failed model call is being retried after `delay_secs`. Mirrors the
     /// renderer's self-heal `retry` event so a SUB-AGENT failure (which runs
     /// on the parent's own stream and is therefore invisible to the frontend's
@@ -2062,6 +2315,11 @@ pub enum AgentEvent {
         /// main agent's own retry ladder.
         tool: String,
         model: String,
+        /// The provider ROW (id) the model is routed to. The banner resolves it
+        /// to the name the user configured, so it can say WHICH provider the
+        /// failing model lives on — a bare model id names nothing when several
+        /// providers serve the same one.
+        provider_id: String,
         /// True: this is a SELF-HEAL (the agent resumes from the existing
         /// transcript), not a user-triggered restart — the renderer keeps the
         /// already-streamed text and tool cards instead of wiping them.
@@ -2081,6 +2339,8 @@ pub enum AgentEvent {
         agent: String,
         tool: String,
         model: String,
+        /// See `Retry::provider_id`.
+        provider_id: String,
         /// See `Retry::fallback`.
         fallback: bool,
     },
@@ -2116,7 +2376,7 @@ impl AgentEvent {
                 "kind": "diff", "tool": tool, "path": path, "diff": diff,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
-            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window } => json!({
+            AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window, reasoning_chars } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_tokens": cache_read_tokens,
@@ -2124,6 +2384,7 @@ impl AgentEvent {
                 "sub": sub,
                 "context_tokens": context_tokens,
                 "context_window": context_window,
+                "reasoning_chars": reasoning_chars,
             }),
             AgentEvent::Branch { branch, sub, inner } => {
                 let mut v = inner.to_json();
@@ -2143,6 +2404,7 @@ impl AgentEvent {
                 agent,
                 tool,
                 model,
+                provider_id,
                 reconnecting,
                 fallback,
             } => json!({
@@ -2154,6 +2416,7 @@ impl AgentEvent {
                 "agent": agent,
                 "tool": tool,
                 "model": model,
+                "provider_id": provider_id,
                 "reconnecting": reconnecting,
                 "fallback": fallback,
             }),
@@ -2164,6 +2427,7 @@ impl AgentEvent {
                 agent,
                 tool,
                 model,
+                provider_id,
                 fallback,
             } => json!({
                 "kind": "retry_giveup",
@@ -2173,6 +2437,7 @@ impl AgentEvent {
                 "agent": agent,
                 "tool": tool,
                 "model": model,
+                "provider_id": provider_id,
                 "fallback": fallback,
             }),
             AgentEvent::Done { aborted } => json!({"kind": "done", "aborted": aborted}),            AgentEvent::PlanCard { title, body } => {
@@ -2200,6 +2465,7 @@ impl AgentEvent {
                 attempt,
                 attempts,
                 model,
+                provider_id,
                 percent,
                 budget_secs,
                 elapsed_secs,
@@ -2209,6 +2475,7 @@ impl AgentEvent {
                 "attempt": attempt,
                 "attempts": attempts,
                 "model": model,
+                "provider_id": provider_id,
                 "percent": percent,
                 "budget_secs": budget_secs,
                 "elapsed_secs": elapsed_secs,
@@ -2239,18 +2506,22 @@ impl AgentEvent {
             AgentEvent::Ask { id, question, options } => json!({
                 "kind": "ask", "id": id, "question": question, "options": options,
             }),
-            AgentEvent::Permission { id, action, path, reason, scope } => json!({
+            AgentEvent::Permission { id, action, path, reason, scope, folder } => json!({
                 "kind": "permission", "id": id, "action": action, "path": path,
-                "reason": reason, "scope": scope,
+                "reason": reason, "scope": scope, "folder": folder,
             }),
             AgentEvent::Error { content } => json!({"kind": "error", "content": content}),
         }
     }
 }
 
-/// Tool schemas for the MAIN agent: no search/read tools — the main agent
-/// delegates all research to the `explore` sub-agent and works only with the
-/// data the sub-agent returns (user request: main agent must not search).
+/// Tool schemas for the MAIN agent: the WORK set (edit/write/terminal/browser)
+/// plus targeted lookups — `read` (files the step already knows), `grep` (one
+/// known token) and locate-by-symbol (`find_symbol`, `lsp_symbols` and the three
+/// position-based LSP lookups, see `lsp_position_schemas`) — which is what keeps
+/// a narrow question from costing either a shell detour or a full `explore`
+/// delegation. DISCOVERY stays delegated: `glob` is withheld (see
+/// `retain_allowed_tools` and `denied_by_caps`).
 fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
     // Per-tool schemas: the model only sees the args each tool actually
     // accepts — a shared all-fields block made it emit empty filler
@@ -2274,10 +2545,67 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "run_terminal",
-            "Run a shell command in the workspace with a timeout.",
+            // The schema is where the model learns the DIVISION OF LABOUR: the
+            // backend refuses a shell read/search (MEASURED: the model reached
+            // for `cat`/`sed -n` whenever the tool list did not say so).
+            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused.",
             json!({"command": {"type": "string"}, "timeout": {"type": "integer"}}),
         ),
         ("current_time", "Current UTC time.", json!({})),
+        // Bounded read/search: the main agent may read what the step already
+        // NAMED (a file list, one window) without a delegation. Measured on the
+        // traced corpus, one main round re-sends the whole conversation for
+        // ~7.7K uncached tokens at the START of a turn, but that number grows
+        // with the turn: re-measured on the newest build, a late main round
+        // re-sends a median of 79K input tokens against 16K for an `explore`
+        // round, so past round 20 one main step already costs about five
+        // explore rounds. Read/search here is for what the step already NAMED.
+        (
+            "read",
+            "Read files this step already KNOWS (never for discovery — that is `explore`). One call covers all of them: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400}] reads one window PER ENTRY — several files and several windows of ONE file cost one call, never one per window; overlapping windows merge. An entry without `path` reuses the top-level filePath.",
+            json!({
+                "filePath": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "ranges": {"type": "array", "items": {"type": "object"}}
+            }),
+        ),
+        (
+            "grep",
+            "Regex search for a token whose FILE is unknown: pass path+include to scope it, then read the hits. Search HERE, not via `run_terminal` (a shell search is refused).",
+            json!({
+                "pattern": {"type": "string"},
+                "patterns": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string"},
+                "include": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "context": {"type": "integer"},
+                "ignore_case": {"type": "boolean"}
+            }),
+        ),
+        // Locate-by-symbol, main-agent edition: the two tools that answer
+        // "where does this live" WITHOUT reading the file. Traced on the live
+        // corpus, the main agent burned 376 extra same-file reads (3.05M chars
+        // ≈ 763K tokens) hunting lines it could have located, 62 of them
+        // re-sending windows that overlapped what it had already read, and 35
+        // rounds whose successor was a plain read of a grep hit. `find_symbol`
+        // collapses grep → definition → references into ONE call and needs no
+        // language server, so it works for every language; `lsp_symbols`
+        // outlines a file instead of reading it to find where something lives.
+        (
+            "find_symbol",
+            "Locate ONE identifier: its definition(s) with bodies PLUS every usage, in a single call — replaces the grep → definition → references chain (three rounds) and needs no language server. Use it FIRST whenever you know the symbol's name, then read only the windows it points at.",
+            json!({
+                "symbol": {"type": "string", "description": "Bare identifier (letters, digits, _ or $ — never a regex)"},
+                "path": {"type": "string", "description": "Directory or file to scope the search (optional)"},
+                "include": {"type": "string", "description": "Glob filter such as *.rs (optional)"}
+            }),
+        ),
+        (
+            "lsp_symbols",
+            "Outline ONE file — functions/structs/classes with their line ranges, `query` filters by name. Use it instead of reading a large file just to find where something lives, then read only that window.",
+            json!({"filePath": {"type": "string"}, "query": {"type": "string"}}),
+        ),
         (
             "system_stats",
             "Read the OS process list (Activity Monitor): per-process RSS memory and CPU usage. Use it to diagnose memory/CPU issues. Args: filter (substring, optional) and top (how many rows, default 15).",
@@ -2340,7 +2668,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "create_mcp",
-            "Create or update an MCP connector (the `/create-mcp` flow). Pass EITHER command (+ optional args/env) for a stdio server, OR url for an HTTP one. To EDIT an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it (the old file is removed so no stale duplicate is left). The connector is saved but stays off until the user enables it in the composer's MCP picker.",
+            "Create or update an MCP connector (the `/mcp` flow). Pass EITHER command (+ optional args/env) for a stdio server, OR url for an HTTP one. To EDIT an existing connector, pass its SAME name to overwrite it in place, or pass previous_name to rename it (the old file is removed so no stale duplicate is left). The connector is saved but stays off until the user enables it in the composer's MCP picker.",
             json!({
                 "name": {"type": "string", "description": "Connector name (also the file name)"},
                 "command": {"type": "string", "description": "Executable for a stdio server (e.g. npx)"},
@@ -2364,9 +2692,9 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // short: create/update/toggle/delete/list instead of four tools.
         (
             "plugin",
-            "Create/edit a plugin — a folder bundling skills and MCP connectors that enable/disable together. `install` reads a bundle from a git repo or local folder; create fails on an existing slug; update patches only the fields sent; toggle flips `enabled`; delete removes it.",
+            "Create/edit a plugin — a folder bundling skills, MCP connectors and runnable scripts behind one switch. `install` READS a bundle from a git repo or local folder; `create` MAKES one (use it when the user names a bundle rather than a repo); update patches only the fields sent; toggle flips `enabled`; delete removes it; run executes a script. Pass its Persian `fa_keywords`. Scripts are Rust — the house language — unless the user asked for another. When a bundle ships scripts, `list` names them and `run` executes one; also write the running command into the SKILL body that owns it, so the route is discoverable from the skill alone.",
             json!({
-                "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete"]},
+                "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete", "run"]},
                 "repo": {"type": "string", "description": "install: `owner/repo`, GitHub URL, or local path"},
                 "repo_path": {"type": "string", "description": "install: sub-folder holding the bundle"},
                 "repo_ref": {"type": "string", "description": "install: branch/tag/commit"},
@@ -2374,6 +2702,11 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "slug": {"type": "string", "description": "Folder slug; defaults to the lowercased name"},
                 "description": {"type": "string"},
                 "version": {"type": "string", "description": "Defaults to 1.0.0"},
+                "fa_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "PERSIAN phrases the whole bundle answers to. Skills with no fa_keywords of their own inherit these (capped)."
+                },
                 "enabled": {"type": "boolean", "description": "toggle: the value to set; omit to flip"},
                 "skills": {
                     "type": "array",
@@ -2383,14 +2716,40 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                             "name": {"type": "string"},
                             "content": {"type": "string"},
                             "description": {"type": "string"},
-                            "fa_keywords": {"type": "string"}
+                            "fa_keywords": {"type": "string"},
+                            "previous_name": {"type": "string", "description": "Old skill name when renaming"},
+                            "extra_files": {"type": "object", "description": "Extra files: filename -> content"},
+                            "deleted_files": {"type": "array", "items": {"type": "string"}, "description": "Extra files to delete"}
                         },
                         "required": ["name", "content"]
                     }
                 },
                 "deleted_skills": {"type": "array", "items": {"type": "string"}},
                 "mcp": {"type": "object", "description": "Connectors: {name: {command,args}|{url}}"},
-                "deleted_mcp": {"type": "array", "items": {"type": "string"}}
+                "deleted_mcp": {"type": "array", "items": {"type": "string"}},
+                "scripts": {
+                    "type": "array",
+                    "description": "Runnable scripts. Scripts are RUST unless the user explicitly asked for another language: leave `language` OUT and write Rust. Never pick a language on your own.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Name used by action=run"},
+                            "language": {"type": "string", "enum": ["rust", "python", "node", "bash"], "description": "Omit for Rust. Set ONLY when the user named this language themselves."},
+                            "description": {"type": "string"},
+                            "content": {"type": "string", "description": "Full source; omit for a starter"},
+                            "previous_name": {"type": "string", "description": "Set when renaming"}
+                        },
+                        "required": ["name"]
+                    }
+                },
+                "deleted_scripts": {"type": "array", "items": {"type": "string"}},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "run: script arguments"
+                },
+                "timeout": {"type": "integer", "description": "run: kill after N seconds (default 60)"},
+                "cwd": {"type": "string", "description": "run: working folder (default: the plugin folder)"}
             }),
         ),
         // Artifacts are versioned documents the renderer previews in a sandboxed
@@ -2427,7 +2786,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "explore",
-            "Delegate research to the explore sub-agent (it reads files, greps, globs, runs LSP lookups and returns the FULL findings — you cannot search yourself). ALWAYS split the work: call explore SEVERAL TIMES IN THE SAME STEP, one focused question per area/file group — parallel calls run CONCURRENTLY and cost ONE round-trip, while a single broad explore is the slowest and shallowest option. Prefer 2-4 focused explores over one giant one; only a genuinely single-area question justifies a single call. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
+            "Delegate research that needs MANY rounds (how an area works, where X is wired up). It reads, greps, globs and runs LSP lookups, then returns the FULL findings. Fire SEVERAL TIMES IN THE SAME STEP — parallel calls run CONCURRENTLY for ONE round-trip — one focused question per area; prefer 2-4 focused explores over one giant one. Read a file whose path you already know directly instead of delegating it. Args: description (SHORT label for the UI, under 80 chars) and prompt (the full research question).",
             json!({
                 "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
                 "prompt": {"type": "string", "description": "The full research question for the sub-agent"}
@@ -2467,18 +2826,17 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
     let schemas: Vec<(&str, &str, Value)> = schemas
         .iter()
         .map(|(name, desc, props)| (*name, *desc, props.clone()))
+        .chain(lsp_position_schemas())
         .chain(extra.drain(..))
         .collect();
-    schemas
+    let mut out: Vec<Value> = schemas
         .iter()
-        // The skill/connector authoring tools are bound only for a turn that
-        // actually asked for them (see AgentRequest::allow_create).
+        // The skill/connector AUTHORING tools are bound only for a turn that
+        // actually asked for them (see AgentRequest::allow_create). `plugin` is
+        // deliberately NOT in this list: it is the one door to a bundle's
+        // scripts, so a plain turn keeps `list`/`run` (see the narrowing below).
         .filter(|(name, _, _)| {
-            allow_create
-                || !matches!(
-                    *name,
-                    "create_skill" | "create_mcp" | "plugin" | "artifact" | "schedule"
-                )
+            allow_create || !matches!(*name, "create_skill" | "create_mcp" | "artifact" | "schedule")
         })
         .map(|(name, desc, props)| {
             json!({
@@ -2490,22 +2848,115 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 },
             })
         })
-        .collect()
+        .collect();
+    if !allow_create {
+        // A plain turn keeps the door to a bundle's scripts, but NOT the
+        // authoring prose: the full schema is ~2.9K chars and is re-sent on
+        // every round-trip, so the authoring description would tax every turn
+        // to describe actions this one cannot call. The compact schema carries
+        // only what `list`/`run` need — the enum IS the gate, since the model
+        // cannot pick an action it cannot name (the loop keeps a second gate for
+        // a stale transcript).
+        for s in out.iter_mut() {
+            if s["function"]["name"] != "plugin" {
+                continue;
+            }
+            *s = json!({
+                "type": "function",
+                "function": {
+                    "name": "plugin",
+                    "description": "A plugin bundle's scripts: `list` names the bundles and their \
+scripts, `run` executes one on disk. Saving a bundle needs the user to ask for it.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["list", "run"]},
+                            "slug": {"type": "string", "description": "Plugin folder slug"},
+                            "name": {"type": "string", "description": "run: script name"},
+                            "args": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+            });
+        }
+    }
+    out
 }
 
-/// Tool schemas for the explore SUB-AGENT: the full read/search set the main
-/// agent no longer has (read/grep/glob/LSP) plus memory search.
+/// The POSITION-based LSP lookups: definition, references, hover — plus
+/// `lsp_diagnostics`.
+///
+/// Shared by BOTH roles through `lsp_position_schemas`, so the main agent gets
+/// targeted symbol navigation without a second copy of the prose. They stay
+/// separate from `tool_schemas`' base table because the explore set already
+/// carried them and the main set only grew them once the trace justified it:
+/// 92.2% of every read window in the corpus (1_645 of 1_785) sits in a language
+/// with a REGISTERED language server (.rs/.ts/.tsx/.js/.py/.sh/.astro), so a
+/// symbol jump is available wherever the model actually spends its reads. The
+/// failure path is bounded and self-explaining — an uninstalled server answers
+/// "the language server is not installed or not on PATH. Use grep + read …
+/// instead of retrying" — so one miss costs one round, not a hunt.
+///
+/// `lsp_diagnostics` also rides on every successful `edit_file` (see
+/// `tools::post_edit_diagnostics`): a WARM server answers inline, so the model
+/// no longer spends a whole round on a manual typecheck it cannot skip.
+fn lsp_position_schemas() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "lsp_definition",
+            "Jump to the DEFINITION of a symbol and show its body (LSP) — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. No need to know line/character.",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol (a usage or the declaration)"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
+        ),
+        (
+            "lsp_references",
+            "Find ALL references/usages of a symbol across the workspace (LSP). Pass filePath + symbol (same as lsp_definition).",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
+        ),
+        (
+            "lsp_hover",
+            "Type/signature/docs of a symbol (LSP). Pass filePath + symbol (same as lsp_definition).",
+            json!({
+                "filePath": {"type": "string", "description": "File that contains the symbol"},
+                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
+                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
+                "character": {"type": "integer"}
+            }),
+        ),
+        (
+            "lsp_diagnostics",
+            "Errors and warnings the language server reports for ONE file, WITHOUT running a build. Use it right after an edit instead of a full build/typecheck round: it answers in one call and names the exact line. It reports only what the server has published for that file — it is not a substitute for running the project's real test command before finishing.",
+            json!({
+                "filePath": {"type": "string", "description": "File to check (a language server must be installed for its language)"}
+            }),
+        ),
+    ]
+}
+
+/// Tool schemas for the explore SUB-AGENT: the UNBOUNDED search set the main
+/// agent does not get — `glob` discovery — plus the memory tools. It shares
+/// `read`/`grep`/`find_symbol` and the position-based LSP lookups with the main
+/// agent by design: both roles read, they differ in how far they may wander.
 fn research_schemas() -> Vec<Value> {
     // Per-tool schemas (see tool_schemas): only the args each tool accepts.
     let schemas: &[(&str, &str, Value)] = &[
         (
             "read",
-            "Read ONE file (single filePath — never a list). Default window is 400 lines; pass offset/limit for one window or ranges=[{\"offset\":..,\"limit\":..},…] for SEVERAL windows of the same file in one call.",
+            "Read files you already KNOW. ONE call covers several: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400},{\"path\":\"b.ts\"},…] reads one window per entry (several files and several windows alike), and an entry without `path` reuses the top-level filePath. Several windows of ONE file belong in the SAME call — never one call per window. Overlapping or adjacent windows of one file arrive merged. Default window is 400 lines.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
                 "limit": {"type": "integer"},
-                "ranges": {"type": "array", "items": {"type": "object", "properties": {"offset": {"type": "integer"}, "limit": {"type": "integer"}}}}
+                "ranges": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}}}
             }),
         ),
         (
@@ -2538,36 +2989,6 @@ fn research_schemas() -> Vec<Value> {
                 "symbol": {"type": "string", "description": "Bare identifier to look up (no regex)"},
                 "path": {"type": "string", "description": "Directory or file to scope the search (optional)"},
                 "include": {"type": "string", "description": "Glob filter such as *.rs (optional)"}
-            }),
-        ),
-        (
-            "lsp_definition",
-            "Jump to the DEFINITION of a symbol and show its body (LSP) — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. No need to know line/character.",
-            json!({
-                "filePath": {"type": "string", "description": "File that contains the symbol (a usage or the declaration)"},
-                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
-                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
-                "character": {"type": "integer"}
-            }),
-        ),
-        (
-            "lsp_references",
-            "Find ALL references/usages of a symbol across the workspace (LSP). Pass filePath + symbol (same as lsp_definition).",
-            json!({
-                "filePath": {"type": "string", "description": "File that contains the symbol"},
-                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
-                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
-                "character": {"type": "integer"}
-            }),
-        ),
-        (
-            "lsp_hover",
-            "Type/signature/docs of a symbol (LSP). Pass filePath + symbol (same as lsp_definition).",
-            json!({
-                "filePath": {"type": "string", "description": "File that contains the symbol"},
-                "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
-                "line": {"type": "integer", "description": "Optional 1-based line to disambiguate repeated names"},
-                "character": {"type": "integer"}
             }),
         ),
         (
@@ -2617,8 +3038,9 @@ fn research_schemas() -> Vec<Value> {
             }),
         ),
     ];
-    schemas
-        .iter()
+    lsp_position_schemas()
+        .into_iter()
+        .chain(schemas.iter().map(|(name, desc, props)| (*name, *desc, props.clone())))
         .map(|(name, desc, props)| {
             json!({
                 "type": "function",
@@ -2642,6 +3064,53 @@ static TURN_SEQ: AtomicU64 = AtomicU64::new(0);
 /// frontend matches `branch` across every card in a message — two explores in
 /// different steps must never share an id or each would show the other's calls.
 static BRANCH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// The applied change, rendered for the MODEL, bounded on a char boundary.
+///
+/// `edit_file` answers with just "Successfully edited x (1 occurrence replaced)."
+/// — 87 chars for a real change. Traced turns then spent their NEXT round-trip
+/// on a lone read/grep of the very same file to confirm it (78 of 131 edits,
+/// 975_031 chars of re-reading in total): a full conversation re-send to buy
+/// back information the edit already had. The diff is computed for the Review
+/// panel anyway, so handing it to the model too removes that round-trip.
+///
+/// The trailer matters: without it the model treats the diff as extra context
+/// and still validates it by re-reading.
+fn applied_change_block(diff: &str) -> String {
+    if diff.len() <= EDIT_DIFF_CHARS {
+        return format!("\n\n=== applied change ===\n{diff}{EDIT_DIFF_TRAILER}");
+    }
+    let mut end = EDIT_DIFF_CHARS;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "\n\n=== applied change (first {EDIT_DIFF_CHARS} bytes of {}) ===\n{}{EDIT_DIFF_TRAILER}",
+        diff.len(),
+        &diff[..end]
+    )
+}
+
+/// What the model is told above the screenshots it just took.
+///
+/// The coordinate line is the important part: the image is resized before it is
+/// sent, so an x/y read off the picture is NOT a screen coordinate. Without the
+/// mapping the model clicks at the pixel it saw in a 1440-wide image on a
+/// 2880-wide screen — off by a factor of two, and it has no way to notice.
+fn shot_summary(shots: &[crate::computer::Shot]) -> String {
+    let mut out = String::from("Screenshot taken:");
+    for (i, s) in shots.iter().enumerate() {
+        if shots.len() > 1 {
+            out.push_str(&format!("\n[{}]", i + 1));
+        }
+        out.push_str(&format!("\n  {} — {}x{} px.", s.label, s.width, s.height));
+        out.push_str(&format!(
+            "\n  Screen point = ({:.0} + image_x × {:.4}, {:.0} + image_y × {:.4}).",
+            s.origin_x, s.points_per_pixel, s.origin_y, s.points_per_pixel
+        ));
+    }
+    out
+}
 
 /// Cap the UI echo, record the trace row, emit the Tool event and push the
 /// tool message — shared by the parallel (read-only batch) and sequential
@@ -2669,10 +3138,14 @@ fn finish_tool(
             end -= 1;
         }
         shown.truncate(end);
-        shown.push_str("\n… (truncated)");
+        shown.push_str("\n… (truncated in the panel only)");
     }
     // The model receives a capped copy too — a narrower re-read is one
     // cheap tool call; an unbounded context is seconds per round-trip.
+    //
+    // Which DETERMINISTIC levers fired, read off the ORIGINAL result: the cap
+    // below can drop the tail that carries the marker.
+    let levers = crate::tools::levers_fired(name, &result);
     let mut for_model = result;
     let is_report = name == "explore";
     let cap = if is_report { EXPLORE_REPORT_CAP } else { MODEL_RESULT_CAP };
@@ -2702,10 +3175,23 @@ fn finish_tool(
             while end > 0 && !for_model.is_char_boundary(end) {
                 end -= 1;
             }
+            // Name the resume point in LINES, not just "use a narrower window":
+            // the model cannot translate a cut character count back into an
+            // offset, so a bare "truncated" was answered by re-reading the whole
+            // file. Counting the newlines that survived gives the exact next
+            // line, and for `read` the trailer is phrased as the next call.
+            let kept_lines = for_model[..end].matches('\n').count();
             for_model.truncate(end);
-            for_model.push_str(
-                "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
-            );
+            if name == "read" {
+                for_model.push_str(&format!(
+                    "\n… [only the first {kept_lines} lines fit the result budget — read the rest with offset={} (do NOT re-read what is shown above)]",
+                    kept_lines + 1
+                ));
+            } else {
+                for_model.push_str(
+                    "\n… [truncated for the model — re-read a narrower offset/limit window if you need more]",
+                );
+            }
         }
     }
     let model_chars = for_model.chars().count();
@@ -2724,6 +3210,13 @@ fn finish_tool(
             // token cost from it was measuring the wrong thing. This is the
             // number any future read/grep budget decision must be based on.
             "model_chars": model_chars,
+            // Which DETERMINISTIC levers fired on this call. Both are decided in
+            // the backend (never a model choice) and both attach their payload
+            // to this result, so that payload is IN `model_chars` above. Without
+            // this flag the only way to tell whether a lever fired was to infer
+            // it from the round count, which cannot distinguish a lever that
+            // fired from one that was never reached.
+            "levers": levers,
         })),
         ..Default::default()
     });
@@ -2786,6 +3279,7 @@ pub async fn run_turn(
     let trace = crate::trace::TraceStore::new(req.chat_id.clone()).with_run(run_id);
     let cfg = LlmConfig {
         provider: req.provider.clone(),
+        provider_id: req.provider_id.clone(),
         model: req.model.clone(),
         base_url: req.base_url.clone(),
         api_keys: if req.api_key.is_empty() {
@@ -2802,7 +3296,10 @@ pub async fn run_turn(
         // gateways and reasoning models can take many minutes). Stop still
         // aborts instantly via the cancel flag.
         timeout_secs: crate::llm::NO_TIMEOUT_SECS,
-        reasoning_level: req.thinking_level.clone(),
+        reasoning_level: crate::llm::level_from_source(
+            provider_model_thinking_levels(&req.providers, &req.provider_id, &req.model).as_deref(),
+            &req.thinking_level,
+        ),
         model_reasoning: req.model_reasoning,
         auto_think: crate::models::auto_think_for(&req.provider),
     };
@@ -3153,7 +3650,7 @@ pub async fn run_turn(
         .unwrap_or_else(|| caps_for_mode(&req.mode));
     // Gate the native set BEFORE the MCP merge below: a connector must not be
     // able to re-introduce a tool the mode forbids (`write_file` through MCP).
-    retain_allowed_tools(&mut schemas, &caps);
+    retain_allowed_tools(&mut schemas, &caps, &req.mode);
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
     // tools/list. An ENABLED plugin's connectors ride along without the user
@@ -3205,7 +3702,7 @@ pub async fn run_turn(
     });
     // A connector is not a way around the mode gate: a read-only turn must not
     // reach a mutating tool through MCP either.
-    retain_allowed_tools(&mut mcp_schemas, &caps);
+    retain_allowed_tools(&mut mcp_schemas, &caps, &req.mode);
     schemas.extend(mcp_schemas);
     // Desktop control is a hard on/off switch (composer → Computer Use): when
     // it is off the tool is never bound, so the model cannot even try.
@@ -3292,6 +3789,12 @@ pub async fn run_turn(
     // and the explore prompt forbids it, yet a traced run re-read three files
     // in round 3 that round 1 had returned and repeated a refused grep.
     let mut seen_lookups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The turn's out-of-workspace reach: the renderer's own grants, WIDENED in
+    // place whenever the user approves a new folder below. Built once, OUTSIDE
+    // the step loop, so a grant given in round 3 is not asked for again in
+    // round 4 — and so a whole round is never spent discovering that the
+    // workspace, /tmp and ~/.codifa are already open.
+    let mut permit = outside_permit(req);
     // Mid-turn auto-compaction state. `compact_rounds` bounds how many times a
     // single turn may fold its history (a turn can run MAX_STEPS tool calls, so
     // folding must be possible while the agent works — but the summarizer must
@@ -3322,6 +3825,34 @@ pub async fn run_turn(
     // was invisible in the trace: whether it fired had to be inferred from
     // round counts. One counter makes "did the nudge reach the model" a fact.
     let mut nudges: usize = 0;
+    // Consecutive rounds this turn spent ONLY on locating/reading. Traced on the
+    // live corpus, the main agent ran 91 discovery streaks, 31 of them 3 rounds
+    // or longer, and the 169 rounds past the third cost 1_548_556 uncached
+    // tokens — the single largest addressable block left, because a streak that
+    // long is exactly the "how is this area wired up" question `explore` exists
+    // for (its own 17 long streaks cost 303_316). The counter drives a nudge
+    // that fires at the streak boundary only, so it cannot become wallpaper the
+    // way the per-round single-call hint did (423 of 863 rounds carried it and
+    // it changed nothing).
+    let mut discovery_streak: usize = 0;
+    // Consecutive rounds whose ONLY call was a mutating/serial tool
+    // (`run_terminal`, `edit_file`, …). The per-round batching hint fired on
+    // every one of them and was measured as wallpaper (16 firings, 0 batches in
+    // one fresh chat), so it now escalates off this counter instead of repeating.
+    let mut lone_mutating_rounds: usize = 0;
+    // Hints delivered by the ESCALATING lone-call lever alone. `nudges` counts
+    // every hint including the discovery-streak one, so it could not answer
+    // whether this lever fired (traced: it climbed on rounds the model had
+    // actually batched). Kept separate so the trace measures one lever per row.
+    let mut lone_call_hints: usize = 0;
+    // Assistant prose this turn produced BEFORE its last round. Plan mode saves
+    // the plan document at the end of the turn, and the plan is written in an
+    // early round (read → plan text → update_plan) while the FINAL round often
+    // carries only a closing note ("the plan is saved, switch to Build"). Saving
+    // just the last round's text made plan.md a one-line summary — the panel had
+    // nothing real to show. Kept in order, one entry per round, so
+    // `plans::plan_text` can pick the rounds that carry the plan.
+    let mut prior_text: Vec<String> = Vec::new();
     for step in 0..max_steps {
         // Drain any mid-turn steer BEFORE this model call: the steer is appended
         // as an extra user message, so the model keeps the whole conversation
@@ -3438,7 +3969,7 @@ pub async fn run_turn(
                 // The effective slot provider id is unused here: the in-turn
                 // fold emits usage via the chat's own accounting path, not the
                 // manual-compact usage event.
-                let (slot_model, slot_base, slot_keys, _slot_provider_id) = crate::backend_light::resolve_slot_target(
+                let (slot_model, slot_base, slot_keys, slot_provider_id) = crate::backend_light::resolve_slot_target(
                     crate::backend_light::other_slot_entry(&req.subagent_models),
                     &cfg.model,
                     &cfg.base_url,
@@ -3446,12 +3977,11 @@ pub async fn run_turn(
                     &req.provider_id,
                     &req.providers,
                 );
-                let has_slot = !slot_model.is_empty() && slot_model != cfg.model;
-                // The "Other" group's own fallback list (Settings → Tools): when
-                // the summariser's model fails, the chat model is tried next and
-                // these rungs after it. Resolved through the same chain helper as
-                // the other tools, so a cross-provider fallback brings its own
-                // base URL / keys / endpoint kind.
+                let _ = &slot_provider_id;
+                // The "Other" group's own fallback list (Settings → Tools): the
+                // summariser's OWN models, top to bottom. Resolved through the
+                // same chain helper as the other tools, so a cross-provider
+                // fallback brings its own base URL / keys / endpoint kind.
                 let fallback_rungs: Vec<(String, String, Vec<String>, String, String)> =
                     crate::backend_light::resolve_slot_chain(
                         crate::backend_light::other_slot_entry(&req.subagent_models),
@@ -3472,17 +4002,26 @@ pub async fn run_turn(
                 let (compact_reasoning, compact_model_reasoning, compact_auto_think) =
                     crate::llm::reasoning_fields(
                         &cfg.provider,
-                        // Missing slot level = OFF (never inherit the main
-                        // level): a side-task call's default is no reasoning.
-                        if compact_level.is_empty() {
-                            "none"
-                        } else {
-                            compact_level
-                        },
+                        &crate::llm::level_from_source(
+                            provider_model_thinking_levels(
+                                &req.providers,
+                                &slot_provider_id,
+                                &slot_model,
+                            )
+                            .as_deref(),
+                            // Missing slot level = OFF (never inherit the main
+                            // level): a side-task call's default is no reasoning.
+                            if compact_level.is_empty() {
+                                "none"
+                            } else {
+                                compact_level
+                            },
+                        ),
                         req.model_reasoning,
                     );
                 let compact_model = LlmConfig {
                     provider: cfg.provider.clone(),
+                    provider_id: slot_provider_id.clone(),
                     model: slot_model.clone(),
                     base_url: slot_base,
                     api_keys: slot_keys,
@@ -3497,40 +4036,29 @@ pub async fn run_turn(
                 };
                 // Fallback = the "Other" slot's own fallback rungs (Settings →
                 // Tools, each carrying its own routing but the slot's reasoning
-                // level) in the user's order, then the active chat model as the
-                // last resort — mirroring the manual path's
-                // subagent -> main-model retry. The whole list is built, not just
-                // its first rung: a rejected key or a dead model must fall
-                // through the remaining fallbacks before the turn gives up.
-                let mut compact_fallbacks: Vec<LlmConfig> = fallback_rungs
+                // level), in the user's order — and NOTHING else. The chat model
+                // used to be appended as a last resort, which meant the run
+                // ignored an empty fallback list and spent the turn on a model
+                // the user never picked for this tool.
+                let compact_fallbacks: Vec<LlmConfig> = fallback_rungs
                     .iter()
                     .map(|(m, b, keys, pid, k)| LlmConfig {
                         provider: k.clone(),
+                        provider_id: pid.clone(),
                         model: m.clone(),
                         base_url: b.clone(),
                         api_keys: keys.clone(),
                         temperature: Some(0.2),
                         max_tokens: Some(COMPACT_MAX_OUTPUT as u32),
                         timeout_secs: COMPACT_TIMEOUT_SECS,
-                        reasoning_level: compact_reasoning.clone(),
+                        reasoning_level: crate::llm::level_from_source(
+                            provider_model_thinking_levels(&req.providers, pid, m).as_deref(),
+                            &compact_reasoning,
+                        ),
                         model_reasoning: provider_model_reasoning(&req.providers, pid, m),
                         auto_think: crate::models::auto_think_for(k),
                     })
                     .collect();
-                if has_slot {
-                    compact_fallbacks.push(LlmConfig {
-                        provider: cfg.provider.clone(),
-                        model: cfg.model.clone(),
-                        base_url: cfg.base_url.clone(),
-                        api_keys: cfg.api_keys.clone(),
-                        temperature: Some(0.2),
-                        max_tokens: Some(COMPACT_MAX_OUTPUT as u32),
-                        timeout_secs: COMPACT_TIMEOUT_SECS,
-                        reasoning_level: req.thinking_level.clone(),
-                        model_reasoning: req.model_reasoning,
-                        auto_think: crate::models::auto_think_for(&cfg.provider),
-                    });
-                }
                 emit(&AgentEvent::CompactStart {});
                 // Bind the result first: a temporary closure borrowing `emit`
                 // would otherwise stay alive across the whole `match` and block
@@ -3549,6 +4077,7 @@ pub async fn run_turn(
                             attempt: p.attempt,
                             attempts: p.attempts_total,
                             model: p.model.clone(),
+                            provider_id: p.provider_id.clone(),
                             percent: p.percent,
                             budget_secs: p.budget_secs,
                             elapsed_secs: p.elapsed_secs,
@@ -3579,6 +4108,14 @@ pub async fn run_turn(
                         next.push(json!({"role": "user", "content": summary_text}));
                         next.extend(tail.iter().cloned());
                         messages = next;
+                        // The summarized `older` half is no longer on the wire,
+                        // so every lookup it answered is unreachable now. The
+                        // repeat-guard must FORGET them: a later read of a file
+                        // the summary swallowed would otherwise be answered with
+                        // a pointer to text the model can no longer see (silent
+                        // data loss), and the coverage entries of my read-merge
+                        // lever have exactly the same obligation.
+                        seen_lookups.clear();
                         // `keep` is the renderer's fold instruction: it keeps the
                         // last N non-system messages verbatim and folds the rest,
                         // so the next turn stops re-sending what the summary
@@ -3753,6 +4290,9 @@ the Vision model's description instead.\n"
             } else {
                 effective_ctx as u64
             },
+            // Ground truth for the reasoning capability: the renderer records
+            // it against this provider+model (see the variant doc).
+            reasoning_chars: acc.reasoning_len as u64,
         });
         // Trace: one llm row per model call (model + tokens), like the
         // Python sidecar's trace panel rows. The reply text and the step's
@@ -3823,6 +4363,7 @@ the Vision model's description instead.\n"
                 // model (see `single_call_hint`). The counter is cumulative, so
                 // a hint appended to step N's result shows on step N+1's row.
                 "hints_delivered": nudges,
+                "lone_call_hints": lone_call_hints,
                 "prompt_messages": messages.len(),
                 // Local estimate of the wire prompt for THIS call. The provider
                 // reports `input` AFTER the fact and that number includes the
@@ -3835,6 +4376,11 @@ the Vision model's description instead.\n"
         });
 
         let text = acc.text.clone();
+        // Keep this round's prose: plan mode persists the whole turn's prose at
+        // the end, and the round that holds the plan already scrolled past.
+        if !text.trim().is_empty() {
+            prior_text.push(text.clone());
+        }
         let tool_calls: Vec<(String, String, String)> = acc
             .tool_calls
             .iter()
@@ -3865,43 +4411,80 @@ the Vision model's description instead.\n"
             })
             .collect();
 
+        // Discovery streak: a round is "discovery" when EVERY call in it only
+        // locates or reads (see `is_discovery_tool`). A round that edits, writes
+        // or runs a command resets the streak — the agent has moved on to doing
+        // the work, which is what the streak nudge wants it to reach.
+        if !tool_calls.is_empty() {
+            if tool_calls.iter().all(|(_, n, _)| is_discovery_tool(n)) {
+                discovery_streak += 1;
+            } else {
+                discovery_streak = 0;
+            }
+        }
+
         if tool_calls.is_empty() {
             // Plan mode: persist the plan document to disk (native plans.rs,
             // same layout the Python sidecar used) and emit plan_card so the
             // frontend collapses the streamed plan into its Plan card.
             if req.mode == "plan" {
-                if let Some((title, body)) = extract_plan_body(&text) {
-                    let data_root = native_data_root();
-                    let ws = crate::plans::workspace_slug_for_root(&root);
-                    // Never swallow this: a failed write used to be silent, so
-                    // the plan looked saved in the chat but was missing from
-                    // disk after a restart. Surface it as a warn the renderer
-                    // shows, and name the target path in the log.
-                    if let Err(e) = crate::plans::save_plan(
-                        &data_root,
-                        &ws,
-                        &title,
-                        &body,
-                        &req.chat_id,
-                    ) {
-                        eprintln!(
-                            "[plan] save failed (root={data_root} ws={ws} chat={}): {e}",
-                            req.chat_id
-                        );
-                        emit(&AgentEvent::Warn {
-                            content: format!(
-                                "The plan was not saved to disk ({e}). It is still in this chat, \
-                                 but a restart will not restore it."
-                            ),
-                        });
+                // `text` is only THIS round's reply, and the plan is written in
+                // an early round (read → plan text → update_plan) while the last
+                // round usually carries only a closing note. Save the whole
+                // turn's prose in order, or plan.md becomes just that note:
+                // `plan_text` joins the plan-carrying rounds and drops the
+                // narration the model wrote next to the reads.
+                let mut parts: Vec<&str> = prior_text.iter().map(String::as_str).collect();
+                if !text.trim().is_empty() {
+                    parts.push(text.as_str());
+                }
+                let full = crate::plans::plan_text(&parts);
+                let data_root = native_data_root();
+                let ws = crate::plans::workspace_slug_for_root(&root);
+                let doc = extract_plan_body(&full);
+                let has_plan = crate::plans::get_plan(&data_root, &ws, &req.chat_id).is_some();
+                let wrote_document = doc
+                    .as_ref()
+                    .map(|(_, body)| crate::plans::has_heading(body))
+                    .unwrap_or(false);
+                // A plan-mode turn is not always a plan: the user asks a
+                // question, answers the planner's clarification, or says "keep
+                // the saved plan", and the turn then ends with a conversational
+                // reply. Saving that reply as the plan overwrote the real
+                // plan.md, which is why the Plan panel showed the answer instead
+                // of the plan (and the answer left its own bubble for a card).
+                // So only a document — a turn whose prose carries a heading —
+                // replaces a saved plan; a chat with no plan yet still saves (a
+                // first plan written as a bare list has no heading).
+                if let Some((title, body)) = doc {
+                    if wrote_document || !has_plan {
+                        // Never swallow this: a failed write used to be silent,
+                        // so the plan looked saved in the chat but was missing
+                        // from disk after a restart. Surface it as a warn the
+                        // renderer shows, and name the target path in the log.
+                        if let Err(e) = crate::plans::save_plan(
+                            &data_root,
+                            &ws,
+                            &title,
+                            &body,
+                            &req.chat_id,
+                        ) {
+                            eprintln!(
+                                "[plan] save failed (root={data_root} ws={ws} chat={}): {e}",
+                                req.chat_id
+                            );
+                            emit(&AgentEvent::Warn {
+                                content: format!(
+                                    "The plan was not saved to disk ({e}). It is still in this \
+                                     chat, but a restart will not restore it."
+                                ),
+                            });
+                        }
+                        emit(&AgentEvent::PlanCard { title, body });
                     }
-                    emit(&AgentEvent::PlanCard {
-                        title,
-                        body,
-                    });
-                } else {
-                    // Plan mode with an empty reply: say so instead of ending
-                    // the turn with no card and no plan file.
+                } else if !has_plan {
+                    // Plan mode with an empty reply and nothing on disk: say so
+                    // instead of ending the turn with no card and no plan file.
                     emit(&AgentEvent::Warn {
                         content: "Plan mode produced no plan text — nothing was saved to disk."
                             .into(),
@@ -3961,12 +4544,76 @@ the Vision model's description instead.\n"
             // tool of the same name.
             !mcp_names.contains(name) && is_readonly_native(name)
         };
+        // Screenshots taken by THIS step's tools. They are attached to the next
+        // request as image blocks, so the model looks at the picture it just
+        // asked for instead of a file path.
+        let mut step_shots: Vec<crate::computer::Shot> = Vec::new();
+        // Images the step's `read` calls pointed at. A screenshot can already sit
+        // in the workspace, and reading it used to answer "file too large" — the
+        // path is collected here and attached exactly like a fresh capture.
+        let mut step_read_images: Vec<String> = Vec::new();
+        // A `run_terminal` that only READS is a lookup too, and it may share the
+        // round: MEASURED on the live build, one chat spent 10 whole rounds on
+        // shell reads (`ls`, `du`, `git status`) that could have run next to its
+        // other reads, and every round costs the model ~6-8K uncached tokens.
+        //
+        // It stays SEQUENTIAL whenever the step also carries a writer, because
+        // the batch runs before the sequential calls: batching a read in a step
+        // that writes would run it BEFORE the write it depends on.
+        let step_has_writer = tool_calls.iter().any(|(_, name, raw_args)| {
+            if is_readonly(name) {
+                return false;
+            }
+            if name != "run_terminal" {
+                return true;
+            }
+            let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+            !is_shell_read_only(args["command"].as_str().unwrap_or_default(), &root)
+        });
         let mut batch: Vec<(String, String, Value)> = Vec::new();
         let mut sequential: Vec<(String, String, String)> = Vec::new();
         let mut repeats: Vec<(String, String, Value)> = Vec::new();
+        // Out-of-workspace reads the user refused: answered with a clear denial
+        // instead of a tool error, so the model neither retries the path nor
+        // spends a round discovering it cannot.
+        let mut denied: Vec<(String, String, Value, String)> = Vec::new();
         for (id, name, raw_args) in &tool_calls {
-            if is_readonly(name) {
-                let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+            let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+            // A call that reaches OUTSIDE every allowed root is asked about
+            // BEFORE it runs, whatever the tool: an answer given now is served in
+            // THIS round, instead of a refusal arriving after the round was
+            // already billed and the model re-asking with another tool on the
+            // SAME path (the old two-round dance this gate exists to end).
+            //
+            // The workspace, the OS temp roots and ~/.codifa never prompt — they
+            // are already open — and nothing prompts when the renderer sent a
+            // grant, so the common case costs nothing. A sub-agent never
+            // prompts: it reports back and the parent turn owns the question.
+            if req.mode != "subagent" && !name.starts_with(crate::mcp::TOOL_PREFIX) {
+                if let Some(folder) = outside_target(name, &args, &root, permit.as_ref()) {
+                    if ask_outside_access(emit, &req.chat_id, cancel, name, &folder).await {
+                        grant_folder(&mut permit, &folder);
+                    } else {
+                        // The card must appear even when the call is refused:
+                        // the renderer resolves it with the denial reason.
+                        emit(&AgentEvent::ToolStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        });
+                        denied.push((id.clone(), name.clone(), args, denied_outside(&folder)));
+                        continue;
+                    }
+                }
+            }
+            let shell_read = {
+                if name != "run_terminal" || step_has_writer {
+                    false
+                } else {
+                    is_shell_read_only(args["command"].as_str().unwrap_or_default(), &root)
+                }
+            };
+            if is_readonly(name) || shell_read {
                 emit(&AgentEvent::Status {
                     stage: "tool".into(),
                     content: name.clone(),
@@ -3977,9 +4624,13 @@ the Vision model's description instead.\n"
                     args: args.clone(),
                 });
                 // A repeat of an identical lookup answers with a pointer
-                // instead of the payload again (see `seen_lookups`).
+                // instead of the payload again (see `seen_lookups`) — and so
+                // does a `read` whose every window is already inside a span
+                // served earlier this turn, even under a different spelling.
                 let key = lookup_key(name, &args);
-                let is_repeat = key.is_some_and(|k| !seen_lookups.insert(k));
+                let covered_read = name == "read"
+                    && read_windows_covered(&seen_lookups, &tools::read_windows_of(&args));
+                let is_repeat = covered_read || key.is_some_and(|k| !seen_lookups.insert(k));
                 if is_repeat {
                     repeats.push((id.clone(), name.clone(), args));
                 } else {
@@ -3991,6 +4642,7 @@ the Vision model's description instead.\n"
         }
         if !batch.is_empty() {
             let root_c = root.clone();
+            let permit_c = permit.clone();
             // Skills live in the DATA root, not the workspace: dispatch must
             // resolve `load_skill`/`create_skill` there, or every load answers
             // "Available: (none)" while the catalog above lists the skill.
@@ -4000,6 +4652,7 @@ the Vision model's description instead.\n"
                 .map(|(_, name, args)| {
                     let root = root_c.clone();
                     let skill_root = skill_root_c.clone();
+                    let permit = permit_c.clone();
                     let name = name.clone();
                     let args = args.clone();
                     tokio::task::spawn_blocking(move || {
@@ -4007,7 +4660,7 @@ the Vision model's description instead.\n"
                             &root,
                             &name,
                             &args,
-                            None,
+                            permit.as_ref(),
                             Some(&skill_root),
                         ) {
                             Ok(r) => (r, true),
@@ -4020,6 +4673,17 @@ the Vision model's description instead.\n"
                 let (result, ok) = handle
                     .await
                     .unwrap_or(("tool task failed".into(), false));
+                if let Some(p) = crate::commands::image_read_path(&result) {
+                    step_read_images.push(p);
+                }
+                // Only a read that HAPPENED counts towards coverage: a refused
+                // or failed one must stay re-requestable. A window the result
+                // budget CUT does not count either — its tail was never
+                // delivered, so claiming those lines would answer the model's
+                // legitimate follow-up with a pointer to text it never saw.
+                if ok && name == "read" && !result_was_window_cut(&result) {
+                    record_read_coverage(&mut seen_lookups, &tools::read_windows_of(&args));
+                }
                 finish_tool(
                     &mut messages,
                     emit,
@@ -4035,6 +4699,21 @@ the Vision model's description instead.\n"
                 );
             }
         }
+        for (id, name, args, reason) in denied {
+            finish_tool(
+                &mut messages,
+                emit,
+                &trace,
+                &id,
+                &name,
+                &args,
+                reason,
+                false,
+                req.mode == "subagent",
+                None,
+                None,
+            );
+        }
         for (id, name, args) in repeats {
             finish_tool(
                 &mut messages,
@@ -4043,8 +4722,8 @@ the Vision model's description instead.\n"
                 &id,
                 &name,
                 &args,
-                "already returned above — this exact lookup is in your context; \
-use what it showed, read a DIFFERENT window, or move on"
+                "already returned above — these lines (or this exact lookup) are in your \
+context; use what it showed, read a DIFFERENT window, or move on"
                     .into(),
                 true,
                 req.mode == "subagent",
@@ -4224,13 +4903,14 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             }
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
             // The call about to run may CHANGE the workspace (`write_file`,
-            // `edit_file`, or `run_terminal`, which runs arbitrary `sh -c` in the
-            // root), so every body cached by the repeat-guard is now possibly a
-            // snapshot of a file taken BEFORE this change. Answering a later
+            // `edit_file`, or a `run_terminal` that really writes), so every body
+            // cached by the repeat-guard is now possibly a snapshot of a file
+            // taken BEFORE this change. Answering a later
             // `read`/`lsp_symbols`/`grep` with a pointer would then feed the model
-            // its own file pre-edit — the guard must forget instead. Read-only
-            // calls never reach this loop, so a pure reader costs nothing here.
-            if !is_readonly(name) {
+            // its own file pre-edit — the guard must forget instead. A call that
+            // reads, fetches or delegates leaves every file exactly as the cache
+            // describes it, so it costs nothing (see `mutates_workspace`).
+            if mutates_workspace(name, &args) {
                 seen_lookups.clear();
             }
             emit(&AgentEvent::Status {
@@ -4298,10 +4978,28 @@ Valid names: {}",
                 (refusal, false)
             } else if name == "run_terminal"
                 && req.mode != "subagent"
-                && is_file_search_command(args["command"].as_str().unwrap_or_default())
+                && is_file_search_command(args["command"].as_str().unwrap_or_default(), &root)
             {
+                // The terminal is for work only the terminal can do (listing,
+                // measuring, builds, tests, git). Locating files belongs to
+                // `grep`/`glob`/`find_symbol`, or to ONE `explore` delegation.
+                // MEASURED: 63% of traced calls arrive as `cd <path> && …`, so
+                // the gate reads the real statements, not the first word.
                 (
-                    "blocked: the main agent must not locate files via the terminal — delegate file discovery to the `explore` sub-agent".into(),
+                    "blocked: the terminal does not locate files. Use `grep` (one token, with path= and include=), `glob` (file names), `find_symbol` (a symbol's definition AND every usage in ONE call), or ONE `explore` delegation for a broad hunt.".into(),
+                    false,
+                )
+            } else if name == "run_terminal"
+                && req.mode != "subagent"
+                && workspace_file_read(args["command"].as_str().unwrap_or_default(), &root)
+            {
+                // A WORKSPACE file is read with `read`, which takes several
+                // files and windows in ONE call and bounds its output, so a
+                // truncated read continues by offset instead of a second shell
+                // round-trip. Reading a log under /tmp stays a terminal job:
+                // `read` is scoped to the workspace.
+                (
+                    "blocked: the terminal does not read workspace files. Use `read` with ranges=[{path,offset,limit}] — it takes SEVERAL files and windows in ONE call and its output is bounded, so continue it with offset= instead of dumping it with `cat`/`sed -n`.".into(),
                     false,
                 )
             } else if name == "run_terminal"
@@ -4319,11 +5017,71 @@ Valid names: {}",
                         .into(),
                     false,
                 )
+            } else if name == "plugin" {
+                // The ONE door to a bundle's scripts. Binding the whole tool
+                // behind the authoring flag meant a scheduled Build run — which
+                // sends `allow_create: false` and has nobody to ask — could not
+                // even LIST a bundle's scripts, so a plugin that ships one was
+                // usable there only through a shell line written into a skill
+                // body. Reading a bundle and running a script on disk are acts
+                // like `run_terminal`, so they stay; only the write actions need
+                // the flag, and the schema already hides them (this is the
+                // backstop for a stale transcript).
+                let action = args["action"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+                if plugin_action_needs_authoring(&action) && !req.allow_create {
+                    (
+                        format!(
+                            "blocked: `plugin action={action}` saves a bundle, which needs the \
+user to ask for it. Available this turn: `list` and `run`."
+                        ),
+                        false,
+                    )
+                } else if action == "run" && !(caps.run_terminal && caps.write_files) {
+                    // A script's effect is unknown, so it is treated the way a
+                    // mutating shell command is: refused in a read-only mode
+                    // rather than trusted.
+                    (
+                        "blocked: this turn is read-only — running a plugin script runs code \
+on disk, which this mode does not allow. Switch to Build mode to run it."
+                            .into(),
+                        false,
+                    )
+                } else {
+                    match tools::dispatch_with_data_root(
+                        &root,
+                        name,
+                        &args,
+                        permit.as_ref(),
+                        Some(&skill_root),
+                    ) {
+                        Ok(r) => (r, true),
+                        Err(e) => (e, false),
+                    }
+                }
             } else if name == "computer" {
                 // Bound only when the user enabled Computer Use; the schema is
                 // withheld otherwise, so reaching here means it is allowed.
                 match crate::computer::run(&args) {
-                    Ok(r) => (r, true),
+                    Ok(o) => {
+                        // The capture must be HANDED to the model, not described
+                        // to it: the result used to be the path alone, so the
+                        // agent asked for a screenshot, received a filename and
+                        // clicked blind. The pixels are attached to the next
+                        // request instead (see `step_shots` after this phase).
+                        for shot in o.shots {
+                            emit(&AgentEvent::Tool {
+                                id: format!("{id}-shot"),
+                                name: "computer".into(),
+                                args: json!({"action": "screenshot", "path": shot.path}),
+                                result: shot.path.clone(),
+                                ok: true,
+                                results: None,
+                                engine: None,
+                            });
+                            step_shots.push(shot);
+                        }
+                        (o.text, true)
+                    }
                     Err(e) => (e, false),
                 }
             } else if crate::browser_driver::handles(name) {
@@ -4361,7 +5119,12 @@ Valid names: {}",
                     }
                 }
             } else if mcp_names.contains(name) || name.starts_with(crate::mcp::TOOL_PREFIX) {
-                match crate::mcp::call_tool(&req.mcp_servers, name, &args) {
+                // The SAME map whose schemas the model was shown: a connector that
+                // only an enabled plugin provides is advertised here, so it must
+                // also be executable. Passing `req.mcp_servers` made every such
+                // call fail with "not enabled for this turn" — the tool was
+                // visible and unusable at once.
+                match crate::mcp::call_tool(&mcp_servers, name, &args) {
                     Ok(r) => (r, true),
                     Err(e) => (e, false),
                 }
@@ -4403,7 +5166,7 @@ Valid names: {}",
                     question: args["question"].as_str().unwrap_or_default().to_string(),
                     options: args["options"].clone(),
                 });
-                match await_answer(&gate, cancel).await {
+                match await_answer(&gate, &req.chat_id, cancel).await {
                     Some(v) => (
                         format!(
                             "The user answered: {}",
@@ -4432,11 +5195,29 @@ Valid names: {}",
                         .or_else(|| args["command"].as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    path: args["path"].as_str().unwrap_or_default().to_string(),
+                    // MEASURED on live popups: the model usually omits `path`
+                    // and names the target only inside `command`, so the card
+                    // rendered no path at all. Derive it from the command's own
+                    // shell targets — the same parse the access gate uses — so
+                    // the user always sees WHICH path is being requested.
+                    path: {
+                        let explicit = args["path"].as_str().unwrap_or_default().trim();
+                        if !explicit.is_empty() {
+                            explicit.to_string()
+                        } else {
+                            shell_targets(args["command"].as_str().unwrap_or_default())
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default()
+                        }
+                    },
                     reason: args["reason"].as_str().unwrap_or_default().to_string(),
                     scope: scope.to_string(),
+                    // A model-driven request names no subtree; only the
+                    // outside-workspace gate (`ask_outside_access`) computes one.
+                    folder: String::new(),
                 });
-                match await_answer(&gate, cancel).await {
+                match await_answer(&gate, &req.chat_id, cancel).await {
                     Some(v) if v["allowed"].as_bool().unwrap_or(false) => (
                         "The user APPROVED the action — proceed with it.".to_string(),
                         true,
@@ -4662,6 +5443,13 @@ call fetch_url again with offset={next} for the rest]",
             // Emit the unified diff while the card is still "running" — the
             // frontend folds it into the card (and the Review panel) before
             // the Tool result resolves the card to done.
+            // The diff serves TWO consumers now. The panel gets it as an event
+            // while the card is still "running"; the MODEL gets it appended to
+            // the tool result, which is what removes the verification round-trip
+            // (measured: 78 of 131 edits spent their next round on a lone
+            // read/grep of the same file, because the plain result said nothing
+            // about what changed).
+            let mut applied_diff: Option<String> = None;
             if ok {
                 if let Some(old) = pre_edit {
                     let p = args["path"]
@@ -4675,11 +5463,19 @@ call fetch_url again with offset={next} for the rest]",
                             emit(&AgentEvent::Diff {
                                 tool: name.clone(),
                                 path: p.to_string(),
-                                diff,
+                                diff: diff.clone(),
                             });
+                            applied_diff = Some(diff);
                         }
                     }
                 }
+            }
+            let applied = match applied_diff {
+                Some(diff) => result + &applied_change_block(&diff),
+                None => result,
+            };
+            if let Some(p) = crate::commands::image_read_path(&applied) {
+                step_read_images.push(p);
             }
             finish_tool(
                 &mut messages,
@@ -4688,7 +5484,7 @@ call fetch_url again with offset={next} for the rest]",
                 id,
                 name,
                 &args,
-                result,
+                applied,
                 ok,
                 req.mode == "subagent",
                 ui_results,
@@ -4698,16 +5494,110 @@ call fetch_url again with offset={next} for the rest]",
 
         // A step with a single call is a wasted model round trip when more
         // lookups were foreseeable. The hint rides on that call's own result,
-        // so it costs no extra request and never cuts a report.
-        if let Some(hint) = single_call_hint(&req.mode, &tool_calls) {
+        // so it costs no extra request and never cuts a report. The STREAK hint
+        // takes the slot first at its two boundaries (see `round_hint`).
+        //
+        // For the MAIN agent's lone serial call the hint ESCALATES off
+        // `lone_mutating_rounds` instead of repeating: a fixed string fired on
+        // 16 consecutive rounds of one fresh chat and the model batched on ZERO
+        // of them (wallpaper, exactly as the 423-of-863 corpus measurement
+        // predicted). Sub-agent and explore shapes are unchanged — they are
+        // already rare and correctly worded.
+        if single_call_is_serial(&req.mode, &tool_calls) {
+            lone_mutating_rounds += 1;
+        } else {
+            lone_mutating_rounds = 0;
+        }
+        // Deliver the escalating form on the first lone round and then every
+        // third; on the rounds in between the streak hint still gets its turn.
+        // Past `LONE_CALL_HINT_MAX_PER_TURN` deliveries the note has been read
+        // and repeating it only re-bills it on every later round, so the lever
+        // goes silent and lets the streak hint keep the slot.
+        let lone_hint_budget_left = lone_call_hints < LONE_CALL_HINT_MAX_PER_TURN;
+        let hints_are_quiet = lone_mutating_rounds > 1 && lone_mutating_rounds % 3 != 0;
+        // The streak hint yields the slot, but it must not silence the round:
+        // traced, a chat sat 34 lone-serial rounds deep and the quiet rounds
+        // delivered nothing at all, because `discovery_streak_hint` returns
+        // `None` whenever the discovery streak is below its boundary — which is
+        // the normal state of a chat whose rounds are shell commands. Falling
+        // back to the escalating text keeps the lever audible exactly where the
+        // counter proves it is needed.
+        let hint: Option<Cow<'_, str>> = if hints_are_quiet {
+            discovery_streak_hint(&req.mode, discovery_streak)
+                .map(Cow::Borrowed)
+                .or_else(|| single_call_hint(&req.mode, &tool_calls, lone_mutating_rounds))
+        } else if lone_hint_budget_left {
+            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds)
+        } else {
+            discovery_streak_hint(&req.mode, discovery_streak).map(Cow::Borrowed)
+        };
+        // Which lever spoke, counted apart: `hints_delivered` sums both, so it
+        // rose on rounds where the model had in fact batched (traced:
+        // `hints_after=24` on a two-call round) and could no longer tell whether
+        // the escalating lever had fired at all. `lone_call_hints` counts only
+        // this one.
+        let lone_hint_str = hint.as_deref().map(str::to_string);
+        if let Some(hint) = hint {
             if let Some(last) = messages.last_mut() {
                 if last["role"].as_str() == Some("tool") {
                     if let Some(c) = last["content"].as_str() {
                         last["content"] = json!(format!("{c}\n\n{hint}"));
                         nudges += 1;
+                        if lone_hint_str
+                            .as_deref()
+                            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
+                        {
+                            lone_call_hints += 1;
+                        }
                     }
                 }
             }
+        }
+
+        // Hand the captures to the model. A tool result may only carry TEXT, so
+        // a screenshot rides into the next request as an image block on a user
+        // message — the same shape the composer's own attachments use, which
+        // `llm.rs` already translates per provider.
+        if !step_shots.is_empty() || !step_read_images.is_empty() {
+            // One encoder, one cap, per provider: `image_data_url_for` picks the
+            // largest edge this provider's vision pass actually reads, so a 5K
+            // capture is not re-uploaded at full size on every following turn.
+            let mut paths: Vec<String> = step_shots.iter().map(|s| s.path.clone()).collect();
+            paths.extend(step_read_images);
+            let urls: Vec<String> = paths
+                .iter()
+                .filter_map(|p| crate::commands::image_data_url_for(p, &cfg.provider))
+                .collect();
+            let mut blocks: Vec<Value> = Vec::new();
+            if urls.is_empty() {
+                // Unreadable file or a format the encoder refused: tell the
+                // model the capture failed instead of leaving it to guess.
+                blocks.push(json!({
+                    "type": "text",
+                    "text": "A screenshot was taken but could not be read back from disk.",
+                }));
+            } else {
+                if !step_shots.is_empty() {
+                    blocks.push(json!({"type": "text", "text": shot_summary(&step_shots)}));
+                }
+                for url in &urls {
+                    blocks.push(json!({"type": crate::llm::IMAGE_BLOCK_TYPE, "data_url": url}));
+                }
+            }
+            // Trace what the vision pass actually pays: a screenshot is re-sent
+            // as base64 on every following step of the turn, so the wire size
+            // here is the one number a downscale/codec change has to move.
+            trace.record(crate::trace::TraceEntry {
+                kind: "images".into(),
+                summary: format!("{} image(s) sent to {}", urls.len(), cfg.provider),
+                detail: Some(json!({
+                    "provider": cfg.provider,
+                    "images": urls.len(),
+                    "base64_chars": urls.iter().map(String::len).sum::<usize>(),
+                })),
+                ..Default::default()
+            });
+            messages.push(json!({"role": "user", "content": blocks}));
         }
     }
 
@@ -4801,6 +5691,37 @@ fn model_id_looks_reasoning(model: &str) -> bool {
         || id.starts_with("o4")
 }
 
+/// Thinking levels a model was described with, read from the same provider row
+/// `provider_model_reasoning` reads its capability flags from (the renderer
+/// stores `/models`' `thinking_levels` as `thinkingLevelsMap`).
+///
+/// `None` = no source described the model, so no level may be sent for it;
+/// `Some(vec![])` = a source described it, and it has no level to offer.
+pub(crate) fn provider_model_thinking_levels(
+    providers: &std::collections::HashMap<String, Value>,
+    provider_id: &str,
+    model: &str,
+) -> Option<Vec<String>> {
+    let cfg = providers.get(provider_id)?;
+    let map = cfg.get("thinkingLevelsMap")?;
+    let pick = |key: String| -> Option<Vec<String>> {
+        map.get(&key).and_then(Value::as_array).map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    let bare = pick(model.to_string());
+    if bare.is_some() {
+        return bare;
+    }
+    if provider_id.is_empty() {
+        return None;
+    }
+    pick(format!("{provider_id}/{model}"))
+}
+
 /// Reasoning capability of the model a slot actually runs, mirroring the
 /// frontend's precedence (`modelReasoning() ?? supportsReasoning()`): the
 /// manual override first, then the live `/models` map, each tried bare and
@@ -4826,6 +5747,13 @@ pub(crate) fn provider_model_reasoning(
             .and_then(Value::as_bool)
     };
     if let Some(v) = map_flag("manualReasoningMap") {
+        return v;
+    }
+    // Evidence the model itself produced reasoning outranks a reported flag:
+    // the renderer records it after a response streamed reasoning content
+    // (`observedReasoningMap`), which is the only capability signal a gateway
+    // with a bare `/models` payload ever yields.
+    if let Some(v) = map_flag("observedReasoningMap") {
         return v;
     }
     if let Some(v) = map_flag("reasoningMap") {
@@ -4903,10 +5831,10 @@ fn resolve_slot_target(
             req.provider_id.clone(),
         );
     }
-    let (provider_id, model) = match entry.split_once('/') {
-        Some((pid, m)) => (pid.trim().to_string(), m.trim().to_string()),
-        None => (String::new(), entry.to_string()),
-    };
+    // A slash is a provider prefix ONLY when its head is a configured provider:
+    // "oc/deepseek-v4.1-flash-free" is a MODEL id, not `oc` + a model.
+    let (provider_id, model) = crate::backend_light::split_slot_entry(entry, &req.providers);
+    let model = model.to_string();
     if provider_id.is_empty() {
         // Bare model id: same provider as the parent.
         return (
@@ -5209,6 +6137,16 @@ fn fold_with(
                 if let Some(k) = lookup_key(name, &args) {
                     seen.remove(&k);
                 }
+                // A folded `read` body is GONE from the wire, so the coverage
+                // its windows granted must go with it — otherwise the model's
+                // re-run is answered with a pointer to text it can no longer
+                // see (the same silent loss the exact key already guards).
+                if name == "read" {
+                    for (file, _, _) in crate::tools::read_windows_of(&args) {
+                        let needle = format!("{READ_COVERAGE_PREFIX}{file}|");
+                        seen.retain(|k| !k.starts_with(&needle));
+                    }
+                }
             }
         }
     }
@@ -5457,28 +6395,284 @@ fn is_mutating_command(cmd: &str) -> bool {
     })
 }
 
+/// The path-like tokens a shell command names.
+///
+/// A token counts as a path when it is absolute, home-relative, or contains a
+/// separator. A BARE name never does: it always resolves inside the workspace, so
+/// skipping it costs nothing and keeps flags, versions and URLs out.
+///
+/// Used by the search gate (can the native tools serve this?) and by the access
+/// gate (does this reach outside every allowed root?). The command is NOT
+/// lowercased here — a path is case-sensitive on this platform, unlike the
+/// verb-matching `shell_statements` applies.
+/// True when a shell token is a regex/glob fragment that cannot be a filename.
+///
+/// `shell_targets` splits a command line on whitespace, so the pattern operand
+/// of a `grep`/`sed`/`rg` lands in the path set. A path may contain `[` or `*`
+/// only in exotic names; a bracket CLASS, a quote, or a regex operator never
+/// appears in one, and every false ask measured on the corpus carried one.
+fn looks_like_pattern(t: &str) -> bool {
+    let body = t.strip_prefix('/').unwrap_or(t);
+    t.contains(['[', ']', '\\', '\'', '"', '*'])
+        || t.contains("//")
+        || t.ends_with(',')
+        || body.chars().any(|c| matches!(c, '^' | '$' | '+' | '?' | '|' | '(' | ')'))
+}
+
+fn shell_targets(cmd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for st in cmd.split([';', '&', '|', '\n']) {
+        for w in st.split_whitespace() {
+            if w.starts_with('-') {
+                continue;
+            }
+            let t = w.trim_matches(['"', '\'', '(', ')', '`']);
+            if t.is_empty() || t.contains('=') {
+                continue;
+            }
+            let pathy = t.starts_with('/') || t.starts_with('~') || t.contains('/');
+            // MEASURED on the live traces: 5 fake "paths" per corpus reached
+            // the access gate and asked for a directory that cannot exist —
+            // regex fragments like `/[Cc]hromium` or `/forkChat/,/^PASS\`.
+            // They parse out of a shell line but are not filenames: a real
+            // path never carries a bracket class, a quote or a regex operator.
+            if !pathy || looks_like_pattern(t) {
+                continue;
+            }
+            if !out.iter().any(|q| q == t) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// True when a shell command tries to SEARCH for files with a search engine
-/// (find/grep/rg/fd/locate/tree/glob).
-/// The main agent has no search tools by design — file discovery must go
-/// through the explore sub-agent, not terminal one-liners (user request).
+/// (find/grep/rg/fd/locate/tree/glob) **for something the native tools can
+/// already reach**.
+/// The main agent reads and greps files its step already NAMED but does not go
+/// looking for files it does not know about — that discovery runs inside the
+/// explore sub-agent, whose report the main agent works from.
+///
+/// Shell SEARCH stays refused for a WORKSPACE target: the terminal is the
+/// measurement/build verb (`ls`, `du`, `df`, `ps`, builds, tests, git), and a
+/// `find`/`rg` one-liner duplicates `grep` while producing an unnumbered,
+/// uncapped dump.
+///
+/// A search that names a path OUTSIDE the workspace is a different animal: every
+/// native lookup is scoped to the workspace, so the terminal is the ONLY tool
+/// that can answer it. Refusing it was a false refusal — the model re-asked with
+/// `grep`, that failed on the same path, and one answer was billed twice
+/// (MEASURED: 14 of 33 traced refusals named such a path).
 ///
 /// `ls` is deliberately NOT in the list: listing a directory (and measuring it
 /// with `du`/`df`) reads what the caller already knows about, it is not a
 /// search, and a read-only mode must be able to see the disk. The user's rule
-/// is that every READ works everywhere and only APPLYING a change needs Build;
-/// a search engine is delegated because it duplicates `explore`, not because
-/// reading is restricted.
-fn is_file_search_command(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    // Check every pipeline/chain segment, not just the first token.
-    lower
-        .split([';', '|', '&', '\n'])
-        .any(|seg| {
-            let t = seg.trim();
-            ["find", "grep", "rg", "fd", "locate", "tree", "glob"]
-                .iter()
-                .any(|p| t == *p || t.starts_with(&format!("{p} ")))
+/// is that every READ works everywhere and only APPLYING a change needs Build.
+fn is_file_search_command(cmd: &str, root: &str) -> bool {
+    // A search that FILTERS another command's output is not file discovery:
+    // `cargo test | grep -E "^(error|test result)"` inspects a build the model
+    // just ran, and refusing it forced a second, bigger command plus an extra
+    // round trip. Only a search that OWNS its own input — the first segment of
+    // the chain — is the delegated case.
+    //
+    // Discovery verbs with NO bounded native equivalent (`find`, `fd`,
+    // `locate`, `tree`) are refused anywhere: the main agent has `grep`/`read`,
+    // so a tree walk is never the cheap way to find a file.
+    const SEARCH_VERBS: [&str; 7] = ["find", "fd", "locate", "tree", "glob", "grep", "rg"];
+    if !shell_statements(cmd).iter().any(|st| {
+        let verb = st.split_whitespace().next().unwrap_or_default();
+        SEARCH_VERBS.iter().any(|p| verb == *p)
+    }) {
+        return false;
+    }
+    // WHICH tree the search owns. Only the search statement's OWN tokens count:
+    // a `cd <abs> && grep foo src` prefix moves the base but the scope is `src`,
+    // so reading the whole command's tokens would let an unrelated `cd` open the
+    // gate. Each scope resolves against the running `cd` base, and a scope the
+    // native tools cannot reach — an absolute path, `~`, or any folder outside
+    // the workspace — is NOT delegated: the terminal is the only tool that can
+    // answer it (this is the false refusal that billed one answer twice).
+    let mut base = root.to_string();
+    for raw in cmd.split([';', '&', '\n']) {
+        let seg = strip_shell_prefix(raw.split('|').next().unwrap_or_default());
+        let mut words = seg.split_whitespace();
+        let verb = words.next().unwrap_or_default();
+        if verb == "cd" {
+            if let Some(dir) = words.next() {
+                if dir.starts_with('/') || dir.starts_with('~') {
+                    base = dir.trim_matches(['"', '\'']).to_string();
+                }
+            }
+            continue;
+        }
+        if !SEARCH_VERBS.contains(&verb) {
+            continue;
+        }
+        for w in words {
+            if w.starts_with('-') {
+                continue;
+            }
+            let t = w.trim_matches(['"', '\'', '(', ')', '`']);
+            if t.is_empty() {
+                continue;
+            }
+            let abs = if t.starts_with('/') || t.starts_with('~') {
+                t.to_string()
+            } else {
+                format!("{}/{t}", base.trim_end_matches('/'))
+            };
+            if !crate::tools::is_inside_root(root, &abs) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The commands a shell string actually RUNS, normalised.
+///
+/// `/`;`/`&`/newline split statements, and only a statement's FIRST pipeline
+/// stage owns files — a later stage just filters the previous command's output
+/// (`cargo test 2>&1 | grep -E "test result"` inspects a build, not the tree).
+/// The leading `cd … &&` / `export …;` noise is stripped from each statement.
+///
+/// MEASURED: 63% of traced `run_terminal` calls arrive as `cd <path> && …`, so a
+/// gate that reads only the first WORD of the raw string lets `cd x && grep -rn …`
+/// through — the exact shell search it exists to refuse.
+fn shell_statements(cmd: &str) -> Vec<String> {
+    cmd.to_lowercase()
+        .split([';', '&', '\n'])
+        .map(|st| {
+            let owned = st.split('|').next().unwrap_or_default().trim();
+            strip_shell_prefix(owned).trim().to_string()
         })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Drop the prefix noise every real command carries: `cd … && `, `export …; `
+/// and bare `VAR=value ` assignments, repeated as often as they nest.
+fn strip_shell_prefix(seg: &str) -> &str {
+    let mut t = seg.trim();
+    loop {
+        if let Some(rest) = t.strip_prefix("cd ") {
+            let cut = rest
+                .find("&&")
+                .map(|i| (i, 2))
+                .or_else(|| rest.find(';').map(|i| (i, 1)));
+            match cut {
+                Some((i, n)) if !rest[i + n..].trim().is_empty() => {
+                    t = rest[i + n..].trim();
+                    continue;
+                }
+                _ => return t,
+            }
+        }
+        if let Some(rest) = t.strip_prefix("export ") {
+            match rest.find(';') {
+                Some(i) if !rest[i + 1..].trim().is_empty() => {
+                    t = rest[i + 1..].trim();
+                    continue;
+                }
+                _ => return t,
+            }
+        }
+        let word = t.split_whitespace().next().unwrap_or_default();
+        let assignment = !word.is_empty()
+            && word.contains('=')
+            && !word.starts_with('=')
+            && word
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '=');
+        if assignment && !t[word.len()..].trim().is_empty() {
+            t = t[word.len()..].trim_start();
+            continue;
+        }
+        return t;
+    }
+}
+
+/// Verbs whose whole job is to PRINT a file's contents.
+const DUMPER_VERBS: [&str; 14] = [
+    "cat", "bat", "tac", "nl", "head", "tail", "less", "more", "xxd", "od", "strings",
+    "sed", "awk", "gawk",
+];
+
+/// True when the command's whole job is to print a file's contents.
+///
+/// The main agent owns `read`, which a result budget bounds and which accepts
+/// several files in ONE call; `cat`/`sed -n` die on a redirect, cannot batch, and
+/// spend a whole round-trip on the same window `read` returns directly.
+fn is_file_dump_command(cmd: &str) -> bool {
+    shell_statements(cmd).iter().any(|st| {
+        let verb = st.split_whitespace().next().unwrap_or_default();
+        // `sed -i` REWRITES the file; that is the mutation gate's business.
+        DUMPER_VERBS.contains(&verb) && !st.contains(" -i")
+    })
+}
+
+/// True when the command prints a file that lives INSIDE the workspace.
+///
+/// Only that case is refused: reading a log under `/tmp`, a build artifact or
+/// anything else out of tree stays a terminal job, because `read` is scoped to
+/// the workspace. A `cd <dir>` statement moves the base, so the same relative
+/// target is judged in the directory it is really read from.
+fn workspace_file_read(cmd: &str, root: &str) -> bool {
+    let mut base = root.to_string();
+    for st in shell_statements(cmd) {
+        let mut words = st.split_whitespace();
+        let verb = words.next().unwrap_or_default().to_string();
+        if verb == "cd" {
+            if let Some(dir) = words.next() {
+                let d = dir.trim_matches(['"', '\'']);
+                base = if d.starts_with('/') {
+                    d.to_string()
+                } else {
+                    format!("{}/{d}", base.trim_end_matches('/'))
+                };
+            }
+            continue;
+        }
+        if !DUMPER_VERBS.contains(&verb.as_str()) || st.contains(" -i") {
+            continue;
+        }
+        let Some(target) = st.split_whitespace().last() else {
+            continue;
+        };
+        let target = target.trim_matches(['"', '\'']);
+        if target.is_empty() || target.starts_with('-') {
+            continue;
+        }
+        let abs = if target.starts_with('/') || target.starts_with('~') {
+            target.to_string()
+        } else {
+            format!("{}/{target}", base.trim_end_matches('/'))
+        };
+        // The SAME resolver the native tools use: a lexical `starts_with` on the
+        // raw argv judged `<root>/~/.config/x` as inside the workspace, so an
+        // out-of-tree read was refused as a "workspace file dump" — a false
+        // refusal the native `read` then failed on for the very same path.
+        if crate::tools::is_inside_root(root, &abs) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a `run_terminal` command is a pure READ: it neither writes, nor
+/// searches the tree, nor dumps a workspace file.
+///
+/// Only such a command may share its round with other lookups; anything else
+/// keeps its own round so a read is never reordered before the write it needs.
+fn is_shell_read_only(cmd: &str, root: &str) -> bool {
+    !is_mutating_command(cmd)
+        && !is_file_search_command(cmd, root)
+        && !workspace_file_read(cmd, root)
 }
 
 /// Fold one sub-agent event into its report / error buffers. Text streamed
@@ -5567,6 +6761,116 @@ fn is_readonly_native(name: &str) -> bool {
     READONLY_NATIVE_TOOLS.contains(&name)
 }
 
+/// True when this call can WRITE to the workspace — the only thing that makes a
+/// cached read body stale.
+///
+/// MEASURED on the live corpus: the old blanket rule (`!is_readonly(name)`) wiped
+/// the whole lookup cache 247 times, and 60 of those wipes came from calls that
+/// cannot put a byte in a workspace file — `explore`(27), `web_search`(11),
+/// `system_stats`(7), `fetch_url`(5), `save_memory`(4), `ask_user`(3),
+/// `load_skill`(2), `confirm_action`(1) — plus every read-only `run_terminal`
+/// (`ls`, `git status`, builds) on top. Each wipe threw away the read coverage
+/// recorded one call earlier, which is why the coverage guard fired 6 times in a
+/// corpus that re-asked 137 already-served windows.
+fn mutates_workspace(name: &str, _args: &Value) -> bool {
+    match name {
+        "write_file" | "edit_file" | "artifact" => true,
+        // A terminal command runs arbitrary `sh -c`: the workspace-file guard
+        // refuses the workspace READ/dump forms, but a build, a test or a script
+        // can still rewrite a file (`cargo` into `target/`, a generator into
+        // `src/`, `python3 build.py`). Keeping the cache here measured the SAME
+        // 84 pointers as the conservative rule while an "inspection verb" variant
+        // measured 130 — the 46 extra pointers are not worth a stale body, so the
+        // whole terminal stays a writer.
+        "run_terminal" => true,
+        // A connector may mutate anything on the far side of the wire.
+        n if n.starts_with(crate::mcp::TOOL_PREFIX) => true,
+        // The observation set cannot write the workspace: `explore` runs the
+        // research tool set (no writer, no terminal), the web tools only fetch,
+        // the memory tools write the MEMORY store, and ask/plan/skill-load merely
+        // report. These were 60 of the 247 measured wipes.
+        "explore" | "web_search" | "fetch_url" | "search_memory" | "save_memory"
+        | "delete_memory" | "load_skill" | "ask_user" | "confirm_action"
+        | "request_permission" | "current_time" | "system_stats" => false,
+        // Everything else (create_skill, create_mcp, plugin, schedule, the
+        // browser_* driver) counts as a writer: an unknown reach is not worth
+        // handing the model a pointer to a file it can no longer trust.
+        _ => !is_readonly_native(name),
+    }
+}
+
+/// True when a `read` result had to cut a window short, so part of what it
+/// asked for never reached the model. Such a read grants NO coverage: the
+/// marker names the exact resume offset, and answering that follow-up with
+/// "already returned above" would make the cut-off remainder unreachable.
+fn result_was_window_cut(result: &str) -> bool {
+    result.contains("window truncated at line")
+        || result.contains("window too large for the result budget")
+}
+
+/// Prefix of the coverage entries the repeat-guard keeps next to the exact
+/// lookup keys: one per window a `read` actually served this turn.
+///
+/// The exact-key guard only recognises a LITERALLY identical call. Traced on the
+/// real corpus it left 190_602 chars of bookkeeping on the table: 7 reads were
+/// byte-identical repeats it should have caught, but 17 more asked for a window
+/// already CONTAINED in a wider span served earlier (the model widens a window
+/// it was told about, then narrows back onto the lines it actually needs). Those
+/// windows are in the context already, so the payload is re-sent for nothing.
+const READ_COVERAGE_PREFIX: &str = "readcov|";
+
+/// `(file, start, end)` of a coverage entry. The file goes LAST in the key so a
+/// path containing `|` cannot be mis-split.
+fn coverage_span(key: &str) -> Option<(&str, usize, usize)> {
+    let rest = key.strip_prefix(READ_COVERAGE_PREFIX)?;
+    let mut parts = rest.rsplitn(3, '|');
+    let end = parts.next()?.parse().ok()?;
+    let start = parts.next()?.parse().ok()?;
+    Some((parts.next()?, start, end))
+}
+
+/// The half-open line span a `read` window asks for.
+///
+/// No normalisation happens here on purpose: `dispatch` reads an ABSENT limit as
+/// the default and an explicit `0` as zero lines, so a guard that turned 0 into
+/// 400 would claim coverage of lines that were never delivered — exactly the
+/// silent loss this guard exists to prevent.
+fn read_window_span(offset: usize, limit: usize) -> (usize, usize) {
+    (offset, offset.saturating_add(limit))
+}
+
+/// True when EVERY window of a `read` call is already inside a span served
+/// earlier this turn — so its payload is in the context above and a pointer is
+/// the whole answer. An empty window list is never "covered": a call naming no
+/// file is an error the model must see.
+fn read_windows_covered(
+    seen: &std::collections::HashSet<String>,
+    windows: &[(String, usize, usize)],
+) -> bool {
+    if windows.is_empty() {
+        return false;
+    }
+    let served: Vec<(&str, usize, usize)> = seen.iter().filter_map(|k| coverage_span(k)).collect();
+    windows.iter().all(|(file, offset, limit)| {
+        let (start, end) = read_window_span(*offset, *limit);
+        served
+            .iter()
+            .any(|(f, s, e)| f == file && *s <= start && end <= *e)
+    })
+}
+
+/// Remember the spans a successful `read` served, so a later call for lines
+/// inside them answers with a pointer instead of the same bytes again.
+fn record_read_coverage(
+    seen: &mut std::collections::HashSet<String>,
+    windows: &[(String, usize, usize)],
+) {
+    for (file, offset, limit) in windows {
+        let (start, end) = read_window_span(*offset, *limit);
+        seen.insert(format!("{READ_COVERAGE_PREFIX}{file}|{start}|{end}"));
+    }
+}
+
 /// Identity of a repeatable read-only lookup: a read window (file + offset +
 /// limit) or a grep (pattern + scope). Two calls with the same key return the
 /// same payload, so the second one is answered with a pointer instead of the
@@ -5576,14 +6880,29 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
     match name {
         "read" => {
             let file = s("filePath");
+            // `ranges` selects windows AND (since the bare path list was
+            // dropped) the files themselves: a multi-file read has an EMPTY
+            // filePath, so keying on the file alone would have returned None
+            // and silently disabled the repeat-guard for exactly the calls that
+            // carry the most bytes. The range body is the identity instead.
+            let ranges = args["ranges"].to_string(); // "null" when absent
             if file.is_empty() {
+                // A multi-entry read has no top-level filePath, yet it is the
+                // call that moves the most bytes: `ranges` (and the legacy
+                // `paths` list) IS its identity, so the repeat-guard still sees
+                // it and two different lists never share a key.
+                if args["ranges"].is_array() {
+                    return Some(format!("read|ranges|{ranges}"));
+                }
+                if let Some(paths) = args["paths"].as_array() {
+                    return Some(format!("read|paths|{paths:?}"));
+                }
                 return None;
             }
             let offset = args["offset"].as_u64().unwrap_or(1);
             let limit = args["limit"].as_u64().unwrap_or(400);
             // `ranges` selects other windows of the same file: without it in the
             // key, a second read of a DIFFERENT range was answered as a repeat.
-            let ranges = args["ranges"].to_string(); // "null" when absent
             Some(format!("read|{file}|{offset}|{limit}|{ranges}"))
         }
         "grep" => {
@@ -5720,30 +7039,126 @@ fn lookup_key(name: &str, args: &Value) -> Option<String> {
 /// ORDER instead. The hint rides on an already-sent tool result, so it costs no
 /// extra request — unlike widening the tool SCHEMA, which is paid on every
 /// single round-trip of every turn.
-fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'static str> {
+/// Whether a tool only LOCATES or reads — no write, no command, no side effect.
+///
+/// Drives the discovery-streak counter (see `discovery_streak_hint`). `explore`
+/// counts: a delegated search is still research, and a round that fires one is
+/// already paying the delegation price.
+fn is_discovery_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "grep"
+            | "glob"
+            | "find_symbol"
+            | "lsp_symbols"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+            | "lsp_diagnostics"
+            | "explore"
+    )
+}
+
+/// Nudge to hand a LONG research streak to `explore`, delivered ONCE per streak.
+///
+/// Measured on the live corpus: the main agent ran 91 discovery streaks, 31 of
+/// them ≥3 rounds, and the 169 rounds past the third burned 1_548_556 uncached
+/// tokens, with one streak reaching 23 consecutive rounds. That shape — "where
+/// is this wired up, how does this area work" — is precisely what `explore`
+/// answers in one delegation on its OWN short context. A late main round, by
+/// contrast, re-sends the whole conversation (re-measured on the newest build:
+/// median 79K input tokens per main round against 16K per explore round, so past
+/// round 20 one main step costs about five explore rounds). The
+/// per-round single-call hint could not catch it: it fires on the FIRST lone
+/// call of every round (423 of 863 rounds carried it, 315 single-call rounds
+/// followed it, i.e. no effect) so it reads as wallpaper.
+///
+/// `STREAK_NUDGE_AT` is the first boundary. Firing at round 3 of a streak leaves
+/// the model its two bounded targeted checks (the prompt promises "at most 2-3
+/// search batches") before it is asked to delegate, and the wording never
+/// forbids a lookup — it names the cheaper path for a question that has already
+/// outgrown the targeted-check budget.
+const STREAK_NUDGE_AT: usize = 3;
+
+/// The second boundary, added because the first one was measured as too quiet.
+///
+/// Measured over the live corpus: 302 rounds sat inside a discovery streak of 3
+/// or more, and the 240 rounds PAST the third carried 2_361_303 uncached tokens
+/// — of which 1_443_180 (61%) sat at round SEVEN and beyond, where a
+/// single-shot nudge at round 3 had long stopped being repeated. The waste
+/// curve peaks at round 4 (460_405) and stays above 100K per round through
+/// round 12, so a streak that reaches 7 is not a finishing move any more; it is
+/// the search being done the expensive way. One reminder there costs a few
+/// dozen tokens on a result already being sent.
+const STREAK_NUDGE_LATE: usize = 7;
+
+fn discovery_streak_hint(mode: &str, streak: usize) -> Option<&'static str> {
+    // Sub-agents have no `explore` of their own and their budget is tiny.
+    if mode == "subagent" {
+        return None;
+    }
+    match streak {
+        STREAK_NUDGE_AT => Some(
+            "[hint] This step is the 3rd round of locating/reading in a row, and every round re-sends the whole conversation. A question this broad — where something is wired up, how an area works — is exactly what ONE `explore` answers in a single round-trip: give it the question (plus the file paths you already found) and work from its report. Only keep looking here when the very next call answers what you need.",
+        ),
+        STREAK_NUDGE_LATE => Some(
+            "[hint] This step is the 7th round of locating/reading in a row: the search has outgrown targeted checks and each further round re-sends the whole conversation for one lookup. Hand the question to ONE `explore` now (question + the paths already found) and keep this transcript for the work that follows. If the answer is already in hand, stop looking and act on it.",
+        ),
+        _ => None,
+    }
+}
+
+/// The ONE nudge a round may carry, or `None`.
+///
+/// The STREAK hint wins at its boundaries: it exists at two streak lengths only,
+/// while the per-round hint was measured as wallpaper (423 of 863 rounds carried
+/// it and single-call rounds kept following it). Traced, the per-round hint would
+/// otherwise take the slot in 24 of the 72 rounds that sit exactly on a streak
+/// boundary (17 at streak 3, 7 at streak 7). A round never carries both: two
+/// post-hoc notes on the same result read as noise instead of one instruction.
+fn round_hint(
+    mode: &str,
+    calls: &[(String, String, String)],
+    streak: usize,
+    lone_rounds: usize,
+) -> Option<Cow<'static, str>> {
+    discovery_streak_hint(mode, streak)
+        .map(Cow::Borrowed)
+        .or_else(|| single_call_hint(mode, calls, lone_rounds))
+}
+
+fn single_call_hint(
+    mode: &str,
+    calls: &[(String, String, String)],
+    lone_rounds: usize,
+) -> Option<Cow<'static, str>> {
     if calls.len() != 1 {
         return None;
     }
     if mode == "subagent" {
-        return Some(
+        return Some(Cow::Borrowed(
             "[hint] That step had ONE call. Calls of a step run in parallel and each extra step costs a model round trip: in your NEXT step issue every call you can already foresee together (other greps, find_symbol, lsp_symbols, reads of the exact windows), then write the report.",
-        );
+        ));
     }
     let name = calls[0].1.as_str();
     if name == "explore" {
-        return Some(
+        return Some(Cow::Borrowed(
             "[hint] That step had ONE explore. Explores of one step run CONCURRENTLY and cost a single round-trip, while one broad explore is slow and returns a shallow report: when the task spans several areas, fire 2-4 focused explores (one per area/file group) IN THE SAME STEP.",
-        );
+        ));
     }
     // Read-only natives are the ONE group that really does run concurrently, so
     // they get the parallelism wording instead of the ordering one. In the last
     // traced corpus 6 lone `read`, 1 lone `fetch_url` (65_694 uncached tokens on
     // its own) and 1 lone `load_skill` round sat outside the whitelist, i.e. the
-    // hint could not fire on any of them.
-    if matches!(name, "read" | "fetch_url" | "load_skill") {
-        return Some(
+    // hint could not fire on any of them. `find_symbol` and `lsp_symbols` joined
+    // the MAIN set for the same reason they belong here: both answer "where does
+    // this live" WITHOUT a follow-up read, so a lone one is exactly a round that
+    // could have carried the window reads it points at.
+    if matches!(name, "read" | "fetch_url" | "load_skill" | "find_symbol" | "lsp_symbols") {
+        return Some(Cow::Borrowed(
             "[hint] That step had ONE call. Every step re-sends the whole conversation: these read-only calls run CONCURRENTLY, so fetch everything you already know you need IN THE SAME STEP.",
-        );
+        ));
     }
     // Native write/terminal/browser tools. Traced main-agent turns spent 76% of
     // their steps on a SINGLE call (210 of 277, measured from tool rows) — 61 of
@@ -5753,27 +7168,73 @@ fn single_call_hint(mode: &str, calls: &[(String, String, String)]) -> Option<&'
     // fired on only 2 of 280 main rounds and could not correct any of it. These
     // calls do NOT run concurrently (they mutate the workspace or act on one
     // shared page, in order), so the hint must say "in order", never "parallel".
-    matches!(
-        name,
-        "run_terminal"
-            | "edit_file"
-            | "write_file"
-            | "artifact"
-            | "browser_navigate"
-            | "browser_evaluate"
-            | "browser_snapshot"
-            | "browser_click"
-            | "browser_type"
-            | "browser_fill_form"
-            | "browser_press_key"
-            | "browser_select_option"
-            | "browser_resize"
-            | "browser_emulate_media"
-    )
-    .then_some(
-        "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: issue all the file edits and shell commands you already know you need together (they run IN ORDER, one after another) instead of spending a step on each. Several replacements in one file go in a SINGLE edit_file call as edits:[{path, old_string, new_string, replace_all}].",
+    //
+    // `run_terminal` and the browser act-then-observe tools are excluded: their
+    // calls are a CHAIN, each one's arguments built from the previous result, so
+    // there is nothing to batch and the hint is an instruction the model cannot
+    // obey. Traced: 59 consecutive rounds of one chat were all lone
+    // `run_terminal` (48 of them separate probes) and the hint fired on 50 for
+    // ~350 chars each, all of which stayed in the re-sent history and moved the
+    // model zero times. Left in the list only the shapes where a batch is
+    // actually possible — the file writes, which are independent by nature.
+    if matches!(name, "edit_file" | "write_file" | "artifact") {
+        return Some(Cow::Owned(single_call_hint_text(lone_rounds)));
+    }
+    None
+}
+
+/// True when this round spent its whole round-trip on ONE call the hint can
+/// actually help with — a file write that had independent siblings to batch.
+/// Main agent only: the sub-agent has no batching freedom to spend and its own
+/// report already governs its rounds.
+///
+/// Deliberately NARROWER than [`is_serial_tool`]: a lone `run_terminal` is a
+/// probe chain, not a missed batch, so counting it would grow the streak while
+/// the hint stays silent — the field would then report waste that was never
+/// addressable. Traced, that is exactly how 50 firings landed on a run with
+/// nothing batchable in it.
+fn single_call_is_serial(mode: &str, calls: &[(String, String, String)]) -> bool {
+    if mode == "subagent" || calls.len() != 1 {
+        return false;
+    }
+    matches!(calls[0].1.as_str(), "edit_file" | "write_file" | "artifact")
+}
+
+/// Cap on how many times ONE turn may deliver the escalating lone-call hint.
+///
+/// Each delivery lives on in the re-sent history for the rest of the turn, so a
+/// deep streak compounds: the traced 59-round run carried 50 of them (~350 chars
+/// each) into every later request while the model batched on 2 of its rounds.
+/// Past this many refusals the note has been read — repeating it only re-bills
+/// it — so the lever falls silent and leaves the streak hint to do the talking.
+const LONE_CALL_HINT_MAX_PER_TURN: usize = 3;
+
+/// The batching hint for the main agent's lone serial call, escalated by how
+/// many rounds in a row have already been spent this way. A fixed string
+/// repeated every round was measured as wallpaper (16 firings, 0 batches in one
+/// fresh chat), so past the first delivery the text carries the price the model
+/// is already paying instead of the same instruction a third time.
+///
+/// `run_terminal` is EXCLUDED from the escalation. Traced on the benchmark
+/// corpus: 59 consecutive rounds of one chat were all lone `run_terminal`, and
+/// the hint fired on 50 of them for ~350 chars each — every one of those
+/// commands was a probe whose arguments came FROM the previous result (`ls` then
+/// `cargo run --example` then `python3` over what it printed). Nothing in that
+/// run was batchable, so the hint was an instruction the model could not obey,
+/// and it stayed in the re-sent history. The hint speaks only where batching is
+/// actually possible — file edits and the read-only lookups — and leaves the
+/// shell loop alone.
+fn single_call_hint_text(rounds: usize) -> String {
+    if rounds <= 1 {
+        return SINGLE_CALL_HINT.to_string();
+    }
+    format!(
+        "[hint] {rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch the independent work you already know you need into this next step — file edits run IN ORDER in a single step, and several replacements in one file go in ONE edit_file call as edits:[{{path, old_string, new_string, replace_all}}]."
     )
 }
+
+/// The teaching form, delivered once at the start of a streak.
+const SINGLE_CALL_HINT: &str = "[hint] That step had ONE call. Every step re-sends the whole conversation, so independent work belongs in ONE step: issue all the file edits and shell commands you already know you need together (they run IN ORDER, one after another) instead of spending a step on each. Several replacements in one file go in a SINGLE edit_file call as edits:[{path, old_string, new_string, replace_all}].";
 
 /// Cap on the saved-plan body injected into the system prompt. A plan is
 /// re-sent on EVERY round-trip of EVERY turn, so an uncapped body is a running
@@ -5964,7 +7425,10 @@ together — a grep per directory/keyword variant, lsp_symbols for likely files,
 find_symbol for the identifiers the question names. Do not read yet: you only \
 need paths and line ranges.\n\
 STEP 2 - READ (ONE step, many calls): read EVERY window step 1 pointed at, \
-together. Earlier results stay cached only while they remain an identical \
+together — ONE `read` call carrying one `ranges` entry per window (several \
+windows of the SAME file are separate entries, or one wider window; measuring a \
+file with 3 separate read calls costs 3x the round-trips for the same bytes). \
+Earlier results stay cached only while they remain an identical \
 PREFIX of your next request, so a cheap read now costs almost nothing, while a \
 later round to fetch the same window re-sends the whole conversation. When you \
 already know a file, a symbol or a window you will need, read it NOW.\n\
@@ -6001,9 +7465,12 @@ that language and use grep + read.\n\
 what will I do differently depending on the result? Drop any call that cannot \
 change your next action. Grep shows only a few lines around each hit — read the \
 window you need, but never re-read what a result already showed and never repeat \
-a search with the same pattern.\n\n\
+a search with the same pattern. Every search goes through `grep`/`find_symbol`/\
+`glob`/`lsp_*` — you have no shell, and a search written as a shell line is not \
+yours to make.\n\n\
 FINAL REPORT (your only text output — write nothing between tool calls): the \
-main agent has no read tool and edits files with exact-match strings, so precision \
+main agent edits files with exact-match strings and only re-reads the narrow \
+windows you point at, so precision \
 matters and padding costs it tokens on every later step. Format:\n\
 (a) ANSWER: 2-4 lines that directly answer the question.\n\
 (b) CODE: VERBATIM excerpts, each with path:start-end, ONLY for code it must edit \
@@ -6262,6 +7729,10 @@ async fn run_subagent(
         allow_browser: false,
         // Authoring tools are never delegated either.
         allow_create: false,
+        // A read grant is inherited: the user widened THIS TURN's reach, and a
+        // sub-agent the turn delegates to searches the same disk.
+        allow_outside: parent.allow_outside,
+        allow_outside_folders: parent.allow_outside_folders.clone(),
         // Web search IS research, so the sub-agent inherits the same engine
         // chain the user configured for the parent turn.
         search_plugins: parent.search_plugins.clone(),
@@ -6376,10 +7847,7 @@ async fn run_subagent(
     // covers each rung plus one spare, and never drops below the old 10 so a
     // short chain keeps exactly the retry story it had.
     let max_attempts = SUBAGENT_MAX_ATTEMPTS
-        .max(chain.len().saturating_add(usize::from(
-            !parent.model.trim().is_empty()
-                && !(parent.model == sub_req.model && parent.provider_id == sub_req.provider_id),
-        )) * SUBAGENT_RUNG_ATTEMPTS);
+        .max(chain.len().saturating_add(1) * SUBAGENT_RUNG_ATTEMPTS);
     // Attempts spent on the rung `sub_req` currently points at, reset whenever
     // the rung changes. The budget belongs to ONE model, not to the ladder.
     let mut rung_attempts = 0usize;
@@ -6583,12 +8051,16 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                 // a click, which reads as "the button did nothing at all" even
                 // though the ladder had already restarted.
                 attempt: attempt + 1,
-                max_attempts: SUBAGENT_MAX_ATTEMPTS,
+                // The REAL budget: a long fallback chain raises it above
+                // SUBAGENT_MAX_ATTEMPTS, and quoting the constant here made
+                // the badge jump between "6/10" and "7/14" after a click.
+                max_attempts,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
                 agent: "explore subagent".into(),
                 tool: tool.to_string(),
                 model: sub_req.model.clone(),
+                provider_id: sub_req.provider_id.clone(),
                 reconnecting: true,
                 fallback: false,
             });
@@ -6614,45 +8086,53 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         // which is what SUBAGENT_RUNG_ATTEMPTS buys it before the chain moves on.
         let rung_spent = rung_attempts >= SUBAGENT_RUNG_ATTEMPTS;
         let advance = attempt < max_attempts && (subagent_error_is_fatal(&last.0) || rung_spent);
+        // Set when the walk ran off the END of the list and went back to rung 0:
+        // the banner then says the whole list is being tried again.
+        let mut wrapped = false;
         if advance {
-            let parent_is_current = parent.model == sub_req.model
-                && parent.provider_id == sub_req.provider_id;
-            // The parent model is appended once, as the final rung of a slot
-            // whose chain is exhausted (or of a slot that has no fallbacks).
-            let parent_as_rung = !parent.model.trim().is_empty() && !parent_is_current;
+            // The slot's own chain is the WHOLE try order. The chat model used to
+            // be appended as a final rung, which meant a tool with an empty
+            // fallback list silently kept trying a model the user never picked
+            // for it — and a tool WITH fallbacks could still land on the chat
+            // model instead of failing loudly.
             let next = chain_idx + 1;
-            let parent_rung = chain.len() + usize::from(parent_as_rung);
-            if next >= parent_rung {
-                // Nothing left to try. A FATAL failure is final right away; a
-                // TRANSIENT one keeps retrying this LAST rung with the remaining
-                // budget, so a slot with no fallback configured stays exactly as
-                // patient as it was before.
+            if next >= chain.len() && chain.len() > 1 {
+                // Every rung has failed. The list is not the end of the road:
+                // the walk goes back to the TOP — the tool's own model — and
+                // tries the whole list again, until the attempt budget is spent.
+                // (A provider that was down a minute ago is often back; giving
+                // up after one pass is what left the turn dead while the first
+                // model had already recovered.) The backoff below still applies,
+                // so the walk never spins through dead rungs without pausing.
+                wrapped = true;
+                chain_idx = 0;
+                rung_attempts = 0;
+                if let Some((m, b, keys, pid, kind)) = chain.first() {
+                    sub_req.model = m.clone();
+                    sub_req.provider_id = pid.clone();
+                    sub_req.base_url = b.clone();
+                    sub_req.api_keys = keys.clone();
+                    sub_req.provider = kind.clone();
+                    sub_req.model_reasoning = provider_model_reasoning(&parent.providers, pid, m);
+                    sub_req.thinking_level = chain_level.clone();
+                }
+            } else if next >= chain.len() {
+                // A one-model chain: there is nothing to rotate through. A FATAL
+                // failure is final right away; a TRANSIENT one keeps retrying
+                // this model with the remaining budget, so a slot with no
+                // fallback configured stays exactly as patient as it was before.
                 if subagent_error_is_fatal(&last.0) {
                     break;
                 }
                 rung_attempts = 0;
             } else {
-                // Moving down the chain: the NEXT fallback model, then the next,
-                // with the PARENT's model as the last resort. Each rung is
-                // applied with the SLOT's reasoning level — a fallback changes
-                // the model and its routing, never the effort the user chose.
+                // Moving down the chain: the NEXT fallback model the user picked,
+                // in their order. Each rung is applied with the SLOT's reasoning
+                // level — a fallback changes the model and its routing, never
+                // the effort the user chose.
                 chain_idx = next;
                 rung_attempts = 0;
-                if next == chain.len() && parent_as_rung {
-                    using_fallback = true;
-                    sub_req.model = parent.model.clone();
-                    sub_req.provider_id = parent.provider_id.clone();
-                    sub_req.base_url = parent.base_url.clone();
-                    sub_req.api_key = parent.api_key.clone();
-                    sub_req.api_keys = parent.api_keys.clone();
-                    // The last rung IS the parent's model, so it must also use
-                    // the parent's endpoint kind — otherwise it inherits the
-                    // kind of the rung that just failed.
-                    sub_req.provider = parent.provider.clone();
-                    sub_req.model_reasoning = parent.model_reasoning;
-                    // The main model's own level is what the parent turn uses.
-                    sub_req.thinking_level = parent.thinking_level.clone();
-                } else if let Some((m, b, keys, pid, kind)) = chain.get(next) {
+                if let Some((m, b, keys, pid, kind)) = chain.get(next) {
                     using_fallback = true;
                     sub_req.model = m.clone();
                     sub_req.provider_id = pid.clone();
@@ -6674,6 +8154,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
                     agent: "explore subagent".into(),
                     tool: tool.to_string(),
                     model: sub_req.model.clone(),
+                    provider_id: sub_req.provider_id.clone(),
                     reconnecting: true,
                     fallback: true,
                 });
@@ -6689,7 +8170,11 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
         // renderer must not be able to tell a sub-agent hiccup from a main
         // agent one. `agent` is what labels WHICH model the user should change,
         // `tool` names the tool that owns the retry.
-        let reason = last.0.clone();
+        let reason = if wrapped {
+            format!("{} — every model failed, starting over from the first", last.0)
+        } else {
+            last.0.clone()
+        };
         emit(&AgentEvent::Retry {
             attempt,
             max_attempts,
@@ -6698,6 +8183,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             agent: "explore subagent".into(),
             tool: tool.to_string(),
             model: sub_req.model.clone(),
+            provider_id: sub_req.provider_id.clone(),
             reconnecting: true,
             fallback: false,
         });
@@ -6727,12 +8213,13 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             // reads as "the button did nothing".
             emit(&AgentEvent::Retry {
                 attempt: attempt + 1,
-                max_attempts: SUBAGENT_MAX_ATTEMPTS,
+                max_attempts,
                 delay_secs: 0,
                 reason: "retrying now (requested)".into(),
                 agent: "explore subagent".into(),
                 tool: tool.to_string(),
                 model: sub_req.model.clone(),
+                provider_id: sub_req.provider_id.clone(),
                 reconnecting: true,
                 fallback: false,
             });
@@ -6749,6 +8236,7 @@ stuck tool call or a provider that stopped responding) — attempt aborted",
             agent: "explore subagent".into(),
             tool: tool.to_string(),
             model: sub_req.model.clone(),
+            provider_id: sub_req.provider_id.clone(),
             fallback: using_fallback,
         });
     }
@@ -6809,16 +8297,12 @@ fn cache_read_tuple(acc: &StreamAcc) -> u64 {
 /// The generic coding rules, inlined into the shared body of every system
 /// prompt.
 ///
-/// Sourced from the shipped skill instead of being copied here: `include_str!`
-/// compiles the markdown into the binary, so `src-tauri/skills/coding-standards.md`
-/// stays the single source and the prompt cannot drift from it. The frontmatter
-/// is stripped because only the body is instructions — the catalog is what
-/// carries the name and the Persian keywords.
-fn coding_rules() -> String {
-    crate::skills::strip_frontmatter_pub(include_str!("../skills/coding-standards.md"))
-        .trim()
-        .to_string()
-}
+/// Kept as a prompt asset instead of a shipped skill: `include_str!` compiles
+/// `src-tauri/prompts/coding-rules.md` into the binary, so the file stays the
+/// single source and the prompt cannot drift from it. A skill would only apply
+/// when the model chose to spend a `load_skill` call, and a rule that is never
+/// read is not a rule.
+const CODING_RULES: &str = include_str!("../prompts/coding-rules.md");
 
 /// The main agent's system prompt.
 ///
@@ -6890,18 +8374,45 @@ commit, package installs); every read-only command still runs. Answer with the c
 change instead — which file, which line, the exact old text -> new text — and tell the user \
 to switch to Build mode to apply it."
     };
-    let rules = coding_rules();
     format!(
         "You are Codifa, a coding agent inside the user's desktop IDE. \
-You have NO search/read tools: delegate ALL file reading, searching and \
-LSP lookups to the `explore` sub-agent and work from its full report. \
-When a task spans several independent areas, fire SEVERAL `explore` calls \
-IN THE SAME STEP (they run concurrently, one round-trip) — one focused \
-explore per area/file group. A single broad explore is the slowest, \
-shallowest option; only a genuinely single-area question justifies one call. \
-NEVER use run_terminal to SEARCH for files (find/grep/rg/fd/locate) — file \
-discovery goes through `explore` only; the shell is for listing and measuring \
-(ls, du, df, ps, lsof), builds, tests and git. \
+PICK THE CHEAPEST TOOL for the job — and the gap GROWS with the turn: measured \
+on real traces, an early step re-sends the whole conversation for ~7.7K \
+uncached tokens, but by round 20 that same step costs ~79K, while ONE `explore` \
+delegation runs on its own SHORT context (~16K per round) and never pays your \
+history. So the longer the turn, the cheaper the delegation:\n\
+TOOL ORDER for finding anything (follow it TOP-DOWN — every step down costs \
+extra round-trips, so never start lower than the question forces):\n\
+  1. Files you can NAME (yours, the user's, a report, an earlier result): `read` \
+them — ranges=[{{\"path\":\"a.rs\",\"offset\":1,\"limit\":80}},{{\"path\":\"b.ts\"}},…] \
+reads every named file AND window in ONE call. Never delegate what one read answers.\n\
+  2. Files you CANNOT name but a SYMBOL you can: go by SYMBOL, never by grep. \
+`find_symbol` returns the definition bodies AND every usage in ONE call (no \
+language server needed); with a server installed `lsp_definition` / \
+`lsp_references` / `lsp_hover` answer precisely, and `lsp_symbols` outlines one \
+file so you read a window instead of the whole file. Grepping a name you already \
+know is the expensive path: measured, the main agent made 195 `read` + 108 `grep` \
+calls against 4 `lsp_symbols`, and each skipped symbol jump cost a grep PLUS a \
+read of the hit — two rounds where one sufficed.\n\
+  3. A token with NO symbol form (a string, a config key, a log line): ONE `grep` \
+with path+include, then read only the windows it points at. A grep on a bare \
+identifier already comes back WITH its `find_symbol` answer attached — use that \
+instead of searching again.\n\
+  4. Still open after 2-3 of your own lookups (where is X wired up, how does this \
+area work, who owns a behaviour, several areas at once): ONE `explore` delegation \
+carrying the question plus the paths you already found. It searches in its own \
+SHORT context and never pays your history; you act on its report. Fire SEVERAL \
+`explore` calls IN THE SAME STEP when the task spans independent areas — they run \
+concurrently on one round-trip; one broad explore is the slowest, shallowest option.\n\
+- After EVERY successful `edit_file`: the result carries the language server's \
+diagnostics for that file whenever a server is warm (it runs NO build). Read them \
+and fix what they name — only run your own build/typecheck when they are absent, \
+because a manual typecheck is a whole extra round you did not need.\n\
+The terminal is for work only the terminal can do: listing and measuring (ls, du, \
+df, ps, lsof), builds, tests and git — plus anything outside the workspace. Reading \
+a WORKSPACE file or locating files is not that work, and the backend REFUSES it: a \
+file's contents come from `read`, a search from `grep`, a symbol from \
+`find_symbol`/`lsp_*` — and a broad hunt is ONE `explore` delegation. \
 To verify LIVE, run the project in its OWN dev workflow, and ALWAYS check \
 first whether that dev process is already running (ps/lsof + its port): if it \
 is, REUSE it and never start a second one — duplicate dev servers fight over \
@@ -6909,9 +8420,8 @@ the same port and produce conflicting logs. Only start it once when nothing \
 is running, and never verify against a release build. \
 Use the tools this mode binds to make changes, and never claim a change you \
 did not make. \
-CODING RULES — apply to every write, edit and review (already inlined from the \
-built-in `Coding Standards` skill; there is no need to load it again):\n\
-{rules}\n\
+CODING RULES — apply to every write, edit and review:\n\
+{CODING_RULES}\n\
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \
 A system message holding a compacted summary is AUTHORITATIVE history: every \
@@ -6937,6 +8447,53 @@ Workspace root: {root}. Mode: {mode}. {mode_rule}"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate must name its chat, and deleting a chat must release its gates.
+    ///
+    /// The old map held only the oneshot, so the only removals were
+    /// `deliver_answer` and the waiter's own cancel tick. A chat deleted while
+    /// its popup was still open left the blocked turn task parked forever — and
+    /// that task owns the chat's entire `Vec<Value>` message history.
+    #[test]
+    fn deleting_a_chat_releases_its_answer_gates() {
+        let (tx_a, _rx_a) = tokio::sync::oneshot::channel::<Value>();
+        let (tx_b, _rx_b) = tokio::sync::oneshot::channel::<Value>();
+        {
+            let mut gates = answer_gates().lock().unwrap_or_else(|e| e.into_inner());
+            gates.insert("gate-a".into(), ("chat-a".into(), tx_a));
+            gates.insert("gate-b".into(), ("chat-b".into(), tx_b));
+        }
+
+        forget_chat("chat-a");
+
+        let gates = answer_gates().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!gates.contains_key("gate-a"), "chat-a's gate must be gone");
+        assert!(gates.contains_key("gate-b"), "chat-b's gate must survive");
+        drop(gates);
+
+        // An empty id must never sweep the whole map (an unset chat id is a
+        // programming error, not "delete everything").
+        forget_chat("   ");
+        assert!(answer_gates()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key("gate-b"));
+    }
+
+    /// The gate record carries the owning chat, which is what makes the release
+    /// above possible at all.
+    #[test]
+    fn a_gate_records_its_owning_chat() {
+        let (tx, _rx) = tokio::sync::oneshot::channel::<Value>();
+        answer_gates()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("gate-owner".into(), ("chat-owner".into(), tx));
+        let gates = answer_gates().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(gates.get("gate-owner").map(|(c, _)| c.as_str()), Some("chat-owner"));
+        drop(gates);
+        forget_chat("chat-owner");
+    }
 
     #[test]
     fn clip_trace_text_cuts_on_a_utf8_boundary() {
@@ -7046,6 +8603,7 @@ mod tests {
             sub: true,
             context_tokens: 0,
             context_window: 0,
+            reasoning_chars: 0,
         }
         .to_json();
         // Sub-agent usage is flagged so the context meter ignores it.
@@ -7067,8 +8625,12 @@ mod tests {
             sub: false,
             context_tokens: 900,
             context_window: 200_000,
+            reasoning_chars: 120,
         }
         .to_json();
+        // The observed reasoning size rides the usage event, so the renderer
+        // can learn that a capability-silent gateway model really reasons.
+        assert_eq!(t["reasoning_chars"], 120);
         assert_eq!(t["context_tokens"], 900);
         // The denominator the trigger uses — the renderer divides by it so the
         // ring and the fold cannot drift apart.
@@ -7225,21 +8787,47 @@ mod tests {
     }
 
     #[test]
-    fn tool_schemas_main_agent_has_no_search_tools() {
+    fn tool_schemas_main_agent_has_bounded_reads_but_no_discovery() {
         let schemas = tool_schemas(false, true);
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|s| s["function"]["name"].as_str())
             .collect();
-        // Main agent must NOT have search/read tools — research is delegated.
-        // Memory tools live on the explore sub-agent too (user request).
-        for banned in [
+        // The main agent may read files its step already NAMED, grep one
+        // known token, and locate a symbol it already knows the NAME of: a
+        // narrow question used to cost a full `explore` delegation (~26K
+        // uncached tokens, ~4 rounds) or a line-hunting read storm when one
+        // main round (~7.7K) answers it. What stays delegated is DISCOVERY —
+        // finding out WHICH files exist — plus the tools that are not a
+        // lookup at all.
+        for allowed in [
             "read",
             "grep",
-            "glob",
             "find_symbol",
-            "lsp_definition",
             "lsp_symbols",
+            // The three position-based LSP lookups: 92.2% of every read window
+            // in the corpus sits in a language with a registered server, so
+            // these serve the targeted search wherever the model actually reads.
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            // Diagnostics belong to the same family and were the gap that
+            // mattered most: they were NEVER called in the traced corpus (0 of
+            // 1_035 tool calls) while 37 manual typecheck/build rounds ran, 12
+            // of them right after an edit. This tool runs NO build — it reads
+            // the `publishDiagnostics` a live server has already published, so
+            // it replaces a whole round-trip with an answer about the same
+            // file. (An earlier version of this test banned it, claiming it
+            // re-ran `cargo check`; that was wrong and cost the lever.)
+            "lsp_diagnostics",
+        ] {
+            assert!(names.contains(&allowed), "main agent must have {allowed}");
+        }
+        for banned in [
+            // Pure discovery: finding out WHICH files exist stays with the
+            // sub-agent, whose report the main agent works from.
+            "glob",
+            // Memory writes and catalog scans are not main-agent work.
             "save_memory",
             "search_memory",
             "delete_memory",
@@ -7252,6 +8840,64 @@ mod tests {
         // Web search is not file discovery: the main agent may search the web
         // itself (the engines come from Settings → Plugins).
         assert!(names.contains(&"web_search"));
+
+        // Batching lives in `ranges`, never in a bare file list: `paths` forced
+        // ONE window on every file and could name a file twice, sending the same
+        // bytes to the model twice. Neither agent may offer it again.
+        for listed in [tool_schemas(false, true), research_schemas()] {
+            let read = listed
+                .iter()
+                .find(|s| s["function"]["name"] == "read")
+                .expect("read schema");
+            let props = &read["function"]["parameters"]["properties"];
+            assert!(
+                props["paths"].is_null(),
+                "read must batch through ranges, not paths: {props}"
+            );
+            assert!(props["ranges"].is_object(), "read must keep ranges: {props}");
+        }
+    }
+
+    #[test]
+    fn discovery_tools_are_withheld_from_the_main_agent_by_name() {
+        // The schema list is not the only gate: a stale transcript can still
+        // call a withheld name, so the retainer must drop it for the main agent
+        // and keep it for the sub-agent.
+        let mut main: Vec<Value> = tool_schemas(false, false);
+        retain_allowed_tools(&mut main, &caps_for_mode("build"), "build");
+        let main_names: Vec<&str> = main
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        assert!(!main_names.contains(&"glob"));
+        // `read` follows the read capability, so a mode that may not read the
+        // workspace cannot reach it either.
+        let mut ask: Vec<Value> = tool_schemas(false, false);
+        retain_allowed_tools(&mut ask, &caps_for_mode("ask"), "ask");
+        assert!(ask
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some("read")));
+        let mut no_read: Vec<Value> = tool_schemas(false, false);
+        retain_allowed_tools(
+            &mut no_read,
+            &ToolCaps {
+                read_files: false,
+                ..ToolCaps::default()
+            },
+            "build",
+        );
+        assert!(!no_read
+            .iter()
+            .any(|s| matches!(
+                s["function"]["name"].as_str(),
+                Some("read") | Some("grep") | Some("glob")
+            )));
+        // A sub-agent keeps the whole search set.
+        let mut sub: Vec<Value> = research_schemas();
+        retain_allowed_tools(&mut sub, &caps_for_mode("subagent"), "subagent");
+        assert!(sub
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some("glob")));
     }
 
     #[test]
@@ -7260,7 +8906,7 @@ mod tests {
         // could touch the disk, and a call that still arrives is refused.
         let names = |caps: &ToolCaps| -> Vec<String> {
             let mut schemas = tool_schemas(true, false);
-            retain_allowed_tools(&mut schemas, caps);
+            retain_allowed_tools(&mut schemas, caps, "build");
             schemas
                 .iter()
                 .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
@@ -7404,22 +9050,22 @@ mod tests {
 
     #[test]
     fn listing_and_measuring_are_reads_but_searching_stays_delegated() {
+        let root = env!("CARGO_MANIFEST_DIR");
         // The user's rule: every READ works in every mode, only APPLYING a
         // change needs Build. Listing and measuring read what the caller
-        // already knows about, so they must never be refused; a search engine
-        // is delegated because it duplicates `explore` (the main agent's only
-        // search path), not because reading is restricted.
+        // already knows about, so they must never be refused.
+        //
+        // Shell SEARCH is refused: the main agent owns `read`/`grep`, so
+        // `run_terminal` stays a measurement/build verb.
         for cmd in [
             "ls",
             "ls -la src",
             "ls -1 | head -20",
             "du -sh * | sort -h",
             "df -h",
-            "cat package.json",
-            "sed -n '1,20p' src/app.ts",
         ] {
             assert!(
-                !is_file_search_command(cmd),
+                !is_file_search_command(cmd, root),
                 "{cmd:?} lists or reads a known target and must stay allowed"
             );
         }
@@ -7432,8 +9078,221 @@ mod tests {
             "tree src",
         ] {
             assert!(
-                is_file_search_command(cmd),
+                is_file_search_command(cmd, root),
                 "{cmd:?} searches and must be delegated to `explore`"
+            );
+        }
+        // A search that FILTERS a command's own output is not file discovery:
+        // it inspects a build/test the model just ran, and refusing it cost an
+        // extra, larger round trip in real traces.
+        for cmd in [
+            "cargo test 2>&1 | grep -E \"^(error|test result)\"",
+            "npm run build 2>&1 | tail -20 | rg error",
+            "git diff | grep '^+'",
+            "cargo test > /tmp/t.out 2>&1; echo exit=$?",
+        ] {
+            assert!(
+                !is_file_search_command(cmd, root),
+                "{cmd:?} filters a build's own output and must stay allowed"
+            );
+        }
+        // A discovery verb with no bounded native equivalent is refused even
+        // in a later segment: `sed -n '1,20p' f.ts | grep foo` filters, but
+        // `ls; tree src` still walks the tree.
+        assert!(is_file_search_command("ls; tree src", root));
+        assert!(is_file_search_command("cargo build && find . -name '*.rs'", root));
+    }
+
+    #[test]
+    fn a_prefixed_search_cannot_sneak_past_the_gate() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // MEASURED on the live build: 63% of `run_terminal` calls arrive as
+        // `cd <path> && …` or with an `export`/assignment prefix. A gate that
+        // reads only the raw string's first WORD lets `cd x && grep -rn foo`
+        // through — the very shell search this predicate exists to refuse.
+        for cmd in [
+            "cd src && grep -rn foo .",
+            "export PATH=/usr/bin:$PATH; grep -rn foo src",
+            "FOO=1 cd src && find . -name '*.rs'",
+            "cd a && cd b && tree src",
+        ] {
+            assert!(
+                is_file_search_command(cmd, root),
+                "{cmd:?} searches the tree behind its prefix and must be refused"
+            );
+        }
+        // An unrelated absolute `cd` must NOT open the gate for a workspace
+        // search, and — the other way round — a search whose OWN scope leaves
+        // the workspace is the terminal's job: every native lookup is scoped to
+        // the workspace, so refusing it billed one answer twice (the model
+        // re-asked with `grep` and failed on the very same path).
+        assert!(is_file_search_command("cd src-tauri && grep -rn foo src", root));
+        assert!(!is_file_search_command("cd /tmp && grep -rn foo src", root));
+        assert!(!is_file_search_command("cd /Users/x/src-tauri && rg TODO src", root));
+        assert!(!is_file_search_command("grep -rn foo /tmp/logs", root));
+        assert!(!is_file_search_command("rg TODO ~/.config", root));
+        // Filtering a command's OWN output is not file discovery, even after a
+        // prefix: it inspects a build the model just ran.
+        for cmd in [
+            "cargo test 2>&1 | grep -E '^error'",
+            "cd src-tauri && cargo test 2>&1 | tail -20 | rg error",
+        ] {
+            assert!(
+                !is_file_search_command(cmd, root),
+                "{cmd:?} filters its own build output and must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workspace_file_is_read_with_read_not_with_cat() {
+        // The user's rule: the terminal is for what only the terminal can do.
+        // `read` takes several files and windows in ONE call and bounds its
+        // output, so a dump of a WORKSPACE file is a refused shell detour.
+        let root = env!("CARGO_MANIFEST_DIR");
+        for cmd in [
+            "cat src/main.rs",
+            "sed -n '1,20p' src/main.rs",
+            "head -30 src/tools.rs",
+            "cd src && cat main.rs",
+            "cd . && tac Cargo.toml",
+            "awk '{print}' src/main.rs",
+        ] {
+            assert!(
+                workspace_file_read(cmd, root),
+                "{cmd:?} dumps a workspace file and must be refused"
+            );
+        }
+        // Out-of-tree reads stay a terminal job: `read` is workspace-scoped,
+        // and a build's own output is not a file the model needs bounded.
+        for cmd in [
+            "cat /tmp/codifa-probe.log",
+            "tail -20 /var/log/system.log",
+            "cargo test 2>&1 | tail -20",
+            "git diff | head -40",
+            "ls -la",
+            "du -sh *",
+        ] {
+            assert!(
+                !workspace_file_read(cmd, root),
+                "{cmd:?} reads outside the workspace or filters output — allowed"
+            );
+        }
+        // `sed -i` REWRITES: that is the mutation gate's business, not this one.
+        assert!(!workspace_file_read("sed -i 's/a/b/' src/main.rs", root));
+    }
+
+    #[test]
+    fn a_read_only_shell_call_shares_the_round_but_a_writer_never_does() {
+        // MEASURED on the live build: one chat spent 10 whole rounds on shell
+        // reads (`ls`, `du`, `git status`) that could have run beside its other
+        // reads — and every round costs the model ~6-8K uncached tokens.
+        let root = env!("CARGO_MANIFEST_DIR");
+        for cmd in [
+            "ls -la src",
+            "du -sh *",
+            "git status --short",
+            "cargo test 2>&1 | tail -5",
+            "lsof -nP -iTCP:5199",
+        ] {
+            assert!(
+                is_shell_read_only(cmd, root),
+                "{cmd:?} only reads and may share the round"
+            );
+        }
+        // A writer keeps its own round: the batch runs BEFORE the sequential
+        // calls, so a read batched beside a write would run before it.
+        for cmd in [
+            "git add -A",
+            "npm install",
+            "cat src/main.rs",
+            "grep -rn foo src",
+            "cargo test 2>&1 | tee out.log",
+        ] {
+            assert!(
+                !is_shell_read_only(cmd, root),
+                "{cmd:?} mutates, searches or dumps — it must keep its own round"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_targets_ignores_regex_operands_that_are_not_paths() {
+        // MEASURED on the live traces: regex operands landed in the path set
+        // and made the access gate ask for `/[Cc]hromium` and `/forkChat/,/^PASS\`
+        // — directories that cannot exist, so the round was spent on a prompt
+        // the user could only deny.
+        for fake in [
+            "/[Cc]hromium",
+            "/forkChat/,/^PASS\\",
+            "/opt/homebrew/opt/node*/bin",
+            "foo//bar",
+        ] {
+            assert!(
+                looks_like_pattern(fake),
+                "{fake:?} is a pattern operand, never a filename"
+            );
+        }
+        // The real paths the same commands carry must survive.
+        for real in [
+            "/opt/homebrew/bin/node",
+            "~/.nvm/versions/node",
+            "/tmp/codifa-live.log",
+            "src/lib/store.ts",
+            "./node_modules/.bin/tsc",
+        ] {
+            assert!(
+                !looks_like_pattern(real),
+                "{real:?} is a real path and must stay in the target set"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_on_the_users_path_is_never_outside() {
+        // MEASURED on the live traces: a plain `node script.js` was classified
+        // OUTSIDE (39 touches, 19 unique) and asked for /opt/homebrew/bin or
+        // ~/.nvm/... — the very binaries the user's terminal runs unasked.
+        let dirs = crate::tools::tool_dirs();
+        assert!(
+            dirs.iter().any(|d| d.join("node").exists() || d.ends_with("bin")),
+            "the user's PATH must resolve to real directories"
+        );
+        // A binary on the user's OWN PATH, taken from it so the assertion is
+        // environment-independent (a test runner's PATH is not the login one).
+        let on_path = dirs
+            .iter()
+            .find(|d| d.ends_with("bin"))
+            .expect("a PATH entry ending in `bin`")
+            .join("node");
+        for rel in [on_path.to_str().unwrap(), "/tmp/x.py"] {
+            assert!(
+                matches!(
+                    crate::tools::path_access(env!("CARGO_MANIFEST_DIR"), rel, None),
+                    crate::tools::PathAccess::Free
+                ),
+                "{rel:?} runs in any terminal without a prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn the_terminal_schema_states_the_division_of_labour() {
+        // MEASURED on the live build, before this text existed: the model ran
+        // 10 rounds of shell reads (`ls`, `du`, `git status`, `cat`) in one chat
+        // that its other read-only calls could have shared, and the schema said
+        // only "Run a shell command in the workspace with a timeout." A schema
+        // that names the wrong tool is paid on every round-trip AND costs the
+        // extra rounds, so the division of labour is asserted here.
+        let desc = tool_schemas(false, false)
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("run_terminal"))
+            .map(|s| s["function"]["description"].as_str().unwrap_or_default().to_string())
+            .expect("run_terminal must be advertised to the main agent");
+        for expected in ["does NOT read workspace files", "does NOT locate files", "read", "grep"] {
+            assert!(
+                desc.contains(expected),
+                "the run_terminal schema must name the division of labour ({expected:?} missing): {desc}"
             );
         }
     }
@@ -7615,14 +9474,76 @@ mod tests {
         // round-trip OF SUCH A TURN (~2_913 tokens for the authoring set),
         // which is why the descriptions were trimmed as well as accommodated:
         // the model needs the parameter names and enum values, not the prose.
+        // `read` + `grep` joined the MAIN set deliberately, and their two
+        // schemas cost 603 chars (~150 tokens) on every main round-trip. That
+        // is paid back by the round it prevents: on the traced corpus a narrow
+        // question ("read these 4 files / grep this token under this path")
+        // cost either a shell detour (320 of 606 `run_terminal` calls were
+        // `cat`/`sed -n`) or a full `explore` delegation at ~26_139 tokens,
+        // 89% of delegations being exactly that narrow. So the three budgets
+        // that include `read`+`grep` were re-based by the measured delta rather
+        // than trimmed: the descriptions are already at parameter-name density
+        // and cutting them back would cost the model the arg semantics the
+        // whole lever depends on.
+        //
+        // `find_symbol` + `lsp_symbols` are the second deliberate addition to
+        // the MAIN set, re-based the same way. `glob` stays OUT (discovery is
+        // the sub-agent's job), which is why the BASE "main" ceiling only moved
+        // by the locators' own chars. Measured on the live corpus, the main
+        // agent spent 376 EXTRA same-file reads (3.05M chars ≈ 763K tokens)
+        // hunting lines it could have located, 62 of them re-sending windows
+        // that overlapped what it had already read, and 35 rounds whose very
+        // next round was a plain read of a grep hit. Outline-by-symbol removes
+        // that hunt for the two tools' combined ~1_500 chars (~375 tokens) per
+        // main round-trip — a price paid on every round, but one that kills a
+        // whole class of rounds.
+        //
+        // The POSITION-based LSP lookups (`lsp_definition`, `lsp_references`,
+        // `lsp_hover`) joined the MAIN set in the same move
+        // and share their prose with the explore set through
+        // `lsp_position_schemas`, so no description is stored twice. They
+        // measure 1_745 chars (~436 tokens) on every main round-trip. The
+        // measured case for them: 92.2% of every read window in the corpus
+        // (1_645 of 1_785) sits in a language with a REGISTERED language server,
+        // so a symbol jump is available wherever the model actually reads.
+        //
+        // `lsp_diagnostics` joined them last, and the reason it was held back
+        // before was a WRONG note in this very comment ("re-runs the project's
+        // own build"). It runs NO build: it reads the `publishDiagnostics` a
+        // live server has already published, and its window is bounded
+        // (3s here, 1.5s when it rides an edit result). Measured: 0 calls in
+        // the whole corpus, while 37 manual typecheck/build rounds ran and 12
+        // of those sat in the round right after an edit — a whole round-trip
+        // each on a question the server already answers. It also rides every
+        // successful `edit_file` automatically (see
+        // `tools::post_edit_diagnostics`), so the common case costs the model
+        // nothing and removes the round entirely.
+        //
+        // Every ceiling below was re-based to the measured size + the same
+        // ~3.5% headroom the earlier budgets used, so an UNINTENDED addition
+        // still trips this test while a deliberate one stays a readable diff.
+        //
+        // The last re-base came from the `run_terminal` description, which now
+        // states the DIVISION OF LABOUR instead of one line: while it did not,
+        // the model reached for `cat`/`sed -n` for every file it wanted to see
+        // (measured on the live build: 10 whole rounds of shell reads in one
+        // chat, each round ~6-8K uncached tokens). A schema that names the
+        // wrong tool is paid on every round-trip AND costs the extra rounds.
         let mut report = String::new();
         let mut over = false;
         for (label, schemas, budget) in [
-            ("main", tool_schemas(false, false), 7_900usize),
-            ("main+browser", tool_schemas(false, true), 11_500),
-            ("main+authoring", tool_schemas(true, false), 12_000),
-            ("main+authoring+browser", tool_schemas(true, true), 17_600),
-            ("explore", research_schemas(), 8_400),
+            // `main`/`main+browser` were re-based when a plain turn gained the
+            // `plugin` door (`list`/`run`, see `tool_schemas`): a scheduled run
+            // has nobody to ask, so a bundle's scripts must be reachable there.
+            // The step is the compact schema's own chars — the authoring prose
+            // stays out, and the ~3.5% headroom convention still holds.
+            ("main", tool_schemas(false, false), 11_400usize),
+            ("main+browser", tool_schemas(false, true), 17_100),
+            // Raised when the `plugin` tool learned `scripts`/`run`: a capability
+            // addition is exactly what this ceiling exists to make deliberate.
+            ("main+authoring", tool_schemas(true, false), 18_100),
+            ("main+authoring+browser", tool_schemas(true, true), 23_900),
+            ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
             if got > budget {
@@ -7633,6 +9554,84 @@ mod tests {
         assert!(
             !over,
             "tool schemas over budget (chars/budget): {report}"
+        );
+    }
+
+    #[test]
+    fn a_plain_turn_keeps_the_script_door_but_not_the_authoring_actions() {
+        // A scheduled Build run sends `allow_create: false` and has nobody to
+        // ask, so binding the WHOLE `plugin` tool behind that flag meant a
+        // bundle's scripts were unreachable there — the plugin was installed,
+        // on, and invisible. `list`/`run` are acts like `run_terminal`, so a
+        // plain turn keeps exactly those two, and the write actions stay out.
+        let schemas = tool_schemas(false, false);
+        let plugin = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "plugin")
+            .expect("a plain turn must still reach a bundle's scripts");
+        let actions: Vec<&str> = plugin["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(actions, vec!["list", "run"], "{actions:?}");
+        // The authoring prose must NOT ride along: it is ~2.9K chars re-sent on
+        // every round-trip of every ordinary turn.
+        let desc = plugin["function"]["description"].as_str().unwrap_or("");
+        assert!(
+            !desc.contains("git repo"),
+            "the authoring description must stay out of a plain turn: {desc}"
+        );
+        // The authoring turn keeps the full set.
+        let full = tool_schemas(true, false);
+        let authored = full
+            .iter()
+            .find(|s| s["function"]["name"] == "plugin")
+            .expect("an authoring turn keeps the plugin tool");
+        let all: Vec<&str> = authored["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for action in ["install", "create", "update", "toggle", "delete", "run"] {
+            assert!(all.contains(&action), "authoring must keep {action}: {all:?}");
+        }
+    }
+
+    #[test]
+    fn plugin_scripts_are_rust_unless_the_user_named_a_language() {
+        // The default lives in `plugins::DEFAULT_SCRIPT_LANGUAGE`, but the model
+        // is the one that chooses — so the SCHEMA is where the rule has to be
+        // stated. While it only said "Defaults to rust", a model could still
+        // pick python on its own and ship a script nobody asked for.
+        let schemas = tool_schemas(true, false);
+        let plugin = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "plugin")
+            .expect("the authoring turn must advertise the plugin tool");
+        let props = &plugin["function"]["parameters"]["properties"];
+        let script = &props["scripts"];
+        let text = format!(
+            "{} {}",
+            script["description"].as_str().unwrap_or(""),
+            script["items"]["properties"]["language"]["description"]
+                .as_str()
+                .unwrap_or("")
+        )
+        .to_lowercase();
+        assert!(
+            text.contains("rust"),
+            "the schema must name Rust as the default language: {text}"
+        );
+        assert!(
+            text.contains("omit") || text.contains("leave `language` out"),
+            "the schema must say the language field is left OUT for Rust: {text}"
+        );
+        assert!(
+            text.contains("user"),
+            "another language must be tied to an explicit user request: {text}"
         );
     }
 
@@ -7774,6 +9773,16 @@ mod tests {
         // Shapes without a target are never deduped (nothing to compare).
         assert!(lookup_key("read", &json!({"path": "src"})).is_none());
         assert!(lookup_key("grep", &json!({"path": "src"})).is_none());
+        // A multi-FILE read carries no top-level filePath, yet it is exactly the
+        // call that moves the most bytes: it must still be deduped, and two
+        // different file lists must never share a key.
+        let many = json!({"ranges": [{"path": "a.rs"}, {"path": "b.ts"}]});
+        let many_key = lookup_key("read", &many).expect("a multi-file read is dedupable");
+        assert_eq!(many_key, lookup_key("read", &many.clone()).unwrap());
+        assert_ne!(
+            many_key,
+            lookup_key("read", &json!({"ranges": [{"path": "a.rs"}]})).unwrap()
+        );
         // `glob` IS deduped now (it was not, and a traced run re-listed the
         // same directory): a pattern is a real target, a bare scope is not.
         assert!(lookup_key("glob", &json!({"pattern": "**/*.ts"})).is_some());
@@ -7784,58 +9793,54 @@ mod tests {
     fn single_call_steps_get_a_batching_hint() {
         let one = |name: &str| vec![("c1".to_string(), name.to_string(), "{}".to_string())];
         // The explore sub-agent: one lookup per step burns rounds.
-        assert!(single_call_hint("subagent", &one("grep"))
+        assert!(single_call_hint("subagent", &one("grep"), 1)
             .unwrap()
             .contains("NEXT step"));
         // The main agent: a single broad explore wastes the concurrent fan-out
         // (a traced turn fired one wide explore and got a 4-round report).
-        let main = single_call_hint("agent", &one("explore")).unwrap();
+        let main = single_call_hint("agent", &one("explore"), 1).unwrap();
         assert!(main.contains("CONCURRENTLY") && main.contains("2-4 focused explores"), "{main}");
         // Batched steps are left alone, and so is a single non-explore call.
         let two = vec![
             ("a".to_string(), "grep".to_string(), "{}".to_string()),
             ("b".to_string(), "read".to_string(), "{}".to_string()),
         ];
-        assert!(single_call_hint("subagent", &two).is_none());
-        // Native write/terminal tools DO get a hint now: traced main-agent turns
-        // spent 72% of their steps on one call, 125 of them `run_terminal`. The
-        // wording must promise ordering, not parallelism — these calls mutate the
-        // workspace and never enter the concurrent batch.
-        for name in ["run_terminal", "edit_file", "write_file"] {
-            let hint = single_call_hint("agent", &one(name)).unwrap();
+        assert!(single_call_hint("subagent", &two, 1).is_none());
+        // Native WRITE tools still get the hint: a lone file write is precisely
+        // the shape a batch fixes, so the wording promises ordering, not
+        // parallelism. `run_terminal` and the browser act-then-observe tools were
+        // REMOVED from this set: traced, their lone rounds are probe chains whose
+        // arguments come from the previous result, so the hint is an instruction
+        // the model cannot obey (59 such rounds, 50 firings, zero effect).
+        for name in ["edit_file", "write_file"] {
+            let hint = single_call_hint("agent", &one(name), 1).unwrap();
             assert!(hint.contains("IN ORDER"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
-        // The browser tools were the BIGGEST missing group: traced main-agent
-        // rounds were 54 solo `browser_evaluate` + 12 solo `browser_navigate`
-        // and the hint never fired on any of them (it fired on 2 of 280 rounds
-        // in the whole corpus). They act on one shared page in order, so they
-        // carry the same "in order" wording, never a parallelism promise.
-        for name in [
-            "browser_evaluate",
-            "browser_navigate",
-            "browser_snapshot",
-            "browser_click",
-            "browser_type",
-            "browser_fill_form",
-            "browser_press_key",
-            "browser_select_option",
-        ] {
-            let hint = single_call_hint("agent", &one(name)).unwrap_or_else(|| panic!("{name} has no hint"));
-            assert!(hint.contains("IN ORDER"), "{name}: {hint}");
-            assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
+        for name in ["run_terminal", "browser_evaluate", "browser_navigate"] {
+            assert!(
+                single_call_hint("agent", &one(name), 1).is_none(),
+                "{name} is a probe chain, not a missed batch — it must stay silent"
+            );
         }
-        // Phase 6.28: 18 single-call main rounds sat OUTSIDE this whitelist
-        // (110_995 uncached tokens), so the hint could never fire on them.
-        for name in ["browser_resize", "browser_emulate_media", "artifact"] {
-            let hint = single_call_hint("agent", &one(name))
+        // A whole-artifact write is a file write and stays in the set; the
+        // browser viewport/emulation calls are act-then-observe like the rest of
+        // the browser group and must stay silent.
+        for name in ["artifact"] {
+            let hint = single_call_hint("agent", &one(name), 1)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
             assert!(hint.contains("IN ORDER"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
+        for name in ["browser_resize", "browser_emulate_media"] {
+            assert!(
+                single_call_hint("agent", &one(name), 1).is_none(),
+                "{name} acts on one shared page in a chain — it must stay silent"
+            );
+        }
         // Read-only natives are the one group that DOES batch concurrently.
-        for name in ["read", "fetch_url", "load_skill"] {
-            let hint = single_call_hint("agent", &one(name))
+        for name in ["read", "fetch_url", "load_skill", "find_symbol", "lsp_symbols"] {
+            let hint = single_call_hint("agent", &one(name), 1)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
             assert!(hint.contains("CONCURRENTLY"), "{name}: {hint}");
         }
@@ -7844,12 +9849,147 @@ mod tests {
         // second full checklist rewrite in one step, so they stay silent.
         for name in ["ask_user", "update_plan"] {
             assert!(
-                single_call_hint("agent", &one(name)).is_none(),
+                single_call_hint("agent", &one(name), 1).is_none(),
                 "{name} must stay silent"
             );
         }
         // A tool the hint has nothing useful to say about must stay silent.
-        assert!(single_call_hint("agent", &one("glob")).is_none());
+        assert!(single_call_hint("agent", &one("glob"), 1).is_none());
+    }
+
+    #[test]
+    fn the_lone_serial_hint_escalates_instead_of_repeating() {
+        // A fixed string fired on 16 consecutive rounds of one fresh chat and the
+        // model batched on ZERO of them: past the second delivery the text must
+        // carry the accumulated price, not the same instruction again.
+        let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
+        let first = single_call_hint("agent", &one, 1).unwrap();
+        assert!(first.contains("That step had ONE call"), "{first}");
+        assert!(!first.contains("rounds in a row"), "{first}");
+        let fifth = single_call_hint("agent", &one, 5).unwrap();
+        assert!(fifth.contains("5 rounds in a row"), "{fifth}");
+        assert!(fifth.contains("IN ORDER"), "{fifth}");
+        assert_ne!(first, fifth, "the text must change as the streak grows");
+    }
+
+    #[test]
+    fn a_lone_shell_probe_is_never_told_to_batch() {
+        // Traced: 59 consecutive rounds of one chat were all lone `run_terminal`,
+        // each command a probe whose arguments came from the previous result, and
+        // the hint fired on 50 of them — an instruction the model could not obey,
+        // left in the re-sent history (~350 chars on every later round) while it
+        // batched on 2 rounds out of 59. A shell round must therefore stay silent
+        // and must not grow the streak either, or the counter would report waste
+        // that was never addressable.
+        let shell = vec![("c1".to_string(), "run_terminal".to_string(), "{}".to_string())];
+        assert!(single_call_hint("agent", &shell, 1).is_none());
+        assert!(single_call_hint("agent", &shell, 5).is_none());
+        assert!(!single_call_is_serial("agent", &shell));
+        // The act-then-observe browser tools are the same chain and stay silent.
+        let browser = vec![("c1".to_string(), "browser_evaluate".to_string(), "{}".to_string())];
+        assert!(single_call_hint("agent", &browser, 1).is_none());
+        assert!(!single_call_is_serial("agent", &browser));
+        // A lone file write is the shape a batch CAN fix, so it still counts.
+        let write = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
+        assert!(single_call_is_serial("agent", &write));
+    }
+
+    #[test]
+    fn discovery_streak_nudge_fires_once_at_the_boundary() {
+        // The per-round single-call hint was measured as wallpaper (423 of 863
+        // rounds carried it, 315 single-call rounds followed it), so the streak
+        // nudge fires ONCE per streak — at the boundary, never before and never
+        // again inside the same streak. Firing earlier or repeatedly would put it
+        // back on the same footing as the hint it replaces.
+        for streak in 1..STREAK_NUDGE_AT {
+            assert!(
+                discovery_streak_hint("agent", streak).is_none(),
+                "streak {streak} must stay silent"
+            );
+        }
+        let hint = discovery_streak_hint("agent", STREAK_NUDGE_AT).unwrap();
+        assert!(hint.contains("`explore`"), "{hint}");
+        // Past the boundary stays silent until the LATE boundary, where the
+        // measured waste says the streak is no longer a finishing move: 1_443_180
+        // of the 2_361_303 uncached tokens past the third round sat at round 7+.
+        for streak in (STREAK_NUDGE_AT + 1)..STREAK_NUDGE_LATE {
+            assert!(discovery_streak_hint("agent", streak).is_none(), "streak {streak}");
+        }
+        let late = discovery_streak_hint("agent", STREAK_NUDGE_LATE).unwrap();
+        assert!(late.contains("`explore`"), "{late}");
+        for streak in (STREAK_NUDGE_LATE + 1)..=25 {
+            assert!(discovery_streak_hint("agent", streak).is_none(), "streak {streak}");
+        }
+        // The explore sub-agent has no `explore` of its own and a 3-round
+        // budget, so it must never receive the delegation nudge.
+        assert!(discovery_streak_hint("subagent", STREAK_NUDGE_AT).is_none());
+        assert!(discovery_streak_hint("subagent", STREAK_NUDGE_LATE).is_none());
+    }
+
+    #[test]
+    fn round_hint_gives_the_streak_boundary_priority() {
+        // Traced: the per-round hint would take the slot in 24 of the 72 rounds
+        // sitting exactly on a streak boundary, starving the one nudge that has a
+        // measured boundary on its side. The streak hint wins there, the
+        // per-round hint still fires everywhere else, and a round never carries
+        // both.
+        let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
+        for boundary in [STREAK_NUDGE_AT, STREAK_NUDGE_LATE] {
+            let got = round_hint("agent", &one, boundary, 1).unwrap();
+            assert_eq!(&*got, discovery_streak_hint("agent", boundary).unwrap());
+        }
+        // Off the boundaries the per-round hint keeps its slot.
+        let off = round_hint("agent", &one, 1, 1).unwrap();
+        assert_eq!(&*off, &*single_call_hint("agent", &one, 1).unwrap());
+        // A multi-call round off every boundary carries nothing.
+        let many = vec![
+            ("c1".to_string(), "read".to_string(), "{}".to_string()),
+            ("c2".to_string(), "read".to_string(), "{}".to_string()),
+        ];
+        assert!(round_hint("agent", &many, 2, 0).is_none());
+    }
+
+    #[test]
+    fn a_deep_lone_streak_is_never_silenced_by_the_streak_lever() {
+        // Traced: one chat ran 34 consecutive lone-serial rounds and the quiet
+        // rounds delivered NOTHING, because the streak hint holds the slot on
+        // `lone_mutating_rounds > 1 && % 3 != 0` and returns `None` whenever the
+        // discovery streak is below its boundary. For a lone FILE WRITE — the
+        // shape a batch can fix — the fallback keeps it audible.
+        let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
+        for rounds in 1..=12 {
+            let quiet = rounds > 1 && rounds % 3 != 0;
+            let hint = if quiet {
+                discovery_streak_hint("agent", 0)
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| single_call_hint("agent", &one, rounds))
+            } else {
+                round_hint("agent", &one, 0, rounds)
+            };
+            assert!(hint.is_some(), "round {rounds} (quiet={quiet}) delivered nothing");
+        }
+        // The quiet rounds that used to go silent now carry the escalating text,
+        // which names the price instead of repeating the same instruction.
+        let text = single_call_hint("agent", &one, 4).unwrap();
+        assert!(text.contains("4 rounds in a row"), "{text}");
+    }
+
+    #[test]
+    fn a_round_carries_at_most_one_nudge() {
+        // Both hints ride on the SAME slot (the step's last tool result), and the
+        // streak hint is the `or_else` fallback: a lone `read` in round 3 of a
+        // streak carries the single-call hint only, never both.
+        let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
+        assert!(single_call_hint("agent", &one, 1).is_some());
+        assert!(discovery_streak_hint("agent", STREAK_NUDGE_AT).is_some());
+        let batched = vec![
+            ("a".to_string(), "read".to_string(), "{}".to_string()),
+            ("b".to_string(), "grep".to_string(), "{}".to_string()),
+        ];
+        // A batched discovery round: no single-call hint, so the streak nudge is
+        // the one that lands — the case the batching lever alone cannot catch.
+        assert!(single_call_hint("agent", &batched, 1).is_none());
+        assert!(discovery_streak_hint("agent", STREAK_NUDGE_AT).is_some());
     }
 
     #[test]
@@ -7866,17 +10006,20 @@ mod tests {
         let mut emit = |_: &AgentEvent| {};
         let trace = crate::trace::TraceStore::new(String::new());
         // A report longer than the report cap: the head (answer) AND the tail
-        // (search results / file list) must both survive — the main agent has
-        // no read tool, so a lost tail is lost work it would re-delegate.
+        // (search results / file list) must both survive — the main agent works
+        // from this report, so a lost tail is lost work it would re-delegate.
         let big = format!("HEAD{}TAIL", "x".repeat(EXPLORE_REPORT_CAP + 100));
         finish_tool(&mut messages, &mut emit, &trace, "c1", "explore", &json!({}), big, true, false, None, None);
         let c = messages[0]["content"].as_str().unwrap();
         assert!(c.contains("HEAD") && c.contains("TAIL"), "head and tail must survive");
         assert!(c.contains("ask explore") && !c.contains("offset/limit"));
-        // A raw tool result still points at a narrower read window.
+        // A raw tool result still points at a narrower read window — and now
+        // names the exact resume offset, because "truncated" alone made the
+        // model re-read the whole file to find out where it stopped.
         let big2 = "x".repeat(MODEL_RESULT_CAP + 100);
         finish_tool(&mut messages, &mut emit, &trace, "c2", "read", &json!({}), big2, true, true, None, None);
-        assert!(messages[1]["content"].as_str().unwrap().contains("offset/limit"));
+        let c = messages[1]["content"].as_str().unwrap();
+        assert!(c.contains("read the rest with offset="), "got: {c}");
     }
 
     #[test]
@@ -8028,6 +10171,33 @@ mod tests {
         assert!(!budget_spent(1, false, true));
         // A fatal error advances immediately, without waiting for the budget.
         assert!(budget_spent(1, true, true));
+    }
+
+    #[test]
+    fn a_gateway_without_upstream_credentials_moves_to_the_next_model() {
+        // A 9router-style gateway answers every `oc/*` model with "No active
+        // credentials for provider: openrouter". That is the GATEWAY saying it
+        // holds no credential for its own upstream — retrying the same model can
+        // never succeed, so this must reach the user's fallback list instead of
+        // burning every attempt on rung 0. Reported by the user as "به فالبک
+        // سوئیچ نمیکنه" with the Explore row set to 9router.
+        assert!(subagent_error_is_fatal(
+            "custom reported an error mid-stream: No active credentials for provider: openrouter"
+        ));
+        assert!(subagent_error_is_fatal(
+            "9router reported an error mid-stream: No active credentials for provider: openrouter"
+        ));
+        // Prefixes the ladder adds on its way through.
+        assert!(subagent_error_is_fatal(
+            "explore failed: No active credentials for provider: openrouter"
+        ));
+        assert!(subagent_error_is_fatal(
+            "sub-agent failed: No active credentials for provider: openrouter"
+        ));
+        // Still transient: a plain 429 must keep the same model.
+        assert!(!subagent_error_is_fatal("429 rate limit exceeded"));
+        // …and a transport failure must never be read as a broken model.
+        assert!(!subagent_error_is_fatal("error sending request: connect timeout"));
     }
 
     #[test]
@@ -8232,7 +10402,8 @@ mod tests {
         // could never match this skill (the catalog is all the model sees).
         let section = crate::skill_router::build_section("", root, &[]);
         assert!(section.text.contains("[fa: فیلم, سینما]"), "{}", section.text);
-        assert!(section.text.contains("Movie Finder: find movies"), "{}", section.text);
+        assert!(section.text.contains("- Movie Finder"), "{}", section.text);
+        assert!(section.text.contains("find movies"), "{}", section.text);
 
         // A missing name/content is rejected instead of writing a broken skill.
         assert!(dispatch(root, "create_skill", &json!({"content": "x"}), None).is_err());
@@ -8338,8 +10509,16 @@ mod tests {
         use crate::tools::dispatch;
         let dir = std::env::temp_dir().join(format!("codifa-load-skill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sdir = dir.join("skills").join("movie-finder");
+        // A skill lives inside a bundle now, so the fixture builds that folder —
+        // the same shape `create_skill` writes.
+        let bundle = dir.join("plugins").join("movie-finder");
+        let sdir = bundle.join("skills").join("movie-finder");
         std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            bundle.join("plugin.json"),
+            r#"{"name":"Movie Finder","slug":"movie-finder","enabled":true}"#,
+        )
+        .unwrap();
         std::fs::write(
             sdir.join("skill.md"),
             "---\nname: Movie Finder\ndescription: find movies\n---\nBODY HERE\n",
@@ -8371,8 +10550,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         for i in 0..40 {
             let name = format!("Bulk Skill {i}");
-            let sdir = dir.join("skills").join(name.to_lowercase().replace(' ', "-"));
+            let slug = name.to_lowercase().replace(' ', "-");
+            let bundle = dir.join("plugins").join(&slug);
+            let sdir = bundle.join("skills").join(&slug);
             std::fs::create_dir_all(&sdir).unwrap();
+            std::fs::write(
+                bundle.join("plugin.json"),
+                format!(r#"{{"name":"{name}","slug":"{slug}","enabled":true}}"#),
+            )
+            .unwrap();
             // One distinctive English description, one Persian keyword set, the
             // rest filler — the two things a real query has to find.
             let (description, keywords) = match i {
@@ -8444,11 +10630,15 @@ mod tests {
         let extra = dispatch_with_data_root(r, "load_skill", &json!({"name": "Release Notes", "file": "checklist.md"}), None, Some(r)).unwrap();
         assert_eq!(extra, "- tag it");
         // A plugin skill is listed in the catalog (with its clipped detail), so
-        // the model can load it by name — and the catalog never carries a body,
-        // however precisely the prompt echoes the skill's own keywords.
-        let cat = crate::skill_router::build_section("یادداشت انتشار", r, &[]);
+        // the model can load it by name — an unrelated prompt carries no body.
+        let cat = crate::skill_router::build_section("", r, &[]);
         assert!(cat.text.contains("- Release Notes"), "{}", cat.text);
         assert!(!cat.text.contains("READ THE GIT LOG"), "{}", cat.text);
+
+        // …and the skill's OWN Persian keyword in the prompt attaches its body,
+        // which is how a Persian request reaches a plugin's skill at all.
+        let matched = crate::skill_router::build_section("یادداشت انتشار بساز", r, &[]);
+        assert!(matched.text.contains("READ THE GIT LOG"), "{}", matched.text);
 
         // Disabled plugin = gone from the catalog AND unloadable.
         crate::plugins::toggle_plugin(&root, &json!({"slug": "release-notes", "enabled": false})).unwrap();
@@ -8471,8 +10661,17 @@ mod tests {
         let data = base.join("data");
         let ws = base.join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
-        let sdir = data.join("skills").join("playwrite");
+        let sdir = data
+            .join("plugins")
+            .join("playwrite")
+            .join("skills")
+            .join("playwrite");
         std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            data.join("plugins").join("playwrite").join("plugin.json"),
+            r#"{"name":"Playwrite","slug":"playwrite","enabled":true}"#,
+        )
+        .unwrap();
         std::fs::write(
             sdir.join("skill.md"),
             "---\nname: Playwrite\ndescription: browser automation\n---\nBROWSER BODY\n",
@@ -8605,6 +10804,140 @@ mod tests {
 
     fn seen_set() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn a_read_is_covered_by_a_wider_window_already_served() {
+        // The exact-key guard only sees a LITERALLY identical call. Traced on
+        // the real corpus, 17 whole reads asked for a window already contained
+        // in a wider span served earlier in the same turn (the model widens a
+        // window it was told about, then narrows back onto the lines it needs)
+        // — 190_602 chars re-sent for content already in the context.
+        let mut seen = seen_set();
+        record_read_coverage(&mut seen, &tools::read_windows_of(&json!({
+            "filePath": "src/a.rs", "offset": 100, "limit": 400
+        })));
+
+        // A narrower window of the same file is covered.
+        assert!(read_windows_covered(
+            &seen,
+            &tools::read_windows_of(&json!({"filePath": "src/a.rs", "offset": 200, "limit": 50}))
+        ));
+        // A window that pokes ONE line past the served span is not: the model
+        // must still be able to fetch the line it cannot see.
+        assert!(!read_windows_covered(
+            &seen,
+            &tools::read_windows_of(&json!({"filePath": "src/a.rs", "offset": 400, "limit": 101}))
+        ));
+        // A different file is never covered by another file's span.
+        assert!(!read_windows_covered(
+            &seen,
+            &tools::read_windows_of(&json!({"filePath": "src/b.rs", "offset": 200, "limit": 50}))
+        ));
+        // EVERY window of a batch must be covered, or the call runs.
+        assert!(!read_windows_covered(
+            &seen,
+            &tools::read_windows_of(&json!({"ranges": [
+                {"path": "src/a.rs", "offset": 200, "limit": 50},
+                {"path": "src/a.rs", "offset": 9000, "limit": 50}
+            ]}))
+        ));
+        // An omitted offset/limit means the default window, exactly as dispatch
+        // reads it — the two must not disagree.
+        let mut wide = seen_set();
+        record_read_coverage(&mut wide, &tools::read_windows_of(&json!({"filePath": "x.rs"})));
+        assert!(read_windows_covered(
+            &wide,
+            &tools::read_windows_of(&json!({"filePath": "x.rs", "offset": 1, "limit": 400}))
+        ));
+        // A call naming no file is an error the model must see, never a hit.
+        assert!(!read_windows_covered(&wide, &tools::read_windows_of(&json!({}))));
+    }
+
+    #[test]
+    fn a_folded_read_forgets_the_coverage_its_body_granted() {
+        // The fold marker tells the model to re-run the read. If coverage still
+        // claims those lines, the re-run is answered with a pointer to a body
+        // that is no longer on the wire — the data becomes unreachable.
+        let args = r#"{"filePath":"a.txt","offset":1,"limit":400}"#;
+        let windows = tools::read_windows_of(&serde_json::from_str(args).unwrap());
+        let mut seen = seen_set();
+        record_read_coverage(&mut seen, &windows);
+        assert!(read_windows_covered(&seen, &windows));
+
+        let mut messages: Vec<Value> = Vec::new();
+        messages.extend(fold_round_args("c1", "read", args, &"r".repeat(30_000)));
+        messages.extend(fold_round("c2", "read", "small"));
+        messages.extend(fold_round("c3", "read", "small"));
+        fold_stale_tool_results(&mut messages, &mut seen);
+
+        assert!(messages[1]["content"].as_str().unwrap().ends_with(MAIN_FOLD_MARKER));
+        assert!(
+            !read_windows_covered(&seen, &windows),
+            "a folded read must drop the coverage of the windows it served"
+        );
+    }
+
+    #[test]
+    fn a_cut_window_does_not_count_as_served() {
+        // A read whose tail was cut never delivered those lines; its own marker
+        // names the resume offset, and coverage must not answer that follow-up
+        // with "already returned above".
+        assert!(result_was_window_cut(
+            "a.rs (lines 1-400):\n1: x\n… (window truncated at line 300 of 1000: …)"
+        ));
+        assert!(result_was_window_cut(
+            "a.rs (lines 1-9): (window too large for the result budget — read it with a smaller limit)"
+        ));
+        assert!(!result_was_window_cut("a.rs (lines 1-400):\n1: x\n"));
+    }
+
+    #[test]
+    fn only_a_workspace_writer_forgets_the_lookup_cache() {
+        // MEASURED: the blanket rule (`!is_readonly(name)`) wiped the whole cache
+        // 247 times, 60 of them from calls that cannot touch a workspace file.
+        // Each wipe discarded the read coverage recorded one call earlier, which
+        // is why the coverage guard fired 6 times against 137 re-asked windows.
+        let root = env!("CARGO_MANIFEST_DIR");
+        for (name, args) in [
+            ("explore", json!({})),
+            ("web_search", json!({})),
+            ("fetch_url", json!({})),
+            ("system_stats", json!({})),
+            ("save_memory", json!({})),
+            ("ask_user", json!({})),
+            ("load_skill", json!({})),
+            ("confirm_action", json!({})),
+        ] {
+            assert!(
+                !mutates_workspace(name, &args),
+                "{name} cannot write the workspace and must not wipe the cache"
+            );
+        }
+        assert!(
+            !root.is_empty(),
+            "the workspace root is only here to keep the assertion honest"
+        );
+        // A writer still forgets: a pointer would feed the model a pre-edit body.
+        for (name, args) in [
+            ("write_file", json!({})),
+            ("edit_file", json!({})),
+            ("artifact", json!({})),
+            ("plugin", json!({})),
+            ("create_skill", json!({})),
+            // The whole terminal counts as a writer, even for a look: `sh -c`
+            // cannot be proven non-writing, and the measured cost is zero.
+            ("run_terminal", json!({"command": "ls -la src"})),
+            ("run_terminal", json!({"command": "git status --short"})),
+            ("run_terminal", json!({"command": "cargo test"})),
+            ("run_terminal", json!({"command": "python3 build.py"})),
+            ("run_terminal", json!({"command": "echo hi > src/a.ts"})),
+        ] {
+            assert!(
+                mutates_workspace(name, &args),
+                "{name} can change files and must clear the cached bodies"
+            );
+        }
     }
 
     #[test]
@@ -8850,6 +11183,8 @@ mod tests {
             allow_computer: false,
             allow_create: false,
             allow_browser: false,
+            allow_outside: false,
+            allow_outside_folders: Vec::new(),
             search_plugins: Vec::new(),
             compact_at_percent: 80,
             fallback_provider: String::new(),
@@ -8911,10 +11246,15 @@ mod tests {
                 // so the capability must be declared exactly like the real
                 // settings.json does (Settings → provider → manualReasoningMap).
                 "manualReasoningMap": { MOCK_MODEL: true },
+                // The levels the model was described with. A level no source
+                // enumerated is never sent, so the slot needs one to reason at
+                // all (Settings → provider, from the provider's `/models`).
+                "thinkingLevelsMap": { MOCK_MODEL: ["none", "low", "medium", "high", "xhigh"] },
             }),
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            provider_id: "main-prov".into(),
             model: "main-model".into(),
             base_url: "http://parent/v1".into(),
             api_keys: vec!["pk".into()],
@@ -8947,8 +11287,8 @@ mod tests {
             "the Other slot model must distil the page, not the chat model: {sent}"
         );
         assert_eq!(
-            sent["reasoning_effort"], "high",
-            "the slot's own level (max→high for this kind) must be sent: {sent}"
+            sent["reasoning_effort"], "xhigh",
+            "the slot's own level must be sent verbatim, as its source named it: {sent}"
         );
         assert_ne!(
             sent["model"], "main-model",
@@ -8971,6 +11311,7 @@ mod tests {
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            provider_id: "p1".into(),
             model: "main-model".into(),
             base_url: format!("{mock_base}/v1"),
             api_keys: vec!["pk".into()],
@@ -9025,6 +11366,7 @@ mod tests {
         );
         let main = LlmConfig {
             provider: "custom".into(),
+            provider_id: "main-prov".into(),
             model: "main-model".into(),
             base_url: "http://parent/v1".into(),
             api_keys: vec!["pk".into()],
@@ -9075,12 +11417,15 @@ mod tests {
     }
 
     #[test]
-    fn subagent_model_slot_unknown_provider_falls_back() {
+    fn subagent_model_slot_keeps_a_slash_bearing_model_name_intact() {
+        // `ghost/m` is a MODEL id: `ghost` is not a configured provider, so the
+        // entry must NOT be split into provider `ghost` + model `m` (which sent
+        // the remainder to the parent's endpoint and 404'd).
         let mut req = base_req();
         req.subagent_models
             .insert("explore".into(), "ghost/m".into());
         let (model, base, keys, pid) = resolve_subagent_target(&req);
-        assert_eq!(model, "m");
+        assert_eq!(model, "ghost/m");
         assert_eq!(base, "http://parent/v1");
         assert_eq!(keys, vec!["pk".to_string()]);
         assert_eq!(pid, "p1");
@@ -10533,13 +12878,13 @@ mod tests {
     }
 
     #[test]
-    fn every_mode_inlines_the_coding_standards_rules() {
-        // The generic coding rules live in the shipped `Coding Standards` skill,
-        // but the prompt INLINES them instead of pointing at the skill: a
-        // pointer only applied when the model chose to spend a `load_skill`
-        // call, and a rule that is never read is not a rule. They sit in the
-        // SHARED body, byte for byte, because that body is the cached prefix — a
-        // per-mode copy would re-bill the whole prompt on every mode switch.
+    fn every_mode_inlines_the_coding_rules() {
+        // The generic coding rules are a prompt ASSET (`src-tauri/prompts/
+        // coding-rules.md`), not a skill: a skill only applied when the model
+        // chose to spend a `load_skill` call, and a rule that is never read is
+        // not a rule. They sit in the SHARED body, byte for byte, because that
+        // body is the cached prefix — a per-mode copy would re-bill the whole
+        // prompt on every mode switch.
         let root = "/tmp/x";
         let mut seen: Option<String> = None;
         for mode in ["build", "ask", "plan"] {
@@ -10549,8 +12894,7 @@ mod tests {
                 "{mode} must carry the coding rules"
             );
             // Spot-check the real rule TEXT, not just the header: the body is
-            // compiled in from the shipped markdown, so an empty or renamed file
-            // would otherwise still read as "rules present".
+            // compiled in from the markdown asset, so it is spot-checked too.
             assert!(
                 p.contains("Smallest correct change") && p.contains("Never hard-code"),
                 "{mode} must inline the real rule body, not a bare header"
@@ -10560,30 +12904,22 @@ mod tests {
                 None => seen = Some(body.to_string()),
                 Some(first) => assert_eq!(
                     first, body,
-                    "the skill pointer must sit in the SHARED body, not in the \
+                    "the rules must sit in the SHARED body, not in the \
                      per-mode tail — otherwise it costs a cache re-bill per switch"
                 ),
             }
         }
 
-        // The rules are read from the shipped markdown by `include_str!`, so a
-        // truncated or frontmatter-less file would silently ship an empty block.
-        let shipped = include_str!("../skills/coding-standards.md");
+        // The rules are read from the markdown asset by `include_str!`, so a
+        // truncated file would silently ship a stub where the whole rule book
+        // used to be.
         assert!(
-            shipped.starts_with("---"),
-            "the shipped skill must keep frontmatter first"
+            CODING_RULES.contains("## 7. Debugging protocol"),
+            "the asset must carry every section — the debugging protocol last"
         );
         assert!(
-            shipped.contains("name: Coding Standards"),
-            "the shipped skill must keep the exact name the prompt points at"
-        );
-        // The catalog line is the model's only trigger for calling load_skill,
-        // and an English description cannot be found from a Persian request:
-        // the keywords are what make a shipped skill findable from the way the
-        // user actually writes.
-        assert!(
-            shipped.contains("fa_keywords:"),
-            "fa_keywords are what make a shipped skill findable from a Persian request"
+            !CODING_RULES.contains("---"),
+            "a prompt asset keeps no frontmatter — that block was the skill's"
         );
     }
 

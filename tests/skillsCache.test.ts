@@ -19,7 +19,7 @@ import {
   invalidateAvailableSkills,
   resetAvailableSkillsCacheForTest,
   setAvailableSkillsFetcher,
-  pluginSkillCommands,
+  pluginCommands,
   type SkillMention,
 } from '../src/lib/skills.ts'
 import type { SkillRow } from '../src/lib/api.ts'
@@ -87,33 +87,35 @@ console.log('4) حذف اسکیل (رفرش لیست):')
   check('اسکیل حذف‌شده دیگر در کش نیست', !getSkillsList().some((s) => s.slug === 'anthropic-frontend-design'), getSkillsList())
 }
 
-console.log('5) کامند /plugin skill → /<slug> و کش دومی:')
+console.log('5) کامند پلاگین (<plugin> <skill>) و کش دومی:')
 {
   resetSkillsCacheForTest()
   resetAvailableSkillsCacheForTest()
   setAvailableSkillsFetcher(async () => availableList)
   check('کش دومی ابتدا خالی است', getAvailableSkills().length === 0, getAvailableSkills())
   availableList = [
-    { name: 'Ponytail', slug: 'ponytail', description: 'lazy senior dev', plugin: 'Ponytail' },
-    { name: 'Ponytail Audit', slug: 'ponytail-audit', description: 'repo audit', plugin: 'Ponytail' },
+    { name: 'Ponytail', slug: 'ponytail', description: 'lazy senior dev', plugin: 'Ponytail', plugin_slug: 'ponytail' },
+    { name: 'Ponytail Audit', slug: 'ponytail-audit', description: 'repo audit', plugin: 'Ponytail', plugin_slug: 'ponytail' },
     // A standalone skill: reachable by @mention, must NOT become a command.
     { name: 'Movie Finder', slug: 'movie-finder', description: 'find movies' },
   ]
   const rows = await ensureAvailableSkills()
   check('کاتالوگ کامل بارگذاری شد', rows.length === 3, rows)
-  const cmds = pluginSkillCommands(rows)
-  check('فقط skillهای پلاگین کامند می‌شوند', cmds.length === 2, cmds)
-  check('نام کامند = slug', cmds[0].name === 'ponytail' && cmds[1].name === 'ponytail-audit', cmds)
-  check('نام اسکیل برای attach = name', cmds[0].skill === 'Ponytail', cmds)
-  check('پلاگین در hint آمده', cmds[0].hint.includes('Ponytail'), cmds[0].hint)
+  const cmds = pluginCommands(rows)
+  // ONE command per bundle: 2 skills of one plugin must not make 2 commands.
+  check('یک کامند برای هر پلاگین', cmds.length === 1, cmds)
+  check('نام کامند = slug پلاگین', cmds[0].name === 'ponytail', cmds)
+  check('اسکیل‌ها سطح دوم کامند هستند', cmds[0].skills.length === 2, cmds[0].skills)
+  check('نام اسکیل برای attach = name', cmds[0].skills[0].skill === 'Ponytail', cmds[0].skills)
+  check('اسکیل بدون پلاگین کامند نمی‌سازد', pluginCommands(rows).length === 1, cmds)
 
-  // Toggling the plugin off must drop its commands on the next refresh.
+  // Toggling the plugin off must drop its command on the next refresh.
   // The new list is in place BEFORE the invalidate, since the fetch starts
   // inside it and would otherwise read the old rows.
   availableList = [{ name: 'Movie Finder', slug: 'movie-finder', description: 'find movies' }]
   invalidateAvailableSkills()
   await new Promise((r) => setTimeout(r, 10))
-  check('بعد از خاموش‌کردن پلاگین کامندی نمی‌ماند', pluginSkillCommands(getAvailableSkills()).length === 0, getAvailableSkills())
+  check('بعد از خاموش‌کردن پلاگین کامندی نمی‌ماند', pluginCommands(getAvailableSkills()).length === 0, getAvailableSkills())
 }
 
 if (failed > 0) {

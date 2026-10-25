@@ -103,10 +103,48 @@ console.log("4) the full card head states which skill was loaded:");
   check("the card head labels the action", card.includes("Load Skill"), card.slice(0, 600))
   check("the skill is its own chip, not an arg key", !card.includes("name:ponytail"), card.slice(0, 600))
   check(
-    "the card body does not repeat the tool name as a summary",
-    !card.includes('class="tool-summary"'),
-    card.slice(0, 600),
+    "a skill card never renders a RESULTS file list",
+    !card.includes('class="file-results"'),
+    card.slice(0, 900),
   )
+}
+
+console.log("5) a skill body is the card body, never a RESULTS file list:");
+{
+  // A `load_skill` result is the skill's own markdown. A filename scan used to
+  // turn every path it mentions into a RESULTS chip (`harness.html`,
+  // `harness.tsx`, …) that also HID the body — and transcripts saved back then
+  // still carry those rows, so the card has to drop them at render time too.
+  const { applyToolEvent, resolveToolResult } = await import(
+    "../src/lib/toolActivity"
+  )
+  const body =
+    "===== SKILL: Test UI =====\nDescription: drive the harness.\n\nOpen tests/ui/harness.html and npm run dev:web."
+  const acts = resolveToolResult(
+    applyToolEvent([], { kind: "tool", tool: "load_skill", call_id: 11 } as any),
+    {
+      kind: "tool_result",
+      tool: "load_skill",
+      call_id: 11,
+      status: "done",
+      result: body,
+    } as any,
+  )
+  check("the skill body is kept as resultText", acts[0]?.resultText === body, acts[0]?.resultText)
+  check("no file rows are invented from the prose", !acts[0]?.items, acts[0]?.items)
+
+  const stale = renderToStaticMarkup(
+    React.createElement(ToolCallView, {
+      activity: {
+        ...loadSkill,
+        resultText: body,
+        // A transcript saved before the fix: bogus rows from the filename scan.
+        items: [{ file: "tests/ui/harness.html" }, { file: "tests/ui/harness.tsx" }],
+      } as any,
+    }),
+  )
+  check("a stale saved card still shows the body", stale.includes("===== SKILL: Test UI ====="), stale.slice(0, 900))
+  check("and never renders the bogus RESULTS list", !stale.includes('class="file-results"'), stale.slice(0, 900))
 }
 
 if (failed > 0) {

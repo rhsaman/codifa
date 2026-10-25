@@ -152,6 +152,33 @@ const PREPARED_CACHE_MAX_CHARS = 2_000_000;
 const PREPARED_CACHE_SKIP_CHARS = 40_000;
 let preparedCacheChars = 0;
 
+/** Fork a chat, after a confirmation.
+ *
+ *  The fork button is a small icon sitting next to Edit/Copy/Retry, and forking
+ *  SWITCHES the active chat: a stray click pulls the user out of the
+ *  conversation they were reading. The source chat survives, but the user still
+ *  has to find their way back, so one click is not enough. `window.confirm` is
+ *  the app's existing pattern for this (SettingsModal, PluginDetail, Chat).
+ *
+ *  The message names what is being forked and from where, because "Are you
+ *  sure?" alone trains the user to dismiss it reflexively — the confirm is only
+ *  useful when it says what the click is about to do. */
+export function forkChatWithConfirm(messageId: string): void {
+  const s = useStore.getState();
+  const src = s.chats.find((c) => c.messages.some((m) => m.id === messageId));
+  if (!src) return;
+  const label = (src.title || "").trim() || "این چت";
+  if (
+    !window.confirm(
+      `از «${label}» یک چت جدید (فورک) ساخته شود؟\n\n` +
+        "فورک فقط تا همین نقطه را به‌صورت خلاصه به همراه می‌برد و چت فعلی دست‌نخورده می‌ماند.",
+    )
+  ) {
+    return;
+  }
+  s.forkChatFromMessage(messageId);
+}
+
 function dropPrepared(id: string): void {
   const hit = preparedCache.get(id);
   if (hit) {
@@ -512,7 +539,9 @@ const CodeBlock = memo(function CodeBlock(props: React.HTMLAttributes<HTMLPreEle
           <span
             className="code-block-path code-block-path-open"
             title={`Open ${filePath}`}
-            onClick={() => openWorkspaceFile(filePath)}
+            // pointerdown, not click: a chat refocus re-render can replace the
+            // node before `click` fires, swallowing the open (see FileChip).
+            onPointerDown={() => openWorkspaceFile(filePath)}
           >
             <FileIcon path={filePath} size={20} />
             {filePath}
@@ -1020,6 +1049,7 @@ export function RetryBanner({
   gaveUp,
   watchdog,
   model,
+  providerId,
   agent,
   tool,
   fallback,
@@ -1037,6 +1067,10 @@ export function RetryBanner({
   gaveUp?: boolean;
   watchdog?: boolean;
   model?: string;
+  /** Provider ROW id the failing model is routed to. Resolved to the name the
+   *  user configured, so the banner reads `provider/model` — a bare model id
+   *  does not say which account or gateway is failing. */
+  providerId?: string;
   agent?: string;
   /** The tool that owns this retry (e.g. "explore"), when it is a sub-agent
    *  retry — lets the banner name the tool, not just the agent. */
@@ -1141,8 +1175,16 @@ export function RetryBanner({
     : tool
       ? [`tool: ${tool}`]
       : [];
-  const who = model
-    ? ` — ${model}${tags.length ? ` (${tags.join(", ")})` : ""}`
+  // The provider as the user knows it (the row they configured), never its wire
+  // kind — several rows can share one kind and one model id.
+  const providerName = useStore((s) => {
+    if (!providerId) return "";
+    return s.settings.providers.find((p) => p.id === providerId)?.name || providerId;
+  });
+  // Provider + the model id IN FULL (never shortened): `provider/model`.
+  const fullModel = model ? `${providerName ? `${providerName}/` : ""}${model}` : "";
+  const who = fullModel
+    ? ` — ${fullModel}${tags.length ? ` (${tags.join(", ")})` : ""}`
     : tags.length
       ? ` — ${tags.join(", ")}`
       : "";
@@ -1211,7 +1253,14 @@ export function RetryBanner({
           ⚠
         </span>
         <span className="retry-text">
-          Sub-agent hit a wall — switched to the main model
+          {/* This banner is raised for EVERY rung of the ladder, not only the
+              last one — so it must not claim the MAIN model was chosen when
+              the next entry of the user's own fallback list was. `who` names
+              the model that is actually running, and `gaveUp` means the chain
+              was exhausted without ever producing a report. */}
+          {gaveUp
+            ? "Sub-agent failed — no models left to try"
+            : "Sub-agent hit a wall — switched to a different model"}
           {who ? <span className="retry-who">{who}</span> : null}
           {detail ? <span className="retry-reason"> — {detail}</span> : null}
         </span>
@@ -1429,22 +1478,6 @@ export function isCollapsibleText(text: string): boolean {
   );
 }
 
-// Above this size a message is too big to paint inline at all: it keeps a
-// short preview in the chat and the full text opens in the side panel.
-const USER_PANEL_CHARS = 4000;
-const USER_PANEL_LINES = 100;
-
-/** True for a message that must open in the side panel instead of unfolding
- *  in the chat. Only a VERY long text (a pasted log/dump) qualifies — a
- *  merely long one expands in place, because clicking "Show more" should not
- *  move a message the user can already read out of the conversation. */
-export function opensInPanel(text: string): boolean {
-  return (
-    text.length > USER_PANEL_CHARS ||
-    text.split("\n").length > USER_PANEL_LINES
-  );
-}
-
 /** Tab title for a full-text side panel: the first non-empty line, capped. */
 function textTabTitle(text: string, fallback: string): string {
   const firstLine = text.split("\n").find((l) => l.trim())?.trim() ?? "";
@@ -1502,20 +1535,13 @@ function UserMessageBubble({
     el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
   }, [isEditing, draft]);
   const content = message.content || "";
-  // Two separate limits: `folded` clamps the bubble to a preview, while
-  // `inPanel` marks a HUGE text (pasted log/dump) whose full body is only
-  // readable in the side panel. A merely long message unfolds IN PLACE, so
-  // "Show more" never moves something the user can already read out of the
-  // conversation (user request).
-  const folded = isCollapsibleText(content);
-  const inPanel = folded && opensInPanel(content);
-  const [expanded, setExpanded] = useState(false);
-  // Virtualized bubbles recycle: a fold state must not leak to the next message.
-  useEffect(() => setExpanded(false), [message.id]);
-  const showFull = folded && !inPanel && expanded;
-  const body =
-    folded && !showFull ? content.slice(0, USER_COLLAPSE_CHARS) : content;
-  const clamped = folded && !showFull;
+  // Folded preview only: a long text is clamped to USER_COLLAPSE_CHARS in the
+  // chat and its FULL body (not the preview) opens in the side panel — a long
+  // paste reads like a diff/plan tab there, and the bubble never grows into a
+  // wall of text.
+  const isLong = isCollapsibleText(content);
+  const body = isLong ? content.slice(0, USER_COLLAPSE_CHARS) : content;
+  const clamped = isLong;
 
   const copy = async () => {
     try {
@@ -1587,25 +1613,17 @@ function UserMessageBubble({
           {cachedPrepare(message.id, body, dir) || "(empty)"}
         </div>
         )}
-        {!isEditing && folded && (
+        {!isEditing && isLong && (
           <button
             className="msg-expand"
-            onClick={() => {
-              if (!inPanel) {
-                setExpanded((v) => !v);
-                return;
-              }
+            onClick={() =>
               useViewerTabs
                 .getState()
-                .openText(textTabTitle(content, "Message"), content);
-            }}
-            title={
-              inPanel
-                ? "Open the full text in the side panel"
-                : undefined
+                .openText(textTabTitle(content, "Message"), content)
             }
+            title="Open the full text in the side panel"
           >
-            {inPanel ? "Show more" : expanded ? "Show less" : "Show more"}
+            Show more
           </button>
         )}
         {message.attachments && message.attachments.length > 0 && (
@@ -1617,6 +1635,10 @@ function UserMessageBubble({
                 role="button"
                 tabIndex={0}
                 title={`${a} — open in the side panel`}
+                // pointerdown, not click: focusing this chat window re-renders
+                // the list and replaces this node before `click` fires, which
+                // swallowed the open (see FileChip). Click stays as a backup.
+                onPointerDown={() => openWorkspaceFile(a)}
                 onClick={() => openWorkspaceFile(a)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
@@ -1705,7 +1727,7 @@ function UserMessageBubble({
           </button>
           <button
             className="msg-copy msg-fork"
-            onClick={() => useStore.getState().forkChatFromMessage(message.id)}
+            onClick={() => forkChatWithConfirm(message.id)}
             title="Fork chat from here"
             aria-label="Fork chat from here"
           >
@@ -1770,12 +1792,9 @@ export function QueuedCollapsibleText({
   editingDisabled?: boolean;
 }) {
   const dir = useStore((s) => s.dir);
-  const folded = isCollapsibleText(text);
-  // Same rule as the user bubble: a huge text keeps a preview and opens in the
-  // panel, anything merely long unfolds in place.
-  const inPanel = folded && opensInPanel(text);
-  const [expanded, setExpanded] = useState(false);
-  useEffect(() => setExpanded(false), [id]);
+  // Same rule as the user bubble: a long text is clamped in the chat and its
+  // full body opens in the side panel.
+  const isLong = isCollapsibleText(text);
   // Inline edit mode: same UX as UserMessageBubble — the text swaps for a
   // textarea with Save/Cancel.
   const [isEditing, setIsEditing] = useState(false);
@@ -1844,30 +1863,22 @@ export function QueuedCollapsibleText({
       ) : (
         <>
           <div
-            className={`queued-bubble-text${folded && !expanded ? " clamped" : ""}`}
+            className={`queued-bubble-text${isLong ? " clamped" : ""}`}
             dir={detectDir(text)}
           >
             {cachedPrepare(id, text, dir) || "(empty)"}
           </div>
-          {folded && (
+          {isLong && (
             <button
               className="msg-expand queued-expand"
-              onClick={() => {
-                if (!inPanel) {
-                  setExpanded((v) => !v);
-                  return;
-                }
+              onClick={() =>
                 useViewerTabs
                   .getState()
-                  .openText(textTabTitle(text, "Queued text"), text);
-              }}
-              title={
-                inPanel
-                  ? "Open the full text in the side panel"
-                  : undefined
+                  .openText(textTabTitle(text, "Queued text"), text)
               }
+              title="Open the full text in the side panel"
             >
-              {inPanel ? "Show more" : expanded ? "Show less" : "Show more"}
+              Show more
             </button>
           )}
         </>
@@ -2420,12 +2431,12 @@ export const ChatMessageView = memo(
   const isSummary = message.role === "system" && !message.modeSwitch;
   const isModeSwitch = message.modeSwitch === true;
 
-  // Plan card display filtering: when a planDoc landed on this message the
-  // plan portion of the streamed reply collapses into the Plan card BELOW the
-  // bubble (see planDisplay). Raw content/segments stay untouched — model
-  // history and "Copy message" keep the full text.
-  const planDoc = !isUser && !isSummary ? message.planDoc : undefined;
+  // Plan card display filtering: when a plan document is attached to this
+  // message the plan portion of the streamed reply collapses into the Plan card
+  // BELOW the bubble (see planDisplay). Raw content/segments stay untouched —
+  // model history and "Copy message" keep the full text.
   const display = planDisplay(message);
+  const planDoc = !isUser && !isSummary ? display.planDoc : undefined;
   const displayContent = display.content;
   const displaySegments = display.segments;
   // Non-code documents created or edited this turn (write_document plus doc
@@ -2438,16 +2449,10 @@ export const ChatMessageView = memo(
   // replies render caption slices around tool cards (small by construction);
   // the full text stays in history/copy regardless.
   const cap = useCapped(message.id, displayContent ?? "", !!message.streaming);
-  // A reply only leaves the chat when it is VERY long (a dumped log): it then
-  // keeps a short preview here and the full body opens in the side panel.
-  // Anything shorter renders in full, exactly as before — the chat must not
-  // grow a "Show more" for every ordinary answer. Streaming replies are never
-  // folded (that would flicker).
+  // `cap.over` = a non-streaming reply past RENDER_CAP: the chat paints the
+  // capped slice and "Show all" opens the full reply in the side panel.
   const replyText = displayContent ?? message.content ?? "";
-  const replyInPanel = !message.streaming && opensInPanel(replyText);
-  const replyBody = replyInPanel
-    ? replyText.slice(0, USER_COLLAPSE_CHARS)
-    : cap.shown;
+  const replyBody = cap.shown;
 
   // Reading mode: only assistant replies with ≥2 headed sections get the
   // "مطالعه" button — short answers don't need a two-pane viewer.
@@ -2573,6 +2578,9 @@ export const ChatMessageView = memo(
               role="button"
               tabIndex={0}
               title={`${a} — open in the side panel`}
+              // pointerdown, not click: a focus re-render can replace this node
+              // before `click` fires (see FileChip). Click stays as a backup.
+              onPointerDown={() => openWorkspaceFile(a)}
               onClick={() => openWorkspaceFile(a)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
@@ -2661,6 +2669,9 @@ export const ChatMessageView = memo(
                     role="button"
                     tabIndex={0}
                     title={`${a} — open in the side panel`}
+                    // pointerdown, not click: a focus re-render can replace
+                    // this node before `click` fires (see FileChip).
+                    onPointerDown={() => openWorkspaceFile(a)}
                     onClick={() => openWorkspaceFile(a)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
@@ -2690,7 +2701,7 @@ export const ChatMessageView = memo(
             <div className="msg-bubble">
               <MarkdownProse text={cachedPrepare(message.id, replyBody, dir)} />
             </div>
-            {replyInPanel && (
+            {cap.over && (
               <button
                 className="msg-expand"
                 onClick={() =>
@@ -2700,7 +2711,7 @@ export const ChatMessageView = memo(
                 }
                 title={`Full reply is ${fmtSize(replyText.length)} — opens in the side panel`}
               >
-                {`Show all (${fmtSize(replyText.length)})`}
+                {`Show all (${fmtSize(cap.cut)} more)`}
               </button>
             )}
           </>
@@ -2766,7 +2777,7 @@ export const ChatMessageView = memo(
               </button>
               <button
                 className="msg-copy msg-fork"
-                onClick={() => useStore.getState().forkChatFromMessage(message.id)}
+                onClick={() => forkChatWithConfirm(message.id)}
                 title="Fork chat from here"
                 aria-label="Fork chat from here"
               >

@@ -1,4 +1,17 @@
 import { create } from 'zustand'
+import {
+  DEFAULT_NVIM_TERMINAL,
+  DEFAULT_TERMINAL_SHELL,
+  resolveNvimTerminal,
+  type NvimTerminal,
+} from './nvimTerminals'
+import {
+  applyTerminalFontSize,
+  clampCodeFontSize,
+  DEFAULT_TERMINAL_FONT_SIZE,
+  DEFAULT_VIEWER_FONT_SIZE,
+} from './xtermTheme'
+import { mergeShippedMarketplaces } from './marketplaceDefaults'
 import type {
   AgentMode,
   AgentModeDef,
@@ -6,6 +19,7 @@ import type {
   ChatDraft,
   ChatMessage,
   McpServerConfig,
+  MarketplaceSource,
   MessageSegment,
   ProviderConfig,
   ProviderKind,
@@ -61,7 +75,7 @@ import { api } from './fs'
 import { deleteMcp, listMcp, pushSlotModel, requestChatTitle, saveMcp } from './api'
 import { BUILTIN_IDS, normalizeMode } from './modes'
 import { encryptSettings, decryptSettings } from './secrets'
-import { PROVIDER_META } from './provider-meta'
+import { PROVIDER_META, accountIdFromBase, accountScopedBaseUrl } from './provider-meta'
 import { DEFAULT_THEME } from './themes'
 import { normalizeUsageEntry, normalizeUsageModel } from './usage'
 import { modelReasoning } from './context'
@@ -96,6 +110,71 @@ export function capCompactedMessages(messages: ChatMessage[]): ChatMessage[] {
     out.push(m)
   }
   return out
+}
+
+/** How much of a message is quoted into the fork seed. The seed is sent on
+ *  every turn of the fork, so an unbounded transcript would rebuild the very
+ *  cost the fork exists to escape. */
+export const FORK_SEED_CHARS_PER_MESSAGE = 600
+/** Total seed budget. The seed stands in for the whole conversation, so it is
+ *  one small system message rather than a second transcript. */
+export const FORK_SEED_MAX_CHARS = 4000
+
+/** One line of a fork seed: a short, single-line digest of a message. */
+function forkSeedLine(m: ChatMessage): string {
+  const who = m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Assistant' : 'Context'
+  // Collapse whitespace so a multi-paragraph message costs ONE line.
+  const flat = m.content.replace(/\s+/g, ' ').trim()
+  const body =
+    flat.length > FORK_SEED_CHARS_PER_MESSAGE
+      ? `${flat.slice(0, FORK_SEED_CHARS_PER_MESSAGE).trimEnd()}…`
+      : flat
+  return `${who}: ${body}`
+}
+
+/**
+ * Build the COMPACTED context seed a fork starts from.
+ *
+ * A fork must NOT inherit the source transcript: copied messages are live wire
+ * history, so every turn of the fork re-sends the entire long conversation —
+ * exactly the token cost the user forked to leave behind. Instead the fork is
+ * seeded with ONE `system` message digesting the conversation up to the fork
+ * point (the same role compaction uses, so the backend merges it as context).
+ *
+ * Pure and synchronous: `forkChatFromMessage` switches to the new chat in the
+ * same tick, so the seed cannot depend on an async summarizer. The first user
+ * message of the fork can still grow the context normally from there.
+ */
+export function forkSeedMessage(src: Chat, forkIndex: number): ChatMessage {
+  // Only what the model would actually have seen: compacted messages are the
+  // ones an earlier summarizer already folded away, so quoting them again (on
+  // top of the summary that replaced them) would double-count old context.
+  const upto = src.messages.slice(0, forkIndex + 1).filter((m) => !m.compacted && !m.modeSwitch)
+  const lines: string[] = []
+  let budget = FORK_SEED_MAX_CHARS
+  // Walk BACKWARDS: the newest turns matter most when the budget runs out.
+  for (let i = upto.length - 1; i >= 0; i--) {
+    const line = forkSeedLine(upto[i])
+    if (line.length > budget) break
+    budget -= line.length + 1
+    lines.unshift(line)
+  }
+  const body = lines.join('\n')
+  const header = src.title && src.title !== 'New chat' ? src.title : 'Forked conversation'
+  return {
+    id: uid(),
+    role: 'system',
+    content:
+      `[Forked from \u00ab${header}\u00bb \u2014 compacted context up to the fork point]\n` +
+      (body || '(no earlier context)') +
+      '\n[End of forked context \u2014 continue from here.]',
+    // Deliberately NOT `compacted`: that flag means "folded into a summary, so
+    // keep it OFF the wire" (isWireHistoryMessage), and this seed IS the wire
+    // context the fork runs on. As a plain `system` message it travels like any
+    // other system turn, and the send path sorts it to the FRONT of the history
+    // — so the model reads it before the user's first new message.
+    createdAt: Date.now(),
+  }
 }
 
 // Persian label for live LSP install/update progress. Shown in the
@@ -234,6 +313,47 @@ let lastMidStreamPersist = 0
 // payload) stays small even for tool calls with huge args/diffs/results.
 const MAX_TOOL_TEXT = 4000 // summary / diff
 const MAX_TOOL_ARG = 2000 // per string value inside args
+
+/** The shipped catalogues every install starts with.
+ *
+ *  All use the same `marketplace.json` format `repo.rs` reads natively, so a
+ *  fresh install can browse and install without knowing any URL. Removing any
+ *  of them from Settings is remembered — see the hydrate branch.
+ *
+ *  The Anthropic plugin directory is deliberately NOT shipped any more: it was
+ *  the one default a v1 file always had, so an install no longer opens on
+ *  someone else's catalogue. Files that still carry it drop it once, through
+ *  `RETIRED_MARKETPLACES` in `marketplaceDefaults`. */
+
+/** The well-known SKILLS index: Anthropic's own example skills repo. */
+export const ANTROPIC_SKILLS_MARKETPLACE: MarketplaceSource = {
+  repo: 'anthropics/skills',
+  label: 'Anthropic skills',
+  kind: 'skills',
+}
+
+/** The well-known MCP/community index: every entry carries connectors. */
+export const COMMUNITY_MARKETPLACE: MarketplaceSource = {
+  repo: 'anthropics/claude-plugins-community',
+  label: 'Community',
+  kind: 'mcp',
+}
+
+/** Every shipped default, in tab order. */
+export const DEFAULT_MARKETPLACES: MarketplaceSource[] = [
+  ANTROPIC_SKILLS_MARKETPLACE,
+  COMMUNITY_MARKETPLACE,
+]
+
+/** Which generation of the shipped defaults a settings file last saw.
+ *
+ *  A file on this version keeps the user's list untouched (an intentional
+ *  removal stays removed); an OLDER one gets the shipped indexes it does not
+ *  name yet, once.
+ *
+ *  4 retired the Anthropic plugin directory: files that still carry it lose it
+ *  (see `mergeShippedMarketplaces`), which is the one edit a current file gets. */
+export const MARKETPLACE_DEFAULTS_VERSION = 4
 
 // Cap on persisted base64 image payloads so one pasted screenshot (often
 // 1-5MB as data:image/...;base64) doesn't bloat every chats snapshot +
@@ -403,9 +523,10 @@ function normalizeSttFallbacks(raw: unknown): SttFallback[] {
 /** Normalize one tool's fallback list (Settings → Tools). Same row shape as an
  *  STT fallback, except that a row naming NOTHING is meaningful there: it is
  *  the "composer's own model" rung, which has no provider id to keep. A row
- *  with only half a target is stale junk from an older build and is dropped,
- *  exactly as before. The list order IS the try order, so rows are never
- *  reordered here. */
+ *  that names only HALF a target is kept too — it is a row the user just added
+ *  and has not picked a model for yet; the wire filter in `toolFallbackEntries`
+ *  is what refuses to send it. The list order IS the try order, so rows are
+ *  never reordered here. */
 function normalizeToolFallbackRows(raw: unknown): ToolFallback[] {
   if (!Array.isArray(raw)) return []
   const out: ToolFallback[] = []
@@ -414,7 +535,11 @@ function normalizeToolFallbackRows(raw: unknown): ToolFallback[] {
     const rec = r as Record<string, unknown>
     const providerId = typeof rec.providerId === 'string' ? rec.providerId.trim() : ''
     const model = typeof rec.model === 'string' ? rec.model.trim() : ''
-    if (!providerId !== !model) continue
+    // Every row is KEPT, half-filled ones included: a row added from Settings →
+    // Tools starts with a provider and NO model yet, so dropping it here is
+    // exactly what made "+ Add fallback" look like a dead button. Whether a row
+    // can actually address a model is a WIRE question, answered by
+    // `toolFallbackEntries`, which drops the unroutable ones there.
     out.push({ providerId, model })
   }
   return out
@@ -710,18 +835,20 @@ function persistTerminalFullscreen(v: boolean): void {
   }
 }
 
-/** Where the terminal is docked: the bottom panel (default, Cmd/Ctrl+J) or
- *  docked into the right side pane. Session-level UI state like the other
- *  terminal keys — localStorage, never the settings payload. */
+/** Height of the bottom terminal panel (Cmd/Ctrl+J), in px. Session-level UI
+ *  state like the other terminal keys — localStorage, never the settings
+ *  payload. The right pane's terminal TABs carry their own height (a tab fills
+ *  the pane), so this number is the bottom panel's alone. */
 const TERMINAL_HEIGHT_KEY = 'coder:terminalHeight'
 
-/** Smallest the dock may be dragged: below this the tab strip eats the shell. */
+/** Smallest the bottom panel may be dragged: below this the tab strip eats the
+ *  shell. */
 export const MIN_TERMINAL_HEIGHT = 140
 
 /** Fallback height for a fresh install / unreadable storage. */
 export const DEFAULT_TERMINAL_HEIGHT = 300
 
-/** Clamp a dock height (drag input, stored value) into the usable range.
+/** Clamp a panel height (drag input, stored value) into the usable range.
  *  Pure, so the drag maths and the hydration rule cannot disagree. */
 export function clampTerminalHeight(px: number): number {
   return Number.isFinite(px)
@@ -732,7 +859,7 @@ export function clampTerminalHeight(px: number): number {
 function loadTerminalHeight(): number {
   try {
     const raw = localStorage.getItem(TERMINAL_HEIGHT_KEY)
-    // A missing or unreadable value falls back instead of collapsing the dock
+    // A missing or unreadable value falls back instead of collapsing the panel
     // to its minimum.
     return raw === null ? DEFAULT_TERMINAL_HEIGHT : clampTerminalHeight(Number(raw))
   } catch {
@@ -746,61 +873,6 @@ function persistTerminalHeight(px: number): void {
   } catch {
     /* storage unavailable */
   }
-}
-
-export type TerminalPlacement = 'bottom' | 'right'
-
-const TERMINAL_PLACEMENT_KEY = 'coder:terminalPlacement'
-
-function loadTerminalPlacement(): TerminalPlacement {
-  try {
-    // A corrupt/unknown value falls back to the bottom dock rather than
-    // leaving the terminal homeless.
-    return localStorage.getItem(TERMINAL_PLACEMENT_KEY) === 'right' ? 'right' : 'bottom'
-  } catch {
-    return 'bottom'
-  }
-}
-
-function persistTerminalPlacement(p: TerminalPlacement): void {
-  try {
-    localStorage.setItem(TERMINAL_PLACEMENT_KEY, p)
-  } catch {
-    /* storage unavailable */
-  }
-}
-
-/**
- * Which dock the terminal actually renders in. `'right'` is a *request*: the
- * side pane can be hidden (its toggle, or the chat going fullscreen), and the
- * docked panel has nothing to sit on then — so the request silently degrades to
- * the bottom dock instead of hiding the terminal. Pure, so the fallback rules
- * are testable without a DOM.
- */
-export function resolveTerminalPlacement(
-  requested: TerminalPlacement,
-  paneOpen: boolean,
-  chatFull: boolean,
-): TerminalPlacement {
-  return requested === 'right' && paneOpen && !chatFull ? 'right' : 'bottom'
-}
-
-/** Pane content the dock must never eat: the tab rail plus a few visible rows.
- *  Without a floor the dock could be dragged to the pane's full height and the
- *  pane would look empty. */
-export const MIN_PANE_CONTENT_HEIGHT = 160
-
-/**
- * Height the side dock may claim inside a pane of `paneHeight` px. The stored
- * height wins, but never so far that the pane's own content disappears — the
- * whole point of docking the terminal into the pane is seeing both. Pure, so
- * the rule is testable without a DOM.
- */
-export function resolveTerminalDockHeight(height: number, paneHeight: number): number {
-  const wanted = clampTerminalHeight(height)
-  if (!Number.isFinite(paneHeight) || paneHeight <= 0) return wanted
-  const room = Math.max(MIN_TERMINAL_HEIGHT, Math.round(paneHeight) - MIN_PANE_CONTENT_HEIGHT)
-  return Math.min(wanted, room)
 }
 
 // Lightweight debounced write for panel visibility toggles (sidebar / right
@@ -847,8 +919,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -933,7 +1005,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -949,7 +1021,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1042,18 +1114,51 @@ function defaultProviders(): ProviderConfig[] {
     row('google'),
     row('nvidia'),
     row('cloudflare'),
-    row('tokenrouter'),
   ]
 }
 
+/** Keep only the maps entries that really carry levels a source enumerated.
+ *  An EMPTY array forbids every option and hides the composer picker, but it is
+ *  indistinguishable from "no source described this model" once stored — so it
+ *  is dropped here and the picker falls back to the full list. */
+function normalizeThinkingLevelsMap(
+  map: Record<string, ThinkingLevel[]> | undefined,
+): Record<string, ThinkingLevel[]> | undefined {
+  if (!map) return undefined
+  const out: Record<string, ThinkingLevel[]> = {}
+  let kept = 0
+  for (const [model, levels] of Object.entries(map)) {
+    if (Array.isArray(levels) && levels.length > 0) {
+      out[model] = levels
+      kept++
+    }
+  }
+  return kept > 0 ? out : undefined
+}
+
 function normalizeProvider(p: ProviderConfig): ProviderConfig {
-  // 'opencode' rows from older builds: the kind no longer exists — keep the
-  // row alive as a custom provider (id, baseUrl unchanged) so saved
-  // chats and the active-provider pointer keep resolving.
+  // Removed kinds from older builds ('opencode', 'tokenrouter'): the kind no
+  // longer exists — keep the row alive as a custom provider (id, baseUrl
+  // unchanged) so saved chats and the active-provider pointer keep resolving.
   const rawKind = (p.kind || '') as string
-  const kind: ProviderKind = rawKind === 'opencode' ? 'custom' : p.kind || 'custom'
+  const retiredKinds = new Set(['opencode', 'tokenrouter'])
+  const kind: ProviderKind = retiredKinds.has(rawKind) ? 'custom' : p.kind || 'custom'
   const meta = PROVIDER_META[kind]
   const raw = p as unknown as Record<string, unknown>
+  // Account-scoped gateways (Cloudflare) have NO usable base URL without the
+  // account id — the endpoint is built from the id and the registry template,
+  // so a half-filled `{account}` can never reach a request. Older builds had
+  // nowhere to put the id but the base URL itself, so it is recovered from
+  // there once and the row switches to the dedicated field.
+  const scoped = meta?.accountScopedBaseUrl
+  const storedBase = typeof raw.baseUrl === 'string' ? (raw.baseUrl as string).trim() : ''
+  let accountId = typeof raw.accountId === 'string' ? (raw.accountId as string).trim() : ''
+  if (scoped && !accountId) accountId = accountIdFromBase(storedBase)
+  const baseUrl = scoped
+    ? accountScopedBaseUrl(kind, accountId) ?? ''
+    : storedBase.includes('{')
+      ? ''
+      : storedBase || meta?.defaultBaseUrl || ''
   const keys: string[] = []
   if (Array.isArray(raw.apiKeys)) {
     for (const k of raw.apiKeys) if (typeof k === 'string' && k.trim() !== '') keys.push(k)
@@ -1069,13 +1174,18 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
     kind,
     apiKeys: keys,
     // Use defaultBaseUrl from provider meta if user hasn't set a custom baseUrl
-    baseUrl: p.baseUrl || meta?.defaultBaseUrl || '',
+    baseUrl,
+    accountId: scoped ? accountId : undefined,
     model: p.model || '',
     contextMap: p.contextMap,
     manualContextMap: p.manualContextMap,
     manualReasoningMap: p.manualReasoningMap,
     pricingMap: p.pricingMap,
     reasoningMap: p.reasoningMap,
+    // An EMPTY array is dropped at load: it carries no trustworthy verdict, and
+    // a map full of them would hide the picker on every model. Only the levels
+    // a source really enumerated (a non-empty list) are kept.
+    thinkingLevelsMap: normalizeThinkingLevelsMap(p.thinkingLevelsMap),
     thinkingLevel: p.thinkingLevel ?? '',
     models: Array.isArray(p.models) ? p.models : [],
     removedModels: Array.isArray(p.removedModels) ? p.removedModels : [],
@@ -1142,15 +1252,10 @@ interface State {
   sidebarOpen: boolean
   /** Docked right panel (todos + future sections) — persisted like sidebarOpen. */
   rightPanelOpen: boolean
-  /** Bottom terminal panel (Cmd/Ctrl+J). Persisted in localStorage like
+  /** Bottom-docked terminal panel (Cmd/Ctrl+J). Persisted in localStorage like
    *  chatFullscreen, NOT in the settings payload. Sessions survive hiding. */
   terminalPanelOpen: boolean
-  /** Requested dock for the terminal (bottom vs the right side pane). The
-   *  effective dock is resolveTerminalPlacement(...) — see setTerminalPlacement. */
-  terminalPlacement: TerminalPlacement
-  /** Dock height in px (localStorage `coder:terminalHeight`). Held here, not in
-   *  the panel: App reserves the SAME strip as padding on the side pane, so both
-   *  sides must read one number. */
+  /** Height in px (localStorage `coder:terminalHeight`). */
   terminalHeight: number
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
@@ -1233,6 +1338,13 @@ interface State {
   setProviderContextMap: (id: string, contextMap: Record<string, number>) => void
   setProviderPricingMap: (id: string, pricingMap: Record<string, { input: number; output: number; cacheRead?: number; cacheWrite?: number }>) => void
   setProviderReasoningMap: (id: string, reasoningMap: Record<string, boolean>) => void
+  /** Record that a provider+model DEMONSTRABLY reasoned: its response streamed
+   *  reasoning content. Positive evidence only — a call that produced no
+   *  reasoning proves nothing, so `false` is never written. */
+  learnModelReasoning: (id: string, model: string) => void
+  /** Per-model thinking levels the PROVIDER (or models.dev) enumerated. A key
+   *  absent for a model means no source described it. */
+  setProviderThinkingLevelsMap: (id: string, levelsMap: Record<string, ThinkingLevel[]>) => void
   healStaleModels: (providerId: string, validModels: string[]) => void
   setMcpServers: (mcpServers: Record<string, McpServerConfig>) => void
   addMcpServer: (name: string, cfg: McpServerConfig) => void
@@ -1246,6 +1358,10 @@ interface State {
    *  inline predictions, spell-check) in every text field — applied at the DOM
    *  level by `src/lib/inputSuppress.ts`. Default: true (suggestions OFF). */
   setDisableTextSuggestions: (on: boolean) => void
+  /** Terminal Neovim / "open terminal" launches into (Settings → Terminal). */
+  setNvimTerminal: (id: NvimTerminal) => void
+  /** Shell the in-app terminal tabs run; '' = the OS login shell ($SHELL). */
+  setTerminalShell: (shell: string) => void
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
@@ -1266,16 +1382,22 @@ interface State {
   terminalFullscreen: boolean
   setTerminalFullscreen: (v: boolean) => void
   toggleTerminalFullscreen: () => void
-  /** Move the terminal between the bottom dock and the right side pane. */
-  setTerminalPlacement: (placement: TerminalPlacement) => void
-  toggleTerminalPlacement: () => void
-  /** Set the dock height (drag). Clamped by clampTerminalHeight. */
+  /** Move the terminal between the bottom panel and the right-pane TABs. */
+  /** Set the bottom panel's height (drag). Clamped by clampTerminalHeight. */
   setTerminalHeight: (px: number) => void
   setTheme: (theme: string) => void
   setDir: (dir: 'rtl' | 'ltr') => void
   toggleDir: () => void
   fontSize: number
   setFontSize: (n: number) => void
+  /** Point size for CODE in the side-pane file viewer (Settings → Appearance).
+   *  Deliberately separate from `fontSize`: dropping the code size to 11 should
+   *  not shrink the chat. */
+  viewerFontSize: number
+  setViewerFontSize: (n: number) => void
+  /** Point size for every terminal screen (bottom panel + side-pane tabs). */
+  terminalFontSize: number
+  setTerminalFontSize: (n: number) => void
   /** Directory for the per-workspace RAG vector store; "" = default. */
   /** ONE number for `web_search`: how many results it returns AND how many of
    *  them get their real page content fetched before the distiller reads them
@@ -1341,10 +1463,24 @@ interface State {
   /** History turn limit sent to the model. 0 = full history (default). */
   historyLimit: number
   setHistoryLimit: (n: number) => void
+  /** Bytes of skill catalog allowed in the system prompt each turn. The agent
+   *  clamps this to [1500, 12000]; 6000 is the cheap default. */
+  skillCatalogMaxChars: number
+  setSkillCatalogMaxChars: (n: number) => void
 
   /** Web-search engines for web_search (Settings → Plugins). */
   searchPlugins: SearchPluginConfig[]
   setSearchPlugins: (plugins: SearchPluginConfig[]) => void
+  /** Plugin marketplaces the user added (Settings → Marketplaces).
+   *
+   *  Each one is a repo holding an index of installable plugins; the list is
+   *  what the browse UI reads, and adding one never installs anything by
+   *  itself. Stored like the search engines above so it survives a restart. */
+  marketplaces: MarketplaceSource[]
+  /** Which shipped default set this store last saw — persisted so a version
+   *  bump only adds the new kinds once, never re-adding a removed source. */
+  marketplaceDefaultsVersion: number
+  setMarketplaces: (list: MarketplaceSource[]) => void
   /** Google Search Console OAuth + site for the search_console tool. */
   searchConsole: SearchConsoleConfig
   setSearchConsole: (patch: Partial<SearchConsoleConfig>) => void
@@ -1434,9 +1570,11 @@ interface State {
    *  user can ask follow-up questions about that section in isolation (reading
    *  mode → "سوال از این بخش"). Inherits the source chat's root/mode/provider. */
   forkSection: (messageId: string, sectionTitle: string, sectionContent: string) => void
-  /** Fork a chat from a message: create a new chat with history up to and
-   *  including the given message, inheriting root/mode/provider, and switch
-   *  to it so the user can continue there. Returns the new chat id. */
+  /** Fork a chat from a message: create a new chat carrying a COMPACTED
+   *  context seed built from the messages up to and including the given one
+   *  (never the raw transcript — a fork exists to leave a long, expensive chat
+   *  behind), inheriting root/mode/provider, and switch to it so the user can
+   *  continue there. Returns the new chat id. */
   forkChatFromMessage: (messageId: string) => string | null
   /** Transient flag: focus the composer on the next ChatPanel mount (set by
    *  forkSection so the user can immediately type their question). */
@@ -1854,12 +1992,14 @@ function makeWorkspace(root: string): Workspace {
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settingsHydrated: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'openrouter', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80, disableTextSuggestions: true },
+  settings: { providers: defaultProviders(), activeProviderId: 'openrouter', systemPrompts: {}, mcpServers: {}, mcpEnabled: [], modes: [], compactAtPercent: 80, disableTextSuggestions: true, nvimTerminal: DEFAULT_NVIM_TERMINAL, terminalShell: DEFAULT_TERMINAL_SHELL },
   builtinMcp: [],
   root: '',
   theme: DEFAULT_THEME,
   dir: 'rtl',
   fontSize: 14,
+  viewerFontSize: DEFAULT_VIEWER_FONT_SIZE,
+  terminalFontSize: DEFAULT_TERMINAL_FONT_SIZE,
   webSearchAutoFetch: 5,
   sttProviderId: '',
   sttModel: 'whisper-1',
@@ -1879,13 +2019,17 @@ export const useStore = create<State>((set, get) => ({
   toolFallbacks: {},
   cacheTtlMinutes: 60,
   historyLimit: 0,
+  /** Bytes of skill catalog allowed in the system prompt each turn (see
+   *  skillCatalogMaxChars in Settings → Skills). */
+  skillCatalogMaxChars: 6000,
   searchPlugins: [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
+  marketplaces: DEFAULT_MARKETPLACES,
+  marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION,
   searchConsole: { clientId: '', clientSecret: '', refreshToken: '', siteUrl: '' },
   sidebarOpen: true,
   rightPanelOpen: false,
   terminalPanelOpen: typeof window !== 'undefined' ? loadTerminalPanel() : false,
   terminalFullscreen: typeof window !== 'undefined' ? loadTerminalFullscreen() : false,
-  terminalPlacement: typeof window !== 'undefined' ? loadTerminalPlacement() : 'bottom',
   terminalHeight: typeof window !== 'undefined' ? loadTerminalHeight() : DEFAULT_TERMINAL_HEIGHT,
   dataPath: '',
   workspaceColors: {},
@@ -2193,9 +2337,23 @@ export const useStore = create<State>((set, get) => ({
       // only the ones listed in this literal survive a restart.
       disableTextSuggestions:
         typeof raw.disableTextSuggestions === 'boolean' ? raw.disableTextSuggestions : true,
+      // Where Neovim / "open terminal" launches. Unknown values fall back to the
+      // documented default so an id dropped in a future release cannot strand the
+      // user on a terminal that no longer exists.
+      nvimTerminal: resolveNvimTerminal(raw.nvimTerminal),
+      terminalShell:
+        typeof raw.terminalShell === 'string' ? raw.terminalShell.trim() : DEFAULT_TERMINAL_SHELL,
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
+    // Sibling sizes for the two code surfaces (Settings → Appearance). Same
+    // clamp as the setter, so a hand-edited settings.json cannot paint a 4px
+    // file or a 40px terminal.
+    const viewerFontSize = clampCodeFontSize(raw.viewerFontSize, DEFAULT_VIEWER_FONT_SIZE)
+    document.documentElement.style.setProperty('--viewer-font-size', `${viewerFontSize}px`)
+    const terminalFontSize = clampCodeFontSize(raw.terminalFontSize, DEFAULT_TERMINAL_FONT_SIZE)
+    document.documentElement.style.setProperty('--terminal-font-size', `${terminalFontSize}px`)
+    applyTerminalFontSize(terminalFontSize)
 
     // First-class workspaces. Persisted list wins; otherwise backfill from the
     // existing chats so the sidebar keeps showing workspaces that predate this.
@@ -2364,6 +2522,9 @@ export const useStore = create<State>((set, get) => ({
       // default — the user did set it, so don't erase their choice.
       cacheTtlMinutes: coercePositiveInt(raw.cacheTtlMinutes, 60),
       historyLimit: coerceNonNegInt(raw.historyLimit, 0),
+      // The agent clamps this to [1500, 12000] when it builds the catalog, so a
+      // hand-edited file cannot disable the skill list entirely.
+      skillCatalogMaxChars: coerceBoundedInt(raw.skillCatalogMaxChars, 6000, 1500, 12000),
       // 0 is a valid, deliberate value (page fetch disabled) — keep it.
       webSearchAutoFetch: coerceBoundedInt(raw.webSearchAutoFetch, 5, 0, 10),
       // Hard desktop-control switch: absent/false in old settings files = OFF.
@@ -2376,6 +2537,49 @@ export const useStore = create<State>((set, get) => ({
       searchPlugins: searchPlugins.length > 0
         ? searchPlugins
         : [{ kind: 'duckduckgo', label: 'DuckDuckGo', enabled: true, order: 0 }],
+      // Hand-edited or half-written rows are dropped rather than kept as a
+      // broken source the browse UI would keep retrying: a marketplace with no
+      // repo cannot be read at all.
+      marketplaces: (() => {
+        const rows = (Array.isArray(raw.marketplaces) ? raw.marketplaces : [])
+          .filter((m): m is MarketplaceSource => !!m && typeof m.repo === 'string' && !!m.repo.trim())
+          .map((m) => ({
+            repo: m.repo.trim(),
+            // The kind survives the round-trip: dropping it here silently
+            // filed EVERY marketplace under the Plugins tab after a reload.
+            ...(m.kind ? { kind: m.kind } : {}),
+            ...(m.label ? { label: m.label } : {}),
+            ...(m.path ? { path: m.path } : {}),
+            ...(m.git_ref ? { git_ref: m.git_ref } : {}),
+          }))
+        // The shipped catalogues are the DEFAULT, not a button: a fresh install
+        // has something to browse immediately. A settings file written before
+        // this field existed still gets them, and removing one is remembered
+        // because the array then exists and is complete for its version.
+        //
+        // `marketplaceDefaultsVersion` marks WHICH default set the file last
+        // saw. When the shipped list grows (a new skills/MCP index), files
+        // written for the older version get the missing sources ADDED once; a
+        // file already on the current version keeps the user's list untouched,
+        // so an intentional removal never comes back.
+        //
+        // The comparison used to spell the version out as a literal here, so
+        // the two copies could drift; it is the exported constant now.
+        const fileVersion = Number(
+          (raw as { marketplaceDefaultsVersion?: number }).marketplaceDefaultsVersion ?? 0,
+        )
+        if (!('marketplaces' in raw)) return DEFAULT_MARKETPLACES
+        return mergeShippedMarketplaces(
+          rows,
+          DEFAULT_MARKETPLACES,
+          fileVersion,
+          MARKETPLACE_DEFAULTS_VERSION,
+        )
+      })(),
+      // The file now CARRIES the current default set (the merge above applied
+      // it), so it is stamped as such: re-running the merge on every launch
+      // would keep re-adding the kinds it missed and never let the file settle.
+      marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION,
       searchConsole: migratedSc,
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
       sidebarOpen: raw.sidebarOpen !== false,
@@ -2684,6 +2888,44 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
+  /** Record that a provider+model DEMONSTRABLY reasoned (its response streamed
+   *  reasoning content). Positive evidence only: a call that produced no
+   *  reasoning proves nothing, so `false` is never written and a model that
+   *  reasoned once stays marked. Stored under the RAW wire id — a gateway's id
+   *  can itself be vendor-namespaced ("nvidia/nemotron-…"), so it must not be
+   *  normalized against the provider id. A no-op once recorded, because this
+   *  runs on every usage event of every step. */
+  learnModelReasoning: (id, model) => {
+    const m = model.trim()
+    if (!m) return
+    const p = get().settings.providers.find((x) => x.id === id)
+    if (!p || (p.observedReasoningMap ?? {})[m] === true) return
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((row) =>
+          row.id === id
+            ? {
+                ...row,
+                observedReasoningMap: { ...(row.observedReasoningMap ?? {}), [m]: true },
+              }
+            : row,
+        ),
+      },
+    }))
+    get().persist()
+  },
+
+  setProviderThinkingLevelsMap: (id, thinkingLevelsMap) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => (p.id === id ? { ...p, thinkingLevelsMap } : p)),
+      },
+    }))
+    get().persist()
+  },
+
   // ترمیم خودکار ارجاع‌های مدلِ ازکاتالوگ‌رفته: وقتی لیست زنده‌ی /models
   // می‌آید، مدل‌های حذف‌شده/تغییرنام‌یافته‌ی پروایدر دیگر معتبر نیستند.
   // چت‌هایی که هنوز روی چنین مدلی هستند به اولین مدل معتبر برمی‌گردند و
@@ -2802,6 +3044,23 @@ export const useStore = create<State>((set, get) => ({
     const n = Math.min(24, Math.max(10, Math.round(fontSize)))
     document.documentElement.style.setProperty('--chat-font-size', `${n}px`)
     set({ fontSize: n })
+    get().persist()
+  },
+
+  setViewerFontSize: (viewerFontSize) => {
+    const n = Math.min(24, Math.max(9, Math.round(viewerFontSize)))
+    document.documentElement.style.setProperty('--viewer-font-size', `${n}px`)
+    set({ viewerFontSize: n })
+    get().persist()
+  },
+
+  setTerminalFontSize: (terminalFontSize) => {
+    const n = Math.min(24, Math.max(9, Math.round(terminalFontSize)))
+    document.documentElement.style.setProperty('--terminal-font-size', `${n}px`)
+    // Live xterm screens read the size when they are built, so a change has to
+    // reach the running terminals too — see applyTerminalFontSize.
+    applyTerminalFontSize(n)
+    set({ terminalFontSize: n })
     get().persist()
   },
 
@@ -2924,8 +3183,18 @@ export const useStore = create<State>((set, get) => ({
     get().persist()
   },
 
-  setSearchPlugins: (searchPlugins) => {
-    set({ searchPlugins })
+  setSkillCatalogMaxChars: (n) => {
+    set({ skillCatalogMaxChars: Math.min(12000, Math.max(1500, Math.round(n) || 6000)) })
+    get().persist()
+  },
+
+  setSearchPlugins: (plugins) => {
+    set({ searchPlugins: plugins })
+    get().persist()
+  },
+
+  setMarketplaces: (marketplaces) => {
+    set({ marketplaces })
     get().persist()
   },
 
@@ -2978,20 +3247,6 @@ export const useStore = create<State>((set, get) => ({
 
   toggleTerminalFullscreen: () => {
     get().setTerminalFullscreen(!get().terminalFullscreen)
-  },
-
-  setTerminalPlacement: (terminalPlacement) => {
-    // Fullscreen floats over everything, so a dock change while fullscreen
-    // would be invisible — leave fullscreen instead of applying it silently.
-    if (terminalPlacement === 'right' && get().terminalFullscreen) {
-      get().setTerminalFullscreen(false)
-    }
-    persistTerminalPlacement(terminalPlacement)
-    set({ terminalPlacement })
-  },
-
-  toggleTerminalPlacement: () => {
-    get().setTerminalPlacement(get().terminalPlacement === 'right' ? 'bottom' : 'right')
   },
 
   setTerminalHeight: (px) => {
@@ -4029,16 +4284,22 @@ export const useStore = create<State>((set, get) => ({
     if (src.providerId) {
       get().setChatProvider(chatId, src.providerId, src.model ?? '')
     }
-    // Copy the history up to and including the fork point (fresh objects so
-    // edits in one chat never leak into the other via shared references).
-    const cut = src.messages.slice(0, idx + 1).map((m) => ({ ...m }))
+    // The fork carries a COMPACTED seed, never the raw transcript: copying the
+    // messages would re-send the whole long conversation on every turn of the
+    // fork, which is the exact cost the user forked to escape. The seed is one
+    // `system` message — the same shape compaction produces — so the backend
+    // merges it as context and the transcript stays tiny.
+    const seed = forkSeedMessage(src, idx)
     set((st) => ({
       chats: st.chats.map((c) =>
         c.id === chatId
           ? {
               ...c,
-              messages: cut,
-              title: `${src.title} (fork)`.slice(0, 80),
+              messages: [seed],
+              // 'New chat' (not "(fork)") on purpose: the title generator only
+              // fires while the title is still the untouched placeholder, so
+              // the user's FIRST new message here renames the fork for real.
+              title: 'New chat',
               thinkingLevel: src.thinkingLevel,
               updatedAt: Date.now(),
             }
@@ -4760,6 +5021,23 @@ export const useStore = create<State>((set, get) => ({
 
   setDisableTextSuggestions: (on: boolean) => {
     set((s) => ({ settings: { ...s.settings, disableTextSuggestions: on } }))
+    get().persist()
+  },
+
+  setNvimTerminal: (id: NvimTerminal) => {
+    // Normalise on write: the Rust side reads this key straight out of
+    // settings.json and only knows the ids in TERMINAL_IDS.
+    set((s) => ({ settings: { ...s.settings, nvimTerminal: resolveNvimTerminal(id) } }))
+    get().persist()
+  },
+
+  setTerminalShell: (shell: string) => {
+    // An empty choice means "use the app's default shell" (zsh): a launched
+    // .app inherits no login shell, so `$SHELL` alone would be a bare /bin/sh.
+    const picked = (shell ?? '').trim()
+    set((s) => ({
+      settings: { ...s.settings, terminalShell: picked || DEFAULT_TERMINAL_SHELL },
+    }))
     get().persist()
   },
 }))

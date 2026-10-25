@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state;
 
@@ -107,6 +107,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("codifa-rs-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Launching a program for the user must not leave a zombie behind.
+    ///
+    /// The `open`-style helpers only spawn; nothing waits. Three `<defunct>`
+    /// children were still listed after eight hours of uptime. `reap_detached`
+    /// must collect the exit status instead.
+    #[test]
+    fn a_detached_child_is_reaped() {
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        assert!(reap_detached(child));
+        // The reaper runs on its own thread, so poll briefly: a reaped pid stops
+        // existing, and `kill(pid, 0)` then fails with ESRCH.
+        let mut reaped = false;
+        for _ in 0..200 {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reaped, "pid {pid} was never reaped — it would show as <defunct>");
+    }
+
+    #[test]
+    fn image_attachment_downscales_past_the_model_limit() {
+        let big = image::DynamicImage::from(image::RgbaImage::new(IMAGE_MAX_DIM + 512, 64));
+        let got = image_attachment(big, IMAGE_MAX_DIM).expect("attachment");
+        let path = got["path"].as_str().expect("path").to_owned();
+        assert!(got["dataUrl"].as_str().expect("dataUrl").starts_with("data:image/"));
+        let decoded = image::open(&path).expect("decode");
+        assert!(
+            decoded.width() <= IMAGE_MAX_DIM && decoded.height() <= IMAGE_MAX_DIM,
+            "{}x{}",
+            decoded.width(),
+            decoded.height()
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -257,6 +300,82 @@ mod tests {
             bytes.len(),
             png.len()
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn image_mime_is_sniffed_from_the_bytes_not_the_name() {
+        // A screenshot saved WITHOUT a suffix (or under the wrong one) used to be
+        // dropped, because the extension was the only mime source.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        assert_eq!(sniff_image_mime(&png), Some("image/png"));
+        assert_eq!(sniff_image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(b"GIF89a"), Some("image/gif"));
+        let mut webp = Vec::from(*b"RIFF____WEBP");
+        assert_eq!(sniff_image_mime(&mut webp), Some("image/webp"));
+        assert_eq!(sniff_image_mime(b"not an image"), None);
+
+        let root = temp_root("sniff");
+        let src = root.join("screenshot"); // no extension at all
+        image::DynamicImage::from(image::RgbImage::from_pixel(
+            20,
+            10,
+            image::Rgb([9u8, 9, 9]),
+        ))
+        .save_with_format(&src, image::ImageFormat::Png)
+        .unwrap();
+        let url = image_data_url(&src.to_string_lossy()).expect("sniffed mime must read");
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn image_cap_follows_the_provider_and_the_cache_keeps_both_sizes() {
+        let root = temp_root("cap");
+        let src = root.join("big.png");
+        image::DynamicImage::from(image::RgbImage::from_pixel(
+            3000,
+            100,
+            image::Rgb([30u8, 90, 200]),
+        ))
+        .save_with_format(&src, image::ImageFormat::Png)
+        .unwrap();
+        let path = src.to_string_lossy().into_owned();
+        let anthropic = image_data_url_for(&path, "anthropic").expect("url");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(anthropic.split_once(',').unwrap().1)
+            .unwrap();
+        // Claude resizes to 1568 px before patching, so shipping more is upload
+        // time for pixels the encoder never reads.
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 1568);
+        // The other cap must not be served the anthropic entry from the cache.
+        let other = image_data_url_for(&path, "openai").expect("url");
+        assert_ne!(other, anthropic, "the cap is part of the cache key");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_steps_sees_a_marker_path_and_nothing_for_a_text_file() {
+        let root = temp_root("readimg");
+        let src = root.join("shot.png");
+        image::DynamicImage::from(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([1u8, 2, 3]),
+        ))
+        .save_with_format(&src, image::ImageFormat::Png)
+        .unwrap();
+        let text = root.join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+
+        let note = image_read_note(&src.to_string_lossy()).expect("an image has a note");
+        assert_eq!(image_read_path(&note).as_deref(), Some(src.to_string_lossy().as_ref()));
+        assert!(note.contains("image/png"), "{note}");
+        assert!(
+            image_read_note(&text.to_string_lossy()).is_none(),
+            "a text file must fall through to the normal window"
+        );
+        assert_eq!(image_read_path("plain text"), None);
         std::fs::remove_dir_all(&root).ok();
     }
 }
@@ -737,7 +856,74 @@ fn image_mime(ext: &str) -> Option<&'static str> {
     })
 }
 
-/// Cache of encoded image data URLs, keyed by absolute path.
+/// Identify an image from its CONTENT (magic bytes) instead of its name.
+///
+/// The extension used to be the only source of the mime, so a screenshot pasted
+/// from the clipboard (`blob`), an image whose suffix was stripped, or one saved
+/// under the wrong name was silently dropped — `image_mime` returned `None` and
+/// the picture never reached the model. The provider is told what the bytes
+/// REALLY are, so a mislabelled file can no longer be rejected for its mime.
+pub fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| data.starts_with(sig);
+    if starts(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if starts(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        Some("image/gif")
+    } else if starts(b"BM") {
+        Some("image/bmp")
+    } else if data.len() >= 12 && starts(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if data.len() >= 12 && &data[4..8] == b"ftyp" && matches!(&data[8..12], b"avif" | b"avis") {
+        Some("image/avif")
+    } else {
+        None
+    }
+}
+
+/// Marker prefix of a `read` result that stands in for an image file.
+///
+/// The path follows on the SAME line (up to the first newline) so a path with
+/// spaces in it survives the round trip; everything after is the description.
+pub const IMAGE_READ_MARK: &str = "[image attached]";
+
+/// A text stand-in for `read`ing an image file.
+///
+/// `read` answers with windowed TEXT and an image has none, so a screenshot in
+/// the workspace used to come back as "file too large to read in one call" (or
+/// as mojibake bytes). The marker carries the path instead, and the turn loop
+/// turns that path into a real image block on the next request — the model sees
+/// the picture rather than its file size.
+///
+/// Returns `None` for anything that is not a readable image, so the caller can
+/// fall through to its normal text window.
+pub fn image_read_note(abs_path: &str) -> Option<String> {
+    let data = std::fs::read(abs_path).ok()?;
+    if data.len() > IMAGE_READ_MAX_BYTES {
+        return None;
+    }
+    let mime = sniff_image_mime(&data)?;
+    let dims = match image::load_from_memory(&data) {
+        Ok(img) => format!(", {}x{}", img.width(), img.height()),
+        Err(_) => String::new(),
+    };
+    Some(format!(
+        "{IMAGE_READ_MARK} {abs_path}\n{mime}{dims}. The picture itself is attached to this turn — look at it directly."
+    ))
+}
+
+/// The image path carried by a `read` result, if it had one.
+pub fn image_read_path(result: &str) -> Option<String> {
+    let first = result.strip_prefix(IMAGE_READ_MARK)?;
+    let path = first.lines().next()?.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// Cache of encoded image data URLs, keyed by `(downscale cap, absolute path)`.
+///
+/// The cap is part of the key because the same file is legitimately encoded at
+/// two sizes (a full-size display copy and a model-bound copy).
 ///
 /// A turn re-reads every image that is still in its history (the renderer sends
 /// bare paths), so the same screenshot file was opened, base64-encoded and
@@ -759,16 +945,60 @@ pub fn read_image(abs_path: String) -> Option<String> {
     image_data_url(&abs_path)
 }
 
+/// Whether macOS will let this build see the screen and inject input.
+///
+/// The renderer shows this next to the Computer Use switch: without Screen
+/// Recording a capture silently comes back as a wallpaper with every other
+/// app's windows missing, so the user has to be told BEFORE the agent takes a
+/// look and reports an empty desktop.
+#[tauri::command]
+pub fn computer_permissions() -> serde_json::Value {
+    serde_json::json!({
+        "screen": crate::screen::screen_recording_allowed(),
+        "accessibility": crate::screen::accessibility_allowed(),
+        "identity": crate::screen::bundle_identity(),
+    })
+}
+
+/// Put Codifa under Screen Recording in System Settings and return whether the
+/// grant is already live.
+///
+/// macOS only ever shows its own prompt from the requesting API, and only a
+/// fresh process picks the resulting grant up — so the renderer calls this when
+/// the user presses Grant on the Computer Use card and re-checks afterwards
+/// instead of demanding a restart.
+#[tauri::command]
+pub fn request_screen_recording() -> bool {
+    crate::screen::request_screen_recording()
+}
+
+/// Read an image for a model whose provider IS known: the downscale cap follows
+/// what that provider's vision encoder actually consumes (see `image_max_dim`).
+pub fn image_data_url_for(abs_path: &str, provider: &str) -> Option<String> {
+    image_data_url_capped(abs_path, image_max_dim(provider))
+}
+
 /// Read an image file and return it as a `data:<mime>;base64,…` URL.
 ///
 /// Shared by the `read_image` Tauri command and the agent's image deserializer
-/// (which turns a bare path from the renderer into bytes for the model). Mime
-/// comes from the extension; unknown extensions and oversized files fail.
-/// Results are cached by `(mtime, len)` — see `image_cache`.
+/// (which turns a bare path from the renderer into bytes for the model). The
+/// mime is sniffed from the BYTES and only falls back to the extension, so an
+/// image whose name lost its suffix still reaches the model. Anything past the
+/// cap is downscaled and re-encoded: these URLs are re-sent with EVERY turn of
+/// the chat, so full-resolution pixels here are a repeated upload of detail no
+/// vision encoder reads. Results are cached — see `image_cache`.
 pub fn image_data_url(abs_path: &str) -> Option<String> {
+    image_data_url_capped(abs_path, IMAGE_MAX_DIM)
+}
+
+fn image_data_url_capped(abs_path: &str, max_dim: u32) -> Option<String> {
+    // The cap is part of the cache key: one file can be read at two sizes.
+    let key = format!("{max_dim}:{abs_path}");
     let p = PathBuf::from(abs_path);
-    let ext = p.extension()?.to_string_lossy().to_lowercase();
-    let mime = image_mime(&ext)?;
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
     let meta = std::fs::metadata(&p).ok()?;
     let mtime = meta
         .modified()
@@ -777,23 +1007,25 @@ pub fn image_data_url(abs_path: &str) -> Option<String> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let len = meta.len();
-    if let Some(hit) = image_cache()
-        .lock()
-        .ok()
-        .and_then(|c| c.get(abs_path).cloned())
-    {
+    if let Some(hit) = image_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         if hit.0 == mtime && hit.1 == len {
             return Some(hit.2);
         }
     }
     let data = std::fs::read(&p).ok()?;
-    if data.len() > 8 * 1024 * 1024 {
+    if data.len() > IMAGE_READ_MAX_BYTES {
         return None;
     }
-    let url = format!(
-        "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(data)
-    );
+    let mime = sniff_image_mime(&data).or_else(|| image_mime(&ext))?;
+    let url = match image::load_from_memory(&data) {
+        Ok(img) if img.width() > max_dim || img.height() > max_dim => {
+            let (bytes, mime) = encode_within_budget(&fit_within(img, max_dim), IMAGE_WIRE_BUDGET);
+            data_url_of(&bytes, mime)
+        }
+        // Inside the cap already, or not decodable (a truncated file, a test
+        // fixture): the original bytes go through untouched.
+        _ => data_url_of(&data, mime),
+    };
     if let Ok(mut c) = image_cache().lock() {
         if c.len() >= IMAGE_CACHE_MAX {
             // Drop an arbitrary older entry: any eviction is fine, the cache is
@@ -802,7 +1034,7 @@ pub fn image_data_url(abs_path: &str) -> Option<String> {
                 c.remove(&k);
             }
         }
-        c.insert(abs_path.to_string(), (mtime, len, url.clone()));
+        c.insert(key, (mtime, len, url.clone()));
     }
     Some(url)
 }
@@ -832,8 +1064,65 @@ pub fn read_pdf_base64(abs_path: String) -> Option<String> {
 
 /// Largest edge an attached image is reduced to before it reaches a model.
 /// Covers more than any vision model actually consumes, so this is not the
-/// quality knob — the ENCODER is (see `encode_smallest_lossless`).
+/// quality knob — the ENCODER is (see `encode_within_budget`).
 const IMAGE_MAX_DIM: u32 = 2048;
+
+/// Largest edge an image is reduced to when it is re-read from the chat history
+/// on every following turn — the repeated upload is the expensive one.
+///
+/// Largest file we will read from disk at all. Beyond this the file is not a
+/// screenshot or a photo but a mistake, and base64 of it would blow up the
+/// request (base64 is 4/3 of the bytes, so 8 MiB becomes ~11 MiB on the wire).
+const IMAGE_READ_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Wire-size ceiling for one encoded image before the lossless encoders are
+/// abandoned for a lossy one (see `encode_within_budget`).
+const IMAGE_WIRE_BUDGET: usize = 1_200_000;
+
+/// Quality for the lossy fallback. Visually identical at model resolution, and
+/// several times smaller than the lossless encode of the same pixels.
+const IMAGE_LOSSY_QUALITY: u8 = 82;
+
+/// Largest edge a provider's vision encoder actually consumes.
+///
+/// A longer edge is not extra detail: Anthropic's vision resizes to 1568 px on
+/// the long edge before it even patches, so anything past that is paid for on
+/// the wire and thrown away on arrival. OpenAI and Gemini take the larger size,
+/// so the table is per-provider rather than one global cap.
+fn image_max_dim(provider: &str) -> u32 {
+    match provider {
+        "anthropic" => 1568,
+        _ => IMAGE_MAX_DIM,
+    }
+}
+
+/// Downscale so the LONGEST edge is at most `max_dim`, keeping the aspect
+/// ratio. A no-op for an image already inside the cap.
+///
+/// Both edges come from ONE scale and are applied with `resize_exact`: `resize`
+/// re-fits the image inside the box it is handed, so truncating the SHORT edge
+/// silently charged the long edge too — a 3000x100 strip capped at 1568 was
+/// resized to a 1560x52 box and came out 1560 wide, i.e. the whole cap spent on
+/// rounding. Screen captures are exactly this shape (a wide, short menu bar or
+/// banner), so the loss was systematic, not a corner case.
+fn fit_within(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
+    let longest = img.width().max(img.height());
+    if longest <= max_dim {
+        return img;
+    }
+    let scale = max_dim as f64 / longest as f64;
+    let nw = ((img.width() as f64) * scale).round().max(1.0) as u32;
+    let nh = ((img.height() as f64) * scale).round().max(1.0) as u32;
+    img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+}
+
+/// `data:<mime>;base64,…` for bytes that are already encoded.
+fn data_url_of(bytes: &[u8], mime: &str) -> String {
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
 
 /// Monotonic counter for temp image names (see `temp_image_path`).
 static TEMP_IMAGE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -903,6 +1192,70 @@ fn encode_smallest_lossless(img: &image::DynamicImage) -> (Vec<u8>, &'static str
     }
 }
 
+/// Encode for the wire: lossless first, lossy only when lossless misses the
+/// budget.
+///
+/// Lossless WebP/PNG of a photographic attachment still lands in the megabytes
+/// (a 5K screenshot stays ~1.5 MB however it is compressed), and that payload
+/// is re-sent on every following turn. Past `budget` bytes the picture is
+/// re-encoded as JPEG at `IMAGE_LOSSY_QUALITY`, which is visually identical at
+/// model resolution and several times smaller. Something is ALWAYS returned: if
+/// the lossy encoder fails or comes out bigger, the lossless bytes do, so this
+/// can never lose an attachment.
+fn encode_within_budget(img: &image::DynamicImage, budget: usize) -> (Vec<u8>, &'static str) {
+    let (lossless, lossless_mime) = encode_smallest_lossless(img);
+    if lossless.len() <= budget {
+        return (lossless, lossless_mime);
+    }
+    let rgb = img.to_rgb8();
+    let mut jpeg: Vec<u8> = Vec::new();
+    let encoded = image::codecs::jpeg::JpegEncoder::new_with_quality(
+        std::io::Cursor::new(&mut jpeg),
+        IMAGE_LOSSY_QUALITY,
+    )
+    .encode(
+        rgb.as_raw(),
+        rgb.width(),
+        rgb.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .is_ok();
+    if encoded && !jpeg.is_empty() && jpeg.len() < lossless.len() {
+        (jpeg, "image/jpeg")
+    } else {
+        (lossless, lossless_mime)
+    }
+}
+
+/// Encode an image the composer can attach: downscale past `IMAGE_MAX_DIM`,
+/// keep the smaller of lossless WebP/PNG, write it to a temp file and return the
+/// `{path, dataUrl}` pair the renderer reads back.
+///
+/// Shared by `normalize_image` and `capture_screen` so a screenshot and an
+/// attached photo take exactly the same path to the model (a raw 5K PNG would
+/// otherwise reach the composer as a multi-megabyte base64 blob).
+fn image_attachment(img: image::DynamicImage, max_dim: u32) -> Option<serde_json::Value> {
+    let (bytes, mime) = encode_within_budget(&fit_within(img, max_dim), IMAGE_WIRE_BUDGET);
+    let tmp = temp_image_path(image_ext_of(mime));
+    std::fs::write(&tmp, &bytes).ok()?;
+    Some(serde_json::json!({
+        "path": tmp.to_string_lossy(),
+        // The temp file's suffix has to match the bytes: the agent re-reads this
+        // path on later turns, and a mime sniffed from the content must agree
+        // with the name it is stored under.
+        "dataUrl": data_url_of(&bytes, mime),
+    }))
+}
+
+/// File suffix for an encoded mime.
+fn image_ext_of(mime: &str) -> &'static str {
+    match mime {
+        "image/webp" => "webp",
+        "image/jpeg" => "jpg",
+        _ => "png",
+    }
+}
+
 /// Normalize any attached image to a temp file the model can always read (like
 /// screenshots), so formats such as HEIC or oversized files reach the model
 /// regardless of source, and shrink what does reach it.
@@ -952,139 +1305,34 @@ pub fn normalize_image(abs_path: String) -> Option<serde_json::Value> {
     }
 
     let img = image::open(&abs_path).ok()?;
-    let img = if img.width() > IMAGE_MAX_DIM || img.height() > IMAGE_MAX_DIM {
-        let scale = IMAGE_MAX_DIM as f32 / img.width().max(img.height()) as f32;
-        img.resize(
-            (img.width() as f32 * scale) as u32,
-            (img.height() as f32 * scale) as u32,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        img
-    };
-    let (bytes, mime) = encode_smallest_lossless(&img);
-    let literal_ext = if mime == "image/webp" { "webp" } else { "png" };
-    let tmp = temp_image_path(literal_ext);
-    std::fs::write(&tmp, &bytes).ok()?;
-    Some(serde_json::json!({
-        "path": tmp.to_string_lossy(),
-        "dataUrl": format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        ),
-    }))
+    image_attachment(img, IMAGE_MAX_DIM)
 }
 
 // --- screen capture ---------------------------------------------------------
 
+/// Grab the primary display as a temp image the composer can attach.
+///
+/// `async` on purpose, and the grab itself runs on the blocking pool: this is
+/// CoreGraphics capture plus an image encode, which takes seconds on a Retina
+/// display. A non-`async` `#[tauri::command]` runs on the MAIN thread, so doing
+/// it inline froze the event loop — macOS reported the app unresponsive and
+/// terminated it while the capture was still running.
 #[tauri::command]
-pub fn capture_screen() -> Option<serde_json::Value> {
-    let shots = screenshots::Screen::all().ok()?;
-    let screen = shots.into_iter().next()?;
-    let shot = screen.capture().ok()?;
-    let mut png: Vec<u8> = Vec::new();
-    let dyn_img = image::DynamicImage::from(
-        image::RgbaImage::from_raw(shot.width(), shot.height(), shot.into_raw())?,
-    );
-    dyn_img
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .ok()?;
-    let tmp = std::env::temp_dir().join(format!("coder-shot-{}.png", state::now_ms()));
-    std::fs::write(&tmp, &png).ok()?;
-    Some(serde_json::json!({
-        "path": tmp.to_string_lossy(),
-        "dataUrl": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)),
-    }))
-}
-
-/// Capture a user-selected region: a fullscreen overlay window shows the
-/// screenshot; the user drags a rectangle which is cropped out of the shot.
-#[tauri::command]
-pub fn capture_region(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-) -> Result<Option<serde_json::Value>, String> {
-    use tauri::PhysicalPosition;
-    let _ = PhysicalPosition { x: 0.0, y: 0.0 }; // keep import for future DIP math
-    let shots = screenshots::Screen::all().map_err(|e| e.to_string())?;
-    let screen = shots.into_iter().next().ok_or("no screen")?;
-    let full = screen.capture().map_err(|e| e.to_string())?;
-    let mut png: Vec<u8> = Vec::new();
-    let dyn_full = image::DynamicImage::from(
-        image::RgbaImage::from_raw(full.width(), full.height(), full.clone().into_raw())
-            .ok_or("capture decode failed")?,
-    );
-    dyn_full
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    let data_url = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&png)
-    );
-
-    // Show the overlay window fullscreen and let the renderer pick the rect.
-    let overlay = tauri::WebviewWindowBuilder::new(
-        &app,
-        "capture-overlay",
-        tauri::WebviewUrl::App("capture.html".into()),
-    )
-    .title("Capture")
-    .decorations(false)
-    .transparent(true)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .build()
-    .map_err(|e| e.to_string())?;
-    let _ = overlay.set_fullscreen(true);
-    let _ = window.set_focus();
-    let _ = data_url; // reserved for the overlay page background
-
-    // The overlay page emits `overlay:selected` with the rect (DIP coords) or
-    // `overlay:cancel`. Wait bounded (2 min like Electron).
-    let (tx, rx) = std::sync::mpsc::channel::<Option<(f64, f64, f64, f64)>>();
-    {
-        let tx_sel = tx.clone();
-        let _ = app.listen("overlay:selected", move |evt| {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(evt.payload()) {
-                let g = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let _ = tx_sel.send(Some((g("x"), g("y"), g("width"), g("height"))));
-            }
-        });
-        let _ = app.listen("overlay:cancel", move |_evt| {
-            let _ = tx.send(None);
-        });
-    }
-    let rect = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .ok()
-        .flatten();
-    let _ = overlay.close();
-
-    let Some((x, y, w, h)) = rect else {
-        return Ok(None);
-    };
-    // Crop in physical pixels (the shot is device-resolution).
-    let scale = 1.0f64; // screenshots crate returns physical pixels; overlay uses DIP
-    let clamp = |v: f64, max: i64| -> i64 { (v.round() as i64).clamp(0, max) };
-    let sx = clamp(x * scale, full.width() as i64);
-    let sy = clamp(y * scale, full.height() as i64);
-    let sw = clamp(w * scale, full.width() as i64 - sx);
-    let sh = clamp(h * scale, full.height() as i64 - sy);
-    if sw <= 0 || sh <= 0 {
-        return Ok(None);
-    }
-    let cropped = dyn_full.crop_imm(sx as u32, sy as u32, sw as u32, sh as u32);
-    let mut cropped_png: Vec<u8> = Vec::new();
-    cropped
-        .write_to(&mut std::io::Cursor::new(&mut cropped_png), image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    let tmp = std::env::temp_dir().join(format!("coder-shot-{}.png", state::now_ms()));
-    std::fs::write(&tmp, &cropped_png).map_err(|e| e.to_string())?;
-    Ok(Some(serde_json::json!({
-        "path": tmp.to_string_lossy(),
-        "dataUrl": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(cropped_png)),
-    })))
+pub async fn capture_screen() -> Option<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let shots = screenshots::Screen::all().ok()?;
+        let screen = shots.into_iter().next()?;
+        let shot = screen.capture().ok()?;
+        let img = image::DynamicImage::from(image::RgbaImage::from_raw(
+            shot.width(),
+            shot.height(),
+            shot.into_raw(),
+        )?);
+        image_attachment(img, IMAGE_MAX_DIM)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 // --- import / dialogs / clipboard / env -------------------------------------
@@ -1262,11 +1510,8 @@ pub fn open_external_chrome(url: String) -> Result<(), String> {
                 .join("Application")
                 .join("chrome.exe");
             if exe.exists() {
-                if std::process::Command::new(&exe)
-                    .arg(&url)
-                    .spawn()
-                    .is_ok()
-                {
+                if let Ok(child) = std::process::Command::new(&exe).arg(&url).spawn() {
+                    reap_detached(child);
                     return Ok(());
                 }
             }
@@ -1275,11 +1520,8 @@ pub fn open_external_chrome(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         for bin in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"] {
-            if std::process::Command::new(bin)
-                .arg(&url)
-                .spawn()
-                .is_ok()
-            {
+            if let Ok(child) = std::process::Command::new(bin).arg(&url).spawn() {
+                reap_detached(child);
                 return Ok(());
             }
         }
@@ -1371,16 +1613,22 @@ pub fn open_file_external(
             }
             OpResult::err("Could not open VS Code — is it installed?")
         }
-        "nvim" => {
-            // Try a running nvim instance over its RPC socket, then a terminal.
+        // Neovim NEVER leaves the app: the renderer opens a terminal tab and
+        // runs `nvim +<line> <file>` in its own pty. A stale renderer build can
+        // still send this, though, and killing its menu row with "Unknown
+        // editor" was the old failure — so reuse a running nvim when one exists,
+        // and otherwise open the file the OS way rather than silently dropping
+        // the request. There is no external-terminal target any more.
+        "nvim" | "inapp" => {
             if open_in_running_nvim(&abs.to_string_lossy()) {
                 return OpResult::ok();
             }
-            let dir = abs.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-            if launch_terminal(&["nvim".into(), abs.to_string_lossy().into_owned()], &dir) {
-                return OpResult::ok();
+            match open::that(&abs) {
+                Ok(_) => OpResult::ok(),
+                Err(_) => OpResult::err(
+                    "Open this file from the in-app terminal tab (Open with → Neovim).",
+                ),
             }
-            OpResult::err("No running Neovim instance and no terminal found.")
         }
         other => OpResult::err(format!("Unknown editor: {other}")),
     }
@@ -1393,14 +1641,32 @@ impl OpResult {
     }
 }
 
+/// Spawn a child and reap it on a background thread.
+///
+/// These helpers only LAUNCH a program for the user (open a terminal, an app, a
+/// file); nothing ever calls `wait` on the result, so every such child stayed in
+/// the process table as `<defunct>` for the rest of the session — three were
+/// still listed after eight hours of uptime. Waiting on a detached thread keeps
+/// the launch non-blocking AND hands the pid back to the OS.
+fn reap_detached(child: std::process::Child) -> bool {
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    true
+}
+
 fn spawn_detached(bin: &str, args: &[&str]) -> bool {
-    std::process::Command::new(bin)
+    match std::process::Command::new(bin)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .is_ok()
+    {
+        Ok(child) => reap_detached(child),
+        Err(_) => false,
+    }
 }
 
 /// `:edit` the file in the first running nvim instance over its RPC socket.
@@ -1489,77 +1755,6 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
-/// Launch a platform terminal at `cwd`, optionally running `argv` inside it.
-fn launch_terminal(argv: &[String], cwd: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if argv.is_empty() {
-            return std::process::Command::new("open")
-                .args(["-a", "Terminal"])
-                .arg(cwd)
-                .spawn()
-                .is_ok();
-        }
-        let q = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
-        let shell_cmd = format!(
-            "cd {} && {}",
-            q(&cwd.to_string_lossy()),
-            argv.iter().map(|a| q(a)).collect::<Vec<_>>().join(" ")
-        );
-        let as_escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-        return std::process::Command::new("osascript")
-            .args(["-e", &format!("tell application \"Terminal\" to do script \"{as_escaped}\"")])
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "start", "cmd", "/k"]).args(argv).current_dir(cwd);
-        return cmd.spawn().is_ok();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let exec_args: Vec<String> = argv.to_vec();
-        let mut tries: Vec<(String, Vec<String>)> = vec![];
-        if let Ok(t) = std::env::var("TERMINAL") {
-            tries.push((t, exec_args.clone()));
-        }
-        let mut gnome = vec!["--working-directory".into(), cwd.to_string_lossy().into_owned()];
-        if !exec_args.is_empty() {
-            gnome.push("--".into());
-            gnome.extend(exec_args.clone());
-        }
-        tries.push(("gnome-terminal".into(), gnome));
-        let mut konsole = vec!["--workdir".into(), cwd.to_string_lossy().into_owned()];
-        if !exec_args.is_empty() {
-            konsole.push("-e".into());
-            konsole.extend(exec_args.clone());
-        }
-        tries.push(("konsole".into(), konsole));
-        tries.push(("x-terminal-emulator".into(), exec_args.clone()));
-        tries.push(("kitty".into(), exec_args.clone()));
-        let mut alacritty = vec![];
-        if !exec_args.is_empty() {
-            alacritty.push("-e".into());
-            alacritty.extend(exec_args.clone());
-        }
-        tries.push(("alacritty".into(), alacritty));
-        tries.push(("xterm".into(), exec_args));
-        for (bin, args) in tries {
-            if std::process::Command::new(&bin)
-                .args(&args)
-                .current_dir(cwd)
-                .spawn()
-                .is_ok()
-            {
-                return true;
-            }
-        }
-        false
-    }
-}
 
 #[tauri::command]
 pub fn open_workspace_folder(dir: String) -> OpResult {
@@ -1573,17 +1768,19 @@ pub fn open_workspace_folder(dir: String) -> OpResult {
     }
 }
 
+/// Open a terminal AT `dir` — always the caller's own in-app terminal tab.
+///
+/// Kept as a command because the renderer asks through the same bridge as the
+/// other workspace actions, but there is no external terminal anymore: the tab
+/// itself is a pty spawned by src-tauri/src/pty.rs, so the request is complete
+/// once the renderer knows which directory to open.
 #[tauri::command]
 pub fn open_workspace_terminal(dir: String) -> OpResult {
     let d = dir.trim();
     if !Path::new(d).is_absolute() {
         return OpResult::err("Not an absolute path.");
     }
-    if launch_terminal(&[], Path::new(d)) {
-        OpResult::ok()
-    } else {
-        OpResult::err("No supported terminal found.")
-    }
+    OpResult::ok()
 }
 
 // --- Google OAuth (native: loopback callback + token exchange in Rust) ------
@@ -1628,18 +1825,6 @@ pub async fn select_file(app: AppHandle) -> Option<Vec<String>> {
             );
         });
     rx.recv().ok().flatten()
-}
-
-// --- overlay region selection (called from the capture overlay page) --------
-
-#[tauri::command]
-pub fn overlay_selected(app: AppHandle, rect: serde_json::Value) {
-    let _ = app.emit("overlay:selected", rect);
-}
-
-#[tauri::command]
-pub fn overlay_cancel(app: AppHandle) {
-    let _ = app.emit("overlay:cancel", ());
 }
 
 // --- quit flush handshake ---------------------------------------------------
@@ -1892,7 +2077,10 @@ fn install_asset(dest: &Path) -> OpResult {
             .env("APPIMAGE_EXTRACT_AND_RUN", "1")
             .spawn()
         {
-            Ok(_) => OpResult::ok(),
+            Ok(child) => {
+                reap_detached(child);
+                OpResult::ok()
+            }
             Err(e) => OpResult::err(e.to_string()),
         };
     }

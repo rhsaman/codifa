@@ -25,6 +25,7 @@ import {
   encodeWavPcm16,
   mergeTranscripts,
   normalizePeak,
+  normalizeTranscript,
   stripSttPromptEcho,
   trimSilence,
   SILENCE_RMS,
@@ -99,6 +100,12 @@ export const LOCAL_LIVE_DEFAULTS = {
   /** How long finishTurn waits for the queue before delivering what it has.
    *  A slow provider must delay a turn, never hang live voice forever. */
   drainTimeoutMs: 4000,
+  /** Total cap on the waits inside finishTurn, measured from its start. The
+   *  single-clip decode runs in parallel with the chunk drain, so it gets the
+   *  REMAINDER of this cap instead of a second full timeout — otherwise a
+   *  provider stuck on both stages held the turn (and the mic handoff) for
+   *  drain + decode, twice as long as either stage needs. */
+  turnDeliverBudgetMs: 6000,
   /** Longest utterance that is re-decoded as ONE clip at turn end. Whisper's
    *  window is 30 s; past that it summarizes, so a longer turn keeps the chunk
    *  transcript instead. */
@@ -285,11 +292,24 @@ export const TTS_ECHO_GATE_MULT = 2;
  * quiet then — the agent's own audio is what is new). A relative multiplier
  * alone is not enough, because the ambient floor during playback is still the
  * room's, not the speaker's.
+ *
+ * The floor sits BELOW the loudest residual bleed on purpose: speech on a quiet
+ * laptop mic starts around 0.03, so the old 0.06 floor made the mic deaf for
+ * the whole answer — the user had to wait for the turn to end before STT heard
+ * a word. Echo cancellation removes most bleed; the onset streak below is what
+ * rejects the rest.
  */
-export const TTS_ECHO_MIN_GATE = 0.06;
+export const TTS_ECHO_MIN_GATE = 0.025;
 
-/** Onset frames required while the agent speaks (bleed must not trip it). */
-export const TTS_ONSET_FRAMES = 5;
+/**
+ * Onset frames required while the agent speaks (bleed must not trip it).
+ *
+ * Four, not three: the floor above was lowered to 0.025, so the residual bleed
+ * that now leans on this streak instead of the level gate needs the extra frame
+ * to be rejected. The quiet-room streak stays at LIVE_SPEECH_ONSET_FRAMES, and
+ * 400 ms of sustained voice is still an instant barge-in.
+ */
+export const TTS_ONSET_FRAMES = 4;
 
 /** Effective gate, raised while the agent's own audio is playing. */
 export function echoSafeThreshold(threshold: number, ttsSpeaking: boolean): number {
@@ -325,12 +345,16 @@ export function isLocalTranscriptJunk(s: string): boolean {
   return false;
 }
 
-/** Clean a transcript: trim, drop junk entirely, otherwise return trimmed text. */
+/**
+ * Clean a transcript: drop junk entirely, otherwise return the text in Persian
+ * spelling (see normalizeTranscript — the providers return Arabic look-alikes
+ * for Persian yeh/kaf, which read as wrong words).
+ */
 export function sanitizeLocalTranscript(raw: string): string {
   const text = (raw ?? '').trim();
   if (!text) return '';
   if (isLocalTranscriptJunk(text)) return '';
-  return text;
+  return normalizeTranscript(text);
 }
 
 /** True when a transcript looks like a Whisper noise hallucination. */
@@ -1195,6 +1219,7 @@ export class LocalLiveSession {
     this.transcribing = true;
     this.hasSpeech = false;
     try {
+      const startedAt = Date.now();
       // Fire the single-clip decode FIRST so it runs in parallel with the
       // chunk drain below: the turn then costs no extra latency compared with
       // delivering the preview, but its text is as accurate as dictation.
@@ -1204,8 +1229,14 @@ export class LocalLiveSession {
       if (rest.length >= minSamples) this.queueChunk(rest);
       // Wait for every queued chunk, but with a hard cap: a slow provider must
       // only delay the turn, never hang live voice. Whatever arrived by then is
-      // merged into the owning turn and delivered as the turn.
-      await this.waitForDrain(LOCAL_LIVE_DEFAULTS.drainTimeoutMs);
+      // merged into the owning turn and delivered as the turn. The cap is the
+      // budget REMAINING after the work already done above, so the whole
+      // delivery stays inside one bound.
+      const budgetLeft = () =>
+        Math.max(0, LOCAL_LIVE_DEFAULTS.turnDeliverBudgetMs - (Date.now() - startedAt));
+      await this.waitForDrain(
+        Math.min(LOCAL_LIVE_DEFAULTS.drainTimeoutMs, budgetLeft()),
+      );
       // Read from the turn we started with, NOT the shared current one. If the
       // user began speaking again during the drain a new turn already owns the
       // session, and gating delivery on the token here discarded the utterance
@@ -1218,7 +1249,7 @@ export class LocalLiveSession {
       whole = await Promise.race([
         wholeP,
         new Promise<string>((resolve) => {
-          wholeTimer = setTimeout(() => resolve(''), LOCAL_LIVE_DEFAULTS.drainTimeoutMs);
+          wholeTimer = setTimeout(() => resolve(''), budgetLeft());
         }),
       ]);
       if (wholeTimer) clearTimeout(wholeTimer);

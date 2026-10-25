@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+import { physicalKey } from '../lib/shortcuts'
+import { applyScroll, scrollDelta } from '../lib/scrollKeys'
+import { isEditableTarget } from '../lib/panePointer'
+import { isPrefixArmed } from '../lib/prefixState'
 
 const MIN_ZOOM = 1
 const MAX_ZOOM = 5
@@ -66,6 +70,39 @@ export function FullscreenModal({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open, onClose])
+
+  // Bare h/j/k/l scroll a SCROLLABLE modal (file diffs), exactly like the diff
+  // docked in the right panel. The caret is taken into the modal on open: left in
+  // the chat composer behind it, the letters would be typing (or would scroll the
+  // chat transcript). The listener sits on `window` in the capture phase so it
+  // runs before the chat's own scroll hook, and a text field inside the modal
+  // (a diff comment box) keeps its letters.
+  useEffect(() => {
+    if (!open || !scrollable) return
+    const prev = document.activeElement as HTMLElement | null
+    const vp = viewportRef.current
+    if (vp) {
+      if (!vp.hasAttribute('tabindex')) vp.setAttribute('tabindex', '-1')
+      vp.focus({ preventScroll: true })
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return
+      if (isPrefixArmed()) return
+      if (isEditableTarget(e.target as Node | null)) return
+      const delta = scrollDelta(physicalKey(e), e.shiftKey)
+      const el = viewportRef.current
+      if (!delta || !el) return
+      e.preventDefault()
+      e.stopPropagation()
+      applyScroll(el, delta, !e.repeat)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('keydown', onKey, true)
+      // Hand the caret back to where it was (the chat composer, usually).
+      if (prev && prev.isConnected) prev.focus({ preventScroll: true })
+    }
+  }, [open, scrollable])
 
   // Reset zoom/pan whenever the modal (re)opens.
   useEffect(() => {

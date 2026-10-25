@@ -3963,9 +3963,17 @@ pub async fn run_turn(
             // the fold ends up rejected.
             let mut probe = messages.clone();
             let mut probe_seen = seen_lookups.clone();
-            let (removed, folded) =
+            let (probe_chars, folded) =
                 fold_stale_tool_results(&mut probe, &mut probe_seen);
-            if folded > 0 && removed >= MAIN_FOLD_MIN_REMOVAL {
+            // `fold_with` reports CHARACTERS (that is what it removes from the
+            // wire text), while the floor is in TOKENS — the same ~4 chars per
+            // token estimate `record_fold` uses below. Comparing the raw char
+            // count against a TOKEN floor was a 4x unit error: it let a
+            // 1_947-token fold through (traced 01:09:58 on the 01:00 build,
+            // `folded=2 removed_tokens_est=1947`) where the floor meant to
+            // refuse everything under 4_000 tokens.
+            let probe_tokens = probe_chars.div_ceil(4);
+            if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
                 let (removed, folded) =
                     fold_stale_tool_results(&mut messages, &mut seen_lookups);
                 record_fold(
@@ -3981,7 +3989,7 @@ pub async fn run_turn(
             } else if folded > 0 {
                 emit(&AgentEvent::Warn {
                     content: format!(
-                        "[fold] skipped: removal {removed} tok < {MAIN_FOLD_MIN_REMOVAL} floor — a prefix-cache reset would cost more than it saved"
+                        "[fold] skipped: removal {probe_tokens} tok < {MAIN_FOLD_MIN_REMOVAL} floor — a prefix-cache reset would cost more than it saved"
                     ),
                 });
             }
@@ -13345,5 +13353,32 @@ mod tests {
         // below a real stale explore report (10-40K), so useful folds survive.
         assert!(MAIN_FOLD_MIN_REMOVAL > 1_000);
         assert!(MAIN_FOLD_MIN_REMOVAL < MAIN_FOLD_MIN_TOKENS);
+    }
+
+    #[test]
+    fn the_fold_floor_is_compared_in_tokens_not_characters() {
+        // `fold_with` returns CHARACTERS removed; `MAIN_FOLD_MIN_REMOVAL` is a
+        // TOKEN floor (`record_fold` writes `removed_chars / 4` as
+        // `removed_tokens_est`). Comparing the raw char count against the token
+        // floor is a 4x unit error that ADMITS folds the floor means to refuse:
+        // traced on the 01:00 build, a `removed_tokens_est = 1947` fold was
+        // recorded while the floor was 4_000.
+        //
+        // A removal that is UNDER the floor in tokens but would pass it in
+        // characters is exactly the case the conversion must reject.
+        let peanut_tokens = MAIN_FOLD_MIN_REMOVAL / 4 + 100; // ~1_100 tok
+        let peanut_chars = peanut_tokens * 4; // char count PASSES the raw floor
+        assert!(
+            peanut_chars >= MAIN_FOLD_MIN_REMOVAL,
+            "the raw char count is what used to slip through"
+        );
+        assert!(
+            peanut_chars.div_ceil(4) < MAIN_FOLD_MIN_REMOVAL,
+            "converted to tokens it must be refused"
+        );
+
+        // And a fold that genuinely clears the floor in tokens is still allowed.
+        let real_chars = MAIN_FOLD_MIN_REMOVAL * 4;
+        assert!(real_chars.div_ceil(4) >= MAIN_FOLD_MIN_REMOVAL);
     }
 }

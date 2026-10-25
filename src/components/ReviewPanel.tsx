@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVimScroll } from "../lib/useVimScroll";
+import { markVimRegion } from "../lib/panePointer";
+import { focusChatInput } from "../lib/chatFocus";
 import { createPortal } from "react-dom";
 import { buildReviewTurn } from "../lib/reviewTurn";
 import { buildUncommittedFiles } from "../lib/uncommitted";
@@ -496,6 +498,26 @@ export function ReviewPanel(props?: {
 
   const panelRef = useRef<HTMLDivElement>(null)
   useVimScroll(panelRef)
+
+  // The floating (non-docked) popup opens over the chat while the caret still
+  // sits in the chat composer. useVimScroll treats a caret in an editable field
+  // as TYPING and never scrolls, so h/j/k/l did nothing there (the docked diff
+  // is entered through focusAppPane, which moves the caret). Take the caret into
+  // the popup on open and hand it back to the chat when it closes.
+  useEffect(() => {
+    if (docked) return;
+    const el = panelRef.current;
+    if (!el) return;
+    if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+    el.focus({ preventScroll: true });
+    markVimRegion(el);
+    return () => {
+      const a = document.activeElement;
+      if (a && a !== document.body) return; // focus already moved somewhere real
+      const id = useStore.getState().activeChatId;
+      if (id) requestAnimationFrame(() => focusChatInput(id));
+    };
+  }, [docked]);
 
   const panel = (
     <div

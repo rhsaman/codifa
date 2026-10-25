@@ -4,11 +4,13 @@
 //  1. App chords (Ctrl/Cmd+J/W/M/X) must never reach the shell as ^J/^M/^X.
 //  2. The Ctrl+X prefix: the ARMING key is already reserved (x), but the SECOND
 //     key arrives WITHOUT any modifier inside the terminal, and xterm would
-//     send it to the shell exactly as typed — ^K kills the half-typed line,
-//     which is why `Ctrl+X k` (hop to chat) looked broken while the caret was
-//     in the terminal. The guard must suppress the second key while the prefix
-//     is armed, and let the very same letters through as normal shell input
-//     once it is not.
+//     send it to the shell exactly as typed — ^J is newline and ^K kills the
+//     half-typed line, which is why `Ctrl+X j` (toggle the terminal) looked
+//     broken while the caret was in the terminal. The guard must suppress the
+//     second key while the prefix is armed, and let the very same letters
+//     through as normal shell input once it is not. `h`/`k`/`l` are NOT prefix
+//     keys any more: window navigation is the direct Ctrl+H/J/K/L chord, so
+//     once the prefix is armed they must reach the shell untouched.
 import { isReservedTerminalChord } from '../src/lib/terminalKeys'
 import { setPrefixArmedForTest } from '../src/lib/prefixState'
 
@@ -57,12 +59,16 @@ console.log('2) the Ctrl+X SECOND key while the prefix is armed:')
 {
   setPrefixArmedForTest(true)
   try {
-    for (const key of ['h', 'j', 'k', 'l', 'u', 'r', 'c', 'v']) {
+    for (const key of ['j', 'u', 'r', 'c', 'v']) {
       const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
       check(`bare ${key} suppressed while armed`, isReservedTerminalChord(ev2))
     }
     check('Space suppressed while armed (Ctrl+X Space = voice)', isReservedTerminalChord(ev({ key: ' ', code: 'Space' })))
     check('a non-prefix letter stays shell input', !isReservedTerminalChord(ev({ key: 'a', code: 'KeyA' })))
+    for (const key of ['h', 'k', 'l']) {
+      const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
+      check(`bare ${key} NOT a prefix key — reaches the shell while armed`, !isReservedTerminalChord(ev2))
+    }
   } finally {
     setPrefixArmedForTest(false)
   }
@@ -74,13 +80,14 @@ console.log('3) the same letters are ORDINARY shell input once disarmed:')
     const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
     check(`bare ${key} reaches the shell`, !isReservedTerminalChord(ev2))
   }
+  check('Ctrl+J stays reserved when not armed (newline chord)', isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ', ctrlKey: true })))
 }
 
 console.log('4) keypress path behaves like keydown:')
 {
   setPrefixArmedForTest(true)
   try {
-    check('keypress k suppressed (the ^K killer)', isReservedTerminalChord(ev({ type: 'keypress' })))
+    check('keypress j suppressed (the ^J newline killer)', isReservedTerminalChord(ev({ type: 'keypress', key: 'j', code: 'KeyJ' })))
   } finally {
     setPrefixArmedForTest(false)
   }

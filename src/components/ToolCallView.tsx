@@ -42,6 +42,9 @@ import { toWorkspacePath } from "../lib/fileTree";
 import { selectionBarPos } from "../lib/selectionBar";
 import { bareToolName, mcpServerOf } from "../lib/mcpTools";
 import { diffPopupPos, type DiffPopPos } from "../lib/hoverCardPos";
+import { useVimScroll } from "../lib/useVimScroll";
+import { markVimRegion } from "../lib/panePointer";
+import { focusChatInput } from "../lib/chatFocus";
 
 /** Shared 500ms ticker for all running-tool clocks. Multi-window can mount
  *  dozens of tool rows; one interval driving every live clock keeps CPU and
@@ -1185,8 +1188,34 @@ const DiffPreview = memo(function DiffPreview({
   onPress?: () => void;
 }) {
   const basename = path ? path.split("/").pop() ?? path : "";
+  // Bare vim keys (j/k scroll, h/l horizontal) drive the diff body like the
+  // docked Review diff. The card is portaled to document.body — OUTSIDE every
+  // registered vim region — so without this it never scrolls: panePointer
+  // resolves the caret/last click against the chat pane and the keys either
+  // type or go nowhere (bug: "در پاپاپ دیف با lkjh اسکرول نمیشه").
+  const cardRef = useRef<HTMLDivElement>(null);
+  useVimScroll(cardRef);
+  // The portal opens over the chat while the caret still sits in the composer;
+  // useVimScroll treats a caret in an editable field as TYPING and never
+  // scrolls. Same fix as the Review popup: take the caret into the card on
+  // open (it is tabbable via tabindex=-1) and hand it back to the chat when
+  // the card closes.
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el) return;
+    if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+    el.focus({ preventScroll: true });
+    markVimRegion(el);
+    return () => {
+      const a = document.activeElement;
+      if (a && a !== document.body) return; // focus already moved somewhere real
+      const id = useStore.getState().activeChatId;
+      if (id) requestAnimationFrame(() => focusChatInput(id));
+    };
+  }, []);
   return (
     <div
+      ref={cardRef}
       className="diff-preview-card"
       style={{
         position: "fixed",

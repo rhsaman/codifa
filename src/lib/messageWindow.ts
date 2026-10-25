@@ -60,12 +60,21 @@ export function sliceWindow<T>(
  * scroll-to-top auto-load, oscillating between mount and unmount.
  *
  * Pure so the policy is testable without a DOM — `nowPinned` is the caller's
- * live `stickToBottom` ref.
+ * live `stickToBottom` ref, `isActive` whether this panel owns the focus.
+ *
+ * An INACTIVE panel trims unconditionally: nothing is reading it, so its
+ * mounted transcript is pure footprint. Keeping a scrolled-up window warm in a
+ * background pane multiplied the renderer's cost by the number of open chats —
+ * measured, the WebContent footprint grew with every extra pane that had ever
+ * been scrolled, while only one of them was on screen. The window paged back in
+ * the moment the pane regains focus (its saved scroll anchor restores the same
+ * viewport), so no visible history is lost.
  */
 export function shouldTrimMountedWindow(
   msgLimit: number,
   msgPage: number,
   nowPinned: boolean,
+  isActive = true,
 ): boolean {
-  return nowPinned && msgLimit > msgPage
+  return (nowPinned || !isActive) && msgLimit > msgPage
 }

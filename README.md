@@ -65,6 +65,48 @@ talk. Nothing leaves your machine unless you want it to.
 - Node.js ≥ 20 and npm
 - [Rust](https://rustup.rs/) (stable) and the Tauri prerequisites for your OS
 
+### 📥 Installing (end users)
+
+If you just want to run Codifa — not build it — grab the installer instead of
+the source. Codifa is **not signed with an Apple Developer ID**, so macOS
+quarantines the downloaded image and refuses the first launch with _"Codifa is
+damaged and can't be opened"_ or _"Apple could not verify…"_. Clearing that flag
+normally needs a Terminal command; the installer does it for you.
+
+**Option A — one-command install (recommended):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash
+```
+
+It downloads the latest release, verifies the app's code signature, clears the
+quarantine attribute and copies the app into `/Applications`. Every step is
+printed so you can read what happened. To pin a specific release, pass the tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v1.7.0
+```
+
+**Option B — manual install:**
+
+1. Download the `.dmg` from the [latest release](https://github.com/rhsaman/codifa/releases/latest) and drag **Codifa** into `/Applications`.
+2. Clear the quarantine flag, or macOS will refuse to open it:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Codifa.app
+   ```
+
+3. Open Codifa from `/Applications`. If macOS still blocks it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+**Requirements:** macOS 11 or newer. The published builds are **Apple Silicon
+(arm64) only** — there is no Intel macOS build, and the installer refuses to run
+on one rather than install a binary the CPU cannot execute.
+
+**Permissions:** Codifa asks for the microphone (voice dictation) and screen
+recording (Computer Use). Grant them in **System Settings → Privacy & Security**;
+because the app is not notarized, you may need to toggle them on and relaunch
+the app once after an update.
+
 ### 🚀 Setup
 
 ```bash
@@ -107,6 +149,12 @@ Output lands in `src-tauri/target/release/bundle/`.
 > ```bash
 > xattr -dr com.apple.quarantine /path/to/Codifa.app
 > ```
+>
+> Distributing to someone else? Point them at
+> [`scripts/install-macos.sh`](scripts/install-macos.sh) — see
+> [Installing (end users)](#-installing-end-users) — rather than embedding the
+> `xattr` line in your instructions. The installer prints each step, so the
+> recipient never has to read shell syntax.
 
 ### 🖱️ Usage
 
@@ -140,9 +188,13 @@ Output lands in `src-tauri/target/release/bundle/`.
 | `Cmd/Ctrl+,`          | Open settings                                      |
 | `Cmd/Ctrl+S`          | Save current file                                  |
 | `Cmd/Ctrl+T`          | New chat                                           |
+| `Ctrl+H/J/K/L`        | Move focus vim-style between chat windows (k=up, j=down, h=left, l=right) |
+| `Shift+Alt(Option)+H/J/K/L` | Swap (move) chat window positions in the same vim directions |
+| `Ctrl+X` then `j`     | Toggle the terminal panel (tmux-style prefix)      |
 | `Ctrl+X` then `u`     | Undo last exchange (tmux-style prefix)             |
 | `Ctrl+X` then `r`     | Redo last undone exchange (tmux-style prefix)      |
 | `Ctrl+X` then `c`     | Compact the chat context (tmux-style prefix)       |
+| `Ctrl+X` then `v`     | Toggle the live voice session (tmux-style prefix)  |
 | `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)           |
 
 ### 🏛️ Architecture
@@ -202,6 +254,49 @@ Data lives in ~/.codifa — settings, chats, skills, MCP, plans, traces.
 - Node.js نسخهٔ ۲۰ به بالا و npm
 - [Rust](https://rustup.rs/) (پایدار) و پیش‌نیازهای Tauri برای سیستم‌عامل شما
 
+### 📥 نصب برای کاربران نهایی
+
+اگر فقط می‌خواهید Codifa را اجرا کنید — نه اینکه از سورس بسازید — همان
+نصب‌کننده را بردارید. Codifa با **گواهی Developer ID اپل امضا نشده است**،
+بنابراین مک فایل دانلودشده را قرنطینه می‌کند و اجرای اول با پیام
+_«Codifa خراب است و باز نمی‌شود»_ یا _«اپل نتوانست تأیید کند…»_ رد می‌شود. پاک
+کردن آن فلگ معمولاً به دستور ترمینال نیاز دارد؛ اسکریپت نصب این کار را برای
+شما انجام می‌دهد.
+
+**راه ۱ — نصب با یک دستور (پیشنهادی):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash
+```
+
+آخرین نسخه را دانلود می‌کند، امضای کد اپ را بررسی می‌کند، فلگ قرنطینه را پاک
+می‌کند و اپ را در `/Applications` می‌گذارد. هر گام چاپ می‌شود تا ببینید چه
+اتفاقی افتاده است. برای نصب یک نسخهٔ مشخص، تگ را بدهید:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v1.7.0
+```
+
+**راه ۲ — نصب دستی:**
+
+۱. فایل `.dmg` را از [آخرین نسخه](https://github.com/rhsaman/codifa/releases/latest) دانلود کنید و **Codifa** را به `/Applications` بکشید.
+۲. فلگ قرنطینه را پاک کنید، وگرنه مک از باز کردن آن سرباز می‌زند:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Codifa.app
+   ```
+
+۳. Codifa را از `/Applications` باز کنید. اگر مک باز هم مسدود کرد، به **System Settings → Privacy & Security** بروید و **Open Anyway** را بزنید.
+
+**پیش‌نیاز:** مک‌اواس ۱۱ یا بالاتر. نسخه‌های منتشرشده **فقط اپل سیلیکون
+(arm64)** هستند — نسخهٔ اینتل برای مک وجود ندارد، و اسکریپت نصب روی مک اینتل
+اجرا نمی‌شود تا باینری‌ای نصب نکند که پردازنده نمی‌تواند اجرا کند.
+
+**مجوزها:** Codifa میکروفون (دیکتهٔ صوتی) و ضبط صفحه (Computer Use) را می‌خواهد.
+آن‌ها را در **System Settings → Privacy & Security** بدهید؛ چون اپ notarize
+نشده است، ممکن است لازم باشد بعد از هر به‌روزرسانی آن‌ها را یک‌بار خاموش و
+روشن کنید و اپ را دوباره باز کنید.
+
 ### 🚀 نصب
 
 ```bash
@@ -237,13 +332,19 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 
 > **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
 > (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«Codifa به
-> خاطر کاهش حریم خصوصی مسدود شده است»_ را نشان دهد. این برای برنامه‌های
+> خاطر کاهش حریم خصوصی مسدود شده است��_ را نشان دهد. این برای برنامه‌های
 > ساخته‌شدهٔ محلی طبیعی است. راه‌حل: روی برنامه کلیک راست کنید ← **Open** ←
 > **Open**. اگر از اینترنت کپی شده است، فلگ قرنطینه را هم پاک کنید:
 >
 > ```bash
 > xattr -dr com.apple.quarantine /path/to/Codifa.app
 > ```
+>
+> می‌خواهید برای کس دیگری بفرستید؟ او را به
+> [`scripts/install-macos.sh`](scripts/install-macos.sh) ارجاع دهید — بخش
+> [نصب برای کاربران نهایی](#-نصب-برای-کاربران-نهایی) — و خط `xattr` را در
+> دستورهایتان نگذارید. اسکریپت نصب هر گام را چاپ می‌کند، پس گیرندهٔ کار
+> نیازی به خواندن سینتکس شل ندارد.
 
 ### 🖱️ کاربرد
 
@@ -281,10 +382,13 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 | `Cmd/Ctrl+,`           | باز کردن تنظیمات                                      |
 | `Cmd/Ctrl+S`           | ذخیرهٔ فایل جاری                                      |
 | `Cmd/Ctrl+T`           | گفتگوی تازه                                           |
+| `Ctrl+H/J/K/L`        | جابه‌جایی فوکوس میان پنجره‌های چت به سبک ویم (k=بالا، j=پایین، h=چپ، l=راست) |
+| `Shift+Alt(Option)+H/J/K/L` | جابه‌جایی (سواپ) جای پنجره‌های چت در همان جهت‌های ویم |
+| `Ctrl+X` و سپس `j`     | نمایش/پنهان‌کردن پنل ترمینال (پیشوندِ سبک tmux)      |
 | `Ctrl+X` و سپس `u`     | بازگردانی آخرین تبادل (پیشوندِ سبک tmux)              |
 | `Ctrl+X` و سپس `r`     | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
 | `Ctrl+X` و سپس `c`     | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux)            |
-| `Ctrl+X` و سپس `x`     | پاک‌کردن پیام‌های این گفتگو (پیشوندِ سبک tmux)        |
+| `Ctrl+X` و سپس `v`     | نمایش/پنهان‌کردن نشست صدای زنده (پیشوندِ سبک tmux)    |
 | `Ctrl+X` و سپس `Space` | نگه‌داشتن Space برای ضبط صدا (پیشوندِ سبک tmux)       |
 
 ### 🏛️ معماری

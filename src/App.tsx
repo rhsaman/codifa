@@ -23,10 +23,12 @@ import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isApplePlatform, prefixMoveDir } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isWindowMoveChord } from './lib/shortcuts'
 import { resolveChatClose } from './lib/chatClose'
-import { collectChatIds, pickNeighborWindow } from './lib/chatTree'
+import { collectChatIds, pickNeighborByRect, type WindowNavDir, type WindowRect } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
+import { activePane, focusAppPane } from './lib/paneFocus'
+import { flashOnEnter, flashPaneFocus } from './lib/paneFlash'
 import { applyInputSuppression } from './lib/inputSuppress'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
@@ -55,6 +57,24 @@ function isInsideTerminal(target: HTMLElement | null | undefined): boolean {
   return !!(target?.closest?.(sel) || document.activeElement?.closest?.(sel))
 }
 
+/** True when a direct Cmd/Ctrl+H/J/K/L window move must NOT run: inside a
+ *  dialog/overlay (their own keys own the Ctrl chords there), inside a text
+ *  input (readline keeps Ctrl+H as backspace and Ctrl+K kills the line), or
+ *  when an @mention/command picker popup is open (its Ctrl+J/K walk its
+ *  list). The terminal panels ARE in this list: xterm hands Ctrl+H/K/L to
+ *  the shell (^H backspace, ^K kill-line). The terminal panel itself toggles
+ *  ONLY through the Ctrl+X J prefix chord. */
+function isWindowMoveBlocked(t: HTMLElement | null | undefined): boolean {
+  if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay, .terminal-panel, .terminal-tab-panel')) return true
+  // A text field only blocks the chord when the key could be TYPING. Every
+  // move chord is Cmd/Ctrl+H/J/K/L (checked by isWindowMoveChord before this
+  // runs), so a modified key is never plain text input: the chat composer's
+  // textarea is `document.activeElement` almost all the time, and gating on
+  // it made all four move chords dead there.
+  if (document.querySelector('.mention-popup')) return true
+  return false
+}
+
 /**
  * Ctrl/Cmd+W while a terminal has focus: close the thing the user is looking at.
  *
@@ -80,7 +100,6 @@ export default function App() {
   const activeChatRoot = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
   )
-  const activeChatId = useStore((s) => s.activeChatId)
   const settingsOpen = useStore((s) => s.settingsOpen)
   const sidebarOpen = useStore((s) => s.sidebarOpen)
   // Keyboard suggestions follow this setting instead of the platform default
@@ -139,6 +158,24 @@ export default function App() {
   const prefixActiveRef = useRef(false)
   const prefixTimerRef = useRef<number | null>(null)
 
+  // Focus ring for the MOUSE: pressing inside a chat window, the right panel
+  // or the sidebar rings that pane once, exactly like the keyboard jumps do
+  // (src/lib/paneFlash.ts). A press inside the pane that already holds the
+  // ring does nothing, so typing/clicking in the composer never re-flashes.
+  useEffect(() => {
+    const paneOf = (t: EventTarget | null): HTMLElement | null => {
+      const el = t instanceof Element ? t : null
+      if (!el) return null
+      if (el.closest('[role="dialog"], .settings-modal, .search-overlay')) return null
+      return (el.closest('[data-chat-window]') ||
+        el.closest('.viewer-group') ||
+        el.closest('.sidebar')) as HTMLElement | null
+    }
+    const onDown = (e: PointerEvent) => flashOnEnter(paneOf(e.target))
+    window.addEventListener('pointerdown', onDown, true)
+    return () => window.removeEventListener('pointerdown', onDown, true)
+  }, [])
+
   useEffect(() => {
     const openSearch = () => setSearchOpen(true)
     window.addEventListener('coder:search', openSearch)
@@ -159,11 +196,6 @@ export default function App() {
     window.addEventListener('coder:open-file', onOpenFile)
     return () => window.removeEventListener('coder:open-file', onOpenFile)
   }, [])
-
-  const openWorkspace = (dir: string) => {
-    const state = useStore.getState()
-    state.setChatRoot(state.activeChatId, dir)
-  }
 
   useEffect(() => {
     let saved = DEFAULT_THEME
@@ -265,8 +297,78 @@ export default function App() {
       // is already prevented.
       e.stopPropagation()
       const st = useStore.getState()
-      if (target === 'right') useViewerTabs.getState().togglePane()
-      else st.setSidebarOpen(!st.sidebarOpen)
+      // Opening a panel puts the caret INSIDE it; closing it hands the caret
+      // back to the chat (otherwise it stays on a hidden element and the next
+      // keys go nowhere). One frame later: the panel mounts/unmounts on the
+      // next React commit.
+      let opened: boolean
+      if (target === 'right') {
+        const vt = useViewerTabs.getState()
+        opened = !vt.paneOpen
+        vt.togglePane()
+      } else {
+        opened = !st.sidebarOpen
+        st.setSidebarOpen(opened)
+      }
+      requestAnimationFrame(() =>
+        focusAppPane(opened ? (target === 'right' ? 'viewer' : 'sidebar') : 'chat'),
+      )
+      return true
+    }
+
+    /** Direct Cmd/Ctrl+H/J/K/L moves focus BETWEEN CHAT WINDOWS (no Ctrl+X
+     *  prefix) — each key always walks its OWN vim direction: k=up, j=down,
+     *  h=left, l=right.
+     *
+     *  The target is the window that REALLY lies in that direction on screen
+     *  (pickNeighborByRect: live rects, nearest edge, same row/column first).
+     *  With no window on that side the key never jumps to a window in another
+     *  direction. The OPEN side panels continue the same directions: Ctrl+L
+     *  from the rightmost window enters the right panel, Ctrl+H from the
+     *  leftmost enters the sidebar, and from inside them the opposite key
+     *  (Ctrl+H in the right panel, Ctrl+L in the sidebar) returns to the chat.
+     *  Returns false only when the chord is NOT ours (a terminal has the caret). */
+    function moveChatWindow(dir: WindowNavDir): boolean {
+      const st = useStore.getState()
+      const pane = activePane()
+      if (pane === 'terminal') return false
+      if (pane === 'viewer' && dir === 'left') {
+        focusAppPane('chat')
+        return true
+      }
+      if (pane === 'sidebar' && dir === 'right') {
+        focusAppPane('chat')
+        return true
+      }
+      const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
+      const rects: Record<string, WindowRect> = {}
+      document.querySelectorAll<HTMLElement>('[data-chat-window]').forEach((el) => {
+        const id = el.getAttribute('data-chat-window')
+        if (!id || !ids.includes(id)) return
+        if (el.classList.contains('window-hidden') || el.getAttribute('aria-hidden') === 'true') return
+        const r = el.getBoundingClientRect()
+        if (r.width <= 0 || r.height <= 0) return
+        rects[id] = { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+      })
+      // `dir` already is the vim direction of the pressed key (isWindowMoveChord:
+      // h=left, j=down, k=up, l=right). It used to be compared against the
+      // letters 'h'/'l'/'k' here, so EVERY chord fell through to 'down'.
+      const next = pickNeighborByRect(rects, st.activeChatId, dir)
+      if (next && next !== st.activeChatId) {
+        st.focusWindow(next)
+        requestAnimationFrame(() => {
+          focusChatInput(next)
+          // The ring says "you are now HERE" — same cue as a mouse press.
+          flashPaneFocus(document.querySelector<HTMLElement>(`[data-chat-window="${CSS.escape(next)}"]`))
+        })
+        return true
+      }
+      // No chat window on that side: the open panel beyond the edge is next.
+      if (dir === 'right' && useViewerTabs.getState().paneOpen && !st.chatFullscreen) {
+        focusAppPane('viewer')
+      } else if (dir === 'left' && st.sidebarOpen) {
+        focusAppPane('sidebar')
+      }
       return true
     }
 
@@ -275,64 +377,36 @@ export default function App() {
       if (prefixActiveRef.current) {
         cancelPrefix()
         const k = physicalKey(e)
-        // Ctrl+X then H/J/K/L moves the focused chat window vim-style
-        // (swaps with the neighbor). Wins over other `l` bindings when a
-        // neighbor exists; otherwise falls through so Ctrl+X L still
-        // toggles the live session in single-window mode.
-        const moveDir = prefixMoveDir(k)
-        if (moveDir) {
-          const t = e.target as HTMLElement | null
-          const inDialog = !!t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')
-          if (!inDialog && !isInsideTerminal(t)) {
-            const st = useStore.getState()
-            const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
-            if (ids.length > 1) {
-              const els = document.querySelectorAll<HTMLElement>('[data-chat-window]')
-              const centers: Record<string, { x: number; y: number }> = {}
-              els.forEach((el) => {
-                const id = el.getAttribute('data-chat-window')
-                if (!id) return
-                if (el.classList.contains('window-hidden') || el.getAttribute('aria-hidden') === 'true') return
-                const r = el.getBoundingClientRect()
-                if (r.width <= 0 || r.height <= 0) return
-                centers[id] = { x: r.left + r.width / 2, y: r.top + r.height / 2 }
-              })
-              const target = pickNeighborWindow(centers, st.activeChatId, moveDir)
-              if (target) {
-                e.preventDefault()
-                e.stopPropagation()
-                st.dropChatOnto(st.activeChatId, target, 'center')
-                const after = useStore.getState().activeChatId
-                if (after) requestAnimationFrame(() => focusChatInput(after))
-                return
-              }
-            }
-          }
-          // No neighbor to move toward: h/j/k do nothing, l falls through
-          // to the live toggle below so single-window behavior is unchanged.
-          if (k !== 'l') return
-        }
+        // The prefix carries NO window movement: focus between chat windows is
+        // the direct Ctrl+H/J/K/L chord (below) and nothing else. `j` is the
+        // ONLY letter of h/j/k/l the prefix knows — it toggles the terminal
+        // panel, also while the caret is inside a terminal. `h`/`k`/`l` mean
+        // nothing after Ctrl+X.
+        // A key the prefix CONSUMES must not travel on: the capture listener
+        // above xterm would otherwise let the second key through, and a
+        // terminal with focus typed the `j` into the shell.
         // Live session has a dedicated toggle (coder:toggle-live), separate
-        // from dictation (coder:toggle-voice) so the modes never mix.
-        // Ctrl+X then L toggles the live session only (when no window move happened).
-        if (k === 'l') {
+        // from dictation (coder:toggle-voice) so the modes never mix. It lives
+        // on `V` (voice).
+        if (k === 'v') {
           e.preventDefault()
+          e.stopPropagation()
           window.dispatchEvent(new CustomEvent('coder:toggle-live'))
-          return
-        }
-        // Ctrl+X then J toggles the bottom terminal panel (user request —
-        // alongside the existing Cmd/Ctrl+J direct chord).
-        if (k === 'j') {
-          e.preventDefault()
-          useStore.getState().toggleTerminalPanel()
           return
         }
         const sc = PREFIX_SHORTCUTS[k]
         if (sc) {
           e.preventDefault()
+          e.stopPropagation()
           if (sc.action === 'voice') {
             // Ctrl+X then Space: toggle voice recording (the mic button).
             window.dispatchEvent(new CustomEvent('coder:toggle-voice'))
+          } else if (sc.action === 'live') {
+            // Ctrl+X then V: toggle the realtime voice session.
+            window.dispatchEvent(new CustomEvent('coder:toggle-live'))
+          } else if (sc.action === 'terminal') {
+            // Ctrl+X then J: toggle the bottom terminal panel.
+            useStore.getState().toggleTerminalPanel()
           } else {
             window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
           }
@@ -353,6 +427,22 @@ export default function App() {
         window.dispatchEvent(new CustomEvent('coder:prefix', { detail: true }))
         prefixTimerRef.current = window.setTimeout(cancelPrefix, 2000)
         return
+      }
+      // DIRECT chord — Cmd/Ctrl + H/J/K/L (no Ctrl+X prefix): move focus
+      // between the split chat windows. h=left, l=right on a horizontal
+      // split, j=down, k=up on a vertical stack. Ranked lower than the app's
+      // other chords on purpose: a defaultPrevented event (sidebar Ctrl+K
+      // search focus) stands down, picker popups stopPropagation before the
+      // event reaches here, and inside dialogs/overlay the pickers keep the
+      // keys. The terminal keeps its shell chords too (xterm sends ^H/^K/^L),
+      // so a blocked chord falls through instead of returning.
+      const winDir = e.defaultPrevented ? null : isWindowMoveChord(e)
+      if (winDir && !isWindowMoveBlocked(e.target as HTMLElement | null)) {
+        if (moveChatWindow(winDir)) {
+          e.preventDefault()
+          e.stopPropagation()
+          return
+        }
       }
       // Fast path first: panel toggle never falls through to the switch.
       if (togglePanelFromKey(e)) return
@@ -453,17 +543,6 @@ export default function App() {
           window.dispatchEvent(new CustomEvent('coder:search'))
           break
         }
-        case 'j': {
-          // Bottom terminal panel — Cmd+J on Apple platforms, Ctrl+J elsewhere
-          // (the user-facing spec, unlike the app's usual Cmd/Ctrl duality).
-          // Must also work while the terminal itself has focus: xterm's custom
-          // key handler lets this chord bubble up instead of feeding it to
-          // the shell.
-          if (isApplePlatform() ? !e.metaKey : !e.ctrlKey) break
-          e.preventDefault()
-          useStore.getState().toggleTerminalPanel()
-          break
-        }
         case 'm': {
           // Window fullscreen inside the chat area (Tab still cycles agent
           // modes, so Ctrl/Cmd+M is free for this). Dialogs keep their own
@@ -488,10 +567,14 @@ export default function App() {
           break
       }
     }
-    window.addEventListener('keydown', onKey)
+    // CAPTURE phase: the composer (a plain textarea) is usually the focused
+    // element and stops keydown propagation, so a bubble listener on `window`
+    // never saw Cmd/Ctrl+H/J/K/L at all. Capturing here lets the app claim its
+    // chords first; onKey returns early for everything that is plain typing.
+    window.addEventListener('keydown', onKey, true)
     window.addEventListener('blur', cancelPrefix)
     return () => {
-      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keydown', onKey, true)
       window.removeEventListener('blur', cancelPrefix)
     }
   }, [])

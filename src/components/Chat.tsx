@@ -10,6 +10,11 @@ import {
 import { createPortal } from "react-dom";
 import { getActiveProvider, getChatProvider, ensureChatHydrated, lspStatusFromEvent, providerApiKeys, sanitizeImageDataUrl, useStore } from "../lib/store";
 import { api } from "../lib/fs";
+import { useVimScroll } from "../lib/useVimScroll";
+import { shouldEnterInsert, shouldLeaveInsert } from "../lib/chatNormalMode";
+import { isPrefixArmed } from "../lib/prefixState";
+import { paneOwner } from "../lib/panePointer";
+import { physicalKey } from "../lib/shortcuts";
 import { AutoRetryScheduler, findRetryBannerMessage, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
   isSlashCommand,
@@ -205,13 +210,14 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
-import { LocalLiveSession, sanitizeLocalTranscript } from "../lib/localLive";
-import { blobToWav16k, buildSttPrompt, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
+import { LocalLiveSession, isHallucinatedTranscript, releaseWarmLiveMic, sanitizeLocalTranscript } from "../lib/localLive";
+import { analyzeClip16k, buildSttPrompt, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
 import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
 import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
 import { buildLiveSpeakSuffix } from "../lib/livePrompt";
 import { playTts, playTtsStream, stopTts, speakableMessageText, subscribeTts } from "../lib/tts";
-import type { LiveVoiceState } from "../types";
+import type { LiveVoiceState } from "../lib/liveVoiceState";
+import { claimLiveVoice, isLiveVoiceBusy, syncLiveVoiceLease } from "../lib/liveVoiceState";
 const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
@@ -1278,7 +1284,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setTitlebarRightEl(document.getElementById("titlebar-right"));
   }, []);
   const [recording, setRecording] = useState(false);
-  const [liveState, setLiveState] = useState<LiveVoiceState>('idle');
+  // Live voice state lives in the app store, not here: one microphone is shared
+  // by every mounted chat panel (split windows) and the session must survive a
+  // chat switch, so only the owner chat id decides who may show the button.
+  const liveState = useStore((s) => s.liveVoiceState);
+  const liveOwnerChatId = useStore((s) => s.liveVoiceChatId);
+  const setLiveVoiceSession = useStore((s) => s.setLiveVoiceSession);
   const [liveError, setLiveError] = useState<string | null>(null);
   // Which pipeline the current live session runs on. Set at start, read by the
   // mic-device switch and by stop, so both act on the right session object.
@@ -1311,7 +1322,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [transcribing, setTranscribing] = useState(false);
   // Composer action visibility: live voice takes over, streaming shows stop
   // + dictate mic, typing shows send only, empty shows mic + live buttons.
-  const isLiveVoiceActive = liveState === 'live' || liveState === 'speaking' || liveState === 'connecting';
+  const isLiveVoiceActive = isLiveVoiceBusy(liveState);
+  // Live voice is allowed in exactly ONE chat at a time: while another chat owns
+  // the session this chat must not even show the button, so the only way onward
+  // is to stop the session in its own chat. The owner id lives in the store, so
+  // the rule also holds for a chat panel that did not start the session.
+  const liveOwnedByOtherChat = liveOwnerChatId != null && liveOwnerChatId !== chat?.id;
+  const liveHere = isLiveVoiceActive && !liveOwnedByOtherChat;
+  // Bind the microphone lease to the store's session state: a session that is
+  // already running claims it for its own chat (so it may be reopened after a
+  // device switch), and it is released the moment no session is busy — which
+  // covers an owner panel that unmounted without an explicit stop.
+  useEffect(() => {
+    syncLiveVoiceLease(liveOwnerChatId, isLiveVoiceActive);
+  }, [liveOwnerChatId, isLiveVoiceActive]);
   /**
    * Ref mirror of {@link isLiveVoiceActive}.
    *
@@ -1323,8 +1347,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    */
   const liveActiveRef = useRef(false);
   useEffect(() => {
-    liveActiveRef.current = isLiveVoiceActive;
-  }, [isLiveVoiceActive]);
+    liveActiveRef.current = liveHere;
+  }, [liveHere]);
   /** Ring the turn/ask/error alarm, except while live voice owns the audio. */
   const ringTurnAlarm = (kind: "alert" | "error") => {
     if (liveActiveRef.current) return;
@@ -1337,21 +1361,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const hasText = input.trim().length > 0;
   const hasAttachment = pastedBlocks.length > 0 || images.length > 0;
   const hasComposerText = hasText || hasAttachment;
-  const showLiveActive = isLiveVoiceActive;
-  const showStopOnly = !isLiveVoiceActive && isStreamingActive;
+  const showLiveActive = liveHere;
+  const showStopOnly = !liveHere && isStreamingActive;
   // Dictate mic stays visible during streaming (hidden only when live is active)
   // so the user can dictate the next prompt while the agent works.
-  const showDictateDuringStreaming = !isLiveVoiceActive && isStreamingActive;
+  const showDictateDuringStreaming = !liveHere && isStreamingActive;
   // Send appears only once there is typed/pasted text: attaching a photo/file
   // alone keeps the mics visible so the prompt can be dictated afterwards.
-  const showSendOnly = !isLiveVoiceActive && !isStreamingActive && hasText;
+  const showSendOnly = !liveHere && !isStreamingActive && hasText;
   // Attachments alone must not hide the mics: user may attach a file/photo
   // and then dictate the prompt. Only typed text hides voice buttons.
-  const showVoiceButtons = !isLiveVoiceActive && !isStreamingActive && !hasText;
+  const showVoiceButtons = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && !hasText;
   // Live voice button shows whenever the composer is idle (empty input,
   // not streaming, live not active) so it comes back after Stop. It stays
   // hidden mid-stream and while typing, unless live is the active session.
-  const showLiveIdle = !isLiveVoiceActive && !isStreamingActive && !hasText;
+  const showLiveIdle = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && !hasText;
   const sttProviderId = useStore((s) => s.sttProviderId);
   const sttModel = useStore((s) => s.sttModel);
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
@@ -1373,6 +1397,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return text;
     });
   };
+  /**
+   * Drop the live preview without touching the composer. Called when a state
+   * change must not lose the recognized words: the final `onUserText` arrives
+   * right after `onStateChange('live')`, and clearing there erased the sentence
+   * that had just been transcribed (the composer stayed empty while the chat got
+   * a DIFFERENT text — the "the chat says one thing, the input says another"
+   * mismatch; the chat bubble showed the words, the input showed the leftovers).
+   */
+  const dropLivePartial = () => {
+    liveTypedRef.current = "";
+  };
   /** Drop the live preview, but only if the composer still holds our text. */
   const clearLivePartial = () => {
     const ours = liveTypedRef.current;
@@ -1386,6 +1421,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // useEffect with a stable closure) can read the latest value without
   // re-subscribing on every render.
   const recordingRef = useRef(false);
+  // Microphone stream kept alive between recordings. Opening the microphone
+  // takes hundreds of milliseconds, and MediaRecorder cannot exist before the
+  // stream does — so starting from scratch on every press dropped whatever the
+  // user said during that window ("the first word is missing"). Warming it on
+  // pointer-down hides the delay behind the user's own reaction time.
+  const warmMicRef = useRef<MediaStream | null>(null);
+  const warmMicTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Pending ask/permission requests live on the chat in the store
   // (Chat.pendingAsk / Chat.pendingPermission), NOT local state:
   // `<ChatPanel key={activeChatId} />` fully unmounts/remounts on every chat
@@ -1539,6 +1581,61 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     (s) => s.slug || s.name,
   );
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Bare j/k scroll the transcript while the chat column is the pane the user
+  // is working in (typing in the composer still keeps the letters). The intent
+  // boundary is the WHOLE chat panel (panelRef — the composer sits outside
+  // .chat-scroll): panePointer must still read a caret parked in the composer
+  // as "typing here", not as "the pane click owns the keys".
+  useVimScroll(scrollRef, panelRef);
+  // Normal/insert mode keys for the chat column, vim-style: `i` takes the
+  // caret from the transcript into the composer, and `Ctrl+C` with NOTHING
+  // selected hands it back. `Ctrl+C` is COPY, so a live selection is left
+  // alone — only the empty-selection case belongs to the mode keys.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.metaKey) return
+      const target = e.target as Node | null
+      const composer = textareaRef.current
+      const inComposer = !!composer && (target === composer || composer.contains(target))
+      // `physicalKey` reads `e.code`, so these strokes work on a PERSIAN (or any
+      // non-Latin) layout too — `e.key` would hand back "ی"/"ز" instead.
+      const phys = physicalKey(e)
+      // EVERY mounted window listens on the window, so `i` would otherwise fire
+      // in all of them and the LAST one's composer won the focus — the "pressed
+      // i here, caret jumped to another chat" bug. Only the window the user is
+      // actually working in may answer: the caret is inside this panel, or the
+      // pane intent (a click here, or Ctrl+X arrival) points at it.
+      const panel = panelRef.current
+      const ownsKeyboard =
+        inComposer ||
+        (!!panel && !!target && panel.contains(target)) ||
+        (!!panel && paneOwner() === panel)
+      if (!ownsKeyboard) return
+
+      if (!e.ctrlKey && !e.shiftKey && phys === 'i') {
+        const editable = target instanceof Element && !!target.closest('input, textarea, [contenteditable="true" i], [contenteditable="" i]')
+        const dialogOpen = !!document.querySelector('[role="dialog"], .settings-modal, .search-overlay')
+        if (!shouldEnterInsert({ targetIsEditable: editable, targetIsComposer: inComposer, dialogOpen, chordActive: isPrefixArmed() })) return
+        if (!composer) return
+        e.preventDefault()
+        composer.focus({ preventScroll: true })
+        return
+      }
+
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && phys === 'c') {
+        const dialogOpen = !!document.querySelector('[role="dialog"], .settings-modal, .search-overlay')
+        const selection = composer ? composer.value.slice(composer.selectionStart ?? 0, composer.selectionEnd ?? 0) : ''
+        if (!shouldLeaveInsert({ caretInComposer: inComposer, selection, dialogOpen, composerBusy: !!busy })) return
+        e.preventDefault()
+        // Leaving insert also parks the caret on the transcript so the next
+        // bare j/k scrolls this chat instead of typing into the composer.
+        const scroller = scrollRef.current
+        if (scroller) scroller.focus({ preventScroll: true })
+      }
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [busy])
   const composerRef = useRef<HTMLDivElement>(null);
   // Per-chat scroll restoration: the panel stays mounted across chat
   // switches (no key={activeChatId}), so the restore anchor is refreshed on
@@ -2194,6 +2291,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     scheduleTranscriptTrim();
   };
 
+  // Bare `j`/`k` from useVimScroll are USER scrolls like any other: without
+  // releasing the pin, stick-to-bottom treats every glide frame's content
+  // resize as "follow the stream" and yanks the viewport back — `j` read as
+  // stuck at the bottom. The event carries the host; only a transcript event
+  // counts here.
+  useEffect(() => {
+    const onVimScroll = (e: Event) => {
+      if ((e as CustomEvent).detail !== scrollRef.current) return;
+      // Same release as a wheel/arrow scroll: stop following, keep the
+      // position the glide is moving to.
+      stickToBottom.current = false;
+      pinTopRef.current = null;
+    };
+    window.addEventListener('coder:vim-scroll', onVimScroll);
+    return () => window.removeEventListener('coder:vim-scroll', onVimScroll);
+  }, []);
+
   const onChatScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2434,7 +2548,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // invisible — the viewport is already at the maximum scroll offset.
   const trimTimerRef = useRef<number | null>(null);
   const scheduleTranscriptTrim = () => {
-    if (!shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current)) return;
+    if (!shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current, isActive)) return;
     if (trimTimerRef.current != null) return;
     trimTimerRef.current = window.setTimeout(() => {
       trimTimerRef.current = null;
@@ -2442,7 +2556,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // Re-check at fire time: the user may have scrolled up meanwhile, and
       // trimming under a viewport that is no longer pinned would jump. The next
       // arrival at the bottom schedules it again (see `recordAtBottom`).
-      if (!el || !shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current)) return;
+      if (!el || !shouldTrimMountedWindow(msgLimit, MSG_PAGE, stickToBottom.current, isActive)) return;
       prependAnchorRef.current = el.scrollHeight;
       setMsgLimit(MSG_PAGE);
     }, TRANSCRIPT_TRIM_DELAY_MS);
@@ -2454,6 +2568,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (stickToBottom.current) scheduleTranscriptTrim();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgLimit]);
+  // A pane that loses focus gives its scrolled-past pages back. Every extra open
+  // chat used to keep its own warm window (markdown + highlight DOM) for the
+  // whole session, so the renderer's footprint grew with the NUMBER of openness
+  // panes rather than what was on screen. The window pages back in on focus: the
+  // saved scroll anchor in the store restores the same viewport, so returning to
+  // a pane shows exactly what the user left.
+  useEffect(() => {
+    if (!isActive) scheduleTranscriptTrim();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isActive]);
   useEffect(
     () => () => {
       if (trimTimerRef.current != null) window.clearTimeout(trimTimerRef.current);
@@ -2698,15 +2822,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       cycleMode(1);
     };
-    const onAttachFile = (e: Event) => {
-      // File picker attaches to the focused chat only — without this guard
-      // Ctrl+P in one window appends the file to ALL visible composers.
-      if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
-      const rel = (e as CustomEvent<{ rel: string }>).detail?.rel;
-      if (!rel || !wroot) return;
-      setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
-      requestAnimationFrame(() => textareaRef.current?.focus());
-    };
     const onToggleVoice = () => {
       // Voice dictation toggles only in the focused chat — otherwise Space
       // during transcription inserts into every visible composer.
@@ -2714,7 +2829,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       toggleRecordingRef.current();
     };
     const onToggleLive = () => {
-      // Live session has its own shortcut (Ctrl+X then L), separate from
+      // Live session has its own shortcut (Ctrl+X then V), separate from
       // dictation, so the two modes never mix.
       if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       toggleLiveRef.current();
@@ -2722,15 +2837,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     window.addEventListener("coder:toggle-mode", onToggleMode);
     window.addEventListener("coder:toggle-voice", onToggleVoice);
     window.addEventListener("coder:toggle-live", onToggleLive);
-    window.addEventListener("coder:attach-file", onAttachFile as EventListener);
     return () => {
       window.removeEventListener("coder:toggle-mode", onToggleMode);
       window.removeEventListener("coder:toggle-voice", onToggleVoice);
       window.removeEventListener("coder:toggle-live", onToggleLive);
-      window.removeEventListener(
-        "coder:attach-file",
-        onAttachFile as EventListener,
-      );
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat?.id, chat?.mode, wroot]);
@@ -4405,6 +4515,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       } else if (event.kind === "tool") {
         bumpToolRunning(toolRunning);
         clearTransientRetry();
+        // A tool call by the retrying sub-agent ITSELF proves its model answers
+        // again: retire the live retry banner now instead of leaving it up for
+        // the rest of the explore run.
+        const recoveredRetry = findMsg()?.retry;
+        if (recoveredRetry && retryRetiredByEvent(recoveredRetry, event)) {
+          store.updateMessage(assistantMsg.id, { retry: null });
+        }
         ensureLiveBubble();
         // A create_mcp call this turn means the connector list in the store is
         // stale — flag it so the `done` handler re-fetches from the sidecar.
@@ -4497,6 +4614,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           providerId: event.provider_id ?? "",
           agent: event.agent ?? "",
           tool: event.tool ?? "",
+          // Which parallel explore this ladder belongs to: its own tool calls
+          // are what retire the banner once the sub-agent works again.
+          branch: event.branch,
           fallback: event.fallback,
           reconnecting: event.reconnecting,
           startedAt: Date.now(),
@@ -7080,6 +7200,89 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     return { lang, chains };
   };
 
+  /**
+   * Capture constraints shared by the warm-up and the real recording.
+   *
+   * Echo cancellation on, but noise suppression and AGC off — they are tuned
+   * for phone calls and eat the Persian fricatives (/s/ /ʃ/ /z/ /f/ /x/) the
+   * model actually needs, while AGC pumps the gain mid-word. Level
+   * consistency comes from normalizePeak instead.
+   */
+  const voiceAudioConstraints: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 1,
+  };
+
+  /** Release the kept-alive microphone (idempotent). */
+  const releaseWarmMic = () => {
+    if (warmMicTimerRef.current !== null) {
+      clearTimeout(warmMicTimerRef.current);
+      warmMicTimerRef.current = null;
+    }
+    const stream = warmMicRef.current;
+    warmMicRef.current = null;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  };
+
+  /**
+   * Hand back a live microphone stream, opening one only when none is warm.
+   *
+   * The stream is deliberately NOT closed after a recording: the next press
+   * then starts capturing instantly instead of losing the first word to the
+   * microphone's start-up delay.
+   */
+  const acquireMic = async (): Promise<MediaStream> => {
+    if (warmMicTimerRef.current !== null) {
+      clearTimeout(warmMicTimerRef.current);
+      warmMicTimerRef.current = null;
+    }
+    const warm = warmMicRef.current;
+    if (warm && warm.getAudioTracks().some((t) => t.readyState === "live")) {
+      warmMicRef.current = null;
+      return warm;
+    }
+    warmMicRef.current = null;
+    return navigator.mediaDevices.getUserMedia({ audio: voiceAudioConstraints });
+  };
+
+  /** Open the microphone ahead of the press so the first word is never lost. */
+  const warmMic = () => {
+    if (warmMicRef.current || recordingRef.current || transcribing) return;
+    if (!navigator.mediaDevices?.getUserMedia) return;
+    void navigator.mediaDevices
+      .getUserMedia({ audio: voiceAudioConstraints })
+      .then((stream) => {
+        // A real recording may have started while the stream was opening.
+        if (recordingRef.current || warmMicRef.current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        warmMicRef.current = stream;
+        // Safety valve: an abandoned warm-up must not hold the microphone.
+        warmMicTimerRef.current = setTimeout(() => {
+          warmMicTimerRef.current = null;
+          if (recordingRef.current) return;
+          const held = warmMicRef.current;
+          warmMicRef.current = null;
+          if (held) held.getTracks().forEach((t) => t.stop());
+        }, 6000);
+      })
+      .catch(() => {
+        // Permission denied or no device: startRecording reports it properly.
+      });
+  };
+
+  // Never leave a microphone held after the composer goes away.
+  useEffect(
+    () => () => {
+      releaseWarmMic();
+      releaseWarmLiveMic();
+    },
+    [],
+  );
+
   const startRecording = async () => {
     if (recording || transcribing) return;
     try {
@@ -7090,28 +7293,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           "Microphone unavailable — grant Codifa microphone access in System Settings, then restart the app.",
         );
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          // Same processing as live capture (see LocalLiveSession.openMic):
-          // echo cancellation on, but noise suppression and AGC off — they are
-          // tuned for phone calls and eat the Persian fricatives (/s/ /ʃ/ /z/
-          // /f/ /x/) the model actually needs, while AGC pumps the gain
-          // mid-word. Level consistency comes from normalizePeak instead.
-          echoCancellation: true,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-        },
-      });
-      // Prefer a format the sidecar's `av` can decode; fall back to whatever the
-      // browser supports (Whisper handles webm/ogg/opus/wav via decode_audio).
-      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : MediaRecorder.isTypeSupported("audio/wav")
-            ? "audio/wav"
-            : "";
+      const stream = await acquireMic();
+      // Pick a container this WebView can ALSO decode back (analyzeClip16k runs
+      // it through decodeAudioData before the upload). WKWebView cannot decode
+      // webm/opus at all: when that was preferred here, the normalisation step
+      // failed, the raw webm blob was uploaded instead, and the provider
+      // answered "could not process file - is it a valid media file?". MP4/AAC
+      // and WAV are both recordable and decodable there; webm stays last (fine
+      // on Chromium, where recording and decoding support match).
+      const mime = MediaRecorder.isTypeSupported("audio/mp4")
+        ? "audio/mp4"
+        : MediaRecorder.isTypeSupported("audio/wav")
+          ? "audio/wav"
+          : MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+            ? "audio/webm;codecs=opus"
+            : MediaRecorder.isTypeSupported("audio/webm")
+              ? "audio/webm"
+              : "";
       const rec = new MediaRecorder(stream, {
         ...(mime ? { mimeType: mime } : {}),
         // Opus is lossy and its artefacts land on the same high frequencies the
@@ -7127,16 +7325,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
       };
       rec.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
         recordingRef.current = false;
         setRecording(false);
+        // Keep the microphone open for the next press instead of paying the
+        // hardware start-up delay again (MediaRecorder stopped using it, so
+        // nothing is recorded in the meantime). Only a device change or a
+        // dead track forces a fresh getUserMedia.
+        const live = stream.getAudioTracks().some((t) => t.readyState === "live");
+        if (live && !warmMicRef.current) {
+          warmMicRef.current = stream;
+        } else {
+          stream.getTracks().forEach((t) => t.stop());
+        }
         const type = mediaChunksRef.current[0]?.type ?? mime;
         const blob = new Blob(mediaChunksRef.current, { type });
         if (blob.size === 0) {
           console.debug("[voice] empty recording (no audio captured)");
           try {
             const bannerId = chatIdRef.current;
-            if (bannerId) useStore.getState().setChatCmdError(bannerId, "No audio was captured — check your microphone.");
+            if (bannerId)
+              useStore
+                .getState()
+                .setChatCmdError(
+                  bannerId,
+                  "No audio was captured. The microphone needs a moment to start — wait for the red indicator, then speak (or hold the key a little longer).",
+                );
           } catch {
             // Banner is best-effort.
           }
@@ -7149,8 +7362,36 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // already sends). Without this, dictate uploaded the raw
           // webm/opus blob, so the same voice could transcribe correctly in
           // live mode and come back garbled here.
-          const wavBlob = await blobToWav16k(blob);
-          const audio = wavBlob ?? blob;
+          const clip = await analyzeClip16k(blob)
+          if (clip.kind === 'no-speech') {
+            // Music, a held tone or room noise: uploading it only produces
+            // invented words, so say nothing was heard instead.
+            console.debug("[voice] clip holds no speech — skipping STT")
+            const bannerId = chatIdRef.current
+            if (bannerId) useStore.getState().setChatLiveError(bannerId, "چیزی شنیده نشد — دوباره بگو")
+            return
+          }
+          if (clip.kind === 'undecodable') {
+            // Uploading the untouched container is what produced the provider's
+            // "is it a valid media file?" — the WebView could not decode it, so
+            // the endpoint almost certainly cannot either. Fail loudly with the
+            // one action that actually helps.
+            console.debug("[voice] recording container could not be decoded", {
+              mime: blob.type,
+              bytes: blob.size,
+            })
+            const bannerId = chatIdRef.current
+            if (bannerId) {
+              useStore
+                .getState()
+                .setChatCmdError(
+                  bannerId,
+                  `ضبط قابل خواندن نبود (${blob.type || 'unknown'}) — میکروفن را بررسی و دوباره امتحان کن.`,
+                )
+            }
+            return
+          }
+          const audio = clip.wav
           console.debug("[voice] transcribing", {
             mime: blob.type,
             bytes: blob.size,
@@ -7181,6 +7422,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // Drop any echo of the prompt we sent: a provider that continues the
           // prompt would otherwise auto-send our own glossary back as a turn.
           const finalText = normalizeTranscript(stripSttPromptEcho((text ?? "").trim(), sttPromptText));
+          // A request for Persian that comes back as bare Latin noise («PYM JBZ»
+          // for «سلام») means the endpoint has no real ASR model behind it —
+          // typical of a chat model served on an OpenAI-compatible proxy. Typing
+          // that into the composer is worse than saying so.
+          if (finalText && isHallucinatedTranscript(finalText, lang)) {
+            console.debug("[voice] provider returned non-Persian noise", { text: finalText });
+            const bannerId = chatIdRef.current;
+            if (bannerId) {
+              useStore.getState().setChatCmdError(
+                bannerId,
+                `مدل STT صدا را تشخیص نداد (خروجی: «${finalText}»). در Settings → Media Providers یک مدل رونویسی واقعی مثل whisper-1 انتخاب کن — مدل چت نمی‌تواند رونویسی کند.`,
+              );
+            }
+            return;
+          }
           // A gateway HTML error page must never land in the composer.
           // Errors surface in the banner under messages, never in the input.
           if (finalText && (isHtmlTranscriptJunk(finalText) || /<\/?[a-z]/i.test(finalText) || finalText.includes('&lt;') || finalText.includes('/_next/') || /preload|fetchpriority/i.test(finalText) || /<[a-z][^<>]*$/i.test(finalText))) {
@@ -7261,6 +7517,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (recording) {
       stopRecording();
     } else {
+      // A press is the last possible moment to catch a cold microphone: the
+      // stream opened here is ready by the time the user starts speaking.
+      warmMic();
       void startRecording();
     }
   };
@@ -7332,11 +7591,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Offline live voice (no OpenAI): chunked mic VAD -> local/remote STT ->
   // existing chat pipeline (send) -> local TTS answer. Barge-in stops TTS.
   const startLive = async () => {
+    if (liveOwnedByOtherChat) return;
     if (liveState === 'connecting' || isLiveVoiceActive) return;
     if (recording) stopRecording();
     stopTts(LIVE_TTS_OWNER);
     clearLiveError();
-    setLiveState('connecting');
+    setLiveVoiceSession(chatIdRef.current ?? null, 'connecting');
+    const setLiveState = (s: LiveVoiceState) => setLiveVoiceSession(chatIdRef.current ?? null, s);
 
     // ── Chat mirror for the realtime path ───────────────────────────────────
     // The realtime server owns the conversation (server VAD + responses), so
@@ -7494,7 +7755,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         });
         liveRealtimeRef.current = rt;
         liveModeRef.current = 'realtime';
-        await rt.connect();
+        await rt.connect(chatIdRef.current);
+        if (!claimLiveVoice(chatIdRef.current ?? null)) {
+          // Lost the race to another chat: tear the session down instead of
+          // leaving a panel that looks live but has no microphone.
+          try {
+            rt.disconnect();
+          } catch {
+            // Already closed.
+          }
+          liveRealtimeRef.current = null;
+          return;
+        }
         return;
       } catch (err) {
         // Provider has no realtime endpoint, no key, or a bad model: keep the
@@ -7657,6 +7929,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
       const live = new LocalLiveSession({
         deviceId: selectedMicId || undefined,
+        /**
+         * Chat this panel runs live voice for.
+         *
+         * The lease is per chat, not per panel: every open chat mounts its own
+         * panel and its own session object, so without it a second chat could
+         * open the same microphone and turn a single spoken sentence into a
+         * message in two conversations at once.
+         */
+        chatId: chatIdRef.current,
         lang: liveLang,
         prompt: sttPrompt,
         transcribe: transcribeChunk,
@@ -7681,7 +7962,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           setLiveState('live');
         },
         onStateChange: (s) => {
-          if (s !== 'live' && s !== 'speaking') clearLivePartial();
+          // Only the ownership marker is dropped here, never the composer text:
+          // the state flips to 'live' the moment the utterance ends, before the
+          // final transcript arrives, and clearing the input at that instant
+          // deleted the last chunk — the words showed up in the chat but not in
+          // the composer.
+          if (s !== 'live' && s !== 'speaking') dropLivePartial();
           setLiveState(s);
         },
         onUserText: async (raw) => {
@@ -7808,7 +8094,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       });
       liveSessionRef.current = live;
       liveModeRef.current = 'chunked';
-      await live.connect();
+      // The chat id is the microphone lease: this call is a no-op if another
+      // chat already holds the session, so a stray shortcut in a second window
+      // can never start a second microphone.
+      await live.connect(chatIdRef.current);
+      if (!claimLiveVoice(chatIdRef.current ?? null)) {
+        // Lost the race: tear this session down instead of leaving a panel
+        // showing live voice that has no working microphone.
+        liveSessionRef.current = null;
+        live.disconnect();
+        return;
+      }
     } catch (err) {
       liveSessionRef.current = null;
       setLiveState('error');
@@ -7816,6 +8112,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
   const stopLive = () => {
+    setLiveVoiceSession(null, 'idle');
     // Both pipelines can hold a session; stop whichever one is running.
     try {
       liveRealtimeRef.current?.disconnect();
@@ -7854,13 +8151,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     liveAccRef.current = { user: '', assistant: '' };
     liveModeRef.current = 'chunked';
     clearLivePartial();
-    setLiveState('idle');
+    setLiveVoiceSession(null, 'idle');
   };
   const toggleLive = () => {
-    if (liveState === 'connecting' || isLiveVoiceActive) stopLive();
+    // Another chat holds the microphone: this panel offers no live button, so a
+    // stray shortcut (Ctrl+X then L in a second window) must not steal it.
+    if (liveOwnedByOtherChat) return;
+    if (liveState === 'connecting' || liveHere) stopLive();
     else void startLive();
   };
-  toggleLiveRef.current = toggleLive;
+  // Only the panel that HOLDS the session may claim ownership: this effect runs
+  // in every mounted panel, so writing `chat.id` here unconditionally made each
+  // panel stamp its own id over the real owner's — the owner id thrashed to
+  // whichever panel rendered last, so a chat that never started live voice
+  // suddenly matched `liveVoiceChatId` and showed the live animation. A holder
+  // is the panel with a live session object, which no other panel has.
+  useEffect(() => {
+    if (!isLiveVoiceActive) return;
+    const holds = liveSessionRef.current != null || liveRealtimeRef.current != null;
+    if (!holds || !chat?.id) return;
+    setLiveVoiceSession(chat.id, liveState);
+  }, [isLiveVoiceActive, chat?.id, liveState, setLiveVoiceSession]);
   // Close the mic menu on outside click / Escape.
   useEffect(() => {
     if (!micMenuOpen) return;
@@ -8705,6 +9016,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       <div
         className="chat-scroll"
         ref={scrollRef}
+        // Focusable so `i`/`Ctrl+C` can hand the keyboard back and forth
+        // between the transcript and the composer without a mouse.
+        tabIndex={-1}
         onScroll={onChatScroll}
         onWheel={() => {
           jumpScrollingRef.current = false;
@@ -8751,10 +9065,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             // Lengths are render-capped: a 1.5MB paste renders ≤100KB, so the
             // budget measures actual parse work, not stored size.
             const budget = windowBudget(msgLimit, MSG_PAGE);
+            // An UNFOCUSED pane renders a single page regardless of how far the
+            // user had scrolled in it: the extra pages are only ever read while
+            // the pane has focus, and every mounted page is markdown + highlight
+            // DOM. The saved scroll anchor (and `msgLimit`, which is untouched)
+            // brings the deep window straight back when the pane regains focus.
+            const effectiveLimit = isActive ? msgLimit : Math.min(msgLimit, MSG_PAGE);
+            const effectiveBudget = isActive ? budget : Math.min(budget, windowBudget(MSG_PAGE, MSG_PAGE));
             const windowed = sliceWindow(
               visible,
-              msgLimit,
-              budget,
+              effectiveLimit,
+              effectiveBudget,
               MSG_WINDOW_MIN_KEEP,
               (m) => Math.min(m.content?.length ?? 0, RENDER_CAP),
             );
@@ -9105,14 +9426,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       // attempt is the visible proof that something happened — a
                       // click that left "6/10" untouched is exactly why this
                       // button kept looking dead.
-                      ackedAttempt = Math.min(
-                        cur.retry.attempt + 1,
-                        cur.retry.maxAttempts,
-                      );
+                      // The attempt number is NOT touched here: the ladder emits
+                      // the real next attempt itself, and a local +1 raced it (the
+                      // two numbers were equal, so the confirmation below never
+                      // saw the badge move, retired the banner after 3s and the
+                      // click looked dead — it took a second one).
+                      ackedAttempt = cur.retry.attempt;
                       useStore.getState().updateMessage(id, {
                         retry: {
                           ...cur.retry,
-                          attempt: ackedAttempt,
                           delay: 0,
                           reason: "retrying now (requested)",
                           startedAt: Date.now(),
@@ -9126,6 +9448,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       // leaving the banner up is what makes the button look dead.
                       // Returning this promise is also what keeps the button in
                       // its loading state until the click has really been handled.
+                      // The backend ALREADY said it consumed the click
+                      // (`listening`), so there is nothing left to second-guess:
+                      // the old 3s "did the badge move?" check retired a healthy
+                      // banner whenever the next attempt simply took longer than
+                      // that. Hold the button in its loading state just long
+                      // enough to read as acknowledged, or until the real next
+                      // attempt / recovery lands.
                       const start = Date.now();
                       return new Promise<void>((resolve) => {
                         const tick = setInterval(() => {
@@ -9133,11 +9462,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                             .getState()
                             .chats.find((c) => c.id === originId)
                             ?.messages.find((x) => x.id === id)?.retry;
-                          const advanced =
+                          const settled =
                             !r || r.gaveUp === true || r.attempt > ackedAttempt;
-                          if (!advanced && Date.now() - start <= 3000) return;
+                          if (!settled && Date.now() - start <= 1500) return;
                           clearInterval(tick);
-                          if (!advanced) retireStale();
                           resolve();
                         }, 100);
                       });
@@ -10439,7 +10767,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         >
                           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
                         </svg>
-                        <span>Add files or photos</span>
+                        <span>Attach file</span>
                       </button>
                       <button
                         type="button"
@@ -10541,6 +10869,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   {showVoiceButtons && (
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                    onPointerDown={warmMic}
                     onClick={toggleRecording}
                     title={
                       transcribing

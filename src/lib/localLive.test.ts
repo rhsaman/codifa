@@ -30,6 +30,7 @@ const {
   NOISE_FLOOR_MIN,
   NOISE_FLOOR_CALIBRATION_FRAMES,
   LOCAL_LIVE_DEFAULTS,
+  LIVE_SPEECH_ONSET_FRAMES,
   chooseCut,
   echoSafeThreshold,
   onsetFramesRequired,
@@ -73,6 +74,30 @@ function makeSession(reply: Reply = '') {
 /** Total number of buffered samples. */
 function buffered(priv: Record<string, unknown>): number {
   return (priv['pcmFrames'] as Float32Array[]).reduce((n, f) => n + f.length, 0)
+}
+
+/**
+ * Synthetic SPEECH-like PCM: a ~4 Hz syllabic envelope over a carrier.
+ *
+ * A flat `Float32Array(n).fill(0.1)` has a steady energy envelope (CV 0), which
+ * is exactly what music or fan hum looks like — and the live pipeline now
+ * rejects it before the request (see isLikelySpeechEnvelope). Test audio must
+ * therefore carry the envelope of real speech: syllables with gaps between
+ * them, which is what these tests are meant to exercise.
+ */
+function speechPcm(samples: number, rate = 16000, amp = 0.1): Float32Array {
+  const out = new Float32Array(samples)
+  for (let i = 0; i < samples; i++) {
+    const t = i / rate
+    // Deep syllable gaps (CV ≈ 1.5, matching measured speech) rather than a
+    // shallow wobble: the envelope gate rejects anything as flat as music, so a
+    // test signal must actually look like speech. The gaps are narrow enough
+    // (≈3 Hz) that a 500 ms buffer still clears MIN_CHUNK_SPEECH_MS once the
+    // silence gate has trimmed it.
+    const syll = Math.max(0, Math.sin(2 * Math.PI * 3 * t))
+    out[i] = amp * syll * syll * syll * Math.sin(2 * Math.PI * 180 * t)
+  }
+  return out
 }
 
 console.log('1) VAD helpers:')
@@ -169,6 +194,19 @@ console.log('4) outside a turn only the pre-roll is buffered:')
   check('idle capture is trimmed to the pre-roll', kept === expected, { kept, expected })
 }
 
+console.log('4b) the pre-roll outlasts the onset detector, so word one survives:')
+{
+  // The VAD opens a turn only after LIVE_SPEECH_ONSET_FRAMES frames of voice
+  // (LIVE_SPEECH_ONSET_FRAMES * frameMs). A pre-roll no longer than that
+  // window re-buffers exactly the audio the streak just consumed, so the word
+  // that STARTED the turn ("سلام", a quiet /s/ onset) was never captured —
+  // the opening word went missing in live voice only.
+  const onsetWindow = LIVE_SPEECH_ONSET_FRAMES * LOCAL_LIVE_DEFAULTS.frameMs
+  const preRoll = LOCAL_LIVE_DEFAULTS.preRollMs
+  check('pre-roll exceeds the onset window', preRoll > onsetWindow, { preRoll, onsetWindow })
+  check('pre-roll leaves margin for a soft onset', preRoll >= onsetWindow * 2, { preRoll })
+}
+
 console.log('5) takePcm keeps an overlap tail for the next chunk:')
 {
   const { priv, session } = makeSession()
@@ -188,7 +226,11 @@ console.log('6) chunks are cut while the user is still speaking:')
   // The turn in progress carries its own text on the turn object (a shared
   // string was cleared by the next turn and lost the utterance).
   priv['turn'] = { token: priv['turnToken'] as number, text: 'متن قبلی' }
-  priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  // 2 s of audio: a chunk cut leaves the overlap (220 ms) behind and the
+  // silence gate trims the rest to syllables, so a short 500 ms buffer no
+  // longer carries MIN_CHUNK_SPEECH_MS of speech — which a real 1.4 s chunk
+  // always does. Test audio must be long enough to model that.
+  priv['pcmFrames'] = [speechPcm(32000)]
   ;(session as unknown as { flushChunk: () => void }).flushChunk()
   await priv['chain']
 
@@ -196,9 +238,9 @@ console.log('6) chunks are cut while the user is still speaking:')
   check('one chunk was transcribed', calls.length === 1, { calls: calls.length })
   if (calls.length === 1) {
     check('chunk is a complete WAV file', calls[0].type === 'audio/wav')
-    check('chunk size matches its sample count', calls[0].size === 44 + (8000 - overlap) * 2, {
+    check('chunk carries the speech, not just the overlap', calls[0].size > 44 + 16000, {
       size: calls[0].size,
-      expected: 44 + (8000 - overlap) * 2,
+      overlap,
     })
     check('language hint is sent', calls[0].lang === 'fa')
     // Regression: the turn text so far used to be fed back as Whisper context.
@@ -260,7 +302,7 @@ console.log('8) a late chunk is kept for its own turn, never shown to the next:'
 {
   const { priv, session, calls, partials } = makeSession('سلام')
   priv['hasSpeech'] = true
-  priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  priv['pcmFrames'] = [speechPcm(32000)]
   ;(session as unknown as { flushChunk: () => void }).flushChunk()
   const firstTurn = priv['turn'] as { token: number; text: string }
   // New turn starts before the previous chunk resolves.
@@ -283,7 +325,7 @@ console.log('9) finishing a turn drains every chunk and delivers once:')
 {
   const { priv, session, calls, partials, finals } = makeSession('سلام دنیا')
   priv['hasSpeech'] = true
-  priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  priv['pcmFrames'] = [speechPcm(32000)]
   await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
 
   check('the tail was transcribed', calls.length === 1, { calls: calls.length })
@@ -303,13 +345,13 @@ console.log('10) hallucinations and error pages never become messages:')
 {
   const noise = makeSession('خب خب خب خب')
   noise.priv['hasSpeech'] = true
-  noise.priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  noise.priv['pcmFrames'] = [speechPcm(8000)]
   await (noise.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   check('a repeated-word hallucination is dropped', noise.finals.length === 0, { finals: noise.finals })
 
   const junk = makeSession('<html><body>gateway error</body></html>')
   junk.priv['hasSpeech'] = true
-  junk.priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  junk.priv['pcmFrames'] = [speechPcm(8000)]
   await (junk.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   check('an HTML error page is dropped', junk.finals.length === 0, { finals: junk.finals })
 }
@@ -320,7 +362,7 @@ console.log('11) a failing provider surfaces an error without breaking the loop:
     throw new Error('provider down')
   })
   failing.priv['hasSpeech'] = true
-  failing.priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  failing.priv['pcmFrames'] = [speechPcm(8000)]
   let threw = false
   try {
     await (failing.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
@@ -333,7 +375,7 @@ console.log('11) a failing provider surfaces an error without breaking the loop:
   check('the queue is drained', failing.priv['pending'] === 0, { pending: failing.priv['pending'] })
   check('the session can start a new turn', (await (async () => {
     failing.priv['hasSpeech'] = true
-    failing.priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+    failing.priv['pcmFrames'] = [speechPcm(8000)]
     await (failing.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
     return failing.errors.length === 2
   })()))
@@ -362,9 +404,10 @@ console.log('12) chunks are requested in parallel, not one round-trip at a time:
   priv['hasSpeech'] = true
   priv['capturing'] = true
   priv['captureRate'] = 16000
-  // Queue several chunks without letting any of them resolve.
+  // Queue several chunks without letting any of them resolve. The buffer must
+  // be long enough that a cut still holds MIN_CHUNK_SPEECH_MS of speech.
   for (let i = 0; i < 4; i++) {
-    priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+    priv['pcmFrames'] = [speechPcm(32000)]
     ;(session as unknown as { flushChunk: () => void }).flushChunk()
   }
   await new Promise((r) => setTimeout(r, 0))
@@ -400,7 +443,7 @@ console.log('13) a hanging provider delays a turn, it never freezes live voice:'
   priv['capturing'] = true
   priv['captureRate'] = 16000
   priv['hasSpeech'] = true
-  priv['pcmFrames'] = [new Float32Array(8000).fill(0.1)]
+  priv['pcmFrames'] = [speechPcm(8000)]
   const started = Date.now()
   const done = (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
   await Promise.race([
@@ -533,7 +576,7 @@ console.log('17) the delivered text comes from ONE full-clip decode, like dictat
   const { priv, session, calls, finals } = makeSession('سلام دنیا')
   priv['hasSpeech'] = true
   ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(
-    new Float32Array(16000).fill(0.1),
+    speechPcm(16000),
   )
   // The chunk cuts consumed the live buffer while the user was speaking; the
   // turn's own copy is what survives to be decoded at the end.
@@ -542,9 +585,12 @@ console.log('17) the delivered text comes from ONE full-clip decode, like dictat
   await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
 
   check('exactly one request decodes the whole turn', calls.length === 1, { calls: calls.length })
-  check('the request carries the whole utterance', calls[0]?.size === 44 + 16000 * 2, {
-    size: calls[0]?.size,
-    expected: 44 + 16000 * 2,
+  // The whole clip is sent, not a chunk: the silence trim only pads/trims the
+  // edges, so allow the head/tail pad around the 1 s utterance instead of
+  // pinning the byte count to the raw input length.
+  const wholeSamples = ((calls[0]?.size ?? 0) - 44) / 2
+  check('the request carries the whole utterance', wholeSamples >= 15000, {
+    samples: wholeSamples,
   })
   check('the delivered text is the full-clip result', finals[0] === 'سلام دنیا', { finals })
   check(
@@ -566,7 +612,7 @@ console.log('18) a failed full-clip decode still delivers the preview:')
   })
   failing.priv['hasSpeech'] = true
   ;(failing.session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(
-    new Float32Array(16000).fill(0.1),
+    speechPcm(16000),
   )
   failing.priv['pcmFrames'] = []
   failing.priv['turn'] = { token: failing.priv['turnToken'] as number, text: 'پیش‌نمایش' }
@@ -584,7 +630,7 @@ console.log('19) a turn too long for one ASR window keeps the chunk transcript:'
   // decoding it would silently drop the last words. The chunk merge wins.
   const { priv, session, calls, finals } = makeSession('نتیجه تکه‌ها')
   priv['hasSpeech'] = true
-  priv['turnAudio'] = [new Float32Array(16000).fill(0.1)]
+  priv['turnAudio'] = [speechPcm(16000)]
   priv['turnAudioLen'] = 16000
   priv['turnAudioTruncated'] = true
   priv['turn'] = { token: priv['turnToken'] as number, text: 'نتیجه تکه‌ها' }

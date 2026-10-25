@@ -573,6 +573,64 @@ export function pickNeighborWindow(
   return best
 }
 
+export interface WindowRect {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/** The window that really lies in `dir` from the current one, from the live
+ *  rects. Pure for tests.
+ *
+ *  A candidate must sit entirely on that side (left: its right edge is at or
+ *  left of the current left edge; and so on). Candidates that share rows (for
+ *  left/right) or columns (for up/down) with the current window win over
+ *  diagonal ones; then the NEAREST edge wins, then the closest centre on the
+ *  other axis. No window on that side means null: the key never jumps to a
+ *  window in another direction. */
+export function pickNeighborByRect(
+  rects: Record<string, WindowRect>,
+  currentId: string,
+  dir: WindowNavDir,
+): string | null {
+  const cur = rects[currentId]
+  if (!cur) return null
+  const EPS = 4
+  const horizontal = dir === 'left' || dir === 'right'
+  const curMid = horizontal ? (cur.top + cur.bottom) / 2 : (cur.left + cur.right) / 2
+  let best: string | null = null
+  let bestOverlap = false
+  let bestGap = Infinity
+  let bestOff = Infinity
+  for (const [id, r] of Object.entries(rects)) {
+    if (id === currentId) continue
+    const gap =
+      dir === 'left' ? cur.left - r.right
+      : dir === 'right' ? r.left - cur.right
+      : dir === 'up' ? cur.top - r.bottom
+      : r.top - cur.bottom
+    if (gap < -EPS) continue
+    const overlap = horizontal
+      ? Math.min(cur.bottom, r.bottom) - Math.max(cur.top, r.top) > EPS
+      : Math.min(cur.right, r.right) - Math.max(cur.left, r.left) > EPS
+    const mid = horizontal ? (r.top + r.bottom) / 2 : (r.left + r.right) / 2
+    const off = Math.abs(mid - curMid)
+    const better =
+      best === null ||
+      (overlap && !bestOverlap) ||
+      (overlap === bestOverlap &&
+        (gap < bestGap - EPS || (Math.abs(gap - bestGap) <= EPS && off < bestOff)))
+    if (better) {
+      best = id
+      bestOverlap = overlap
+      bestGap = gap
+      bestOff = off
+    }
+  }
+  return best
+}
+
 /** Toggle a fullscreen window id: same target exits, another target switches.
  *  Empty target keeps the current state. Pure, for test. */
 export function toggleFullscreenId(current: string | null, target: string): string | null {

@@ -44,8 +44,14 @@
         // bar) from every in-harness check. Captured data callbacks are exposed
         // so a driver can push pty output through window.__ptyData(text).
         var dataCbs = [];
+        var ptyCounter = 0;
         stub.terminalCreate = function () {
-          return Promise.resolve({ id: 'harness-pty-1' });
+          // The REAL reply shape (src-tauri/src/pty.rs TerminalSessionInfo):
+          // consumers read shell/program/cwd, and a shapeless { id } reply made
+          // the bottom panel crash (cwdBasename(undefined)). Unique ids, since
+          // two tabs here are two sessions.
+          var n = ++ptyCounter;
+          return Promise.resolve({ id: 'harness-pty-' + n, shell: 'zsh', program: '', cwd: '/tmp/codifa-ui-harness' });
         };
         stub.terminalWrite = function () { return Promise.resolve(true); };
         stub.terminalResize = function () { return Promise.resolve(true); };

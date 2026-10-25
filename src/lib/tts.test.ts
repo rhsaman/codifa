@@ -628,6 +628,26 @@ console.log('۲۳) مرزهای جدید سگمنت: خط جدید و ویرگو
   check('ویرگول در قطعهٔ کوتاه مرز نمی‌شود', short.length === 1, short)
 }
 
+console.log('۲۴) پخش استریمِ بی‌صدا خطا می‌دهد تا فل‌بک متن کامل اجرا شود:')
+{
+  // Regression for "live voice is mute": when the text source never produced a
+  // chunk (the answer bubble was not found), playTtsStream used to finish as a
+  // silent success — the caller saw `false`, never ran the full-text fallback,
+  // and the turn stayed mute with no error. It must report a failure instead.
+  MockAudio.instances = []
+  ttsCall = 0
+  const { playTtsStream } = await import('./tts')
+  let threw = false
+  try {
+    await playTtsStream({ snapshot: () => ({ text: '', done: true }) }, opts, 90)
+  } catch {
+    threw = true
+  }
+  check('پخش بی‌صدا throw کرد', threw)
+  check('هیچ Audio ساخته نشد', MockAudio.instances.length === 0, MockAudio.instances.length)
+  check('بعد از پایان: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+}
+
 if (failed > 0) {
   console.error(`\n❌ ${failed} تست شکست خورد`)
   process.exit(1)

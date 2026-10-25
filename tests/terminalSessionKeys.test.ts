@@ -81,7 +81,7 @@ const exitListeners: Array<(id: string) => void> = []
 
 const { spies } = await import('./xterm-spy.js')
 const { written } = await import('./xterm-spy.js')
-const { openTerminalSession, peekTerminalSession, attachTerminalScreen, fitTerminalSession, closeTerminalSession } =
+const { openTerminalSession, peekTerminalSession, attachTerminalScreen, fitTerminalSession, closeTerminalSession, ownedPtyIds } =
   await import('../src/lib/terminalSessions')
 const { NVIM_PROGRAM } = await import('../src/lib/nvimEdit')
 
@@ -190,6 +190,10 @@ console.log('3c) re-attaching the SAME element does not rebuild the terminal:')
   attachTerminalScreen(entry, el)
   check('nothing was disposed on a same-element re-attach', spies.disposed === disposed, spies.disposed)
   check('and nothing was re-opened', spies.opened === opened, spies.opened)
+  // This session's pty belongs to the PANE, so the bottom panel's open-sweep
+  // (terminalList → adopt) must skip it — otherwise the nvim of the right pane
+  // showed up as a bottom chip AND died with that panel.
+  check('the pane\'s pty is marked as panel-owned', ownedPtyIds().has('pty-1'), ownedPtyIds())
 }
 
 console.log('3d) pty OUTPUT reaches xterm even though ids differ (pty id vs tab id):')

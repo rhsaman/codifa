@@ -3,7 +3,7 @@
 // The panel reads ONE directory level at a time, so the interesting behaviour
 // is how fetched levels are merged and how open folders flatten into rows —
 // pure logic, no DOM needed.
-import { flattenTree, isLoaded, isInWorkspace, mergeChildren, pruneSubtree, sortEntries, splitWorkspaceFiles, toggleExpanded, toWorkspacePath } from '../src/lib/fileTree'
+import { ancestorDirs, flattenTree, filterRows, isLoaded, isInWorkspace, mergeChildren, nextFilterIndex, pruneSubtree, sortEntries, splitWorkspaceFiles, toggleExpanded, toWorkspacePath } from '../src/lib/fileTree'
 import type { FileEntry } from '../src/lib/fs'
 
 export {}
@@ -168,6 +168,90 @@ console.log('8) display shortening and the inside/outside split:')
   const { inside, outside } = splitWorkspaceFiles(files, root)
   check('the inside half keeps order', inside.map((f) => f.path).join() === 'src/a.ts,/Users/me/proj/b.ts', inside)
   check('the outside half keeps order', outside.map((f) => f.path).join() === '/tmp/scratch.ts', outside)
+}
+
+console.log('9) filterRows searches loaded levels and auto-opens the chain:')
+{
+  let cache = {}
+  cache = mergeChildren(cache, '', [dir('src'), file('readme.md'), file('App.tsx'), file('فیلم.mp4')])
+  cache = mergeChildren(cache, 'src', [dir('src/components'), file('src/main.ts')])
+  cache = mergeChildren(cache, 'src/components', [file('src/components/FilesPanel.tsx'), file('src/components/Chat.tsx')])
+
+  const hits = filterRows(cache, 'files')
+  check(
+    'a deep hit is pulled up with its folder chain',
+    hits.map((r) => r.path).join() === 'src,src/components,src/components/FilesPanel.tsx',
+    hits.map((r) => r.path),
+  )
+  check('the chain rows are marked open', hits[0].expanded && hits[1].expanded)
+  check('depths follow the chain', hits.map((r) => r.depth).join() === '0,1,2', hits.map((r) => r.depth))
+
+  const leaf = filterRows(cache, 'main')
+  check(
+    'a leaf hit keeps its parent chain',
+    leaf.map((r) => r.path).join() === 'src,src/main.ts',
+    leaf.map((r) => r.path),
+  )
+  check('the match is case-insensitive', filterRows(cache, 'FILES').length === 3)
+
+  const folderHit = filterRows(cache, 'comp')
+  check(
+    'a matching folder is listed by its own name (children not forced in)',
+    folderHit.map((r) => r.path).join() === 'src,src/components',
+    folderHit.map((r) => r.path),
+  )
+
+  check('nothing matches garbage', filterRows(cache, 'zzz').length === 0)
+  check(
+    'an arabic-layout query still finds the persian name',
+    filterRows(cache, 'فيلم').map((r) => r.path).join() === 'فیلم.mp4',
+    filterRows(cache, 'فيلم'),
+  )
+}
+
+console.log('10) the walked path list finds deep folders the lazy cache never read:')
+{
+  let cache = {}
+  cache = mergeChildren(cache, '', [dir('src')])
+  // Deliberately NOT loaded: `src/lib` and everything under it.
+  const walked = ['src/index.ts', 'src/lib/fileTree.ts', 'src/lib/components/Deep.tsx', 'docs/readme.md']
+
+  const deep = filterRows(cache, 'deep', walked)
+  check(
+    'a deep unopened file is found through the walk, with its ancestor chain',
+    deep.map((r) => r.path).join() === 'src,src/lib,src/lib/components,src/lib/components/Deep.tsx',
+    deep.map((r) => r.path),
+  )
+  check('the synthetic chain rows carry the right depths', deep.map((r) => r.depth).join() === '0,1,2,3', deep.map((r) => r.depth))
+  check('an unloaded ancestor is emitted as a folder row', deep[1].kind === 'dir' && deep[1].expandable === false)
+
+  const folderDeep = filterRows(cache, 'lib', walked)
+  check('a deep folder is found by name too', folderDeep.some((r) => r.path === 'src/lib'), folderDeep.map((r) => r.path))
+
+  check('a loaded hit is not duplicated from the walk', filterRows(cache, 'index', walked).filter((r) => r.path === 'src/index.ts').length === 1)
+  check('no walk list keeps the loaded-levels-only behaviour', filterRows(cache, 'deep').length === 0)
+}
+
+console.log('11) nextFilterIndex wraps the Ctrl+K/J navigation:')
+{
+  check('moving down steps forward', nextFilterIndex(0, 1, 3) === 1)
+  check('moving up steps back', nextFilterIndex(2, -1, 3) === 1)
+  check('down wraps past the end', nextFilterIndex(2, 1, 3) === 0)
+  check('up wraps past the start', nextFilterIndex(0, -1, 3) === 2)
+  check('an empty list pins to zero', nextFilterIndex(5, 1, 0) === 0)
+}
+
+console.log('12) ancestorDirs opens the chain down to a revealed file:')
+{
+  check(
+    'every parent, outermost first',
+    ancestorDirs('src/lib/components/Deep.tsx').join(',') === 'src,src/lib,src/lib/components',
+    ancestorDirs('src/lib/components/Deep.tsx'),
+  )
+  check('a top-level file has no folder to open', ancestorDirs('App.tsx').length === 0)
+  check('a one-level file opens just its folder', ancestorDirs('src/main.ts').join(',') === 'src')
+  check('an empty path yields nothing', ancestorDirs('').length === 0)
+  check('leading/trailing slashes are ignored', ancestorDirs('/src/lib/x.ts').join(',') === 'src,src/lib')
 }
 
 if (failures > 0) {

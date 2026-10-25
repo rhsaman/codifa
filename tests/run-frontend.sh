@@ -205,6 +205,7 @@ viewerFilesKind|tests/viewerFilesKind.test.ts|--packages=external --external:ele
 viewerPages|tests/viewerPages.test.ts|--packages=external --external:electron
 toolSlots|src/lib/toolSlots.test.ts|
 filesPanel|tests/filesPanel.ssr.test.tsx|--jsx=automatic --loader:.png=file --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+chatNormalMode|tests/chatNormalMode.test.ts|-
 artifactPanel|tests/artifactPanel.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 artifactsPage|tests/artifactsPage.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 tabOrder|tests/tabOrder.test.ts|-
@@ -214,6 +215,12 @@ liveSession|src/lib/liveSession.test.ts|
 livePrompt|src/lib/livePrompt.test.ts|
 paging|tests/paging.test.ts|-
 fuzzy|tests/fuzzy.test.ts|-
+paneCycle|tests/paneCycle.test.ts|
+prefixState|tests/prefixState.test.ts|
+panePointer|tests/panePointer.test.ts|
+terminalKeys|tests/terminalKeys.test.ts|
+scrollKeys|tests/scrollKeys.test.ts|
+sidebarStep|tests/sidebarStep.test.ts|
 pluginDetail|tests/pluginDetail.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 browserPanelMemory|src/lib/browserPanelMemory.test.ts|
 EOF

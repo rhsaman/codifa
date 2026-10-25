@@ -124,6 +124,9 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
     if data.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty audio");
     }
+    // Size of the clip actually uploaded (read before `data` is moved into the
+    // multipart body) — the diagnosis log below reports it.
+    let audio_bytes = data.len();
     let provider_kind = form_str(&form, "provider").trim().to_string();
     if provider_kind.is_empty() {
         return error_response(
@@ -178,6 +181,11 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
 
     let url = format!("{}/audio/transcriptions", base_url.trim_end_matches('/'));
     let (filename, mime) = sniff_audio_upload(&data);
+    // Snapshot of the request fields for the diagnosis log below (the values
+    // themselves are moved into the multipart form).
+    let debug_fields = format!(
+        "model={model} lang={lang:?} temp={temperature:?} bytes={audio_bytes} mime={mime}"
+    );
     let part = reqwest::multipart::Part::bytes(data)
         .file_name(filename.to_string())
         .mime_str(mime)
@@ -212,6 +220,16 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
     };
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
+    if std::env::var("CODIFA_STT_DEBUG").as_deref() == Ok("1") {
+        // Diagnosis switch (off by default): prints what was uploaded and what
+        // came back, so a "wrong text" report can be split into a bad REQUEST
+        // (empty/garbled audio, wrong model or language) versus a bad MODEL.
+        eprintln!(
+            "[stt-debug] {debug_fields} status={} resp={:?}",
+            status.as_u16(),
+            body.chars().take(300).collect::<String>(),
+        );
+    }
     if !status.is_success() {
         let cleaned = strip_tags(&body);
         let detail: String = if cleaned.is_empty() {

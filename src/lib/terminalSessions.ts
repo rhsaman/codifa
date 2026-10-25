@@ -47,6 +47,13 @@ const entries = new Map<string, TerminalSessionEntry>()
  * routing must therefore translate through this map first.
  */
 const tabByPtyId = new Map<string, string>()
+/** Output that arrived while its screen did not exist yet (see the router and
+ *  openTerminalSession). Keyed by pty id, replayed in order once the screen is
+ *  built. Only the tiny window between the pty id becoming known and xterm's
+ *  write path being wired can put anything here — but in that window EVERY byte
+ *  used to be silently dropped, which is exactly the "sometimes empty" nvim
+ *  screen. */
+const earlyOutput = new Map<string, string[]>()
 /** In-flight creates, so a double mount never spawns two ptys for one tab. */
 const pending = new Map<string, Promise<TerminalSessionEntry>>()
 let transportOff: (() => void) | null = null
@@ -55,6 +62,27 @@ let transportOff: (() => void) | null = null
 function entryByPtyId(ptyId: string): TerminalSessionEntry | null {
   const tabId = tabByPtyId.get(ptyId)
   return tabId ? entries.get(tabId) ?? null : null
+}
+
+/** Pty ids owned by RIGHT-PANE terminal tabs. The bottom panel sweeps
+ *  `terminalList()` (every backend session) when it opens, so without this
+ *  marker it would adopt the pane's nvim as one of its own chips — and closing
+ *  the bottom panel would then kill the in-app editor. The two hosts stay
+ *  independent: each only ever touches the ptys it created. */
+export function ownedPtyIds(): Set<string> {
+  return new Set(tabByPtyId.keys())
+}
+
+/** Start buffering a pty's raw output until its xterm exists. The pty is
+ *  ALREADY running when `terminal_create` resolves, so its first bytes can race
+ *  the screen build (nvim paints its welcome frame within one microtask) —
+ *  without this collector that output went to the router, matched nothing, and
+ *  was dropped: the screen opened on nvim's SECOND frame, i.e. blank.
+ *  Returns the live bucket: pushes land in `earlyOutput` through the router. */
+function collectPtyOutput(ptyId: string): string[] {
+  const buffered = earlyOutput.get(ptyId) ?? []
+  earlyOutput.set(ptyId, buffered)
+  return buffered
 }
 
 function hasTerminalApi(): boolean {
@@ -67,7 +95,11 @@ function hasTerminalApi(): boolean {
 function ensureTransport(): void {
   if (transportOff || !hasTerminalApi()) return
   const offData = window.coder.onTerminalData((id, data) => {
-    entryByPtyId(id)?.term.write(data)
+    // The pty can emit BEFORE its tab's screen is built (see collectPtyOutput):
+    // buffer instead of dropping, so the first frame is replayed, not lost.
+    const buf = earlyOutput.get(id)
+    if (buf) buf.push(data)
+    else entryByPtyId(id)?.term.write(data)
   })
   const offExit = window.coder.onTerminalExit((id) => {
     // The program ended on its own (`exit`): the tab stays and reports the
@@ -110,11 +142,38 @@ export function openTerminalSession(
   if (!hasTerminalApi()) return Promise.reject(new Error('terminal API unavailable'))
   ensureTransport()
 
+  // THE PTY STARTS EMITTING WHEN THE BACKEND SPAWNS IT — before this function
+  // even knows the pty id. Without a bucket ready from this moment, the buffer
+  // only starts after `terminal_create` ANSWERS, and anything nvim printed in
+  // the gap was dropped by the router (no routing existed yet) — nvim's welcome
+  // frame, which IS its first screenful, was exactly that kind of output. The
+  // backend (pty.rs) routes data through tauri events only after it has an id
+  // to name, so in practice these buckets stay empty until the answer arrives;
+  // but nothing in the IPC contract guarantees that ordering, so the safe
+  // behaviour is to always be able to hold early bytes.
+  const idBucket = collectPtyOutput('pending:' + tabId)
+
   const created = (async () => {
     const info = await window.coder.terminalCreate(cwd, program, args, program ? undefined : shell)
     const id = info?.id
     // The render reads `id`; a malformed reply must not create a phantom entry.
     if (!id || typeof id !== 'string') throw new Error('terminal_create returned no session id')
+
+    // MAP THE PTY ID *BEFORE* ANY SCREEN IS BUILT. The pty is already running
+    // (`terminal_create` resolved), so `onTerminalData(id, …)` can fire at any
+    // microtask from here on — nvim paints its first frame the moment it boots.
+     // Registering the route AFTER `buildTerminal` (the order this file used to
+    // use) dropped those early bytes: the router looked the id up, found
+    // nothing and silently discarded them, so nvim came up next to a BLANK
+    // screen — the "sometimes opens empty" bug.
+    tabByPtyId.set(id, tabId)
+    // Chunks captured under the pending key (in case any arrived before the
+    // answer) move under the REAL pty id so the router keeps buffering them.
+    if (idBucket.length) {
+      const moved = collectPtyOutput(id)
+      moved.push(...idBucket)
+    }
+    earlyOutput.delete('pending:' + tabId)
 
     const { term, fit } = buildTerminal(id)
     // Register for live point-size changes; the fit makes the new size visible
@@ -127,7 +186,16 @@ export function openTerminalSession(
     // default 80x24 grid inside a much larger pane) and closing the tab never
     // found the session to kill it.
     entries.set(tabId, entry)
-    tabByPtyId.set(id, tabId)
+    // Everything nvim printed while the screen was still being built — under
+    // either key — replayed IN ORDER, so the first frame is never lost to the
+    // await above. The collector must drop off BEFORE the replay loop: data
+    // arriving from here on goes straight to `term.write` (the live path), and
+    // a chunk landing between the drain and the loop's last iteration would be
+    // written twice.
+    const preOpen = earlyOutput.get(id) ?? []
+    earlyOutput.delete(id)
+    earlyOutput.delete('pending:' + tabId)
+    preOpen.forEach((chunk: string) => entry.term.write(chunk))
     return entry
   })()
 
@@ -250,9 +318,10 @@ export function closeTerminalSession(tabId: string): void {
   const entry = entries.get(tabId)
   if (!entry) return
   entries.delete(tabId)
-  // Drop the pty-id translation too: a leftover mapping would route a NEW
+   // Drop the pty-id translation too: a leftover mapping would route a NEW
   // session's output into this dead entry if the backend ever reused the id.
   tabByPtyId.delete(entry.id)
+  earlyOutput.delete(entry.id)
   entry.offFont()
   entry.term.dispose()
   const ptyId = entry.id

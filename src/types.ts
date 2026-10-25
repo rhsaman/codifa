@@ -519,7 +519,7 @@ export interface ChatMessage {
   skills?: string[]
   usage?: TokenUsage
   error?: boolean
-  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
+  retry?: { attempt: number; maxAttempts: number; delay: number; reason: string; gaveUp?: boolean; watchdog?: boolean; model?: string; providerId?: string; agent?: string; tool?: string; branch?: number; fallback?: boolean; reconnecting?: boolean; startedAt?: number } | null
   /** True once this message has been folded into a compact summary (kept in the
    *  UI as a greyed, collapsible entry but NOT re-sent to the model). */
   compacted?: boolean

@@ -38,6 +38,7 @@ import type {
   LspStatus,
   Workspace,
 } from '../types'
+import type { LiveVoiceState } from './liveVoiceState'
 
 /** Max persisted inbox seen ids — newest win, so the badge store stays bounded. */
 export const MAX_SCHEDULE_RUNS_SEEN = 500
@@ -1440,6 +1441,23 @@ interface State {
   setLiveProviderId: (id: string) => void
   setLiveModel: (m: string) => void
   setLiveVoice: (v: string) => void
+  /**
+   * The chat that owns the (single) live voice session, or null when none
+   * runs. App-wide and not persisted: every mounted chat panel reads it and
+   * only the owner shows the live button, no matter how many windows exist.
+   */
+  liveVoiceChatId: string | null
+  /**
+   * Live state of the owning session as seen by every mounted chat panel.
+   * `idle` means no session runs; a non-null `liveVoiceChatId` with a busy
+   * state is what hides the live button in all the other chats.
+   */
+  liveVoiceState: LiveVoiceState
+  /**
+   * Brings every mounted chat panel in line after the session's state changed.
+   * `state` is the owning chat's own live state (`idle` releases the lock).
+   */
+  setLiveVoiceSession: (chatId: string | null, state: LiveVoiceState) => void
   setTtsProviderId: (id: string) => void
   setTtsModel: (m: string) => void
   setTtsVoice: (v: string) => void
@@ -1835,9 +1853,24 @@ function applyChatBody(body: Chat): void {
   })
 }
 
+/** A chat whose transcript a live turn is still appending to.
+ *
+ *  Its body must stay resident: the streamed text only exists in memory until
+ *  the turn settles, and `writeChatsNow` persists it as a side effect of that
+ *  same in-memory body. Dropping it would silently lose the turn's output. */
+function chatIsStreaming(c: Chat): boolean {
+  return c.messages.some((m) => m.streaming)
+}
+
 /**
- * Drop the bodies of hydrated chats that are neither open nor visible, newest
- * first, until at most `HYDRATED_CHAT_CAP` bodies remain.
+ * Drop the bodies of hydrated chats that are not in use, newest first, until at
+ * most `HYDRATED_CHAT_CAP` bodies remain.
+ *
+ * Only the ACTIVE chat and chats with a live turn are exempt. Chats that are
+ * merely open or visible are candidates too: a session with six chats open used
+ * to keep all six multi-megabyte transcripts resident forever, which is what
+ * made memory grow linearly with the number of open chats. Re-opening one is a
+ * single local file read through `chatGet`, so eviction costs no visible delay.
  */
 function evictChatBodies(): void {
   const s = useStore.getState()
@@ -1847,9 +1880,9 @@ function evictChatBodies(): void {
   // whose latest edit was never written — the edit would vanish from disk.
   // Let the pending flush land first; eviction happens on the next hydrate.
   if (persistTimer) return
-  const keep = new Set<string>([s.activeChatId, ...s.openChatIds, ...s.visibleChatIds])
+  const keep = new Set<string>([s.activeChatId])
   const candidates = s.chats
-    .filter((c) => c.hydrated === true && !keep.has(c.id))
+    .filter((c) => c.hydrated === true && !keep.has(c.id) && !chatIsStreaming(c))
     // Most recently used first: the tail of this list is what gets dropped.
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
   if (candidates.length <= HYDRATED_CHAT_CAP) {
@@ -2013,6 +2046,8 @@ export const useStore = create<State>((set, get) => ({
   liveProviderId: '',
   liveModel: '',
   liveVoice: '',
+  liveVoiceChatId: null,
+  liveVoiceState: 'idle',
   recentModels: [],
   subagentModels: {},
   subagentThinking: {},
@@ -3115,6 +3150,9 @@ export const useStore = create<State>((set, get) => ({
   setLiveVoice: (v) => {
     set({ liveVoice: (v ?? '').trim() })
     get().persist()
+  },
+  setLiveVoiceSession: (liveVoiceChatId, state) => {
+    set({ liveVoiceChatId, liveVoiceState: state })
   },
   setTtsProviderId: (id) => {
     set({ ttsProviderId: (id ?? '').trim() })

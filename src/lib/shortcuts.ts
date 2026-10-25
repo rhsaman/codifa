@@ -64,8 +64,10 @@ export interface PrefixShortcut {
   cmd: string;
   /** Short human description, e.g. "Compact the chat context". */
   label: string;
-  /** Non-command actions that App.tsx dispatches directly (e.g. voice). */
-  action?: "voice";
+  /** Non-command actions that App.tsx dispatches directly. `live` toggles
+   *  the realtime voice session; `voice` is hold-Space dictation; `terminal`
+   *  toggles the bottom terminal panel. */
+  action?: "voice" | "live" | "terminal";
 }
 
 /** Second key (after Ctrl+X) -> the command it runs. Order is display order.
@@ -75,10 +77,12 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   u: { cmd: "/undo", label: "Undo the last exchange" },
   r: { cmd: "/redo", label: "Redo the last undone exchange" },
   c: { cmd: "/compact", label: "Summarize & compact the chat context" },
+  v: { cmd: "/voice", label: "Toggle the live voice session", action: "live" },
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
+  j: { cmd: "", label: "Toggle the terminal panel", action: "terminal" },
 };
 
-/** Move direction for a prefix second key (Ctrl+X then H/J/K/L).
+/** Move direction for the direct chord (Cmd/Ctrl + H/J/K/L, no Ctrl+X prefix).
  *  Vim-style: h=left, j=down, k=up, l=right. Pure, for test. */
 export type PrefixMoveDir = "left" | "down" | "up" | "right";
 
@@ -89,6 +93,22 @@ export function prefixMoveDir(key: string | null | undefined): PrefixMoveDir | n
   if (k === "k") return "up";
   if (k === "l") return "right";
   return null;
+}
+
+/** Which chat-window move (or none) a direct Cmd/Ctrl+H/J/K/L chord requests.
+ *  True when the event is a bare Cmd/Ctrl chord (no Shift/Alt/other modifier)
+ *  of exactly one of the four movement keys. Pure, for test. */
+export function isWindowMoveChord(e: {
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey?: boolean;
+  shiftKey?: boolean;
+}): PrefixMoveDir | null {
+  if (e.shiftKey || e.altKey) return null;
+  if (!(e.ctrlKey || e.metaKey)) return null;
+  return prefixMoveDir(physicalKey(e));
 }
 
 /** True on macOS/iOS — decides which half of the Cmd/Ctrl convention a chord
@@ -126,9 +146,9 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+P", label: "Quick-open / search overlay (⌘⇧F = content search)" },
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
-  { keys: "Cmd/Ctrl+J", label: "Toggle the terminal panel" },
-  { keys: "Ctrl+H/J/K/L", label: "Move between chat windows vim-style (focuses the composer)" },
-  { keys: "Ctrl+X H/J/K/L", label: "Move the focused chat window vim-style (swaps with the neighbor)" },
+  { keys: "Ctrl+X then J", label: "Toggle the terminal panel (the only terminal toggle — works while the caret is inside the terminal too)" },
+  { keys: "Ctrl+H/J/K/L", label: "Move focus vim-style (k=up, j=down, h=left, l=right): to the chat window that really lies in that direction; past the rightmost window l enters the open right panel, past the leftmost h enters the open sidebar, and h/l return from them to the chat" },
+  { keys: "Shift+Alt(Option)+H/J/K/L", label: "Swap (move) chat window positions in the same vim directions" },
   {
     keys: "Cmd/Ctrl+W",
     label: "Close the active tab (terminal while it has focus, else viewer, else chat)",

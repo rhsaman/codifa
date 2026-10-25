@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { workspaceFiles, api, loadFileUsage, bumpFileUsage, type WorkspaceFile, type SearchMatch } from '../lib/fs'
 import { useStore } from '../lib/store'
 import { physicalKey } from '../lib/shortcuts'
+import { useViewerTabs } from '../lib/viewerTabs'
 
 function fuzzyScore(pattern: string, text: string): number {
   pattern = pattern.toLowerCase()
@@ -106,9 +107,14 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
     resultsRef.current?.querySelector<HTMLElement>('.search-item.active')?.scrollIntoView({ block: 'nearest' })
   }, [idx])
 
-  const select = (rel: string) => {
+  // Picking a result opens it in the right-hand viewer pane instead of
+  // attaching it to the composer — a file result opens at the top, a content
+  // (grep) hit at its matching line. The owning chat of the active tab is
+  // passed so the tab lands on the chat whose explorer opened it.
+  const select = (rel: string, line?: number) => {
     if (root) bumpFileUsage(root, rel)
-    window.dispatchEvent(new CustomEvent('coder:attach-file', { detail: { rel } }))
+    const chatId = useStore.getState().activeChatId
+    useViewerTabs.getState().openFile(rel, line, root, chatId)
     onClose()
   }
 
@@ -148,7 +154,13 @@ export function SearchOverlay({ onClose }: { onClose: () => void }) {
     if (e.key === 'Enter') {
       e.preventDefault()
       const r = results[idx]
-      if (r) select('rel' in r ? (r as WorkspaceFile).rel : (r as SearchMatch).file)
+      if (r) {
+        if ('rel' in r) select((r as WorkspaceFile).rel)
+        else {
+          const m = r as SearchMatch
+          select(m.file, m.line)
+        }
+      }
       return
     }
     if (physicalKey(e) === 'f' && e.shiftKey && (e.metaKey || e.ctrlKey)) {

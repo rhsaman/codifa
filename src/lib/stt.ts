@@ -323,8 +323,33 @@ export function decimationKernel(ratio: number): Float32Array {
   return kernel
 }
 
-/** RMS below which a 20 ms window is treated as silence. */
-export const SILENCE_RMS = 0.004
+/** Absolute RMS floor below which a 20 ms window is silence, whatever the clip. */
+export const SILENCE_RMS = 0.0015
+
+/**
+ * Level, as a fraction of the clip's reference, at which the HEAD walk-back
+ * stops.
+ *
+ * Deliberately far below the voice gate: the opening of a word is a ramp, and
+ * the walk-back only has to follow that ramp back down to where the room tone
+ * ends. Reaching it while still below the gate is exactly what keeps a soft
+ * first word («سلام» said quickly) from being sliced off.
+ */
+export const SILENCE_ONSET_FRACTION = 0.012
+
+/** A window counts as voice once its RMS reaches this fraction of the clip's own
+ *  reference level. Gating on the clip's own level instead of an absolute RMS is
+ *  what keeps a soft final syllable from being deleted just because the speaker
+ *  trailed off (an absolute gate sliced the tail off every quiet word: "نصفه").
+ *
+ *  The reference is a HIGH PERCENTILE of the window energies, not the single
+ *  loudest window: an utterance with one loud burst pulled the peak reference up
+ *  and gated out a soft first word ("سلام خوبی" came back as "خوبی"). The
+ *  percentile tracks the body of the speech instead. */
+export const SILENCE_RELATIVE_FLOOR = 0.05
+
+/** Percentile of the window energy used as the loudness reference for the gate. */
+export const SILENCE_REFERENCE_PERCENTILE = 0.9
 
 /** Result of {@link trimSilence}. */
 export interface TrimmedPcm {
@@ -332,6 +357,18 @@ export interface TrimmedPcm {
   /** Milliseconds that actually contained signal (silence excluded). */
   speechMs: number
 }
+
+/**
+ * Extra audio kept BEFORE the first voiced window.
+ *
+ * The head needs far more than the tail: a word does not start at full energy,
+ * it ramps up (and the first consonant of a phrase is the quietest part of it).
+ * With head and tail padded equally, an utterance that begins softly — «سلام»
+ * said quickly before the body gets loud — had its whole first word gated out,
+ * so the model transcribed «سلام خوبی» as «خوبی». The head pad is deliberately
+ * several times the tail pad so the first phoneme always survives.
+ */
+export const TRIM_HEAD_PAD_MS = 300
 
 /**
  * Trim the silence around the speech in one chunk.
@@ -343,7 +380,9 @@ export interface TrimmedPcm {
  * model's attention.
  *
  * `padMs` is kept on both sides so the first and last phoneme is never clipped
- * — cutting exactly on the energy edge audibly truncates plosives.
+ * — cutting exactly on the energy edge audibly truncates plosives. The head
+ * side additionally keeps {@link TRIM_HEAD_PAD_MS}, because the onset ramp of
+ * the first word sits below the voice gate.
  */
 export function trimSilence(
   pcm: Float32Array,
@@ -357,14 +396,31 @@ export function trimSilence(
   const total = pcm.length
   const windows = Math.floor(total / win)
   if (windows === 0) return { pcm, speechMs: 0 }
-  const loud: boolean[] = []
-  let speechWindows = 0
+  // Per-window RMS in one pass, so the gate can be made relative to the clip's
+  // own loudness instead of an absolute level.
+  const rms: number[] = new Array(windows)
   for (let w = 0; w < windows; w++) {
     const start = w * win
     let sum = 0
     for (let i = start; i < start + win; i++) sum += pcm[i] * pcm[i]
-    const voiced = Math.sqrt(sum / win) >= SILENCE_RMS
-    loud.push(voiced)
+    rms[w] = Math.sqrt(sum / win)
+  }
+  // Loudness reference: a high percentile of the window energies (see
+  // SILENCE_REFERENCE_PERCENTILE), so one loud burst cannot gate out the rest.
+  const sorted = [...rms].sort((a, b) => a - b)
+  const refIndex = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.round((sorted.length - 1) * SILENCE_REFERENCE_PERCENTILE)),
+  )
+  const reference = sorted[refIndex] ?? 0
+  // Voice threshold: the louder of an absolute floor (rejects pure room noise)
+  // and a fraction of the clip's own reference level (keeps quiet real speech).
+  const gate = Math.max(SILENCE_RMS, reference * SILENCE_RELATIVE_FLOOR)
+  const loud: boolean[] = new Array(windows)
+  let speechWindows = 0
+  for (let w = 0; w < windows; w++) {
+    const voiced = rms[w] >= gate
+    loud[w] = voiced
     if (voiced) speechWindows++
   }
   if (speechWindows === 0) return { pcm: new Float32Array(0), speechMs: 0 }
@@ -372,8 +428,19 @@ export function trimSilence(
   while (first < windows && !loud[first]) first++
   let last = windows - 1
   while (last >= 0 && !loud[last]) last--
+  // Walk the head back to where the sound actually STARTS, not to the first
+  // window that crosses the gate. A soft first word ramps up (and a Persian
+  // «س» carries almost no energy), so its opening windows sit below the gate
+  // while the word is already being spoken: cutting at `first` sliced the head
+  // off «سلام» and the model transcribed only «خوبی».
+  const onsetFloor = Math.max(SILENCE_RMS, reference * SILENCE_ONSET_FRACTION)
+  let onset = first
+  while (onset > 0 && rms[onset - 1] >= onsetFloor) onset--
+  // Tail pad stays at `padMs` (plosives only need a little room); the head gets
+  // the larger onset ramp budget (see TRIM_HEAD_PAD_MS).
   const pad = Math.max(0, Math.floor((sampleRate * padMs) / 1000))
-  const start = Math.max(0, first * win - pad)
+  const headPad = Math.max(pad, Math.floor((sampleRate * TRIM_HEAD_PAD_MS) / 1000))
+  const start = Math.max(0, onset * win - headPad)
   const end = Math.min(total, (last + 1) * win + pad)
   return { pcm: pcm.slice(start, end), speechMs: speechWindows * 20 }
 }
@@ -460,21 +527,97 @@ export function mixToMono(
   return out
 }
 
+/** Frame length (ms) used to sample a clip's energy envelope. */
+export const ENVELOPE_FRAME_MS = 20
+
 /**
- * Decode a recorded blob and re-encode it as 16 kHz mono WAV.
+ * Minimum coefficient of variation of the frame-RMS envelope for audio to be
+ * considered speech rather than music or steady noise.
  *
- * Every STT request should carry the format providers decode most reliably.
- * Live voice already does (raw PCM -> WAV); dictate used to upload the raw
- * MediaRecorder container untouched, so the same voice could transcribe well
- * in one mode and badly in the other. Returns null when the blob cannot be
- * decoded, and the caller then sends the original bytes unchanged.
+ * Speech has syllables: its energy envelope crosses near-silence between them,
+ * so it is spiky (measured CV ≈ 1.5). Music, fan/AC hum and room noise all hold
+ * a steady level across the clip (measured CV ≤ 0.3), so they sit far below this
+ * cut. Gating on the SHAPE of the envelope is level-independent — unlike a
+ * louder level threshold, it never rejects a softly spoken first word.
+ *
+ * The cut is deliberately closer to the noise side (0.5, not the midpoint of
+ * 0.3 and 1.5): this gate decides whether REAL speech is thrown away and the
+ * user is told "nothing was heard", so it must only reject audio that is
+ * unambiguously flat. Real decoded recordings are noisier than a synthetic
+ * signal, and a rejected recording is unrecoverable.
  */
-export async function blobToWav16k(blob: Blob): Promise<Blob | null> {
+export const SPEECH_ENVELOPE_MIN_CV = 0.5
+
+/**
+ * Coefficient of variation (std/mean) of a 20 ms frame-RMS envelope.
+ *
+ * Returns 0 for an empty or silent clip, which is correctly "not speech". A
+ * pure tone or steady noise keeps both its mean and its variation small, so the
+ * ratio — not the absolute level — is what separates speech from them.
+ */
+export function envelopeCv(pcm: Float32Array, sampleRate: number): number {
+  const win = Math.max(1, Math.floor((sampleRate * ENVELOPE_FRAME_MS) / 1000))
+  const windows = Math.floor(pcm.length / win)
+  if (windows < 2) return 0
+  const rms: number[] = new Array(windows)
+  let mean = 0
+  for (let w = 0; w < windows; w++) {
+    const start = w * win
+    let sum = 0
+    for (let i = start; i < start + win; i++) {
+      const v = pcm[i]
+      sum += v * v
+    }
+    const r = Math.sqrt(sum / win)
+    rms[w] = r
+    mean += r
+  }
+  mean /= windows
+  if (mean <= 1e-9) return 0
+  let variance = 0
+  for (let w = 0; w < windows; w++) {
+    const d = rms[w] - mean
+    variance += d * d
+  }
+  return Math.sqrt(variance / windows) / mean
+}
+
+/**
+ * True when the clip's energy envelope looks like speech (syllabic, spiky)
+ * rather than music, a steady tone or room noise.
+ */
+export function isLikelySpeechEnvelope(
+  pcm: Float32Array,
+  sampleRate: number,
+  minCv: number = SPEECH_ENVELOPE_MIN_CV,
+): boolean {
+  if (pcm.length === 0) return false
+  return envelopeCv(pcm, sampleRate) >= minCv
+}
+
+/** Outcome of analysing a recorded clip for STT. */
+type ClipAnalysis =
+  /** Decoded, cleaned 16 kHz WAV ready to upload. */
+  | { kind: 'speech'; wav: Blob }
+  /** Decoded fine, but the audio is music/tone/room noise, not voice. */
+  | { kind: 'no-speech' }
+  /** The container could not be decoded at all. */
+  | { kind: 'undecodable' }
+
+/**
+ * Decode a recorded blob, then decide whether it even holds speech.
+ *
+ * Splitting "could not decode" (send the original bytes) from "decoded, but it
+ * is background audio" (send NOTHING) is what stops music or room noise from
+ * being uploaded and coming back as invented words. A level gate cannot tell
+ * them apart; the energy envelope can (see {@link isLikelySpeechEnvelope}).
+ */
+export async function analyzeClip16k(blob: Blob): Promise<ClipAnalysis> {
   try {
     const Ctx =
       (globalThis as { AudioContext?: typeof AudioContext }).AudioContext ??
       (globalThis as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-    if (!Ctx) return null
+    if (!Ctx) return { kind: 'undecodable' }
     const raw = await blob.arrayBuffer()
     const ctx = new Ctx()
     try {
@@ -485,15 +628,40 @@ export async function blobToWav16k(blob: Blob): Promise<Blob | null> {
       }
       const mono = mixToMono(channels, decoded.length)
       const pcm = downsampleFloat32(mono, decoded.sampleRate, STT_SAMPLE_RATE)
-      if (pcm.length === 0) return null
+      if (pcm.length === 0) return { kind: 'no-speech' }
       // Same clean-up as a live chunk: dead air around the utterance is what
       // makes a non-streaming model invent filler words, and a quiet recording
       // is the single biggest accuracy loss for a non-streaming provider. When
       // nothing crosses the silence gate (a very quiet mic), the whole clip is
       // sent instead of an empty file.
       const trimmed = trimSilence(pcm, STT_SAMPLE_RATE)
+      // The envelope gate exists to drop music, a held tone or steady room noise
+      // BEFORE it reaches the provider (which turns them into invented words).
+      //
+      // It must never veto a real recording, and two things used to make it do
+      // exactly that — the "nothing was heard" a genuine short utterance got:
+      //
+      //  * a dictate clip opens with the gap between pressing the button and the
+      //    first word, so most of the clip is silence. Sampling the envelope over
+      //    the WHOLE clip let that silence dominate the mean and drag the CV
+      //    below the cut, even though the words were perfectly clear.
+      //  * trimSilence already proved there IS a voiced region. If it found
+      //    speech, the gate has nothing left to prove:
+      //
+      // So: the gate runs on the trimmed (speech) region, and only when the trim
+      // found no voice at all does flatness decide.
       const voiced = trimmed.pcm.length > 0 ? trimmed.pcm : pcm
-      return encodeWavPcm16(normalizePeak(voiced), STT_SAMPLE_RATE)
+      if (trimmed.speechMs > 0 && !isLikelySpeechEnvelope(voiced, STT_SAMPLE_RATE)) {
+        // Voiced windows but a flat envelope: music or a sustained tone (a held
+        // note, a fan next to the mic) rather than a voice.
+        return { kind: 'no-speech' }
+      }
+      if (trimmed.speechMs === 0 && !isLikelySpeechEnvelope(pcm, STT_SAMPLE_RATE)) {
+        // Nothing crossed the silence gate and the clip is flat throughout — no
+        // speech to transcribe.
+        return { kind: 'no-speech' }
+      }
+      return { kind: 'speech', wav: encodeWavPcm16(normalizePeak(voiced), STT_SAMPLE_RATE) }
     } finally {
       try {
         void ctx.close()
@@ -503,8 +671,27 @@ export async function blobToWav16k(blob: Blob): Promise<Blob | null> {
     }
   } catch {
     // Undecodable container: the caller keeps the original blob.
-    return null
+    return { kind: 'undecodable' }
   }
+}
+
+/**
+ * Decode a recorded blob and re-encode it as 16 kHz mono WAV.
+ *
+ * Every STT request should carry the format providers decode most reliably.
+ * Live voice already does (raw PCM -> WAV); dictate used to upload the raw
+ * MediaRecorder container untouched, so the same voice could transcribe well
+ * in one mode and badly in the other. Returns null when the blob cannot be
+ * decoded, and the caller then sends the original bytes unchanged.
+ *
+ * Prefer {@link analyzeClip16k} when the caller needs to distinguish "could not
+ * decode" from "decoded but held no speech".
+ */
+export async function blobToWav16k(blob: Blob): Promise<Blob | null> {
+  const res = await analyzeClip16k(blob)
+  if (res.kind === 'speech') return res.wav
+  if (res.kind === 'no-speech') return null
+  return null
 }
 
 /**

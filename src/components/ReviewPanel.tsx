@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useVimScroll } from "../lib/useVimScroll";
 import { createPortal } from "react-dom";
 import { buildReviewTurn } from "../lib/reviewTurn";
 import { buildUncommittedFiles } from "../lib/uncommitted";
@@ -493,8 +494,12 @@ export function ReviewPanel(props?: {
     );
   };
 
+  const panelRef = useRef<HTMLDivElement>(null)
+  useVimScroll(panelRef)
+
   const panel = (
     <div
+      ref={panelRef}
       className={docked ? "review-docked-wrap" : `review-overlay${fullscreen ? " fullscreen" : ""}`}
       dir="ltr"
       style={docked ? undefined : ({ "--review-w": `${width}px` } as React.CSSProperties)}

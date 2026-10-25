@@ -392,6 +392,9 @@ export const TEXT_RESULT_TOOLS = new Set([
   "lsp_diagnostics",
   "search_memory",
   "save_memory",
+  // A delete answers with a plain confirmation line, not a note list; without
+  // this the card showed nothing after a successful delete.
+  "delete_memory",
   "explore",
   "read",
   // Terminal output arrives as a plain string in `event.result` — without
@@ -402,6 +405,15 @@ export const TEXT_RESULT_TOOLS = new Set([
   // into a result chip — a `Test UI` skill showed `harness.html` /
   // `harness.tsx` rows for files the tool never touched.
   "load_skill",
+]);
+
+/** Tools whose result is a plain text line/note-list rather than files or a
+ *  diff: a `search_memory` hit list, a `save_memory` confirmation or a
+ *  `delete_memory` acknowledgement. Their expansion shows that text. */
+export const MEMORY_TOOLS = new Set([
+  "search_memory",
+  "save_memory",
+  "delete_memory",
 ]);
 
 /** Tools whose result rows come from the BACKEND as structured JSON

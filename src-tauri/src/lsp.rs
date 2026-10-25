@@ -212,6 +212,29 @@ pub fn activity() -> u64 {
 
 // --- registry tables (parity with lsp_manager.py) ---------------------------
 
+/// `NODE_OPTIONS` for a node-based language server: cap the V8 heap, then
+/// append whatever the user already had.
+///
+/// `typescript-language-server` forks `tsserver`, whose default heap ceiling is
+/// several GB — measured 578 MB of RSS on this workspace before any cap. This
+/// is the knob VS Code exposes as `maxTsServerMemory`; nothing becomes
+/// unavailable, the GC simply runs earlier (a full GC at >512 MB takes ~290 ms,
+/// so 1 GB leaves room to stay responsive).
+///
+/// The user's own options are appended, never replaced, and always separated by
+/// a space: without it `--inspect` would concatenate into `=1024--inspect` and
+/// node would reject the whole string.
+fn node_options_with_heap_cap() -> String {
+    const HEAP_CAP: &str = "--max-old-space-size=1024";
+    let inherited = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let inherited = inherited.trim().to_string();
+    if inherited.is_empty() {
+        HEAP_CAP.to_string()
+    } else {
+        format!("{HEAP_CAP} {inherited}")
+    }
+}
+
 fn server_command(language: &str) -> Option<Vec<String>> {
     let cmd: &[&str] = match language {
         "python" => &["pylsp"],
@@ -460,6 +483,17 @@ impl Server {
             // and each one is a full compiler; unbounded, they were the source
             // of the multi-GB spikes that made this app look like a leak.
             .env("CARGO_BUILD_JOBS", "2")
+            // Bound the V8 heap of node-based servers. `typescript-language-server`
+            // forks tsserver, and tsserver holds the whole project index; without a
+            // cap V8 lets its heap grow until macOS swaps (measured 578 MB on this
+            // workspace). This is the same knob VS Code exposes as
+            // `maxTsServerMemory` (its default is ~3 GB): no feature is lost —
+            // diagnostics, hover and rename all still work, the GC merely runs
+            // earlier. 1 GB leaves generous headroom above every RSS sample we
+            // have taken while still halving the pathological peak. Ignored by
+            // non-node servers (rust-analyzer is a native binary). Appended to any
+            // NODE_OPTIONS the user already set, never replacing it.
+            .env("NODE_OPTIONS", node_options_with_heap_cap())
             .current_dir(root)
             // Give the server its OWN process group so it dies with everything it
             // spawns. A language server is a launcher: `typescript-language-server`
@@ -660,7 +694,23 @@ impl Server {
         // produces identical results, just without the eager warm-up.
         let initialization_options = if self.language == "rust" {
             json!({
+                // Skip the initial "cache priming" scan: it walks the whole
+                // workspace before the first query and was a large part of the
+                // multi-GB spikes. Nothing user-visible depends on it.
                 "cachePriming": { "enable": false },
+                // Cap the parallel-query worker pool instead of one thread per
+                // core: each worker holds part of the query arena, and the peak
+                // (measured 2 GB) scaled with it. 4 keeps hover/rename fast on
+                // an 8-core machine while halving the worst-case arena.
+                "numThreads": 4,
+                // Keep the query LRU at its documented default so caching
+                // behaviour (and therefore responsiveness) is unchanged.
+                "lru": { "capacity": 128 },
+                // Pinned explicitly on purpose: these are the features the
+                // caps above must never degrade.
+                "diagnostics": { "enable": true },
+                "procMacro": { "enable": true },
+                "cargo": { "buildScripts": { "enable": true } },
             })
         } else {
             Value::Null
@@ -1873,6 +1923,23 @@ mod tests {
         assert_eq!(language_id_for_suffix(".tsx"), "typescriptreact");
         assert_eq!(language_id_for_suffix(".sh"), "shellscript");
         assert_eq!(language_id_for_suffix(".py"), "python");
+    }
+
+    /// The heap cap must never swallow a user's own `NODE_OPTIONS`: a missing
+    /// separator turns `--max-old-space-size=1024--inspect=0` into an invalid
+    /// string and node refuses to start at all.
+    #[test]
+    fn node_options_cap_is_always_separated() {
+        std::env::remove_var("NODE_OPTIONS");
+        assert_eq!(node_options_with_heap_cap(), "--max-old-space-size=1024");
+        std::env::set_var("NODE_OPTIONS", "--inspect=0");
+        assert_eq!(
+            node_options_with_heap_cap(),
+            "--max-old-space-size=1024 --inspect=0"
+        );
+        std::env::set_var("NODE_OPTIONS", "   ");
+        assert_eq!(node_options_with_heap_cap(), "--max-old-space-size=1024");
+        std::env::remove_var("NODE_OPTIONS");
     }
 
     #[test]

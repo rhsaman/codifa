@@ -261,18 +261,29 @@ export function retryRetiredByEvent(
         gaveUp?: boolean
         watchdog?: boolean
         fallback?: boolean
+        branch?: number
       }
     | null
     | undefined,
-  event: { kind?: string; tool?: string; sub?: boolean },
+  event: { kind?: string; tool?: string; sub?: boolean; branch?: number },
 ): boolean {
   if (!retry || !retry.agent) return false
   if (retry.gaveUp === true || retry.watchdog === true) return false
   if (retry.fallback === true) return false
+  // PROOF OF RECOVERY: the sub-agent's own tool call (read/grep/glob) in the
+  // SAME branch means its model answered again, so the retry is over. Waiting
+  // for the owning tool's final result left a recovered explore showing its
+  // error banner for the whole rest of its run. Branch-exact on purpose: a
+  // parallel sibling working fine proves nothing about this one.
+  if (
+    event.sub === true &&
+    (event.kind === 'tool' || event.kind === 'tool_result')
+  ) {
+    return retry.branch !== undefined && event.branch === retry.branch
+  }
   if (event.kind !== 'tool_result') return false
-  // Nested events belong to the sub-agent's OWN tools (read/grep/glob), not to
-  // the call being retried — only the parent-level result retires the banner.
-  if (event.sub === true) return false
+  // Any other nested event belongs to a sub-agent but proves nothing here — only
+  // the parent-level result retires the banner by tool name.
   const owner = (retry.tool ?? '').trim()
   if (!owner) return false
   return (event.tool ?? '').trim() === owner

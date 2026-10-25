@@ -4,7 +4,10 @@
 // اجرا: npx esbuild src/lib/shortcuts.test.ts --bundle --platform=node \
 //        --format=esm --outfile=src/lib/.tmp-shortcuts.mjs && node src/lib/.tmp-shortcuts.mjs
 
-import { navChord, panelToggleTarget, prefixMoveDir, shouldFocusSearch } from "./shortcuts"
+import { navChord, panelToggleTarget, prefixMoveDir, isWindowMoveChord, shouldFocusSearch, PREFIX_SHORTCUTS } from "./shortcuts"
+import { PREFIX_SECOND_KEYS } from "./terminalKeys"
+import { pickNeighborByRect } from "./chatTree"
+import type { PrefixMoveDir } from "./shortcuts"
 
 export {}
 
@@ -84,7 +87,7 @@ console.log('۴) panelToggleTarget — تفکیک سایدبار و پنل را�
   check('کلید دیگر → null', panelToggleTarget({ code: 'KeyC', key: 'c', ctrlKey: true, metaKey: false, shiftKey: true }) === null)
 }
 
-console.log('۵) prefixMoveDir — جابه‌جایی پنجره با Ctrl+X then H/J/K/L:')
+console.log('۵) prefixMoveDir — جابه‌جایی پنجره با H/J/K/L:')
 {
   check('h → left', prefixMoveDir('h') === 'left')
   check('j → down', prefixMoveDir('j') === 'down')
@@ -94,6 +97,91 @@ console.log('۵) prefixMoveDir — جابه‌جایی پنجره با Ctrl+X th
   check('u → null (undo می‌ماند)', prefixMoveDir('u') === null)
   check('خالی → null', prefixMoveDir('') === null)
   check('null → null', prefixMoveDir(null) === null)
+}
+
+console.log('۶) isWindowMoveChord — کورد مستقیم Cmd/Ctrl + H/J/K/L:')
+{
+  const chord = (k: string, code: string, opts: Partial<{ ctrl: boolean; meta: boolean; alt: boolean; shift: boolean }> = {}) => ({
+    key: k,
+    code,
+    ctrlKey: !!opts.ctrl,
+    metaKey: !!opts.meta,
+    altKey: !!opts.alt,
+    shiftKey: !!opts.shift,
+  })
+  check('Ctrl+H → left', isWindowMoveChord(chord('h', 'KeyH', { ctrl: true })) === 'left')
+  check('Ctrl+J → down', isWindowMoveChord(chord('j', 'KeyJ', { ctrl: true })) === 'down')
+  check('Ctrl+K → up', isWindowMoveChord(chord('k', 'KeyK', { ctrl: true })) === 'up')
+  check('Ctrl+L → right', isWindowMoveChord(chord('l', 'KeyL', { ctrl: true })) === 'right')
+  check('⌘+H (مک) → left', isWindowMoveChord(chord('h', 'KeyH', { meta: true })) === 'left')
+  // چیدمان فارسی: کلید فیزیکی H حرف «ا» می‌دهد ولی code همان KeyH است.
+  check('Ctrl+«ا» (code=KeyH) → left', isWindowMoveChord(chord('ا', 'KeyH', { ctrl: true })) === 'left')
+  check('Ctrl+Shift+H → null (سواپ Shift+Alt جدا است)', isWindowMoveChord(chord('h', 'KeyH', { ctrl: true, shift: true })) === null)
+  check('Ctrl+Alt+H → null', isWindowMoveChord(chord('h', 'KeyH', { ctrl: true, alt: true })) === null)
+  check('بدون مودیفایر → null (تایپ/اسکرول)', isWindowMoveChord(chord('h', 'KeyH')) === null)
+  check('Ctrl+X → null (پیشوند جدا)', isWindowMoveChord(chord('x', 'KeyX', { ctrl: true })) === null)
+}
+
+console.log('۷) کلید دوم پیشوند — فقط j=ترمینال:')
+{
+  // پیشوند Ctrl+X فقط `j` را به ترمینال می‌دهد؛ هیچ کلید حرکتی در پیشوند
+  // نمانده (حرکت پنجره‌ها فقط با کورد مستقیم Ctrl+H/J/K/L است).
+  check('j → terminal', PREFIX_SHORTCUTS['j']?.action === 'terminal')
+  check('k کلید دوم دستور نیست', PREFIX_SHORTCUTS['k'] === undefined)
+  check('h کلید دوم دستور نیست', PREFIX_SHORTCUTS['h'] === undefined)
+  check('l کلید دوم دستور نیست', PREFIX_SHORTCUTS['l'] === undefined)
+  // ترمینال هم نباید h/k/l را به‌عنوان کلید دوم پیشوند بلعد؛ فقط j می‌ماند.
+  const second: readonly string[] = PREFIX_SECOND_KEYS
+  check('ترمینال: j کلید دوم پیشوند است', second.includes('j'))
+  check('ترمینال: h/k/l کلید دوم پیشوند نیستند', !second.includes('h') && !second.includes('k') && !second.includes('l'))
+}
+
+console.log('۸) جهت هر کلید — همان جهت ویم، مستقل از چیدمان:')
+{
+  // مستقیم: هر کلید همیشه همان جهت ویم را می‌دهد.
+  check('h → left', prefixMoveDir('h') === 'left')
+  check('j → down', prefixMoveDir('j') === 'down')
+  check('k → up', prefixMoveDir('k') === 'up')
+  check('l → right', prefixMoveDir('l') === 'right')
+
+  // مسیر واقعی App.moveChatWindow: همسایه از روی مستطیل‌های واقعی انتخاب می‌شود
+  // و فقط پنجره‌ای که واقعاً در آن جهت است هدف می‌شود. باگ قبلی: پیمایش به‌ترتیب
+  // صفحه باعث می‌شد Ctrl+H پایین برود و Ctrl+J/K به راست.
+  const R = (left: number, top: number, right: number, bottom: number) => ({ left, top, right, bottom })
+  const step = (k: string, rects: Record<string, ReturnType<typeof R>>, active: string) =>
+    pickNeighborByRect(rects, active, prefixMoveDir(k) as PrefixMoveDir)
+
+  // کنار هم و روی هم.
+  const side = { A: R(0, 0, 500, 800), B: R(500, 0, 1000, 800) }
+  const stack = { A: R(0, 0, 1000, 400), B: R(0, 400, 1000, 800) }
+  check('کنار هم A: l → B', step('l', side, 'A') === 'B')
+  check('کنار هم B: h → A', step('h', side, 'B') === 'A')
+  check('کنار هم A: j → null (پایین پنجره‌ای نیست)', step('j', side, 'A') === null)
+  check('کنار هم B: k → null', step('k', side, 'B') === null)
+  check('کنار هم A: h → null (لبه)', step('h', side, 'A') === null)
+  check('روی هم A: j → B', step('j', stack, 'A') === 'B')
+  check('روی هم B: k → A', step('k', stack, 'B') === 'A')
+  check('روی هم A: l → null', step('l', stack, 'A') === null)
+
+  // چیدمان مختلط: A بلند در چپ، B بالا-راست، C پایین-راست.
+  const mixed = { A: R(0, 0, 500, 800), B: R(500, 0, 1000, 400), C: R(500, 400, 1000, 800) }
+  check('مختلط B: h → A (نه پایین)', step('h', mixed, 'B') === 'A')
+  check('مختلط C: h → A', step('h', mixed, 'C') === 'A')
+  check('مختلط B: j → C', step('j', mixed, 'B') === 'C')
+  check('مختلط C: k → B', step('k', mixed, 'C') === 'B')
+  check('مختلط B: k → null', step('k', mixed, 'B') === null)
+  check('مختلط B: l → null', step('l', mixed, 'B') === null)
+  check('مختلط A: l → یکی از B/C', ['B', 'C'].includes(step('l', mixed, 'A') ?? ''))
+  check('مختلط A: j → null', step('j', mixed, 'A') === null)
+
+  // شبکهٔ ۲×۲.
+  const grid = { TL: R(0, 0, 500, 400), TR: R(500, 0, 1000, 400), BL: R(0, 400, 500, 800), BR: R(500, 400, 1000, 800) }
+  check('شبکه TL: j → BL', step('j', grid, 'TL') === 'BL')
+  check('شبکه TL: l → TR', step('l', grid, 'TL') === 'TR')
+  check('شبکه BR: k → TR', step('k', grid, 'BR') === 'TR')
+  check('شبکه BR: h → BL', step('h', grid, 'BR') === 'BL')
+  check('شبکه TR: h → TL', step('h', grid, 'TR') === 'TL')
+  check('شبکه BL: k → TL', step('k', grid, 'BL') === 'TL')
 }
 
 if (failed > 0) {

@@ -17,12 +17,14 @@
 // onUserText. Barge-in: onSpeechStart fires on voice onset so the caller can
 // stop TTS playback immediately.
 
+import { claimLiveVoice, releaseLiveVoice } from './liveVoiceState';
 import {
   STT_SAMPLE_RATE,
   buildSttPrompt,
   concatFloat32,
   downsampleFloat32,
   encodeWavPcm16,
+  isLikelySpeechEnvelope,
   mergeTranscripts,
   normalizePeak,
   normalizeTranscript,
@@ -35,6 +37,14 @@ export type LocalLiveState = 'idle' | 'connecting' | 'live' | 'speaking' | 'clos
 
 export interface LocalLiveOptions {
   deviceId?: string;
+  /**
+   * Chat this session runs for.
+   *
+   * Doubles as the microphone lease: every open chat mounts its own panel and
+   * its own session object, so without it a second chat could open the same
+   * device and turn one spoken sentence into a message in two chats.
+   */
+  chatId?: string | null;
   /** Language hint sent to the provider ('fa', 'en', …). */
   lang?: string;
   /** Extra vocabulary / prompt for the provider (user setting). */
@@ -90,8 +100,18 @@ export const LOCAL_LIVE_DEFAULTS = {
   // 1.4 s per request still keeps the partial transcript visibly live, but
   // gives the provider whole phrases to work with.
   chunkMs: 1400,
-  /** Audio kept before the detected onset so the first syllable is intact. */
-  preRollMs: 300,
+  /**
+   * Audio kept before the detected onset so the first word is intact.
+   *
+   * This MUST exceed the onset window (LIVE_SPEECH_ONSET_FRAMES * frameMs =
+   * 300 ms) that the VAD needs before it opens a turn: the detector only fires
+   * after the voice has already been running for that long, so a 300 ms
+   * pre-roll re-buffered exactly the frames the streak had just consumed —
+   * nothing of the word that started the turn survived, and the opening word
+   * ("سلام" — a low-energy /s/) was dropped in live voice while dictation of
+   * the same sentence kept it. 3x the onset window covers a soft onset too.
+   */
+  preRollMs: 900,
   /** Audio re-sent at the head of the next chunk (merged away afterwards). */
   overlapMs: 220,
   /** Chunk requests allowed in flight at once. Pipelining without the
@@ -350,15 +370,16 @@ export function isLocalTranscriptJunk(s: string): boolean {
  * spelling (see normalizeTranscript — the providers return Arabic look-alikes
  * for Persian yeh/kaf, which read as wrong words).
  */
-export function sanitizeLocalTranscript(raw: string): string {
+export function sanitizeLocalTranscript(raw: string, lang?: string): string {
   const text = (raw ?? '').trim();
   if (!text) return '';
   if (isLocalTranscriptJunk(text)) return '';
+  if (isHallucinatedTranscript(text, lang)) return '';
   return normalizeTranscript(text);
 }
 
 /** True when a transcript looks like a Whisper noise hallucination. */
-export function isHallucinatedTranscript(text: string): boolean {
+export function isHallucinatedTranscript(text: string, lang?: string): boolean {
   const t = (text ?? '').trim();
   if (!t) return true;
   if (t.length <= 1) return true;
@@ -373,8 +394,40 @@ export function isHallucinatedTranscript(text: string): boolean {
       repeat = 1;
     }
   }
+  // A request for Persian that comes back in Latin letters is not a
+  // transcription at all: an endpoint without a real ASR model (a chat model
+  // behind a proxy) answers with something like «PYM JBZ» for «سلام». Only
+  // short Latin runs count — a Persian sentence may legitimately cite English
+  // identifiers, but a couple of bare Latin letters never are Persian speech.
+  if (lang === 'fa' && !/[\u0600-\u06FF]/.test(t) && !LATIN_WORD_RE.test(t)) return true;
+  if (lang === 'fa' && !/[\u0600-\u06FF]/.test(t) && t.split(/\s+/).length <= 3) return true;
+  // Subtitle boilerplate Whisper emits when the audio is music or noise: it is
+  // not a transcription of anything the user said, and keeping it types a stray
+  // sentence into the composer after every silent stretch.
+  const lower = t.toLowerCase();
+  for (const junk of HALLUCINATION_PHRASES) {
+    if (lower.includes(junk)) return true;
+  }
   return false;
 }
+
+/** A real word (4+ letters) in Latin script — a cited identifier, not noise. */
+const LATIN_WORD_RE = /[A-Za-z]{4,}/
+
+/** Phrases Whisper invents over music, applause and room noise (lower-case). */
+const HALLUCINATION_PHRASES = [
+  'thank you for watching',
+  'thanks for watching',
+  'please subscribe',
+  'subscribe to my channel',
+  'like and subscribe',
+  'subtitles by',
+  'amara.org',
+  'muito obrigado',
+  'شكرا للمشاهدة',
+  'شكرا على المشاهدة',
+  'subscribe',
+];
 
 // AudioWorklet source: batches ~21 ms of mono samples before posting, so the
 // main thread gets a few dozen messages per second instead of thousands.
@@ -403,8 +456,76 @@ class CodifaLiveCapture extends AudioWorkletProcessor {
 registerProcessor('${CAPTURE_WORKLET_NAME}', CodifaLiveCapture);
 `;
 
+// How long a stopped session keeps its microphone and AudioContext alive so the
+// next start is instant. Opening a device costs hundreds of ms in WKWebView and
+// no frame is captured until it resolves — the user pressed the button, spoke,
+// and the first word was already gone (the dictation bug, same cause here).
+const LIVE_MIC_HOLD_MS = 4000;
+
+/** Warm audio source kept between sessions: stream plus the context it belongs
+ *  to. The pair must be cached TOGETHER — a Web Audio graph is bound to the
+ *  context that created it, so reusing a stream on a closed context silences
+ *  capture entirely. */
+let heldMic: { stream: MediaStream; ctx: AudioContext } | null = null;
+let heldMicTimer: ReturnType<typeof setTimeout> | null = null;
+
+function dropHeldMic(): void {
+  if (heldMicTimer !== null) {
+    clearTimeout(heldMicTimer);
+    heldMicTimer = null;
+  }
+  if (!heldMic) return;
+  const held = heldMic;
+  heldMic = null;
+  try {
+    held.stream.getTracks().forEach((t) => t.stop());
+  } catch {
+    // Tracks already stopped.
+  }
+  try {
+    void held.ctx.close();
+  } catch {
+    // Close is best-effort.
+  }
+}
+
+/** Release the held microphone NOW (component teardown, not a quick restart). */
+export function releaseWarmLiveMic(): void {
+  dropHeldMic();
+}
+
+/** A held stream is only reusable while it is still live. */
+function heldMicUsable(): { stream: MediaStream; ctx: AudioContext } | null {
+  if (!heldMic) return null;
+  if (heldMic.stream.getTracks().some((t) => t.readyState === 'ended')) {
+    dropHeldMic();
+    return null;
+  }
+  if (heldMic.ctx.state === 'closed') {
+    dropHeldMic();
+    return null;
+  }
+  if (heldMicTimer !== null) {
+    clearTimeout(heldMicTimer);
+    heldMicTimer = null;
+  }
+  return heldMic;
+}
+
+/** Keep a stopped session's device warm for a short while, then free it. */
+function holdMic(stream: MediaStream, ctx: AudioContext): void {
+  dropHeldMic();
+  heldMic = { stream, ctx };
+  heldMicTimer = setTimeout(() => {
+    heldMicTimer = null;
+    dropHeldMic();
+  }, LIVE_MIC_HOLD_MS);
+}
+
 export class LocalLiveSession {
   private options: LocalLiveOptions;
+  /** Chat that holds the microphone lease while this session is connected. */
+  private leaseChatId: string | null = null;
   private state: LocalLiveState = 'idle';
   private stopped = false;
   private micStream: MediaStream | null = null;
@@ -493,9 +614,16 @@ export class LocalLiveSession {
     }
   }
 
-  async connect(): Promise<void> {
+  async connect(chatId?: string | null): Promise<void> {
     if (this.stopped) this.stopped = false;
     if (this.state === 'connecting' || this.state === 'live') return;
+    // Hard gate: the previous session's audio was already handed over to this
+    // object, so only the lease holder may actually open one microphone.
+    if (!claimLiveVoice(chatId ?? null)) {
+      this.setState('closed');
+      return;
+    }
+    this.leaseChatId = chatId ?? null;
     this.setState('connecting');
     try {
       await this.openMic();
@@ -516,6 +644,8 @@ export class LocalLiveSession {
     this.stopped = true;
     this.stopMonitor();
     this.closeMic();
+    releaseLiveVoice(this.leaseChatId);
+    this.leaseChatId = null;
     this.setState('closed');
   }
 
@@ -564,35 +694,53 @@ export class LocalLiveSession {
   }
 
   private async openMic(): Promise<void> {
-    // An exact deviceId can go stale (OverconstrainedError) while plain
-    // audio:true still works, so fall back to it.
-    try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConstraints() });
-    } catch (err) {
-      const name = err instanceof DOMException ? err.name : (err as { name?: unknown }).name;
-      const constraint = (err as { constraint?: unknown }).constraint;
-      const isDevice =
-        name === 'OverconstrainedError' || name === 'OverconstrainedConstraint' || constraint === 'deviceId';
-      // A stale device is retried with plain audio; any other rejection (the
-      // user denied the mic) must surface instead of being retried blindly.
-      if (this.deviceId && isDevice) {
-        this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } else if (name === 'NotSupportedError' || name === 'TypeError') {
-        this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } else {
-        throw err;
+    // A device opened moments ago is reused as-is: getUserMedia plus a fresh
+    // AudioContext costs hundreds of ms in WKWebView, and every frame before
+    // that resolves is a word the user already spoke into a dead microphone.
+    const warm = heldMicUsable();
+    if (warm && !this.deviceId) {
+      this.micStream = warm.stream;
+      this.audioCtx = warm.ctx;
+      heldMic = null;
+      if (this.audioCtx.state === 'suspended') {
+        try {
+          await this.audioCtx.resume();
+        } catch {
+          // Resume is best-effort; monitoring still works when running.
+        }
       }
-    }
-    const Ctx =
-      window.AudioContext ??
-      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctx) throw new Error('Web Audio is not supported in this browser');
-    this.audioCtx = new Ctx();
-    if (this.audioCtx.state === 'suspended') {
+    } else {
+      if (warm) dropHeldMic();
+      // An exact deviceId can go stale (OverconstrainedError) while plain
+      // audio:true still works, so fall back to it.
       try {
-        await this.audioCtx.resume();
-      } catch {
-        // Resume is best-effort; monitoring still works when running.
+        this.micStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConstraints() });
+      } catch (err) {
+        const name = err instanceof DOMException ? err.name : (err as { name?: unknown }).name;
+        const constraint = (err as { constraint?: unknown }).constraint;
+        const isDevice =
+          name === 'OverconstrainedError' || name === 'OverconstrainedConstraint' || constraint === 'deviceId';
+        // A stale device is retried with plain audio; any other rejection (the
+        // user denied the mic) must surface instead of being retried blindly.
+        if (this.deviceId && isDevice) {
+          this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else if (name === 'NotSupportedError' || name === 'TypeError') {
+          this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else {
+          throw err;
+        }
+      }
+      const Ctx =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctx) throw new Error('Web Audio is not supported in this browser');
+      this.audioCtx = new Ctx();
+      if (this.audioCtx.state === 'suspended') {
+        try {
+          await this.audioCtx.resume();
+        } catch {
+          // Resume is best-effort; monitoring still works when running.
+        }
       }
     }
     this.captureRate = this.audioCtx.sampleRate || STT_SAMPLE_RATE;
@@ -832,21 +980,32 @@ export class LocalLiveSession {
       }
       this.sink = null;
     }
-    if (this.audioCtx) {
-      try {
-        void this.audioCtx.close();
-      } catch {
-        // Close is best-effort.
+    // The device is NOT closed here: a quick restart (toggle, device switch)
+    // must not pay the open cost again. Only the graph is torn down; the stream
+    // and context are handed to the module-level hold, which frees them after
+    // LIVE_MIC_HOLD_MS. Dropping the whole pair is required — a new graph needs
+    // the context the stream was opened on.
+    const heldStream = this.micStream;
+    const heldCtx = this.audioCtx;
+    this.micStream = null;
+    this.audioCtx = null;
+    if (heldStream && heldCtx && heldCtx.state !== 'closed') {
+      holdMic(heldStream, heldCtx);
+    } else {
+      if (heldStream) {
+        try {
+          heldStream.getTracks().forEach((t) => t.stop());
+        } catch {
+          // Tracks already stopped.
+        }
       }
-      this.audioCtx = null;
-    }
-    if (this.micStream) {
-      try {
-        this.micStream.getTracks().forEach((t) => t.stop());
-      } catch {
-        // Tracks already stopped.
+      if (heldCtx) {
+        try {
+          void heldCtx.close();
+        } catch {
+          // Close is best-effort.
+        }
       }
-      this.micStream = null;
     }
   }
 
@@ -921,7 +1080,7 @@ export class LocalLiveSession {
     const raw = await this.requestChunk(wav, lang, prompt, token, true);
     // Same cleanup as a chunk: an error page or a prompt echo must never be
     // delivered as the user's words.
-    return stripSttPromptEcho(sanitizeLocalTranscript(raw), prompt).trim();
+    return stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
   }
 
   /** Copy the turn's audio out and reset the buffer for the next turn. */
@@ -1084,6 +1243,12 @@ export class LocalLiveSession {
     // which merges into the user's sentence and reads as a wrong dictation.
     const trimmed = trimSilence(resampled, STT_SAMPLE_RATE);
     if (trimmed.speechMs < MIN_CHUNK_SPEECH_MS) return;
+    // Music, a held tone or fan/AC hum passes a level gate just as easily as a
+    // voice, but its energy envelope is flat where speech is syllabic. Rejecting
+    // it HERE — before the request — means the provider never gets the chance to
+    // invent words for it. This is level-independent, so a softly spoken first
+    // word is still accepted (see SPEECH_ENVELOPE_MIN_CV).
+    if (!isLikelySpeechEnvelope(trimmed.pcm, STT_SAMPLE_RATE)) return;
     // Normalize AFTER trimming: the gain must be computed from the speech that
     // is actually sent, not from a quiet tail that would let the words clip.
     const wav = encodeWavPcm16(normalizePeak(trimmed.pcm), STT_SAMPLE_RATE);
@@ -1111,8 +1276,8 @@ export class LocalLiveSession {
         // Strip any prompt echo BEFORE merging: providers that continue the
         // prompt instead of transcribing the clip would otherwise splice our
         // own context (or the previous chunk's tail) into the user's words.
-        const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw), prompt);
-        if (!clean || isHallucinatedTranscript(clean)) return;
+        const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt);
+        if (!clean || isHallucinatedTranscript(clean, lang)) return;
         // Merge into the turn that OWNS this chunk, even once a newer turn has
         // started: the owning turn may still be draining and its finishTurn()
         // delivers `owner.text`. Only the visible partial is gated on the

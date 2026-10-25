@@ -11,7 +11,12 @@ import {
 } from "react";
 import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
-import { diffStatsFromUnified, isSkillTool, terminalOutputText } from "../lib/toolActivity";
+import {
+  diffStatsFromUnified,
+  isSkillTool,
+  MEMORY_TOOLS,
+  terminalOutputText,
+} from "../lib/toolActivity";
 import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
@@ -610,6 +615,15 @@ function webProviderLabel(kind: string): string {
 /** Tools whose rows are web hits/fetched pages rather than files. */
 function isWebRow(activity: ToolActivity): boolean {
   return activity.tool === "web_search" || activity.tool === "fetch_url";
+}
+
+/** Web rows whose payload is worth showing WITHOUT a click: a `web_search`
+ *  row's hits are the answer to the question the user just asked. A `fetch_url`
+ *  row only confirms that one URL was read, so it starts collapsed like every
+ *  other row — its links still render inside, one click away (see `isWebRow`,
+ *  which keeps driving the in-row renderer). */
+function isWebRowOpenByDefault(activity: ToolActivity): boolean {
+  return activity.tool === "web_search";
 }
 
 /** The hits of a `web_search` / `fetch_url` row. Rendered at the bottom of the
@@ -2204,14 +2218,15 @@ const TraceRow = memo(function TraceRow({
   activity: ToolActivity;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  // edit_file / write_file and web rows always start open: a diff and a search
-  // result list are the payload of their row, so a collapsed line would hide
-  // them. A fold click still tucks the content inside the call.
+  // edit_file / write_file and web SEARCH rows always start open: a diff and a
+  // search result list are the payload of their row, so a collapsed line would
+  // hide them. A fold click still tucks the content inside the call. A
+  // `fetch_url` row stays collapsed by default (see isWebRowOpenByDefault).
   const [expanded, setExpanded] = useState(
     () =>
       activity.tool === "edit_file" ||
       activity.tool === "write_file" ||
-      isWebRow(activity),
+      isWebRowOpenByDefault(activity),
   );
   const running = activity.status === "running";
   useEffect(() => {
@@ -3078,6 +3093,14 @@ export const ToolCallView = memo(function ToolCallView({
             (activity.items ?? activity.results)!.length > 0 && (
               <WebResultLinks items={(activity.items ?? activity.results)!} />
             )}
+          {MEMORY_TOOLS.has(activity.tool) && activity.resultText && (
+            <pre
+              className="trace-expand-val trace-expand-pre trace-terminal-output"
+              dir="auto"
+            >
+              {activity.resultText}
+            </pre>
+          )}
           {activity.tool === "run_terminal" &&
             (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
               Boolean(activity.resultText)) && (

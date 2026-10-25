@@ -5,8 +5,13 @@
  * the tree is a cache of already-fetched levels plus the set of open folders.
  * Keeping that logic here — no React, no DOM — makes the merge/toggle/flatten
  * rules unit-testable; the component stays a thin renderer over `flattenTree`.
+ *
+ *  The name filter (`filterRows`) has two sources: the LOADED levels of this
+ *  lazy tree, and — when the caller passes one — a full workspace path list
+ *  (`fs_walk`), which is what makes a deep unopened folder findable.
  */
 import type { FileEntry } from './fs'
+import { foldFa } from './fuzzy'
 
 /** Fetched children for a directory, keyed by workspace-relative dir path
  *  ('' = the workspace root itself). */
@@ -46,6 +51,16 @@ export function mergeChildren(
   entries: readonly FileEntry[] | null | undefined,
 ): TreeCache {
   return { ...cache, [dir]: sortEntries(entries ?? []) }
+}
+
+/** Every ancestor directory of a workspace-relative file path, outermost
+ *  first (`a/b/c.ts` → `['a', 'a/b']`). Used to open the chain down to a hit
+ *  without opening the file's own folder siblings. */
+export function ancestorDirs(path: string): string[] {
+  const parts = path.split('/').filter(Boolean)
+  const out: string[] = []
+  for (let i = 0; i < parts.length - 1; i++) out.push(parts.slice(0, i + 1).join('/'))
+  return out
 }
 
 /** Open a folder if it was closed, close it if it was open. */
@@ -98,6 +113,129 @@ export function flattenTree(
     if (open) rows.push(...flattenTree(cache, expanded, entry.path, depth + 1))
   }
   return rows
+}
+
+/** Case- and Persian-layout-insensitive name match for the tree filter (the
+ *  same folding the rest of the app's matchers use, so searching stays
+ *  consistent with the composer palette and the quick-open overlay). */
+function filterName(needle: string, path: string): boolean {
+  return foldFa(path).includes(needle)
+}
+
+/**
+ * Rows visible while a NAME FILTER is active: every LOADED level is searched
+ * (laziness is preserved — an unread folder has nothing to search until it is
+ * opened) and matching entries auto-expand their folder chain, so a hit three
+ * levels down shows up even though the user never opened those folders.
+ *
+ * Folders that carry no match themselves stay listed when something under
+ * them matches (as the open chain to it); a folder whose own NAME matches is
+ * listed even when nothing inside does. A blank query has no filtering —
+ * callers render the plain `flattenTree` rows for it.
+ */
+export function filterRows(
+  cache: TreeCache,
+  query: string,
+  /** Full workspace paths (`fs_walk`): every file and folder on disk, not just
+   *  the loaded levels. Absent/empty keeps the loaded-levels-only behaviour. */
+  walked: readonly string[] = [],
+  dir = '',
+  depth = 0,
+): TreeRow[] {
+  if (!query) return []
+  const needle = foldFa(query).trim()
+  if (!needle) return []
+  const rows: TreeRow[] = []
+  const seen = new Set<string>()
+  for (const entry of cache[dir] ?? []) {
+    const isDir = entry.kind === 'dir'
+    const kids = isDir && cache[entry.path] ? filterRows(cache, query, walked, entry.path, depth + 1) : []
+    if (kids.length === 0 && !filterName(needle, entry.name)) continue
+    seen.add(entry.path)
+    rows.push({
+      path: entry.path,
+      name: entry.name,
+      kind: entry.kind,
+      depth,
+      // Carriers stay open while the filter is on; they collapse back on
+      // their own the moment the query changes.
+      expanded: true,
+      expandable: isExpandable(cache, entry),
+    })
+    rows.push(...kids)
+  }
+  rows.push(...walkedRows(walked, needle, cache, seen))
+  return rows
+}
+
+/**
+ * Matches from the walked path list that the loaded tree did not already
+ * produce — the deep files and folders the lazy cache has never read.
+ *
+ * A hit's ancestor chain is emitted as carrier rows (a folder with no match of
+ * its own is still reachable), one row per path, so a match four levels down in
+ * an unopened folder still renders with its indent. Ancestors that ARE loaded
+ * inherit the real children, so the row behaves as a folder rather than a
+ * dead end.
+ */
+function walkedRows(
+  walked: readonly string[],
+  needle: string,
+  cache: TreeCache,
+  seen: ReadonlySet<string>,
+): TreeRow[] {
+  // Every path the walk knows is a directory when it also prefixes another
+  // walked path (or when its level was already fetched). Guessing from `cache`
+  // alone labelled an unopened folder as a FILE, so a deep match rendered with
+  // the wrong icon and no chevron.
+  const dirs = new Set<string>()
+  for (const raw of walked) {
+    const path = raw.replace(/^\/+/, '')
+    const cut = path.lastIndexOf('/')
+    if (cut > 0) dirs.add(path.slice(0, cut))
+  }
+  for (const p of Object.keys(cache)) if (p) dirs.add(p)
+  const emitted = new Map<string, TreeRow>()
+  const emit = (path: string, depth: number) => {
+    const existing = emitted.get(path)
+    if (existing) return
+    const isDir = dirs.has(path)
+    emitted.set(path, {
+      path,
+      name: path.split('/').pop() ?? path,
+      kind: isDir ? 'dir' : 'file',
+      depth,
+      expanded: true,
+      // A folder the walk never opened has no fetched children, so a chevron
+      // would open nothing: it stays a label until its level is fetched.
+      expandable: isDir && cache[path] ? isExpandable(cache, { kind: 'dir', path } as FileEntry) : false,
+    })
+  }
+  for (const raw of walked) {
+    const path = raw.replace(/^\/+/, '')
+    if (!path || seen.has(path) || !filterName(needle, path)) continue
+    const parts = path.split('/')
+    for (let i = 1; i < parts.length; i++) {
+      const dirPath = parts.slice(0, i).join('/')
+      // A loaded ancestor already owns this row through the recursive pass.
+      if (seen.has(dirPath)) continue
+      emit(dirPath, i - 1)
+    }
+    emit(path, parts.length - 1)
+  }
+  return [...emitted.values()].sort(
+    (a, b) => a.depth - b.depth || a.path.localeCompare(b.path, undefined, { sensitivity: 'base' }),
+  )
+}
+
+/** Wrap-around step for the Ctrl+K/J navigation over the filter's rows.
+ *
+ *  Pure so the wrap rule (and the empty-list guard) is testable without a DOM:
+ *  an empty list always yields 0, otherwise the index moves by `delta` and
+ *  wraps in both directions. */
+export function nextFilterIndex(current: number, delta: number, count: number): number {
+  if (count <= 0) return 0
+  return ((current + delta) % count + count) % count
 }
 
 /** Drop every cached level under a closed folder: reopening must re-read from

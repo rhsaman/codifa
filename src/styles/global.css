@@ -13650,12 +13650,12 @@ body.coder-dragging .chat-split-child {
 /* Full-row tint (faint green/red, git-diff style) instead of the old underline.
    The gutter bar + −/+ sign below stay as a second cue. */
 .diff-line-del {
-  background: color-mix(in srgb, #f85149 12%, transparent);
+  background: color-mix(in srgb, #f85149 9%, transparent);
   color: var(--text);
 }
 
 .diff-line-add {
-  background: color-mix(in srgb, #3fb950 12%, transparent);
+  background: color-mix(in srgb, #3fb950 9%, transparent);
   color: var(--text);
 }
 
@@ -18760,11 +18760,11 @@ body.coder-dragging .chat-split-child {
 /* Faint full-row tint (git-diff style): add/del rows get a barely-there green
    /red background. The gutter bar + −/+ sign below stay as a second cue. */
 .diff-u-row.diff-u-add {
-  background: color-mix(in srgb, #3fb950 12%, transparent);
+  background: color-mix(in srgb, #3fb950 9%, transparent);
 }
 
 .diff-u-row.diff-u-del {
-  background: color-mix(in srgb, #f85149 12%, transparent);
+  background: color-mix(in srgb, #f85149 9%, transparent);
 }
 
 /* A row is already tinted (git-diff style, rules above); no underline cue. */
@@ -23540,6 +23540,28 @@ mark.trace-hit-active {
   white-space: nowrap;
 }
 
+/* The header name is a button (click = show this file in the Files explorer),
+   so it resets the native button chrome and keeps the plain-text look. */
+.file-viewer-name-btn {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 4px;
+}
+
+.file-viewer-name-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.file-viewer-name-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 .file-viewer-line {
   color: var(--text-dim);
 }
@@ -24943,6 +24965,39 @@ tr[data-search-current] .fv-mark,
   cursor: default;
 }
 
+/* Name filter (Ctrl/Cmd+F): a chip that replaces the title in the head while
+   active, plus the pressed state of its toggle button. */
+.files-panel-action[aria-pressed="true"] {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.files-filter {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.files-filter-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.files-filter-input::placeholder {
+  color: var(--text-dim);
+}
+
 .files-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -24974,6 +25029,13 @@ tr[data-search-current] .fv-mark,
 
 .files-row:hover {
   background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Keyboard-highlighted hit while the name filter is navigating (Ctrl+K/J):
+   an accent tint, distinct from the plain hover wash. */
+.files-row-active,
+.files-row-active:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 .files-row:focus-visible {

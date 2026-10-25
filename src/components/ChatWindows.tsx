@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
+import { useViewerTabs } from "../lib/viewerTabs";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, flexWeights, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
 import { focusChatInput } from "../lib/chatFocus";
@@ -793,34 +794,54 @@ export function ChatWindows() {
     if (activeChatId) syncViewerToChat(activeChatId);
   }, [activeChatId]);
 
-  // Vim-style window navigation: Ctrl+H/J/K/L moves focus between windows
-  // (h=left, j=down, k=up, l=right) and drops the caret into the new
-  // window's composer input. Capture phase so it can win over the global
-  // Cmd/Ctrl+J terminal toggle on non-Mac layouts — but only when a
-  // neighbor actually exists in that direction; otherwise the key passes
-  // through so Ctrl+J still toggles the terminal (App.tsx). Skipped while
-  // the terminal has focus (the shell keeps its own Ctrl chords) and while
-  // a popup already consumed the key (defaultPrevented).
+  // App-wide Ctrl/Cmd+F: the file explorer's name filter. The explorer tab is
+  // often NOT the active rail tab (opening a file switches the rail to that
+  // file), and the panel is then unmounted, so this handler has to exist
+  // outside it. Deliberately LAST in the chord chain: a dialog/overlay, the
+  // terminal and the file viewer all keep their own find, and a press INSIDE
+  // the explorer is handled by the panel itself (focus stays where the user put
+  // it). Only when none of them claims the key does this activate the tab and
+  // focus its box.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      if (e.defaultPrevented) return;
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      if (physicalKey(e as { code: string; key: string }) !== "f") return;
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.(".files-panel")) return;
+      if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) return;
+      const st = useStore.getState();
+      const chatId = st.activeChatId;
+      const chat = chatId ? st.chats.find((c) => c.id === chatId) : undefined;
+      if (!chat?.root) return;
+      e.preventDefault();
+      e.stopPropagation();
+      useViewerTabs.getState().focusFilesFilter();
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, []);
+
+  // Vim-style window navigation: Ctrl+H/J/K/L moves focus between windows
+  // (h=left, j=down, k=up, l=right) and drops the caret into the new
+  // window's composer input. LIVES ON Shift+Alt(Option)+H/J/K/L: the plain
+  // `Ctrl+H/J/K/L` (App.tsx) walks the chat windows and must never swap
+  // chats, and a bare j/k must stay free for sidebar/transcript scrolling.
+  // Skipped in dialogs, settings and overlays (someone already consumed the
+  // key when defaultPrevented).
+  useEffect(() => {
+     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       const t = e.target as HTMLElement | null;
-      if (t?.closest?.('.terminal-panel')) return;
       if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) return;
       const k = physicalKey(e as { code: string; key: string });
-      // Composer popups (slash palette, @mention, history, plus menu) own
-      // Ctrl+J/K for list navigation — let them keep those keys.
-      if ((k === 'j' || k === 'k') && t?.closest?.('.composer-input-wrap')) {
-        const win = t.closest('[data-chat-window]');
-        if (win?.querySelector('.mention-popup, .plus-menu')) return;
-      }
-      // Window fullscreen: Ctrl+M expands the focused window to the whole
+      // Window fullscreen: Cmd/Ctrl+M expands the focused window to the whole
       // chat area; pressing again restores the split. Focus lands back in
       // the composer so typing can continue. Skipped in the terminal (the
       // shell owns Ctrl chords there) and in dialogs/overlays.
       if (k === 'm') {
-        if (t?.closest?.('.terminal-panel') || t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) return;
+        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+        if (t?.closest?.('.terminal-panel')) return;
         e.preventDefault();
         e.stopPropagation();
         const st2 = useStore.getState();
@@ -831,6 +852,10 @@ export function ChatWindows() {
         if (after) requestAnimationFrame(() => focusChatInput(after));
         return;
       }
+      // Window MOVE (swap positions): Shift+Alt(Option)+H/J/K/L. The plain
+      // Ctrl+X chords move FOCUS between windows/panes (App.tsx) and never
+      // swap chats; bare j/k stay free for transcript/sidebar scrolling.
+      if (!e.shiftKey || !e.altKey || e.metaKey || e.ctrlKey) return;
       const dir = k === 'h' ? 'left' : k === 'j' ? 'down' : k === 'k' ? 'up' : k === 'l' ? 'right' : null;
       if (!dir) return;
       const st = useStore.getState();
@@ -847,14 +872,16 @@ export function ChatWindows() {
         centers[id] = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
       });
       const target = pickNeighborWindow(centers, st.activeChatId, dir);
-      // No neighbor in this direction: let the key through (Ctrl+J toggles
-      // the terminal, Ctrl+K stays free) instead of swallowing it.
+      // No neighbor in this direction: let the key through instead of
+      // swallowing it (other Shift+Alt sets stay free).
       if (!target) return;
       e.preventDefault();
       e.stopPropagation();
-      st.focusWindow(target);
-      // Focus after paint so the hop lands in the committed DOM.
-      requestAnimationFrame(() => focusChatInput(target));
+      // SWAP the two windows' places (a real move, not a focus hop), then put
+      // the caret into the moved window's composer so work continues there.
+      st.dropChatOnto(st.activeChatId, target, 'center');
+      const next = useStore.getState().activeChatId;
+      if (next) requestAnimationFrame(() => focusChatInput(next));
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);

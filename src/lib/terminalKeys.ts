@@ -1,13 +1,22 @@
 /** Chord guard shared by every terminal host (the bottom panel and the
  *  right-pane terminal tabs).
  *
- *  Cmd/Ctrl + one of these is an APP chord, never shell input: J = bottom
- *  panel, W = close the active tab, M = terminal fullscreen, X = the app's
- *  prefix. Checked on `keypress` as well as `keydown` — see the caller — and
- *  `code` is checked too so the chords survive non-Latin keyboard layouts.
+ *  Cmd/Ctrl + one of these is an APP chord, never shell input: W = close the
+ *  active tab, M = terminal fullscreen, X = the app's prefix (Ctrl+X J is the
+ *  ONLY way to toggle the bottom panel). J stays reserved so ^J never reaches
+ *  the shell as a newline that would run the half-typed line. Checked on
+ *  `keypress` as well as `keydown` — see the caller — and `code` is checked
+ *  too so the chords survive non-Latin keyboard layouts.
  *
  *  Pure, for tests: no DOM, no xterm. */
+import { isPrefixArmed } from './prefixState'
 export const RESERVED_TERMINAL_CHORDS = ['j', 'w', 'm', 'x'] as const
+
+/** The second key of the Ctrl+X prefix, as ran inside the terminal: xterm must
+ *  NOT send it to the shell, and App.tsx runs the chord with it (`j` toggles
+ *  the terminal panel). Declared here so the guard stays the single source of
+ *  what the shell never sees. `v` toggles the live voice session. */
+export const PREFIX_SECOND_KEYS = ['j', 'u', 'r', 'c', 'v', ' '] as const
 
 export interface TerminalChordEvent {
   type: string
@@ -27,11 +36,18 @@ export function isReservedTerminalChord(ev: TerminalChordEvent): boolean {
   if (ev.type === 'keyup') return false
   // Shift/Alt combinations are ordinary terminal input.
   if (ev.altKey || ev.shiftKey) return false
+  const physical = (ev.code || '').replace(/^Key/, '').toLowerCase()
+  const pressed = (ev.key || '').toLowerCase()
+  const matches = (keys: readonly string[]) => keys.some((k) => pressed === k || physical === k)
+  // The second key of the Ctrl+X prefix: no modifier on it, but the app's
+  // prefix is armed (App.tsx sets `coder:prefix`), so xterm must hand it to
+  // the window handler instead of sending it to the shell.
+  if (!ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
+    if (isPrefixArmed() && matches(PREFIX_SECOND_KEYS)) return true
+  }
   // Cmd and Ctrl are each reserved on their OWN (never both), on every
   // platform: Ctrl+J on macOS must not become a newline either.
   const chord = (ev.metaKey && !ev.ctrlKey) || (ev.ctrlKey && !ev.metaKey)
   if (!chord) return false
-  const physical = (ev.code || '').replace(/^Key/, '').toLowerCase()
-  const pressed = (ev.key || '').toLowerCase()
-  return RESERVED_TERMINAL_CHORDS.some((k) => pressed === k || physical === k)
+  return matches(RESERVED_TERMINAL_CHORDS)
 }

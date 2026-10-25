@@ -37,7 +37,7 @@
   removeEventListener: () => {},
 }
 
-const { useViewerTabs, viewerTabId, visibleTabs, viewerTabTitle, registerViewerTabCloseHook } = await import('../src/lib/viewerTabs')
+const { useViewerTabs, viewerTabId, visibleTabs, viewerTabTitle, viewerTabRows, registerViewerTabCloseHook } = await import('../src/lib/viewerTabs')
 const { clampTerminalHeight, DEFAULT_TERMINAL_HEIGHT, MIN_TERMINAL_HEIGHT } = await import('../src/lib/store')
 const { NVIM_PROGRAM, nvimArgs, runTargetKey } = await import('../src/lib/nvimEdit')
 
@@ -134,6 +134,40 @@ console.log('4) the rail can tell two terminal tabs apart:')
   const editor = { kind: 'terminal' as const, title: 'nvim — a.ts', createdAt: 2 } as any
   check('an untitled tab falls back to its kind label', viewerTabTitle(shell) === 'Terminal', viewerTabTitle(shell))
   check('a titled tab keeps its own title', viewerTabTitle(editor) === 'nvim — a.ts')
+}
+
+console.log('6) MANY terminal tabs collapse into ONE rail row (the strip inside the')
+console.log('   pane is the real shell list — the rail must not list them twice):')
+{
+  useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
+  const st = useViewerTabs.getState()
+  st.openFile('/w/a.ts', undefined, '/w', 'c1')
+  st.openTerminal({ chatId: 'c1', program: 'nvim', args: ['+1', '/w/a.ts'] })
+  st.openTerminal({ chatId: 'c1', fresh: true, title: 'zsh' })
+  st.openTerminal({ chatId: 'c1', fresh: true, title: 'zsh' })
+  const tabs = useViewerTabs.getState().tabs
+  check('three terminal tabs exist', tabs.filter((t) => t.kind === 'terminal').length === 3, tabs.map((t) => t.id))
+
+  const activeTerm = tabs.find((t) => t.kind === 'terminal')!.id
+  useViewerTabs.setState({ activeId: activeTerm })
+  const rows = viewerTabRows(tabs, 'c1', activeTerm)
+  check('ONE terminal row in the rail', rows.filter((t) => t.kind === 'terminal').length === 1, rows.map((t) => t.id))
+  check('non-terminal rows survive the fold', rows.some((t) => t.kind === 'file'), rows.map((t) => t.kind))
+  check('the row is the ACTIVE terminal (the pane paints it)', rows.find((t) => t.kind === 'terminal')?.id === activeTerm)
+
+  // Switching to another shell moves the highlight, never multiplies rows.
+  const secondTerm = tabs.filter((t) => t.kind === 'terminal')[1].id
+  useViewerTabs.setState({ activeId: secondTerm })
+  const rows2 = viewerTabRows(tabs, 'c1', secondTerm)
+  check('still ONE terminal row after switching shells', rows2.filter((t) => t.kind === 'terminal').length === 1)
+  check('the representative follows the newly active shell', rows2.find((t) => t.kind === 'terminal')?.id === secondTerm)
+
+  // Collapsing must not eat the row when only one terminal exists — a single
+  // shell still needs its rail row (closing / focusing lives there too).
+  useViewerTabs.setState({ tabs: tabs.filter((t) => t.id === activeTerm), activeId: activeTerm })
+  const single = viewerTabRows(useViewerTabs.getState().tabs, 'c1', activeTerm)
+  check('a single terminal keeps its row', single.length === 1 && single[0].kind === 'terminal', single)
+  useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
 }
 
 console.log('5) the BOTTOM panel is untouched — it is a separate host:')

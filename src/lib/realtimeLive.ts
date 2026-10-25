@@ -6,6 +6,7 @@
 // only reacts to the server's speech_started/stopped + transcript events.
 
 import { normalizeTranscript } from './stt'
+import { claimLiveVoice, releaseLiveVoice } from './liveVoiceState'
 
 export type LiveVoiceState =
   | 'idle'
@@ -217,6 +218,8 @@ export class LiveVoiceSession {
   private options: LiveVoiceOptions;
   private ws: WebSocket | null = null;
   private state: LiveVoiceState = 'idle';
+  /** Chat holding the microphone lease while this session is connected. */
+  private leaseChatId: string | null = null;
   private manualClose = false;
   private microphoneDeviceId?: string;
 
@@ -261,8 +264,17 @@ export class LiveVoiceSession {
 
   // Open the always-on bidirectional socket using an ephemeral token,
   // then optionally start the microphone.
-  async connect(): Promise<void> {
+  //
+  // `chatId` claims the microphone lease: every open chat mounts its own
+  // session object, so without the lease two chats could open the microphone at
+  // once and the same spoken sentence would land in both conversations.
+  async connect(chatId?: string | null): Promise<void> {
     if (this.connected || this.state === 'connecting') return;
+    if (!claimLiveVoice(chatId ?? null)) {
+      this.setState('closed');
+      return;
+    }
+    this.leaseChatId = chatId ?? null;
     this.manualClose = false;
     this.setState('connecting');
     try {
@@ -284,6 +296,8 @@ export class LiveVoiceSession {
   // Stop mic + playback and close the socket.
   disconnect(): void {
     this.manualClose = true;
+    releaseLiveVoice(this.leaseChatId);
+    this.leaseChatId = null;
     this.clearServerWatchdog();
     this.stopCaptureWatchdog();
     this.stopMicrophone();

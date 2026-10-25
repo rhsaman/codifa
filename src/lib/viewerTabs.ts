@@ -15,7 +15,11 @@ export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | '
  *  stay global: an artifact is opened from the Artifacts page and from a
  *  transcript card, and hiding it whenever another chat had focus made the
  *  row look broken (the document opened onto a tab that chat could not show). */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'files', 'todos', 'terminal'])
+// `files` is NOT here: the explorer is ONE global tab whose root follows the
+// focused chat. A per-chat explorer gave every chat its own `files:<chatId>`
+// tab, so the rail showed one icon per chat AND activating it pushed the open
+// file tab out of the rail.
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'todos', 'terminal'])
 
 /** Kinds that are NEVER written to localStorage. A terminal tab is a live pty:
  *  restoring one after a restart would spawn a shell (or an editor) the user
@@ -142,9 +146,19 @@ export function shownViewerTabId(
 /** Tabs the pane rail draws as ROWS: every tab visible in the active chat.
  *  A page opened from the rail's "+" menu is an ordinary tab, so it is
  *  closable and reorderable exactly like a file tab — no page owns a fixed
- *  icon any more. Pure, for tests. */
-export function viewerTabRows(tabs: ViewerTab[], chatId: string): ViewerTab[] {
-  return visibleTabs(tabs, chatId)
+ *  icon any more. Pure, for tests.
+ *
+ *  TERMINAL tabs collapse into ONE rail row: the terminal body paints its own
+ *  horizontal chip strip (TerminalTabPanel's .terminal-tabs), which is the real
+ *  shell list — a rail row per shell would list the same shells twice in two
+ *  places. The representative row is the ACTIVE terminal tab (or the first), so
+ *  the row highlights exactly when the pane is painting a terminal. */
+export function viewerTabRows(tabs: ViewerTab[], chatId: string, activeId?: string | null): ViewerTab[] {
+  const visible = visibleTabs(tabs, chatId)
+  const terminals = visible.filter((t) => t.kind === 'terminal')
+  if (terminals.length < 2) return visible
+  const rep = (activeId && terminals.find((t) => t.id === activeId)) || terminals[0]
+  return [...visible.filter((t) => t.kind !== 'terminal'), rep]
 }
 
 /** True when the viewer tab-list has anything to show inline (visible open
@@ -296,9 +310,9 @@ interface ViewerTabsState {
    *  with one tab per chat: clicking another run retargets the same tab
    *  instead of stacking a tab per run. */
   openExplore: (messageId: string, index: number, title?: string, chatId?: string) => void
-  /** Open the workspace file explorer of a chat (one tab per chat). The tree
-   *  itself is read lazily from disk by the panel. */
-  openFiles: (chatId?: string) => void
+  /** Open the workspace file explorer (one GLOBAL tab; its root follows the
+   *  focused chat). The tree itself is read lazily from disk by the panel. */
+  openFiles: () => void
   /** Open the chat's Todos page (turn usage + plan checklist) as its own
    *  closable tab: pages are ordinary tabs now, opened from the rail's "+". */
   openTodos: (chatId?: string) => void
@@ -364,6 +378,29 @@ interface ViewerTabsState {
   paneOpen: boolean
   setPaneOpen: (v: boolean) => void
   togglePane: () => void
+  /** Bumped whenever Ctrl/Cmd+F asks for the file explorer's name filter.
+   *  The tree's tab may not be the active one (opening a file switches the
+   *  rail to that file), so the shortcut first ACTIVATES the explorer tab and
+   *  then signals it here; the panel consumes the new value to open + focus
+   *  its filter box. A counter, not a boolean, so repeated finds re-fire. */
+  filesFilterFocusAt: number
+  /** Ctrl/Cmd+F routing: show the file explorer and focus its filter. */
+  focusFilesFilter: () => void
+  /** Open folders of each chat's file explorer, keyed by chat id.
+   *
+   *  Kept HERE, not in the panel's own state, because the rail mounts only the
+   *  active tab: opening a file unmounts the explorer and switching back
+   *  remounted it blank, collapsing every folder the user had opened. Session
+   *  state (not persisted) — a restart starts from the closed tree. */
+  expandedByChat: Record<string, string[]>
+  /** Remember one chat's open folders (the explorer's `expanded` set). */
+  setExpandedDirs: (chatId: string | undefined, dirs: readonly string[]) => void
+  /** Bumped when the file header asks the explorer to REVEAL one file: the
+   *  panel consumes the new value, opens the file's folder chain and highlights
+   *  the row. A counter so asking twice for the same file re-fires. */
+  filesReveal: { chatId: string | null; path: string; at: number } | null
+  /** Header click: show the explorer with `path` revealed + highlighted. */
+  revealFile: (path: string) => void
 }
 
 const STORAGE_KEY = 'coder:viewerTabs'
@@ -665,6 +702,9 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   focusedViewerId: initial.activeId,
   lastActiveByChat: {},
   closedTabs: initial.closed,
+  filesFilterFocusAt: 0,
+  expandedByChat: {},
+  filesReveal: null,
   fullscreen: typeof window !== 'undefined' ? loadFullscreen() : false,
   paneOpen: typeof window !== 'undefined' ? loadPaneOpen(initial.tabs.length) : false,
   setPaneOpen: (v) =>
@@ -676,6 +716,70 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     set((s) => {
       persistPaneOpen(!s.paneOpen)
       return { paneOpen: !s.paneOpen }
+    }),
+  focusFilesFilter: () =>
+    set((s) => {
+      // The explorer tab is activated by the same call, because Ctrl/Cmd+F must
+      // work while ANY right-rail tab is showing (an open file, Git, todos…).
+      // Global explorer id (no chatId): one tab for the whole app, so the rail
+      // keeps a single `files` icon and activating it never displaces the open
+      // file tab of whichever chat is focused.
+      const id = viewerTabId('files', '')
+      const entry: ViewerTab = {
+        id,
+        kind: 'files',
+        title: 'Files',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? entry : t))
+        : [...s.tabs, entry])
+      const next = {
+        tabs,
+        activeId: id,
+        paneOpen: true,
+        filesFilterFocusAt: s.filesFilterFocusAt + 1,
+      }
+      persist(next.tabs, next.activeId)
+      return next
+    }),
+  setExpandedDirs: (chatId, dirs) =>
+    set((s) => {
+      const cid = chatId ?? currentChatId()
+      if (!cid) return s
+      // Stored sorted+unique so the same set never churns a new array identity
+      // (the explorer writes on every toggle, and an identical value must not
+      // re-render every subscriber).
+      const next = [...new Set(dirs)].sort()
+      const prev = s.expandedByChat[cid]
+      if (prev && prev.length === next.length && prev.every((d, i) => d === next[i])) return s
+      return { expandedByChat: { ...s.expandedByChat, [cid]: next } }
+    }),
+  revealFile: (path) =>
+    set((s) => {
+      // Same global explorer as `focusFilesFilter`: the tab carries no chatId,
+      // so `activeId` moving to it leaves the chat's open file tab untouched.
+      // The reveal SIGNAL still carries the focused chat, because only that
+      // chat's explorer pane may jump to the file.
+      const cid = currentChatId()
+      const id = viewerTabId('files', '')
+      const entry: ViewerTab = {
+        id,
+        kind: 'files',
+        title: 'Files',
+        createdAt: Date.now(),
+      }
+      const tabs = capTabs(s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? entry : t))
+        : [...s.tabs, entry])
+      const next = {
+        tabs,
+        activeId: id,
+        paneOpen: true,
+        filesReveal: { chatId: cid ?? null, path, at: (s.filesReveal?.at ?? 0) + 1 },
+      }
+      persist(next.tabs, next.activeId)
+      return next
     }),
   openViewer: (tab) =>
     set((s) => {
@@ -1026,21 +1130,19 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       persist(next.tabs, next.activeId)
       return next
     }),
-  openFiles: (chatId) =>
+  openFiles: () =>
     set((s) => {
-      // One explorer tab per chat: the tree follows that chat's workspace root.
-      const cid = chatId ?? currentChatId()
-      const id = viewerTabId('files', cid)
+      // One GLOBAL explorer tab: its root follows the focused chat (the panel
+      // resolves that itself), so the rail shows a single `files` icon.
+      const id = viewerTabId('files', '')
       const entry: ViewerTab = {
         id,
         kind: 'files',
-        chatId: cid,
         title: 'Files',
         createdAt: Date.now(),
       }
       const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
-      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
-      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
+      const next = { tabs, activeId: id, paneOpen: true }
       persist(next.tabs, next.activeId)
       return next
     }),

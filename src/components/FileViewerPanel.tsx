@@ -11,6 +11,8 @@ import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
 import { FileChip, FileIcon } from "./FileIcon";
 import { getHighlightedLines } from "../lib/highlight";
+import { toWorkspacePath } from "../lib/fileTree";
+import { useVimScroll } from "../lib/useVimScroll";
 
 /** Native PDF pane: WKWebView renders PDFs itself, so the viewer shows the
  *  file through a Blob object URL instead of backend-rasterized page images.
@@ -601,6 +603,11 @@ export function FileViewerPanel({
     const onKey = (ev: KeyboardEvent) => {
       const key = ev.key.toLowerCase();
       if ((ev.ctrlKey || ev.metaKey) && key === "f") {
+        if (ev.defaultPrevented) return;
+        // A find pressed over the FILES tree belongs to the tree's name
+        // filter, not to this document (a split view can show both at once).
+        const tgt = ev.target as HTMLElement | null;
+        if (tgt?.closest?.(".files-panel")) return;
         ev.preventDefault();
         ev.stopPropagation();
         setSearchOpen(true);
@@ -952,13 +959,27 @@ export function FileViewerPanel({
     };
   }, [openMenu]);
 
+  useVimScroll(rootRef);
+
   return (
     <div ref={rootRef} className={`file-viewer${commentOpen ? " has-comment-open" : ""}`} dir={appDir} onMouseUp={(e) => { const t = e.target; requestAnimationFrame(() => requestAnimationFrame(() => refreshSelection(t))); }} onKeyUp={(e) => refreshSelection(e.target)}>
       <div className="file-viewer-head" dir="ltr" style={{ direction: "ltr" }}>
         <FileIcon path={filePath} size={20} />
-        <span className="file-viewer-name" title={filePath}>
+        {/* The name doubles as "show me this in the explorer": it activates the
+            chat's Files tab, opens the file's folder chain and highlights the
+            row — the reverse trip of opening a file from the tree. */}
+        <button
+          type="button"
+          className="file-viewer-name file-viewer-name-btn"
+          title={`${filePath} — show in Files`}
+          onClick={() =>
+            useViewerTabs
+              .getState()
+              .revealFile(toWorkspacePath(fileRoot, filePath) || filePath)
+          }
+        >
           {fileBasename(filePath)}
-        </span>
+        </button>
         {fileLine ? <span className="file-viewer-line">:{fileLine}</span> : null}
         <span className="file-viewer-spacer" />
         <div className="fv-icon-actions" style={{ display: "flex", alignItems: "center", gap: 2 }}>
@@ -1258,7 +1279,7 @@ export function FileViewerPanel({
             })}
             {bottomPad > 0 && <span className="fv-pad" aria-hidden="true" style={{ height: bottomPad }} />}
           </pre>
-          {totalRows > WINDOW_ROWS && (
+          {useVirtual && (
             <div className="file-viewer-note">
               Virtualized: showing rows {startRow + 1}–{endRow} of {totalRows} — scroll to load more.
             </div>

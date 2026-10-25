@@ -821,6 +821,20 @@ const MAIN_FOLD_RESULT_CHARS: usize = 2_000;
 /// estimated past this many tokens. Fresh conversations and short turns must
 /// not pay any elision cost.
 const MAIN_FOLD_MIN_TOKENS: usize = 20_000;
+
+/// In-turn elision: the SMALLEST removal worth its prefix-cache break.
+///
+/// Folding rewrites an early tool result, so the provider's prefix cache
+/// breaks at that depth and everything after it re-bills at miss price. The
+/// 12:44 run measured the floor: a 226-token removal re-billed a ~40K-token
+/// cached prefix. The cached part of DeepSeek-class prefixes grows roughly
+/// linearly with history, and a mid-size turn re-bills 10-40K after one
+/// rewrite — so a removal must clear a floor that one such re-bill would
+/// dwarf. 4_000 tokens ≈ the smallest fold that still pays for one miss
+/// event at DeepSeek's 5:1 miss-to-hit pricing; smaller folds wait for the
+/// next round, where they either grown past this floor (they usually do —
+/// the same stale results are still there) or the turn ends first.
+const MAIN_FOLD_MIN_REMOVAL: usize = 4_000;
 /// In-turn elision: marker appended to a folded tool-result stub. The model
 /// reads it as a pointer (re-run with narrower args), not as data loss.
 const MAIN_FOLD_MARKER: &str = "[… result elided to save context. Only its beginning is kept — re-run the tool with a narrower pattern/range/file to see the rest again]";
@@ -1411,6 +1425,13 @@ fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     let (allowed, action) = match name {
         "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
         "run_terminal" => (caps.run_terminal, "run commands"),
+        // The memory tools are a read of the project's own notes (and the
+        // matching write to the same store), so they ride the read capability
+        // like the locator tools: a turn that may not read the workspace must
+        // not reach the saved notes either.
+        "search_memory" | "save_memory" | "delete_memory" => {
+            (caps.read_files, "read or write project memory")
+        }
         // Read/search follows the mode's own read capability, not `web`: a mode
         // that may not read the workspace must not reach it through `grep`.
         // The locator tools read the workspace as well (`find_symbol` answers
@@ -2793,6 +2814,26 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             }),
         ),
         (
+            "search_memory",
+            "Search previously saved project notes. Every hit carries an `id` — pass it to delete_memory to remove a note that is stale or wrong.",
+            json!({"query": {"type": "string"}}),
+        ),
+        (
+            "save_memory",
+            "Persist a durable note about the project for future sessions. Save ONLY key points: decisions, user preferences, gotchas, and facts worth remembering — never dump whole files, tool outputs or conversation text. Keep each note under ~500 chars.",
+            json!({
+                "content": {"type": "string", "description": "The key point to remember (concise, self-contained)"},
+                "memory_type": {"type": "string", "description": "long_term (default) or short_term"}
+            }),
+        ),
+        (
+            "delete_memory",
+            "Delete ONE saved note by its id (the `id` field returned by search_memory). Use it to drop a note that turned out to be wrong or obsolete.",
+            json!({
+                "memory_id": {"type": "string", "description": "Id of the note to delete (from search_memory)"}
+            }),
+        ),
+        (
             "web_search",
             "Search the web and fetch the real page content of the top results before answering. Use it for facts, docs and current information. The result count is fixed by the user's \"Results per search\" setting (Settings → Web Providers) — do NOT try to request more or fewer results; if the user wants a different count, tell them where to change it. For several searches, fire every web_search call in the SAME turn (parallel tool calls). Only use fetch_url afterwards for one specific URL that was not among the top results.",
             json!({
@@ -2942,10 +2983,11 @@ fn lsp_position_schemas() -> Vec<(&'static str, &'static str, Value)> {
     ]
 }
 
-/// Tool schemas for the explore SUB-AGENT: the UNBOUNDED search set the main
-/// agent does not get — `glob` discovery — plus the memory tools. It shares
-/// `read`/`grep`/`find_symbol` and the position-based LSP lookups with the main
-/// agent by design: both roles read, they differ in how far they may wander.
+/// Tool schemas for the explore SUB-AGENT: the UNBOUNDED search set — `glob`
+/// discovery — plus the memory tools, which BOTH roles share (see tool_schemas).
+/// It shares `read`/`grep`/`find_symbol` and the position-based LSP lookups with
+/// the main agent by design: both roles read, they differ in how far they may
+/// wander.
 fn research_schemas() -> Vec<Value> {
     // Per-tool schemas (see tool_schemas): only the args each tool accepts.
     let schemas: &[(&str, &str, Value)] = &[
@@ -3899,10 +3941,50 @@ pub async fn run_turn(
         // keeping the last MAIN_FOLD_KEEP_ROUNDS rounds untouched — the model
         // is actively reasoning over those. Below MAIN_FOLD_MIN_TOKENS the
         // whole thing is a no-op: short turns pay nothing.
-        if req.mode != "subagent" && estimate_wire_tokens(&messages[1..]) >= MAIN_FOLD_MIN_TOKENS {
+        //
+        // Two gates besides the token threshold (both traced on the 12:44 run,
+        // where a 226-token fold re-billed the whole 40K cached prefix):
+        // - `fold_pays_off`: no fold once too few model calls remain to reuse
+        //   the savings — the same rule the sub-agent fold already honours.
+        // - `MAIN_FOLD_MIN_REMOVAL`: a fold rewrites an EARLY result, so the
+        //   cache breaks at that depth and everything after it re-bills at
+        //   miss price. When the removal is a few hundred tokens, the reset
+        //   costs an order of magnitude more than the fold saves — so the
+        //   fold is DRY-RUNNED on a clone and only applied when the removal
+        //   clears the floor.
+        if req.mode != "subagent"
+            && estimate_wire_tokens(&messages[1..]) >= MAIN_FOLD_MIN_TOKENS
+            && fold_pays_off(max_steps - step)
+        {
             let before = estimate_wire_tokens(&messages[1..]);
-            let (removed, folded) = fold_stale_tool_results(&mut messages, &mut seen_lookups);
-            record_fold(&trace, "main", step, step + 1, max_steps - step, before, removed, folded);
+            // The probe runs on clones of BOTH arguments: `fold_with` also
+            // mutates `seen` (it retains/removes the lookups it folds), so
+            // handing it the live set would corrupt the dedup state even when
+            // the fold ends up rejected.
+            let mut probe = messages.clone();
+            let mut probe_seen = seen_lookups.clone();
+            let (removed, folded) =
+                fold_stale_tool_results(&mut probe, &mut probe_seen);
+            if folded > 0 && removed >= MAIN_FOLD_MIN_REMOVAL {
+                let (removed, folded) =
+                    fold_stale_tool_results(&mut messages, &mut seen_lookups);
+                record_fold(
+                    &trace,
+                    "main",
+                    step,
+                    step + 1,
+                    max_steps - step,
+                    before,
+                    removed,
+                    folded,
+                );
+            } else if folded > 0 {
+                emit(&AgentEvent::Warn {
+                    content: format!(
+                        "[fold] skipped: removal {removed} tok < {MAIN_FOLD_MIN_REMOVAL} floor — a prefix-cache reset would cost more than it saved"
+                    ),
+                });
+            }
         }
         // Same elision for the explore sub-agent, on its own (much smaller)
         // budget. Its compaction only runs ONCE, before this loop, so without
@@ -5896,15 +5978,30 @@ fn resolve_slot_target(
 /// enough to be worth folding" (the in-turn elision trigger, which only cares
 /// about tool output).
 fn estimate_wire_tokens(messages: &[Value]) -> usize {
-    messages
-        .iter()
-        .map(|m| {
-            m["content"]
-                .as_str()
-                .map(|c| c.len().div_ceil(4))
-                .unwrap_or(0)
-        })
-        .sum()
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// Wire tokens one message costs, counting EVERYTHING the provider bills.
+///
+/// `content` alone is not the cost. Traced on a 38-round build turn, the wire
+/// was billed at 89_201 tokens from the first step while the sum of every
+/// `content` on it was ~29K: an `assistant` message also carries
+/// `tool_calls[].function.arguments`, and for `edit_file` that is the WHOLE
+/// `old_string` + `new_string` body — 44_784 chars measured over one turn, none
+/// of it visible to a `content`-only reader. The old estimate therefore reported
+/// a wire that was less than a third of the real one, which is why the fold
+/// trigger believed a 76K-token history was a 29K one and the fold's own
+/// `before_tokens` stayed flat at 76-88K while the provider billed 89-113K.
+fn estimate_message_tokens(m: &Value) -> usize {
+    let mut chars = m["content"].as_str().map(str::len).unwrap_or(0);
+    if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
+        for c in calls {
+            // The name is a handful of bytes; the arguments are the payload.
+            chars += c["function"]["name"].as_str().map(str::len).unwrap_or(0);
+            chars += c["function"]["arguments"].as_str().map(str::len).unwrap_or(0);
+        }
+    }
+    chars.div_ceil(4)
 }
 
 /// The prompt size the auto-compaction trigger compares against the threshold.
@@ -6148,6 +6245,52 @@ fn fold_with(
                     }
                 }
             }
+        }
+    }
+    // The assistant side is the OTHER half of the wire, and it was never folded.
+    // A round's `assistant` message carries its calls' FULL arguments, so every
+    // stale `edit_file` keeps its entire `old_string` + `new_string` — the file
+    // body it rewrote — on the wire forever. Traced on a 38-round build turn:
+    // 44_784 chars of `edit_file` arguments against 131_747 chars of ALL tool
+    // results, and the tool-results pass alone left `before_tokens` climbing
+    // 76K -> 88K while the provider billed 89K -> 113K. The `tool` result has
+    // already been folded to a pointer by the loop above, so keeping the args
+    // buys nothing: the model can re-read the file (the marker tells it to).
+    //
+    // Only the ARGUMENTS are trimmed, never the call itself: dropping the call
+    // would orphan its `tool` message and break the provider's
+    // assistant/tool pairing (a 400, not a saving).
+    for m in messages[..cut].iter_mut() {
+        if m["role"] != "assistant" { continue; }
+        let Some(calls) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) else {
+            continue;
+        };
+        for c in calls.iter_mut() {
+            let Some(f) = c.get_mut("function") else { continue };
+            if f["name"].as_str() != Some("edit_file") { continue; }
+            let Some(raw) = f["arguments"].as_str() else { continue };
+            let old_chars = raw.chars().count();
+            if old_chars <= result_budget { continue; }
+            // `arguments` is STRUCTURED: the provider re-parses it on every
+            // subsequent round-trip, so a head-truncated string is not a cheap
+            // saving — it is a malformed JSON fragment that can 400 the whole
+            // turn. Blank only the bulky string fields instead, keeping the
+            // object parseable and the call's IDENTITY (`path`, so the model
+            // still knows WHICH file an earlier round touched) intact.
+            let Ok(mut parsed) = serde_json::from_str::<Value>(raw) else { continue };
+            let mut shrunk = false;
+            for field in ["old_string", "new_string"] {
+                let Some(body) = parsed[field].as_str() else { continue };
+                if body.chars().count() <= result_budget { continue; }
+                let head: String = body.chars().take(result_budget).collect();
+                parsed[field] = json!(format!("{head}\n{MAIN_FOLD_MARKER}"));
+                shrunk = true;
+            }
+            if !shrunk { continue; }
+            let new_args = parsed.to_string();
+            removed_chars += old_chars.saturating_sub(new_args.chars().count());
+            folded += 1;
+            f["arguments"] = json!(new_args);
         }
     }
     (removed_chars, folded)
@@ -7665,6 +7808,24 @@ async fn run_subagent(
         return ("explore requires a non-empty prompt".into(), false);
     }
 
+    // Every retry event of this ladder is stamped with ITS branch id. Parallel
+    // explore calls share one stream, so without it the renderer cannot tell
+    // WHICH sub-agent recovered: a sibling's tool call retired another's banner,
+    // and the recovered branch's own banner stayed frozen until its whole tool
+    // finished. The branch id is what lets the banner retire the moment ITS
+    // sub-agent makes progress again.
+    let emit_raw = emit;
+    let mut emit = |ev: &AgentEvent| match ev {
+        AgentEvent::Retry { .. } | AgentEvent::RetryGiveup { .. } => {
+            emit_raw(&AgentEvent::Branch {
+                branch,
+                sub: false,
+                inner: Box::new(ev.clone()),
+            })
+        }
+        _ => emit_raw(ev),
+    };
+
     emit(&AgentEvent::Status {
         stage: "subagent".into(),
         content: description.clone(),
@@ -8820,6 +8981,12 @@ mod tests {
             // file. (An earlier version of this test banned it, claiming it
             // re-ran `cargo check`; that was wrong and cost the lever.)
             "lsp_diagnostics",
+            // The memory tools are shared with the explore sub-agent: a saved
+            // note is the project's own context, and reaching it through a
+            // delegation charged a whole sub-agent round for one lookup.
+            "search_memory",
+            "save_memory",
+            "delete_memory",
         ] {
             assert!(names.contains(&allowed), "main agent must have {allowed}");
         }
@@ -8827,10 +8994,6 @@ mod tests {
             // Pure discovery: finding out WHICH files exist stays with the
             // sub-agent, whose report the main agent works from.
             "glob",
-            // Memory writes and catalog scans are not main-agent work.
-            "save_memory",
-            "search_memory",
-            "delete_memory",
         ] {
             assert!(!names.contains(&banned), "main agent must not have {banned}");
         }
@@ -9537,12 +9700,16 @@ mod tests {
             // has nobody to ask, so a bundle's scripts must be reachable there.
             // The step is the compact schema's own chars — the authoring prose
             // stays out, and the ~3.5% headroom convention still holds.
-            ("main", tool_schemas(false, false), 11_400usize),
-            ("main+browser", tool_schemas(false, true), 17_100),
+            // The memory tools became main-agent tools as well, so the four
+            // main budgets moved with them: the ceilings stay measured-size +
+            // the same ~3.5% headroom convention, and only `explore` is
+            // unchanged (it never lost the schemas).
+            ("main", tool_schemas(false, false), 12_700usize),
+            ("main+browser", tool_schemas(false, true), 18_500),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
-            ("main+authoring", tool_schemas(true, false), 18_100),
-            ("main+authoring+browser", tool_schemas(true, true), 23_900),
+            ("main+authoring", tool_schemas(true, false), 19_900),
+            ("main+authoring+browser", tool_schemas(true, true), 25_700),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -10781,10 +10948,67 @@ mod tests {
     }
 
     #[test]
-    fn estimate_wire_tokens_reads_content_only() {
+    fn fold_shrinks_stale_edit_file_arguments_and_keeps_the_call() {
+        // A stale edit call whose arguments carry the whole rewritten body: the
+        // `tool` result is folded to a pointer, so the args are dead weight the
+        // provider re-bills on every later round.
+        let big = "b".repeat(30_000);
+        let args = json!({"path": "a.rs", "old_string": big, "new_string": big}).to_string();
+        let mut messages: Vec<Value> = Vec::new();
+        messages.push(json!({"role": "user", "content": "go"}));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "edit_file", "arguments": args}}],
+        }));
+        messages.push(json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}));
+        // Two fresh rounds below `MAIN_FOLD_KEEP_ROUNDS`, so `c1` is stale.
+        for n in 0..MAIN_FOLD_KEEP_ROUNDS {
+            messages.extend(fold_round(&format!("fresh{n}"), "read", "small"));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let (removed, folded) = fold_stale_tool_results(&mut messages, &mut seen);
+
+        assert!(folded > 0, "the oversized edit args must be folded");
+        assert!(removed > 20_000, "most of the 60K args must come off the wire");
+        // The call itself survives: dropping it would orphan its `tool` reply,
+        // which providers reject outright.
+        let calls = messages[1]["tool_calls"].as_array().expect("call kept");
+        assert_eq!(calls.len(), 1);
+        let folded_args = calls[0]["function"]["arguments"].as_str().unwrap();
+        assert!(folded_args.contains(MAIN_FOLD_MARKER));
+        // The provider re-parses `arguments` on every later round-trip, so a
+        // head-truncated fragment would 400 the turn. The object must stay
+        // valid JSON, and the call's identity (`path`) must survive so the model
+        // still knows WHICH file an earlier round touched.
+        let reparsed: Value = serde_json::from_str(folded_args)
+            .expect("folded arguments must remain parseable JSON");
+        assert_eq!(reparsed["path"].as_str(), Some("a.rs"));
+        assert!(reparsed["old_string"].is_string());
+        // The pairing the provider validates is intact.
+        assert_eq!(messages[2]["tool_call_id"].as_str(), Some("c1"));
+    }
+
+    #[test]
+    fn estimate_wire_tokens_counts_content_and_call_arguments() {
         let msgs = vec![json!({"role": "user", "content": "x".repeat(400)})];
         assert_eq!(estimate_wire_tokens(&msgs), 100);
         assert_eq!(estimate_wire_tokens(&[]), 0);
+
+        // A `content`-only estimate read the wire as less than a third of what
+        // the provider billed: an assistant call carries its arguments (for
+        // `edit_file`, the whole rewritten file body) OUTSIDE `content`.
+        let with_call = vec![json!({
+            "role": "assistant",
+            "content": "x".repeat(400),
+            "tool_calls": [{
+                "id": "t1",
+                "function": {"name": "edit_file", "arguments": "y".repeat(400)},
+            }],
+        })];
+        // 400 content + 9 name + 400 args = 809 chars -> 203 tokens.
+        assert_eq!(estimate_wire_tokens(&with_call), 203);
     }
 
     /// One "round": an assistant message carrying a single tool_call plus the
@@ -13107,5 +13331,19 @@ mod tests {
         // The guard must not shadow the elision it protects: it sits far below
         // the run length, so an explore run that folds at all still folds.
         assert!(SUBAGENT_MAX_STEPS > FOLD_MIN_REMAINING_CALLS);
+    }
+
+    #[test]
+    fn a_peanut_fold_would_cost_more_than_it_saves() {
+        // The 12:44 run folded 226 tokens out of an early result and re-billed
+        // the WHOLE ~40K cached prefix at miss price one model call later — a
+        // net loss ~180× the gain. The main fold must therefore clear a floor
+        // before mutating history; sub-agent folds keep their own (much larger)
+        // budgets and their own payoff rule.
+        assert!(MAIN_FOLD_MIN_REMOVAL > 0);
+        // The floor is comfortably above the measured peanut (226 tok) but far
+        // below a real stale explore report (10-40K), so useful folds survive.
+        assert!(MAIN_FOLD_MIN_REMOVAL > 1_000);
+        assert!(MAIN_FOLD_MIN_REMOVAL < MAIN_FOLD_MIN_TOKENS);
     }
 }

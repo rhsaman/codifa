@@ -322,15 +322,18 @@ export async function playTts(
   if (!playedAny && lastErr && stillMine) throw lastErr
 }
 
-const LIVE_STREAM_POLL_MS = 350
+const LIVE_STREAM_POLL_MS = 150
 // Max consecutive fetch failures for one sentence before it is skipped, so a
 // poisoned sentence never stalls live speech forever.
 const LIVE_STREAM_MAX_FAILS = 2
 // Streaming tail: how long the trailing part of the answer must stop growing
 // before it is spoken without waiting for the turn to finish, and the shortest
 // tail worth a request of its own (a single stray letter is not speech).
-const TAIL_SETTLE_MS = 600
-const TAIL_MIN_CHARS = 8
+// Kept just above one poll interval: live answers (see livePrompt) are short
+// unpunctuated Persian prose, so the tail rule is what starts speech — a long
+// settle was the "the text finishes, THEN it talks" delay.
+const TAIL_SETTLE_MS = 250
+const TAIL_MIN_CHARS = 4
 // A punctuation-free run this long is spoken even before it pauses (a big code
 // block or a streamed list item would otherwise stay mute until the end).
 // Matches splitTtsSentences' own hard cap, so the cut still lands on a word.
@@ -496,8 +499,16 @@ export async function playTtsStream(
   }
   if (activeAbort === controller) activeAbort = null
   const stillMine = activeSeq === seq
+  // "Produced no audio" must be read BEFORE stopTtsGlobal() bumps the sequence
+  // (which would make stale() true and hide the fact). Either every fetch failed
+  // (lastErr) or the text source never produced a single chunk — the live answer
+  // bubble was not found — and the caller's only recovery is the full-text
+  // fallback, so report a failure instead of a silent, successful no-op that
+  // leaves the turn mute. When the caller stopped us on purpose (a newer playback
+  // or a barge-in abort) that is a normal stop, never an error.
+  const mute = !playedAny && stillMine && !stale()
   if (stillMine) stopTtsGlobal()
-  if (!playedAny && lastErr && stillMine) throw lastErr
+  if (mute) throw lastErr ?? new Error("progressive speech produced no audio")
 }
 
 /** پخش یک تکه صوتی (یک جمله) و انتظار تا پایان آن. */

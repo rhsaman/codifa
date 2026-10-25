@@ -1,5 +1,5 @@
 /**
- * Bottom-docked terminal panel (Cmd/Ctrl+J).
+ * Bottom-docked terminal panel (Ctrl+X then J).
  *
  * Each tab owns one pty session living in the Rust shell (src-tauri/src/pty.rs);
  * this component only renders xterm.js screens and shuttles I/O over IPC.
@@ -13,12 +13,12 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useStore } from '../lib/store'
 import { focusChatInput } from '../lib/chatFocus'
-import { isApplePlatform } from '../lib/shortcuts'
 import { suppressField } from '../lib/inputSuppress'
 import { WebKitDeadKeyAddon } from '../lib/webkitDeadKey'
 import { findOpenRunTarget } from '../lib/nvimEdit'
 import { TERMINAL_FONT_FAMILY, TERMINAL_FONT_SIZE, registerTerminalScreen, xtermTheme } from '../lib/xtermTheme'
 import { isReservedTerminalChord } from '../lib/terminalKeys'
+import { ownedPtyIds } from '../lib/terminalSessions'
 
 interface TerminalTab {
   id: string
@@ -55,8 +55,10 @@ export function shouldSpawnShell(tabCount: number): boolean {
   return tabCount === 0
 }
 
-function cwdBasename(cwd: string): string {
-  const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/)
+function cwdBasename(cwd: string | undefined): string {
+  // A session with no cwd (an older backend reply, a stub) must not crash the
+  // whole tree: `undefined.replace` threw and unmounted the app.
+  const parts = (cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/)
   return parts[parts.length - 1] || cwd || '~'
 }
 
@@ -108,6 +110,19 @@ export function TerminalPanel() {
     if (st.activeChatId !== id) st.focusWindow(id)
     requestAnimationFrame(() => focusChatInput(id))
   }, [open])
+
+  // A `coder:focus-terminal` request asks the panel to take the caret: the
+  // panel is opened by the caller, this only focuses the ACTIVE session's
+  // xterm, which is where typing has to land.
+  useEffect(() => {
+    const onFocusRequest = () => {
+      const id = activeIdRef.current
+      const term = id ? entries.current.get(id)?.term : null
+      term?.focus()
+    }
+    window.addEventListener('coder:focus-terminal', onFocusRequest)
+    return () => window.removeEventListener('coder:focus-terminal', onFocusRequest)
+  }, [])
 
   const supported = hasTerminalApi()
 
@@ -198,9 +213,14 @@ export function TerminalPanel() {
       const live = (await window.coder.terminalList().catch(() => [])) ?? []
       if (cancelled) return
       const known = new Set(tabsRef.current.map((t) => t.id))
+      // RIGHT-PANE sessions are NOT ours to adopt: `terminalList` returns every
+      // backend pty, and adopting the pane's nvim duplicated it as a chip here
+      // (and let closing this panel kill the in-app editor). Marked ids stay
+      // with their own host.
+      const paneOwned = ownedPtyIds()
       // Same nullish-entry defence as spawnSession: only sessions carrying a
       // real id can become a tab (the render reads `tab.id`).
-      const adopt = live.filter((s) => !!s && typeof s.id === 'string' && !known.has(s.id))
+      const adopt = live.filter((s) => !!s && typeof s.id === 'string' && !known.has(s.id) && !paneOwned.has(s.id))
       if (adopt.length > 0) {
         setTabs((prev) => [...prev, ...adopt])
         setActiveId((cur) => cur ?? adopt[0].id)
@@ -440,8 +460,10 @@ export function TerminalPanel() {
       })
       // Reserved chords must reach the window-level handler even while the
       // terminal has focus — return false so xterm neither sends them to the
-      // shell nor eats them: Cmd/Ctrl+J toggles the panel, Cmd/Ctrl+W closes
-      // the active terminal tab (Cmd on Apple platforms, Ctrl elsewhere).
+      // shell nor eats them: Cmd/Ctrl+W closes the active terminal tab (Cmd
+      // on Apple platforms, Ctrl elsewhere). The panel toggle (Ctrl+X J) is
+      // consumed by the window handler, which also stops the second key so
+      // the `j` never reaches this xterm.
       term.attachCustomKeyEventHandler((ev) => {
         // `keyup` only clears xterm's own `_keyDownSeen`/`_keyPressHandled`
         // bookkeeping — never suppress it here.
@@ -483,7 +505,7 @@ export function TerminalPanel() {
   // Nothing before the first open — no shells spawn just because the app booted.
   if (!everOpenedRef.current && !open) return null
 
-  const toggleLabel = isApplePlatform() ? '⌘J' : 'Ctrl+J'
+  const toggleLabel = 'Ctrl+X J'
 
   return (
     <section

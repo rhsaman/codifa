@@ -1,11 +1,14 @@
 // The 'files' viewer kind: persistence whitelist + the open action.
 //
-// Two things are locked here:
+// Three things are locked here:
 //   * BOTH kind whitelists in loadPersisted accept the new kinds — 'explore'
 //     was missing from them since it was introduced, so an explore tab was
 //     silently dropped on every restart. A kind the store can create but not
 //     reload is worse than no persistence at all.
-//   * openFiles creates exactly one chat-scoped tab and focuses the pane.
+//   * openFiles creates exactly ONE global explorer tab and focuses the pane.
+//     The explorer is deliberately NOT chat-scoped: a per-chat tab made the
+//     rail show one files icon per chat, and activating it pushed the chat's
+//     open file tab out of the rail.
 //
 // Persistence is driven through the REAL load path (seeding localStorage before
 // the module loads): zustand hydrates its initial state at import time, so a
@@ -36,13 +39,14 @@ const disk = new Map<string, string>([
     'coder:viewerTabs',
     JSON.stringify({
       tabs: [
-        { id: 'files:c1', kind: 'files', chatId: 'c1', title: 'Files', createdAt: 200 },
         { id: 'explore:c1', kind: 'explore', chatId: 'c1', title: 'Explore', createdAt: 100 },
+        // The global explorer id carries no chat scope.
+        { id: 'files', kind: 'files', title: 'Files', createdAt: 150 },
         // A kind that never existed must still be rejected on load, so the
         // whitelist is not accidentally widened into "accept anything".
         { id: 'bogus:c1', kind: 'bogus', chatId: 'c1', title: 'Bogus', createdAt: 50 },
       ],
-      activeId: 'files:c1',
+      activeId: 'files',
       closed: [],
     }),
   ],
@@ -83,13 +87,13 @@ console.log('1) loadPersisted keeps the new kinds (and still rejects unknown one
   check('the explore tab survives too (was silently dropped before)', kinds.includes('explore'), kinds)
   check('an unknown kind is still rejected', !kinds.includes('bogus'), kinds)
   const files = tabs.find((t) => t.kind === 'files')
-  check('the files tab keeps its chat scope', files?.chatId === 'c1', files)
-  check('the files tab keeps its id', files?.id === 'files:c1', files?.id)
+  check('the files tab is global (no chat scope)', files?.chatId === undefined, files)
+  check('the files tab keeps its id', files?.id === 'files', files?.id)
 }
 
 console.log('2) id and title follow the shared rules:')
 {
-  check("viewerTabId scopes files to a chat", viewerTabId('files', 'c1') === 'files:c1', viewerTabId('files', 'c1'))
+  check("viewerTabId keeps files global (no chat suffix)", viewerTabId('files', 'c1') === 'files', viewerTabId('files', 'c1'))
   check(
     'the files tab shows the shared kind label',
     viewerTabTitle({ kind: 'files', title: 'Files' }) === 'Files',
@@ -97,29 +101,34 @@ console.log('2) id and title follow the shared rules:')
   )
 }
 
-console.log('3) visibility is chat-scoped:')
+console.log('3) visibility is global:')
 {
   const tabs = useViewerTabs.getState().tabs
   const mine = visibleTabs(tabs, 'c1').map((t) => t.kind)
-  check('the owning chat sees its files tab', mine.includes('files'), mine)
+  check('the owning chat sees the files tab', mine.includes('files'), mine)
   const other = visibleTabs(tabs, 'c2').map((t) => t.kind)
-  check('another chat does not', !other.includes('files'), other)
+  check('another chat sees the SAME single files tab', other.includes('files'), other)
+  check(
+    'no second files tab appears for another chat',
+    tabs.filter((t) => t.kind === 'files').length === 1,
+    tabs,
+  )
 }
 
-console.log('4) openFiles creates one tab per chat and reveals the pane:')
+console.log('4) openFiles creates one GLOBAL tab and reveals the pane:')
 {
   useViewerTabs.setState({ tabs: [], activeId: null, paneOpen: false } as any)
-  useViewerTabs.getState().openFiles('c9')
+  useViewerTabs.getState().openFiles()
   const s = useViewerTabs.getState() as any
   const created = s.tabs.filter((t: any) => t.kind === 'files')
   check('exactly one files tab was created', created.length === 1, s.tabs)
   check('it is named Files', created[0]?.title === 'Files', created[0])
-  check('it is owned by the requested chat', created[0]?.chatId === 'c9', created[0])
-  check('it became the active tab', s.activeId === 'files:c9', s.activeId)
+  check('it is NOT owned by a chat', created[0]?.chatId === undefined, created[0])
+  check('it became the active tab', s.activeId === 'files', s.activeId)
   check('the pane was revealed', s.paneOpen === true)
   check('the page opened as an ordinary tab (no pane mode to exit)', !('panelMode' in s))
 
-  useViewerTabs.getState().openFiles('c9')
+  useViewerTabs.getState().openFiles()
   const again = useViewerTabs.getState() as any
   check(
     'reopening does not stack a second tab',
@@ -127,11 +136,21 @@ console.log('4) openFiles creates one tab per chat and reveals the pane:')
     again.tabs,
   )
 
-  useViewerTabs.getState().openFiles('c10')
+  // The whole point of the global id: another chat's open file tab must
+  // survive the explorer being activated.
+  useViewerTabs.setState({
+    tabs: [
+      { id: 'files', kind: 'files', title: 'Files', createdAt: 1 },
+      { id: 'file:c2:a.ts', kind: 'file', chatId: 'c2', title: 'a.ts', createdAt: 2 },
+    ],
+    activeId: 'file:c2:a.ts',
+  } as any)
+  useViewerTabs.getState().openFiles()
+  const after = useViewerTabs.getState() as any
   check(
-    'another chat gets its own tab',
-    (useViewerTabs.getState() as any).tabs.filter((t: any) => t.kind === 'files').length === 2,
-    (useViewerTabs.getState() as any).tabs,
+    "another chat's file tab is not closed by activating the explorer",
+    after.tabs.some((t: any) => t.id === 'file:c2:a.ts'),
+    after.tabs,
   )
 }
 

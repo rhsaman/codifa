@@ -50,6 +50,26 @@ const PAGE = 30
 }
 
 {
+  console.log('── an unfocused pane always gives its pages back ──')
+  // THE regression this pins: with several chats open, every pane kept its own
+  // warm window even while the user looked at another one, so the renderer's
+  // footprint multiplied by the number of open chats. An inactive pane is not
+  // being read, so its extra pages are pure footprint and must be released
+  // regardless of where its (unseen) scroll position sits.
+  check('inactive + scrolled up still trims', shouldTrimMountedWindow(PAGE * 4, PAGE, false, false) === true)
+  check('inactive 2 pages trims', shouldTrimMountedWindow(PAGE * 2, PAGE, false, false) === true)
+  check('inactive at the bottom trims too', shouldTrimMountedWindow(PAGE * 4, PAGE, true, false) === true)
+  // One page is the floor for every panel: nothing to release, so no loop.
+  check('inactive at one page is a no-op', shouldTrimMountedWindow(PAGE, PAGE, true, false) === false)
+  // The active panel keeps the original conservative rule: only trim once it is
+  // pinned to the newest message.
+  check('active + scrolled up keeps its window', shouldTrimMountedWindow(PAGE * 4, PAGE, false, true) === false)
+  check('active at the bottom trims', shouldTrimMountedWindow(PAGE * 4, PAGE, true, true) === true)
+  // Default is the active rule, so the single-pane caller is unaffected.
+  check('default is the active rule', shouldTrimMountedWindow(PAGE * 4, PAGE, false) === false)
+}
+
+{
   console.log('── the trim never discards reachable history ──')
   // Trimming returns to ONE page, which must remain >= the minimum the window
   // slice keeps; otherwise the transcript could render nothing.

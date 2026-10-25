@@ -153,9 +153,10 @@ console.log('4) the "+" menu is the single entry point, and every page is a tab:
     check(`${btn} is gone`, !barSrc.includes(`export function ${btn}`), btn)
   }
   // Every visible tab is a row now — pages included — so each one has a ✕.
+  // Terminals fold into ONE row; the pane body's chip strip is the real list.
   check(
     'the rail draws rows from viewerTabRows',
-    /const tabs = viewerTabRows\(allTabs, activeChatId\)/.test(barSrc),
+    /const tabs = viewerTabRows\(allTabs, activeChatId, activeId\)/.test(barSrc),
     barSrc.slice(0, 0),
   )
 }

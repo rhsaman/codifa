@@ -310,8 +310,11 @@ export function ViewerTabBar() {
   const activeId = useViewerTabs((s) => s.activeId);
   const activeChatId = useStore((s) => s.activeChatId);
   // Every visible tab is a row — pages included, since the "+" menu opens them
-  // as ordinary tabs, so each one can be closed from its own row.
-  const tabs = viewerTabRows(allTabs, activeChatId);
+  // as ordinary tabs, so each one can be closed from its own row. Terminal tabs
+  // are the exception: they collapse into ONE row (their shells are listed in
+  // the pane body's own chip strip), and the single row highlights the ACTIVE
+  // shell.
+  const tabs = viewerTabRows(allTabs, activeChatId, activeId);
   // Same rule the pane body uses, so the highlighted row is the painted page.
   const activeRowId = shownViewerTabId(allTabs, activeId, activeChatId);
   const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : tabs[0]?.id ?? null;
@@ -588,7 +591,7 @@ export function ViewerAddButton() {
     {
       label: "Open a page",
       entries: [
-        { key: "files", title: "Files", icon: <FilesIcon />, onOpen: () => vt().openFiles(activeChatId) },
+        { key: "files", title: "Files", icon: <FilesIcon />, onOpen: () => vt().openFiles() },
         { key: "todos", title: "Todos", icon: <TodosIcon />, onOpen: () => vt().openTodos(activeChatId) },
         { key: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onOpen: () => vt().openArtifacts() },
         { key: "review", title: "Git diff", icon: <ReviewIcon />, onOpen: () => vt().openGitDiff(activeChatId) },

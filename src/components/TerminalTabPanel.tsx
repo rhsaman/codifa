@@ -137,7 +137,7 @@ export function TerminalTabPanel({ tabId, cwd, program, args, shell }: TerminalT
               title={t.title}
               onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
             >
-              <span className="terminal-tab-shell">{t.title}</span>
+              <span className="terminal-tab-shell">{(t.title || '').split('/').pop() || t.title}</span>
               <button
                 className="terminal-tab-close"
                 aria-label={`Close ${t.title}`}

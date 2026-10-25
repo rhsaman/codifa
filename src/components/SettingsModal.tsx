@@ -1566,7 +1566,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     return d
   })
 
-  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'extensions' | 'marketplaces' | 'storage' | 'tools' | 'models' | 'general' | 'terminal'>(initialTab as any || 'providers')
+  const [tab, setTab] = useState<'providers' | 'auth' | 'plugins' | 'modes' | 'appearance' | 'extensions' | 'marketplaces' | 'storage' | 'tools' | 'models' | 'general'>(initialTab as any || 'providers')
   // Search Console OAuth (Settings → Auth) — the ONLY Google sign-in. Gemini
   // models authenticate with an API key like every other provider.
   const searchConsole = useStore((s) => s.searchConsole)
@@ -2372,18 +2372,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 22a10 10 0 1 1 10-10c0 2-1.5 3-3 3h-2a3 3 0 0 0-3 3v1c0 1.5-1 2-2 2Z" />
-        </svg>
-      ),
-    },
-    {
-      id: 'terminal',
-      label: 'Terminal',
-      group: 'App',
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <rect x="3" y="4" width="18" height="16" rx="2" />
-          <path d="m7 9 3 3-3 3" />
-          <path d="M13 15h4" />
         </svg>
       ),
     },
@@ -3488,20 +3476,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         </>
         )}
 
-        {tab === 'terminal' && (
+        {tab === 'general' && (
         <>
-            <div className="field">
-              <div className="field-head">
-                <label>Neovim</label>
-              </div>
-              <div className="hint">
-                <strong>Open with → Neovim</strong> always opens a terminal tab in
-                this app's right pane — no other terminal needs to be installed.
-                Run in the pane is the only target; the editor itself is whatever
-                <code>nvim</code> your login shell resolves.
-              </div>
-            </div>
-
             <div className="field">
               <div className="field-head">
                 <label>Shell for the in-app terminal</label>
@@ -3524,11 +3500,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 ))}
               </select>
             </div>
-        </>
-        )}
 
-        {tab === 'general' && (
-        <>
             <div className="field">
               <div className="field-head">
                 <label>Auto-compaction threshold</label>

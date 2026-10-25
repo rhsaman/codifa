@@ -34,6 +34,30 @@ export async function getArtifact(
   }
 }
 
+/** Read the supporting files (backend source, data, config) of one artifact.
+ *
+ *  They live beside the document rather than in the transcript, so the preview
+ *  panel asks for them itself; an artifact with none is simply empty. */
+export async function getArtifactAssets(
+  chatId: string,
+  id: string,
+): Promise<{ files: Array<{ path: string; content: string }> } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: 'the local backend is not ready' }
+  try {
+    const qs = new URLSearchParams({ chat_id: chatId, id }).toString()
+    const res = await fetch(`${url}/artifacts/assets?${qs}`)
+    const data = (await res.json().catch(() => ({}))) as {
+      files?: Array<{ path: string; content: string }>
+      detail?: string
+    }
+    if (!res.ok) return { error: data.detail || `request failed (${res.status})` }
+    return { files: data.files ?? [] }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** Delete one artifact: every saved version goes with it.
  *
  *  A missing artifact reports the backend's own error instead of looking like

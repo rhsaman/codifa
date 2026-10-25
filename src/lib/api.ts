@@ -1765,6 +1765,39 @@ export async function listMcp(): Promise<{
   }
 }
 
+/** Run one MCP tool on behalf of the artifact panel's page channel.
+ *
+ *  The caller names a TOOL, never a server, and passes the connector set the
+ *  composer already resolved for the turn — this module never reaches into the
+ *  store (it is imported by the store's own module graph). A page in the sandbox
+ *  can therefore only reach connectors the user switched on, and it never
+ *  learns a token, a command line or a server name. */
+export async function callMcpTool(
+  tool: string,
+  args: unknown,
+  servers: Record<string, McpServerConfig> = {},
+): Promise<{ result: string } | { error: string }> {
+  const name = tool.trim()
+  if (!name) return { error: 'an MCP tool name is required' }
+  const url = await ensureSidecar()
+  if (!url) return { error: 'the local backend is not ready' }
+  try {
+    const res = await fetch(`${url}/mcp/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool: name, args, servers }),
+    })
+    const data = (await res.json().catch(() => ({}))) as {
+      result?: string
+      detail?: string
+    }
+    if (!res.ok) return { error: data.detail || `mcp call failed (${res.status})` }
+    return { result: data.result ?? '' }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** Save an MCP connector into the bundle that owns it (a new one if it has none). */
 export async function saveMcp(name: string, cfg: McpServerConfig): Promise<void> {
   const url = await ensureSidecar()

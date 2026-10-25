@@ -62,6 +62,29 @@ const sampleDiff = (label: string) =>
     " const g = 8",
   ].join("\n");
 
+const artifactDoc = `<!DOCTYPE html>
+<html><body style="font:14px system-ui;background:#0b0e14;color:#e6e6e6">
+<h3 style="margin:0 0 8px">Fleet dashboard</h3>
+<div id="v">waiting for live data…</div>
+<script>
+window.addEventListener("message", (e) => {
+  const m = e.data;
+  if (!m) return;
+  if (m.source === "probe") {
+    parent.postMessage({ source: "codifa-artifact", id: 2, tool: m.tool, args: {} }, "*");
+    return;
+  }
+  if (m.source !== "codifa-artifact-reply") return;
+  const text = m.ok ? m.result : "error: " + m.error;
+  document.getElementById("v").textContent = text;
+  // Report the received text back so a driver can assert the round trip
+  // without reaching into an opaque-origin frame.
+  parent.postMessage({ source: "codifa-artifact-received", id: m.id, text }, "*");
+});
+parent.postMessage({ source: "codifa-artifact", id: 1, tool: "list_containers", args: {} }, "*");
+<\/script>
+</body></html>`;
+
 function initialState(scenario: string | null) {
   const now = Date.now();
   const chat = (extra: Record<string, unknown>) => ({
@@ -416,6 +439,44 @@ function initialState(scenario: string | null) {
           }),
         ],
       };
+    case "artifact":
+      // A multi-file artifact: the transcript card carries the supporting-file
+      // list, and opening it docks the sandboxed preview tab. The panel also
+      // answers a page's `mcp-call` message, so a driver can post one and see
+      // the result flow back into the frame.
+      return {
+        root: "/tmp/codifa-ui-harness",
+        activeChatId: "c1",
+        chats: [
+          chat({
+            messages: [
+              {
+                id: "m1",
+                role: "user",
+                content: "build a dashboard with a rust backend",
+                createdAt: now,
+              },
+              {
+                id: "m2",
+                role: "assistant",
+                createdAt: now + 1,
+                content: "",
+                segments: [
+                  {
+                    kind: "artifact",
+                    id: "dash",
+                    title: "Fleet dashboard",
+                    artifactKind: "html",
+                    content: artifactDoc,
+                    version: 2,
+                    assets: ["backend.rs", "data.json"],
+                  },
+                ],
+              },
+            ],
+          }),
+        ],
+      };
     case "composer":
     default:
       return {
@@ -573,6 +634,83 @@ if (params.get("scenario") === "diff") {
   const { SettingsModal } = await import("../../src/components/SettingsModal");
   root.render(
     <SettingsModal onClose={() => {}} initialTab={params.get("tab") ?? "tools"} />,
+  );
+} else if (params.get("scenario") === "artifact") {
+  // The real multi-file artifact flow, exercised through the REAL panel. Both
+  // bridge calls go to the sidecar over HTTP, so this stubs `fetch` at that
+  // boundary: `/artifacts/assets` answers the supporting-file list and
+  // `/mcp/call` records the page's request. That way the panel's own parsing,
+  // its narrow message guard and its reply are all under test.
+  let mcpCalls: Array<{ tool: string; servers: string[] }> = [];
+  // The panel reaches the sidecar through `getSidecarUrl`; without a URL both
+  // effects bail out and the file list and page channel look dead. Point it at
+  // a stub host — every request below is answered by the fetch stub, so nothing
+  // ever leaves the page.
+  const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+  coder.getSidecarUrl = () => Promise.resolve("http://127.0.0.1:1");
+  coder.probeSidecar = () => Promise.resolve(true);
+  const realFetch = window.fetch.bind(window);
+  window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.includes("/artifacts/assets")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            files: [
+              { path: "backend.rs", content: "fn main() {}" },
+              { path: "data.json", content: '{"ok":true}' },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    }
+    if (url.includes("/mcp/call")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        tool?: string;
+        servers?: Record<string, unknown>;
+      };
+      mcpCalls.push({ tool: body.tool ?? "", servers: Object.keys(body.servers ?? {}) });
+      return Promise.resolve(
+        new Response(JSON.stringify({ result: `stub result for ${body.tool}` }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+    return realFetch(input as RequestInfo, init);
+  }) as typeof window.fetch;
+  (window as any).__ui.mcpCalls = () => mcpCalls;
+  const { ArtifactPanel } = await import("../../src/components/ArtifactPanel");
+  const { useStore } = await import("../../src/lib/store");
+  const { useViewerTabs } = await import("../../src/lib/viewerTabs");
+  (window as any).__ui.viewer = useViewerTabs;
+  // One connector enabled, exactly as the composer would pass it: the page may
+  // ask for a tool, and only this server's tools are reachable.
+  (useStore as any).setState({
+    settings: {
+      ...(useStore as any).getState().settings,
+      mcpServers: { proxmox: { url: "http://127.0.0.1:9/mcp" } },
+      mcpEnabled: ["proxmox"],
+    },
+  });
+  useViewerTabs.getState().openArtifact("c1", {
+    id: "dash",
+    title: "Fleet dashboard",
+    kind: "html",
+    body: artifactDoc,
+    version: 2,
+  });
+  root.render(
+    <div style={{ display: "flex", height: "100vh", background: "var(--bg, #0b0e14)" }}>
+      <ArtifactPanel
+        title="Fleet dashboard"
+        kind="html"
+        body={artifactDoc}
+        chatId="c1"
+        id="dash"
+      />
+    </div>,
   );
 } else {
   root.render(<ChatPanel />);

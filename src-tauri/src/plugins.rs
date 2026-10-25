@@ -867,6 +867,17 @@ scripts"
         )
     })?;
     let language = meta["language"].as_str().unwrap_or(DEFAULT_SCRIPT_LANGUAGE);
+    // Rust is the project's own backend language, so it stays the default; the
+    // other runtimes are accepted only when the bundle names one explicitly.
+    // An artifact that needs a non-Rust backend asks the user first (see the
+    // `artifact` schema), so an unknown runtime is refused rather than guessed:
+    // no silent fallback to an interpreter the user never approved.
+    if !matches!(language, "rust" | "python" | "node" | "bash") {
+        return Err(format!(
+            "plugin {plugin} script {name:?} asks for language {language:?}; supported: \
+rust, python, node, bash"
+        ));
+    }
     let dir = script_dir(root, &plugin, &name);
     let source = dir.join(script_file(language));
     if !source.is_file() {

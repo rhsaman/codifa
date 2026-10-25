@@ -4,6 +4,7 @@
 // render paths that depend on props: sandboxed html frame, markdown document,
 // and the empty-body notice (a tab restored from localStorage has no body).
 import "./_globals.ts";
+import { readFileSync } from "node:fs";
 import { renderToString } from "react-dom/server";
 import { ArtifactPanel } from "../src/components/ArtifactPanel";
 
@@ -77,6 +78,29 @@ const pending = renderToString(
 check(
   "owned empty artifact does not claim loss while loading",
   !pending.includes("no longer in memory"),
+);
+
+// 5. No supporting files: the header says nothing rather than "0 files", which
+//    would read as a broken counter to anyone without a backend artifact.
+check("no asset hint when there are none", !html.includes("artifact-panel-assets"));
+check("no asset hint on markdown either", !md.includes("artifact-panel-assets"));
+
+// 6. The page's outward channel is narrow by contract: the frame may name a
+//    TOOL, never a server, and only a message stamped with the panel's own source
+//    is accepted. Locked here because loosening it would let any embedded page
+//    reach a connector the user has switched off.
+const src = readFileSync("src/components/ArtifactPanel.tsx", "utf8");
+check(
+  "the page channel asks for a tool, not a server",
+  src.includes("isMcpRequest") && src.includes('source: "codifa-artifact"'),
+);
+check(
+  "an unverified frame cannot drive the channel",
+  src.includes("event.source !== frame.contentWindow"),
+);
+check(
+  "assets are fetched, not assumed present",
+  src.includes("getArtifactAssets"),
 );
 
 console.log(`${passed} artifact-panel checks passed`);

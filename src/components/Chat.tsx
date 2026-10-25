@@ -293,16 +293,20 @@ function wantsSkillOrMcp(text: string): boolean {
 
 /** True when a message asks to build/edit an artifact, so the agent gets the
  *  `artifact` tool for the turn. Same English + Persian intent words as
- *  `wantsSkillOrMcp`, targeting artifacts only. */
+ *  `wantsSkillOrMcp`, targeting artifacts only. The target list also carries the
+ *  "whole app" phrasings: an artifact with a backend is still an artifact, and
+ *  without them "build me an app that…" opened only the chat, so the agent had
+ *  no artifact tool and answered with a wall of markup instead. */
 function wantsArtifact(text: string): boolean {
   const low = text.toLowerCase();
   const action =
     /\b(build|make|create|draw|render|generate|edit|update|change|fix|add|modify)\b|(بساز|ساخت|ایجاد|رسم|درست|تولید|ویرایش|ادیت|اصلاح|تغییر|اضافه)/.test(
       low,
     );
-  const target = /\b(artifact|artefact|dashboard|chart|mockup|prototype|page|widget)s?\b|(آرتیفکت|ارتیفکت|داشبورد|نمودار|ماکاپ|ویجت)/.test(
-    low,
-  );
+  const target =
+    /\b(artifact|artefact|dashboard|chart|mockup|prototype|page|widget|app|ui|script|backend|server|tool)s?\b|(آرتیفکت|ارتیفکت|داشبورد|نمودار|ماکاپ|ویجت|اپ|برنامه|بک\s?اند|اسکریپت|سرور|رابط)/.test(
+      low,
+    );
   return action && target;
 }
 
@@ -4909,6 +4913,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           artifactKind: event.artifact_kind === "md" ? "md" : "html",
           content: event.content ?? "",
           version: event.version ?? 1,
+          assets: event.assets ?? [],
         };
         if (seg.id) {
           useStore.getState().appendMessageSegments(assistantMsg.id, [seg]);

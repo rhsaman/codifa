@@ -2375,6 +2375,9 @@ pub enum AgentEvent {
         kind: String,
         content: String,
         version: u64,
+        /// Supporting files of this version (backend, data, config). Empty for a
+        /// plain document; the panel serves them to the sandboxed frame.
+        assets: Vec<String>,
     },
 }
 
@@ -2514,7 +2517,7 @@ impl AgentEvent {
             AgentEvent::Plan { items, chat_id } => json!({
                 "kind": "plan", "items": items, "chat_id": chat_id,
             }),
-            AgentEvent::Artifact { id, title, kind, content, version } => json!({
+            AgentEvent::Artifact { id, title, kind, content, version, assets } => json!({
                 "kind": "artifact",
                 "id": id,
                 "title": title,
@@ -2523,6 +2526,7 @@ impl AgentEvent {
                 "artifact_kind": kind,
                 "content": content,
                 "version": version,
+                "assets": assets,
             }),
             AgentEvent::Ask { id, question, options } => json!({
                 "kind": "ask", "id": id, "question": question, "options": options,
@@ -2774,16 +2778,29 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             }),
         ),
         // Artifacts are versioned documents the renderer previews in a sandboxed
-        // right-hand panel instead of dumping raw markup into the bubble.
+        // right-hand panel instead of dumping raw markup into the bubble. They
+        // carry supporting files too: an artifact may need a real backend.
         (
             "artifact",
-            "Create, update or delete a chat artifact: a versioned HTML/Markdown document shown in a sandboxed preview panel.",
+            "Create, update or delete a chat artifact: a versioned HTML/Markdown document shown in a sandboxed preview panel, optionally with supporting files (backend source, data, config).",
             json!({
                 "action": {"type": "string", "enum": ["create", "update", "delete"]},
                 "title": {"type": "string"},
                 "id": {"type": "string", "description": "Derived from title; needed to update"},
                 "kind": {"type": "string", "enum": ["html", "md"]},
-                "content": {"type": "string", "description": "Self-contained; inline CSS/JS, no network"},
+                "content": {"type": "string", "description": "The document itself; self-contained for html (inline CSS/JS, no network). If the UI needs live data or logic, do NOT fake it in the page: write the backend too and pass it through `files`, then talk to it over the page's MCP channel."},
+                "files": {
+                    "type": "array",
+                    "description": "Supporting files of this version: backend source, data, config. BACKEND LANGUAGE: Rust first. Write the backend as a Rust source file (single file, std-only unless the project already carries a manifest) and list it here, so the plugin runner compiles and caches it. Use another language ONLY if Rust genuinely cannot do the job (e.g. a Python-only SDK the task needs) AND the user agreed after you asked — never silently, never for convenience. Omitting `files` on an update keeps the files already stored.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative file name (e.g. backend.rs); stored under the artifact's assets folder"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                },
                 "chat_id": {"type": "string", "description": "Owning chat id"}
             }),
         ),
@@ -2875,9 +2892,12 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // The skill/connector AUTHORING tools are bound only for a turn that
         // actually asked for them (see AgentRequest::allow_create). `plugin` is
         // deliberately NOT in this list: it is the one door to a bundle's
-        // scripts, so a plain turn keeps `list`/`run` (see the narrowing below).
+        // scripts, so a plain turn keeps `list`/`run` (see the narrowing below)
+        // and the create path gets its full action set — which is what an
+        // artifact with a Rust backend needs to RUN that backend.
         .filter(|(name, _, _)| {
-            allow_create || !matches!(*name, "create_skill" | "create_mcp" | "artifact" | "schedule")
+            allow_create
+                || !matches!(*name, "create_skill" | "create_mcp" | "artifact" | "schedule")
         })
         .map(|(name, desc, props)| {
             json!({
@@ -5500,12 +5520,25 @@ call fetch_url again with offset={next} for the rest]",
                                     kind: saved["kind"].as_str().unwrap_or_default().to_string(),
                                     content: saved["content"].as_str().unwrap_or_default().to_string(),
                                     version: saved["version"].as_u64().unwrap_or(1),
+                                    assets: saved["assets"]
+                                        .as_array()
+                                        .map(|list| {
+                                            list.iter()
+                                                .filter_map(|v| v.as_str().map(str::to_string))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                 });
+                                let attached = saved["assets"]
+                                    .as_array()
+                                    .map(|list| list.len())
+                                    .unwrap_or(0);
                                 (
                                     format!(
-                                        "Artifact saved: {} (v{})\nIt is now shown in the chat; open it to preview.",
+                                        "Artifact saved: {} (v{}, {} supporting file(s))\nIt is now shown in the chat; open it to preview.",
                                         saved["title"].as_str().unwrap_or_default(),
-                                        saved["version"].as_u64().unwrap_or(1)
+                                        saved["version"].as_u64().unwrap_or(1),
+                                        attached
                                     ),
                                     true,
                                 )
@@ -5633,9 +5666,18 @@ call fetch_url again with offset={next} for the rest]",
                     if let Some(c) = last["content"].as_str() {
                         last["content"] = json!(format!("{c}\n\n{hint}"));
                         nudges += 1;
-                        if lone_hint_str
-                            .as_deref()
-                            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
+                        // Both generators carry the lone-call wording: the
+                        // budgeted lever (`single_call_hint`) AND the quiet-round
+                        // fallback (`single_call_hint_text`, reached when the
+                        // streak lever is silent). Counting on the text alone let
+                        // the fallback path bypass `lone_hint_budget_left` and the
+                        // counter climbed to 6 against a cap of 3 (traced on a
+                        // live build). The budget gates BOTH paths, so a delivery
+                        // is counted only while it is still inside the cap.
+                        if lone_hint_budget_left
+                            && lone_hint_str
+                                .as_deref()
+                                .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
                         {
                             lone_call_hints += 1;
                         }
@@ -9716,8 +9758,12 @@ mod tests {
             ("main+browser", tool_schemas(false, true), 18_500),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
-            ("main+authoring", tool_schemas(true, false), 19_900),
-            ("main+authoring+browser", tool_schemas(true, true), 25_700),
+            // Raised again for the `artifact` schema's `files` field: an artifact
+            // may now carry a Rust backend, which is what makes the tool a
+            // project builder instead of a document writer. The step is the
+            // added prose itself; the ~3.5% headroom convention still holds.
+            ("main+authoring", tool_schemas(true, false), 20_400),
+            ("main+authoring+browser", tool_schemas(true, true), 26_200),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -9807,6 +9853,47 @@ mod tests {
         assert!(
             text.contains("user"),
             "another language must be tied to an explicit user request: {text}"
+        );
+    }
+
+    #[test]
+    fn the_artifact_schema_asks_for_a_rust_backend_before_anything_else() {
+        // The user's rule: an artifact that needs logic gets a real backend, and
+        // that backend is Rust unless Rust genuinely cannot do it — in which case
+        // the model ASKS instead of picking a language on its own. The schema is
+        // the only place the model reads that rule, so it is asserted here.
+        let schemas = tool_schemas(true, false);
+        let artifact = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "artifact")
+            .expect("the authoring turn must advertise the artifact tool");
+        let props = &artifact["function"]["parameters"]["properties"];
+        let files = props["files"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(
+            files.contains("rust first"),
+            "the schema must make Rust the first choice: {files}"
+        );
+        assert!(
+            files.contains("user agreed") && files.contains("asked"),
+            "another language must require asking the user first: {files}"
+        );
+        // A UI that needs live data must not fake it in the page: the schema has
+        // to point at the backend route, or the model ships a static mock.
+        let content = props["content"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(
+            content.contains("backend") && content.contains("files"),
+            "the content field must route live data through a backend file: {content}"
+        );
+        // Omitting `files` on an update must not wipe the backend it added.
+        assert!(
+            files.contains("keeps the files already stored"),
+            "an update without files must be documented as non-destructive: {files}"
         );
     }
 
@@ -10147,6 +10234,43 @@ mod tests {
         // which names the price instead of repeating the same instruction.
         let text = single_call_hint("agent", &one, 4).unwrap();
         assert!(text.contains("4 rounds in a row"), "{text}");
+    }
+
+    #[test]
+    fn lone_call_hint_counter_never_exceeds_its_cap() {
+        // Traced on a live build: `lone_call_hints` reached 4, 5 and 6 against a
+        // cap of 3. The counter was incremented on the hint TEXT, and BOTH the
+        // budgeted lever and the quiet-round fallback carry "ONE call" — so the
+        // fallback, reached on every `lone_mutating_rounds > 1 && % 3 != 0`
+        // round, bypassed `lone_hint_budget_left` and kept counting after the
+        // lever had gone silent. This replays the loop guard over a long lone
+        // streak and pins the counter to the cap.
+        let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
+        let mut lone_call_hints: usize = 0;
+        for rounds in 1..=30 {
+            let lone_hint_budget_left = lone_call_hints < LONE_CALL_HINT_MAX_PER_TURN;
+            let hints_are_quiet = rounds > 1 && rounds % 3 != 0;
+            let hint = if hints_are_quiet {
+                discovery_streak_hint("agent", 0)
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| single_call_hint("agent", &one, rounds))
+            } else if lone_hint_budget_left {
+                round_hint("agent", &one, 0, rounds)
+            } else {
+                discovery_streak_hint("agent", 0).map(std::borrow::Cow::Borrowed)
+            };
+            if lone_hint_budget_left
+                && hint
+                    .as_deref()
+                    .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
+            {
+                lone_call_hints += 1;
+            }
+        }
+        assert_eq!(
+            lone_call_hints, LONE_CALL_HINT_MAX_PER_TURN,
+            "the counter must stop at the cap even though quiet rounds keep producing lone-call text"
+        );
     }
 
     #[test]

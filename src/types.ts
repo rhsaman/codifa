@@ -456,6 +456,9 @@ export type MessageSegment =
       artifactKind: 'html' | 'md'
       content: string
       version: number
+      /** Names of the supporting files saved with this version (backend source,
+       *  data, config). The bodies are fetched by the preview panel. */
+      assets?: string[]
     }
 
 export interface ChatMessage {
@@ -876,6 +879,9 @@ export interface SidecarEvent {
   artifact_kind?: 'html' | 'md'
   /** artifact: which save of that document this is (v1, v2, …). */
   version?: number
+  /** artifact: names of the supporting files saved with this version (backend
+   *  source, data, config). The preview panel fetches their bodies itself. */
+  assets?: string[]
 }
 
 /** One marketplace the user added: a repo holding an index of plugins.

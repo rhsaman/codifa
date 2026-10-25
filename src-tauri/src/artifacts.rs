@@ -5,6 +5,9 @@
 //! - `index.json`      — id, title, kind, latest version, version history
 //! - `v<N>.html|md`    — one file per save, so `update_artifact` never loses an
 //!   earlier rendering
+//! - `assets/`         — the supporting files of the SAME version: backend
+//!   sources, data files, config. An artifact is a small project, not only a
+//!   document, so the panel can hand these to the sandboxed frame.
 //!
 //! The transcript itself only carries `{id, title, kind, content}` (see
 //! `MessageSegment`), so a chat reopened after the files are gone still shows
@@ -21,6 +24,12 @@ const INDEX: &str = "index.json";
 const DEFAULT_KIND: &str = "html";
 /// How many versions one artifact keeps before the oldest is dropped.
 const MAX_VERSIONS: usize = 20;
+/// Folder holding the supporting files of the latest version.
+const ASSETS: &str = "assets";
+/// Cap on the number of attached files: the panel is a preview, not a repo.
+const MAX_ASSET_FILES: usize = 40;
+/// Cap on one attached file, so a pasted blob cannot freeze the preview.
+const MAX_ASSET_BYTES: usize = 512 * 1024;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -68,6 +77,142 @@ fn read_index(dir: &Path) -> Value {
         .unwrap_or_else(|| json!({ "versions": [] }))
 }
 
+/// One attached file name: relative, inside the artifact folder, no traversal.
+///
+/// A backend in another language is NORMAL for an artifact, so the name is kept
+/// as written but forced to stay inside `assets/`: the agent names the file, the
+/// store decides where it may land.
+fn asset_relative(path: &str) -> Option<String> {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned: Vec<&str> = trimmed
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.join("/"))
+}
+
+/// Write the attached files of one version into `assets/`, replacing the whole
+/// folder so the latest version is what the panel serves.
+///
+/// Returns the written file names, sorted. Limits are enforced here rather than
+/// trusted from the caller: this folder is served back to a sandboxed frame.
+fn write_assets(dir: &Path, files: &Value) -> Result<Vec<String>, String> {
+    let assets_dir = dir.join(ASSETS);
+    if assets_dir.is_dir() {
+        fs::remove_dir_all(&assets_dir).map_err(|e| e.to_string())?;
+    }
+    let Some(list) = files.as_array() else {
+        return Ok(vec![]);
+    };
+    if list.is_empty() {
+        return Ok(vec![]);
+    }
+    if list.len() > MAX_ASSET_FILES {
+        return Err(format!(
+            "artifact accepts at most {MAX_ASSET_FILES} files (got {})",
+            list.len()
+        ));
+    }
+    fs::create_dir_all(&assets_dir).map_err(|e| e.to_string())?;
+    let mut written: Vec<String> = Vec::new();
+    for entry in list {
+        let content = entry["content"].as_str().unwrap_or("");
+        if content.len() > MAX_ASSET_BYTES {
+            return Err(format!(
+                "artifact file exceeds {MAX_ASSET_BYTES} bytes: {}",
+                entry["path"].as_str().unwrap_or("?")
+            ));
+        }
+        let Some(relative) = asset_relative(entry["path"].as_str().unwrap_or("")) else {
+            continue;
+        };
+        let target = assets_dir.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(&target, content).map_err(|e| e.to_string())?;
+        written.push(relative);
+    }
+    written.sort();
+    Ok(written)
+}
+
+/// The supporting files of an artifact, for the preview panel.
+///
+/// Text only, capped: the panel renders a document, so a binary asset would be
+/// noise — and an unbounded read would let one artifact freeze the page.
+pub fn read_assets(root: &Path, chat_id: &str, id: &str) -> Result<Value, String> {
+    let dir = chat_dir(root, chat_id).join(crate::skills::safe_file(id, "artifact"));
+    let assets_dir = dir.join(ASSETS);
+    let mut files: Vec<Value> = Vec::new();
+    if assets_dir.is_dir() {
+        collect_assets(&assets_dir, &assets_dir, &mut files)?;
+    }
+    files.sort_by(|a, b| {
+        a["path"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["path"].as_str().unwrap_or_default())
+    });
+    Ok(json!({ "id": id, "files": files }))
+}
+
+/// Names of the files already stored in `assets/`, without reading them: an
+/// update that attaches nothing must not silently drop the backend it added
+/// earlier.
+fn existing_assets(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let assets_dir = dir.join(ASSETS);
+    if assets_dir.is_dir() {
+        let _ = collect_asset_names(&assets_dir, &assets_dir, &mut names);
+    }
+    names.sort();
+    names
+}
+
+fn collect_asset_names(base: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_asset_names(base, &path, out)?;
+        } else if let Ok(relative) = path.strip_prefix(base) {
+            out.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn collect_assets(base: &Path, dir: &Path, out: &mut Vec<Value>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_assets(base, &path, out)?;
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        if bytes.len() > MAX_ASSET_BYTES {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(base)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        out.push(json!({ "path": relative, "content": text }));
+    }
+    Ok(())
+}
+
 /// Save a new version of one artifact.
 ///
 /// `create` refuses to overwrite an existing artifact (the caller asked for a
@@ -104,6 +249,12 @@ pub fn save(root: &Path, chat_id: &str, body: &Value, create: bool) -> Result<Va
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let file = format!("v{version}.{kind}");
     fs::write(dir.join(&file), content).map_err(|e| e.to_string())?;
+    // The supporting files travel with the version that references them.
+    // Omitting `files` on an update keeps the ones already stored.
+    let assets = match body.get("files") {
+        Some(files) if !files.is_null() => write_assets(&dir, files)?,
+        _ => existing_assets(&dir),
+    };
 
     let title = body["title"]
         .as_str()
@@ -136,6 +287,7 @@ pub fn save(root: &Path, chat_id: &str, body: &Value, create: bool) -> Result<Va
         // folder name for them.
         "chat_id": chat_id,
         "versions": versions,
+        "assets": assets,
     });
     fs::write(dir.join(INDEX), record.to_string()).map_err(|e| e.to_string())?;
     Ok(json!({
@@ -146,6 +298,7 @@ pub fn save(root: &Path, chat_id: &str, body: &Value, create: bool) -> Result<Va
         "version": version,
         "path": dir.join(&file).to_string_lossy(),
         "content": content,
+        "assets": assets,
     }))
 }
 
@@ -257,6 +410,68 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         tmp
+    }
+
+    #[test]
+    fn attached_files_travel_with_the_version() {
+        let root = temp_root("assets");
+        let saved = save(
+            &root,
+            "chat-1",
+            &json!({
+                "title": "Live panel",
+                "kind": "html",
+                "content": "<b>ui</b>",
+                "files": [
+                    {"path": "backend.rs", "content": "fn main() {}"},
+                    {"path": "data/rows.json", "content": "[]"},
+                ],
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(saved["assets"].as_array().unwrap().len(), 2);
+
+        let read_back = read_assets(&root, "chat-1", "live-panel").unwrap();
+        let files = read_back["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        // Sorted by path, so the panel lists them in a stable order.
+        assert_eq!(files[0]["path"], "backend.rs");
+        assert_eq!(files[1]["path"], "data/rows.json");
+        assert_eq!(files[1]["content"], "[]");
+
+        // An update that attaches nothing keeps the files already stored: a
+        // content-only edit must not silently drop the backend.
+        save(
+            &root,
+            "chat-1",
+            &json!({"id": "live-panel", "content": "<b>ui 2</b>"}),
+            false,
+        )
+        .unwrap();
+        let kept = read_assets(&root, "chat-1", "live-panel").unwrap();
+        assert_eq!(kept["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn attached_file_names_cannot_escape_the_artifact_folder() {
+        let root = temp_root("assets-traversal");
+        save(
+            &root,
+            "chat-1",
+            &json!({
+                "title": "Sneaky",
+                "content": "x",
+                "files": [{"path": "../../escaped.rs", "content": "evil"}],
+            }),
+            true,
+        )
+        .unwrap();
+        // The name is flattened into the assets folder instead of walking out.
+        assert!(!root.join("escaped.rs").exists());
+        assert!(root
+            .join("artifacts/chat-1/sneaky/assets/escaped.rs")
+            .is_file());
     }
 
     #[test]

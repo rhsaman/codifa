@@ -624,6 +624,43 @@ async fn plugins_delete(State(st): State<AppState>, Json(body): Json<Value>) -> 
     }
 }
 
+/// Run one MCP tool on behalf of a trusted surface (the artifact panel).
+///
+/// The caller names a TOOL, never a server: the connector list is resolved here
+/// from what the user has enabled, so a generated page cannot reach a connector
+/// that is switched off, and it never sees a token or a command line. MCP calls
+/// speak a child process or the network, so this stays off the async worker.
+async fn mcp_call(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    let root = st.root();
+    match tokio::task::spawn_blocking(move || {
+        let tool = body["tool"].as_str().unwrap_or("").trim();
+        if tool.is_empty() {
+            return Err("an MCP tool name is required".to_string());
+        }
+        let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
+        // Same resolution the agent uses for a turn: the connectors the renderer
+        // says are enabled win, and plugin-shipped ones fill the rest. The
+        // caller cannot name a server, only a tool, so this list IS the whole
+        // reachable surface.
+        let mut servers = crate::plugins::enabled_connectors(&root);
+        if let Some(own) = body["servers"].as_object() {
+            for (name, cfg) in own {
+                servers.insert(name.clone(), cfg.clone());
+            }
+        }
+        let servers = Value::Object(servers);
+        // A bare name is resolved against the enabled set by `call_tool`; the
+        // error it returns already names what is available.
+        crate::mcp::call_tool(&servers, tool, &args)
+    })
+    .await
+    {
+        Ok(Ok(text)) => Json(json!({ "ok": true, "result": text })).into_response(),
+        Ok(Err(msg)) => bad_request(&msg),
+        Err(e) => bad_request(&format!("the MCP call stopped: {e}")),
+    }
+}
+
 /// Run one of a plugin's scripts. A Rust script compiles on first use, so this
 /// is a blocking task exactly like the repo read an install does.
 async fn plugins_run(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
@@ -676,6 +713,18 @@ async fn plugins_install(State(st): State<AppState>, Json(body): Json<Value>) ->
 /// (the transcript only carries the card's id/title/kind/content).
 async fn artifact_get(State(st): State<AppState>, Query(q): Query<ArtifactQuery>) -> Response<Body> {
     match crate::artifacts::read(&st.root(), &q.chat_id, &q.id) {
+        Ok(v) => Json(v).into_response(),
+        Err(msg) => (StatusCode::NOT_FOUND, Json(json!({ "detail": msg }))).into_response(),
+    }
+}
+
+/// Supporting files (backend source, data, config) of one artifact, for the
+/// preview panel. The document itself comes from `/artifacts/get`.
+async fn artifact_assets(
+    State(st): State<AppState>,
+    Query(q): Query<ArtifactQuery>,
+) -> Response<Body> {
+    match crate::artifacts::read_assets(&st.root(), &q.chat_id, &q.id) {
         Ok(v) => Json(v).into_response(),
         Err(msg) => (StatusCode::NOT_FOUND, Json(json!({ "detail": msg }))).into_response(),
     }
@@ -1935,10 +1984,14 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins/mcp", get(plugins_mcp))
         .route("/plugins/mcp/save", post(plugins_mcp_save))
         .route("/plugins/mcp/delete", post(plugins_mcp_delete))
+        // Run one MCP tool from a trusted surface (the artifact panel's page
+        // channel). Bounded like any other connector call.
+        .route("/mcp/call", post(mcp_call))
         // Run one of a bundle's scripts. Blocking (a `rustc` build on first use),
         // so it stays off the async worker like the install route.
         .route("/plugins/run", post(plugins_run))
         .route("/artifacts/get", get(artifact_get))
+        .route("/artifacts/assets", get(artifact_assets))
         .route("/artifacts/list", get(artifact_list))
         .route("/artifacts", delete(artifact_delete))
         .route("/chat/compact", post(chat_compact))

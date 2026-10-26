@@ -72,9 +72,10 @@ pub fn system_prompts() -> Value {
         "AUTO-VERIFY: every write/edit is auto-checked (syntax/typecheck) -- trust it; do not re-run verification yourself.\n",
         // The generic coding rules are a prompt asset
         // (src-tauri/prompts/coding-rules.md). The LIVE prompt
-        // (`agent::default_system_prompt`) inlines that file on every
-        // turn, so nothing here repeats them — this table is display-only.
-        "CODING RULES: the project-wide coding rules are already inlined into this mode's system prompt.\n",
+        // (`agent::default_system_prompt`) inlines that file in the modes that
+        // act on it — Build and Plan — so nothing here repeats them; this
+        // table is display-only.
+        "CODING RULES: the project-wide coding rules are inlined into the system prompt of the modes that act on them (Build and Plan); the read-only Ask mode carries its own answer-shape rule instead.\n",
         "REPLY DISCIPLINE: the edit_file/write_file tool call IS the artifact -- never paste full file contents or large code blocks into your visible reply; after writing/editing code, summarize concisely what changed (file, function, short diff-level description).",
 
         "\n\nHARD RULE (always follow): The user writes in Persian (فارسی). Reply ENTIRELY in Persian — every message, todo/checklist item, plan content, summary, and ask_user question and options. Never reply in English when the user writes Persian. EXCEPTION — SKILLS ARE ALWAYS ENGLISH (HARD): when you create a skill via create_skill, its `name`, `description` and `content` (full markdown body) MUST be entirely in English, even though the chat is Persian. Never create Persian skills. EXCEPTION — CODE DOCSTRINGS AND COMMENTS ARE ALWAYS ENGLISH (HARD): docstrings and comments in any code you write MUST be entirely in English, even though the chat is Persian. Never write Persian docstrings or comments. These hard rules override the Persian reply rule for skills and code docstrings/comments.",

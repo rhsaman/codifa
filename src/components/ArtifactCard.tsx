@@ -1,3 +1,4 @@
+import { ArtifactGlyph } from "./ArtifactsPanel";
 import { useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import type { MessageSegment } from "../types";
@@ -21,7 +22,7 @@ export function ArtifactCard({ segment }: { segment: ArtifactSegment }) {
     <div className="artifact-card">
       <div className="artifact-card-head">
         <span className="artifact-card-icon" aria-hidden="true">
-          {segment.artifactKind === "md" ? "¶" : "</>"}
+          <ArtifactGlyph size={15} />
         </span>
         <span className="artifact-card-title" title={segment.title || segment.id}>
           {segment.title || segment.id}

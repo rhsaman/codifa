@@ -23,6 +23,23 @@ function isMcpRequest(data: unknown): data is McpRequest {
   );
 }
 
+/** The sandbox's second gate: it grants no popups, so an <a target="_blank">
+ *  inside it is dropped. A page may ask for an http(s) URL to be opened in the
+ *  OS browser instead — same shape as the tool request; the URL constraint is
+ *  checked here so a page can never push a file:// or custom-scheme at the OS. */
+type OpenUrlRequest = { source: "codifa-artifact"; id: number; url: string };
+
+function isOpenUrlRequest(data: unknown): data is OpenUrlRequest {
+  if (!data || typeof data !== "object") return false;
+  const msg = data as Partial<OpenUrlRequest>;
+  return (
+    msg.source === "codifa-artifact" &&
+    typeof msg.id === "number" &&
+    typeof msg.url === "string" &&
+    (msg.url.startsWith("http://") || msg.url.startsWith("https://"))
+  );
+}
+
 /** Artifact preview: the document the agent built, rendered APART from the chat.
  *
  *  HTML runs in a sandboxed iframe with `allow-scripts` only — no
@@ -67,6 +84,14 @@ export function ArtifactPanel({
     for (const n of mcpEnabled) if (mcpServers[n]) sel[n] = mcpServers[n];
     return sel;
   }, [mcpServers, mcpEnabled]);
+  // Every connector the user has INSTALLED, regardless of the on/off switch.
+  // An artifact is a standalone document: its live data must load the same way
+  // in any chat, so when nothing is enabled we fall back to this list.
+  const installedServers = useMemo(() => {
+    const sel: Record<string, McpServerConfig> = {};
+    for (const [n, cfg] of Object.entries(mcpServers)) sel[n] = cfg;
+    return sel;
+  }, [mcpServers]);
   useEffect(() => {
     if (!missing) {
       setFetched("");
@@ -100,28 +125,50 @@ export function ArtifactPanel({
     };
   }, [chatId, id, body]);
 
-  // The page's only outward channel. A generated UI that needs live data asks
-  // for an MCP tool here; the host runs it through the app's own client and
-  // posts the text (or the error) back into the same frame.
+  // The page's only outward channel, now two request kinds. A generated UI
+  // that needs live data asks for an MCP tool here; the host runs it through
+  // the app's own client and posts the text (or the error) back into the same
+  // frame. The sandbox grants no popups, so for an http(s) link the page asks
+  // the host to hand the URL to the OS browser (the app-wide open_external).
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       const frame = frameRef.current;
       if (!frame || event.source !== frame.contentWindow) return;
       const data: unknown = event.data;
-      if (!isMcpRequest(data)) return;
-      const reply = (payload: Record<string, unknown>) =>
+      const reply = (id: number, payload: Record<string, unknown>) =>
         frame.contentWindow?.postMessage(
-          { source: "codifa-artifact-reply", id: data.id, ...payload },
+          { source: "codifa-artifact-reply", id, ...payload },
           "*",
         );
-      void callMcpTool(data.tool, data.args, enabledServers).then((out) => {
-        if ("error" in out) reply({ ok: false, error: out.error });
-        else reply({ ok: true, result: out.result });
-      });
+      if (isMcpRequest(data)) {
+        // An artifact is a saved, STANDALONE document: reopening it in another
+        // chat must not change whether its live data loads. `enabledServers` is
+        // the app's global on/off list; when nothing is enabled we hand over
+        // the installed connectors (and the backend falls back to all of
+        // them), so the page works without being tied to any one chat.
+        const servers = Object.keys(enabledServers).length
+          ? enabledServers
+          : installedServers;
+        void callMcpTool(data.tool, data.args, servers).then((out) => {
+          if ("error" in out) reply(data.id, { ok: false, error: out.error });
+          else reply(data.id, { ok: true, result: out.result });
+        });
+        return;
+      }
+      if (!isOpenUrlRequest(data)) return;
+      const coder = window.coder as unknown as {
+        openExternal?: (u: string) => unknown;
+      };
+      if (typeof coder.openExternal !== "function") {
+        reply(data.id, { ok: false, error: "this host offers no OS-browser opener" });
+        return;
+      }
+      void coder.openExternal(data.url);
+      reply(data.id, { ok: true, result: "opened in the OS browser" });
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [enabledServers]);
+  }, [enabledServers, installedServers]);
 
   const doc = body.trim() ? body : fetched;
 

@@ -1608,6 +1608,9 @@ interface State {
   setChatLiveError: (id: string, error: string | null) => void
   setChatTtsError: (id: string, error: string | null) => void
   setChatSkillNotice: (id: string, notice: string | null) => void
+  /** Persist the connectors a chat has loaded with `use_mcp`. Sent back on every
+   *  later request so the backend re-activates them without a fresh tool call. */
+  setChatMcpActive: (id: string, mcpActive: string[]) => void
   setChatUndoNotice: (id: string, notice: string | null) => void
   /** Revision counter per ABSOLUTE file path, bumped whenever the agent
    *  writes that file (write_document tool_result / write_file+edit_file
@@ -4753,6 +4756,12 @@ export const useStore = create<State>((set, get) => ({
   setChatSkillNotice: (id, skillNotice) => {
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, skillNotice } : c)),
+    }))
+  },
+
+  setChatMcpActive: (id, mcpActive) => {
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, mcpActive } : c)),
     }))
   },
 

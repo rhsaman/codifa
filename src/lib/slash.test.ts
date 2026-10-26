@@ -12,6 +12,12 @@ import {
   forgetCommands,
   SUBCOMMANDS,
   slashBody,
+  commandFlags,
+  slashFlagAt,
+  flagValues,
+  flagValueRows,
+  parseScheduleFlags,
+  stripFlagTokens,
   recordHistory,
   togglePin,
   historyRows,
@@ -336,6 +342,99 @@ console.log("16) forgetCommands drops the commands of a deleted plugin:")
     if (prevStorage === undefined) delete g.localStorage
     else g.localStorage = prevStorage
   }
+}
+
+console.log("17) schedule --flags: names, values and parsing:")
+{
+  check(
+    "schedule offers the three flags",
+    commandFlags("/schedule").map((f) => f.name).join(",") === "--skills,--mcp,--plugins",
+    commandFlags("/schedule").map((f) => f.name),
+  )
+  check("a command without flags offers none", commandFlags("/plugin").length === 0)
+  check(
+    "each flag reads a real value list",
+    commandFlags("/schedule").map((f) => f.values).join(",") === "skill,mcp,plugin",
+    commandFlags("/schedule").map((f) => f.values),
+  )
+
+  // The flag-name level: `--mcp` typed at value level.
+  const fl = slashFlagAt(slashCaretAt("/schedule create x --mc", 22)!, "/schedule")
+  check("a flag word is recognized while typing", fl?.flag === "--mc", fl)
+  check("no '=' yet means no typed value", fl?.typed === "", fl)
+  // The value level: `--skills=fo` must complete `fo`, not the whole token.
+  const fv = slashFlagAt(slashCaretAt("/schedule create x --skills=fo", 29)!, "/schedule")
+  check("the flag is found with a value", fv?.flag === "--skills" && fv?.typed === "fo", fv)
+  // A plain argument is not a flag, or the value menu would never open.
+  check(
+    "a plain value is not a flag",
+    slashFlagAt(slashCaretAt("/schedule create هر", 18)!, "/schedule") === null,
+  )
+  check(
+    "an unknown flag is rejected",
+    slashFlagAt(slashCaretAt("/schedule create x --nope", 24)!, "/schedule") === null,
+  )
+  check("flagValues splits on commas", flagValues("a,b").join("|") === "a|b")
+  check("flagValues ignores blanks", flagValues(" a , , b ").join("|") === "a|b")
+  check("flagValues of empty is empty", flagValues("").length === 0)
+}
+
+console.log("18) parseScheduleFlags / stripFlagTokens:")
+{
+  // Repeating the flag ACCUMULATES, so picking several skills builds one list.
+  const rep = parseScheduleFlags("create nightly --skills=a --skills=b,c --mcp=x --plugins=z")
+  check("repeat accumulates", rep.skills.join(",") === "a,b,c", rep.skills)
+  check("mcp is read", rep.mcp_servers.join(",") === "x", rep.mcp_servers)
+  check("plugins is read", rep.plugins.join(",") === "z", rep.plugins)
+  const none = parseScheduleFlags("create nightly report")
+  check(
+    "no flags = empty arrays",
+    none.skills.length === 0 && none.mcp_servers.length === 0 && none.plugins.length === 0,
+    none,
+  )
+  // The description must survive untouched — flags are arguments, not prose.
+  check(
+    "the description survives minus the flags",
+    stripFlagTokens("create هر روز گزارش بده --skills=a") === "create هر روز گزارش بده",
+    stripFlagTokens("create هر روز گزارش بده --skills=a"),
+  )
+  check("no flags leaves the text alone", stripFlagTokens("create foo") === "create foo")
+  check("an unknown --word is kept", stripFlagTokens("create foo --nope") === "create foo --nope")
+}
+
+console.log("19) flagValueRows: the rows a --flag token offers:")
+{
+  const skills = ["anthropic-skills", "brainstorming", "data-analysis"]
+  check("an empty fragment offers the whole list", flagValueRows(skills, "").length === 3)
+  // The regression: `an` matched nothing through `rankMatches`, so the popup
+  // read "No matching commands" while `anthropic-skills` was right there.
+  check(
+    "a fragment that matches nothing still shows the list",
+    flagValueRows(skills, "zz").length === 3,
+    flagValueRows(skills, "zz"),
+  )
+  check(
+    "a matching fragment ranks the match first",
+    flagValueRows(skills, "br")[0] === "brainstorming",
+    flagValueRows(skills, "br"),
+  )
+  check(
+    "a partial fragment still finds the name",
+    flagValueRows(skills, "an")[0] === "anthropic-skills",
+    flagValueRows(skills, "an"),
+  )
+  check(
+    "an already-picked value is dropped",
+    !flagValueRows(skills, "a,brainstorming").includes("brainstorming"),
+    flagValueRows(skills, "a,brainstorming"),
+  )
+  // After a comma the user is choosing the NEXT value, so the fragment resets
+  // and the whole remaining list is offered again.
+  check(
+    "a fresh value after a comma lists everything unpicked",
+    flagValueRows(skills, "brainstorming,").length === 2,
+    flagValueRows(skills, "brainstorming,"),
+  )
 }
 
 if (failed > 0) {

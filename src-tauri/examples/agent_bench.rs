@@ -468,6 +468,7 @@ fn bench_codifa(task: &Task, model: &str) -> Result<RunMetrics, String> {
         context_window: 0,
         chat_id: chat_id.clone(),
         mcp_servers: Value::Null,
+        mcp_active: Default::default(),
         subagent_models: Default::default(),
         providers: Default::default(),
         data_root: data_root.to_string_lossy().to_string(),

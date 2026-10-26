@@ -38,7 +38,6 @@ const leave = (o: Partial<Parameters<typeof shouldLeaveInsert>[0]> = {}) =>
     caretInComposer: true,
     selection: '',
     dialogOpen: false,
-    composerBusy: false,
     ...o,
   })
 
@@ -49,7 +48,15 @@ console.log('2) `Ctrl+C` leaves insert only when there is nothing to copy:')
   check('a real selection stays a COPY', !leave({ selection: 'hello' }))
   check('caret outside the composer → untouched', !leave({ caretInComposer: false }))
   check('dialog open → untouched', !leave({ dialogOpen: true }))
-  check('busy composer → untouched', !leave({ composerBusy: true }))
+  // Ctrl+C only MOVES the caret, it never stops the turn — so a streaming chat
+  // must not veto it (it used to: Ctrl+C did nothing while the model streamed).
+  // The function takes no busy input any more; a stale caller still passing one
+  // must be ignored, not honoured.
+  const legacy = shouldLeaveInsert as (o: Record<string, unknown>) => boolean
+  check(
+    'streaming turn (legacy composerBusy) does NOT veto',
+    legacy({ caretInComposer: true, selection: '', dialogOpen: false, composerBusy: true }),
+  )
 }
 
 console.log('3) the strokes survive a non-Latin (Persian) layout:')

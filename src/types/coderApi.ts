@@ -66,7 +66,8 @@ export interface CoderApi {
     scope?: string,
   ): Promise<GoogleSignInResult>
   selectFolder(): Promise<string | null>
-  selectFile(): Promise<string[] | null>
+  /** Opens a multi-file picker starting in `startDir` (the workspace root). */
+  selectFile(startDir?: string): Promise<string[] | null>
   importFile(absPath: string): Promise<string | null>
   fsList(root: string, rel: string): Promise<FileEntry[]>
   fsWalk(root: string): Promise<{ rel: string; name: string }[]>

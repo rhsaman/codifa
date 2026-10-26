@@ -15,8 +15,16 @@ export interface TurnSkill {
  *  message list, the same list the todo panel derives from. */
 export interface TurnUsage {
   skills: TurnSkill[]
-  /** Enabled MCP connector names for the turn. */
-  mcp: string[]
+  /** Every connector the turn had ENABLED, with `used` telling whether the model
+   *  actually loaded it. Enabled-but-never-loaded is the common case and the one
+   *  worth seeing: the connector cost the turn an index line, not its schemas. */
+  mcp: TurnMcp[]
+}
+
+/** One connector as the turn saw it. */
+export interface TurnMcp {
+  name: string
+  used: boolean
 }
 
 /** True when a message carries real work: a tool call, an answer or a thought.
@@ -104,7 +112,45 @@ export function turnUsage(messages: ChatMessage[]): TurnUsage {
     seen.add(key)
     skills.push({ name, used: true })
   }
-  return { skills, mcp: Object.keys(turn.mcpServers ?? {}) }
+  return { skills, mcp: enabledConnectors(turn, loadedMcp(messages.slice(start + 1))) }
+}
+
+/** Connectors the turn loaded on demand. The `mcp_loaded` event on the turn's
+ *  user message is authoritative (it is what `use_mcp` reports); a call by the
+ *  connector's `mcp__<server>__` prefix is the fallback for a resumed turn whose
+ *  event predates this field. Sub-agent calls live under `children`, but a
+ *  sub-agent never loads a connector — kept for symmetry. */
+function loadedMcp(list: ChatMessage[]): Set<string> {
+  const out = new Set<string>()
+  for (const m of list) {
+    for (const name of m.mcpLoaded ?? []) out.add(name)
+    for (const a of m.toolActivity ?? []) {
+      if (a.tool === 'use_mcp') {
+        const raw = a.args?.server ?? a.args?.name
+        if (typeof raw === 'string' && raw.trim()) out.add(raw.trim())
+      } else if (a.tool.startsWith('mcp__')) {
+        const end = a.tool.indexOf('__', 5)
+        if (end > 5) out.add(a.tool.slice(5, end))
+      }
+    }
+  }
+  return out
+}
+
+/** Enabled connectors paired with whether the model actually loaded them. The
+ *  `mcp_loaded` stream event is the authoritative signal; a tool call by the
+ *  connector's `mcp__<server>__` prefix counts too, so a turn that called a tool
+ *  straight after loading still reads as used. */
+function enabledConnectors(turn: ChatMessage, loaded: Set<string>): TurnMcp[] {
+  const out: TurnMcp[] = []
+  for (const name of Object.keys(turn.mcpServers ?? {})) {
+    out.push({ name, used: loaded.has(name) })
+  }
+  // Loaded without being listed (a plugin connector) still belongs here.
+  for (const name of loaded) {
+    if (!out.some((c) => c.name === name)) out.push({ name, used: true })
+  }
+  return out
 }
 
 /** Plugin that ships a skill ("" when it comes from the store itself). */
@@ -130,7 +176,7 @@ export function usagePlugins(
   for (const s of usage.skills) add(skillOwner(s.name, catalog))
   for (const connector of usage.mcp) {
     for (const p of plugins) {
-      if (p.mcp?.includes(connector)) add(p.name || p.slug)
+      if (p.mcp?.includes(connector.name)) add(p.name || p.slug)
     }
   }
   return out

@@ -735,6 +735,10 @@ export interface StreamParams {
    *  provider payload / models.dev catalog. */
   modelReasoning?: boolean
   mcpServers?: Record<string, McpServerConfig>
+  /** Connectors the model already loaded with `use_mcp` (see Settings). Sent so
+   *  the backend inlines ONLY those, instead of every switched-on connector's
+   *  whole catalogue. */
+  mcpActive?: string[]
   /** Web-search engines from Settings → Plugins, in priority order: the top
    *  engine is the primary and the ones below are fallbacks tried in order. */
   searchPlugins?: SearchPluginConfig[]
@@ -937,6 +941,11 @@ export async function streamChat(
           thinking_level: params.thinkingLevel ?? '',
           model_reasoning: params.modelReasoning ?? false,
           mcp_servers: params.mcpServers ?? {},
+          // Connectors this chat already loaded with `use_mcp`: the backend
+          // intersects it with the enabled map, so a connector switched OFF
+          // since does not come back. Without it the model re-loaded the whole
+          // catalogue on every turn.
+          mcp_active: params.mcpActive ?? [],
           search_plugins: params.searchPlugins ?? [],
           web_search_auto_fetch: params.webSearchAutoFetch ?? 5,
           skills: params.skills ?? [],

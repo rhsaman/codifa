@@ -51,7 +51,8 @@ const bridge: CoderApi = {
       scope: scope ?? null,
     }),
   selectFolder: () => invoke<string | null>('select_folder'),
-  selectFile: () => invoke<string[] | null>('select_file'),
+  selectFile: (startDir?: string) =>
+    invoke<string[] | null>('select_file', { startDir: startDir ?? null }),
   importFile: (absPath) => invoke<string | null>('import_file', { absPath }),
   fsList: (root, rel) => invoke<FileEntry[]>('fs_list', { root, rel }),
   fsWalk: (root) =>

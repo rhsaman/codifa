@@ -103,14 +103,16 @@ const FilesIcon = () => (
   </svg>
 );
 
-/** Window/gem glyph for a chat artifact tab (a document the agent built). */
+/** Document glyph for a chat artifact tab (a page the agent built). A page
+ *  with a folded corner and text lines — distinct from TerminalIcon's prompt
+ *  chevron and from ArtifactsIcon's container box. */
 function ArtifactIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <rect x="3" y="4" width="18" height="16" rx="2.5" />
-      <path d="M3 9h18" />
-      <path d="m8 13 2 2-2 2" />
-      <path d="M13 17h3" />
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+      <path d="M9 13h6" />
+      <path d="M9 17h4" />
     </svg>
   );
 }

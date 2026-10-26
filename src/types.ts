@@ -191,6 +191,13 @@ export interface Settings {
   /** MCP connector names switched on via the composer popup. Applied to every
    *  message; defaults to none. */
   mcpEnabled?: string[]
+  /** Connectors the model loaded with `use_mcp`. Their tool schemas are NOT
+   *  inlined until the connector is named here, so a switched-on-but-unused
+   *  connector costs one prompt line instead of its whole catalogue (measured:
+   *  391 tools / ~59K tokens for one enabled Proxmox connector a turn never
+   *  touched). Persisted per chat so a connector is asked for once, not every
+   *  turn. */
+  mcpActive?: string[]
   /** The agent's Browser switch (composer → MCP tools → Browser). Stored like
    *  `computerUse`: when off, no `browser_*` tool is bound to the model. */
   browserUse?: boolean
@@ -519,6 +526,10 @@ export interface ChatMessage {
   attachments?: string[]
   images?: Array<{ path: string; name: string; dataUrl?: string }>
   mcpServers?: Record<string, McpServerConfig>
+  /** Connectors the model actually loaded with `use_mcp` this turn (the
+   *  `mcp_loaded` stream event). Enabled-but-never-loaded is the common case and
+   *  the one worth showing: it cost the turn an index line, not its schemas. */
+  mcpLoaded?: string[]
   skills?: string[]
   usage?: TokenUsage
   error?: boolean
@@ -628,6 +639,14 @@ export interface Chat {
   compactNotice?: string | null
   compactError?: string | null
   cmdError?: string | null
+  /** Connectors the model already loaded with `use_mcp`, persisted per chat so
+   *  a connector is asked for ONCE per conversation instead of once per turn.
+   *  The backend rebuilds its in-turn `activated` set from this on every
+   *  request — without it the model re-loaded a 342-tool connector on every
+   *  single turn (measured: two identical `use_mcp` calls in one trace).
+   *  Intersected with the live enable map on the backend, so a connector the
+   *  user switched OFF does not come back through this list. */
+  mcpActive?: string[]
   /** Live voice error shown in the transcript banner under messages (never in the composer). */
   liveError?: string | null
   /** TTS playback error shown in the transcript banner under messages (never beside the speaker icon). */
@@ -744,7 +763,7 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   content?: string

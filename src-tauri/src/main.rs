@@ -16,6 +16,7 @@ mod retention;
 mod scheduler;
 mod lsp;
 mod mcp;
+mod mcp_index;
 mod migrate;
 mod memory;
 mod backend_light;

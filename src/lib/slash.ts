@@ -102,6 +102,153 @@ export function slashBody(command: string, rest: string): string {
   return known ? parts.slice(1).join(' ') : text
 }
 
+/** A `--flag=value` option a slash command accepts after its sub-command.
+ *
+ *  The palette offers the flag NAMES (`--skills`, `--mcp`, …), then the values
+ *  that actually exist for it — a schedule, for instance, can name which skills,
+ *  MCP connectors and plugins every run gets. `values` says which installed list
+ *  the value menu reads. */
+export interface CommandFlag {
+  /** Flag as typed, including the leading dashes. */
+  name: string
+  hint: string
+  /** Key into the palette's named-value map (`skill`, `mcp`, `plugin`). */
+  values: string
+  /** Comma-separated flags accumulate (`--skills=a,b`); a single one replaces. */
+  multiple?: boolean
+}
+
+/** The flags a command accepts, keyed by command name (no slash). */
+export const COMMAND_FLAGS: Record<string, CommandFlag[]> = {
+  schedule: [
+    { name: '--skills', hint: 'Skills attached to every run', values: 'skill', multiple: true },
+    { name: '--mcp', hint: 'MCP connectors for every run', values: 'mcp', multiple: true },
+    { name: '--plugins', hint: 'Plugins every run gets', values: 'plugin', multiple: true },
+  ],
+}
+
+/** Every flag name the caret's command accepts, for the name level. */
+export function commandFlags(command: string): CommandFlag[] {
+  const key = command.startsWith('/') ? command.slice(1) : command
+  return COMMAND_FLAGS[key] ?? []
+}
+
+/** The flag word the caret is inside, if any: `--skills` or `--skills=a,b`.
+ *
+ *  Returns null for a plain argument, so a sub-command's own value menu (a repo,
+ *  an id) keeps working alongside the flags. `flag` is the flag name as typed
+ *  (`--skills`, lowercased), `typed` the value text already after `=`. */
+export interface CaretFlag {
+  start: number
+  end: number
+  flag: string
+  typed: string
+}
+export function slashFlagAt(caret: SlashCaret, command: string): CaretFlag | null {
+  // macOS smart punctuation rewrites a hand-typed `--` into `—`; the flag is
+  // still a flag, so straighten it before matching. Token bounds stay in raw
+  // coordinates (caret.start/end), so replacement ranges keep working.
+  const w = /^[—–]/.test(caret.word) ? `--${caret.word.slice(1)}` : caret.word
+  const match = /^(--[a-z0-9-]*)(?:=(.*))?$/i.test(w)
+  if (!match) return null
+  const eq = w.indexOf('=')
+  const flag = (eq === -1 ? w : w.slice(0, eq)).toLowerCase()
+  const known = commandFlags(command)
+  // A PARTIAL name (no `=` yet) is completing the flag itself, so `--mc` must
+  // reach the name menu. Once a value follows `=`, the name must be exact or
+  // the value menu would offer lists for a flag that does not exist.
+  if (eq === -1) {
+    return known.some((f) => f.name.startsWith(flag))
+      ? { start: caret.start, end: caret.end, flag, typed: '' }
+      : null
+  }
+  if (!known.some((f) => f.name === flag)) return null
+  return { start: caret.start, end: caret.end, flag, typed: w.slice(eq + 1) }
+}
+
+/** Does the caret's word look like a flag: `--x`, or `—x`/`–x` — the single
+ *  em/en-dash macOS smart punctuation makes of a hand-typed `--`. */
+export function isFlagToken(word: string): boolean {
+  return /^([—–]|--)/.test(word)
+}
+
+/** Rewrite macOS "smart dashes" back to `--` inside a command line.
+ *
+ *  Typing `--skills` with smart punctuation on turns the pair into one em-dash
+ *  (`—skills`), which no flag parser matched: flags inserted from the menu
+ *  (real `--`) worked while every hand-typed one went dead, and even deleting
+ *  the typed character did not bring the list back. Inside a command line, a
+ *  dash variant that begins a letter token is a mangled `--`; a dash followed
+ *  by a space or standing inside a word is prose punctuation and stays. */
+export function normalizeFlagDashes(text: string): string {
+  if (!text.startsWith('/')) return text
+  if (!text.includes('—') && !text.includes('–')) return text
+  return text.replace(/(^|\s)[—–](?=[A-Za-z])/g, '$1--')
+}
+
+/** Split an accumulated flag value (`a,b,c`) into its parts, trimmed. */
+export function flagValues(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+}
+
+/** The rows a `--flag=<typed>` token offers, from the installed list.
+ *
+ *  Ranked by the typed fragment but never emptied by it: a fragment matching
+ *  no installed name used to leave an empty popup ("No matching commands")
+ *  while the list was right there, so the ranking is only a preference and the
+ *  full list is the fallback. Values already picked in the same token are
+ *  dropped, so `--skills=a,b` does not offer `a` twice. */
+export function flagValueRows(values: string[], typed: string): string[] {
+  const picked = flagValues(typed)
+  const fragment = picked.length > 0 && !typed.includes(',') ? picked[picked.length - 1] : ''
+  const ranked = values.filter((v) => v.toLowerCase().startsWith(fragment.toLowerCase()))
+  return (ranked.length > 0 ? ranked : values).filter((v) => !picked.includes(v))
+}
+
+/** Resolve the command line's `--flags` into the tool's three arrays.
+ *
+ *  The composer writes flags so the user can PICK from what exists, but the
+ *  schedule tool wants `skills`/`mcp_servers`/`plugins` — so the line is read
+ *  here instead of leaving the model to re-parse it. An empty result means the
+ *  line carried no flags. */
+export interface ScheduleFlags {
+  skills: string[]
+  mcp_servers: string[]
+  plugins: string[]
+}
+export function parseScheduleFlags(text: string): ScheduleFlags {
+  const out: ScheduleFlags = { skills: [], mcp_servers: [], plugins: [] }
+  const key: Record<string, keyof ScheduleFlags> = {
+    '--skills': 'skills',
+    '--mcp': 'mcp_servers',
+    '--plugins': 'plugins',
+  }
+  // `—skills=` (the smart-dash mangling of a typed `--skills=`) counts too.
+  for (const m of text.matchAll(/(?:—|–|--)(skills|mcp|plugins)=([^\s]*)/gi)) {
+    const name = `--${m[1].toLowerCase()}`
+    const target = key[name]
+    if (!target) continue
+    for (const v of flagValues(m[2])) {
+      if (!out[target].includes(v)) out[target].push(v)
+    }
+  }
+  return out
+}
+
+/** Drop the `--flag=value` tokens from a line, leaving the user's prose.
+ *
+ *  `/schedule create هر روز --skills=x` must describe the task as "هر روز", not
+ *  spell the flags out to the model — they travel as real tool arguments. */
+export function stripFlagTokens(text: string): string {
+  return text
+    .replace(/(?:—|–|--)(?:skills|mcp|plugins)=[^\s]*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 /** Where the caret sits in the whitespace-separated words of a slash line. */
 export interface SlashCaret {
   /** Offset where the caret's word starts (0 for the `/command` token). */

@@ -45,10 +45,10 @@ export function shouldLeaveInsert(opts: {
   selection: string
   /** A dialog/palette owns the keyboard right now. */
   dialogOpen: boolean
-  /** The composer is holding something the user must not lose focus on. */
-  composerBusy: boolean
 }): boolean {
-  if (opts.dialogOpen || opts.composerBusy) return false
+  // A running stream does NOT veto this: Ctrl+C only moves the caret (it never
+  // stops the turn), so it must work while the model is streaming too.
+  if (opts.dialogOpen) return false
   if (!opts.caretInComposer) return false
   // Something is selected: this is a real COPY. Leave it alone.
   return opts.selection.trim().length === 0

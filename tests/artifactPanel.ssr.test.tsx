@@ -102,6 +102,30 @@ check(
   "assets are fetched, not assumed present",
   src.includes("getArtifactAssets"),
 );
+// 7. An artifact is a standalone document: its live data must load the same way
+//    whichever chat it is reopened in. The panel therefore falls back to the
+//    installed connectors when the global on/off list resolves nothing —
+//    pinning it to a single chat's enabled servers is the bug this guards.
+check(
+  "the channel falls back to installed connectors, not one chat's list",
+  src.includes("installedServers") &&
+    src.includes("Object.keys(enabledServers).length") &&
+    !src.includes("callMcpTool(data.tool, data.args, enabledServers)"),
+);
+
+// 8. The sandbox grants no popups, so an external link must go through the
+//    host: an http(s)-only open-url request rides the same verified-frame
+//    channel and is handed to the OS browser via the app-wide bridge.
+check(
+  "links ask the host for the OS browser over the same channel",
+  src.includes("isOpenUrlRequest") &&
+    src.includes("coder.openExternal") &&
+    src.includes('msg.url.startsWith("http'),
+);
+check(
+  "open-url keeps the sandbox strict (no popup grant)",
+  src.includes('sandbox="allow-scripts"') && !src.includes("allow-popups"),
+);
 
 console.log(`${passed} artifact-panel checks passed`);
 if (failures.length) {

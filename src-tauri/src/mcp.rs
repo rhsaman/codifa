@@ -321,6 +321,47 @@ fn list_tools(server: &str, cfg: &Value) -> Result<Vec<Value>, String> {
 /// a name two connectors both expose stays qualified to remain unambiguous.
 /// The second element carries one message per connector that could not be
 /// reached, so the agent loop can warn the user instead of failing silently.
+/// What one turn's connectors expose: the schemas to send, one index entry per
+/// connector (name + full tool list), and any connector that could not be
+/// reached.
+///
+/// The index is built from the SAME `tools/list` payload as the schemas, so the
+/// names the prompt advertises and the names the guard accepts cannot drift.
+pub struct Discovered {
+    pub schemas: Vec<Value>,
+    pub index: Vec<crate::mcp_index::ConnectorEntry>,
+    pub failures: Vec<String>,
+}
+
+/// Discover every enabled connector's tools.
+///
+/// Returns the raw material for BOTH the schema list and the prompt index — and
+/// the index is the cheap half: `mcp_index::index_section` prints a line per
+/// connector, so the model learns that Proxmox exists without paying for its
+/// 300 tool schemas unless the turn asks for them.
+pub fn discover(servers: &Value) -> Discovered {
+    let Some(map) = servers.as_object() else {
+        // No connector is enabled at all: every cached session is now orphaned,
+        // so release them rather than keep their child processes alive.
+        retire_disabled(&serde_json::Map::new());
+        return Discovered {
+            schemas: Vec::new(),
+            index: Vec::new(),
+            failures: Vec::new(),
+        };
+    };
+    let (schemas, index, failures) = build(map);
+    Discovered {
+        schemas,
+        index,
+        failures,
+    }
+}
+
+/// Kept for the tools that still need the schema list alone (tests, and any
+/// caller that does not build an index). `discover` is the one the agent loop
+/// uses, because it returns the index too.
+#[cfg(test)]
 pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
     let Some(map) = servers.as_object() else {
         // No connector is enabled at all: every cached session is now orphaned,
@@ -328,6 +369,18 @@ pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
         retire_disabled(&serde_json::Map::new());
         return (Vec::new(), Vec::new());
     };
+    let (schemas, _index, failures) = build(map);
+    (schemas, failures)
+}
+
+/// Shared body of `discover` and `tool_schemas`.
+fn build(
+    map: &serde_json::Map<String, Value>,
+) -> (
+    Vec<Value>,
+    Vec<crate::mcp_index::ConnectorEntry>,
+    Vec<String>,
+) {
     retire_disabled(map);
     let mut failures = Vec::new();
     // Collect every connector's tools first: the bare/qualified decision needs
@@ -349,6 +402,34 @@ pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
             }
         }
     }
+    // The index carries the names AS THE MODEL WOULD CALL THEM (bare when
+    // unique), so a name read off the index is dispatchable without translation.
+    let index: Vec<crate::mcp_index::ConnectorEntry> = found
+        .iter()
+        .filter_map(|(server, tools)| {
+            let names: Vec<String> = tools
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(|tool| {
+                    if counts.get(tool).copied().unwrap_or(0) == 1 {
+                        tool.to_string()
+                    } else {
+                        format!("{TOOL_PREFIX}{server}__{tool}")
+                    }
+                })
+                .collect();
+            if names.is_empty() {
+                None
+            } else {
+                Some(crate::mcp_index::ConnectorEntry {
+                    server: server.clone(),
+                    tools: names,
+                })
+            }
+        })
+        .collect();
     let mut out = Vec::new();
     for (server, tools) in &found {
         for t in tools {
@@ -373,7 +454,7 @@ pub fn tool_schemas(servers: &Value) -> (Vec<Value>, Vec<String>) {
             }));
         }
     }
-    (out, failures)
+    (out, index, failures)
 }
 
 /// Split `mcp__<server>__<tool>` back into its two parts.

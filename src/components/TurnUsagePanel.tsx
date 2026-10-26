@@ -61,17 +61,19 @@ export function TurnUsageSection({
 
   const usage: TurnUsage = turnUsage(messages);
   const owners = usagePlugins(usage, catalog, plugins);
-  // "Used" here means the connector was offered at least one tool to this turn
-  // — a connector can be enabled and still never be called, so the card says
-  // what the turn RAN WITH, not a call count (the trace already shows calls).
+  // "Used" here means the model LOADED the connector this turn (`use_mcp`) or
+  // called one of its tools — a connector can be enabled and never touched, and
+  // that distinction is the whole point: an untouched one cost the turn an index
+  // line, not its schemas (the trace already shows the calls).
   const connectorTools = new Map<string, string[]>();
   if (usage.mcp.length > 0) {
+    const enabled = new Set(usage.mcp.map((c) => c.name));
     const start = turnStart(messages);
     for (const m of messages.slice(start + 1)) {
       for (const a of m.toolActivity ?? []) {
         if (!a.tool.startsWith("mcp__")) continue;
         const server = a.tool.slice(5, a.tool.indexOf("__", 5));
-        if (!usage.mcp.includes(server)) continue;
+        if (!enabled.has(server)) continue;
         const list = connectorTools.get(server) ?? [];
         const name = bareTool(a.tool);
         if (!list.includes(name)) list.push(name);
@@ -85,15 +87,16 @@ export function TurnUsageSection({
   const skills = [...usage.skills].sort(
     (a, b) => Number(b.used) - Number(a.used),
   );
-  const connectors = usage.mcp.map((name) => ({
-    name,
-    tools: connectorTools.get(name) ?? [],
+  const connectors = usage.mcp.map((c) => ({
+    name: c.name,
+    used: c.used,
+    tools: connectorTools.get(c.name) ?? [],
   }));
   // Split ONCE: the Used row states what ran, so the groups below carry only
   // what was attached/enabled and left untouched. Listing a used skill in both
   // places was the panel's real noise (the same chip appeared twice).
   const unusedSkills = skills.filter((s) => !s.used);
-  const unusedConnectors = connectors.filter((c) => c.tools.length === 0);
+  const unusedConnectors = connectors.filter((c) => !c.used && c.tools.length === 0);
 
   const total = usage.skills.length + usage.mcp.length + owners.length;
 
@@ -116,12 +119,15 @@ export function TurnUsageSection({
     });
   }
   for (const c of connectors) {
-    if (c.tools.length === 0) continue;
+    if (!c.used && c.tools.length === 0) continue;
     usedChips.push({
       key: `used-mcp-${c.name}`,
       name: c.name,
-      meta: `· ${c.tools.length}`,
-      title: c.tools.join(", "),
+      meta: c.tools.length > 0 ? `· ${c.tools.length}` : undefined,
+      title:
+        c.tools.length > 0
+          ? c.tools.join(", ")
+          : "Loaded by the agent this turn",
     });
   }
 

@@ -34,8 +34,17 @@ import {
   slashBody,
   SUBCOMMANDS,
   slashCaretAt,
+  slashFlagAt,
+  commandFlags,
+  flagValues,
+  flagValueRows,
+  parseScheduleFlags,
+  stripFlagTokens,
+  isFlagToken,
+  normalizeFlagDashes,
   migrateCommandNames,
   type SlashCaret,
+  type ScheduleFlags,
 } from "../lib/slash";
 import { didYouMean, rankMatches } from "../lib/fuzzy";
 import {
@@ -275,6 +284,19 @@ type PermInfo = {
  *  the palette costs no request. */
 const ARG_VALUE_TTL_MS = 15_000;
 
+/** The `--skills/--mcp/--plugins` picks, spelled out for the schedule prompt.
+ *
+ *  The composer let the user PICK the values, so handing the model a sentence it
+ *  may re-interpret loses the choice; naming the three arrays verbatim makes it
+ *  pass them straight to the tool. Empty when the line carried no flags. */
+function describeScheduleFlags(flags: ScheduleFlags): string {
+  const parts: string[] = [];
+  if (flags.skills.length) parts.push(`skills=[${flags.skills.join(", ")}]`);
+  if (flags.mcp_servers.length) parts.push(`mcp_servers=[${flags.mcp_servers.join(", ")}]`);
+  if (flags.plugins.length) parts.push(`plugins=[${flags.plugins.join(", ")}]`);
+  return parts.join(", ");
+}
+
 /** True when a message asks to create/edit/install/import skills or MCP connectors,
  *  so the agent gets the `create_skill` / `create_mcp` tools for the turn.
  *  Matches English AND Persian intent words (نصب/ساخت/بساز/ایجاد/ذخیره/اضافه/ویرایش/ادیت/اصلاح/تغییر/حذف/آپدیت/بروز →
@@ -288,25 +310,6 @@ function wantsSkillOrMcp(text: string): boolean {
       low,
     );
   const target = /\b(skill|mcp|connector)s?\b|(اسکیل|مهارت|کانکتور|ام‌سی‌پی)/.test(low);
-  return action && target;
-}
-
-/** True when a message asks to build/edit an artifact, so the agent gets the
- *  `artifact` tool for the turn. Same English + Persian intent words as
- *  `wantsSkillOrMcp`, targeting artifacts only. The target list also carries the
- *  "whole app" phrasings: an artifact with a backend is still an artifact, and
- *  without them "build me an app that…" opened only the chat, so the agent had
- *  no artifact tool and answered with a wall of markup instead. */
-function wantsArtifact(text: string): boolean {
-  const low = text.toLowerCase();
-  const action =
-    /\b(build|make|create|draw|render|generate|edit|update|change|fix|add|modify)\b|(بساز|ساخت|ایجاد|رسم|درست|تولید|ویرایش|ادیت|اصلاح|تغییر|اضافه)/.test(
-      low,
-    );
-  const target =
-    /\b(artifact|artefact|dashboard|chart|mockup|prototype|page|widget|app|ui|script|backend|server|tool)s?\b|(آرتیفکت|ارتیفکت|داشبورد|نمودار|ماکاپ|ویجت|اپ|برنامه|بک\s?اند|اسکریپت|سرور|رابط)/.test(
-      low,
-    );
   return action && target;
 }
 
@@ -940,6 +943,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Named values the third level offers (plugin names, skills, connectors,
   // documents, tasks, and the repos plugins were installed from).
   const [cmdArgValues, setCmdArgValues] = useState<Record<string, string[]>>({});
+  // Whether the value lists have landed at least once. `paletteRows` needs it
+  // to tell "still loading" from "loaded and genuinely empty" — without it an
+  // empty list stayed on the Loading row forever.
+  const [cmdArgLoaded, setCmdArgLoaded] = useState(false);
+  // The same map as a ref: `ensureCmdArgValues` decides whether to refetch
+  // without being re-created on every state change.
+  const cmdArgValuesRef = useRef<Record<string, string[]>>({});
   const cmdArgFetchedAt = useRef(0);
   // One `/`-command per ENABLED PLUGIN (the bundle's slug), with its skills as
   // the sub-command level. Seeded from the module cache so a remount (chat
@@ -1096,31 +1106,78 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  stays empty instead of breaking the palette, and the TTL keeps a cached set
    *  from turning a keypress into a request. */
   const ensureCmdArgValues = useCallback(async () => {
-    if (Date.now() - cmdArgFetchedAt.current < ARG_VALUE_TTL_MS) return;
+    // A fresh cache is reused, but an EMPTY one is never trusted: the value
+    // menus read this map the moment they open, so a list that has not landed
+    // yet must refetch instead of showing "No matching commands".
+    const cached = cmdArgValuesRef.current;
+    // The guard keys on the LISTS, not on the map being non-empty: once
+    // `plugin` had landed, a map with `skill` still missing passed the old
+    // check and the value menu stayed empty for good — typing `--skills=a`
+    // then showed nothing at all.
+    // The guard asks whether the map was FETCHED recently, not whether every
+    // list came back non-empty: a machine with no MCP connector installed, or
+    // a dev harness with a stubbed backend, returned an empty list for one key
+    // and the whole guard then failed forever — every keystroke refetched and
+    // the value menu sat empty between rounds.
+    const fetchedRecently = Date.now() - cmdArgFetchedAt.current < ARG_VALUE_TTL_MS;
+    if (fetchedRecently && Object.keys(cached).length > 0) return;
+    // The stamp is taken BEFORE the awaits so two keystrokes cannot both
+    // start a fetch, but the modal bumps it forward again the moment the map
+    // is published. A stamp written after the awaits was already too late:
+    // the next keystroke strolled past the TTL and refetched on every key.
     cmdArgFetchedAt.current = Date.now();
-    const next: Record<string, string[]> = {};
-    const plugins = await listPlugins();
-    if (!Array.isArray(plugins)) {
-      // A failed list must not empty a menu that already had values.
-      cmdArgFetchedAt.current = 0;
-      return;
-    }
-    next.plugin = plugins.map((p) => p.slug);
-    // The repo a bundle came from is the only install history the app keeps.
-    next.repo = Array.from(
-      new Set(plugins.map((p) => p.source).filter((s): s is string => !!s)),
-    );
-    const skills = await listAvailableSkills();
-    next.skill = Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)));
-    const connectors = await listMcp();
-    next.mcp = Object.keys(connectors.mcpServers ?? {});
-    // Documents and tasks belong to ONE chat, so they are read from the active
-    // chat id the same way their own panels do.
-    const artifacts = await listArtifacts(activeChatId || undefined);
-    next.artifact = Array.isArray(artifacts) ? artifacts.map((a) => a.id) : [];
-    const tasks = await listSchedules();
-    next.schedule = Array.isArray(tasks) ? tasks.map((t) => t.id) : [];
+    // Start from the PREVIOUS map: a list that fails this round keeps the
+    // values it had, so one failed endpoint cannot blank the whole menu.
+    // Start from the PREVIOUS map: a list that fails this round keeps the
+    // values it had, so one failed endpoint cannot blank the whole menu.
+    const next: Record<string, string[]> = { ...cached };
+    // Each list is fetched on its OWN and guarded: one endpoint that rejects
+    // used to unwind the whole function before it published anything, so the
+    // value menus sat on "Loading…" forever even though skills were right
+    // there. A failure now only skips its own key.
+    const load = async (key: string, fetch: () => Promise<string[]>) => {
+      try {
+        next[key] = await fetch();
+      } catch {
+        // Leave whatever the previous round cached for this key.
+      }
+    };
+    await Promise.all([
+      load('plugin', async () => {
+        const plugins = await listPlugins();
+        if (Array.isArray(plugins)) {
+          // The repo a bundle came from is the only install history kept.
+          next.repo = Array.from(
+            new Set(plugins.map((p) => p.source).filter((s): s is string => !!s)),
+          );
+          return plugins.map((p) => p.slug);
+        }
+        return next.plugin ?? [];
+      }),
+      load('skill', async () => {
+        const skills = await listAvailableSkills();
+        return Array.isArray(skills)
+          ? Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)))
+          : (next.skill ?? []);
+      }),
+      load('mcp', async () => {
+        const connectors = await listMcp();
+        return Object.keys(connectors?.mcpServers ?? {});
+      }),
+      // Documents and tasks belong to ONE chat, so they are read from the
+      // active chat id the same way their own panels do.
+      load('artifact', async () => {
+        const artifacts = await listArtifacts(activeChatId || undefined);
+        return Array.isArray(artifacts) ? artifacts.map((a) => a.id) : (next.artifact ?? []);
+      }),
+      load('schedule', async () => {
+        const tasks = await listSchedules();
+        return Array.isArray(tasks) ? tasks.map((t) => t.id) : (next.schedule ?? []);
+      }),
+    ]);
+    cmdArgValuesRef.current = next;
     setCmdArgValues(next);
+    setCmdArgLoaded(true);
   }, [activeChatId]);
 
   /** The rows the palette shows: the level the caret is on, filtered by its
@@ -1129,8 +1186,81 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  exactly the `repo`/`repo_path`/`repo_ref` trio the backend reads. */
   const paletteRows: PaletteRow[] = useMemo(() => {
     if (!cmdOpen) return [];
+    // `cmdCaret` IS the live caret: `syncCmdPalette` re-derives it from the
+    // textarea on every keystroke, so the memo never has to touch a DOM ref
+    // (reading one here ran before its own declaration and threw on `/`).
     const caret = cmdCaret;
     const q = cmdQuery.toLowerCase();
+    if (caret && caret.index >= 2) {
+      const flags = commandFlags(caret.prev[0] ?? "");
+      const subName = caret.prev[1] ?? "";
+      const afterFlagSub =
+        flags.length > 0 &&
+        (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).some((s) => s.name === subName);
+      // The empty word right after `create `/`update ` is the flag level: offer
+      // the names instead of falling through to the sub-command's (absent) value
+      // menu, which rendered an empty box.
+      if (afterFlagSub && (!caret.word || isFlagToken(caret.word))) {
+        const caretFlag = slashFlagAt(caret, caret.prev[0] ?? "");
+        if (!caret.word.includes("=")) {
+          // Rank by the straightened name: `—ski` (a smart-dash `--ski`) must
+          // still find `--skills`.
+          const byName = rankMatches(flags, caretFlag?.flag ?? caret.word, (f) => f.name);
+          // A fragment matching no flag (`—zz`) still lists the names instead of
+          // an empty box — the value level follows the same never-empty rule.
+          return (byName.length > 0 ? byName : flags).map((f) => ({
+            key: `flagname:${f.name}`,
+            label: f.name,
+            hint: f.hint,
+            insert: `${f.name}=`,
+          }));
+        }
+        // `--skills=a`: a VALUE is being typed. The list loads lazily, so an
+        // empty cache renders as loading — returning [] here closed the palette
+        // and looked like "writing a flag shows nothing".
+        const spec = flags.find((f) => f.name === (caretFlag?.flag ?? ""));
+        if (!spec) return [];
+        const values = cmdArgValues[spec.values] ?? [];
+        const typed = flagValues(caretFlag?.typed ?? "");
+        if (values.length === 0) {
+          // Distinguish "not there yet" from "landed and empty": the first is
+          // a loading row, the second tells the user nothing is installed. The
+          // old code always said Loading…, so a genuinely empty list looked
+          // like a hang.
+          return [
+            {
+              key: `flagloading:${spec.name}`,
+              label: cmdArgLoaded ? "Nothing installed" : "Loading…",
+              hint: spec.name,
+              insert: "",
+            },
+          ];
+        }
+        // Already-picked values are dropped, ranked by the typed fragment, and
+        // the FULL list is the fallback when nothing matches it — see
+        // `flagValueRows`. Done in `slash.ts` so the rule is unit-tested.
+        const remaining = flagValueRows(values, caretFlag?.typed ?? "");
+        // Everything installed is already in the line: say so instead of
+        // letting the popup fall to the generic "No matching commands".
+        if (remaining.length === 0) {
+          return [
+            { key: `flagdone:${spec.name}`, label: "All selected", hint: spec.name, insert: "" },
+          ];
+        }
+        // The fragment being typed is REPLACED, not appended to: inserting
+        // `typed.join(",") + "," + v` while text is present produced
+        // `--skills=an,anthropic-frontend-design` instead of completing it.
+        const already = flagValues(caretFlag?.typed ?? "");
+        return remaining.map((v) => ({
+          key: `flag:${spec.name}:${v}`,
+          label: v,
+          hint: spec.name,
+          // With earlier picks in the token, keep them and add one: `--skills=a`
+          // becomes `--skills=a,b`. With a bare fragment, complete it.
+          insert: already.length > 1 ? `${already.slice(0, -1).join(",")},${v}` : v,
+        }));
+      }
+    }
     if (!caret || caret.index === 0) {
       // Ranked by name so a typo or an abbreviation still finds its command
       // (`/plu`, `/plugni`). The long prose hints only fill in when no NAME
@@ -1195,7 +1325,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       hint: kind === "repo" ? "repo" : verb,
       insert: v,
     }));
-  }, [cmdOpen, cmdCaret, cmdQuery, commandUsage, commands, cmdArgValues, pluginCmds]);
+  }, [cmdOpen, cmdCaret, cmdQuery, commandUsage, commands, cmdArgValues, cmdArgLoaded, pluginCmds, input]);
   const slashParsed = parseSlashInput(input);
   const slashActive =
     !!slashParsed?.name && commands.some((c) => c.name === slashParsed.name);
@@ -1629,7 +1759,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       if (e.ctrlKey && !e.shiftKey && !e.altKey && phys === 'c') {
         const dialogOpen = !!document.querySelector('[role="dialog"], .settings-modal, .search-overlay')
         const selection = composer ? composer.value.slice(composer.selectionStart ?? 0, composer.selectionEnd ?? 0) : ''
-        if (!shouldLeaveInsert({ caretInComposer: inComposer, selection, dialogOpen, composerBusy: !!busy })) return
+        if (!shouldLeaveInsert({ caretInComposer: inComposer, selection, dialogOpen })) return
         e.preventDefault()
         // Leaving insert also parks the caret on the transcript so the next
         // bare j/k scrolls this chat instead of typing into the composer.
@@ -1639,7 +1769,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [busy])
+  }, [])
   const composerRef = useRef<HTMLDivElement>(null);
   // Per-chat scroll restoration: the panel stays mounted across chat
   // switches (no key={activeChatId}), so the restore anchor is refreshed on
@@ -3813,8 +3943,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // the last several chat messages, so a follow-up like "ادامه بده" keeps the
     // tools it was originally granted (the user's install request is still in
     // history and matches the intent).
+    // The `artifact` tool is NOT in this gate: predicting from the prompt text
+    // that a turn will build an artifact cannot work (a correctly phrased
+    // "فهرست زنده را بیاور و نشان بده" matched no action word and left the model
+    // with no artifact tool at all, so it shipped a hard-coded HTML mock). The
+    // model decides for itself whether to call the tool — the gate is DOWN, in
+    // `tool_schemas`, so `allowCreate` no longer arms it.
     if (!allowCreate) {
-      if (wantsSkillOrMcp(text) || wantsArtifact(text) || wantsSchedule(text) || wantsPlugin(text)) {
+      if (wantsSkillOrMcp(text) || wantsSchedule(text) || wantsPlugin(text)) {
         allowCreate = true;
       } else {
         const recent = chat.messages.slice(-6);
@@ -3823,7 +3959,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             m.role === "user" &&
             m.content &&
             (wantsSkillOrMcp(m.content) ||
-              wantsArtifact(m.content) ||
               wantsSchedule(m.content) ||
               wantsPlugin(m.content))
           ) {
@@ -4505,6 +4640,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // Deliberately NOT rendered into the chat (same reason as "skill"
         // above): the active MCP servers are already listed in the prompt's
         // USER-SELECTED SKILLS/TOOLS section, so the note is redundant UI.
+      } else if (event.kind === "mcp_loaded") {
+        // The model loaded a connector on demand with `use_mcp`. Record it on
+        // the turn's user message so the Todos card can show which connectors
+        // were actually USED — the enabled-but-never-loaded ones are the whole
+        // reason this mechanism exists (they cost an index line, not schemas).
+        const loaded = (event.servers ?? []).filter((s) => !!s);
+        if (loaded.length > 0 && userMsg) {
+          useStore.getState().updateMessage(userMsg.id, { mcpLoaded: loaded });
+        }
+        // Persist on the CHAT as well: `mcpLoaded` feeds the Todos card for this
+        // turn only, while the request needs the full set on every later turn —
+        // without this the model re-loaded a 342-tool connector each turn.
+        if (loaded.length > 0) {
+          const cid = chat?.id;
+          if (cid) useStore.getState().setChatMcpActive(cid, loaded);
+        }
       } else if (event.kind === "ctx_parts") {
         // Real part sizes for the context popover. Route by the backend's
         // chat_id (never the viewed chat): a sub-agent building its context
@@ -5333,6 +5484,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               modelReasoning(activeProvider, activeProvider.model),
             ),
           mcpServers: effectiveMcpServers,
+          // Connectors this chat already loaded in an EARLIER turn. Read off the
+          // LIVE store (not the `chat` captured at render): the `mcp_loaded`
+          // handler writes it on the previous turn, and a stale closure here
+          // would send an empty list and re-load the catalogue every turn —
+          // exactly the bug this field exists to prevent.
+          mcpActive: s.chats.find((c) => c.id === chat.id)?.mcpActive,
           // Settings → Plugins order decides the web_search engine chain
           // (top = primary, below = fallbacks tried in order).
           searchPlugins: s.searchPlugins,
@@ -6102,13 +6259,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           content: prettySlashLabel(`${word} ${sub} ${arg}`),
           ...(ch.mode ? { mode: ch.mode } : {}),
         });
+        const updFlags = describeScheduleFlags(parseScheduleFlags(rest));
+        const updChange = stripFlagTokens(rest);
         void send(
-          `Edit the existing scheduled task "${arg}": ${rest}. Call the schedule tool ` +
+          `Edit the existing scheduled task "${arg}": ${updChange}. Call the schedule tool ` +
             `with action=list first to find that task — it is the id or the name the ` +
             `user gave — and read its CURRENT prompt, cron, root, mode and attached ` +
             `skills/mcp_servers/plugins. Then call action=update with the SAME id and ` +
             `send only the fields that change (an omitted field keeps its stored ` +
-            `value). The cron is 5 fields in UTC, and an empty cron makes it run once.`,
+            `value).${updFlags ? ` Set these attached arrays exactly: ${updFlags}.` : ""} ` +
+            `The cron is 5 fields in UTC, and an empty cron makes it run once.`,
           [],
           [],
           true,
@@ -6392,7 +6552,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           "/artifact":
             "Usage: `\/artifact list`, `\/artifact create <description>`, `\/artifact update <id> <change>`, `\/artifact remove <id>`.",
           "/schedule":
-            "Usage: `\/schedule list`, `\/schedule create <description>`, `\/schedule update <id|name> <change>`, `\/schedule run <id>`, `\/schedule remove <id>`.",
+            "Usage: `\/schedule list`, `\/schedule create <description> [--skills=a,b] [--mcp=x] [--plugins=z]`, `\/schedule update <id|name> <change> [--skills=…]`, `\/schedule run <id>`, `\/schedule remove <id>`. The `--` flags attach skills, MCP connectors and plugins to every run.",
         };
         if (!rest) {
           s.addMessage(ch.id, { role: "assistant", content: usage[word] });
@@ -6411,7 +6571,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // inside a sentence that already said "Create or edit a scheduled task …".
         // Checked BEFORE the bubble is added, so a bare sub-command does not
         // leave a stray user message behind.
-        const desc = slashBody(word, rest)
+        // `--flags` are real tool arguments, not prose: read them out of the
+        // line and keep them from reaching the description the model reads.
+        const flags = parseScheduleFlags(rest);
+        const desc = stripFlagTokens(slashBody(word, rest))
         if (!desc) {
           s.addMessage(ch.id, {
             role: "assistant",
@@ -6419,6 +6582,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           });
           break;
         }
+        const flagLine = describeScheduleFlags(flags);
         const created = s.addMessage(ch.id, {
           role: "user",
           content: prettySlashLabel(v),
@@ -6427,7 +6591,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const prompts: Record<string, string> = {
           "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass "fa_keywords" (the Persian phrases the WHOLE bundle answers to, comma-separated) plus the skills (name + content + description + fa_keywords in English AND Persian), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
           "/artifact": `Build an artifact from this description: "${desc}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
-          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode, and the skills/mcp_servers/plugins the run needs. To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
+          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode,${flagLine ? " and pass these exact arrays: " + flagLine + "." : " and the skills/mcp_servers/plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
         };
         void send(
           prompts[word],
@@ -6775,7 +6939,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   );
 
   const submit = (overrideText?: string) => {
-    const typed = (overrideText ?? input).trim();
+    // Straighten smart punctuation once, on the way out: the composer never
+    // rewrites the textarea mid-typing (that scrambled WebKit composition into
+    // `ockd`), so a line still carrying `—skills=` is repaired here, where
+    // nothing is mid-flight. Prose (non-slash lines) is untouched — the helper
+    // only rewrites dash tokens on a `/command` line.
+    const typed = normalizeFlagDashes(overrideText ?? input).trim();
     if (!typed && pastedBlocks.length === 0 && images.length === 0 && !activeQuote) return;
     // Record plain prompts so ArrowUp recalls them; slash commands and
     // skill mentions stay out (they have their own recent-use popups).
@@ -7160,9 +7329,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
 
   const attachFile = async () => {
+    // Open the native picker in this chat's workspace root so the user lands
+    // in the project they are working in, not in the OS's last-used folder.
     // Older Electron main processes still return a single path string —
     // accept both shapes so the picker never degrades into a no-op.
-    const picked = await api.selectFile().catch(() => null);
+    const picked = await api.selectFile(wroot).catch(() => null);
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
     for (const p of paths) {
@@ -8223,13 +8394,36 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const acceptCmd = (insert: string) => {
     if (!cmdOpen) return;
     const caret = cmdCaret;
-    const start = caret ? caret.start : cmdOpen.at;
+    // A flag token (`--skills=a,b`) appends: only the value after `=` is
+    // replaced, so picking a second skill keeps the first.
+    const caretFlag = caret ? slashFlagAt(caret, caret.prev[0] ?? "") : null;
+    // Inside a flag token only the part after `=` is being edited, so a second
+    // pick appends to the first instead of wiping it. Without an `=` yet the
+    // whole `--flag` token is replaced, which is the name-completion level.
+    const hasEq = !!caret && caret.word.includes("=");
+    const start =
+      caretFlag && hasEq
+        ? caretFlag.start + caretFlag.flag.length + 1
+        : caret
+          ? caret.start
+          : cmdOpen.at;
     const end = caret ? caret.end : cmdOpen.at + 1 + cmdQuery.length;
     // Record usage on pick (like skills) so the next open sorts recent-last at
     // the bottom even before the command runs via handleCommand.
     setCommandUsage(recordCommandUsage(insert));
-    const next = `${input.slice(0, start)}${insert} ${input.slice(end)}`;
-    const pos = start + insert.length + 1;
+    // A trailing space is written into the line itself, not merely left for the
+    // caret: the next level's menu opens off it, and without it the caret sat
+    // one character past the text while the palette stayed on the same word.
+    // A flag VALUE is the exception: no space, so a second pick appends to the
+    // same `--skills=a,b` token instead of starting a new word.
+    // A flag NAME pick (`--plugins=`) and a flag VALUE pick both keep the token
+    // open: the `=` already starts the value level, and a space would split the
+    // word so the value list could never appear on the same token.
+    const openFlagToken = !!caretFlag || insert.endsWith('=')
+    const tail = openFlagToken ? '' : ' '
+    const inserted = `${input.slice(0, start)}${insert}${tail}`;
+    const next = inserted + input.slice(end);
+    const pos = inserted.length;
     setInput(next);
     setCmdOpen(null);
     setCmdCaret(null);
@@ -8255,8 +8449,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       return;
     }
     // A level the app has nothing to offer for closes rather than showing an
-    // empty box over the composer.
-    const known = caret.index === 0 || !!SUBCOMMANDS[caret.prev[0] ?? ""];
+    // empty box over the composer. A `--flag` word keeps the palette open even
+    // when the sub-command itself has no value menu, since the flags are the
+    // palette's own level.
+    // Every level that HAS rows keeps the palette open. The level is read from
+    // the word itself, so it holds for ANY command that declares sub-commands
+    // or flags — not just the schedule example this was built against:
+    //   0  the command names
+    //   1  the sub-commands (`/schedule ` → `create`, `update`, …)
+    //   2+ a sub-command's own value, or the flags a sub-command declares
+    const subVerb = caret.prev[0] ?? "";
+    const subName = caret.prev[1] ?? "";
+    const hasSubCommands =
+      caret.index === 1 && (SUBCOMMANDS[subVerb] ?? []).length > 0;
+    const subDecl =
+      caret.index >= 2
+        ? (SUBCOMMANDS[subVerb] ?? []).find((s) => s.name === subName)
+        : undefined;
+    const flagLevel =
+      caret.index >= 2 && commandFlags(subVerb).length > 0 && !!subDecl;
+    // Any other level-2+ word belongs to the sub-command's own value menu
+    // (`/plugin install <repo>`); its rows decide whether it is worth showing.
+    const argLevel = caret.index >= 2 && !!subDecl && subDecl.arg !== "free";
+    const known =
+      caret.index === 0 || hasSubCommands || flagLevel || argLevel;
     if (!known) {
       setCmdOpen(null);
       setCmdCaret(null);
@@ -8264,7 +8480,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     setCmdOpen({ at: 0 });
     setCmdCaret(caret);
+    // Reset the filter for the NEW word: leaving the previous level's query in
+    // place filtered the command list by a word that no longer exists and the
+    // palette appeared to stay on the level that was just picked.
     setCmdQuery(caret.word.toLowerCase());
+    if (caret.index === 0) setCmdIndex(0);
     // At a value level the rows are ranked by match quality, so the best one is
     // highlighted (bottom-anchoring a fuzzy-ranked list would point at the
     // worst match). The command level keeps its recent-first bottom anchor.
@@ -8467,6 +8687,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   };
 
   const onInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    // NOTE: never rewrite `e.target.value` in here. macOS smart punctuation
+    // substitutes `--` → `—` through WebKit's composition machinery, and a
+    // mid-composition value write desyncs its pending text state — the next
+    // keystrokes then land at stale offsets (`dock` came out as `ockd`, and
+    // the em-dash stayed anyway). The flag parsers accept every dash variant
+    // (`isFlagToken`/`slashFlagAt`/`parseScheduleFlags`), so the line is only
+    // straightened once, at submit time — see `submit`.
     const v = e.target.value;
     const prev = input;
     setInput(v);
@@ -8487,9 +8714,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
     }
 
-    if (cmdOpen) {
-      // The caret decides the level, so moving it between the words of a line
-      // like `/plugin install x` re-targets the menu instead of closing it.
+    // The caret decides the level on EVERY edit — typing, deleting or moving
+    // it. Gating this on `cmdOpen` meant the palette could never come back
+    // after a delete closed it (pressing backspace left it shut for good).
+    {
       const el = e.target;
       syncCmdPalette(v, el.selectionStart ?? v.length);
       if (v.length === prev.length + 1 && v[v.length - 1] === "/") {

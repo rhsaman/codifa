@@ -52,11 +52,23 @@ function check(name: string, cond: boolean, extra?: unknown) {
 const user = (
   id: string,
   extra: Partial<ChatMessage> = {},
-): ChatMessage => ({ id, role: "user", content: "hi", ...extra })
+): ChatMessage => ({
+  id,
+  role: "user",
+  content: "hi",
+  createdAt: 0,
+  ...extra,
+})
 const assistant = (
   id: string,
   extra: Partial<ChatMessage> = {},
-): ChatMessage => ({ id, role: "assistant", content: "", ...extra })
+): ChatMessage => ({
+  id,
+  role: "assistant",
+  content: "",
+  createdAt: 0,
+  ...extra,
+})
 
 console.log("1) turnStart finds the newest user message:");
 {
@@ -84,7 +96,11 @@ console.log("2) turnUsage reports the CURRENT turn only:");
     u.skills,
   )
   check("a previous turn's skill is not carried over", !u.skills.some((s) => s.name === "old-skill"))
-  check("connectors come from the same message", u.mcp.length === 1 && u.mcp[0] === "github", u.mcp)
+  check(
+    "connectors come from the same message",
+    u.mcp.length === 1 && u.mcp[0].name === "github" && u.mcp[0].used === false,
+    u.mcp,
+  )
   check("an attached-but-not-loaded skill is not marked used", u.skills[0].used === false)
 }
 
@@ -205,8 +221,19 @@ console.log("6) skillOwner + usagePlugins map names back to plugins:");
   check("lookup is case-insensitive", skillOwner("PONYTAIL", catalog) === "Dev Kit")
   check("an unknown skill has no owner", skillOwner("nope", catalog) === "")
 
+  // `usage.mcp` is `TurnMcp[]` ({name, used}), NOT a list of names: the panel
+  // needs the `used` flag to tell a connector that cost the turn its SCHEMAS
+  // from one that only cost an index line. Passing bare strings here silently
+  // resolved `connector.name` to undefined and dropped every connector owner —
+  // this test caught exactly that, so keep the object shape.
   const owners = usagePlugins(
-    { skills: [{ name: "Ponytail", used: true }], mcp: ["github", "other"] },
+    {
+      skills: [{ name: "Ponytail", used: true }],
+      mcp: [
+        { name: "github", used: true },
+        { name: "other", used: false },
+      ],
+    },
     catalog,
     plugins,
   )

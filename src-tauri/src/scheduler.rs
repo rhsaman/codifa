@@ -663,6 +663,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         } else {
             Value::Object(task_mcp)
         },
+        // A schedule is a single headless turn: nothing carries an activation
+        // back to it, so a scheduled run starts with every connector on the
+        // index and loads one only if that run actually calls `use_mcp`.
+        mcp_active: Vec::new(),
         subagent_models,
         providers: providers_map,
         data_root: data_root.to_string_lossy().to_string(),

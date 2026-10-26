@@ -19,6 +19,7 @@ pub mod retention;
 pub mod scheduler;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_index;
 pub mod migrate;
 pub mod memory;
 pub mod backend_light;

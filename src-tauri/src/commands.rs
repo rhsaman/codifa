@@ -1812,18 +1812,23 @@ pub async fn select_folder(app: AppHandle) -> Option<String> {
     rx.recv().ok().flatten()
 }
 
+/// `start_dir` is the caller's workspace root: the picker opens there instead of
+/// wherever the OS last left the user. Ignored when it is empty or gone.
 #[tauri::command]
-pub async fn select_file(app: AppHandle) -> Option<Vec<String>> {
+pub async fn select_file(app: AppHandle, start_dir: Option<String>) -> Option<Vec<String>> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
-    app.dialog()
-        .file()
-        .set_title("Select files")
-        .pick_files(move |paths| {
-            let _ = tx.send(
-                paths.map(|list| list.iter().map(|p| p.to_string()).collect()),
-            );
-        });
+    let mut builder = app.dialog().file().set_title("Select files");
+    if let Some(dir) = start_dir.filter(|d| !d.trim().is_empty()) {
+        if std::path::Path::new(&dir).is_dir() {
+            builder = builder.set_directory(dir);
+        }
+    }
+    builder.pick_files(move |paths| {
+        let _ = tx.send(
+            paths.map(|list| list.iter().map(|p| p.to_string()).collect()),
+        );
+    });
     rx.recv().ok().flatten()
 }
 

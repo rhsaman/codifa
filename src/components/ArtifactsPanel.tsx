@@ -7,6 +7,21 @@ import {
   type ArtifactSummary,
 } from "../lib/artifacts";
 
+/** Document glyph shared by the artifacts LIST row and the transcript card.
+ *  A single inline SVG (not the `</>`  string it replaced, which read as a
+ *  terminal/code badge). Keeps both surfaces on the same mark as the viewer
+ *  tab's ArtifactIcon. */
+export function ArtifactGlyph({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+      <path d="M9 13h6" />
+      <path d="M9 17h4" />
+    </svg>
+  );
+}
+
 /** The Artifacts page: every document the agent built, newest first.
  *
  *  A LIST page and nothing else: artifacts are created and edited from the
@@ -163,7 +178,7 @@ export function ArtifactsPanel() {
         error ? null : (
           <div className="viewer-empty">
             No artifacts yet. Build one from the chat with{" "}
-            <code>/artifact &lt;description&gt;</code>.
+            <code>/artifact create &lt;description&gt;</code>.
           </div>
         )
       ) : shown !== null && shown.length === 0 ? (
@@ -179,7 +194,7 @@ export function ArtifactsPanel() {
                 onClick={() => void open(it)}
               >
                 <span className="artifacts-icon" aria-hidden="true">
-                  {it.kind === "md" ? "¶" : "</>"}
+                  <ArtifactGlyph />
                 </span>
                 <span className="artifacts-title">{it.title}</span>
                 <span className="artifacts-meta">

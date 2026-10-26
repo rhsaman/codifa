@@ -1238,6 +1238,16 @@ pub struct AgentRequest {
     pub chat_id: String,
     #[serde(default)]
     pub mcp_servers: Value,
+    /// Connectors the model already asked for through `use_mcp` in this chat.
+    ///
+    /// Their schemas are NOT inlined until the connector is named here, which is
+    /// what keeps a switched-on-but-unused connector at one prompt line instead
+    /// of its whole catalogue (measured: 391 schemas / ~59K tokens for a single
+    /// enabled Proxmox connector the turn never touched). The renderer persists
+    /// this per chat and echoes it back, so a connector loaded once stays loaded
+    /// for the rest of the conversation without asking again.
+    #[serde(default)]
+    pub mcp_active: Vec<String>,
     /// Per-slot sub-agent model overrides from the UI's Tool Models settings
     /// (e.g. {"explore": "providerId/model"}); empty = the parent model.
     #[serde(default)]
@@ -1571,6 +1581,7 @@ impl AgentRequest {
             context_window: self.context_window,
             chat_id: self.chat_id.clone(),
             mcp_servers: self.mcp_servers.clone(),
+            mcp_active: self.mcp_active.clone(),
             subagent_models: self.subagent_models.clone(),
             providers: self.providers.clone(),
             data_root: self.data_root.clone(),
@@ -2164,6 +2175,11 @@ pub enum AgentEvent {
     Status { stage: String, content: String },
     Text { content: String },
     Thinking { active: bool },
+    /// Emitted when `use_mcp` loads a connector, so the renderer can persist the
+    /// activated set and echo it back on the next turn. Without it the model
+    /// would have to ask again every turn — and the schemas would be re-inlined
+    /// per turn, which is the cost this whole mechanism exists to avoid.
+    McpLoaded { servers: Vec<String> },
     /// Emitted when a tool call STARTS — the frontend mints a running card.
     /// `id` is the provider tool_call id so the frontend can dedup/re-pair.
     ToolStart { id: String, name: String, args: Value },
@@ -2400,6 +2416,7 @@ impl AgentEvent {
                 "kind": "diff", "tool": tool, "path": path, "diff": diff,
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
+            AgentEvent::McpLoaded { servers } => json!({"kind": "mcp_loaded", "servers": servers}),
             AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window, reasoning_chars } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -2866,6 +2883,13 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "offset": {"type": "integer", "description": "Character offset to start from, when paging through a long page"}
             }),
         ),
+        (
+            "use_mcp",
+            "Load an MCP connector's tools for this turn. Connectors are exposed as an INDEX (see the MCP CONNECTORS section of your prompt): a switched-on connector costs nothing until you ask for it, because every connector's whole catalogue would otherwise ride on every round trip. Call this with the server name when the task actually needs that connector; its tools become available from your next call onward. Call it with no argument to list what is available.",
+            json!({
+                "server": {"type": "string", "description": "The connector's server name, exactly as the MCP CONNECTORS index spells it"}
+            }),
+        ),
     ];
     // Native browser tools (`browser_driver`): the app's own CDP driver ships
     // these under the SAME `browser_*` names the prompts and skills already
@@ -2890,14 +2914,16 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
     let mut out: Vec<Value> = schemas
         .iter()
         // The skill/connector AUTHORING tools are bound only for a turn that
-        // actually asked for them (see AgentRequest::allow_create). `plugin` is
-        // deliberately NOT in this list: it is the one door to a bundle's
-        // scripts, so a plain turn keeps `list`/`run` (see the narrowing below)
-        // and the create path gets its full action set — which is what an
-        // artifact with a Rust backend needs to RUN that backend.
+        // actually asked for them (see AgentRequest::allow_create). `artifact`
+        // is deliberately NOT in this list: whether a turn builds one is the
+        // MODEL's decision, not something `allow_create` (a prompt-text guess)
+        // can predict — gating it made a correctly phrased request ship a
+        // hard-coded HTML mock instead. `plugin` is likewise absent: it is the
+        // one door to a bundle's scripts, so a plain turn keeps `list`/`run`
+        // (see the narrowing below) and the create path gets its full action
+        // set — which is what an artifact with a Rust backend needs to RUN it.
         .filter(|(name, _, _)| {
-            allow_create
-                || !matches!(*name, "create_skill" | "create_mcp" | "artifact" | "schedule")
+            allow_create || !matches!(*name, "create_skill" | "create_mcp" | "schedule")
         })
         .map(|(name, desc, props)| {
             json!({
@@ -3732,40 +3758,73 @@ pub async fn run_turn(
         }
         Value::Object(merged)
     };
-    let (mut mcp_schemas, mcp_failures) = crate::mcp::tool_schemas(&mcp_servers);
-    for failure in mcp_failures {
+    // LAZY. Discovering the connectors is still needed every turn (the index
+    // must name what is switched on), but their SCHEMAS are no longer inlined:
+    // measured on a real trace, one enabled Proxmox connector shipped 391 tool
+    // schemas (~59K tokens) on the FIRST call of a turn the user never asked to
+    // touch Proxmox in. See `mcp_index` for the whole story.
+    let discovered = crate::mcp::discover(&mcp_servers);
+    for failure in discovered.failures {
         emit(&AgentEvent::Warn { content: failure });
     }
-    // The exact names the model will call. A connector tool whose name is
-    // unique across the enabled servers is advertised BARE (`browser_navigate`)
-    // so the model sees short readable names; dispatch therefore cannot rely on
-    // the `mcp__` prefix alone. Without this set a bare call fell through to
-    // the native dispatcher and failed with "not available natively" — the
-    // browser tool looked broken even though the connector was running.
-    let mcp_names: std::collections::HashSet<String> = mcp_schemas
-        .iter()
-        .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
-        .collect();
-    // Drop any MCP tool whose name collides with a NATIVE tool. Two schemas
-    // advertising the same `function.name` made the model see the same tool
-    // twice (the duplicated tool pills / "×2" counters in the UI) and made
-    // dispatch ambiguous — a bare MCP name shadows the native one. The native
-    // tool wins: it is always available and does not depend on a connector
-    // being up.
+    let connectors = discovered.index;
+    // Deferred schemas, filtered ONCE here so activation later is a cheap split
+    // rather than a second round of name collision work. Two filters, applied in
+    // the order the eager path applied them:
+    //  1) a connector tool may not shadow a native name (native always wins);
+    //  2) a connector is not a way around the mode gate.
     let native_names: std::collections::HashSet<String> = schemas
         .iter()
         .filter_map(|s| s["function"]["name"].as_str().map(str::to_string))
         .collect();
-    mcp_schemas.retain(|s| {
+    let mut deferred = discovered.schemas;
+    deferred.retain(|s| {
         s["function"]["name"]
             .as_str()
             .map(|n| !native_names.contains(n))
             .unwrap_or(false)
     });
-    // A connector is not a way around the mode gate: a read-only turn must not
-    // reach a mutating tool through MCP either.
-    retain_allowed_tools(&mut mcp_schemas, &caps, &req.mode);
-    schemas.extend(mcp_schemas);
+    retain_allowed_tools(&mut deferred, &caps, &req.mode);
+    // THE INDEX. A connector that is switched on but unused costs one prompt
+    // line instead of its whole catalogue. The model reaches it through
+    // `use_mcp`, which activates the connector for the rest of the turn.
+    if req.mode != "subagent" {
+        let index = crate::mcp_index::index_section(&connectors);
+        if !index.is_empty() {
+            system.push_str(&index);
+        }
+    }
+    // A server name the turn declares it needs BEFORE the loop: the renderer
+    // echoes back whatever `use_mcp` loaded in earlier turns, so a connector is
+    // asked for ONCE per chat instead of once per turn. It is resolved here,
+    // before the first model call, because the tool array must stay
+    // byte-identical across the rounds of one turn or the prefix cache collapses
+    // from round 2 (see `tool_schemas_serialize_byte_identically`).
+    let mut activated: std::collections::HashSet<String> = req
+        .mcp_active
+        .iter()
+        // A connector switched OFF since it was activated must not come back:
+        // the enabled map is the source of truth, so activation is intersected
+        // with it rather than trusted on its own.
+        .filter(|s| connectors.iter().any(|c| &c.server == *s))
+        .cloned()
+        .collect();
+    // Append the schemas of everything activated so far. `deferred` was filtered
+    // once above, so this is a partition, not a second collision pass.
+    if !activated.is_empty() {
+        let active: Vec<Value> = deferred
+            .iter()
+            .filter(|s| {
+                s["function"]["name"]
+                    .as_str()
+                    .and_then(|n| crate::mcp_index::owner_of(&connectors, n))
+                    .map(|owner| activated.contains(owner))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        schemas.extend(active);
+    }
     // Desktop control is a hard on/off switch (composer → Computer Use): when
     // it is off the tool is never bound, so the model cannot even try.
     // The name is checked first because this push happens AFTER the MCP filter:
@@ -4030,8 +4089,22 @@ pub async fn run_turn(
             && fold_pays_off(max_steps - step)
         {
             let before = estimate_wire_tokens(&messages[1..]);
-            let (removed, folded) = fold_subagent_tool_results(&mut messages, &mut seen_lookups);
-            record_fold(&trace, "explore", step, step + 1, max_steps - step, before, removed, folded);
+            // Same floor as the main path, for the same reason: a fold rewrites
+            // an EARLY result, so the prefix cache breaks at that depth and
+            // everything after it re-bills at miss price. Traced on the r5/r7
+            // explorations: the sub-agent path had NO floor here, so a removal
+            // of a few hundred tokens reset the whole cached prefix and the
+            // round after it dropped to a 30-45% hit rate. Dry-run on clones of
+            // BOTH arguments (`fold_with` also mutates `seen`).
+            let mut probe = messages.clone();
+            let mut probe_seen = seen_lookups.clone();
+            let (probe_chars, folded) =
+                fold_subagent_tool_results(&mut probe, &mut probe_seen);
+            let probe_tokens = probe_chars.div_ceil(4);
+            if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
+                let (removed, folded) = fold_subagent_tool_results(&mut messages, &mut seen_lookups);
+                record_fold(&trace, "explore", step, step + 1, max_steps - step, before, removed, folded);
+            }
         }
 
         // --- Mid-turn auto-compaction ---------------------------------------
@@ -4651,8 +4724,11 @@ the Vision model's description instead.\n"
         let is_readonly = |name: &str| {
             // An MCP tool is never batched as read-only: it may mutate remote
             // state, and a bare connector name could otherwise shadow a native
-            // tool of the same name.
-            !mcp_names.contains(name) && is_readonly_native(name)
+            // tool of the same name. A DEFERRED connector tool is not in
+            // `advertised` either, so the owner lookup is what identifies it.
+            crate::mcp_index::owner_of(&connectors, name).is_none()
+                && !name.starts_with(crate::mcp::TOOL_PREFIX)
+                && is_readonly_native(name)
         };
         // Screenshots taken by THIS step's tools. They are attached to the next
         // request as image blocks, so the model looks at the picture it just
@@ -5071,6 +5147,12 @@ Valid names: {}",
                 )
             } else if !name.starts_with(crate::mcp::TOOL_PREFIX)
                 && !advertised.iter().any(|n| n == name)
+                // A DEFERRED connector tool is deliberately not in `advertised`:
+                // its schemas are not inlined, so the name never reaches this
+                // list. It is still a real tool of a connector that is switched
+                // ON, so it must dispatch — otherwise the whole lazy path would
+                // be unusable the moment the model used a tool the index named.
+                && crate::mcp_index::owner_of(&connectors, name).is_none()
             {
                 (
                     format!(
@@ -5228,7 +5310,101 @@ on disk, which this mode does not allow. Switch to Build mode to run it."
                         Err(e) => (format!("browser task failed: {e}"), false),
                     }
                 }
-            } else if mcp_names.contains(name) || name.starts_with(crate::mcp::TOOL_PREFIX) {
+            } else if name == "use_mcp" {
+                // Connectors are OFFERED as an index and loaded on demand: the
+                // whole catalogue of every switched-on connector was 59K tokens
+                // per round trip on a real trace, for connectors the turn never
+                // touched. Activating here cannot add to `schemas` mid-turn —
+                // the tool array must stay byte-identical across rounds or the
+                // prefix cache breaks — so the call reports what is already
+                // loaded and how to reach the rest, and the names it asks for
+                // are recorded for the next turn's array.
+                let asked = args["server"].as_str().unwrap_or_default().trim();
+                if asked.is_empty() {
+                    if connectors.is_empty() {
+                        (
+                            "No MCP connector is switched on in this chat. ".to_string(),
+                            false,
+                        )
+                    } else {
+                        let list: Vec<String> = connectors
+                            .iter()
+                            .map(|c| format!("{} ({} tools)", c.server, c.tools.len()))
+                            .collect();
+                        (format!("Connectors available: {}", list.join(", ")), true)
+                    }
+                } else if let Some(server) = crate::mcp_index::resolve_server(&connectors, asked) {
+                    // Activated in THIS turn's array already? Then it is loaded
+                    // and the tools are directly callable — say so instead of
+                    // claiming a second round trip is needed.
+                    if activated.contains(&server) {
+                        (
+                            format!("MCP connector {server:?} is already loaded in this turn."),
+                            true,
+                        )
+                    } else {
+                        activated.insert(server.clone());
+                        // The tool array is re-read on every round (the call site
+                        // borrows `schemas`, it does not snapshot it), so appending
+                        // HERE makes the connector's tools callable on the very
+                        // NEXT round of this turn. Only the already-borrowed round
+                        // keeps the old shape, which is what the byte-stability
+                        // guard (`tool_schemas_serialize_byte_identically`) is about.
+                        let fresh: Vec<Value> = deferred
+                            .iter()
+                            .filter(|s| {
+                                s["function"]["name"]
+                                    .as_str()
+                                    .and_then(|n| crate::mcp_index::owner_of(&connectors, n))
+                                    == Some(server.as_str())
+                            })
+                            .cloned()
+                            .collect();
+                        advertised.extend(
+                            fresh
+                                .iter()
+                                .filter_map(|s| s["function"]["name"].as_str().map(str::to_string)),
+                        );
+                        advertised.sort();
+                        advertised.dedup();
+                        let fresh_count = fresh.len();
+                        schemas.extend(fresh);
+                        let tools = connectors
+                            .iter()
+                            .find(|c| c.server == server)
+                            .map(|c| c.tools.join(", "))
+                            .unwrap_or_default();
+                        // Tell the renderer to persist the set: without the echo the
+                        // model would ask again on the next turn, and the index
+                        // would re-charge the round trip this module exists to save.
+                        let mut all: Vec<String> = activated.iter().cloned().collect();
+                        all.sort();
+                        emit(&AgentEvent::McpLoaded { servers: all });
+                        (
+                            format!(
+                                "MCP connector {server:?} is now loaded: its {fresh_count} tool(s) \
+                                 are callable from your next step. Tools: {tools}"
+                            ),
+                            true,
+                        )
+                    }
+                } else {
+                    let list: Vec<&str> = connectors.iter().map(|c| c.server.as_str()).collect();
+                    (
+                        format!(
+                            "no such MCP connector: {asked:?}. Switched on here: {}",
+                            if list.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                list.join(", ")
+                            }
+                        ),
+                        false,
+                    )
+                }
+            } else if crate::mcp_index::owner_of(&connectors, name).is_some()
+                || name.starts_with(crate::mcp::TOOL_PREFIX)
+            {
                 // The SAME map whose schemas the model was shown: a connector that
                 // only an enabled plugin provides is advertised here, so it must
                 // also be executable. Passing `req.mcp_servers` made every such
@@ -7931,9 +8107,12 @@ async fn run_subagent(
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
-        subagent_models: std::collections::HashMap::new(),
-        providers: parent.providers.clone(),
+        // A sub-agent runs the research tool set (read/grep/find_symbol): it has
+        // no connectors at all, so nothing is ever activated for it.
+        mcp_active: Vec::new(),
         data_root: parent.data_root.clone(),
+        subagent_models: parent.subagent_models.clone(),
+        providers: parent.providers.clone(),
         // Sub-agents are research-only: desktop control is never delegated.
         allow_computer: false,
         // A research sub-agent has no business driving a page either.
@@ -8505,14 +8684,17 @@ fn cache_read_tuple(acc: &StreamAcc) -> u64 {
         .unwrap_or(0)
 }
 
-/// The generic coding rules, inlined into the shared body of every system
-/// prompt.
+/// The generic coding rules, inlined into the system prompt of a WRITABLE turn
+/// (build and any unknown writable mode) — nowhere else.
 ///
 /// Kept as a prompt asset instead of a shipped skill: `include_str!` compiles
 /// `src-tauri/prompts/coding-rules.md` into the binary, so the file stays the
 /// single source and the prompt cannot drift from it. A skill would only apply
 /// when the model chose to spend a `load_skill` call, and a rule that is never
 /// read is not a rule.
+///
+/// Read only by the writable branch of `default_system_prompt`: a read-only
+/// mode has no write to govern, so `ask`/`plan`/`chat` are not billed its text.
 const CODING_RULES: &str = include_str!("../prompts/coding-rules.md");
 
 /// The main agent's system prompt.
@@ -8532,17 +8714,28 @@ fn default_system_prompt(mode: &str, root: &str) -> String {
     // The mode-specific rule rides in the VOLATILE TAIL (next to `root`/`mode`),
     // not in the body above: the body is the cached prefix, so a byte that
     // differed between modes would re-bill the whole prompt on every switch.
+    // The coding rules govern WRITING code, so they ride only in the modes that
+    // can act on them: `build` (writes directly) and `plan` (its whole
+    // deliverable is the change it describes, written to be executed), not
+    // `ask`/`chat`, where the reply is an answer and the rules were billed in
+    // full for a turn that could not act on a single line.
+    //
+    // Built as its own string so both writable-intent branches below share one
+    // byte-identical text: a second copy would drift.
+    let coding_rules = format!("CODING RULES — apply to every write, edit and review:\n{CODING_RULES}\n");
     let mode_rule = if caps_for_mode(mode).write_files {
         // Build (and any unknown writable mode): the edit IS the artifact, so the
         // reply is a short report OF it. The rule has to live here — the
         // "REPLY DISCIPLINE" text in `appstate::system_prompts` is display-only
         // and never reaches the model — and without it a one-line fix came back
         // wrapped in pasted file contents and a multi-paragraph write-up.
-        "You may write and edit files here. The edit_file/write_file call IS the \
+        format!(
+            "{coding_rules}You may write and edit files here. The edit_file/write_file call IS the \
 artifact: never paste whole files or large code blocks into your reply — after the edits, \
 say concisely what changed (file, function, short diff-level description) and stop. Scale \
 the report to the size of the change: a one-line fix gets one line, not a write-up. If the \
 user also asked a question, answer it directly and briefly."
+        )
     } else if mode == "ask" || mode == "chat" {
         // Ask is the mentoring mode: the user wants an ANSWER, not a report.
         // Without this rule the shared body above ("delegate to `explore` and
@@ -8559,12 +8752,19 @@ here, but READING IS OPEN: files through `explore`, and the shell for any inspec
 (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck) — only a command that would \
 change the workspace is refused. Describe a needed change as file + the exact old text -> \
 new text and say that Build mode applies it."
+            .to_string()
     } else if mode == "plan" {
         // Plan's whole deliverable IS prose, so an unbounded plan sprawls exactly
         // the way ask's answers did. Its shape rule belongs here, next to the
         // read-only rule: the "SHORT, scannable IMPLEMENTATION PLAN" wording in
         // `appstate::system_prompts` is display-only and never reaches the model.
-        "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
+        //
+        // The coding rules ride here too: a plan names the change to make, and
+        // writing that change against the house rules is the point of planning
+        // it — a step that hard-codes a path has to be caught in the plan, not
+        // after the edit.
+        format!(
+            "{coding_rules}This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
 commit, package installs), so describe changes instead of applying them — inspection is \
 otherwise wide open (du/df/ps/lsof, git status/diff/log, builds, tests, typecheck). The \
@@ -8578,12 +8778,14 @@ the steps are too fine, so merge them. END the plan with a short summary section
 heading in the user's language): 2-4 plain sentences saying what will be done overall and \
 what the user gets when it is finished. Name the mode each out-of-scope item belongs to \
 instead of expanding on it."
+        )
     } else {
         "This turn is READ-ONLY: write_file/edit_file are not bound and the shell refuses \
 anything that would change the workspace (writing into a file, sed -i, rm/mv/cp, git \
 commit, package installs); every read-only command still runs. Answer with the concrete \
 change instead — which file, which line, the exact old text -> new text — and tell the user \
 to switch to Build mode to apply it."
+            .to_string()
     };
     format!(
         "You are Codifa, a coding agent inside the user's desktop IDE. \
@@ -8623,7 +8825,15 @@ The terminal is for work only the terminal can do: listing and measuring (ls, du
 df, ps, lsof), builds, tests and git — plus anything outside the workspace. Reading \
 a WORKSPACE file or locating files is not that work, and the backend REFUSES it: a \
 file's contents come from `read`, a search from `grep`, a symbol from \
-`find_symbol`/`lsp_*` — and a broad hunt is ONE `explore` delegation. \
+`find_symbol`/`lsp_*` — and a broad hunt is ONE `explore` delegation. In practice \
+ONLY these shapes are refused, so pick the native tool FIRST instead of spending a \
+round: `cat`/`sed -n`/`head`/`tail`/`less` on a file under the workspace root is \
+`read`; `find`/`fd`/`tree`/`rg`/`grep -r`/`ls <unknown dir>` is `grep`/`glob`/\
+`find_symbol`. A command that PIPES another command's output through `grep`/`tail` \
+is NOT refused (`cargo test 2>&1 | grep -E 'test result'` inspects a build), and \
+neither is a read of a path outside the workspace. Measured on real traces, three \
+such calls per heavy turn were refused AFTER a whole round had already been spent \
+— ~30K input tokens each — which is exactly the round this sentence exists to save. \
 To verify LIVE, run the project in its OWN dev workflow, and ALWAYS check \
 first whether that dev process is already running (ps/lsof + its port): if it \
 is, REUSE it and never start a second one — duplicate dev servers fight over \
@@ -8631,8 +8841,6 @@ the same port and produce conflicting logs. Only start it once when nothing \
 is running, and never verify against a release build. \
 Use the tools this mode binds to make changes, and never claim a change you \
 did not make. \
-CODING RULES — apply to every write, edit and review:\n\
-{CODING_RULES}\n\
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
 on your own initiative. \
 A system message holding a compacted summary is AUTHORITATIVE history: every \
@@ -9754,16 +9962,29 @@ mod tests {
             // main budgets moved with them: the ceilings stay measured-size +
             // the same ~3.5% headroom convention, and only `explore` is
             // unchanged (it never lost the schemas).
-            ("main", tool_schemas(false, false), 12_700usize),
-            ("main+browser", tool_schemas(false, true), 18_500),
+            //
+            // `main`/`main+browser` were re-based one last time when the
+            // `artifact` schema stop being gated behind `allow_create`: the
+            // gate guessed intent from the prompt text, so a correctly phrased
+            // build request could reach the model with no artifact tool at all
+            // and ship a hard-coded HTML mock instead of a backed page. The
+            // tool is now always present, which is the point — a capability
+            // that belongs to the model's own judgement must not depend on a
+            // regex — and the step is exactly that schema's chars.
+            ("main", tool_schemas(false, false), 15_100usize),
+            ("main+browser", tool_schemas(false, true), 20_900),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
             // may now carry a Rust backend, which is what makes the tool a
             // project builder instead of a document writer. The step is the
             // added prose itself; the ~3.5% headroom convention still holds.
-            ("main+authoring", tool_schemas(true, false), 20_400),
-            ("main+authoring+browser", tool_schemas(true, true), 26_200),
+            // Raised once more for `use_mcp`, the native tool that replaced the
+            // EAGER inlining of every connector's whole catalogue. That trade is
+            // the point: +243 chars of native schema bought back ~236K chars of
+            // connector schemas on a trace where one connector was switched on.
+            ("main+authoring", tool_schemas(true, false), 21_700),
+            ("main+authoring+browser", tool_schemas(true, true), 27_500),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -11533,8 +11754,9 @@ mod tests {
             context_window: 0,
             chat_id: String::new(),
             mcp_servers: Value::Null,
-            subagent_models: std::collections::HashMap::new(),
+            mcp_active: Vec::new(),
             providers: std::collections::HashMap::new(),
+            subagent_models: std::collections::HashMap::new(),
             data_root: String::new(),
             allow_computer: false,
             allow_create: false,
@@ -13234,38 +13456,102 @@ mod tests {
     }
 
     #[test]
-    fn every_mode_inlines_the_coding_rules() {
+    fn only_the_writable_intent_modes_inline_the_coding_rules() {
         // The generic coding rules are a prompt ASSET (`src-tauri/prompts/
         // coding-rules.md`), not a skill: a skill only applied when the model
         // chose to spend a `load_skill` call, and a rule that is never read is
-        // not a rule. They sit in the SHARED body, byte for byte, because that
-        // body is the cached prefix — a per-mode copy would re-bill the whole
-        // prompt on every mode switch.
+        // not a rule.
+        //
+        // They belong to the modes that can ACT on them — `build` writes
+        // directly, `plan` writes the change it describes — and not to
+        // `ask`/`chat`, where the reply is an answer and the rules were billed
+        // in full for a turn that could not act on a single line. Measured on
+        // the rule asset: ~1.6K chars of prompt per read-only ask turn, all of
+        // it dead weight.
+        //
+        // Match the rule BLOCK's own header, not the bare phrase "CODING
+        // RULES": the display-only showcase in `appstate` mentions the phrase
+        // in every mode, so a bare-phrase check would pass on the label alone.
+        const HEADER: &str = "CODING RULES — apply to every write, edit and review:";
         let root = "/tmp/x";
-        let mut seen: Option<String> = None;
-        for mode in ["build", "ask", "plan"] {
+        let build = default_system_prompt("build", root);
+        for mode in ["build", "plan"] {
             let p = default_system_prompt(mode, root);
             assert!(
-                p.contains("CODING RULES"),
-                "{mode} must carry the coding rules"
+                p.contains(HEADER),
+                "{mode} acts on the change — it must carry the coding rules"
             );
-            // Spot-check the real rule TEXT, not just the header: the body is
-            // compiled in from the markdown asset, so it is spot-checked too.
             assert!(
                 p.contains("Smallest correct change") && p.contains("Never hard-code"),
                 "{mode} must inline the real rule body, not a bare header"
             );
-            let body = p.split("Workspace root:").next().unwrap_or_default();
-            match &seen {
-                None => seen = Some(body.to_string()),
-                Some(first) => assert_eq!(
-                    first, body,
-                    "the rules must sit in the SHARED body, not in the \
-                     per-mode tail — otherwise it costs a cache re-bill per switch"
-                ),
-            }
         }
+        // Only the modes this function actually serves. `chat`/`reader` are a
+        // different prompt entirely (`req.system_prompt` is non-empty for
+        // them), so asserting on them here would test code that never runs.
+        for mode in ["ask"] {
+            let p = default_system_prompt(mode, root);
+            assert!(
+                !p.contains(HEADER),
+                "{mode} is read-only — it must not be billed the coding rules"
+            );
+            // …and not the rule BODY either: the header alone could be dropped
+            // while the ~1.6K chars of rules still rode along.
+            assert!(
+                !p.contains("Smallest correct change"),
+                "{mode} is read-only — it must not be billed the rule body"
+            );
+        }
+        // The rules live in the volatile TAIL (`mode_rule`), so the cached BODY
+        // must stay byte-identical between a writable and a read-only turn.
+        // Otherwise every Build<->Ask switch would re-bill the whole prefix.
+        let body = |p: &str| p.split("Workspace root:").next().unwrap_or_default().to_string();
+        assert_eq!(
+            body(&build),
+            body(&default_system_prompt("ask", root)),
+            "the rules must ride in the per-mode tail, not the cached body — \
+             otherwise it costs a cache re-bill per switch"
+        );
+        // Same guarantee between the two modes that DO carry the rules: they
+        // must share one byte-identical body, or `build` -> `plan` re-bills it.
+        assert_eq!(
+            body(&build),
+            body(&default_system_prompt("plan", root)),
+            "build and plan must share the cached body — the rules ride the tail"
+        );
+    }
 
+    /// The concrete refused-shape list must reach EVERY mode, from the shared
+    /// body — not from a per-mode tail.
+    ///
+    /// The abstract rule ("locating files is not terminal work") was already in
+    /// the prompt and the model still spent the round: measured on a real heavy
+    /// turn, three `cd x && find …` / `cat <workspace file>` calls were refused
+    /// only AFTER a whole round had been billed (~30K input tokens each).
+    /// Naming the exact command shapes is what makes the rule actionable, and it
+    /// governs `ask` (whose shell is read-only, not search-free) as much as
+    /// `build`, so it belongs to the byte-identical body all four modes share.
+    #[test]
+    fn the_refused_terminal_shapes_are_named_in_every_mode() {
+        let root = "/tmp/x";
+        for mode in ["build", "plan", "ask"] {
+            let p = default_system_prompt(mode, root);
+            assert!(
+                p.contains("`find`/`fd`/`tree`/`rg`/`grep -r`"),
+                "{mode} may not search through the shell — it must see the exact refused shapes"
+            );
+            // The carve-out matters as much as the rule: without it the model
+            // avoids a piped grep that is perfectly allowed and loses a round
+            // the other way.
+            assert!(
+                p.contains("PIPES another command's output"),
+                "{mode} must also learn which shapes are NOT refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_coding_rules_asset_is_complete() {
         // The rules are read from the markdown asset by `include_str!`, so a
         // truncated file would silently ship a stub where the whole rule book
         // used to be.
@@ -13345,6 +13631,19 @@ mod tests {
         // Folding rewrites old results, so it invalidates the cached prefix from
         // that point on. The threshold is therefore not free to go low.
         assert_eq!(SUB_FOLD_MIN_TOKENS, MAIN_FOLD_MIN_TOKENS);
+        // Both fold sites must carry the removal floor: the sub-agent path once
+        // fired with no floor at all, so a tiny rewrite reset the cached prefix
+        // and the next round fell to a 30-45% hit rate (traced r5/r7).
+        let src = include_str!("agent.rs");
+        let sub_site = src
+            .split("if SUB_FOLD_ENABLED")
+            .nth(1)
+            .expect("the sub-agent fold site must exist");
+        let sub_site = sub_site.split("// --- Mid-turn").next().unwrap();
+        assert!(
+            sub_site.contains("MAIN_FOLD_MIN_REMOVAL"),
+            "the sub-agent fold must honour a removal floor, like the main path"
+        );
     }
 
     #[test]

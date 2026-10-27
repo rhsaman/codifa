@@ -28,7 +28,6 @@ import { resolveChatClose } from './lib/chatClose'
 import { collectChatIds, pickNeighborByRect, type WindowNavDir, type WindowRect } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
 import { activePane, focusAppPane } from './lib/paneFocus'
-import { nudgeChatWindowRepaint, setBorderRepaintLoop } from './lib/paneFlash'
 import { cyclePane } from './lib/paneCycle'
 import { paneOwner, snapshotIntent } from './lib/panePointer'
 import { flashOnEnter, flashPaneFocus } from './lib/paneFlash'
@@ -126,45 +125,6 @@ export default function App() {
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
   const chatFull = useStore((s) => s.chatFullscreen)
-  // The right pane animates open/close: it stays MOUNTED through the close
-  // transition (`paneMounted`) and, on open, mounts collapsed and expands on
-  // the next frame (`paneRevealed`) so the width transition actually runs.
-  const [paneMounted, setPaneMounted] = useState(paneOpen)
-  const [paneRevealed, setPaneRevealed] = useState(paneOpen)
-  // True while the open/close transition runs: the pane then carries its own
-  // compositing layer (`.animating`), cleared at transitionend (with a timeout
-  // fallback) so its fixed popups anchor to the viewport again.
-  const [paneAnimating, setPaneAnimating] = useState(false)
-  const animatingTimer = useRef<number | null>(null)
-  const clearPaneAnimating = useCallback(() => {
-    if (animatingTimer.current !== null) {
-      window.clearTimeout(animatingTimer.current)
-      animatingTimer.current = null
-    }
-    setPaneAnimating(false)
-  }, [])
-  useEffect(() => {
-    if (paneOpen) {
-      setPaneMounted(true)
-      setPaneAnimating(true)
-      if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current)
-      animatingTimer.current = window.setTimeout(clearPaneAnimating, 400)
-      const raf = requestAnimationFrame(() => setPaneRevealed(true))
-      return () => cancelAnimationFrame(raf)
-    }
-    setPaneRevealed(false)
-    setPaneAnimating(true)
-    if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current)
-    animatingTimer.current = window.setTimeout(clearPaneAnimating, 400)
-    const t = window.setTimeout(() => setPaneMounted(false), 320)
-    return () => window.clearTimeout(t)
-  }, [paneOpen, clearPaneAnimating])
-  // While the pane animates, force per-frame chat-window repaints (the
-  // WKWebView stale-border hammer — see setBorderRepaintLoop).
-  useEffect(() => {
-    setBorderRepaintLoop(paneAnimating)
-    return () => setBorderRepaintLoop(false)
-  }, [paneAnimating])
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
@@ -796,9 +756,9 @@ export default function App() {
                 <ChatWindows />
               </main>
             </section>
-            {paneMounted && !chatFull && (
+            {paneOpen && !chatFull && (
               <>
-                {!viewerFull && paneOpen && (
+                {!viewerFull && (
                   <div
                     className="dock-resize-handle"
                     title="Drag to resize"
@@ -806,13 +766,9 @@ export default function App() {
                   />
                 )}
                 <section
-                  className={
-                    "viewer-group" +
-                    (paneRevealed ? "" : " closing") +
-                    (paneAnimating ? " animating" : "")
-                  }
+                  className="viewer-group"
                   style={
-                    viewerFull && paneOpen
+                    viewerFull
                       ? {
                           display: "flex",
                           flexDirection: "column",
@@ -820,38 +776,16 @@ export default function App() {
                           minWidth: 0,
                           overflow: "hidden",
                         }
-                      : paneOpen
-                        ? ({
-                            flexBasis: splitW,
-                            width: splitW,
-                            display: "flex",
-                            flexDirection: "column",
-                            minHeight: 0,
-                            minWidth: 0,
-                            overflow: "hidden",
-                          } as React.CSSProperties)
-                        : ({
-                            /* Collapsed mid-animation: the class carries the
-                               zero size so the transition has somewhere to go. */
-                            flexBasis: 0,
-                            width: 0,
-                            minWidth: 0,
-                            display: "flex",
-                            flexDirection: "column",
-                            minHeight: 0,
-                            overflow: "hidden",
-                          } as React.CSSProperties)
+                      : ({
+                          flexBasis: splitW,
+                          width: splitW,
+                          display: "flex",
+                          flexDirection: "column",
+                          minHeight: 0,
+                          minWidth: 0,
+                          overflow: "hidden",
+                        } as React.CSSProperties)
                   }
-                  onTransitionEnd={(e) => {
-                    // The width transition leaves a STALE focused-border tile
-                    // on the chat windows (WebKit keeps the last intermediate
-                    // paint); one repaint nudge at the end clears it. The
-                    // compositing promotion ends here too.
-                    if (e.target === e.currentTarget && (e.propertyName === 'width' || e.propertyName === 'flex-basis')) {
-                      nudgeChatWindowRepaint()
-                      clearPaneAnimating()
-                    }
-                  }}
                   aria-label="Viewers"
                 >
                   {/* Pane body: a titled tab strip along the TOP edge (files,

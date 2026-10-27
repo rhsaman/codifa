@@ -9,7 +9,6 @@ import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch, physicalKey } from "../lib/shortcuts";
 import { stepChatId } from "../lib/sidebarStep";
 import { isVimRegionActive } from "../lib/panePointer";
-import { nudgeChatWindowRepaint, setBorderRepaintLoop } from "../lib/paneFlash";
 import { isPrefixArmed, watchPrefixFlag } from "../lib/prefixState";
 import { WindowStripCluster } from "./WindowStripCluster";
 
@@ -170,35 +169,8 @@ export function Sidebar() {
   // grouping, search) mounts when open and unmounts only AFTER the close
   // animation, so the collapse never flashes an empty strip.
   const open = useStore((s) => s.sidebarOpen);
-  const [contentMounted, setContentMounted] = useState(open);
-  // True while the open/close transition runs (the pane then carries its own
-  // compositing layer, cleared at transitionend + timeout fallback).
-  const [animating, setAnimating] = useState(false);
-  const animatingTimer = useRef<number | null>(null);
-  useEffect(() => {
-    if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current);
-    setAnimating(true);
-    animatingTimer.current = window.setTimeout(() => {
-      animatingTimer.current = null;
-      setAnimating(false);
-    }, 400);
-  }, [open]);
-  // Per-frame chat-window repaints while the sidebar animates (stale-border
-  // hammer — see setBorderRepaintLoop).
-  useEffect(() => {
-    setBorderRepaintLoop(animating);
-    return () => setBorderRepaintLoop(false);
-  }, [animating]);
-  useEffect(() => {
-    if (open) {
-      setContentMounted(true);
-      return;
-    }
-    const t = window.setTimeout(() => setContentMounted(false), 300);
-    return () => window.clearTimeout(t);
-  }, [open]);
-  // Sidebar width lives HERE (the shell owns the animated aside); the content
-  // only receives the drag handler. Previously the width sat below the shell,
+  // Sidebar width lives HERE (the shell owns the aside); the content only
+  // receives the drag handler. Previously the width sat below the shell,
   // which produced a nested .sidebar whose fixed var() width clipped the
   // resizable one.
   const [sidebarWidth, setSidebarWidth] = useState(() => {
@@ -244,31 +216,22 @@ export function Sidebar() {
     window.addEventListener("mouseup", onUp);
     sidebarDragCleanup.current = onUp;
   };
+  // No open/close animation on purpose: the width transition left WebKit
+  // painting the focused chat window's border at stale geometry, so the
+  // sidebar mounts/unmounts instantly instead.
+  if (!open) return null;
   return (
     <aside
-      className={"sidebar" + (open ? "" : " closed") + (animating ? " animating" : "")}
-      aria-hidden={!open}
+      className="sidebar"
       style={
         {
-          flexBasis: open ? sidebarWidth : 0,
-          width: open ? sidebarWidth : 0,
+          flexBasis: sidebarWidth,
+          width: sidebarWidth,
           "--sidebar-w": `${sidebarWidth}px`,
         } as React.CSSProperties
       }
-      onTransitionEnd={(e) => {
-        // Same stale-border fix as the right pane: the width transition can
-        // leave the focused chat window's border painted at an intermediate
-        // geometry; one repaint nudge at the end clears it. The compositing
-        // promotion ends here too.
-        if (e.target === e.currentTarget && (e.propertyName === 'width' || e.propertyName === 'flex-basis')) {
-          nudgeChatWindowRepaint();
-          if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current);
-          animatingTimer.current = null;
-          setAnimating(false);
-        }
-      }}
     >
-      {contentMounted ? <SidebarContent onResizeStart={startSidebarResize} /> : null}
+      <SidebarContent onResizeStart={startSidebarResize} />
     </aside>
   );
 }

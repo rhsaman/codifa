@@ -523,17 +523,8 @@ export function PluginDetail({
             <span className="pd-slug">{plugin.slug}</span>
             {plugin.enabled ? null : <span className="pd-badge pd-badge--off">off</span>}
           </div>
-          <div className="pd-head-meta">
-            <span className="pm-meta-item">
-              <b>{skills.length}</b> skills
-            </span>
-            <span className="pm-meta-item">
-              <b>{conns.length}</b> connectors
-            </span>
-            <span className="pm-meta-item">
-              <b>{scripts.length}</b> scripts
-            </span>
-          </div>
+          {/* The census lives in the tab badges below (Skills 24 · Connectors 0
+              · Scripts 0); repeating it here was noise. */}
           <button className="pd-close" onClick={onClose} aria-label="Close">
             ✕
           </button>

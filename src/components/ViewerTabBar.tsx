@@ -1,8 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
-import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
-import { previewSlot } from "../lib/tabOrder";
+import {
+  barFlowSign,
+  edgeScroll,
+  slideWidth,
+  tabForPoint,
+  tabMove,
+  type TabExtent,
+} from "../lib/tabBar";
+import { previewShifts } from "../lib/tabOrder";
 import { shownViewerTabId, TAB_STRIP_KINDS, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
@@ -324,6 +331,9 @@ export function ViewerTabBar() {
   const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : null;
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  // Slide geometry measured once at drag start (slot width + visual flow
+  // direction), mirroring ChatTabBar's transform-slide preview.
+  const [dragGeom, setDragGeom] = useState<{ slot: number; sign: 1 | -1 } | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
 
@@ -337,38 +347,41 @@ export function ViewerTabBar() {
   const clearDrag = () => {
     setDragId(null);
     setDropTarget(null);
+    setDragGeom(null);
   };
 
-  // The rail previews the landing slot instead of drawing an insertion line: the
-  // DOM never moves (a mid-drag re-render of the dragged node cancels the native
-  // drag in Chromium), only its CSS `order` does, and the dragged tab is drawn as
-  // a ghost outline so it reads as "this is where you drop".
-  const dragPreview = (() => {
+  // The bar previews the landing by SLIDING tabs aside with transforms — no
+  // mid-drag reflow, animated slide (same design as ChatTabBar).
+  const shifts = (() => {
     if (!dragId || !dropTarget) return null;
-    const slot = previewSlot(
+    return previewShifts(
       tabs.map((t) => t.id),
       dragId,
       dropTarget.id,
       dropTarget.after,
     );
-    // The visible last tab follows the PREVIEW, not the DOM: with inline `order`
-    // the last DOM node may no longer be the last row on screen.
-    let tailId: string | null = null;
-    let tailMax = -1;
-    slot.forEach((index, id) => {
-      if (index > tailMax) {
-        tailMax = index;
-        tailId = id;
-      }
-    });
-    return { slot, tailId };
   })();
-  // With an inline `order` the DOM's last tab is no longer the visible last one,
-  // so the "drop past the end" target has to come from the previewed order.
-  const tailId = dragPreview?.tailId ?? tabs[tabs.length - 1]?.id ?? null;
+  const slot = dragGeom?.slot ?? 0;
+  const sign = dragGeom?.sign ?? 1;
 
-  // No early null return: with the pane open the header must stay reachable
-  // even when every tab is closed.
+  /** Landing preview for a pointer x: nearest tab by geometry — tabs, gaps
+   *  and the space past the ends in one rule. */
+  const previewAt = (clientX: number) => {
+    const bar = barRef.current;
+    if (!bar) return;
+    const extents: TabExtent[] = Array.from(
+      bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
+    ).map((el) => ({
+      id: el.dataset.tabId ?? "",
+      left: el.getBoundingClientRect().left,
+      right: el.getBoundingClientRect().right,
+    }));
+    const next = tabForPoint(extents, clientX, dragGeom?.sign ?? barFlowSign(bar));
+    if (!next) return;
+    setDropTarget((prev) =>
+      prev && prev.id === next.id && prev.after === next.after ? prev : next,
+    );
+  };
 
   return (
     <div
@@ -386,29 +399,30 @@ export function ViewerTabBar() {
         // Dragging near the rail's edge scrolls it, so off-screen tabs stay reachable.
         const delta = edgeScroll(e.clientX, bar.getBoundingClientRect(), "x");
         if (delta) bar.scrollLeft += delta;
-        // Empty space past the visible last tab previews a landing at the very end.
-        if (!tailId || tailId === dragId) return;
-        const tailEl = bar.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`);
-        if (!tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
-        setDropTarget((prev) =>
-          prev?.id === tailId && prev.after ? prev : { id: tailId, after: true },
-        );
+        previewAt(e.clientX);
       }}
       onDragLeave={(e) => {
         if (e.target !== e.currentTarget) return;
         setDropTarget(null);
       }}
       onDrop={(e) => {
-        // Tabs handle their own drop; empty space past the last tab drops at the end.
-        if (e.target !== e.currentTarget || !dragId) return;
-        const tailEl = tailId
-          ? barRef.current?.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`)
-          : null;
-        if (!tailId || !tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
-        const from = e.dataTransfer.getData("text/plain") || dragId;
-        if (!from || from === tailId) return;
+        if (!dragId) return;
         e.preventDefault();
-        useViewerTabs.getState().moveViewerTab(from, tailId, true);
+        const from = e.dataTransfer.getData("text/plain") || dragId;
+        const bar = barRef.current;
+        if (from && bar) {
+          const extents: TabExtent[] = Array.from(
+            bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
+          ).map((el) => ({
+            id: el.dataset.tabId ?? "",
+            left: el.getBoundingClientRect().left,
+            right: el.getBoundingClientRect().right,
+          }));
+          const at = tabForPoint(extents, e.clientX, dragGeom?.sign ?? barFlowSign(bar));
+          if (at && at.id !== from) {
+            useViewerTabs.getState().moveViewerTab(from, at.id, at.after);
+          }
+        }
         clearDrag();
       }}
     >
@@ -417,10 +431,8 @@ export function ViewerTabBar() {
         // File/text tabs show their own title; sub-agent trace tabs keep
         // their own title so they never look like the main chat trace.
         const title = prepareContent(viewerTabTitle(t), "ltr");
-        const dropCls =
-          dropTarget?.id === t.id ? (dropTarget.after ? " drop-after" : " drop-before") : "";
         const Icon = KIND_ICON[t.kind];
-        const order = dragPreview?.slot.get(t.id);
+        const shift = shifts?.get(t.id) ?? 0;
         return (
           <div
             key={t.id}
@@ -429,8 +441,12 @@ export function ViewerTabBar() {
             aria-selected={active}
             tabIndex={0}
             draggable
-            className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging drop-preview" : ""}${dropCls}`}
-            style={order === undefined ? undefined : { order }}
+            className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging drop-preview" : ""}`}
+            style={
+              shift !== 0 && slot > 0
+                ? { transform: `translateX(${shift * slot * sign}px)` }
+                : undefined
+            }
             aria-label={title}
             title={title}
             onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
@@ -451,30 +467,10 @@ export function ViewerTabBar() {
             }}
             onDragStart={(e) => {
               setViewerDragData(e, t.id);
+              const bar = barRef.current;
+              const el = bar?.querySelector<HTMLElement>(`[data-tab-id="${t.id}"]`);
+              setDragGeom(el && bar ? { slot: slideWidth(el, bar), sign: barFlowSign(bar) } : null);
               setDragId(t.id);
-            }}
-            onDragOver={(e) => {
-              if (!dragId || dragId === t.id) return;
-              e.preventDefault();
-              e.dataTransfer.dropEffect = "move";
-              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = dropSide(e.clientX, rect, "x") === "after";
-              setDropTarget((prev) =>
-                prev?.id === t.id && prev.after === after ? prev : { id: t.id, after },
-              );
-            }}
-            onDragLeave={() => {
-              setDropTarget((prev) => (prev?.id === t.id ? null : prev));
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              const from = e.dataTransfer.getData("text/plain") || dragId;
-              if (from && from !== t.id) {
-                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = dropSide(e.clientX, rect, "x") === "after";
-                useViewerTabs.getState().moveViewerTab(from, t.id, after);
-              }
-              clearDrag();
             }}
             onDragEnd={clearDrag}
           >

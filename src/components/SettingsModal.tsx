@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
-import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES } from '../lib/store'
+import { useStore, flushStateNow, providerApiKeys, DEFAULT_MARKETPLACES, setPersistSuspended } from '../lib/store'
 import { getSkillFile, listMcp, listSkills, syncSkill } from '../lib/api'
 import {
   deletePlugin,
@@ -594,11 +594,6 @@ function MarketplaceEditor() {
             {showAdd ? 'Cancel' : '+ Add marketplace'}
           </button>
         </div>
-        <div className="hint">
-          A marketplace is a repo holding an index
-          (<code>.claude-plugin/marketplace.json</code>). Browsing is read-only:
-          nothing installs until you press Install on a card.
-        </div>
 
         {/* No kind selector: a marketplace row installs a plugin whatever it
             advertises (a lone skill or a lone connector becomes its own
@@ -677,7 +672,7 @@ function MarketplaceEditor() {
         )}
       </div>
 
-      {error ? <div className="hint" style={{ color: 'var(--danger)' }}>{error}</div> : null}
+      {error ? <div className="hint error-text">{error}</div> : null}
       {note ? <div className="hint">{note}</div> : null}
 
       {/* The body renders even with NO marketplace: the search box and the
@@ -741,7 +736,7 @@ function MarketplaceEditor() {
                 .
               </div>
             ) : (
-              <div className="hint">Nothing matches.</div>
+              <div className="hint empty-state">Nothing matches.</div>
             )
           ) : (
             <>
@@ -813,6 +808,11 @@ function PluginBundleEditor() {
   /** Outcome of the last update's keyword fill — the update itself already
    *  stands, so this is a note and never an error. */
   const [note, setNote] = useState('')
+  // The one skill knob that is NOT per bundle: how much of the whole catalog
+  // rides in every prompt. It sits ABOVE the grid because it scales the whole
+  // page's content, not any one bundle.
+  const skillCatalogMaxChars = useStore((s) => s.skillCatalogMaxChars ?? 6000)
+  const setSkillCatalogMaxChars = useStore((s) => s.setSkillCatalogMaxChars)
 
   /** Filter before paging: one query covers the name, its skills and its
    *  Persian keywords, so `/ترجمه` finds a bundle whose skills translate. */
@@ -955,11 +955,38 @@ function PluginBundleEditor() {
         </button>
       </div>
       <div className="hint">
-        A plugin bundles skills and MCP connectors behind one switch: turning it off removes
-        its skills from the catalog and its connectors from the tools, without deleting anything.
-        Create or edit one by typing <code>/plugin &lt;description&gt;</code> in the chat.
+        One switch per bundle: off pulls its skills and connectors from the catalog,
+        nothing is deleted. Create: <code>/plugin &lt;description&gt;</code>
       </div>
-      {error ? <div className="hint" style={{ color: 'var(--danger)' }}>{error}</div> : null}
+      {/* Catalog budget sits ABOVE the grid: it scales every bundle's footprint,
+          and a number alone under a pile of cards read as leftover. */}
+      <div className="panel-card">
+        <div className="field-head">
+          <label>Catalog budget</label>
+          <span className="field-value-badge">{skillCatalogMaxChars} chars</span>
+        </div>
+        <div className="hint">
+          Catalog characters that ride in the system prompt every turn
+          (~4 chars ≈ 1 token). Default 6000.
+        </div>
+        <div className="settings-row-control">
+          <input
+            type="number"
+            min={1500}
+            max={12000}
+            step={500}
+            value={skillCatalogMaxChars}
+            onChange={(e) => setSkillCatalogMaxChars(Number(e.target.value))}
+            dir="ltr"
+            aria-label="Skill catalog budget in characters"
+          />
+          <span className="field-unit">chars</span>
+          <span className="field-unit">
+            ≈ {Math.round(skillCatalogMaxChars / 4).toLocaleString()} tokens per turn
+          </span>
+        </div>
+      </div>
+      {error ? <div className="hint error-text">{error}</div> : null}
       {note ? <div className="hint">{note}</div> : null}
       {plugins !== null && plugins.length > 12 ? (
         <div className="settings-search">
@@ -973,16 +1000,13 @@ function PluginBundleEditor() {
         </div>
       ) : null}
       {plugins === null ? (
-        <div className="hint">Loading…</div>
+        <div className="hint empty-state">Loading…</div>
       ) : filteredPlugins.length === 0 ? (
-        <div className="hint">No plugin matches.</div>
+        <div className="hint empty-state">No plugin matches.</div>
       ) : (
         <div className="settings-grid">
           {visiblePlugins.map((p) => (
             <div key={p.slug} className={`pm-card${p.enabled ? '' : ' pm-card--off'}`}>
-              {/* The edge rail IS the state: rose = live, gray = off. A status you
-                  read without reading any chip or label. */}
-              <span className="pm-rail" aria-hidden="true" />
               <div className="pm-card-head">
                 <div className="pm-card-title">
                   {/* A real on/off switch, not a checkbox: the state is a power
@@ -1038,20 +1062,12 @@ function PluginBundleEditor() {
                   {(p.scripts ?? []).length === 1 ? 'script' : 'scripts'}
                 </span>
               </div>
-              {(p.skills ?? []).length > 0 ? (
-                <div className="pm-card-tags">
-                  {(p.skills ?? []).slice(0, 4).map((name) => (
-                    <code key={name} className="pm-tag">/{name}</code>
-                  ))}
-                  {(p.skills ?? []).length > 4 ? (
-                    <span className="pm-tag pm-tag--more">+{(p.skills ?? []).length - 4}</span>
-                  ) : null}
-                </div>
-              ) : null}
               {/* One way in, not an expander: what a bundle CONTAINS — its
                   skills, connectors and scripts with their descriptions and
                   Persian keywords — is a page of its own. An inline `<details>`
-                  turned the grid card into a column three screens tall. */}
+                  turned the grid card into a column three screens tall. The
+                  census row above already carries the counts, so this row is
+                  only the action. */}
               <button
                 type="button"
                 className="pm-card-open"
@@ -1059,8 +1075,9 @@ function PluginBundleEditor() {
               >
                 <span>View details</span>
                 <span className="pm-card-open-hint">
-                  {(p.skills ?? []).length} skills · {(p.mcp ?? []).length} connectors ·{' '}
-                  {(p.scripts ?? []).length} scripts
+                  {(p.skills ?? []).length + (p.mcp ?? []).length + (p.scripts ?? []).length === 1
+                    ? '1 item'
+                    : `${(p.skills ?? []).length + (p.mcp ?? []).length + (p.scripts ?? []).length} items`}
                 </span>
                 <span className="pd-chevron" aria-hidden="true">
                   ▶
@@ -1518,8 +1535,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setCompactAtPercent = useStore((s) => s.setCompactAtPercent)
   const historyLimit = useStore((s) => s.historyLimit ?? 0)
   const setHistoryLimit = useStore((s) => s.setHistoryLimit)
-  const skillCatalogMaxChars = useStore((s) => s.skillCatalogMaxChars ?? 6000)
-  const setSkillCatalogMaxChars = useStore((s) => s.setSkillCatalogMaxChars)
   const disableTextSuggestions = useStore((s) => s.settings.disableTextSuggestions ?? true)
   const setDisableTextSuggestions = useStore((s) => s.setDisableTextSuggestions)
   const terminalShell = useStore((s) => s.settings.terminalShell ?? DEFAULT_TERMINAL_SHELL)
@@ -1696,6 +1711,87 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
       setBackupLabel('')
       setBackupPct(0)
       setBackupFiles(null)
+    }
+  }
+
+  // ---- Restore (Settings → Storage) ----
+  // Two-step by design: the picker only STAGES the archive (its manifest is
+  // read and shown), and the actual restore needs a second click on "Restore
+  // now". From that click until the restart, persistence is suspended — the
+  // in-memory state is stale and must never overwrite the restored files.
+  const [restorePick, setRestorePick] = useState<{
+    path: string
+    created: string
+    files: number
+    bytes: number
+    version: string
+  } | null>(null)
+  const [restoring, setRestoring] = useState(false)
+  const [restorePct, setRestorePct] = useState(0)
+  const [restoreLabel, setRestoreLabel] = useState('')
+  const [restoreMsg, setRestoreMsg] = useState('')
+  const [restoreFailed, setRestoreFailed] = useState(false)
+
+  const pickBackupForRestore = async () => {
+    setRestoreMsg('')
+    setRestoreFailed(false)
+    const picked = await api.selectFile()
+    const path = picked?.[0]
+    if (!path) return
+    if (!path.toLowerCase().endsWith('.zip')) {
+      setRestoreMsg('Please pick a codifa-backup-….zip file.')
+      setRestoreFailed(true)
+      return
+    }
+    try {
+      const info = await api.backupInfo(path)
+      setRestorePick({
+        path,
+        created: info.created,
+        files: info.files,
+        bytes: info.bytes,
+        version: info.version,
+      })
+    } catch (err) {
+      setRestoreMsg((err as Error).message || String(err))
+      setRestoreFailed(true)
+    }
+  }
+
+  const confirmRestore = async () => {
+    if (!restorePick) return
+    const path = restorePick.path
+    setRestorePick(null)
+    setRestoring(true)
+    setRestorePct(0)
+    setRestoreLabel('Preparing…')
+    setPersistSuspended(true)
+    const unsub = api.onRestoreProgress((evt) => {
+      setRestoreLabel(evt.label)
+      setRestorePct(evt.pct)
+    })
+    try {
+      const res = await api.restoreBackup(path)
+      setRestoreMsg(
+        `Restored ${res.files.toLocaleString()} files. Restarting to apply…`,
+      )
+      // Every reader (store, skills, MCP) holds pre-restore state in memory —
+      // only a full restart re-loads the restored data from disk.
+      setTimeout(() => {
+        void api.restartApp()
+      }, 1200)
+    } catch (err) {
+      const message = (err as Error).message || String(err)
+      const cancelled = message.toLowerCase().includes('cancel')
+      setRestoreMsg(cancelled ? 'Restore cancelled.' : `Restore failed: ${message}`)
+      setRestoreFailed(!cancelled)
+      // Nothing was applied (staging is discarded on failure) — resume saving.
+      setPersistSuspended(false)
+    } finally {
+      unsub()
+      setRestoring(false)
+      setRestoreLabel('')
+      setRestorePct(0)
     }
   }
 
@@ -3065,13 +3161,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <label>Font Size</label>
               <div className="font-size-row">
                 <span className="font-size-label">A−</span>
-                <input
-                  type="range"
+                <RangeSlider
                   min={10}
                   max={24}
                   step={1}
                   value={fontSize}
-                  onChange={(e) => setFontSize(Number(e.target.value))}
+                  onChange={setFontSize}
+                  ariaLabel="Chat font size"
                 />
                 <span className="font-size-label">A+</span>
                 <span className="font-size-value">{fontSize}px</span>
@@ -3085,13 +3181,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <label>File viewer font size</label>
               <div className="font-size-row">
                 <span className="font-size-label">A−</span>
-                <input
-                  type="range"
+                <RangeSlider
                   min={9}
                   max={24}
                   step={1}
                   value={viewerFontSize}
-                  onChange={(e) => setViewerFontSize(Number(e.target.value))}
+                  onChange={setViewerFontSize}
+                  ariaLabel="File viewer font size"
                 />
                 <span className="font-size-label">A+</span>
                 <span className="font-size-value">{viewerFontSize}px</span>
@@ -3105,13 +3201,13 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <label>Terminal font size</label>
               <div className="font-size-row">
                 <span className="font-size-label">A−</span>
-                <input
-                  type="range"
+                <RangeSlider
                   min={9}
                   max={24}
                   step={1}
                   value={terminalFontSize}
-                  onChange={(e) => setTerminalFontSize(Number(e.target.value))}
+                  onChange={setTerminalFontSize}
+                  ariaLabel="Terminal font size"
                 />
                 <span className="font-size-label">A+</span>
                 <span className="font-size-value">{terminalFontSize}px</span>
@@ -3138,44 +3234,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               the connectors and skills living inside them. The old `skills` and
               `mcp` tabs are gone because a skill or a connector has no life of
               its own any more — it belongs to a bundle, and the bundle's switch
-              is what turns it on or off. */}
+              is what turns it on or off. The catalog budget rides inside the
+              editor, above the grid. */}
           <PluginBundleEditor />
-            {/* The one skill knob that is NOT per bundle: how much of the whole
-                catalog rides in every prompt. Everything else a bundle holds —
-                its skills and its connectors — is edited inside its own card. */}
-            <div className="field">
-              <div className="field-head">
-                <label>Catalog budget</label>
-                <span className="field-value-badge">{skillCatalogMaxChars} chars</span>
-              </div>
-              <div className="hint">
-                How many characters of the skill catalog (every name, plus as much
-                description and as many Persian keywords as fit) ride in the system
-                prompt on <b>every</b> turn. Past this the list drops DETAIL first and
-                always keeps each skill's name — so an absent entry never means a
-                missing skill, only that it was not listed. Raise it for a large store
-                (roughly <code>4</code> characters per token, so <code>6000</code> ≈{' '}
-                <code>1500</code> tokens per turn); lower it to save context. Range{' '}
-                <code>1500</code>–<code>12000</code> on the backend as well, so a value
-                typed here is never silently ignored. Default: <code>6000</code>.
-              </div>
-              <div className="settings-row-control">
-                <input
-                  type="number"
-                  min={1500}
-                  max={12000}
-                  step={500}
-                  value={skillCatalogMaxChars}
-                  onChange={(e) => setSkillCatalogMaxChars(Number(e.target.value))}
-                  dir="ltr"
-                  aria-label="Skill catalog budget in characters"
-                />
-                <span className="field-unit">chars</span>
-                <span className="field-unit">
-                  ≈ {Math.round(skillCatalogMaxChars / 4).toLocaleString()} tokens per turn
-                </span>
-              </div>
-            </div>
         </>
         )}
 
@@ -3190,8 +3251,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div>
                 <div className="settings-group-title">Tool result cache</div>
                 <div className="settings-group-desc">
-                  Speeds up repeated work by caching tool outputs (searches, reads, runs) in memory.
-                  Cached results are reused within the TTL window.
+                  Tool outputs (searches, reads, runs) are cached in memory and
+                  reused within the TTL window.
                 </div>
               </div>
             </div>
@@ -3200,8 +3261,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="settings-row-label">
                 <div className="settings-row-title">Cache TTL</div>
                 <div className="settings-row-desc">
-                  How long <b>tool outputs</b> stay cached before re-running. Default: <code>60min</code>.
-                  Persists automatically on every change (no Save button needed).
+                  How long <b>tool outputs</b> stay cached. Default: <code>60min</code> —
+                  persists automatically.
                 </div>
               </div>
               <div className="settings-row-control">
@@ -3246,11 +3307,9 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div className="settings-row-label">
                 <div className="settings-row-title">Data path</div>
                 <div className="settings-row-desc">
-                  All app data lives under this path: settings (<code>settings.json</code>), chats,
-                  vector stores, models, skills, MCP connectors, and plans. Moving the path
-                  copies every file to the new location and empties the old one. The default{' '}
-                  <code>~/.codifa</code> works the same on macOS, Linux, and Windows
-                  (<code>~/</code> = your home directory).
+                  Where all app data lives — settings, chats, models, skills.
+                  Moving the path copies every file over.{' '}
+                  Default&nbsp;<code>~/.codifa</code>.
                 </div>
               </div>
               <div className="data-path-row">
@@ -3284,10 +3343,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
               <div>
                 <div className="settings-group-title">Backup</div>
                 <div className="settings-group-desc">
-                  Packs the whole app into one <code>codifa-backup-&lt;date&gt;.zip</code>:
-                  settings and providers, chats, plugins (skills + MCP connectors), plans,
-                  schedules, artifacts and uploads. Traces, checkpoints, memory, caches and the
-                  browser profile are left out — the app re-creates those on demand.
+                  One <code>codifa-backup-&lt;date&gt;.zip</code> with settings, chats,
+                  plugins, plans and uploads. Traces and caches are re-created on demand.
                 </div>
               </div>
             </div>
@@ -3309,16 +3366,73 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   }}
                   placeholder={dataPath || '~/.codifa'}
                   dir="ltr"
-                  disabled={backingUp}
+                  disabled={backingUp || restoring}
                   aria-label="Backup destination folder"
                 />
-                <button className="btn tiny" onClick={browseBackupDir} disabled={backingUp}>
+                <button className="btn tiny" onClick={browseBackupDir} disabled={backingUp || restoring}>
                   Browse…
                 </button>
-                <button className="btn tiny" onClick={startBackup} disabled={backingUp}>
+                <button className="btn tiny" onClick={startBackup} disabled={backingUp || restoring}>
                   {backingUp ? 'Backing up…' : 'Back up now'}
                 </button>
               </div>
+              <div>
+                <button
+                  className="btn tiny"
+                  onClick={pickBackupForRestore}
+                  disabled={backingUp || restoring}
+                >
+                  {restoring ? 'Restoring…' : 'Restore from backup…'}
+                </button>
+              </div>
+              {restorePick && !restoring && (
+                <div className="restore-confirm">
+                  <div className="hint">
+                    Archive: <code dir="ltr">{restorePick.path}</code>
+                    <br />
+                    {restorePick.files.toLocaleString()} files ·{' '}
+                    {(restorePick.bytes / (1024 * 1024)).toFixed(1)} MB · created{' '}
+                    {new Date(restorePick.created).toLocaleString()}
+                    {restorePick.version ? ` by v${restorePick.version}` : ''}
+                  </div>
+                  <div className="hint" style={{ color: 'var(--danger)' }}>
+                    Restoring overwrites current settings, chats and plugins with the archive's
+                    contents (files not in the archive are kept). The app restarts to apply it.
+                  </div>
+                  <div className="backup-progress-actions">
+                    <button className="btn tiny" onClick={confirmRestore}>
+                      Restore now
+                    </button>
+                    <button className="btn tiny" onClick={() => setRestorePick(null)}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {restoring && (
+                <div className="migrate-progress">
+                  <div className="migrate-bar-track">
+                    <div className="migrate-bar-fill" style={{ width: `${restorePct}%` }} />
+                  </div>
+                  <div className="backup-progress-line">
+                    <span className="backup-progress-label" dir="ltr">{restoreLabel}</span>
+                    <span className="backup-progress-pct">{restorePct}%</span>
+                  </div>
+                  <div className="backup-progress-actions">
+                    <button className="btn tiny" onClick={() => void api.cancelBackup()}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {restoreMsg && (
+                <div
+                  className="hint"
+                  style={{ color: restoreFailed ? 'var(--danger)' : 'var(--accent)', wordBreak: 'break-all' }}
+                >
+                  {restoreMsg}
+                </div>
+              )}
               {backingUp && (
                 <div className="migrate-progress">
                   <div className="migrate-bar-track">

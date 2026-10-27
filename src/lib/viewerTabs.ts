@@ -164,6 +164,42 @@ export function visibleTabs(tabs: ViewerTab[], scope: ViewerScope): ViewerTab[] 
   })
 }
 
+/** Terminal tab the Ctrl+X `[` / `]` chord lands on, walking the SAME order
+ *  the terminal tab strip renders (`visibleTabs` filtered to terminals), with
+ *  wrap-around at both ends. `activeId` not among them (or null) → the first
+ *  tab. Pure, for tests. */
+export function nextTerminalTabId(
+  tabs: ViewerTab[],
+  scope: ViewerScope,
+  activeId: string | null | undefined,
+  dir: 1 | -1,
+): string | null {
+  const list = visibleTabs(tabs, scope).filter((t) => t.kind === 'terminal')
+  if (list.length === 0) return null
+  const i = list.findIndex((t) => t.id === activeId)
+  if (i === -1) return list[0].id
+  return list[(i + dir + list.length) % list.length].id
+}
+
+/** Ctrl+X then `[` (previous) / `]` (next): cycle the right-pane TERMINAL
+ *  tabs of the focused chat's scope, revealing the pane if it is closed.
+ *  When the pane has no terminal tabs at all, the request falls through to
+ *  the BOTTOM panel (`coder:cycle-terminal`) so the same chord cycles its
+ *  shells — one gesture, whichever surface actually holds the terminals. */
+export function cycleTerminalTabs(dir: 1 | -1): void {
+  const st = useViewerTabs.getState()
+  const scope = viewerScopeForChat(useStore.getState().activeChatId || undefined)
+  const id = nextTerminalTabId(st.tabs, scope, st.activeId, dir)
+  if (!id) {
+    window.dispatchEvent(new CustomEvent('coder:cycle-terminal', { detail: dir }))
+    return
+  }
+  st.setActiveViewer(id)
+  // Cycling is navigation: a closed pane must come back to show the tab
+  // (the same reveal rule openTerminal follows).
+  if (!useViewerTabs.getState().paneOpen) useViewerTabs.setState({ paneOpen: true })
+}
+
 /** Id of the tab the pane body is showing RIGHT NOW, or `null` when the pane
  *  has no visible tab at all — the body then falls back to the todos page.
  *

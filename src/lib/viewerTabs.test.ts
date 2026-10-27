@@ -507,6 +507,34 @@ console.log('16) browser tab carries the url the agent opened (not about:blank):
   )
 }
 
+console.log('N) nextTerminalTabId — Ctrl+X [ / ] cycles terminal tabs in strip order:')
+{
+  const { nextTerminalTabId } = await import('./viewerTabs')
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const [c1, wsA] = chatInWs('/ws-a')
+  vt().openTerminal({ cwd: '/ws-a', fresh: true })
+  vt().openTerminal({ cwd: '/ws-a', fresh: true })
+  vt().openTerminal({ cwd: '/ws-a', fresh: true })
+  const scope = scopeOf(c1, wsA)
+  const ids = visibleTabs(vt().tabs, scope)
+    .filter((t) => t.kind === 'terminal')
+    .map((t) => t.id)
+  check('three terminal tabs opened in scope', ids.length === 3, ids)
+  const at = (i: number) => ids[i]
+  check('next moves forward', nextTerminalTabId(vt().tabs, scope, at(0), 1) === at(1))
+  check('next from the last wraps to the first', nextTerminalTabId(vt().tabs, scope, at(2), 1) === at(0))
+  check('prev moves backward', nextTerminalTabId(vt().tabs, scope, at(2), -1) === at(1))
+  check('prev from the first wraps to the last', nextTerminalTabId(vt().tabs, scope, at(0), -1) === at(2))
+  check('no active terminal lands on the first', nextTerminalTabId(vt().tabs, scope, null, 1) === at(0))
+  check('a foreign active id is ignored (lands on the first)', nextTerminalTabId(vt().tabs, scope, 'file:nope', 1) === at(0))
+  check('no terminals -> null', nextTerminalTabId([], scope, null, 1) === null)
+  // Terminals are WORKSPACE-scoped: another workspace's shells stay out.
+  const [c2] = chatInWs('/ws-b')
+  vt().openTerminal({ cwd: '/ws-b', fresh: true })
+  check('other workspace terminals stay out of scope', nextTerminalTabId(vt().tabs, scope, at(0), 1) === at(1))
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)

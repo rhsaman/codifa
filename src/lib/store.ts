@@ -900,6 +900,7 @@ function persistPanelsSoon(): void {
 // the main process. The backend upserts chat files, so a subset write is safe;
 // the next full persist rewrites everything.
 function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
+  if (persistSuspended) return
   // Only chats whose body is in memory can be written: an index-only row is
   // not a snapshot of the transcript and must never be sent as one.
   const streaming = s.chats.filter(
@@ -918,7 +919,7 @@ function writeChatsNow(s: ReturnType<typeof useStore.getState>): void {
 // Shares the persistSeq guard with writeStateNow so a stale snapshot can
 // never overtake a newer full write.
 function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  if (!s.settingsHydrated) return Promise.resolve()
+  if (!s.settingsHydrated || persistSuspended) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
     const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
@@ -1006,7 +1007,19 @@ if (typeof window !== 'undefined') {
 // one, and letting the stale snapshot win would revert the user's latest change.
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
+
+// While a RESTORE runs (Settings → Storage → Restore, and until the app
+// restarts to load it), the renderer's in-memory state is STALE: any persist
+// would overwrite the files the restore just wrote with the pre-restore state.
+// Every persist path checks this and no-ops. It is never cleared in-process —
+// only the restart itself starts a fresh renderer with the flag off.
+let persistSuspended = false
+export function setPersistSuspended(v: boolean): void {
+  persistSuspended = v
+}
+
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
+  if (persistSuspended) return Promise.resolve()
   const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [

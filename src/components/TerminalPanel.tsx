@@ -135,6 +135,24 @@ export function TerminalPanel() {
     return () => window.removeEventListener('coder:new-terminal', onNewRequest)
   }, [])
 
+  // A `coder:cycle-terminal` request is Ctrl+X then [ / ] fired when the RIGHT
+  // pane has no terminal tabs of its own: the chord cycles THIS panel's shells
+  // instead (same order the chip strip renders). Closed panel → nothing to
+  // show, so the chord is a no-op rather than revealing the panel.
+  useEffect(() => {
+    const onCycleRequest = (e: Event) => {
+      const dir = (e as CustomEvent).detail === -1 ? -1 : 1
+      if (!useStore.getState().terminalPanelOpen) return
+      const list = tabsRef.current
+      if (list.length < 2) return
+      const i = list.findIndex((t) => t.id === activeIdRef.current)
+      const j = i === -1 ? 0 : (i + dir + list.length) % list.length
+      setActiveId(list[j].id)
+    }
+    window.addEventListener('coder:cycle-terminal', onCycleRequest)
+    return () => window.removeEventListener('coder:cycle-terminal', onCycleRequest)
+  }, [])
+
   const supported = hasTerminalApi()
 
   /** Fit + push the new cols/rows to the pty. Skips while hidden (0 size). */
@@ -534,6 +552,15 @@ export function TerminalPanel() {
       dir="ltr"
       style={fullscreen ? undefined : { height }}
       aria-label="Terminal"
+      onTransitionEnd={(e) => {
+        // The height animation resizes the xterm host every frame; the
+        // ResizeObserver fits along the way, and this final fit locks the
+        // geometry once the transition settles (the open-effect fit at 50ms
+        // lands mid-animation).
+        if (e.target === e.currentTarget && e.propertyName === 'height') {
+          scheduleFit()
+        }
+      }}
     >
       <div className="terminal-resize-handle" title="Drag to resize" onMouseDown={startResize} />
       <header className="terminal-tabbar">

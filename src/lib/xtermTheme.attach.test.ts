@@ -22,7 +22,7 @@ function check(name: string, ok: boolean) {
 // rose-pine values so the derivation runs unmodified under node.
 const VARS: Record<string, string> = {
   '--bg': '#191724',
-  '--bg-alt': '#21202e',
+  '--bg-alt': '#191724',
   '--text': '#e0def4',
   '--text-dim': '#6e6a86',
   '--danger': '#eb6f92',

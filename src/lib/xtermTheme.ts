@@ -80,7 +80,7 @@ export function applyTerminalFontSize(px: number): void {
 export function xtermTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement)
   const v = (name: string, fallback: string): string => cs.getPropertyValue(name).trim() || fallback
-  const bg = v('--bg-alt', '#21202e')
+  const bg = v('--bg-alt', '#191724')
   const fg = v('--text', '#e0def4')
   return {
     background: bg,

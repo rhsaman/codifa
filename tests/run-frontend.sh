@@ -126,6 +126,7 @@ fileDrag|src/lib/fileDrag.test.ts|
 chatWindowMeta|src/lib/chatWindowMeta.test.ts|
 chatClose|src/lib/chatClose.test.ts|
 viewerTabs|src/lib/viewerTabs.test.ts|--packages=external --external:electron
+shortcutsKeys|src/lib/shortcuts.test.ts|
 fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -219,6 +220,7 @@ fuzzy|tests/fuzzy.test.ts|-
 paneCycle|tests/paneCycle.test.ts|
 prefixState|tests/prefixState.test.ts|
 panePointer|tests/panePointer.test.ts|
+chatFind|src/lib/chatFind.test.ts|
 terminalKeys|tests/terminalKeys.test.ts|
 scrollKeys|tests/scrollKeys.test.ts|
 sidebarStep|tests/sidebarStep.test.ts|

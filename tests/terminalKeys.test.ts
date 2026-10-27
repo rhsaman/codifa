@@ -74,6 +74,11 @@ console.log('2) the Ctrl+X SECOND key while the prefix is armed:')
       check(`bare ${key} suppressed while armed`, isReservedTerminalChord(ev2))
     }
     check('Space suppressed while armed (Ctrl+X Space = voice)', isReservedTerminalChord(ev({ key: ' ', code: 'Space' })))
+    // The terminal tab cycle ([ / ]) must never type a bracket into the shell
+    // while the prefix is armed — the bracket arrives on the shell's stdin
+    // otherwise, right when the user is switching tabs.
+    check('bare [ suppressed while armed (Ctrl+X [ = prev terminal tab)', isReservedTerminalChord(ev({ key: '[', code: 'BracketLeft' })))
+    check('bare ] suppressed while armed (Ctrl+X ] = next terminal tab)', isReservedTerminalChord(ev({ key: ']', code: 'BracketRight' })))
     check('a non-prefix letter stays shell input', !isReservedTerminalChord(ev({ key: 'a', code: 'KeyA' })))
     for (const key of ['h', 'k', 'l']) {
       const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
@@ -90,6 +95,8 @@ console.log('3) the same letters are ORDINARY shell input once disarmed:')
     const ev2 = ev({ key, code: `Key${key.toUpperCase()}` })
     check(`bare ${key} reaches the shell`, !isReservedTerminalChord(ev2))
   }
+  check('bare [ reaches the shell when disarmed', !isReservedTerminalChord(ev({ key: '[', code: 'BracketLeft' })))
+  check('bare ] reaches the shell when disarmed', !isReservedTerminalChord(ev({ key: ']', code: 'BracketRight' })))
   check('Ctrl+J stays reserved when not armed (newline chord)', isReservedTerminalChord(ev({ key: 'j', code: 'KeyJ', ctrlKey: true })))
 }
 

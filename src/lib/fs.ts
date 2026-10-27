@@ -71,6 +71,16 @@ export const api = {
   onBackupProgress: (
     cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
   ): (() => void) => window.coder.onBackupProgress(cb),
+  backupInfo: (
+    path: string,
+  ): Promise<{ created: string; files: number; bytes: number; version: string; dataRoot: string }> =>
+    window.coder.backupInfo(path),
+  restoreBackup: (path: string): Promise<{ files: number; elapsedMs: number }> =>
+    window.coder.restoreBackup(path),
+  onRestoreProgress: (
+    cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
+  ): (() => void) => window.coder.onRestoreProgress(cb),
+  restartApp: (): Promise<void> => window.coder.restartApp(),
   openFileExternal: async (
     absPath: string,
     editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp' | 'default',

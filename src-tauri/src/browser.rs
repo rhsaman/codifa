@@ -1600,6 +1600,7 @@ pub fn navigate_to(url: &str, chat_id: &str) -> Value {
         return json!({"ok": true, "url": showing});
     }
     let tab_for_call = tab.clone();
+    let tab_for_settle = tab.clone();
     let target_owned = target.to_string();
     let fut = async move {
         navigate(&tab_for_call, &target_owned).await?;
@@ -1607,9 +1608,13 @@ pub fn navigate_to(url: &str, chat_id: &str) -> Value {
     };
     match block_on(fut) {
         Ok(_) => {
-            // Give the navigation a moment to commit so the returned url is the
-            // new page rather than the one being left.
-            std::thread::sleep(Duration::from_millis(400));
+            // Wait for the navigation to commit AND settle so the returned url
+            // is the new page rather than the one being left (a fixed sleep
+            // both raced slow pages and wasted time on fast ones).
+            let _ = block_on(async move {
+                wait_page_settled(&tab_for_settle, Duration::from_secs(8)).await;
+                Ok(Value::Null)
+            });
             json!({"ok": true, "url": current_url(&tab)})
         }
         Err(e) => json!({"ok": false, "error": format!("navigation failed: {e}")}),
@@ -1647,6 +1652,44 @@ pub fn launch(url: &str, chat_id: &str) -> Value {
     status(&chat)
 }
 
+/// Wait until the tab's document leaves the `loading` state (bounded).
+///
+/// `Page.captureScreenshot` on a document that is still loading — or whose
+/// first paint has not landed yet — returns a BLACK frame: the reported
+/// "the page goes black during UI tests". ZCode's own browser tooling waits
+/// for the load state before every observation; this is the same rule,
+/// enforced centrally so every consumer (the panel's status poll and the
+/// agent's tool calls) is covered. Falls through on the timeout so a page
+/// that never settles still produces a frame.
+async fn wait_page_settled(tab: &Tab, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ready = cdp_calls_on(
+            tab,
+            vec![("Runtime.evaluate", json!({
+                "expression": "document.readyState",
+                "returnByValue": true,
+            }))],
+            false,
+        )
+        .await;
+        let settled = ready
+            .ok()
+            .and_then(|res| res.into_iter().next())
+            .and_then(|r| {
+                r["result"]["result"]["value"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .map(|v| v == "interactive" || v == "complete")
+            .unwrap_or(false);
+        if settled || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
 /// One JPEG frame as a data URI (the panel renders it directly).
 ///
 /// The device-metrics override is re-applied on THIS connection right before
@@ -1661,6 +1704,11 @@ pub fn screenshot(chat_id: &str) -> Value {
     let (w, h) = tab.viewport;
     let tab_for_call = tab.clone();
     let fut = async move {
+        wait_page_settled(&tab_for_call, Duration::from_secs(6)).await;
+        // One paint beat after readyState flips: the first composited frame
+        // usually lands right behind the DOM reporting ready — capturing on
+        // the readyState tick alone still races it every few pages.
+        tokio::time::sleep(Duration::from_millis(180)).await;
         let res = cdp_calls(
             &tab_for_call,
             vec![(

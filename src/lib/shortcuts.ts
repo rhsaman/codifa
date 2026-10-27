@@ -17,6 +17,8 @@ export function physicalKey(e: { code: string; key: string }): string {
   if (c.startsWith("Key")) return c.slice(3).toLowerCase();
   if (c === "Comma") return ",";
   if (c === "Slash") return "/";
+  if (c === "BracketLeft") return "[";
+  if (c === "BracketRight") return "]";
   return (e.key || "").toLowerCase();
 }
 
@@ -68,8 +70,19 @@ export interface PrefixShortcut {
    *  the realtime voice session; `voice` is hold-Space dictation; `terminal`
    *  toggles the bottom terminal panel; `pane-left`/`pane-right` move focus
    *  across the app's three sections (sidebar ↔ chats ↔ right pane); and
-   *  `terminal-focus` lands the caret in the bottom terminal, opening it. */
-  action?: "voice" | "live" | "terminal" | "pane-left" | "pane-right" | "terminal-focus";
+   *  `terminal-focus` lands the caret in the bottom terminal, opening it.
+   *  `terminal-next`/`terminal-prev` cycle the TERMINAL TABS ([ = previous,
+   *  ] = next): right-pane terminal tabs first, the bottom panel's shells
+   *  as the fallback. */
+  action?:
+    | "voice"
+    | "live"
+    | "terminal"
+    | "pane-left"
+    | "pane-right"
+    | "terminal-focus"
+    | "terminal-next"
+    | "terminal-prev";
 }
 
 /** Second key (after Ctrl+X) -> the command it runs. Order is display order.
@@ -85,6 +98,8 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   l: { cmd: "", label: "Move focus right: sidebar → chats → right pane", action: "pane-right" },
   h: { cmd: "", label: "Move focus left: right pane → chats → sidebar", action: "pane-left" },
   t: { cmd: "", label: "Focus the terminal (opens it if closed)", action: "terminal-focus" },
+  "[": { cmd: "", label: "Previous terminal tab", action: "terminal-prev" },
+  "]": { cmd: "", label: "Next terminal tab", action: "terminal-next" },
 };
 
 /** Move direction for the direct chord (Cmd/Ctrl + H/J/K/L, no Ctrl+X prefix).
@@ -144,6 +159,10 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
     keys: "Cmd/Ctrl+Enter",
     label: "Queue the message (sends after the current turn, won't interrupt)",
   },
+  {
+    keys: "Cmd/Ctrl+F",
+    label: "Find in the focused chat transcript — highlight all matches, Enter/Shift+Enter or the arrows to step, Esc to close",
+  },
   { keys: "Tab", label: "Cycle agent mode (Ask / Plan / Build)" },
   { keys: "/", label: "Open command palette" },
   { keys: "Cmd/Ctrl+M", label: "Fullscreen what has focus — the bottom terminal, else the right pane, else the focused chat window (press again to restore)" },
@@ -152,6 +171,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
   { keys: "Ctrl+X then J", label: "Toggle the terminal panel (the only terminal toggle — works while the caret is inside the terminal too)" },
+  { keys: "Ctrl+X then [ / ]", label: "Previous / next TERMINAL tab — cycles the right-pane terminal tabs (reveals the pane if closed); with no terminal tabs there, cycles the bottom panel's shells" },
   { keys: "Ctrl+H/J/K/L", label: "Move focus between the split CHAT windows vim-style (k=up, j=down, h=left, l=right) — to the window that really lies in that direction, nothing beyond them. The three sections (sidebar / chats / right pane / terminal) are reached only with Ctrl+X then L/H/T" },
   { keys: "Shift+Alt(Option)+H/J/K/L", label: "Swap (move) chat window positions in the same vim directions" },
   {

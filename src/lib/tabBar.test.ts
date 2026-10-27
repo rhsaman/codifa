@@ -1,7 +1,8 @@
 // Unit tests for the shared tab-bar reorder helpers.
 // Run: npx esbuild src/lib/tabBar.test.ts --bundle --platform=node \
 //        --format=esm --outfile=/tmp/tabBar.test.mjs && node /tmp/tabBar.test.mjs
-import { dropSide, edgeScroll, inactiveTabIds, menuLeft, tabMove } from "./tabBar";
+import { dropSide, edgeScroll, inactiveTabIds, menuLeft, tabForPoint, tabMove } from "./tabBar";
+import { previewShifts } from "./tabOrder";
 
 export {};
 
@@ -94,6 +95,42 @@ console.log("5) menuLeft — dropdown stays inside the viewport:");
   check("bottom menu never pokes past the right edge", menuLeft(990, 240, 1000) === 760);
   check("left menu opens away from the right edge", menuLeft(980, 240, 1000, "left") === 740);
   check("left menu never pokes past the left edge", menuLeft(10, 240, 1000, "left") === 12);
+}
+
+console.log("6) previewShifts — animated slide preview:");
+{
+  const ids = ["a", "b", "c"];
+  const end = previewShifts(ids, "a", "c", true);
+  check(
+    "a to the end: b and c each slide one slot left",
+    end.get("b") === -1 && end.get("c") === -1 && end.get("a") === undefined,
+  );
+  const front = previewShifts(ids, "c", "a", false);
+  check("c to the front: a and b slide right", front.get("a") === 1 && front.get("b") === 1);
+  const noop = previewShifts(ids, "a", "b", false);
+  check("a landing already in place slides nothing", noop.size === 0);
+  const swap = previewShifts(ids, "b", "c", true);
+  check("b after c: only c slides left", swap.get("c") === -1 && swap.get("a") === undefined);
+  check("unknown tab -> empty", previewShifts(ids, "x", "c", true).size === 0);
+}
+
+console.log("7) tabForPoint — geometric drop target (gaps are not dead zones):");
+{
+  const tabs = [
+    { id: "a", left: 0, right: 100 },
+    { id: "b", left: 106, right: 206 },
+    { id: "c", left: 212, right: 312 },
+  ];
+  check("over a's left half -> a/before", JSON.stringify(tabForPoint(tabs, 30)) === '{"id":"a","after":false}');
+  check("over a's right half -> a/after", tabForPoint(tabs, 80)?.after === true);
+  const gap = tabForPoint(tabs, 102);
+  check("gap nearest a's edge -> a/after", gap?.id === "a" && gap.after === true);
+  check("past the end -> last tab/after", tabForPoint(tabs, 400)?.id === "c" && tabForPoint(tabs, 400)?.after === true);
+  check("before the start -> first tab/before", tabForPoint(tabs, -20)?.id === "a" && tabForPoint(tabs, -20)?.after === false);
+  // rtl: a drop on a tab's right half is BEFORE it in array order.
+  check("rtl right half flips to before", tabForPoint(tabs, 80, -1)?.after === false);
+  check("rtl past the (visual) end flips to before on first", tabForPoint(tabs, -20, -1)?.after === true);
+  check("empty bar -> null", tabForPoint([], 50) === null);
 }
 
 if (failed > 0) {

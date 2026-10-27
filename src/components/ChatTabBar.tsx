@@ -2,8 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
-import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "../lib/tabBar";
-import { previewSlot } from "../lib/tabOrder";
+import {
+  barFlowSign,
+  edgeScroll,
+  inactiveTabIds,
+  slideWidth,
+  tabForPoint,
+  tabMove,
+  type TabExtent,
+} from "../lib/tabBar";
+import { previewShifts } from "../lib/tabOrder";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 
@@ -215,6 +223,10 @@ export function ChatTabBar() {
   );
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  // Slide geometry measured once at drag start: how far "one slot" is (the
+  // dragged tab's width + the bar gap) and which way array order flows
+  // (rtl windows render the row right→left, mirroring the slide).
+  const [dragGeom, setDragGeom] = useState<{ slot: number; sign: 1 | -1 } | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
 
@@ -228,33 +240,40 @@ export function ChatTabBar() {
   const clearDrag = () => {
     setDragId(null);
     setDropTarget(null);
+    setDragGeom(null);
   };
 
-  // The bar previews the landing slot instead of drawing an insertion line: the
-  // DOM never moves (a mid-drag re-render of the dragged node cancels the native
-  // drag in Chromium), only its CSS `order` does, and the dragged tab is drawn as
-  // a ghost outline so it reads as "this is where you drop".
-  const dragPreview = (() => {
+  // The bar previews the landing by SLIDING tabs aside with transforms: the
+  // dragged tab stays as a muted hole, its neighbours glide one slot toward
+  // the freed space, and the layout never reflows mid-drag (the old CSS
+  // `order` preview re-squeezed every tab on each preview change — the tabs
+  // "jumbled" while dragging). Transitions on `transform` animate the slide.
+  const shifts = (() => {
     if (!dragId || !dropTarget) return null;
-    const slot = previewSlot(openChatIds, dragId, dropTarget.id, dropTarget.after);
-    // The visible last tab follows the PREVIEW, not the DOM: with inline `order`
-    // the last DOM node may no longer be the last one on screen.
-    let tailId: string | null = null;
-    let tailMax = -1;
-    slot.forEach((index, id) => {
-      if (index > tailMax) {
-        tailMax = index;
-        tailId = id;
-      }
-    });
-    return { slot, tailId };
+    return previewShifts(openChatIds, dragId, dropTarget.id, dropTarget.after);
   })();
-  // With an inline `order` the DOM's last tab is no longer the visible last one,
-  // so the "drop past the end" target has to come from the previewed order.
-  const tailId = dragPreview?.tailId ?? openChatIds[openChatIds.length - 1] ?? null;
-  // The "+" button trails the tabs in the DOM, so while a drag is
-  // active it must claim the slot right after the last tab (the previewed one).
-  const tailOrder = dragId ? openChatIds.length : undefined;
+  const slot = dragGeom?.slot ?? 0;
+  const sign = dragGeom?.sign ?? 1;
+
+  /** Landing preview for a pointer x: nearest tab by geometry, array-order
+   *  correct for rtl bars. Covers tabs, inter-tab gaps and the empty space
+   *  past the ends in ONE rule (the old code left the gaps as dead zones). */
+  const previewAt = (clientX: number) => {
+    const bar = barRef.current;
+    if (!bar) return;
+    const tabs: TabExtent[] = Array.from(
+      bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
+    ).map((el) => ({
+      id: el.dataset.tabId ?? "",
+      left: el.getBoundingClientRect().left,
+      right: el.getBoundingClientRect().right,
+    }));
+    const next = tabForPoint(tabs, clientX, dragGeom?.sign ?? barFlowSign(bar));
+    if (!next) return;
+    setDropTarget((prev) =>
+      prev && prev.id === next.id && prev.after === next.after ? prev : next,
+    );
+  };
 
   if (openChatIds.length === 0) return null;
 
@@ -273,29 +292,30 @@ export function ChatTabBar() {
         if (!bar) return;
         const delta = edgeScroll(e.clientX, bar.getBoundingClientRect());
         if (delta) bar.scrollLeft += delta;
-        // Empty space past the visible last tab previews a landing at the very end.
-        if (!tailId || tailId === dragId) return;
-        const tailEl = bar.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`);
-        if (!tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
-        setDropTarget((prev) =>
-          prev?.id === tailId && prev.after ? prev : { id: tailId, after: true },
-        );
+        previewAt(e.clientX);
       }}
       onDragLeave={(e) => {
         if (e.target !== e.currentTarget) return;
         setDropTarget(null);
       }}
       onDrop={(e) => {
-        // Tabs handle their own drop; empty space past the last tab drops at the end.
-        if (e.target !== e.currentTarget || !dragId) return;
-        const tailEl = tailId
-          ? barRef.current?.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`)
-          : null;
-        if (!tailId || !tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
-        const from = e.dataTransfer.getData("text/plain") || dragId;
-        if (!from || from === tailId) return;
+        if (!dragId) return;
         e.preventDefault();
-        useStore.getState().moveChatTab(from, tailId, true);
+        const from = e.dataTransfer.getData("text/plain") || dragId;
+        const bar = barRef.current;
+        if (from && bar) {
+          const tabs: TabExtent[] = Array.from(
+            bar.querySelectorAll<HTMLElement>("[data-tab-id]"),
+          ).map((el) => ({
+            id: el.dataset.tabId ?? "",
+            left: el.getBoundingClientRect().left,
+            right: el.getBoundingClientRect().right,
+          }));
+          const at = tabForPoint(tabs, e.clientX, dragGeom?.sign ?? barFlowSign(bar));
+          if (at && at.id !== from) {
+            useStore.getState().moveChatTab(from, at.id, at.after);
+          }
+        }
         clearDrag();
       }}
     >
@@ -304,7 +324,7 @@ export function ChatTabBar() {
         const rawTitle = meta ? chatTitle({ title: meta.title, messages: meta.messages }) : "Chat";
         const title = prepareContent(rawTitle, dir);
         const active = id === activeChatId;
-        const order = dragPreview?.slot.get(id);
+        const shift = shifts?.get(id) ?? 0;
         return (
           <div
             key={id}
@@ -314,7 +334,11 @@ export function ChatTabBar() {
             tabIndex={0}
             draggable={editingId !== id}
             className={`editor-tab chat-tab${active ? " active" : ""}${meta?.streaming ? " busy" : ""}${meta?.unread ? " unread" : ""}${dragId === id ? " dragging drop-preview" : ""}`}
-            style={order === undefined ? undefined : { order }}
+            style={
+              shift !== 0 && slot > 0
+                ? { transform: `translateX(${shift * slot * sign}px)` }
+                : undefined
+            }
             title={title}
             onClick={() => useStore.getState().openChat(id)}
             onKeyDown={(e) => {
@@ -340,30 +364,10 @@ export function ChatTabBar() {
               }
               e.dataTransfer.setData("text/plain", id);
               e.dataTransfer.effectAllowed = "move";
+              const bar = barRef.current;
+              const el = bar?.querySelector<HTMLElement>(`[data-tab-id="${id}"]`);
+              setDragGeom(el && bar ? { slot: slideWidth(el, bar), sign: barFlowSign(bar) } : null);
               setDragId(id);
-            }}
-            onDragOver={(e) => {
-              if (!dragId || dragId === id) return;
-              e.preventDefault();
-              e.dataTransfer.dropEffect = "move";
-              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = dropSide(e.clientX, rect) === "after";
-              setDropTarget((prev) =>
-                prev?.id === id && prev.after === after ? prev : { id, after },
-              );
-            }}
-            onDragLeave={() => {
-              setDropTarget((prev) => (prev?.id === id ? null : prev));
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              const from = e.dataTransfer.getData("text/plain") || dragId;
-              if (from && from !== id) {
-                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = dropSide(e.clientX, rect) === "after";
-                useStore.getState().moveChatTab(from, id, after);
-              }
-              clearDrag();
             }}
             onDragEnd={clearDrag}
           >
@@ -427,7 +431,6 @@ export function ChatTabBar() {
         className="editor-tab-new"
         title="New chat"
         aria-label="New chat"
-        style={tailOrder === undefined ? undefined : { order: tailOrder }}
         onClick={() => useStore.getState().newChat()}
       >
         +

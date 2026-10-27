@@ -140,6 +140,19 @@ const bridge: CoderApi = {
       'backup:progress',
       (evt) => cb(evt),
     ),
+  backupInfo: (path) =>
+    invoke<{ created: string; files: number; bytes: number; version: string; dataRoot: string }>(
+      'backup_info',
+      { path },
+    ),
+  restoreBackup: (path) =>
+    invoke<{ files: number; elapsedMs: number }>('restore_backup', { path }),
+  onRestoreProgress: (cb) =>
+    eventSubscribe<{ label: string; pct: number; files: number; total: number }>(
+      'restore:progress',
+      (evt) => cb(evt),
+    ),
+  restartApp: () => invoke<void>('restart_app'),
   checkForUpdates: () => invoke<UpdateInfo>('check_for_updates'),
   startUpdate: () => invoke<OpResult>('start_update'),
   onUpdateProgress: (cb) =>
@@ -218,6 +231,44 @@ function createShimDataTransfer(): DataTransfer {
   } as unknown as DataTransfer
 }
 
+/** Floating clone of the dragged element that follows the cursor. WKWebView
+ *  shows NO drag image for a cancelled-and-replayed drag session, so without
+ *  this the user drags an invisible thing — the single biggest reason the tab
+ *  drags felt broken. `pointer-events: none` keeps elementFromPoint honest. */
+let dragGhost: HTMLElement | null = null
+let ghostOffsetX = 0
+let ghostOffsetY = 0
+
+function removeDragGhost(): void {
+  dragGhost?.remove()
+  dragGhost = null
+}
+
+function makeDragGhost(source: HTMLElement, e: MouseEvent): void {
+  removeDragGhost()
+  const rect = source.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return
+  const clone = source.cloneNode(true) as HTMLElement
+  // The source carries the drag-state classes (muted hole); the ghost must
+  // read as the tab itself, floating.
+  clone.classList.remove("dragging", "drop-preview", "drop-before", "drop-after")
+  clone.classList.add("dnd-ghost")
+  clone.style.width = `${Math.round(rect.width)}px`
+  clone.style.height = `${Math.round(rect.height)}px`
+  clone.style.transform = `translate3d(${Math.round(rect.left)}px, ${Math.round(rect.top)}px, 0)`
+  document.body.appendChild(clone)
+  dragGhost = clone
+  ghostOffsetX = e.clientX - rect.left
+  ghostOffsetY = e.clientY - rect.top
+}
+
+function moveDragGhost(e: MouseEvent): void {
+  dragGhost?.style.setProperty(
+    "transform",
+    `translate3d(${Math.round(e.clientX - ghostOffsetX)}px, ${Math.round(e.clientY - ghostOffsetY)}px, 0)`,
+  )
+}
+
 /** Mouse-based replay of HTML5 drag-and-drop for WKWebView, where native
  *  dragover/drop never fire for internal drags (WebKit bug 265857). The
  *  native session is cancelled at dragstart (bubble-phase React onDragStart
@@ -246,7 +297,9 @@ function installDndPolyfill(): void {
 
   // Native dragover fires periodically even for a stationary pointer; the
   // replay must do the same, or a layout shift under a still cursor (vacated
-  // source pane, mounted ghost) leaves a stale preview at the wrong spot.
+  // source pane, mounted ghost) leaves a stale preview at the wrong spot —
+  // and the bar edge auto-scroll stalls the moment the mouse stops moving.
+  // The replay therefore runs CONTINUOUSLY while a drag is active.
   let lastMove: MouseEvent | null = null
   let rafId = 0
   const stopReplay = () => {
@@ -275,8 +328,8 @@ function installDndPolyfill(): void {
   }
   const replayOver = () => {
     rafId = 0
-    if (!active || !lastMove) return
-    fireOver(lastMove)
+    if (!active) return
+    if (lastMove) fireOver(lastMove)
     rafId = requestAnimationFrame(replayOver)
   }
 
@@ -284,7 +337,7 @@ function installDndPolyfill(): void {
   // so toggle a global class backed by an !important stylesheet instead.
   const style = document.createElement("style")
   style.textContent =
-    "body.coder-dragging, body.coder-dragging * { user-select: none !important; -webkit-user-select: none !important; }"
+    "body.coder-dragging, body.coder-dragging * { user-select: none !important; -webkit-user-select: none !important; cursor: grabbing !important; }"
   document.head.appendChild(style)
 
   const cancel = () => {
@@ -292,6 +345,7 @@ function installDndPolyfill(): void {
     const wasActive = active
     const over = lastOver
     stopReplay()
+    removeDragGhost()
     source = null
     active = false
     document.body.classList.remove("coder-dragging")
@@ -337,11 +391,15 @@ function installDndPolyfill(): void {
         if (Math.hypot(e.clientX - startX, e.clientY - startY) < 3) return
         active = true
         source.dispatchEvent(dragEvent("dragstart", e))
+        // The floating ghost is what makes the replayed drag readable: there
+        // is no OS drag image once the native session is cancelled.
+        makeDragGhost(source, e)
         lastMove = e
         if (!rafId) rafId = requestAnimationFrame(replayOver)
       }
       e.preventDefault()
       lastMove = e
+      moveDragGhost(e)
       fireOver(e)
     },
     true,
@@ -353,6 +411,7 @@ function installDndPolyfill(): void {
       const src = source
       const wasActive = active
       stopReplay()
+      removeDragGhost()
       source = null
       active = false
       // Drop must land with no dragging class set: the post-drop relayout is

@@ -8,16 +8,16 @@ export interface Theme {
   workspaceColors: string[]
 }
 
-export const DEFAULT_THEME = 'rose-pine'
+export const DEFAULT_THEME = 'codex'
 
 export const THEMES: Theme[] = [
   {
     id: 'claude',
-    name: 'Claude',
+    name: 'Ember',
     blurb: 'claude.ai dark',
     vars: {
       '--bg': '#1a1816',
-      '--bg-alt': '#16140f',
+      '--bg-alt': '#1a1816',
       '--bg-panel': '#1f1c18',
       '--bg-input': '#2d2820',
       '--bg-hover': '#2a2620',
@@ -55,7 +55,7 @@ export const THEMES: Theme[] = [
     blurb: 'tokyonight.nvim',
     vars: {
       '--bg': '#1a1b26',
-      '--bg-alt': '#16161e',
+      '--bg-alt': '#1a1b26',
       '--bg-panel': '#292e42',
       '--bg-input': '#292e42',
       '--bg-hover': '#283457',
@@ -93,7 +93,7 @@ export const THEMES: Theme[] = [
     blurb: 'catppuccin/nvim mocha',
     vars: {
       '--bg': '#1e1e2e',
-      '--bg-alt': '#181825',
+      '--bg-alt': '#1e1e2e',
       '--bg-panel': '#313244',
       '--bg-input': '#45475a',
       '--bg-hover': '#45475a',
@@ -131,7 +131,7 @@ export const THEMES: Theme[] = [
     blurb: 'catppuccin/nvim macchiato',
     vars: {
       '--bg': '#24273a',
-      '--bg-alt': '#1e2030',
+      '--bg-alt': '#24273a',
       '--bg-panel': '#363a4f',
       '--bg-input': '#494d64',
       '--bg-hover': '#494d64',
@@ -169,7 +169,7 @@ export const THEMES: Theme[] = [
     blurb: 'catppuccin/nvim frappé',
     vars: {
       '--bg': '#303446',
-      '--bg-alt': '#292c3c',
+      '--bg-alt': '#303446',
       '--bg-panel': '#414559',
       '--bg-input': '#51576d',
       '--bg-hover': '#51576d',
@@ -207,7 +207,7 @@ export const THEMES: Theme[] = [
     blurb: 'catppuccin/nvim latte (light)',
     vars: {
       '--bg': '#eff1f5',
-      '--bg-alt': '#e6e9ef',
+      '--bg-alt': '#eff1f5',
       '--bg-panel': '#ccd0da',
       '--bg-input': '#bcc0cc',
       '--bg-hover': '#bcc0cc',
@@ -248,7 +248,7 @@ export const THEMES: Theme[] = [
     blurb: 'gruvbox.nvim dark',
     vars: {
       '--bg': '#282828',
-      '--bg-alt': '#1d2021',
+      '--bg-alt': '#282828',
       '--bg-panel': '#3c3836',
       '--bg-input': '#3c3836',
       '--bg-hover': '#504945',
@@ -258,7 +258,7 @@ export const THEMES: Theme[] = [
       '--accent': '#fe8019',
       '--accent-dim': '#3c3836',
       '--on-accent': '#282828',
-      '--danger': '#ff6a5c',
+      '--danger': '#fb4934',
       '--success': '#b8bb26',
       '--link': '#83a598',
       '--thinking': '#fabd2f',
@@ -286,7 +286,7 @@ export const THEMES: Theme[] = [
     blurb: 'dracula/nvim',
     vars: {
       '--bg': '#282a36',
-      '--bg-alt': '#21222c',
+      '--bg-alt': '#282a36',
       '--bg-panel': '#282a36',
       '--bg-input': '#21222c',
       '--bg-hover': '#44475a',
@@ -324,7 +324,7 @@ export const THEMES: Theme[] = [
     blurb: 'nordic.nvim',
     vars: {
       '--bg': '#2e3440',
-      '--bg-alt': '#3b4252',
+      '--bg-alt': '#2e3440',
       '--bg-panel': '#3b4252',
       '--bg-input': '#434c5e',
       '--bg-hover': '#3b4252',
@@ -334,7 +334,7 @@ export const THEMES: Theme[] = [
       '--accent': '#88c0d0',
       '--accent-dim': '#434c5e',
       '--on-accent': '#2e3440',
-      '--danger': '#e88a91',
+      '--danger': '#bf616a',
       '--success': '#a3be8c',
       '--link': '#81a1c1',
       '--thinking': '#ebcb8b',
@@ -362,7 +362,7 @@ export const THEMES: Theme[] = [
     blurb: 'rose-pine/nvim',
     vars: {
       '--bg': '#191724',
-      '--bg-alt': '#21202e',
+      '--bg-alt': '#191724',
       '--bg-panel': '#1f1d2e',
       '--bg-input': '#26233a',
       '--bg-hover': '#403d52',
@@ -374,7 +374,7 @@ export const THEMES: Theme[] = [
       '--on-accent': '#191724',
       '--danger': '#eb6f92',
       '--success': '#9ccfd8',
-      '--link': '#4a9bc0',
+      '--link': '#9ccfd8',
       '--thinking': '#f6c177',
       '--provider-openrouter': '#f6c177',
       '--provider-google': '#9ccfd8',
@@ -400,7 +400,7 @@ export const THEMES: Theme[] = [
     blurb: 'onedark.nvim',
     vars: {
       '--bg': '#282c34',
-      '--bg-alt': '#21252b',
+      '--bg-alt': '#282c34',
       '--bg-panel': '#2c313a',
       '--bg-input': '#3e4451',
       '--bg-hover': '#3e4451',
@@ -410,7 +410,7 @@ export const THEMES: Theme[] = [
       '--accent': '#61afef',
       '--accent-dim': '#4b5263',
       '--on-accent': '#282c34',
-      '--danger': '#e9858e',
+      '--danger': '#e06c75',
       '--success': '#98c379',
       '--link': '#61afef',
       '--thinking': '#e5c07b',
@@ -448,7 +448,7 @@ export const THEMES: Theme[] = [
       '--accent': '#66d9ef',
       '--accent-dim': '#49483e',
       '--on-accent': '#272822',
-      '--danger': '#ff5590',
+      '--danger': '#f92672',
       '--success': '#a6e22e',
       '--link': '#66d9ef',
       '--thinking': '#e6db74',
@@ -476,18 +476,18 @@ export const THEMES: Theme[] = [
     blurb: 'kanagawa.nvim wave',
     vars: {
       '--bg': '#1f1f28',
-      '--bg-alt': '#181820',
+      '--bg-alt': '#1f1f28',
       '--bg-panel': '#2a2a37',
       '--bg-input': '#363646',
       '--bg-hover': '#363646',
       '--border': '#54546d',
       '--text': '#dcd7ba',
-      '--text-dim': '#b0a9c4',
+      '--text-dim': '#9cabca',
       '--accent': '#7e9cd8',
       '--accent-dim': '#363646',
       '--on-accent': '#1f1f28',
-      '--danger': '#e05e5c',
-      '--success': '#7fa172',
+      '--danger': '#c34043',
+      '--success': '#76946a',
       '--link': '#7fb4ca',
       '--thinking': '#dca561',
       '--provider-openrouter': '#dca561',
@@ -514,13 +514,13 @@ export const THEMES: Theme[] = [
     blurb: 'everforest.nvim dark',
     vars: {
       '--bg': '#2d353b',
-      '--bg-alt': '#272e33',
+      '--bg-alt': '#2d353b',
       '--bg-panel': '#343f44',
       '--bg-input': '#3d484d',
       '--bg-hover': '#475258',
       '--border': '#475258',
       '--text': '#d3c6aa',
-      '--text-dim': '#b3c0b7',
+      '--text-dim': '#9da9a0',
       '--accent': '#83c092',
       '--accent-dim': '#475258',
       '--on-accent': '#2d353b',
@@ -544,6 +544,44 @@ export const THEMES: Theme[] = [
       '#d699b6', // purple
       '#e69875', // orange
       '#d3c6aa', // light
+    ],
+  },
+  {
+    id: 'codex',
+    name: 'Onyx',
+    blurb: 'OpenAI Codex app — near-black, neutral, white primary',
+    vars: {
+      '--bg': '#0d0d0d',
+      '--bg-alt': '#0d0d0d',
+      '--bg-panel': '#1a1a1a',
+      '--bg-input': '#202020',
+      '--bg-hover': '#262626',
+      '--border': '#2e2e2e',
+      '--text': '#ededed',
+      '--text-dim': '#9b9b9b',
+      '--accent': '#ffffff',
+      '--accent-dim': '#333333',
+      '--on-accent': '#0d0d0d',
+      '--danger': '#ff6b6b',
+      '--success': '#3fb27f',
+      '--link': '#7fb0ff',
+      '--thinking': '#c9c9c9',
+      '--provider-openrouter': '#d6d6d6',
+      '--provider-google': '#8fb4e3',
+      '--provider-nvidia': '#9dd6b0',
+      '--provider-cloudflare': '#c9b8e8',
+      '--provider-ollama': '#e0b48a',
+      '--provider-custom': '#a8a8a8',
+    },
+    workspaceColors: [
+      '#ededed', // white
+      '#9b9b9b', // gray
+      '#ff6b6b', // red
+      '#e0b48a', // orange
+      '#d7c59a', // sand
+      '#3fb27f', // green
+      '#7fb0ff', // blue
+      '#c9b8e8', // lilac
     ],
   },
 ]

@@ -13,7 +13,7 @@ import { api } from "../lib/fs";
 import { useVimScroll } from "../lib/useVimScroll";
 import { shouldEnterInsert, shouldLeaveInsert } from "../lib/chatNormalMode";
 import { isPrefixArmed } from "../lib/prefixState";
-import { paneOwner } from "../lib/panePointer";
+import { isEditableTarget, paneOwner } from "../lib/panePointer";
 import { physicalKey } from "../lib/shortcuts";
 import { AutoRetryScheduler, findRetryBannerMessage, resetStreamForRetry, isKeepTextRetry, planRetry, resolveRestartUser, retryRetiredByEvent, shouldIgnoreLateRetryEvent } from "../lib/retry";
 import {
@@ -217,6 +217,7 @@ import { ModeSelect } from "./ModeSelect";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
+import { ChatFindBar } from "./ChatFindBar";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
 import { isFileDrag } from "../lib/fileDrag";
@@ -1894,6 +1895,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     (s) => s.slug || s.name,
   );
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Find-in-chat (Cmd/Ctrl+F, ChatFindBar): the query and case sensitivity
+  // live here so they survive close/reopen; the bar owns the active index
+  // and the highlight paint.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findCase, setFindCase] = useState(false);
+  const findOpenRef = useRef(false);
+  findOpenRef.current = findOpen;
+  const findReturnFocusRef = useRef<HTMLElement | null>(null);
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    // Hand the caret back to whoever had it when the bar opened (the
+    // composer, the transcript) so typing continues where it left off.
+    const back = findReturnFocusRef.current;
+    findReturnFocusRef.current = null;
+    if (back && back.isConnected && panelRef.current?.contains(back)) back.focus({ preventScroll: true });
+    else scrollRef.current?.focus({ preventScroll: true });
+  }, []);
   // Bare j/k scroll the transcript while the chat column is the pane the user
   // is working in (typing in the composer still keeps the letters). The intent
   // boundary is the WHOLE chat panel (panelRef — the composer sits outside
@@ -1949,6 +1968,37 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [])
+  // Cmd/Ctrl+F opens the transcript find bar for the chat window that owns
+  // the keyboard (caret inside it, or the pane intent — WebKit keeps the
+  // caret parked after a transcript click). Surfaces with their own find/UI
+  // — dialogs, settings, the search overlay, the viewer and terminals — are
+  // never stolen from, and an editable outside this panel (sidebar search)
+  // keeps the chord too.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.shiftKey) return;
+      if (!(e.ctrlKey || e.metaKey) || physicalKey(e) !== "f") return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const target = e.target as Node | null;
+      const inPanel = !!target && panel.contains(target);
+      if (!inPanel && (isEditableTarget(target) || paneOwner() !== panel)) return;
+      if (
+        target instanceof Element &&
+        target.closest(
+          '[role="dialog"], .settings-modal, .search-overlay, .viewer-pane, .viewer-split, .terminal-panel, .terminal-tab-panel, .review-overlay, .review-docked-wrap',
+        )
+      )
+        return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (findOpenRef.current) return; // the open bar refocuses its field
+      findReturnFocusRef.current = document.activeElement as HTMLElement | null;
+      setFindOpen(true);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
   const composerRef = useRef<HTMLDivElement>(null);
   // Per-chat scroll restoration: the panel stays mounted across chat
   // switches (no key={activeChatId}), so the restore anchor is refreshed on
@@ -10668,6 +10718,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         </div>
         </div>
 
+        {findOpen && (
+          <ChatFindBar
+            panelRef={panelRef}
+            scrollerRef={scrollRef}
+            query={findQuery}
+            matchCase={findCase}
+            onQueryChange={setFindQuery}
+            onCaseChange={setFindCase}
+            onJump={() => {
+              // Jumping to a match is a user-style scroll: release the
+              // stick-to-bottom pin so streaming can't yank the view back.
+              stickToBottom.current = false;
+            }}
+            onClose={closeFind}
+          />
+        )}
+
       <div ref={composerRef} className="composer">
         {showJump && (
           <button
@@ -11260,17 +11327,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           <div className="composer-input-wrap">
             {historyOpen && (
               // Terminal-style history: oldest on top, newest just above the
-              // bottom, pins (max 3) last at the very bottom. Click / Enter
-              // sends the row directly via submit.
+              // bottom, pins (max 3) last at the very bottom. KEYBOARD ONLY:
+              // ArrowUp/Down move, Enter sends. No mouse handlers on the rows —
+              // a stray hover used to overwrite the draft and a click fired the
+              // prompt, which read as the popup "selecting itself".
               <div className="mention-popup history-popup" dir="ltr" ref={historyPopupRef}>
                 {(() => {
                   const rows = historyRows(promptHistory, pinnedCmds);
                   const pinnedRows = rows.filter((r) => pinnedCmds.includes(r));
                   const recentRows = rows.filter((r) => !pinnedCmds.includes(r));
-                  const insert = (row: string) => {
-                    setHistoryOpen(false);
-                    submit(row);
-                  };
                   const renderCard = (row: string) => {
                     const i = rows.indexOf(row);
                     const pinned = pinnedCmds.includes(row);
@@ -11280,18 +11345,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                     const meta = historyMeta(row);
                     const sub = meta && meta !== title ? meta : null;
                     return (
-                      <div
-                        key={row}
-                        className={`hist-card${i === historyIdx ? " kbd" : ""}`}
-                        onMouseEnter={() => {
-                          setHistoryIdx(i);
-                          setInput(row);
-                        }}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          insert(row);
-                        }}
-                      >
+                      <div key={row} className={`hist-card${i === historyIdx ? " kbd" : ""}`}>
                         <div className="hist-card-head">
                           <span
                             className={`hist-card-icon${slash ? " cmd" : ""}`}

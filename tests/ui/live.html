@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>codifa live test</title>
+    <script>
+      // Same bridge stub as harness.html (see it for the rationale): boots the
+      // REAL App inside a plain browser for live UI testing.
+      (function () {
+        var stub = new Proxy(
+          {},
+          {
+            get: function (target, prop) {
+              if (prop in target) return target[prop];
+              if (typeof prop === 'string' && prop.indexOf('on') === 0) {
+                return function () {
+                  return function () {};
+                };
+              }
+              return function () {
+                return Promise.resolve(null);
+              };
+            },
+          },
+        );
+        stub.probeSidecar = function () {
+          return Promise.resolve(true);
+        };
+        var dataCbs = [];
+        stub.terminalCreate = function () {
+          return Promise.resolve({ id: 'live-pty-1', shell: 'zsh', program: '', cwd: '/tmp' });
+        };
+        stub.terminalWrite = function () { return Promise.resolve(true); };
+        stub.terminalResize = function () { return Promise.resolve(true); };
+        stub.onTerminalData = function (cb) {
+          dataCbs.push(cb);
+          return function () {};
+        };
+        stub.onTerminalExit = function () { return function () {}; };
+        window.coder = stub;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/tests/ui/live.tsx"></script>
+  </body>
+</html>

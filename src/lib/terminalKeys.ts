@@ -24,9 +24,10 @@ const CLOSE_CHORD_KEY = 'w'
 
 /** The second key of the Ctrl+X prefix, as ran inside the terminal: xterm must
  *  NOT send it to the shell, and App.tsx runs the chord with it (`j` toggles
- *  the terminal panel). Declared here so the guard stays the single source of
- *  what the shell never sees. `v` toggles the live voice session. */
-export const PREFIX_SECOND_KEYS = ['j', 'u', 'r', 'c', 'v', ' '] as const
+ *  the terminal panel, `[`/`]` cycle the terminal tabs). Declared here so the
+ *  guard stays the single source of what the shell never sees. `v` toggles the
+ *  live voice session. */
+export const PREFIX_SECOND_KEYS = ['j', 'u', 'r', 'c', 'v', ' ', '[', ']'] as const
 
 export interface TerminalChordEvent {
   type: string

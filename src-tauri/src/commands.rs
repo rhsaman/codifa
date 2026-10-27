@@ -1469,6 +1469,18 @@ pub fn secrets_get_key(app: AppHandle) -> String {
     crate::secrets::get_secrets_key(&app)
 }
 
+// --- restart (Settings → Storage → Restore) ----------------------------------
+
+/// Restart the whole app: the only way every reader (renderer store, skills
+/// router, MCP index, caches) re-loads data a restore just wrote to disk. Goes
+/// through the normal exit events, so the quit-flush handshake runs — but the
+/// renderer suspends persistence when the restore starts, so that flush cannot
+/// clobber the restored files with the stale pre-restore state.
+#[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    app.request_restart();
+}
+
 // --- open external ----------------------------------------------------------
 
 #[tauri::command]

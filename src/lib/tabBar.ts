@@ -72,6 +72,69 @@ export function edgeScroll(
   return 0;
 }
 
+/** Visual flow direction of a bar: +1 when array order renders left→right
+ *  (a ltr flex row), −1 when it renders right→left (rtl). Slide transforms
+ *  are physical, so a slide of one ARRAY slot must be mirrored in rtl. */
+export function barFlowSign(bar: HTMLElement): 1 | -1 {
+  try {
+    return getComputedStyle(bar).direction === "rtl" ? -1 : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** Slide distance for one slot: the dragged tab's outer width plus the bar's
+ *  flex gap — exactly the hole the dragged tab leaves behind. */
+export function slideWidth(dragged: HTMLElement, bar: HTMLElement): number {
+  const w = dragged.getBoundingClientRect().width;
+  let gap = 0;
+  try {
+    const cs = getComputedStyle(bar);
+    gap = parseFloat(cs.columnGap || cs.gap || "") || 0;
+  } catch {
+    /* keep 0 */
+  }
+  return w + gap;
+}
+
+export interface TabExtent {
+  id: string;
+  left: number;
+  right: number;
+}
+
+/** Which tab a drop lands on, from the pointer x and the tabs' PHYSICAL
+ *  extents: the tab under the pointer (side = which half), else — over a gap
+ *  or the empty space past the ends — the nearest tab by center. `sign` is
+ *  the bar's flow direction, so "after" stays array-order-correct in rtl bars
+ *  (a drop on a tab's right half is AFTER it in ltr, BEFORE it in rtl).
+ *  This replaces the old "only the space past the tail drops at the end"
+ *  rule, which left every inter-tab gap a dead drop zone. */
+export function tabForPoint(
+  tabs: TabExtent[],
+  x: number,
+  sign: 1 | -1 = 1,
+): { id: string; after: boolean } | null {
+  if (tabs.length === 0) return null;
+  const sideOf = (t: TabExtent) => {
+    const after = x > (t.left + t.right) / 2;
+    return sign === 1 ? after : !after;
+  };
+  for (const t of tabs) {
+    if (x >= t.left && x <= t.right) return { id: t.id, after: sideOf(t) };
+  }
+  let best = tabs[0];
+  let bestDist = Infinity;
+  for (const t of tabs) {
+    const d = Math.abs(x - (t.left + t.right) / 2);
+    if (d < bestDist) {
+      bestDist = d;
+      best = t;
+    }
+  }
+  return { id: best.id, after: sideOf(best) };
+}
+
 /** Where a fixed dropdown anchored to a trigger opens. "bottom" keeps the
  *  trigger's own left edge; "left" flips the menu toward the window's left,
  *  for triggers hugging the right edge (vertical pane rail). */

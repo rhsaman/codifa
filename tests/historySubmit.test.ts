@@ -1,6 +1,7 @@
-// Contract: history popup rows send directly via submit (no setInput-only path).
-// Click / Enter / Tab on a history row must call submit(row), so picking a
-// past prompt re-sends it instead of only filling the composer.
+// Contract: history popup rows are KEYBOARD-ONLY. Enter/Tab send the picked
+// row via submit; the mouse has NO effect on the rows — no hover fill, no
+// click-to-send (a stray hover used to overwrite the draft and a click fired
+// the prompt). Only the pin button stays mouse-operable.
 // Run: npx esbuild tests/historySubmit.test.ts --bundle --platform=node
 //        --format=esm --packages=external --external:electron
 //        --outfile=tests/.tmp-history-submit.mjs && node tests/.tmp-history-submit.mjs
@@ -28,12 +29,13 @@ check(
   ),
 );
 
-// Click insert sends the row directly (no setInput-only insert path).
+// The mouse insert path is gone: no `insert` closure, no mouse handlers on
+// the history rows.
 check(
-  "history insert calls submit(row)",
-  /const insert = \(row: string\) => \{\s*setHistoryOpen\(false\);\s*submit\(row\);\s*\};/.test(
-    src,
-  ),
+  "history rows are keyboard-only (no mouse insert path)",
+  !src.includes("const insert = (row: string)") &&
+    !/onMouseEnter=\{\(\) => \{\s*setHistoryIdx\(i\);/.test(src) &&
+    !/onMouseDown=\{\(e\) => \{\s*e\.preventDefault\(\);\s*insert\(row\);/.test(src),
 );
 
 // No leftover setInput-only insert path for history rows.

@@ -4,7 +4,7 @@
 // اجرا: npx esbuild src/lib/shortcuts.test.ts --bundle --platform=node \
 //        --format=esm --outfile=src/lib/.tmp-shortcuts.mjs && node src/lib/.tmp-shortcuts.mjs
 
-import { navChord, panelToggleTarget, prefixMoveDir, isWindowMoveChord, shouldFocusSearch, PREFIX_SHORTCUTS } from "./shortcuts"
+import { navChord, panelToggleTarget, physicalKey, prefixMoveDir, isWindowMoveChord, shouldFocusSearch, PREFIX_KEY, PREFIX_SHORTCUTS } from "./shortcuts"
 import { PREFIX_SECOND_KEYS } from "./terminalKeys"
 import { pickNeighborByRect } from "./chatTree"
 import type { PrefixMoveDir } from "./shortcuts"
@@ -122,15 +122,17 @@ console.log('۶) isWindowMoveChord — کورد مستقیم Cmd/Ctrl + H/J/K/L:
   check('Ctrl+X → null (پیشوند جدا)', isWindowMoveChord(chord('x', 'KeyX', { ctrl: true })) === null)
 }
 
-console.log('۷) کلید دوم پیشوند — فقط j=ترمینال:')
+console.log('۷) کلید دوم پیشوند — j=ترمینال، h/l=پرش سکشن، براکت‌ها=تب ترمینال:')
 {
-  // پیشوند Ctrl+X فقط `j` را به ترمینال می‌دهد؛ هیچ کلید حرکتی در پیشوند
-  // نمانده (حرکت پنجره‌ها فقط با کورد مستقیم Ctrl+H/J/K/L است).
+  // حرکت بین پنجره‌های چت فقط با کورد مستقیم Ctrl+H/J/K/L است؛ در پیشوند،
+  // h/l پرش بین سه سکشن‌اند (سایدبار ↔ چت‌ها ↔ پنل راست) و j ترمینال را
+  // می‌زند. k هیچ کاری در پیشوند ندارد.
   check('j → terminal', PREFIX_SHORTCUTS['j']?.action === 'terminal')
   check('k کلید دوم دستور نیست', PREFIX_SHORTCUTS['k'] === undefined)
-  check('h کلید دوم دستور نیست', PREFIX_SHORTCUTS['h'] === undefined)
-  check('l کلید دوم دستور نیست', PREFIX_SHORTCUTS['l'] === undefined)
-  // ترمینال هم نباید h/k/l را به‌عنوان کلید دوم پیشوند بلعد؛ فقط j می‌ماند.
+  check('h → پرش سکشن چپ', PREFIX_SHORTCUTS['h']?.action === 'pane-left')
+  check('l → پرش سکشن راست', PREFIX_SHORTCUTS['l']?.action === 'pane-right')
+  // ترمینال هم نباید h/k/l را به‌عنوان کلید دوم پیشوند بلعد؛ فقط j و براکت‌ها
+  // و کلیدهای صوتی/undo می‌مانند.
   const second: readonly string[] = PREFIX_SECOND_KEYS
   check('ترمینال: j کلید دوم پیشوند است', second.includes('j'))
   check('ترمینال: h/k/l کلید دوم پیشوند نیستند', !second.includes('h') && !second.includes('k') && !second.includes('l'))
@@ -182,6 +184,25 @@ console.log('۸) جهت هر کلید — همان جهت ویم، مستقل ا
   check('شبکه BR: h → BL', step('h', grid, 'BR') === 'BL')
   check('شبکه TR: h → TL', step('h', grid, 'TR') === 'TL')
   check('شبکه BL: k → TL', step('k', grid, 'BL') === 'TL')
+}
+
+console.log('۹) کلیدهای فیزیکی براکت — چرخه تب ترمینال با Ctrl+X [ / ]:')
+{
+  // physicalKey باید براکت‌ها را از `e.code` بسازد تا کورد روی چیدمان‌های
+  // غیرلاتین (فارسی و…) هم کار کند — e.key روی آن‌ها نویسهٔ بومی می‌دهد.
+  check('BracketLeft → [', physicalKey({ code: 'BracketLeft', key: 'ﮊ' }) === '[')
+  check('BracketRight → ]', physicalKey({ code: 'BracketRight', key: 'ﮈ' }) === ']')
+  check('latin key هم‌خوان است', physicalKey({ code: 'BracketLeft', key: '[' }) === '[')
+  check('کلید پیشوند دست‌نخورده', physicalKey({ code: 'KeyX', key: 'خ' }) === 'x' && PREFIX_KEY === 'x')
+  // ثبت کورد در جدول پیشوند + گارد ترمینال.
+  check('[ → terminal-prev', PREFIX_SHORTCUTS['[']?.action === 'terminal-prev')
+  check('] → terminal-next', PREFIX_SHORTCUTS[']']?.action === 'terminal-next')
+  const second: readonly string[] = PREFIX_SECOND_KEYS
+  check('براکت‌ها کلید دوم پیشوند داخل ترمینال‌اند', second.includes('[') && second.includes(']'))
+  // هر action باید در اپ وایر شده باشد — یک تایپو بی‌صدا کورد را می‌بلعد.
+  const known = new Set(['voice', 'live', 'terminal', 'pane-left', 'pane-right', 'terminal-focus', 'terminal-next', 'terminal-prev'])
+  const unknown = Object.values(PREFIX_SHORTCUTS).filter((s) => s.action && !known.has(s.action))
+  check('همهٔ actionها وایر شده‌اند', unknown.length === 0, unknown)
 }
 
 if (failed > 0) {

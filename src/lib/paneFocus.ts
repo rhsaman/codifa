@@ -75,30 +75,43 @@ export function activePane(): AppPane {
  *  the panels already expose; the terminal is asked over an event because its
  *  xterm handles live inside the component.
  *
- *  Every landing also FIRES THE FOCUS RING (src/lib/paneFlash.ts): a pane
- *  without a visible caret gives no feedback at all, so the ring is what makes
- *  `Ctrl+X h/l/j/k` readable — "I am now HERE". */
-export function focusAppPane(pane: AppPane): void {
+ *  The FOCUS RING (src/lib/paneFlash.ts) is opt-in via `{ ring: true }` and
+ *  only the explicit Ctrl+X pane jumps pass it. Every other arrival — opening
+ *  or closing the sidebar/right pane from a button, Ctrl+B, or a store action —
+ *  must land SILENTLY: a ring on a mere toggle reads as a stray border flash.
+ */
+export function focusAppPane(pane: AppPane, opts?: { ring?: boolean }): void {
   if (typeof document === 'undefined') return
+  const ring = opts?.ring === true
   if (pane === 'terminal') {
     useStore.getState().setTerminalPanelOpen(true)
-    // Flash the BOTTOM panel as soon as it mounts (one rAF is enough here:
-    // the panel is a plain conditional render, not a lazy chunk).
-    requestAnimationFrame(() => {
-      flashPaneFocus(document.querySelector<HTMLElement>('.terminal-panel, .terminal-tab-panel'))
-    })
+    // Flash the BOTTOM panel once it mounts. The commit can land a frame or
+    // two after `setTerminalPanelOpen` (concurrent rendering), so probe
+    // briefly instead of betting on one rAF.
+    if (ring) {
+      let ringTries = 0
+      const ringWhenMounted = () => {
+        const el = document.querySelector<HTMLElement>('.terminal-panel, .terminal-tab-panel')
+        if (el) flashPaneFocus(el)
+        else if (ringTries++ < 20) requestAnimationFrame(ringWhenMounted)
+      }
+      requestAnimationFrame(ringWhenMounted)
+    }
     window.dispatchEvent(new CustomEvent('coder:focus-terminal'))
     return
   }
   if (pane === 'viewer') {
     useViewerTabs.getState().setPaneOpen(true)
-    // The pane's panels each bring their own focusable control, so land on the
-    // first one there is; the scroll body is the last resort, and is made
-    // focusable on demand so the bare scroll keys reach its handler.
+    // The caret lands in the PAGE BODY, never on the pane's tab strip: the
+    // first-focusable probe used to grab the strip's buttons (the tab list
+    // chevron, a tab row), which read as "the tabs are focused" on every page
+    // but the terminal. The content host is focused on demand (tabindex=-1,
+    // same element a mouse click focuses — see App.tsx) so the pane's own
+    // scroll keys reach their handler.
     // RETRY: `setPaneOpen` just flipped a store flag — the section mounts on
     // the NEXT React commit. One frame is not always enough (a cold lazy()
     // chunk loads async), and a silent miss reads as "the key did nothing":
-    // keep probing briefly, then land on whatever exists first.
+    // keep probing briefly, then land.
     let tries = 0
     const land = () => {
       const root = document.querySelector<HTMLElement>('.viewer-pane-body, .viewer-split, .viewer-pane')
@@ -107,21 +120,18 @@ export function focusAppPane(pane: AppPane): void {
         return
       }
       // A TERMINAL tab owns the pane: the caret must land in its xterm. The
-      // generic probe below picks the first focusable control instead, which in a
-      // terminal tab is a button of its tab strip — the pane got the ring but
-      // typing went nowhere. The session is mounted a commit or two after the
-      // pane opens, so wait for it the same way the pane itself is awaited.
-      // Decided from the DOM, not from store bookkeeping: whatever terminal is
-      // PAINTED in the pane gets the focus. The check after focus() matters too —
-      // a refused focus must not count as arrival (the pane was ringed while the
-      // xterm cursor stayed hollow, i.e. unfocused).
+      // session is mounted a commit or two after the pane opens, so wait for it
+      // the same way the pane itself is awaited. Decided from the DOM, not from
+      // store bookkeeping: whatever terminal is PAINTED in the pane gets the
+      // focus. The check after focus() matters too — a refused focus must not
+      // count as arrival.
       const termHost = root.querySelector<HTMLElement>('.terminal-tab-panel')
       if (termHost) {
         const input = termHost.querySelector<HTMLElement>('.xterm-helper-textarea')
         if (input) {
           input.focus({ preventScroll: true })
           if (document.activeElement === input) {
-            flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || root)
+            if (ring) flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || root)
             return
           }
         }
@@ -135,11 +145,17 @@ export function focusAppPane(pane: AppPane): void {
           active: document.activeElement?.tagName,
         })
       }
-      const focusable = root.querySelector<HTMLElement>(
-        'input:not([type="hidden"]), textarea, button, [tabindex]:not([tabindex="-1"])',
-      )
-      if (focusable) {
-        focusable.focus({ preventScroll: true })
+      // Every other page: the pane CONTENT body. Single pane = `.viewer-content`
+      // (the host App.tsx also focuses on click); a split tree = the focused
+      // leaf's body. Falling back to the pane root keeps the keys working even
+      // when neither host exists yet.
+      const body =
+        document.querySelector<HTMLElement>('.viewer-pane-body > .viewer-content') ||
+        root.querySelector<HTMLElement>('.viewer-window.focused .viewer-window-body') ||
+        root.querySelector<HTMLElement>('.viewer-window-body')
+      if (body) {
+        if (!body.hasAttribute('tabindex')) body.setAttribute('tabindex', '-1')
+        body.focus({ preventScroll: true })
       } else {
         if (!root.hasAttribute('tabindex')) root.setAttribute('tabindex', '-1')
         root.focus({ preventScroll: true })
@@ -150,25 +166,21 @@ export function focusAppPane(pane: AppPane): void {
         '.file-viewer, .review-docked-wrap, .review-overlay, .text-viewer',
       )
       if (paneRoot) markVimRegion(paneRoot)
-      // The ring wraps the WHOLE right pane (`.viewer-group`, the same element
-      // a mouse press rings — see App.tsx), not the control the caret landed
-      // on: a toolbar button would flash one pixel of chrome.
-      flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || paneRoot || root)
+      if (ring) flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || root)
     }
     requestAnimationFrame(land)
     return
   }
   if (pane === 'sidebar') {
     focusSidebar()
-    flashPaneFocus(document.querySelector<HTMLElement>('.sidebar'))
+    if (ring) flashPaneFocus(document.querySelector<HTMLElement>('.sidebar'))
     return
   }
   const chatId = useStore.getState().activeChatId
   if (chatId) focusChatInput(chatId)
-  // The window wrap (`.chat-window`) flashes, not the composer: the ring must
+  // The window wrap (`.chat-window`) rings, not the composer: the ring must
   // show "this chat is active", and wrap the transcript too.
-  const win = chatId
-    ? document.querySelector<HTMLElement>(`[data-chat-window="${CSS.escape(chatId)}"]`)
-    : null
-  flashPaneFocus(win)
+  if (ring && chatId) {
+    flashPaneFocus(document.querySelector<HTMLElement>(`[data-chat-window="${CSS.escape(chatId)}"]`))
+  }
 }

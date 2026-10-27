@@ -169,6 +169,20 @@ export function Sidebar() {
   // grouping, search) mounts when open and unmounts only AFTER the close
   // animation, so the collapse never flashes an empty strip.
   const open = useStore((s) => s.sidebarOpen);
+  // Animated open/close: the aside stays MOUNTED so the width+fade transition
+  // runs in BOTH directions; the heavy content (all chat subscriptions,
+  // grouping, search) unmounts only after the close transition, so the
+  // collapse never flashes an empty strip. The arrival ring is NOT part of
+  // this — opening/closing lands silently (rings ride on Ctrl+X hops only).
+  const [contentMounted, setContentMounted] = useState(open);
+  useEffect(() => {
+    if (open) {
+      setContentMounted(true);
+      return;
+    }
+    const t = window.setTimeout(() => setContentMounted(false), 300);
+    return () => window.clearTimeout(t);
+  }, [open]);
   // Sidebar width lives HERE (the shell owns the aside); the content only
   // receives the drag handler. Previously the width sat below the shell,
   // which produced a nested .sidebar whose fixed var() width clipped the
@@ -216,22 +230,19 @@ export function Sidebar() {
     window.addEventListener("mouseup", onUp);
     sidebarDragCleanup.current = onUp;
   };
-  // No open/close animation on purpose: the width transition left WebKit
-  // painting the focused chat window's border at stale geometry, so the
-  // sidebar mounts/unmounts instantly instead.
-  if (!open) return null;
   return (
     <aside
-      className="sidebar"
+      className={"sidebar" + (open ? "" : " closed")}
+      aria-hidden={!open}
       style={
         {
-          flexBasis: sidebarWidth,
-          width: sidebarWidth,
+          flexBasis: open ? sidebarWidth : 0,
+          width: open ? sidebarWidth : 0,
           "--sidebar-w": `${sidebarWidth}px`,
         } as React.CSSProperties
       }
     >
-      <SidebarContent onResizeStart={startSidebarResize} />
+      {contentMounted ? <SidebarContent onResizeStart={startSidebarResize} /> : null}
     </aside>
   );
 }

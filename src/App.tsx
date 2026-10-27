@@ -16,7 +16,7 @@ import { Sidebar } from './components/Sidebar'
 import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
-import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
+import { clampSplitWidth, cycleTerminalTabs, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
 import { ViewerAddButton, ViewerDockBar, ViewerPaneFullscreenButton, ViewerPaneToggleButton, ViewerTabListButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
@@ -30,7 +30,6 @@ import { focusChatInput } from './lib/chatFocus'
 import { activePane, focusAppPane } from './lib/paneFocus'
 import { cyclePane } from './lib/paneCycle'
 import { paneOwner, snapshotIntent } from './lib/panePointer'
-import { flashOnEnter, flashPaneFocus } from './lib/paneFlash'
 import { applyInputSuppression } from './lib/inputSuppress'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
 import { UpdateButton } from './components/UpdateButton'
@@ -125,6 +124,21 @@ export default function App() {
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
   const chatFull = useStore((s) => s.chatFullscreen)
+  // Animated open/close for the right pane — same shape as the sidebar: the
+  // section itself STAYS MOUNTED (a fresh node would skip its first transition,
+  // so remounting could never animate the open) and only its inline width
+  // animates 0 ↔ splitW; the heavy content (ViewerWindows) mounts when open
+  // and unmounts after the close transition. Opening/closing lands silently —
+  // rings ride on Ctrl+X hops.
+  const [paneContentMounted, setPaneContentMounted] = useState(paneOpen)
+  useEffect(() => {
+    if (paneOpen) {
+      setPaneContentMounted(true)
+      return
+    }
+    const t = window.setTimeout(() => setPaneContentMounted(false), 320)
+    return () => window.clearTimeout(t)
+  }, [paneOpen])
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
@@ -172,24 +186,6 @@ export default function App() {
   // so the window listener reads the latest state without re-subscribing.
   const prefixActiveRef = useRef(false)
   const prefixTimerRef = useRef<number | null>(null)
-
-  // Focus ring for the MOUSE: pressing inside a chat window, the right panel
-  // or the sidebar rings that pane once, exactly like the keyboard jumps do
-  // (src/lib/paneFlash.ts). A press inside the pane that already holds the
-  // ring does nothing, so typing/clicking in the composer never re-flashes.
-  useEffect(() => {
-    const paneOf = (t: EventTarget | null): HTMLElement | null => {
-      const el = t instanceof Element ? t : null
-      if (!el) return null
-      if (el.closest('[role="dialog"], .settings-modal, .search-overlay')) return null
-      return (el.closest('[data-chat-window]') ||
-        el.closest('.viewer-group') ||
-        el.closest('.sidebar')) as HTMLElement | null
-    }
-    const onDown = (e: PointerEvent) => flashOnEnter(paneOf(e.target))
-    window.addEventListener('pointerdown', onDown, true)
-    return () => window.removeEventListener('pointerdown', onDown, true)
-  }, [])
 
   useEffect(() => {
     const openSearch = () => setSearchOpen(true)
@@ -360,11 +356,7 @@ export default function App() {
       const next = pickNeighborByRect(rects, st.activeChatId, dir)
       if (next && next !== st.activeChatId) {
         st.focusWindow(next)
-        requestAnimationFrame(() => {
-          focusChatInput(next)
-          // The ring says "you are now HERE" — same cue as a mouse press.
-          flashPaneFocus(document.querySelector<HTMLElement>(`[data-chat-window="${CSS.escape(next)}"]`))
-        })
+        requestAnimationFrame(() => focusChatInput(next))
       }
       // No neighbour on that side: consume the chord, move nothing. The panes
       // beyond the edges are reached through the Ctrl+X prefix, never here.
@@ -418,12 +410,21 @@ export default function App() {
               if (next === 'sidebar' && !useStore.getState().sidebarOpen) {
                 useStore.getState().setSidebarOpen(true)
               }
-              focusAppPane(next)
+              // The arrival ring fires HERE and nowhere else: opening/closing
+              // the sidebar or the pane (buttons, Ctrl+B, store actions) and
+              // mouse presses never flash — only an explicit Ctrl+X jump does.
+              focusAppPane(next, { ring: true })
             }
           } else if (sc.action === 'terminal-focus') {
             // Ctrl+X then T: the caret lands in the bottom terminal (opening
             // the panel first) — no toggle, so it never hides the panel.
-            focusAppPane('terminal')
+            focusAppPane('terminal', { ring: true })
+          } else if (sc.action === 'terminal-next' || sc.action === 'terminal-prev') {
+            // Ctrl+X then ] / [: cycle the TERMINAL tabs — right-pane terminal
+            // tabs (revealing the pane if closed), falling back to the bottom
+            // panel's shells when the pane has none. Works while the caret is
+            // inside a terminal too: the consumed key never reaches the shell.
+            cycleTerminalTabs(sc.action === 'terminal-next' ? 1 : -1)
           } else {
             window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
           }
@@ -756,9 +757,9 @@ export default function App() {
                 <ChatWindows />
               </main>
             </section>
-            {paneOpen && !chatFull && (
+            {!chatFull && (
               <>
-                {!viewerFull && (
+                {!viewerFull && paneOpen && (
                   <div
                     className="dock-resize-handle"
                     title="Drag to resize"
@@ -766,9 +767,9 @@ export default function App() {
                   />
                 )}
                 <section
-                  className="viewer-group"
+                  className={"viewer-group" + (paneOpen ? "" : " closing")}
                   style={
-                    viewerFull
+                    viewerFull && paneOpen
                       ? {
                           display: "flex",
                           flexDirection: "column",
@@ -777,8 +778,15 @@ export default function App() {
                           overflow: "hidden",
                         }
                       : ({
-                          flexBasis: splitW,
-                          width: splitW,
+                          /* The width animates 0 ↔ splitW on the persistent
+                             section; closed it rests at 0 (invisible, inert).
+                             max-width rides along INLINE: the stylesheet's
+                             min(50%, …) cap would otherwise clamp the first
+                             ~40% of the close transition into a visible
+                             plateau (width stuck, then a sudden drop). */
+                          flexBasis: paneOpen ? splitW : 0,
+                          width: paneOpen ? splitW : 0,
+                          maxWidth: paneOpen ? splitW : undefined,
                           display: "flex",
                           flexDirection: "column",
                           minHeight: 0,
@@ -825,18 +833,26 @@ export default function App() {
                       // pane-scoped chords (Ctrl+M) misfire. Give the pane
                       // host the caret — unless the click already landed on
                       // something that takes focus of its own (a button, the
-                      // xterm textarea, the find box).
+                      // find box, an xterm screen). xterm manages its own
+                      // focus: its mousedown handler focuses the hidden
+                      // textarea, but the click TARGET is the canvas, so the
+                      // target-based editable probe below can never see it —
+                      // excluding `.xterm` here is what keeps a pane-terminal
+                      // click from having its caret stolen right back.
                       onMouseDown={(e) => {
                         const t = e.target as HTMLElement | null
                         if (t?.closest?.(
-                          'input, textarea, select, button, a, [contenteditable="true" i], [tabindex]:not([tabindex="-1"])',
+                          'input, textarea, select, button, a, [contenteditable="true" i], [tabindex]:not([tabindex="-1"]), .xterm',
                         )) return
                         viewerContentRef.current?.focus({ preventScroll: true })
                       }}
                     >
-                      <ViewerWindows />
+                      {paneContentMounted ? <ViewerWindows /> : null}
                     </div>
-                    <ViewerDockBar />
+                    {/* The dock rides the CONTENT mount (not paneOpen): it
+                        stays through the close fade instead of vanishing
+                        under a still-collapsing pane. */}
+                    {paneContentMounted ? <ViewerDockBar /> : null}
                   </div>
                 </section>
               </>

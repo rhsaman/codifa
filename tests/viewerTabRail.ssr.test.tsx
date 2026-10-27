@@ -140,7 +140,9 @@ console.log("2) markup + CSS keep the strip on top and the dock at the bottom:")
   const barSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
   check(
     "drag/keyboard reordering runs on the horizontal axis",
-    /dropSide\(e\.clientX, rect, "x"\)/.test(barSrc) && /tabMove\(.*"x"\)/.test(barSrc),
+    // Pointer reorder goes through the geometric tabForPoint (clientX against
+    // tab extents); keyboard reorder stays Alt+Arrow on the "x" axis.
+    /tabForPoint\(/.test(barSrc) && /tabMove\(.*"x"\)/.test(barSrc),
   )
   // Every strip tab shows one ✕ of its own: closing a tab never switches to it.
   check(

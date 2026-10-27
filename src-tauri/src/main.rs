@@ -203,6 +203,9 @@ fn main() {
             // backup (Settings → Storage)
             backup::create_backup,
             backup::cancel_backup,
+            backup::backup_info,
+            backup::restore_backup,
+            commands::restart_app,
             // local backend endpoint (native router port)
             commands::sidecar_url,
             commands::sidecar_probe,

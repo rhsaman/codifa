@@ -148,6 +148,17 @@ export interface CoderApi {
   onBackupProgress(
     cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
   ): () => void
+  /** Reads a backup archive's manifest without extracting — also the validator
+   *  that refuses non-codifa zips before a restore can start. */
+  backupInfo(path: string): Promise<{ created: string; files: number; bytes: number; version: string; dataRoot: string }>
+  /** Restores an archive over the data root (staged: a failure leaves the
+   *  current data untouched). The app must restart afterwards to re-load it. */
+  restoreBackup(path: string): Promise<{ files: number; elapsedMs: number }>
+  onRestoreProgress(
+    cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
+  ): () => void
+  /** Full app restart (relaunch) — applies a completed restore. */
+  restartApp(): Promise<void>
   checkForUpdates(): Promise<UpdateInfo>
   startUpdate(): Promise<OpResult>
   onUpdateProgress(cb: (p: UpdateProgress) => void): () => void

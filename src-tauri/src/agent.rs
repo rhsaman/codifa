@@ -1428,6 +1428,42 @@ pub fn caps_for_mode(mode: &str) -> ToolCaps {
     }
 }
 
+/// Whether this tool call edits an EXISTING skill/connector (vs creating a new
+/// one), and if so its kind, name and folder on disk. The tools.rs handlers
+/// return only a string, so the agent loop must ask the store BEFORE the call
+/// and emit the `EditTarget` badge event only when the dispatch succeeds. A
+/// delete or a first-ever create pins nothing.
+fn edit_target_of(
+    tool: &str,
+    args: &Value,
+    store: &std::path::Path,
+) -> Option<(String, String, String)> {
+    match tool {
+        "create_skill" => {
+            if args["delete"].as_bool().unwrap_or(false) {
+                return None;
+            }
+            let nm = args["name"].as_str().unwrap_or("").trim().to_string();
+            let prev = args["previous_name"].as_str().unwrap_or("").trim().to_string();
+            let dir = crate::plugins::skill_update_dir(store, &nm)
+                .or_else(|| crate::plugins::skill_update_dir(store, &prev))?;
+            let name_out = if nm.is_empty() { prev } else { nm };
+            if name_out.is_empty() {
+                return None;
+            }
+            Some(("skill".into(), name_out, dir.to_string_lossy().to_string()))
+        }
+        "create_mcp" => {
+            let nm = args["name"].as_str().unwrap_or("").trim().to_string();
+            let prev = args["previous_name"].as_str().unwrap_or("").trim().to_string();
+            let (slug, dir) = crate::plugins::connector_update_target(store, args, &nm, &prev)?;
+            let name_out = if nm.is_empty() { slug } else { nm };
+            Some(("mcp".into(), name_out, dir.to_string_lossy().to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// The refusal text when this turn's capabilities forbid `name`, else `None`.
 /// Phrased like the other in-loop refusals: one plain sentence the model can act
 /// on, no "Error:" prefix (the card already renders failure from `ok`).
@@ -2395,6 +2431,17 @@ pub enum AgentEvent {
         /// plain document; the panel serves them to the sandboxed frame.
         assets: Vec<String>,
     },
+    /// An UPDATE landed on a plugin/skill/connector/artifact: the renderer pins
+    /// an "editing" badge above the composer so follow-up messages keep
+    /// targeting the same folder (Build mode, rooted there) without the user
+    /// repeating the update command. Emitted ONLY for updates — a fresh
+    /// create/install announces itself once and pins nothing.
+    EditTarget {
+        target: String,
+        action: String,
+        name: String,
+        path: String,
+    },
 }
 
 impl AgentEvent {
@@ -2417,6 +2464,10 @@ impl AgentEvent {
             }),
             AgentEvent::Warn { content } => json!({"kind": "warn", "content": content}),
             AgentEvent::McpLoaded { servers } => json!({"kind": "mcp_loaded", "servers": servers}),
+            AgentEvent::EditTarget { target, action, name, path } => json!({
+                "kind": "edit_target", "target": target, "action": action,
+                "name": name, "path": path,
+            }),
             AgentEvent::Usage { input_tokens, output_tokens, cache_read_tokens, model, provider_id, sub, context_tokens, context_window, reasoning_chars } => json!({
                 "kind": "usage", "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -2830,7 +2881,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "id": {"type": "string", "description": "Needed for update/toggle/delete"},
                 "name": {"type": "string"},
                 "prompt": {"type": "string", "description": "What the run should do"},
-                "cron": {"type": "string", "description": "5-field UTC cron; empty = run once"},
+                "cron": {"type": "string", "description": "5-field cron in the machine's LOCAL time; empty = run once"},
                 "enabled": {"type": "boolean", "description": "toggle: value to set; omit to flip"},
                 "root": {"type": "string", "description": "Workspace root the run works in"},
                 "mode": {"type": "string"},
@@ -3910,6 +3961,12 @@ pub async fn run_turn(
     // and the explore prompt forbids it, yet a traced run re-read three files
     // in round 3 that round 1 had returned and repeated a refused grep.
     let mut seen_lookups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Files read or path-scoped-grepped EARLIER IN THIS STEP — the batch phase
+    // always runs before the sequential writers, so a writer landing on one of
+    // these has just invalidated the copy the model is quoting (traced: 4
+    // failed edits off one pre-edit grep, run=106). Stamped via
+    // `POST_EDIT_STALE_NOTE` below.
+    let mut step_read_files: Vec<String> = Vec::new();
     // The turn's out-of-workspace reach: the renderer's own grants, WIDENED in
     // place whenever the user approves a new folder below. Built once, OUTSIDE
     // the step loop, so a grant given in round 3 is not asked for again in
@@ -3985,6 +4042,11 @@ pub async fn run_turn(
         // Client disconnect (Stop button closes the SSE stream) flips the
         // cancel flag — bail out instead of burning provider tokens.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            // The cancel flag is raised by Stop OR by the router noticing the SSE
+            // receiver is gone; the renderer cannot tell the two apart, so log it.
+            if req.mode != "subagent" {
+                eprintln!("[turn-end] chat={} cancel flag set before step {}", req.chat_id, step + 1);
+            }
             // A steer that arrived together with the Stop still belongs to the
             // user: hand it back so the renderer re-sends it as the next turn.
             drop_steers(&req.chat_id, emit);
@@ -4698,6 +4760,21 @@ the Vision model's description instead.\n"
                     continue;
                 }
             }
+            // A turn that ends HERE ends because the model answered with no tool
+            // call. Say so in the log, with what the model last said: a turn that
+            // stops mid-work with no error is otherwise indistinguishable from a
+            // finished one, and this line is the only evidence of which it was.
+            if req.mode != "subagent" {
+                let tail: String = text.trim().chars().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect();
+                eprintln!(
+                    "[turn-end] chat={} step={} finish_reason={:?} reasoning_chars={} reply_tail={:?}",
+                    req.chat_id,
+                    step + 1,
+                    acc.finish_reason,
+                    acc.reasoning_len,
+                    tail
+                );
+            }
             emit(&AgentEvent::Done { aborted: false });
             return Ok(());
         }
@@ -4824,6 +4901,21 @@ the Vision model's description instead.\n"
                 }
             } else {
                 sequential.push((id.clone(), name.clone(), raw_args.clone()));
+            }
+        }
+        // Same-step reader targets for the STALE-SOURCE note: readers run in
+        // the batch phase BEFORE the sequential writers, so this Vec is the
+        // exact set whose returned text a writer below just invalidated.
+        for (_, rname, rargs) in &batch {
+            if let Some(f) = match rname.as_str() {
+                "read" => rargs["filePath"].as_str().map(str::to_string),
+                "grep" => rargs["path"]
+                    .as_str()
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+                _ => None,
+            } {
+                step_read_files.push(f);
             }
         }
         if !batch.is_empty() {
@@ -5083,6 +5175,9 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 // Stop mid-batch: the remaining tools are skipped, so anything
                 // the user steered while they ran has no step left to ride on.
+                if req.mode != "subagent" {
+                    eprintln!("[turn-end] chat={} cancel flag set mid-batch", req.chat_id);
+                }
                 drop_steers(&req.chat_id, emit);
                 emit(&AgentEvent::Done { aborted: true });
                 return Ok(());
@@ -5246,7 +5341,36 @@ on disk, which this mode does not allow. Switch to Build mode to run it."
                         permit.as_ref(),
                         Some(&skill_root),
                     ) {
-                        Ok(r) => (r, true),
+                        Ok(r) => {
+                            // Only an UPDATE pins the badge: a fresh install or
+                            // create announces itself once and is done — the
+                            // user never keeps working on what they merely built.
+                            if action == "update" {
+                                let data_root = if req.data_root.trim().is_empty() {
+                                    native_data_root()
+                                } else {
+                                    req.data_root.clone()
+                                };
+                                let store = std::path::Path::new(&data_root);
+                                let slug = crate::plugins::plugin_ref(&args);
+                                let pin_name = {
+                                    let n = args["name"].as_str().unwrap_or("").trim();
+                                    if n.is_empty() {
+                                        slug.clone()
+                                    } else {
+                                        n.to_string()
+                                    }
+                                };
+                                let dir = crate::plugins::plugin_dir_pub(store, &slug);
+                                emit(&AgentEvent::EditTarget {
+                                    target: "plugin".into(),
+                                    action: action.clone(),
+                                    name: pin_name,
+                                    path: dir.to_string_lossy().to_string(),
+                                });
+                            }
+                            (r, true)
+                        }
                         Err(e) => (e, false),
                     }
                 }
@@ -5690,6 +5814,24 @@ call fetch_url again with offset={next} for the rest]",
                         let create = action == "create";
                         match crate::artifacts::save(store, chat_id, &args, create) {
                             Ok(saved) => {
+                                // Only an update pins the editor badge: a fresh
+                                // create announces itself once and is done.
+                                if !create {
+                                    let dir = crate::artifacts::chat_dir_pub(
+                                        store,
+                                        chat_id,
+                                        saved["id"].as_str().unwrap_or_default(),
+                                    );
+                                    emit(&AgentEvent::EditTarget {
+                                        target: "artifact".into(),
+                                        action: action.clone(),
+                                        name: saved["title"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        path: dir.to_string_lossy().to_string(),
+                                    });
+                                }
                                 emit(&AgentEvent::Artifact {
                                     id: saved["id"].as_str().unwrap_or_default().to_string(),
                                     title: saved["title"].as_str().unwrap_or_default().to_string(),
@@ -5728,6 +5870,12 @@ call fetch_url again with offset={next} for the rest]",
                     ),
                 }
             } else {
+                // Skills and connectors are updated through the generic dispatch
+                // (their handlers live in tools.rs and return only a string), so
+                // the edit badge is decided HERE: does the target exist before
+                // the call (an EDIT, not a create)? The event goes out only when
+                // the save succeeds.
+                let was_update = edit_target_of(name, &args, std::path::Path::new(&skill_root));
                 match tools::dispatch_with_data_root(
                     &root,
                     name,
@@ -5735,7 +5883,17 @@ call fetch_url again with offset={next} for the rest]",
                     None,
                     Some(&skill_root),
                 ) {
-                    Ok(r) => (r, true),
+                    Ok(r) => {
+                        if let Some((target, pin_name, pin_path)) = was_update {
+                            emit(&AgentEvent::EditTarget {
+                                target,
+                                action: "update".into(),
+                                name: pin_name,
+                                path: pin_path,
+                            });
+                        }
+                        (r, true)
+                    }
                     Err(e) => (e, false),
                 }
             };
@@ -5769,10 +5927,24 @@ call fetch_url again with offset={next} for the rest]",
                     }
                 }
             }
-            let applied = match applied_diff {
+            let mut applied = match applied_diff {
                 Some(diff) => result + &applied_change_block(&diff),
                 None => result,
             };
+            // Stamp the STALE-SOURCE note on a SUCCESSFUL writer whose file was
+            // read/greped EARLIER IN THIS STEP (batch readers always run before
+            // these sequential writers): that earlier result still carries the
+            // pre-edit text on the wire, and the model rebuilds old_string from
+            // exactly it — the measured 4-round edit-fail loop (run=106). One
+            // appended line; writer results are short, so the cap can never cut
+            // it, and `levers_fired` records the lever in the trace.
+            if ok {
+                if let Some(target) = writer_target_path(name, &args) {
+                    if step_read_files.iter().any(|f| f == &target) {
+                        applied.push_str(tools::POST_EDIT_STALE_NOTE);
+                    }
+                }
+            }
             if let Some(p) = crate::commands::image_read_path(&applied) {
                 step_read_images.push(p);
             }
@@ -6842,61 +7014,202 @@ fn is_file_search_command(cmd: &str, root: &str) -> bool {
     // A search that FILTERS another command's output is not file discovery:
     // `cargo test | grep -E "^(error|test result)"` inspects a build the model
     // just ran, and refusing it forced a second, bigger command plus an extra
-    // round trip. Only a search that OWNS its own input — the first segment of
-    // the chain — is the delegated case.
+    // round trip. Only a search that OWNS its own input — the first pipeline
+    // stage — is the delegated case.
     //
-    // Discovery verbs with NO bounded native equivalent (`find`, `fd`,
-    // `locate`, `tree`) are refused anywhere: the main agent has `grep`/`read`,
-    // so a tree walk is never the cheap way to find a file.
+    // THE gate refuses only when a scope touches the workspace. The OLD loop
+    // had two billing bugs, both live in traces: (1) an early `return false`
+    // on the first out-of-tree token let `rg foo src/ > /tmp/o` escape the
+    // gate and search the workspace freely; (2) a quote-blind split read the
+    // tokens of a quoted PATTERN (`grep -n "fn a\|fn b" file`) as path scopes,
+    // so a grep on ~/.codifa’s plugin sources was refused as a workspace
+    // search (mvqksnvw run59) — the same shell call the native `grep` then
+    // could not answer either.
     const SEARCH_VERBS: [&str; 7] = ["find", "fd", "locate", "tree", "glob", "grep", "rg"];
-    if !shell_statements(cmd).iter().any(|st| {
-        let verb = st.split_whitespace().next().unwrap_or_default();
-        SEARCH_VERBS.iter().any(|p| verb == *p)
-    }) {
-        return false;
-    }
-    // WHICH tree the search owns. Only the search statement's OWN tokens count:
-    // a `cd <abs> && grep foo src` prefix moves the base but the scope is `src`,
-    // so reading the whole command's tokens would let an unrelated `cd` open the
-    // gate. Each scope resolves against the running `cd` base, and a scope the
-    // native tools cannot reach — an absolute path, `~`, or any folder outside
-    // the workspace — is NOT delegated: the terminal is the only tool that can
-    // answer it (this is the false refusal that billed one answer twice).
+    // grep-family takes [flags] PATTERN [PATH…]; find/tree take PATHS first.
+    const PATTERNED: [&str; 5] = ["grep", "rg", "fd", "locate", "glob"];
     let mut base = root.to_string();
-    for raw in cmd.split([';', '&', '\n']) {
-        let seg = strip_shell_prefix(raw.split('|').next().unwrap_or_default());
-        let mut words = seg.split_whitespace();
-        let verb = words.next().unwrap_or_default();
-        if verb == "cd" {
-            if let Some(dir) = words.next() {
-                if dir.starts_with('/') || dir.starts_with('~') {
-                    base = dir.trim_matches(['"', '\'']).to_string();
+    let mut has_ws_scope = false;
+    let mut implied_ws = false;
+    for stage in shell_stages(cmd) {
+        if !stage.owns_input {
+            continue;
+        }
+        // prefix pass: assignments / `export` vanish, `cd` moves the base
+        let mut idx = 0;
+        while idx < stage.words.len() {
+            let w = stage.words[idx].as_str();
+            if w == "export" {
+                idx += 1;
+                continue;
+            }
+            if w == "cd" {
+                if let Some(d) = stage.words.get(idx + 1) {
+                    base = cd_base(&base, d);
+                }
+                idx += 2;
+                continue;
+            }
+            if is_shell_assignment(w) {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        let Some(verb) = stage.words.get(idx) else {
+            continue;
+        };
+        if !SEARCH_VERBS.contains(&verb.as_str()) {
+            continue;
+        }
+        let patterned = PATTERNED.contains(&verb.as_str());
+        let mut saw_pathish = false;
+        let mut stage_ws = false;
+        let mut skipped_pattern = false;
+        let mut after_first_flag = false;
+        for w in &stage.words[idx + 1..] {
+            if w.starts_with('-') {
+                after_first_flag = true;
+                continue;
+            }
+            // A bare number right after a flag is that flag's value (`-A 40`,
+            // `-maxdepth 2`), never a scope. A number NOT after a flag is an
+            // ordinary token — for grep-family that is the PATTERN itself
+            // (`grep 404 /elsewhere/x`), so it must fall through to the
+            // pattern-consumption branch below, not silently vanish.
+            if after_first_flag && w.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if patterned {
+                if !skipped_pattern {
+                    skipped_pattern = true; // the PATTERN, not a scope
+                    continue;
+                }
+            } else if after_first_flag {
+                // find/tree: everything after the first flag is an expression
+                continue;
+            }
+            saw_pathish = true;
+            let abs = resolve_scope(&base, w);
+            if abs.is_empty() {
+                // A program fragment or unexpanded variable — not a path
+                // token; it invents no scope and must not count as one.
+                continue;
+            }
+            if crate::tools::is_inside_root(root, &abs) {
+                stage_ws = true;
+            }
+        }
+        if stage_ws {
+            has_ws_scope = true;
+        }
+        // No path token at all: grep-family searches the CWD, and run_terminal
+        // spawns with the workspace root as cwd — an implied workspace scope.
+        if patterned && !saw_pathish {
+            implied_ws = true;
+        }
+    }
+    has_ws_scope || implied_ws
+}
+
+/// One pipeline stage of a shell string, tokenised quote-aware: statements
+/// split on `;`/`&`/newline and stages on `|` — never inside quotes — and
+/// redirect tokens (`2>/dev/null`, `> out`, `<<EOF`) are dropped so a search
+/// cannot hide behind plumbing, nor be refused because of it.
+struct ShellStage {
+    owns_input: bool,
+    words: Vec<String>,
+}
+
+fn shell_stages(cmd: &str) -> Vec<ShellStage> {
+    fn flush(out: &mut Vec<ShellStage>, words: &mut Vec<String>, tok: &mut String, owns: bool) {
+        if !tok.is_empty() {
+            words.push(std::mem::take(tok));
+        }
+        if !words.is_empty() {
+            out.push(ShellStage {
+                owns_input: owns,
+                words: std::mem::take(words),
+            });
+        }
+    }
+    let mut out: Vec<ShellStage> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut tok = String::new();
+    let mut owns = true;
+    let mut quote: Option<char> = None;
+    for c in cmd.chars() {
+        match c {
+            '\'' | '"' if quote.is_none() || quote == Some(c) => {
+                quote = if quote.is_none() { Some(c) } else { None };
+                tok.push(c);
+            }
+            ';' | '&' | '\n' if quote.is_none() => {
+                flush(&mut out, &mut words, &mut tok, owns);
+                owns = true;
+            }
+            '|' if quote.is_none() => {
+                flush(&mut out, &mut words, &mut tok, owns);
+                owns = false;
+            }
+            ' ' | '\t' if quote.is_none() => {
+                if !tok.is_empty() {
+                    words.push(std::mem::take(&mut tok));
                 }
             }
-            continue;
-        }
-        if !SEARCH_VERBS.contains(&verb) {
-            continue;
-        }
-        for w in words {
-            if w.starts_with('-') {
-                continue;
-            }
-            let t = w.trim_matches(['"', '\'', '(', ')', '`']);
-            if t.is_empty() {
-                continue;
-            }
-            let abs = if t.starts_with('/') || t.starts_with('~') {
-                t.to_string()
-            } else {
-                format!("{}/{t}", base.trim_end_matches('/'))
-            };
-            if !crate::tools::is_inside_root(root, &abs) {
-                return false;
-            }
+            _ => tok.push(c),
         }
     }
-    true
+    flush(&mut out, &mut words, &mut tok, owns);
+    out
+}
+
+/// `VAR=value` prefix token, as `strip_shell_prefix` judges them.
+fn is_shell_assignment(w: &str) -> bool {
+    !w.is_empty()
+        && w.contains('=')
+        && !w.starts_with('=')
+        && w.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '=')
+}
+
+/// Resolve a `cd` argument against the running base, `~`-aware.
+fn cd_base(base: &str, d: &str) -> String {
+    let d = d.trim_matches(['"', '\'']);
+    let home = std::env::var("HOME").unwrap_or_default();
+    if d.starts_with('/') {
+        d.to_string()
+    } else if d == "~" {
+        home
+    } else if let Some(rest) = d.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if d.starts_with('$') {
+        // An unresolved env-var cd: keep the base — judging its children
+        // against a guessed path would invent scopes that do not exist.
+        base.to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), d)
+    }
+}
+
+/// Resolve a search-scope token against the running base, `~`-aware. An
+/// EMPTY result means "not a path token at all" — an awk/sed program fragment
+/// (`'{print'`) or an unexpanded shell variable must not invent a scope.
+fn resolve_scope(base: &str, t: &str) -> String {
+    let t = t.trim_matches(['"', '\'', '(', ')', '`']);
+    if t.is_empty() || t.starts_with('$') || t.starts_with('{') || t.starts_with('%') {
+        return String::new();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if t.starts_with('/') {
+        t.to_string()
+    } else if t == "~" {
+        home
+    } else if let Some(rest) = t.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), t)
+    }
 }
 
 /// The commands a shell string actually RUNS, normalised.
@@ -6998,19 +7311,44 @@ fn workspace_file_read(cmd: &str, root: &str) -> bool {
         let verb = words.next().unwrap_or_default().to_string();
         if verb == "cd" {
             if let Some(dir) = words.next() {
-                let d = dir.trim_matches(['"', '\'']);
-                base = if d.starts_with('/') {
-                    d.to_string()
-                } else {
-                    format!("{}/{d}", base.trim_end_matches('/'))
-                };
+                base = cd_base(&base, dir);
             }
             continue;
         }
         if !DUMPER_VERBS.contains(&verb.as_str()) || st.contains(" -i") {
             continue;
         }
-        let Some(target) = st.split_whitespace().last() else {
+        // Strip redirect plumbing BEFORE choosing the target: `cat f.json
+        // 2>/dev/null` reads f.json — the shim alone billed run59 a round
+        // because the raw last token `2>/dev/null` resolved as a relative
+        // (hence "workspace") path. A WRITE redirect (`> out`, `>>x`, `&>x`)
+        // or a heredoc makes this the mutation gate's business, not a dump.
+        let mut writer = false;
+        let mut clean: Vec<&str> = Vec::new();
+        for w in st.split_whitespace() {
+            if w.contains("<<") {
+                writer = true;
+                break;
+            }
+            if w.contains('>') {
+                if w.starts_with('1') || w.starts_with('2') {
+                    continue; // fd shim, not a file the dumper reads
+                }
+                writer = true;
+                break;
+            }
+            if w == "<" {
+                continue; // stdin redirect: the operand IS the read target
+            }
+            if w == "&1" {
+                continue;
+            }
+            clean.push(w);
+        }
+        if writer {
+            continue;
+        }
+        let Some(target) = clean.last() else {
             continue;
         };
         let target = target.trim_matches(['"', '\'']);
@@ -7026,11 +7364,45 @@ fn workspace_file_read(cmd: &str, root: &str) -> bool {
         // raw argv judged `<root>/~/.config/x` as inside the workspace, so an
         // out-of-tree read was refused as a "workspace file dump" — a false
         // refusal the native `read` then failed on for the very same path.
-        if crate::tools::is_inside_root(root, &abs) {
+        if !always_allowed_target(&abs) && crate::tools::is_inside_root(root, &abs) {
             return true;
         }
     }
     false
+}
+
+/// Areas the terminal may read without any shim: codifa's own config tree
+/// (plugins, skills, traces — the plugin workflows live here and no native
+/// tool can reach them) and the OS temp areas. The read and search shields
+/// exist to route WORKSPACE lookups to the cheaper native tools; both are
+/// pointless outside the workspace, where those tools cannot answer anyway.
+fn always_allowed_target(abs: &str) -> bool {
+    // shell_statements lowercases its statements, so every comparison here is
+    // case-folded: on a case-insensitive APFS root `/Users/saman/.codifa`
+    // arrived as `/users/saman/.codifa` and strayed past an exact match.
+    let a = abs.trim_matches(['"', '\'']).to_lowercase();
+    if a.starts_with("/dev/") {
+        return true;
+    }
+    for p in ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"] {
+        if a == p || a.starts_with(&format!("{p}/")) {
+            return true;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default().to_lowercase();
+    let a = if let Some(rest) = a.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        a
+    };
+    if let Ok(tmp) = std::env::temp_dir().canonicalize() {
+        let t = tmp.to_string_lossy().to_lowercase();
+        if !t.is_empty() && (a == t || a.starts_with(&format!("{t}/"))) {
+            return true;
+        }
+    }
+    let cfg = format!("{home}/.codifa");
+    a == cfg || a.starts_with(&format!("{cfg}/"))
 }
 
 /// True when a `run_terminal` command is a pure READ: it neither writes, nor
@@ -7206,6 +7578,20 @@ fn coverage_span(key: &str) -> Option<(&str, usize, usize)> {
 /// silent loss this guard exists to prevent.
 fn read_window_span(offset: usize, limit: usize) -> (usize, usize) {
     (offset, offset.saturating_add(limit))
+}
+
+/// The workspace file a WRITER targets, in the same spelling the reader side
+/// records (`filePath`/`path`) — the two must agree character-for-character or
+/// the same-file check below never fires.
+fn writer_target_path(name: &str, args: &Value) -> Option<String> {
+    if !matches!(name, "edit_file" | "write_file") {
+        return None;
+    }
+    args["path"]
+        .as_str()
+        .or_else(|| args["filePath"].as_str())
+        .map(str::to_string)
+        .filter(|p| !p.is_empty())
 }
 
 /// True when EVERY window of a `read` call is already inside a span served
@@ -8867,6 +9253,89 @@ Workspace root: {root}. Mode: {mode}. {mode_rule}"
 mod tests {
     use super::*;
 
+    #[test]
+    fn edit_target_event_serializes_target_action_name_and_path() {
+        let v = AgentEvent::EditTarget {
+            target: "plugin".into(),
+            action: "update".into(),
+            name: "healer".into(),
+            path: "/data/plugins/healer".into(),
+        }
+        .to_json();
+        assert_eq!(v["kind"], "edit_target");
+        assert_eq!(v["target"], "plugin");
+        assert_eq!(v["action"], "update");
+        assert_eq!(v["name"], "healer");
+        assert_eq!(v["path"], "/data/plugins/healer");
+    }
+
+    #[test]
+    fn edit_target_of_marks_existing_skill_and_mcp_as_update_new_ones_as_none() {
+        let dir = std::env::temp_dir().join(format!("codifa-edit-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills")).unwrap();
+        // Nothing stored under the name yet: a first create is not an update.
+        assert!(edit_target_of("create_skill", &json!({"name": "Probe Skill"}), &dir).is_none());
+        // Create the skill for real, then the EDIT is recognized and pins its
+        // own folder.
+        crate::tools::dispatch_with_data_root(
+            dir.to_str().expect("temp path is utf-8"),
+            "create_skill",
+            &json!({
+                "name": "Probe Skill",
+                "description": "probe",
+                "fa_keywords": "پروب",
+                "content": "step 1",
+            }),
+            None,
+            None,
+        )
+        .expect("create the probe skill");
+        let pin = edit_target_of("create_skill", &json!({"name": "Probe Skill"}), &dir)
+            .expect("an existing skill counts as an update");
+        assert_eq!(pin.0, "skill");
+        assert!(
+            std::path::Path::new(&pin.2).is_dir(),
+            "the pinned folder must be the skill's own folder: {}",
+            pin.2
+        );
+        // A delete call never pins the badge.
+        assert!(edit_target_of(
+            "create_skill",
+            &json!({"name": "Probe Skill", "delete": true}),
+            &dir,
+        )
+        .is_none());
+        // Connectors: none stored yet → no pin.
+        assert!(edit_target_of(
+            "create_mcp",
+            &json!({"name": "Probe MCP", "command": "echo"}),
+            &dir,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn load_plugin_env_parses_pairs_and_skips_comments_and_junk() {
+        let dir = std::env::temp_dir().join(format!("codifa-plugin-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "# comment\n\nKEY=value\nQUOTED=\"v 1\"\nexport SEC=2\nBAD-KEY=x\n=",
+        )
+        .unwrap();
+        let vars = crate::plugins::load_plugin_env(&dir);
+        assert_eq!(
+            vars,
+            vec![
+                ("KEY".to_string(), "value".to_string()),
+                ("QUOTED".to_string(), "v 1".to_string()),
+                ("SEC".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
     /// A gate must name its chat, and deleting a chat must release its gates.
     ///
     /// The old map held only the oneshot, so the only removals were
@@ -9552,6 +10021,23 @@ mod tests {
         assert!(!is_file_search_command("cd /Users/x/src-tauri && rg TODO src", root));
         assert!(!is_file_search_command("grep -rn foo /tmp/logs", root));
         assert!(!is_file_search_command("rg TODO ~/.config", root));
+        // `grep -n "fn a\|fn b" -A 40 file.rs` — the PATTERN is one quoted
+        // token, `-A 40` is flag+value, and neither is a path scope: a
+        // quote-blind split read both as scopes and refused a grep that lives
+        // entirely outside the workspace (mvqksnvw run59, billed one round).
+        assert!(!is_file_search_command(
+            "grep -n \"fn build_article_prompt\\|fn article_prompt\\|build_prompt\" -A 40 /Users/saman/.codifa/plugins/healer-article/scripts/generate-article/main.rs",
+            root
+        ));
+        // A redirect must not blind the gate either way: `rg foo src/ >
+        // /tmp/o` still SEARCHES the workspace (the early-return escape),
+        // while `grep -rn pattern /tmp/hg_home.html` (a temp FILE) stays a
+        // terminal job under the always-allowed rule.
+        assert!(is_file_search_command("rg foo src/ > /tmp/o.txt", root));
+        assert!(!is_file_search_command(
+            "grep -oE 'blogs' /tmp/hg_home.html | sort -u | head -40",
+            root
+        ));
         // Filtering a command's OWN output is not file discovery, even after a
         // prefix: it inspects a build the model just ran.
         for cmd in [
@@ -9601,6 +10087,28 @@ mod tests {
         }
         // `sed -i` REWRITES: that is the mutation gate's business, not this one.
         assert!(!workspace_file_read("sed -i 's/a/b/' src/main.rs", root));
+        // Redirect SHIMS must not become the read target. The raw last-token
+        // read judged `2>/dev/null` a relative (hence "workspace") path and
+        // refused `cat <plugin>/models.json 2>/dev/null` — an ALWAYS-allowed
+        // area — and billed run59 a whole round. A write redirect, by
+        // contrast, is the mutation gate's business: `> f` is not a dump.
+        assert!(!workspace_file_read(
+            "cat /Users/saman/.codifa/plugins/healer-article/models.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -60",
+            root
+        ));
+        assert!(!workspace_file_read(
+            "grep -cE 'Key|TOKEN' ~/.codifa/plugins/healer-article/.env",
+            root
+        ));
+        assert!(!workspace_file_read(
+            "cat src/main.rs > /tmp/copy.rs 2>&1",
+            root
+        ));
+        // A workspace dump right beside the shims is still refused.
+        assert!(workspace_file_read(
+            "cat /Users/saman/.codifa/x 2>/dev/null; cat src/main.rs",
+            root
+        ));
     }
 
     #[test]

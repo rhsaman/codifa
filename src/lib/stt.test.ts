@@ -172,6 +172,17 @@ console.log('6) transcript merge stitches overlapping chunks:')
     'a chunk inside the committed text adds nothing',
     mergeTranscripts('one two three four', 'two three') === 'one two three four',
   )
+  // Regression: a chunk cut ON A PAUSE carries none of the previous audio, so
+  // an identical word there is the user repeating it ("سلام … سلام") — it
+  // must be appended, never deduped away (the composer lost every repeat).
+  check(
+    'a silent-boundary chunk appends even a verbatim repeat',
+    mergeTranscripts('سلام', 'سلام', { headSilent: true }) === 'سلام سلام',
+  )
+  check(
+    'a loud-boundary chunk still dedupes the overlap echo',
+    mergeTranscripts('سلام', 'سلام') === 'سلام',
+  )
 }
 
 if (failed > 0) {

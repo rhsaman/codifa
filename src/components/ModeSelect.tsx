@@ -24,6 +24,13 @@ export function ModeSelect({
   const close = useCallback(() => setOpen(false), []);
   // Entries shown in the popup menu (defaults to every mode).
   const menuModes = menuModesProp ?? modes;
+  // The Tab cycle is every mode except Plan, named by their OWN labels — the
+  // hint used to hard-code "Ask and Coder" while the mode itself is labelled
+  // Build, so the hint named a mode the menu never showed.
+  const cycleLabels = modes
+    .filter((m) => m.id !== "plan")
+    .map((m) => m.label)
+    .join(" and ");
 
   // Close on click outside
   useEffect(() => {
@@ -58,7 +65,7 @@ export function ModeSelect({
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-haspopup="listbox"
-        title={`${current.label} — applies to this chat only (Tab / ⌘M cycles Ask and Coder, /plan enters Plan mode)`}
+        title={`${current.label} — applies to this chat only (Tab cycles ${cycleLabels}, /plan enters Plan mode)`}
       >
         {!iconOnly && (
           <span className="mode-select-icon"><ModeIcon icon={current.icon} /></span>

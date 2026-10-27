@@ -5671,6 +5671,84 @@ body.coder-dragging .chat-split-child {
   }
 }
 
+/* Streaming dictation confirm pair: dots + ✕ discard + ✓ send (replaces mic) */
+.dictate-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dictate-typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-inline-end: 2px;
+  color: var(--text-dim, #888);
+}
+
+.dictate-typing span {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: dictate-dot 1.2s ease-in-out infinite;
+}
+
+.dictate-typing span:nth-child(2) { animation-delay: 0.12s; }
+.dictate-typing span:nth-child(3) { animation-delay: 0.24s; }
+.dictate-typing span:nth-child(4) { animation-delay: 0.36s; }
+.dictate-typing span:nth-child(5) { animation-delay: 0.48s; }
+.dictate-typing span:nth-child(6) { animation-delay: 0.6s; }
+.dictate-typing span:nth-child(7) { animation-delay: 0.72s; }
+
+@keyframes dictate-dot {
+
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.dictate-x-btn,
+.dictate-check-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.dictate-x-btn svg,
+.dictate-check-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.dictate-x-btn:hover {
+  color: var(--danger, #e5484d);
+  border-color: var(--danger, #e5484d);
+  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
+}
+
+.dictate-check-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.dictate-check-btn:hover {
+  background: var(--accent-dim);
+}
+
 /* Claude.ai-style enter icon send button — no background, just the glyph */
 /* Claude.ai-style send button: filled circle + upward arrow */
 .send-circle-btn {
@@ -11522,6 +11600,67 @@ body.coder-dragging .chat-split-child {
 /* ---- attachment chips (inside composer, above textarea) ---- */
 .composer-inner>.attachment-chips {
   padding: 8px 14px 0;
+}
+
+/* ---- edit-target badge (composer, above the input) ---- */
+/* Pinned while an update session is open — "پلاگین · update · name". The × is
+   the ONLY way the session ends: folder and mode fall back to the chat's own. */
+.edit-target-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 14px 0;
+  padding: 5px 6px 5px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--link) 14%, var(--bg-input));
+  border: 1px solid color-mix(in srgb, var(--link) 35%, transparent);
+  font-size: 12px;
+  line-height: 1.2;
+  width: fit-content;
+  max-width: 100%;
+  flex: 0 0 auto;
+}
+
+.edit-target-glyph {
+  display: inline-flex;
+  color: var(--link);
+  font-size: 11px;
+}
+
+.edit-target-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.edit-target-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.edit-target-x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.edit-target-x:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
 }
 
 .attachment-chips {
@@ -19597,8 +19736,6 @@ mark.diff-hit-active {
   display: flex;
   align-items: center;
   gap: 6px;
-  cursor: pointer;
-  user-select: none;
 }
 
 .schedule-item-name {
@@ -19679,9 +19816,6 @@ mark.diff-hit-active {
   min-width: 0;
 }
 
-.schedule-item-head:hover {
-  background: color-mix(in srgb, var(--text) 5%, transparent);
-}
 
 .schedule-item-head:focus-visible {
   outline: none;
@@ -19987,6 +20121,37 @@ mark.diff-hit-active {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* Button-level spinner (panel Run now — shows for the whole spawned run). */
+.schedule-btn-spinner {
+  width: 12px;
+  height: 12px;
+  display: inline-block;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+/* Live run card in the Inbox: spinner + label instead of "No output". */
+.schedule-run-live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px 4px;
+}
+
+.schedule-run-spinner {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--text) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
 }
 
 .schedule-runs-empty {
@@ -22712,6 +22877,20 @@ mark.trace-hit-active {
   display: none;
 }
 
+/* The docked overlay keeps the popped-up variant's --z-review-overlay (95);
+   without its own stacking context that subtree painted OVER the icon rail
+   (z 2), so the inbox tab swallowed the chevron/+ icons and the other tabs.
+   confine it, exactly like the review docked panel. */
+.viewer-inbox-wrap {
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
+}
+
+.viewer-inbox-wrap .schedule-inbox-overlay {
+  z-index: auto;
+}
+
 /* Docked panels use the ViewerTabBar fullscreen button — hide inner ones. */
 .viewer-inbox-wrap .viewer-fullscreen-btn,
 .review-docked-panel .viewer-fullscreen-btn,
@@ -25380,6 +25559,8 @@ tr[data-search-current] .fv-mark,
 }
 
 .viewer-pane-body > .viewer-content {
+  position: relative;
+  z-index: 0;
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;

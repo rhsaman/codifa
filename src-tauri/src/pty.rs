@@ -274,6 +274,27 @@ pub fn terminal_create(
     // inherited value ("dumb", or another terminal's id) would be wrong.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Same rule for the terminal's IDENTITY: the app inherits `TERM_PROGRAM`
+    // from whatever launched it (`iTerm.app` when started from iTerm2), and a
+    // program that trusts it behaves like that emulator. Neovim does exactly
+    // that: for `iTerm.app` it paints truecolor with the colon form
+    // `ESC[38:2:R:G:B m` (no colour-space slot), which xterm.js reads as
+    // `38:2:<cs>:R:G:B` — every colour came out as (G, B, 0), so the whole
+    // editor rendered olive/yellow. The emulator here is xterm.js, so say so.
+    cmd.env("TERM_PROGRAM", "codifa");
+    cmd.env_remove("TERM_PROGRAM_VERSION");
+    // iTerm2 also leaves its fingerprints in other variables (and `LC_TERMINAL`
+    // is forwarded over ssh/sudo); programs that sniff any of them take the same
+    // iTerm-only colon-form truecolor path. Drop every one.
+    for var in [
+        "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "TERM_SESSION_ID",
+    ] {
+        cmd.env_remove(var);
+    }
     // Same reason as TERM, for the other direction: a program spawned directly
     // ("Edit in nvim") inherits the minimal GUI PATH and could not find the
     // tools its own config shells out to (git, rg, node, …). The login PATH is

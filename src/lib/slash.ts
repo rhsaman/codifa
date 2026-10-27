@@ -46,7 +46,6 @@ export const SUBCOMMANDS: Record<string, SubCommand[]> = {
     { name: 'list', hint: 'List installed bundles', arg: 'free' },
     { name: 'install', hint: 'Install a bundle from a repo', arg: 'repo', rest: 'free' },
     { name: 'create', hint: 'Create a bundle from a description', arg: 'free' },
-    { name: 'run', hint: 'Run one of the bundle\u2019s scripts', arg: 'free' },
     { name: 'update', hint: 'Edit a bundle (skills, scripts, keywords)', arg: 'name' },
     { name: 'on', hint: 'Switch a bundle on', arg: 'name' },
     { name: 'off', hint: 'Switch a bundle off', arg: 'name' },
@@ -194,6 +193,19 @@ export function flagValues(raw: string): string[] {
     .filter(Boolean)
 }
 
+/** Does any word of the line already carry a complete `--flag=value` token?
+ *
+ *  One landed value is where auto-open stops: from there on a fresh word is
+ *  the user writing the prompt prose, not another flag, and a popup jumping
+ *  in front of every word made the description unwritable. The palette comes
+ *  back on ArrowUp instead (see the composer's key handler). */
+export function hasLandedFlag(words: string[]): boolean {
+  return words.some((w) => {
+    const eq = w.indexOf('=')
+    return eq >= 0 && isFlagToken(w) && flagValues(w.slice(eq + 1)).length > 0
+  })
+}
+
 /** The rows a `--flag=<typed>` token offers, from the installed list.
  *
  *  Ranked by the typed fragment but never emptied by it: a fragment matching
@@ -203,9 +215,30 @@ export function flagValues(raw: string): string[] {
  *  dropped, so `--skills=a,b` does not offer `a` twice. */
 export function flagValueRows(values: string[], typed: string): string[] {
   const picked = flagValues(typed)
-  const fragment = picked.length > 0 && !typed.includes(',') ? picked[picked.length - 1] : ''
+  const last = picked[picked.length - 1] ?? ''
+  // A COMPLETE value sitting in the token is a finished pick, not a fragment:
+  // treating `brainstorming` as a prefix left one row, the picked-filter then
+  // dropped it, and the popup read "All selected" with 23 skills still to
+  // choose. A complete pick resets the fragment; only partial text ranks.
+  const complete = values.some((v) => v.toLowerCase() === last.toLowerCase())
+  const fragment = complete ? '' : last
   const ranked = values.filter((v) => v.toLowerCase().startsWith(fragment.toLowerCase()))
   return (ranked.length > 0 ? ranked : values).filter((v) => !picked.includes(v))
+}
+
+/** The text a value pick writes over the token's typed part (`--skills=` …).
+ *
+ *  An earlier COMPLETE pick is kept and the new value appended
+ *  (`brainstorming` + `data-analysis` → `brainstorming,data-analysis`); a
+ *  partial fragment is replaced by its completion (`an` +
+ *  `anthropic-skills` → `anthropic-skills`, not `an,anthropic-skills`). */
+export function flagPickInsert(typed: string, v: string, values: string[]): string {
+  const picked = flagValues(typed)
+  if (picked.length === 0) return v
+  const last = picked[picked.length - 1]
+  const complete = values.some((x) => x.toLowerCase() === last.toLowerCase())
+  if (complete) return `${picked.join(',')},${v}`
+  return picked.length > 1 ? `${picked.slice(0, -1).join(',')},${v}` : v
 }
 
 /** Resolve the command line's `--flags` into the tool's three arrays.

@@ -87,6 +87,9 @@ export async function deleteArtifact(
 export interface ArtifactSummary {
   id: string
   title: string
+  /** Absolute folder of this artifact, when the list carries it — what an
+   *  update session pins the composer badge to. */
+  dir?: string
   kind?: string
   version?: number
   updatedAt: number
@@ -115,6 +118,7 @@ export async function listArtifacts(
         version?: number
         updated_at?: number
         chat_id?: string
+        dir?: string
       }>
       detail?: string
     }
@@ -126,6 +130,9 @@ export async function listArtifacts(
       version: a.version,
       updatedAt: a.updated_at ?? 0,
       chatId: a.chat_id ?? '',
+      // Absolute folder — what a `/artifact update <id>` session pins the
+      // composer badge to (dropped here once, the pick then silently no-oped).
+      dir: a.dir,
     }))
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }

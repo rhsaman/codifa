@@ -1,4 +1,5 @@
-// Pure helper for Ctrl/Cmd+W chat close behavior.
+// Pure helper for the platform close chord's chat-close behavior (Cmd+W on
+// Apple, Ctrl+W elsewhere).
 // Multi-window: close the focused WINDOW (chat stays in the sidebar).
 // Single window: close the TAB (legacy behavior).
 export type ChatCloseAction =

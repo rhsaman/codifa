@@ -756,11 +756,19 @@ function compareWord(word: string): string {
  * word-by-word (punctuation-insensitive) and only the new words are appended;
  * a chunk that re-recognized an already covered span adds nothing at all.
  */
-export function mergeTranscripts(committed: string, next: string): string {
+export function mergeTranscripts(
+  committed: string,
+  next: string,
+  opts?: { headSilent?: boolean },
+): string {
   const a = (committed ?? '').trim()
   const b = (next ?? '').trim()
   if (!b) return a
   if (!a) return b
+  // The chunk was cut inside a pause: its head holds no audio from the
+  // previous chunk, so nothing in it can be an overlap echo — a repeated word
+  // is the user repeating it and must survive ("سلام سلام" is two greetings).
+  if (opts?.headSilent) return `${a} ${b}`
   const aw = a.split(/\s+/).filter(Boolean)
   const bw = b.split(/\s+/).filter(Boolean)
   if (bw.length === 0) return a

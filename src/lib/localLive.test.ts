@@ -179,7 +179,17 @@ console.log('3) noise is filtered before it reaches the agent:')
 {
   check('empty is a hallucination', isHallucinatedTranscript(''))
   check('single char is a hallucination', isHallucinatedTranscript('ه'))
-  check('repeated word is a hallucination', isHallucinatedTranscript('خب خب خب خب'))
+  // Six floor: real users repeat words on purpose ("سلام سلام سلام") — only
+  // Whisper's noise loops go this far.
+  check('same word six times is a hallucination', isHallucinatedTranscript('خب خب خب خب خب خب'))
+  check('a three-word verbal repeat is real speech', !isHallucinatedTranscript('سلام سلام سلام'))
+  // Regression: the ping-pong loop «اینکه از اینکه از…» defeated the
+  // same-word check (no word repeats CONSECUTIVELY) and, being LONGER than the
+  // real text, then replaced it via fuller-wins. Words are now also compared
+  // to the one two back: 5+ alternations of one bigram is a loop, not speech.
+  const pingPong = Array.from({ length: 21 }, (_, i) => (i % 2 === 0 ? 'اینکه' : 'از')).join(' ')
+  check('two-word ping-pong loop is a hallucination', isHallucinatedTranscript(pingPong))
+  check('real speech with a repeated bigram passes', !isHallucinatedTranscript('که این کار رو که این بار کردم'))
   check('real speech passes', !isHallucinatedTranscript('سلام حال شما چطوره'))
 }
 
@@ -343,7 +353,9 @@ console.log('9) finishing a turn drains every chunk and delivers once:')
 
 console.log('10) hallucinations and error pages never become messages:')
 {
-  const noise = makeSession('خب خب خب خب')
+  // Six floor (see isHallucinatedTranscript): fifty repeats is the Whisper
+  // noise loop, three-to-five is a real verbal repeat.
+  const noise = makeSession('خب خب خب خب خب خب')
   noise.priv['hasSpeech'] = true
   noise.priv['pcmFrames'] = [speechPcm(8000)]
   await (noise.session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
@@ -645,8 +657,140 @@ console.log('19) a turn too long for one ASR window keeps the chunk transcript:'
   })
 }
 
+console.log('20) dictate mode: only an explicit stop ends the turn:')
+{
+  // Regression: in dictate mode the 800 ms silence timeout of live voice must
+  // NOT close the turn — a natural pause while dictating would have finalized
+  // and sent half a sentence. Only tickChunks' dictate branch keeps cutting
+  // through it, and only finishDictation (mic button / Space) delivers.
+  const finals: string[] = []
+  const partials: string[] = []
+  const calls: { size: number }[] = []
+  const session = new LocalLiveSession({
+    lang: 'fa',
+    dictate: true,
+    transcribe: async (blob) => {
+      calls.push({ size: blob.size })
+      return 'متن دیکته'
+    },
+    onUserText: (t) => {
+      finals.push(t)
+    },
+    onPartial: (t) => {
+      partials.push(t)
+    },
+  })
+  const priv = session as unknown as Record<string, unknown>
+  priv['capturing'] = true
+  priv['captureRate'] = 16000
+  priv['hasSpeech'] = true
+  // As in test 12: a 2 s buffer — a short one would be dropped by the
+  // silence-trim gate (MIN_CHUNK_SPEECH_MS) before any request is queued.
+  priv['pcmFrames'] = [speechPcm(32000)]
+  // Simulate speech that started long ago: past maxChunkMs the live engine
+  // would force-close the turn; dictate must keep it open instead.
+  priv['speechStartAt'] = Date.now() - LOCAL_LIVE_DEFAULTS.maxChunkMs - 5000
+  priv['lastFlushAt'] = Date.now() - LOCAL_LIVE_DEFAULTS.chunkMs - 5
+  const ticks = session as unknown as {
+    tickChunks: (now: number, chunkMs: number, maxChunkMs: number) => void
+  }
+  ticks.tickChunks(Date.now(), LOCAL_LIVE_DEFAULTS.chunkMs, LOCAL_LIVE_DEFAULTS.maxChunkMs)
+  // The chunk request starts on the next microtask (inflight semaphore).
+  await new Promise((r) => setTimeout(r, 0))
+  check('a long pause never closes a dictate turn', finals.length === 0, {
+    finals: finals.length,
+  })
+  check('chunks keep cutting through the pause', calls.length === 1, {
+    calls: calls.length,
+  })
+  check('the streamed preview reaches the composer', partials[partials.length - 1] === 'متن دیکته', {
+    partials,
+  })
+
+  // Mic button pressed: flush the tail, drain, deliver, tear down.
+  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
+  check('an explicit stop delivers the final text',
+    finals.length === 1 && finals[0] === 'متن دیکته',
+    { finals },
+  )
+  check('the preview is cleared on stop', partials[partials.length - 1] === '', {
+    partials,
+  })
+  check('the engine is torn down after delivery', priv['stopped'] === true, {})
+
+  // A second press (or Space) must be a no-op, not a duplicate message.
+  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
+  check('a repeated stop does not duplicate the text', finals.length === 1, {
+    finals: finals.length,
+  })
+}
+
+console.log('21) multi-chunk dictate accumulates (the "only the first chunk" regression):')
+{
+  // The composer showed ONLY the first chunk's words while the server returned
+  // full text for every chunk. The engine contract this pins: chunks 2+ must
+  // APPEND to the turn (mergeTranscripts) — the turn and the preview may never
+  // reset to an earlier chunk's words, and no chunk may be dropped silently.
+  let call = 0
+  const perChunk = ['سلام خوبی', 'این تکه دوم است و اضافه میشود', 'و تکه سوم پایانی']
+  const calls: { size: number }[] = []
+  const partials: string[] = []
+  const finals: string[] = []
+  const session = new LocalLiveSession({
+    lang: 'fa',
+    dictate: true,
+    transcribe: async (blob) => {
+      calls.push({ size: blob.size })
+      return perChunk[Math.min(call++, perChunk.length - 1)]
+    },
+    onUserText: (t) => {
+      finals.push(t)
+    },
+    onPartial: (t) => {
+      partials.push(t)
+    },
+  })
+  const priv = session as unknown as Record<string, unknown>
+  priv['capturing'] = true
+  priv['captureRate'] = 16000
+  // An open turn is required, or finishDictation (+ finishTurn) returns early.
+  priv['hasSpeech'] = true
+  priv['turn'] = { token: priv['turnToken'] as number, text: '' }
+  // Three 1 s speech buffers cut back-to-back, exactly what the monitor does
+  // while the user keeps talking past chunkMs. Overlap is deliberately NOT
+  // simulated: appending on a no-overlap match is the weaker guarantee — if
+  // the merge can lose words here, it can lose them anywhere.
+  for (let i = 0; i < 3; i++) {
+    priv['pcmFrames'] = [speechPcm(16000)]
+    ;(session as unknown as { flushChunk: () => void }).flushChunk()
+    // The request resolves on the next microtask chain link.
+    await new Promise((r) => setTimeout(r, 0))
+  }
+  await new Promise((r) => setTimeout(r, 30))
+  check('at least the three chunks left for the transcriber', calls.length >= 3, {
+    calls: calls.length,
+  })
+  const last = partials[partials.length - 1] ?? ''
+  check(
+    'the preview holds chunk 1, 2 AND 3',
+    last.includes('سلام خوبی') && last.includes('تکه دوم') && last.includes('پایانی'),
+    { last, partials },
+  )
+  // finishDictation must be AWAITED: delivery happens after the drain (macro-
+  // tasks), exactly like the existing dictate test above.
+  await (session as unknown as { finishDictation: () => Promise<void> }).finishDictation()
+  const delivered = finals[finals.length - 1] ?? ''
+  check(
+    'the delivered final keeps every chunk',
+    delivered.includes('سلام خوبی') && delivered.includes('پایانی'),
+    { finals },
+  )
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)
 }
 console.log('\nall live voice checks passed')
+
+

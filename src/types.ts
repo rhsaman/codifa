@@ -597,6 +597,19 @@ export interface GoalState {
   turns?: number
 }
 
+/** What an open "editing" badge is keeping a chat pointed at: the folder one
+ *  plugin/skill/connector/artifact update session lives in. Pinned when the
+ *  agent UPDATES one (never on create/install), cleared only by the badge's ×
+ *  — so follow-up turns keep targeting the same folder without re-asking.
+ *  Lives on the chat (persisted) so it survives turns and restarts. */
+export interface ChatEditTarget {
+  target: 'plugin' | 'skill' | 'mcp' | 'artifact'
+  action: string
+  name: string
+  /** Absolute folder on disk — sent as the turn's workspace root. */
+  path: string
+}
+
 export interface Chat {
   id: string
   title: string
@@ -608,6 +621,15 @@ export interface Chat {
   /** Per-chat model override (defaults to the global active provider's model). */
   model?: string
   root?: string
+  /** Open "editing" badge (see ChatEditTarget): while set, sends go to this
+   *  folder in Build mode until the user closes the badge. The chat's mode is
+   *  forced to "build" for the whole session (so retries, resume and the
+   *  composer's mode selector all agree); pinChatEditTarget saves the previous
+   *  mode and × (clearChatEditTarget) restores it. */
+  editTarget?: ChatEditTarget
+  /** The mode the chat had BEFORE the edit badge forced Build (undefined =
+   *  no session open). × on the badge restores it. */
+  editTargetPrevMode?: AgentMode
   messages: ChatMessage[]
   /** Cumulative per-model token usage for this chat (session totals). */
   usage?: ChatUsage
@@ -763,9 +785,13 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'edit_target' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
+  /** edit_target: what an update session pins on the composer badge (the
+   *  existing `action`/`name`/`path` fields below carry the rest). */
+  target?: 'plugin' | 'skill' | 'mcp' | 'artifact'
+  name?: string
   content?: string
   /** Tool name on a tool-card event; on a retry/retry_giveup event it names the
    *  tool that owns the retry (e.g. "explore"), empty for the main agent. */
@@ -932,6 +958,9 @@ export type MarketplaceKind = 'plugins' | 'skills' | 'mcp'
 export interface PluginInfo {
   name: string
   slug: string
+  /** Absolute folder of the bundle, when the list carries it — what an update
+   *  session pins the composer badge to. */
+  dir?: string
   description?: string
   version?: string
   enabled: boolean
@@ -939,7 +968,8 @@ export interface PluginInfo {
   skills?: string[]
   /** Connector names the folder currently holds. */
   mcp?: string[]
-  /** Names of the runnable scripts the folder holds (`/plugin run <slug> <name>`). */
+  /** Names of the runnable scripts the folder holds. The assistant runs one
+   *  during a turn through its `plugin` tool (`action: "run"`). */
   scripts?: string[]
   /** Persian phrases the WHOLE bundle answers to. A skill with none of its own
    *  inherits these (capped), so a bundle of bare skills is still findable from
@@ -973,7 +1003,7 @@ export interface ScheduledTask {
   id: string
   name: string
   prompt: string
-  /** کرون ۵ فیلدی نرمال‌شده (UTC)؛ رشته خالی یعنی اجرای یک‌باره. */
+  /** کرون ۵ فیلدی نرمال‌شده (به زمان لوکال ماشین ارزیابی می‌شود)؛ رشته خالی یعنی اجرای یک‌باره. */
   cron: string
   /** توصیف فارسی کوتاه برای نمایش (از بک‌اند می‌آید). */
   cron_label?: string
@@ -982,6 +1012,10 @@ export interface ScheduledTask {
   mode: string
   provider_id?: string
   model?: string
+  /** اسکیل/کانکتور/پلاگین ضمیمهشده به هر اجرا (اسمها و slug). */
+  skills?: string[]
+  mcp_servers?: string[]
+  plugins?: string[]
   /** نوبت بعدی اجرا (epoch ثانیه)؛ null یعنی بدون نوبت بعدی. */
   next_run?: number | null
   last_run?: number | null

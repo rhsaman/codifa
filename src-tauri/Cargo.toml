@@ -44,7 +44,7 @@ tokio-stream = "0.1"
 # Native in-app browser: Chromium is driven over the CDP WebSocket protocol
 # (navigate/screenshot/click/type), which reqwest cannot speak.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-# Scheduler loop: cron math needs civil-time date fields (UTC).
+# Scheduler loop: cron math needs civil-time date fields (local time).
 chrono = "0.4"
 
 # Desktop control needs what the `screenshots` crate cannot do: read the cursor

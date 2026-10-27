@@ -92,6 +92,8 @@ let failAllTts = false
 // body ارسالی api.ts شامل provider (= opts.kind) و base_url (= opts.baseUrl) است.
 const failBaseUrls = new Set<string>()
 const failProviders = new Set<string>()
+// Base urls whose /tts answers 200 with an EMPTY body — the silent-chain-killer.
+const emptyBodyBaseUrls = new Set<string>()
 let ttsFailRemaining = 0
 // Fail any /tts request whose body text includes this substring (sentence-targeted,
 // immune to call numbering and retry rounds).
@@ -122,6 +124,13 @@ const seenSignals: AbortSignal[] = []
     if (bodyText) seenTexts.push(bodyText)
     if (failTextIncludes && bodyText.includes(failTextIncludes)) throw new Error('synthesis failed (500)')
     if (bodyBaseUrl) seenBaseUrls.push(bodyBaseUrl)
+    if (bodyBaseUrl && emptyBodyBaseUrls.has(bodyBaseUrl)) {
+      return {
+        ok: true,
+        status: 200,
+        blob: async () => new Blob([], { type: 'audio/mpeg' }),
+      } as any
+    }
     if (bodyBaseUrl && failBaseUrls.has(bodyBaseUrl)) throw new Error('synthesis failed (500)')
     if (bodyProvider && failProviders.has(bodyProvider)) throw new Error('synthesis failed (500)')
     if (ttsFailRemaining > 0) {
@@ -646,6 +655,72 @@ console.log('۲۴) پخش استریمِ بی‌صدا خطا می‌دهد تا
   check('پخش بی‌صدا throw کرد', threw)
   check('هیچ Audio ساخته نشد', MockAudio.instances.length === 0, MockAudio.instances.length)
   check('بعد از پایان: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+}
+
+console.log('۲۵) پاسخ ۲۰۰-خالی شکست است — زنجیره به پروایدر بعدی می‌رود:')
+{
+  // Regression for "TTS never falls from top to bottom": a provider answering
+  // 200 with an EMPTY body used to resolve as success — the chain stopped
+  // there, the sentence was silently dropped, and the lower fallback never
+  // ran. An empty body must count as a failure.
+  MockAudio.instances = []
+  ttsCall = 0
+  seenBaseUrls.length = 0
+  failBaseUrls.clear()
+  failProviders.clear()
+  emptyBodyBaseUrls.clear()
+  const emptyOpts = { kind: 'empty-provider', baseUrl: 'http://empty-provider:8899' }
+  const goodOpts = { kind: 'openai', baseUrl: 'http://good-provider:8899' }
+  emptyBodyBaseUrls.add('http://empty-provider:8899')
+  const fetchSentenceRobust = (
+    ttsMod as unknown as {
+      fetchSentenceRobust?: (s: string, c: unknown, sig: AbortSignal) => Promise<Blob>
+    }
+  ).fetchSentenceRobust
+  check('fetchSentenceRobust صادر شده است', typeof fetchSentenceRobust === 'function')
+  let blob: Blob | null = null
+  let threw = false
+  try {
+    blob = await (fetchSentenceRobust as any)(
+      'یک جمله آزمایشی',
+      [emptyOpts, goodOpts],
+      new AbortController().signal,
+    )
+  } catch {
+    threw = true
+  }
+  emptyBodyBaseUrls.clear()
+  check('زنجیره throw نکرد (فالبک موفق)', !threw)
+  check('blob از پروایدر سالم رسید (غیرخالی)', blob !== null && blob.size > 0, blob?.size)
+  check('پروایدر سالم واقعاً صدا زده شد', seenBaseUrls.includes('http://good-provider:8899'), seenBaseUrls)
+}
+
+console.log('۲۶) playTts: جملهٔ ۲۰۰-خالی حذف نمی‌شود، فالبک پخش می‌کند:')
+{
+  MockAudio.instances = []
+  ttsCall = 0
+  seenBaseUrls.length = 0
+  emptyBodyBaseUrls.clear()
+  const emptyOpts = { kind: 'empty-provider', baseUrl: 'http://empty-provider:8899' }
+  const goodOpts = { kind: 'openai', baseUrl: 'http://good-provider:8899' }
+  emptyBodyBaseUrls.add('http://empty-provider:8899')
+  const before = MockAudio.instances.length
+  const startCalls = ttsCall
+  let threw = false
+  try {
+    await (playTts as any)('متن فالبک خالی', [emptyOpts, goodOpts], 103)
+  } catch (err) {
+    threw = true
+    console.error('   playTts threw:', err)
+  }
+  emptyBodyBaseUrls.clear()
+  const usedCalls = ttsCall - startCalls
+  check('playTts throw نکرد', !threw)
+  check('حداقل ۲ فراخوانی (empty + good)', usedCalls >= 2, usedCalls)
+  check('پروایدر سالم صدا زده شد', seenBaseUrls.includes('http://good-provider:8899'), seenBaseUrls)
+  check('یک Audio ساخته شد', MockAudio.instances.length === before + 1, MockAudio.instances.length)
+  check('بعد از پایان صف: idle', getTtsSnapshot().status === 'idle', getTtsSnapshot())
+  stopTts()
 }
 
 if (failed > 0) {

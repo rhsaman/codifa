@@ -38,8 +38,10 @@ import {
   commandFlags,
   flagValues,
   flagValueRows,
+  flagPickInsert,
   parseScheduleFlags,
   stripFlagTokens,
+  hasLandedFlag,
   isFlagToken,
   normalizeFlagDashes,
   migrateCommandNames,
@@ -66,6 +68,7 @@ import { bareModelId } from "../lib/provider-fetch";
 import { normalizeUsageModel } from "../lib/usage";
 import { otherSlotLevel, otherSlotModel, toolFallbackEntries } from "../lib/toolSlots";
 import { stripLeadingModeTag } from "../lib/modeTag";
+import type { ChatEditTarget } from "../types";
 import {
   contextPercent,
   computeContextUsed,
@@ -89,6 +92,8 @@ import {
   streamChat,
   fetchCredits,
   transcribeAudio,
+  warmStt,
+  warmTts,
   createRealtimeSession,
   respondPermission,
   respondAsk,
@@ -109,7 +114,7 @@ import {
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
-import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills, runPluginScript } from "../lib/plugins";
+import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills } from "../lib/plugins";
 import { fillKeywordsAfterInstall, fillKeywordsFromToolResult } from "../lib/keywordFill";
 import type { PluginInfo } from "../types";
 import { looksLikeRepoAddress } from "../lib/repoAddress";
@@ -146,6 +151,7 @@ import {
   mentionCatalog,
   type PluginCommand,
 } from "../lib/skills";
+import { resolvePluginTurn } from "../lib/pluginBundle";
 import { detectDir, prepareContent } from "../lib/bidi";
 import {
   registerChatSend,
@@ -336,6 +342,57 @@ function wantsPlugin(text: string): boolean {
     );
   const target = /\bplugin(s)?\b|(پلاگین|افزونه)/.test(low);
   return action && target;
+}
+
+/** The only commands whose `update <name>` pick opens a pinned session. */
+const EDIT_TARGET_COMMANDS = new Set(["plugin", "skill", "mcp", "artifact"]);
+
+/** The folder holding a file path (a skill row points at its SKILL.md). */
+function folderOf(p?: string): string {
+  if (!p) return "";
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return i > 0 ? p.slice(0, i) : "";
+}
+
+/** Pin (open) the update session for a named target whose folder is known.
+ *  ONE session per chat: `setChatEditTarget` refuses a DIFFERENT target while
+ *  a badge is open — the × on the badge is the only way out. False ⇒ nothing
+ *  was pinned (unknown folder, or another session holds the chat). */
+function openEditTargetSession(
+  chatId: string,
+  target: ChatEditTarget["target"],
+  name: string,
+  dirs: Record<string, Record<string, string>>,
+): boolean {
+  const dir = dirs[target]?.[name];
+  if (!dir) return false;
+  return useStore.getState().setChatEditTarget(chatId, {
+    target,
+    action: "update",
+    name,
+    path: dir,
+  });
+}
+
+/** System-prompt suffix while an edit badge is open: the agent must know it is
+ *  working INSIDE the pinned folder — and for plugins, where secrets live
+ *  (the runner injects the plugin folder's .env into every script run). */
+function editTargetSuffix(t?: ChatEditTarget | null): string {
+  if (!t) return "";
+  const base =
+    `EDIT SESSION ACTIVE: you are updating the ${t.target} "${t.name}" — its folder on disk is ${t.path}. ` +
+    "Make every change inside that folder and nowhere else. The edit session stays open across turns " +
+    "until the user closes the badge above the composer — never treat the session as finished on your own, " +
+    "and never ask the user to re-run the update command for follow-up changes.";
+  if (t.target === "plugin") {
+    return (
+      base +
+      " Never hard-code secrets or API keys into the script source: write them into the plugin's own " +
+      ".env file (KEY=value lines in that same folder) — the script runner injects them as environment " +
+      "variables when the plugin's scripts run."
+    );
+  }
+  return base;
 }
 
 /**
@@ -950,6 +1007,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // The same map as a ref: `ensureCmdArgValues` decides whether to refetch
   // without being re-created on every state change.
   const cmdArgValuesRef = useRef<Record<string, string[]>>({});
+  // Slug/id → absolute folder per kind: lets a bare `update <name>` sub-command
+  // pin the badge without a second fetch — the lists already carry the folder.
+  const cmdArgDirsRef = useRef<Record<string, Record<string, string>>>({});
   const cmdArgFetchedAt = useRef(0);
   // One `/`-command per ENABLED PLUGIN (the bundle's slug), with its skills as
   // the sub-command level. Seeded from the module cache so a remount (chat
@@ -1150,25 +1210,44 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           next.repo = Array.from(
             new Set(plugins.map((p) => p.source).filter((s): s is string => !!s)),
           );
+          // Slug → folder, for `/plugin update <slug>` opening a session.
+          cmdArgDirsRef.current.plugin = Object.fromEntries(
+            plugins.map((p) => [p.slug, p.dir ?? ""]),
+          );
           return plugins.map((p) => p.slug);
         }
         return next.plugin ?? [];
       }),
       load('skill', async () => {
         const skills = await listAvailableSkills();
-        return Array.isArray(skills)
-          ? Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)))
-          : (next.skill ?? []);
+        if (Array.isArray(skills)) {
+          // Skill slug → its folder (the SKILL.md's directory), for
+          // `/skill update <name>` opening a session.
+          cmdArgDirsRef.current.skill = Object.fromEntries(
+            skills.map((s) => [s.slug || s.name, folderOf(s.path)]),
+          );
+          return Array.from(new Set(skills.map((s) => s.slug || s.name).filter(Boolean)));
+        }
+        return next.skill ?? [];
       }),
       load('mcp', async () => {
         const connectors = await listMcp();
+        // Connector name → owning bundle folder, for `/mcp update <name>`.
+        cmdArgDirsRef.current.mcp = { ...(connectors.dirs ?? {}) };
         return Object.keys(connectors?.mcpServers ?? {});
       }),
       // Documents and tasks belong to ONE chat, so they are read from the
       // active chat id the same way their own panels do.
       load('artifact', async () => {
         const artifacts = await listArtifacts(activeChatId || undefined);
-        return Array.isArray(artifacts) ? artifacts.map((a) => a.id) : (next.artifact ?? []);
+        if (Array.isArray(artifacts)) {
+          // Artifact id → folder (this chat's), for `/artifact update <id>`.
+          cmdArgDirsRef.current.artifact = Object.fromEntries(
+            artifacts.map((a) => [a.id, a.dir ?? ""]),
+          );
+          return artifacts.map((a) => a.id);
+        }
+        return next.artifact ?? [];
       }),
       load('schedule', async () => {
         const tasks = await listSchedules();
@@ -1179,6 +1258,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setCmdArgValues(next);
     setCmdArgLoaded(true);
   }, [activeChatId]);
+
+  /** Folder of a named update target, refetching the lists ONCE on a miss —
+   *  a command typed straight into the box may outrun the value fetch. */
+  const editTargetDir = useCallback(
+    async (kind: ChatEditTarget["target"], name: string): Promise<string> => {
+      const direct = cmdArgDirsRef.current[kind]?.[name];
+      if (direct) return direct;
+      cmdArgFetchedAt.current = 0;
+      await ensureCmdArgValues();
+      return cmdArgDirsRef.current[kind]?.[name] ?? "";
+    },
+    [ensureCmdArgValues],
+  );
 
   /** The rows the palette shows: the level the caret is on, filtered by its
    *  own word. Level 3+ completes the value the chosen sub-command expects —
@@ -1250,14 +1342,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // The fragment being typed is REPLACED, not appended to: inserting
         // `typed.join(",") + "," + v` while text is present produced
         // `--skills=an,anthropic-frontend-design` instead of completing it.
-        const already = flagValues(caretFlag?.typed ?? "");
+        // `flagPickInsert` (unit-tested) keeps earlier COMPLETE picks and only
+        // replaces the partial fragment, so pick two never drops pick one.
+        const typedRaw = caretFlag?.typed ?? "";
         return remaining.map((v) => ({
           key: `flag:${spec.name}:${v}`,
           label: v,
           hint: spec.name,
-          // With earlier picks in the token, keep them and add one: `--skills=a`
-          // becomes `--skills=a,b`. With a bare fragment, complete it.
-          insert: already.length > 1 ? `${already.slice(0, -1).join(",")},${v}` : v,
+          insert: flagPickInsert(typedRaw, v, values),
         }));
       }
     }
@@ -1317,6 +1409,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const kind: CmdArg | undefined = caret.index === 2 ? sub.arg : sub.rest;
     if (!kind || kind === "free") return [];
     const values = (kind === "repo" ? cmdArgValues.repo : cmdArgValues[verb]) ?? [];
+    // The lists load lazily and the menu opens the moment the level does, so an
+    // EMPTY map here usually means "still fetching", not "nothing installed" —
+    // an info row replaces the old "No matching commands" flash.
+    if (values.length === 0) {
+      return [{ key: `ensure:${verb}`, label: "Loading…", hint: verb, insert: "" }];
+    }
     // `rankMatches` already drops what does not match, so a plain `includes`
     // pre-filter here would throw a typo away before the fuzzy metric saw it.
     return rankMatches(values, caret.word, (v) => v).map((v) => ({
@@ -1502,10 +1600,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const showDictateDuringStreaming = !liveHere && isStreamingActive;
   // Send appears only once there is typed/pasted text: attaching a photo/file
   // alone keeps the mics visible so the prompt can be dictated afterwards.
-  const showSendOnly = !liveHere && !isStreamingActive && hasText;
+  const showSendOnly = !liveHere && !isStreamingActive && hasText && !recording;
   // Attachments alone must not hide the mics: user may attach a file/photo
-  // and then dictate the prompt. Only typed text hides voice buttons.
-  const showVoiceButtons = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && !hasText;
+  // and then dictate the prompt. Typed text hides them too — EXCEPT while
+  // recording: streaming dictation writes its partials INTO the input as they
+  // are recognized, and the mic button is showing Stop. Swapping it for Send
+  // mid-dictation removed the only way to stop ("the button never turns off").
+  const showVoiceButtons = !liveHere && !liveOwnedByOtherChat && !isStreamingActive && (!hasText || recording);
   // Live voice button shows whenever the composer is idle (empty input,
   // not streaming, live not active) so it comes back after Stop. It stays
   // hidden mid-stream and while typing, unless live is the active session.
@@ -1525,9 +1626,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const liveTypedRef = useRef("");
   /** Write the live partial into the composer (chunk by chunk). */
   const applyLivePartial = (text: string) => {
+    if (!text) return;
+    // ✓/✕ already acted (or ✓ is draining the final decode): an in-flight
+    // chunk reply must not retype the composer over the send/wipe decision.
+    if (dictateAwaitRef.current || dictateSuppressedRef.current) return;
+    // The ownership marker must advance OUTSIDE the updater: React may run an
+    // updater twice (StrictMode dev, interrupted renders). Writing the ref
+    // inside made the second run see a mismatched `prev` and commit the FIRST
+    // chunk's text while the ref raced ahead — every later partial was then
+    // rejected forever and the composer froze on the first chunk.
+    const ours = liveTypedRef.current;
+    liveTypedRef.current = text;
     setInput((prev) => {
-      if (prev.trim() !== "" && prev !== liveTypedRef.current) return prev;
-      liveTypedRef.current = text;
+      if (prev.trim() !== "" && prev !== ours) return prev;
       return text;
     });
   };
@@ -1550,6 +1661,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     setInput((prev) => (prev === ours ? "" : prev));
   };
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  /**
+   * Streaming dictate engine (same chunked pipeline as live voice, but speech
+   * never auto-sends): partials type into the composer while the user talks,
+   * only the mic button/Space stops dictation and finalizes the text.
+   */
+  const dictateSessionRef = useRef<LocalLiveSession | null>(null);
+  /** The last dictate press ran the streaming engine (guards the blob tail). */
+  const dictateWasStreamingRef = useRef(false);
+  /**
+   * True only for STREAMING dictation (the ✓/✕ confirm pair in the composer):
+   * the legacy blob pipeline keeps its mic-button flow and its own banner.
+   */
+  const [dictateConfirming, setDictateConfirming] = useState(false);
+  /** Mirror of `dictateConfirming` for the session callbacks (stable closures). */
+  const dictateConfirmingRef = useRef(false);
+  /** ✓ pressed: the engine is draining — final deliveries park here, then send. */
+  const dictateAwaitRef = useRef(false);
+  /** A turn-final delivery parked while the ✓/✕ pair is up (✓ may prefer it). */
+  const dictatePendingFinalRef = useRef("");
+  /** ✓/✕ already acted: in-flight deliveries must not retype the composer. */
+  const dictateSuppressedRef = useRef(false);
   const mediaChunksRef = useRef<Blob[]>([]);
   // Mirror of `recording` so the global keydown handler (which lives in a
   // useEffect with a stable closure) can read the latest value without
@@ -2188,8 +2320,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     useStore.getState().setChatMode(chat.id, mode);
   };
 
-  // Cycle Ask <-> Coder in the current chat (Tab / ⌘M). Plan is entered
-  // via `/plan` (Codex-style) and never appears in the cycle or the mode
+  // Cycle between the non-Plan modes, named by their labels (Ask <-> Build).
+  // Plan is entered via `/plan` (Codex-style) and never appears in the cycle or the mode
   // menu; when the chat is already in Plan mode, Tab lands on Ask.
   const cycleMode = (dir: 1 | -1) => {
     if (!chat) return;
@@ -2951,7 +3083,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
 
   useEffect(() => {
     const onToggleMode = () => {
-      // Only the focused chat cycles mode — otherwise one Tab/⌘M chord
+      // Only the focused chat cycles mode — otherwise one Tab chord
       // would flip every visible window.
       if (!shouldHandleForChat(useStore.getState().activeChatId, chatIdRef.current)) return;
       cycleMode(1);
@@ -3949,6 +4081,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // with no artifact tool at all, so it shipped a hard-coded HTML mock). The
     // model decides for itself whether to call the tool — the gate is DOWN, in
     // `tool_schemas`, so `allowCreate` no longer arms it.
+    // An open edit badge keeps a plugin/skill/connector/artifact update session
+    // alive: follow-up turns keep the authoring tools armed without the user
+    // repeating the command every turn.
+    if (chat.editTarget) allowCreate = true;
     if (!allowCreate) {
       if (wantsSkillOrMcp(text) || wantsSchedule(text) || wantsPlugin(text)) {
         allowCreate = true;
@@ -3968,7 +4104,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
       }
     }
-    const rootDir = chat.root || s.root;
+    // While the edit badge is open, the turn is rooted at the pinned folder
+    // (the updated plugin/skill/connector/artifact's own directory) instead of
+    // the workspace — closing the badge falls back to the chat's own root.
+    const rootDir = chat.editTarget?.path || chat.root || s.root;
     if (!rootDir) {
       // Every chat belongs to a workspace (see store.ts newChat/newChatInRoot).
       // A silent return here used to look like an "instant disconnect" — the
@@ -5052,6 +5191,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             // Viewer open must never break the stream.
           }
         }
+      } else if (event.kind === "edit_target") {
+        // A plugin/skill/connector/artifact UPDATE succeeded: pin the composer
+        // badge so follow-up turns keep targeting this folder (Build mode,
+        // rooted there) until the user closes the badge with its ×.
+        const kind = typeof event.target === "string" ? event.target : "";
+        const name = typeof event.name === "string" ? event.name : "";
+        const path = typeof event.path === "string" ? event.path : "";
+        if (
+          (kind === "plugin" || kind === "skill" || kind === "mcp" || kind === "artifact") &&
+          name &&
+          path
+        ) {
+          useStore
+            .getState()
+            .setChatEditTarget(chat.id, {
+              target: kind,
+              action: typeof event.action === "string" ? event.action : "update",
+              name,
+              path,
+            });
+        }
       } else if (event.kind === "artifact") {
         // The agent built or re-rendered a document. The card goes into the
         // transcript at this point in the stream, and the preview tab is
@@ -5443,7 +5603,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         {
           provider: activeProvider,
           root: rootDir,
-          mode: chat.mode,
+          // An open edit badge forces its turn to Build regardless of the
+          // chat's mode — an update session edits. The chat's own mode is
+          // untouched, so closing the badge restores it verbatim.
+          mode: chat.editTarget ? "build" : chat.mode,
           chatId: chat.id,
           prompt: activeGoalForSend ? `[Active goal: ${activeGoalForSend.condition}] ${promptWithResume}` : promptWithResume,
           history,
@@ -5457,12 +5620,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           images: sendImgs.map((i) =>
             i.dataUrl ? { path: i.path, dataUrl: i.dataUrl } : i.path,
           ),
-          systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
+          systemPrompt: s.settings.systemPrompts?.[chat.editTarget ? "build" : chat.mode] ?? "",
           // Live voice only: shape the answer for the ear (one language, plain
           // prose, numbers as words). APPENDED by the backend, so the chat's
           // own custom prompt is untouched and typed turns send nothing at all
           // (their request stays byte-identical to before).
-          systemSuffix: overrides?.liveSuffix ?? "",
+          systemSuffix:
+            [editTargetSuffix(chat.editTarget), overrides?.liveSuffix ?? ""]
+              .filter(Boolean)
+              .join("\n"),
           // Only a level a source enumerated for this model may be sent: a chat
           // keeps its level across model switches, and a level nobody described
           // is what the gateway answered with 400.
@@ -5498,7 +5664,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           webSearchAutoFetch: s.webSearchAutoFetch,
           skills: effectiveSkills,
           allowCreate,
-          cap: getMode(s.settings, chat.mode).capabilities,
+          cap: getMode(s.settings, chat.editTarget ? "build" : chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
           allowOutsideFolders: s.outsideFolders,
           allowComputer: s.computerUse,
@@ -6078,22 +6244,31 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 : ""),
         );
       }
-      if (sub === "run" && arg) {
-        // `<slug> <script> [args…]`: running code already on disk costs no turn.
-        const [script, ...scriptArgs] = rest.split(/\s+/).filter(Boolean);
-        if (!script) return say("Usage: `/plugin run <plugin> <script> [args…]`.");
-        const out = await runPluginScript({ slug: arg, name: script, args: scriptArgs });
-        if ("error" in out) return say(`Plugin script failed: ${out.error}`);
-        return say(
-          `\`${out.plugin}/${out.script}\` (${out.language}) in \`${out.cwd}\`:\n\n` +
-            "```\n" +
-            out.output.trimEnd() +
-            "\n```",
-        );
-      }
       if (sub === "update" && arg) {
-        if (!rest) return say("Usage: `/plugin update <slug> <change>`.");
         if (!ch) return say(`Open a chat to edit plugin \`${arg}\`.`);
+        if (!rest) {
+          // Picking a NAME — with no change text yet — OPENS the update session:
+          // the badge pins this bundle's folder; the change is described in
+          // the following messages instead of packed into one command.
+          const held = useStore
+            .getState()
+            .chats.find((c) => c.id === ch.id)?.editTarget;
+          if (held)
+            return say(
+              `An update session for **${held.name}** is already open — close it with the badge × first.`,
+            );
+          const dir = await editTargetDir("plugin", arg);
+          if (!dir) return say(`Plugin \`${arg}\` not found — run \`/plugin list\` first.`);
+          useStore.getState().setChatEditTarget(ch.id, {
+            target: "plugin",
+            action: "update",
+            name: arg,
+            path: dir,
+          });
+          return say(
+            `Update session for **${arg}** is open — describe the change in your next message.`,
+          );
+        }
         // Stated as an update OF a named bundle rather than as "a description":
         // the generic prompt dropped the slug into the description text, so the
         // model had to guess which bundle the words named. Listing first is what
@@ -6203,7 +6378,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         );
       }
       if (sub === "update" && arg && ch) {
-        if (!rest) return say("Usage: `/artifact update <id> <change>`.");
+        if (!rest) {
+          const held = useStore
+            .getState()
+            .chats.find((c) => c.id === ch.id)?.editTarget;
+          if (held)
+            return say(
+              `An update session for **${held.name}** is already open — close it with the badge × first.`,
+            );
+          const dir = await editTargetDir("artifact", arg);
+          const ok = dir
+            ? useStore
+                .getState()
+                .setChatEditTarget(ch.id, {
+                  target: "artifact",
+                  action: "update",
+                  name: arg,
+                  path: dir,
+                })
+            : false;
+          return ok
+            ? say(`Update session for **${arg}** is open — describe the change in your next message.`)
+            : say(`Artifact ${arg} not found — run /artifact list first.`);
+        }
+        // (with change text, the send below runs the turn.)
         // The body is injected: the artifact tool has no read action and `read`
         // cannot reach the app's data folder, so the model used to rebuild the
         // document from memory and the edit silently lost the rest of it.
@@ -6268,7 +6466,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             `skills/mcp_servers/plugins. Then call action=update with the SAME id and ` +
             `send only the fields that change (an omitted field keeps its stored ` +
             `value).${updFlags ? ` Set these attached arrays exactly: ${updFlags}.` : ""} ` +
-            `The cron is 5 fields in UTC, and an empty cron makes it run once.`,
+            `The cron is 5 fields in the machine's LOCAL time, and an empty cron makes it run once.`,
           [],
           [],
           true,
@@ -6497,6 +6695,37 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             );
             break;
           }
+          if (verb === "update" && tail.length === 1) {
+            // A bare `… update <name>` OPENS the session at once: the badge
+            // pins the skill/connector's folder; the change lands in the next
+            // messages (the model turn below runs only for an unknown name).
+            const name = tail[0];
+            const kind: ChatEditTarget["target"] = target === "skill" ? "skill" : "mcp";
+            const held = useStore
+              .getState()
+              .chats.find((c) => c.id === ch.id)?.editTarget;
+            if (held) {
+              s.addMessage(ch.id, {
+                role: "assistant",
+                content: `An update session for **${held.name}** is already open — close it with the badge × first.`,
+              });
+              break;
+            }
+            const dir = await editTargetDir(kind, name);
+            if (dir) {
+              useStore.getState().setChatEditTarget(ch.id, {
+                target: kind,
+                action: "update",
+                name,
+                path: dir,
+              });
+              s.addMessage(ch.id, {
+                role: "assistant",
+                content: `Update session for **${name}** is open — describe the change in your next message.`,
+              });
+              break;
+            }
+          }
         }
         if (!rest) {
           s.addMessage(ch.id, {
@@ -6548,7 +6777,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const rest = v.slice(word.length).trim();
         const usage: Record<string, string> = {
           "/plugin":
-            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin run <slug> <script> [args…]`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`. `install` reads an existing bundle from a repo; to make one, use `create`.",
+            "Usage: `\/plugin list`, `\/plugin install <repo> [path] [ref]`, `\/plugin create <description>`, `\/plugin update <slug> <change>`, `\/plugin on|off <slug>`, `\/plugin remove <slug>`. `install` reads an existing bundle from a repo; to make one, use `create`. To USE a bundle, type its `\/<slug>` command.",
           "/artifact":
             "Usage: `\/artifact list`, `\/artifact create <description>`, `\/artifact update <id> <change>`, `\/artifact remove <id>`.",
           "/schedule":
@@ -6591,7 +6820,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const prompts: Record<string, string> = {
           "/plugin": `Create or edit a plugin from this description: "${desc}". A plugin is a folder bundling skills, MCP connectors AND runnable scripts so they switch on and off together. If the user gave a REPOSITORY or folder to install from (a GitHub URL, owner/repo, or a path), use action=install with "repo" (plus "repo_path" for a sub-folder and "repo_ref" for a branch) — it reads the whole bundle out of the repo like Claude Desktop does. If instead they NAMED a plugin they want made (a bare word, not a repo address), use action=create with that name. Otherwise use the plugin tool: action=list first to see what exists, then create with a good name/slug and pass "fa_keywords" (the Persian phrases the WHOLE bundle answers to, comma-separated) plus the skills (name + content + description + fa_keywords in English AND Persian), the mcp map, and any "scripts" the description calls for. SCRIPTS ARE RUST BY DEFAULT: leave "language" out unless the user explicitly asked for python, node or bash, and write a complete, compiling program that prints its result to stdout (arguments arrive in std::env::args()). Run one later with action=run. If it names an existing plugin, use action=update with its slug and send only what changes. Do not touch files outside the plugin folder.`,
           "/artifact": `Build an artifact from this description: "${desc}". Use the artifact tool with action=create, a short title, kind=html for anything visual (a self-contained page: inline CSS, inline JS, no network requests) or kind=md for prose, and the FULL document as content. If the user is asking to change an artifact you already made in this chat, use action=update with its id and the complete new content.`,
-          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field UTC cron (empty = run once), the workspace root, mode,${flagLine ? " and pass these exact arrays: " + flagLine + "." : " and the skills/mcp_servers/plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
+          "/schedule": `Create or edit a scheduled task from this description: "${desc}". Use the schedule tool: action=list first to see the existing tasks, then create or update one with a name, the prompt the run should execute, a 5-field cron in the machine's LOCAL time (empty = run once), the workspace root, mode,${flagLine ? " and pass these exact arrays: " + flagLine + "." : " and the skills/mcp_servers/plugins the run needs."} To pause or resume, use action=toggle; to remove it, action=delete. Do not open any form — the Schedule page only displays what you save.`,
         };
         void send(
           prompts[word],
@@ -6650,41 +6879,76 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         break;
       }
       default: {
-        // `/<plugin>` alone names what the bundle holds; `/<plugin> <skill>`
-        // attaches that one skill through `overrides`, so the turn runs it
-        // instead of answering "Unknown command".
+        // Naming a plugin loads the BUNDLE. The user installs, switches and
+        // deletes a plugin as one unit, so asking them to spell a second word
+        // for one of its skills — and leaving the rest behind — defeated the
+        // point of bundling it. Every skill it holds is attached, and its MCP
+        // connectors come with their schemas. `/<plugin> <skill>` stays
+        // supported as an explicit narrowing for a bundle that holds several.
         const plug = pluginCmds.find((c) => `/${c.name}` === word);
         if (plug && ch) {
+          // A plugin turn is a pipeline that WRITES (its scripts patch files and
+          // its skills answer with edits), and the turn's capabilities come from
+          // the chat's mode — so an ask/plan chat would have the backend refuse
+          // the pipeline's first write mid-run ("blocked: this turn is
+          // read-only"). Move ask/plan to build before the turn starts, the
+          // same reasoning as `/goal`: a pipeline has nobody to ask mid-run.
+          const turnMode: AgentMode = "build";
+          if (ch.mode !== turnMode) s.setChatMode(ch.id, turnMode);
           const rest = v.slice(word.length).trim();
           const [head = '', ...tail] = rest.split(/\s+/);
-          const picked = plug.skills.find((s) => s.word === head.toLowerCase());
-          if (!picked) {
-            // `/<plugin>` alone is a question, not a turn: answer with what the
-            // bundle holds so the second level is discoverable.
-            s.addMessage(ch.id, {
-              role: 'assistant',
-              content:
-                `**${plug.hint}** holds ${plug.skills.length} skill(s):\n` +
-                plug.skills.map((sk) => `- \`/${plug.name} ${sk.word}\` — ${sk.hint}`).join('\n'),
-            });
-            break;
-          }
+          const named = plug.skills.find((s) => s.word === head.toLowerCase());
+          // `mcp:<name>` keeps ONLY that connector; a bare `mcp` keeps the
+          // bundle's connectors and drops its skills, so one server is usable on
+          // its own without carrying the whole bundle's prompt.
+          const mcpSelector = named ? undefined : head.toLowerCase();
+          const mcpNarrow = mcpSelector === 'mcp' || mcpSelector?.startsWith('mcp:');
+          const onlyMcp = mcpSelector?.startsWith('mcp:')
+            ? [mcpSelector.slice('mcp:'.length)]
+            : undefined;
           const created = s.addMessage(ch.id, {
             role: "user",
             content: prettySlashLabel(v),
-            ...(ch.mode ? { mode: ch.mode } : {}),
+            // The turn runs (and the fresh `chat` inside send() re-reads the
+            // store) as `turnMode`, so record THAT — the stale `ch` closure
+            // still carries the pre-switch mode.
+            mode: turnMode,
           });
-          void send(
-            tail.join(' ') || `Apply the ${picked.skill} skill to this turn's task.`,
-            [],
-            [],
-            false,
-            created.id,
-            undefined,
-            false,
-            { skills: [picked.skill] },
-            ch.id,
-          );
+          // With no skill word spelled out, the first token of the rest belongs
+          // to the task ("/plugin موضوع جدید بساز"), so keep all of it. A
+          // `mcp…` selector is the turn's target, not part of the task.
+          const task = (named || mcpNarrow ? tail : [head, ...tail]).join(' ').trim();
+          void resolvePluginTurn(plug, {
+            ...(named ? { onlySkill: named.skill } : {}),
+            ...(mcpNarrow ? { onlyMcp: onlyMcp ?? [] } : {}),
+          }).then((bundle) => {
+            const skills = mcpNarrow ? [] : named ? [named.skill] : bundle.skills;
+            // The banner is added AFTER the user's message so the bundle's
+            // contents read as the result of naming it.
+            if (bundle.mcpNames.length > 0) {
+              s.addMessage(ch.id, {
+                role: 'assistant',
+                content:
+                  `**${plug.hint}** — ${skills.length} skill(s), ` +
+                  `${bundle.mcpNames.length} connector(s): ` +
+                  bundle.mcpNames.map((n) => `\`${n}\``).join(', '),
+              });
+            }
+            void send(
+              task || `Run the ${plug.hint} plugin on this turn's task.`,
+              [],
+              [],
+              false,
+              created.id,
+              undefined,
+              false,
+              {
+                skills,
+                ...(bundle.mcpServers ? { mcpServers: bundle.mcpServers } : {}),
+              },
+              ch.id,
+            );
+          });
           break;
         }
         // With no chat there is nowhere to render the banner (setChatCmdError
@@ -7352,6 +7616,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     lang: string;
     chains: TranscribeProviderOpts[];
   } => {
+    // Fresh store read, NOT the render closure: this runs inside a press-time
+    // event handler whose render may predate a Settings change. The stale
+    // closure values silently produced an EMPTY chain, `chains.length > 0`
+    // failed, and the dictate press fell through to the classic (non-streaming)
+    // recorder with no trace — while live voice, which already reads fresh
+    // state the same way (buildLiveTtsChain), kept working.
+    const st = useStore.getState();
+    const providers = st.settings.providers ?? [];
+    const sttId = st.sttProviderId;
+    const sttMdl = st.sttModel;
+    const sttFbs = st.sttFallbacks ?? [];
     // The language hint is what stops short clips from being auto-detected
     // as the wrong language (the main cause of mangled Persian). The user's
     // setting wins; otherwise the UI direction / typed text decides.
@@ -7366,10 +7641,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       model,
     });
     const chains: TranscribeProviderOpts[] = [];
-    const sttCfg = settings.providers.find((p) => p.id === sttProviderId);
-    if (sttCfg) chains.push(toTranscribeOpts(sttCfg, sttModel));
-    for (const fb of sttFallbacks ?? []) {
-      const cfg = settings.providers.find((p) => p.id === fb.providerId);
+    const sttCfg = providers.find((p) => p.id === sttId);
+    if (sttCfg) chains.push(toTranscribeOpts(sttCfg, sttMdl));
+    for (const fb of sttFbs) {
+      const cfg = providers.find((p) => p.id === fb.providerId);
       if (!cfg) continue;
       chains.push(toTranscribeOpts(cfg, fb.model));
     }
@@ -7455,12 +7730,169 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     () => () => {
       releaseWarmMic();
       releaseWarmLiveMic();
+      // A mounted-away composer must not leak a running dictate engine (its
+      // partials belong to a composer that no longer exists).
+      dictateSessionRef.current?.disconnect();
+      dictateSessionRef.current = null;
     },
     [],
   );
 
+  /**
+   * Transcribe one audio clip across the FULL STT chain: primary provider
+   * first, then every fallback. Shared by live voice and streaming dictate so
+   * one failing endpoint (denied, offline, timeout) falls through to the next
+   * provider instead of killing the whole utterance.
+   */
+  const transcribeChunk = async (
+    blob: Blob,
+    lang?: string,
+    prompt?: string,
+  ): Promise<string> => {
+    const { lang: chainLang, chains } = resolveSttChain();
+    // Live/dictate have no typed input to sniff, so fall back to the UI
+    // direction (Persian for RTL): without a language hint short Persian
+    // chunks come back transliterated or in Arabic orthography.
+    const effectiveLang = lang || chainLang || 'fa';
+    const chainPrompt = prompt || buildSttPrompt(effectiveLang, sttPrompt);
+    let lastError: unknown = null;
+    for (const opts of chains) {
+      try {
+        const text = await transcribeAudio(
+          blob,
+          undefined,
+          effectiveLang,
+          opts,
+          chainPrompt || undefined,
+        );
+        lastError = null;
+        return text;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError ?? new Error('Transcription failed');
+  };
+
   const startRecording = async () => {
     if (recording || transcribing) return;
+    // Streaming dictate first: same engine as live voice (VAD, 1.4s chunks,
+    // pipelined requests), configured so a pause never auto-sends — while the
+    // user talks, partials type into the composer; only the mic button/Space
+    // stops dictation and finalizes the text. Falls back to the classic blob
+    // pipeline below when the engine is unavailable (missing memory, another
+    // chat owns it, mic already taken).
+    if (!liveSessionRef.current) {
+      console.debug('[voice] dictate: trying streaming engine, sttProviders=', (useStore.getState().settings.providers ?? []).length, 'sttProviderId=', useStore.getState().sttProviderId, 'chatId=', chatIdRef.current);
+      try {
+        const { lang, chains } = resolveSttChain();
+        if (chains.length > 0) {
+          const target = chains[0];
+          dictateWasStreamingRef.current = true;
+          // Warm the SELECTED provider: an argument-less warmStt() is a no-op.
+          void warmStt(target);
+          const s = new LocalLiveSession({
+            deviceId: selectedMicId || undefined,
+            dictate: true,
+            chatId: chatIdRef.current,
+            lang: lang || undefined,
+            prompt: sttPrompt || undefined,
+            // Same chain-walking transcriber live voice uses: when a provider
+            // fails (denied, offline, timeout — e.g. Groq unreachable), the
+            // next STT fallback (the local whisper server) takes over instead
+            // of killing the whole dictation with one error.
+            transcribe: transcribeChunk,
+            onPartial: applyLivePartial,
+            /**
+             * While the user talks the partials type into the composer; the
+             * ✓/✕ pair decides the outcome (✓ sends the text to the chat, ✕
+             * wipes it and cuts). A turn-final delivery retypes the composer
+             * only while the pair is not up and no press has acted yet.
+             */
+            onUserText: (text) => {
+              const t = text.trim();
+              if (dictateConfirmingRef.current || dictateAwaitRef.current) {
+                // The ✓/✕ pair is up (or ✓ is draining the final decode): park
+                // the whole-clip decode — ✓ may prefer it over the stale
+                // partial, ✕ throws it away. Nothing retypes the composer.
+                dictatePendingFinalRef.current = t;
+                return;
+              }
+              if (dictateSuppressedRef.current) {
+                // ✓/✕ already acted — a late delivery must not retype.
+                return;
+              }
+              if (!t) {
+                clearLivePartial();
+                return;
+              }
+              const previous = liveTypedRef.current;
+              liveTypedRef.current = "";
+              setInput((prev) => (prev === previous ? t : prev));
+            },
+            onStateChange: (st) => {
+              if (st === "live") setTranscribing(false);
+            },
+            onError: (err) => {
+              // The engine has no UI of its own: surface what it hits (mic
+              // delivering pure silence, capture producing no frames, a failed
+              // transcribe) instead of swallowing it — a silent onError made
+              // dictation look alive while nothing worked.
+              try {
+                const id = chatIdRef.current;
+                if (id)
+                  useStore.getState().setChatCmdError(
+                    id,
+                    `Dictation error: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+              } catch {
+                // Banner is best-effort.
+              }
+            },
+          });
+          dictateSessionRef.current = s;
+          console.debug('[voice] streaming dictate: session built (dictate=true)');
+          try {
+            await s.connect();
+            console.debug('[voice] streaming dictate: connect() resolved, state=', (s as unknown as { state: string }).state);
+          } catch (connectErr) {
+            console.debug('[voice] streaming dictate connect failed:', connectErr instanceof Error ? `${connectErr.name}: ${connectErr.message}\n${connectErr.stack ?? ''}` : connectErr);
+            // Release the lease a failed connect may still hold (claimed, then
+            // openMic threw), then let THIS press continue into the classic
+            // pipeline below. The next press tries streaming again: a one-off
+            // mic/claim failure must not permanently downgrade the panel to
+            // the legacy pipeline.
+            try {
+              s.disconnect();
+            } catch {
+              // Already closed.
+            }
+            dictateSessionRef.current = null;
+            dictateWasStreamingRef.current = false;
+          }
+          if (dictateSessionRef.current) {
+            recordingRef.current = true;
+            setRecording(true);
+            dictateConfirmingRef.current = true;
+            dictateAwaitRef.current = false;
+            dictatePendingFinalRef.current = "";
+            dictateSuppressedRef.current = false;
+            // Streaming dictate opened: swap the animated mic button for the
+            // ✓/✕ confirm pair.
+            setDictateConfirming(true);
+            return;
+          }
+        }
+      } catch (err) {
+        // Surfaced, not swallowed: the streaming branch used to fail here in
+        // silence (store shape, provider lookup, mic claim) and the press fell
+        // through to the classic pipeline with NO trace — "streaming never
+        // happens" was undebuggable. This log names the exact reason.
+        console.debug('[voice] streaming dictate unavailable for this press:', err);
+        // Fall through to the classic pipeline for THIS press; streaming is
+        // retried on the next press.
+      }
+    }
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
         // WKWebView only exposes mediaDevices when the app carries the
@@ -7503,6 +7935,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       rec.onstop = async () => {
         recordingRef.current = false;
         setRecording(false);
+        // Streaming dictate teardown: flushStreamingDictate may end dictation
+        // first (mic button/Space/Space/new session) — its onUserText already
+        // replaced the partial in the composer and its disconnect stops this
+        // recorder, so the blob pipeline must not run at all for that press.
+        if (dictateWasStreamingRef.current) {
+          dictateWasStreamingRef.current = false;
+          if (mediaRecorderRef.current === rec) mediaRecorderRef.current = null;
+          warmMicRef.current = null;
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
         // Keep the microphone open for the next press instead of paying the
         // hardware start-up delay again (MediaRecorder stopped using it, so
         // nothing is recorded in the meantime). Only a device change or a
@@ -7669,6 +8112,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       recordingRef.current = true;
       setRecording(true);
       console.debug("[voice] recording started", { mime: rec.mimeType });
+      // Warm the local server while the user walks up to speak: the ~14s
+      // whisper load is then paid before the first real request instead of
+      // hanging it. A no-op for cloud providers — and ONLY when the target is
+      // passed: an argument-less warmStt() does nothing.
+      const { chains: warmChains } = resolveSttChain();
+      void warmStt(warmChains[0]);
     } catch (err) {
       console.debug("[voice] microphone unavailable:", err);
       try {
@@ -7689,9 +8138,88 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
 
+  /** ✓ (or Ctrl+X Space): send the transcribed text to the chat, free the engine. */
+  const flushStreamingDictate = () => {
+    const s = dictateSessionRef.current;
+    dictateSessionRef.current = null;
+    if (!s) {
+      // Orphaned pair (session already gone): restore the mic button, keep the
+      // typed text so nothing is lost.
+      setDictateConfirming(false);
+      return;
+    }
+    const typed = liveTypedRef.current;
+    liveTypedRef.current = "";
+    dictateConfirmingRef.current = false;
+    dictateAwaitRef.current = true;
+    dictateSuppressedRef.current = true;
+    setDictateConfirming(false);
+    recordingRef.current = false;
+    setRecording(false);
+    void s
+      .finishDictation()
+      .then(() => {
+        // In dictate mode the whole-clip decode lands DURING this drain (the
+        // turn only closes on stop) — prefer the parked, fuller transcript over
+        // the last chunk partial.
+        const pending = dictatePendingFinalRef.current.trim();
+        dictatePendingFinalRef.current = "";
+        const text =
+          pending.length > typed.trim().length ? pending : typed.trim();
+        setInput((prev) => (prev === typed ? "" : prev));
+        if (text) void submit(text);
+      })
+      .finally(() => {
+        dictateAwaitRef.current = false;
+        // A NEW dictate session owns the flags now; leave it alone otherwise.
+        if (!dictateSessionRef.current) dictateSuppressedRef.current = false;
+      });
+  };
+
+  /** ✕: wipe the transcribed text, stop dictation, free the engine. */
+  const discardDictation = () => {
+    const s = dictateSessionRef.current;
+    dictateSessionRef.current = null;
+    if (!s) {
+      setDictateConfirming(false);
+      return;
+    }
+    clearLivePartial();
+    dictatePendingFinalRef.current = "";
+    dictateConfirmingRef.current = false;
+    dictateAwaitRef.current = false;
+    dictateSuppressedRef.current = true;
+    setDictateConfirming(false);
+    recordingRef.current = false;
+    setRecording(false);
+    void s.finishDictation().finally(() => {
+      if (!dictateSessionRef.current) dictateSuppressedRef.current = false;
+    });
+  };
+
+  /** Implicit stop (live voice start, teardown): keep the final text in the composer. */
+  const stopStreamingDictateKeepText = () => {
+    const s = dictateSessionRef.current;
+    dictateSessionRef.current = null;
+    if (!s) {
+      setDictateConfirming(false);
+      return;
+    }
+    dictateConfirmingRef.current = false;
+    dictateAwaitRef.current = false;
+    dictateSuppressedRef.current = false;
+    setDictateConfirming(false);
+    recordingRef.current = false;
+    setRecording(false);
+    // onUserText delivers the final transcript into the composer (dictation
+    // writes a prompt for the user to review/send) — nothing is auto-sent.
+    void s.finishDictation();
+  };
+
   const toggleRecording = () => {
     if (recording) {
       stopRecording();
+      flushStreamingDictate();
     } else {
       // A press is the last possible moment to catch a cold microphone: the
       // stream opened here is ready by the time the user starts speaking.
@@ -7700,6 +8228,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
   };
   toggleRecordingRef.current = toggleRecording;
+
+  /** ✓/✕ confirm pair — shared by the idle AND the mid-stream composer branch
+   *  ((showDictateDuringStreaming) used to render the old animated mic, so the
+   *  pair vanished whenever the agent was streaming). */
+  const dictateConfirmPair = (
+    <span className="dictate-confirm" role="group" aria-label="Dictation actions">
+      <span className="dictate-typing" aria-hidden="true">
+        <span /><span /><span /><span /><span /><span /><span />
+      </span>
+      <button
+        type="button"
+        className="icon-btn dictate-x-btn"
+        onClick={discardDictation}
+        title="Discard dictation and stop"
+        aria-label="Discard dictation"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+          <line x1="6" y1="6" x2="18" y2="18" />
+          <line x1="18" y1="6" x2="6" y2="18" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        className="icon-btn dictate-check-btn"
+        onClick={flushStreamingDictate}
+        title="Send dictation to the chat"
+        aria-label="Send dictation"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4.5 12.5l5 5L19.5 7" />
+        </svg>
+      </button>
+    </span>
+  );
 
   // Live voice session (separate from dictate): persistent WebSocket,
   // auto mic streaming, model playback, server VAD barge-in.
@@ -7770,6 +8332,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (liveOwnedByOtherChat) return;
     if (liveState === 'connecting' || isLiveVoiceActive) return;
     if (recording) stopRecording();
+    stopStreamingDictateKeepText();
     stopTts(LIVE_TTS_OWNER);
     clearLiveError();
     setLiveVoiceSession(chatIdRef.current ?? null, 'connecting');
@@ -7794,6 +8357,19 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         forceScrollToBottom();
       } catch {
         // Mirror is best-effort; the voice session keeps running either way.
+      }
+    };
+    /** Drop the live-preview user bubble (delivery replaces it with the real
+     * message from send(); a stop mid-turn drops the half utterance). */
+    const removeLiveUserMirror = () => {
+      const cid = chatIdRef.current;
+      const id = liveMirrorRef.current.userId;
+      liveMirrorRef.current.userId = null;
+      if (!cid || !id) return;
+      try {
+        useStore.getState().removeMessage(cid, id);
+      } catch {
+        // Best-effort.
       }
     };
     const mirrorAssistantText = (text: string, final: boolean) => {
@@ -7959,36 +8535,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
 
     try {
-      const transcribeChunk = async (
-        blob: Blob,
-        lang?: string,
-        prompt?: string,
-      ): Promise<string> => {
-        const { lang: chainLang, chains } = resolveSttChain();
-        // Live has no typed input to sniff, so fall back to the UI direction
-        // (Persian for RTL): without a language hint short Persian chunks come
-        // back transliterated or in Arabic orthography.
-        const effectiveLang = lang || chainLang || 'fa';
-        const chainPrompt = prompt || buildSttPrompt(effectiveLang, sttPrompt);
-        let lastError: unknown = null;
-        for (const opts of chains) {
-          try {
-            const text = await transcribeAudio(
-              blob,
-              undefined,
-              effectiveLang,
-              opts,
-              chainPrompt || undefined,
-            );
-            lastError = null;
-            return text;
-          } catch (e) {
-            lastError = e;
-          }
-        }
-        throw lastError ?? new Error('Transcription failed');
-      };
-      // Provider chain + local voice config for live speech (shared by
+  // Provider chain + local voice config for live speech (shared by
       // progressive streaming speech and the full-text fallback).
       const buildLiveTtsChain = () => {
         const st = useStore.getState();
@@ -8005,6 +8552,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         }
         return { args: chain };
       };
+      // Warm the chain live voice will use (STT + the answer's TTS voice): by
+      // the time the user finishes the first spoken turn, models are resident.
+      // Real targets only — an argument-less warm call is a no-op.
+      void warmStt(resolveSttChain().chains[0]);
+      void warmTts(buildLiveTtsChain().args);
       // Live text source for progressive speech: follows the currently
       // streaming assistant bubble and reports done when it settles, so
       // speech starts on the first completed sentence instead of waiting
@@ -8118,10 +8670,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         prompt: sttPrompt,
         transcribe: transcribeChunk,
         onPartial: (text) => {
-          // Progressive transcript: the words appear in the composer as they
-          // are recognized, chunk by chunk, instead of only after the turn.
-          if (text) applyLivePartial(text);
-          else clearLivePartial();
+          // Progressive transcript mirrors into the CHAT (same as the realtime
+          // path): the spoken words grow a user bubble while the user talks.
+          // The composer stays free — live is a conversation, not a draft.
+          if (text) mirrorUserText(text);
+          // onPartial('') fires just before delivery; the mirrored bubble is
+          // released by onUserText / teardown, not here, so the words never
+          // flash empty mid-turn.
         },
         onSpeechStart: () => {
           // Barge-in: user started talking while the agent answers — stop
@@ -8148,9 +8703,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         },
         onUserText: async (raw) => {
           const text = sanitizeLocalTranscript(raw).trim();
-          // The turn is now a real message: clear the progressive preview so
-          // the composer never shows the same words twice.
+          // The turn is now a real message: clear the progressive preview and
+          // release the mirrored bubble so send() creates the one real message
+          // (no duplicate of the live preview).
           clearLivePartial();
+          removeLiveUserMirror();
           if (!text) return;
           // Noise gate: never interrupt the agent for a 1-char hallucination.
           if (text.length < 2) return;
@@ -8323,6 +8880,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // Best-effort.
       }
     }
+    // A stop mid-turn drops the half-grown mirrored user bubble: those words
+    // were never sent, so leaving them in the chat implies a message exists.
+    const userMirrorId = liveMirrorRef.current.userId;
+    liveMirrorRef.current.userId = null;
+    if (cid && userMirrorId) {
+      try {
+        useStore.getState().removeMessage(cid, userMirrorId);
+      } catch {
+        // Best-effort.
+      }
+    }
     liveMirrorRef.current = { userId: null, assistantId: null };
     liveAccRef.current = { user: '', assistant: '' };
     liveModeRef.current = 'chunked';
@@ -8393,6 +8961,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    *  space — which is what makes the chain continue like nvim's. */
   const acceptCmd = (insert: string) => {
     if (!cmdOpen) return;
+    // An informational row ("Loading…", "Nothing installed", "All selected")
+    // carries no insert: accepting it must be a no-op, not a wipe of the
+    // fragment the user has typed (`--skills=brain` → `--skills=`).
+    if (insert === "") return;
     const caret = cmdCaret;
     // A flag token (`--skills=a,b`) appends: only the value after `=` is
     // replaced, so picking a second skill keeps the first.
@@ -8425,12 +8997,55 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const next = inserted + input.slice(end);
     const pos = inserted.length;
     setInput(next);
+    // Picking the NAME of an `… update` target opens the session AT ONCE — the
+    // badge pins before any Enter; the next messages only carry the change.
+    let cleared = false;
+    try {
+      const tokens = next.trim().split(/\s+/);
+      const cmd = (tokens[0] ?? "").replace(/^\//, "").toLowerCase();
+      if (
+        tokens.length >= 3 &&
+        EDIT_TARGET_COMMANDS.has(cmd) &&
+        (tokens[1] ?? "").toLowerCase() === "update"
+      ) {
+        if (
+          openEditTargetSession(
+            activeChatId,
+            cmd as ChatEditTarget["target"],
+            tokens[2],
+            cmdArgDirsRef.current,
+          )
+        ) {
+          // The line has served its purpose: the badge above the composer now
+          // carries the target, so the input is reset for the change itself.
+          cleared = true;
+          setInput("");
+        }
+      }
+    } catch {
+      // A pick must never break the input edit.
+    }
     setCmdOpen(null);
     setCmdCaret(null);
+    if (cleared) {
+      // The session line is gone — nothing for the palette to sit on.
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          el.focus();
+          el.setSelectionRange(0, 0);
+        }
+      });
+      return;
+    }
     // The trailing space starts the NEXT level, so the palette is re-seeded for
     // the fresh caret — leaving it closed broke the chain after one step.
     // `syncCmdPalette` closes it again for a level with nothing to offer.
-    syncCmdPalette(next, pos);
+    // A flag VALUE pick is the exception: the token just landed
+    // (`--skills=a,b`), and re-seeding popped the value menu straight back —
+    // exactly the popup that blocked writing the prompt. ArrowUp reopens it.
+    const nextCaret = slashCaretAt(next, pos);
+    if (!nextCaret || !hasLandedFlag([nextCaret.word])) syncCmdPalette(next, pos);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (el) {
@@ -8468,9 +9083,26 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         : undefined;
     const flagLevel =
       caret.index >= 2 && commandFlags(subVerb).length > 0 && !!subDecl;
-    // Any other level-2+ word belongs to the sub-command's own value menu
-    // (`/plugin install <repo>`); its rows decide whether it is worth showing.
-    const argLevel = caret.index >= 2 && !!subDecl && subDecl.arg !== "free";
+    // Flag menus auto-open only while a flag is being BUILT: the empty word
+    // right after `create `/`update ` (no flag landed yet), a `--name` being
+    // typed, or the value side of `--name=`. Prose (the prompt itself) and the
+    // fresh word after a landed `--flag=value` do NOT pop the menu — a popup
+    // over every word made the description unwritable. ArrowUp brings the menu
+    // back by hand (next flag name, or the rest of a value list).
+    const proseWord = caret.word !== "" && !isFlagToken(caret.word);
+    const afterLanded = caret.word === "" && hasLandedFlag(caret.prev.slice(2));
+    if (flagLevel && (proseWord || afterLanded)) {
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    // A level-2 word belongs to the sub-command's own value menu, and level 3+
+    // to its declared `rest` — none for `update`, so after the NAME is picked
+    // the palette must CLOSE instead of sitting on an empty
+    // "No matching commands" box (the change text is typed freely there).
+    const argLevel =
+      (caret.index === 2 && !!subDecl && subDecl.arg !== "free") ||
+      (caret.index >= 3 && !!subDecl && !!subDecl.rest && subDecl.rest !== "free");
     const known =
       caret.index === 0 || hasSubCommands || flagLevel || argLevel;
     if (!known) {
@@ -8863,6 +9495,40 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // to lose).
     if (!cmdOpen && !skillMention && !skillOpen && !historyOpen && e.key === "ArrowUp") {
       const el = textareaRef.current;
+      // A landed `--flag=value` closed the auto flag menu by design; ArrowUp
+      // brings it back anywhere on the line: a flag token under the caret opens
+      // its own level (value list to append, or the name menu), and a prose
+      // word opens the FLAG NAMES so the next flag can be picked.
+      if (input.startsWith("/")) {
+        const caret = slashCaretAt(input, el?.selectionStart ?? input.length);
+        const flags = caret ? commandFlags(caret.prev[0] ?? "") : [];
+        const subDecl =
+          caret && caret.index >= 2
+            ? (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).find((s) => s.name === caret.prev[1])
+            : undefined;
+        if (caret && caret.index >= 2 && flags.length > 0 && subDecl) {
+          e.preventDefault();
+          e.stopPropagation();
+          setCommandUsage(loadCommandUsage());
+          setCmdOpen({ at: 0 });
+          // On a flag token / empty word the caret's own level opens; over prose
+          // the caret word is blanked to the NAME menu, spliced at the exact
+          // caret offset so picking inserts rather than replacing the word.
+          const onFlag = !caret.word || isFlagToken(caret.word);
+          const opened = onFlag
+            ? caret
+            : (() => {
+                const at = el?.selectionStart ?? caret.start;
+                return { ...caret, start: at, end: at, word: "" };
+              })();
+          setCmdCaret(opened);
+          setCmdQuery(opened.word.toLowerCase());
+          setCmdIndex(0);
+          void ensureCmdArgValues();
+          requestAnimationFrame(() => textareaRef.current?.focus());
+          return;
+        }
+      }
       const atStart = !el || ((el.selectionStart ?? 0) === 0 && (el.selectionEnd ?? 0) === 0);
       if (input === "" && atStart && (promptHistory.length > 0 || pinnedCmds.length > 0)) {
         e.preventDefault();
@@ -8945,6 +9611,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     if (e.key === "Enter" && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
       e.preventDefault();
+      // While streaming dictation is live, Enter means the ✓ button: finalize
+      // and send the transcribed text. A direct submit() here sent the raw
+      // partial and left the mic open (the composer kept typing over a sent
+      // message).
+      if (dictateSessionRef.current) {
+        flushStreamingDictate();
+        return;
+      }
       submit();
     }
   };
@@ -9283,8 +9957,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   </div>
                 ))}
                 <p className="empty-hint">
-                  Switch between Ask and Coder with <code>Tab</code>,{" "}
-                  <code>Cmd/Ctrl+M</code>, or the selector above — type{" "}
+                  Switch between{" "}
+                  {allModes(settings)
+                    .filter((m) => m.id !== "plan")
+                    .map((m) => m.label)
+                    .join(" and ")}{" "}
+                  with <code>Tab</code> or the{" "}
+                  selector above — type{" "}
                   <code>/plan</code> for Plan mode, <code>/help</code> for all
                   commands and shortcuts.
                 </p>
@@ -10896,6 +11575,23 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ))}
               </div>
             )}
+            {chat.editTarget && (
+              <div className="edit-target-badge" dir="ltr" title={chat.editTarget.path}>
+                <span className="edit-target-glyph" aria-hidden="true">
+                  {chat.editTarget.target === "artifact" ? "◆" : "●"}
+                </span>
+                <span className="edit-target-name">
+                  {chat.editTarget.action} · {chat.editTarget.name}
+                </span>
+                <button
+                  className="edit-target-x"
+                  onClick={() => useStore.getState().clearChatEditTarget(chat.id)}
+                  title="پایان ویرایش — بازگشت به پوشهٔ ورک‌اسپیس و مود قبلی"
+                >
+                  ×
+                </button>
+              </div>
+            )}
             <div
               ref={composerRowRef}
               className={`composer-input-row${composerExpanded ? " expanded" : " compact"}`}
@@ -11100,6 +11796,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                   {(showVoiceButtons || showLiveActive) && (
                   <>
                   {showVoiceButtons && (
+                  dictateConfirming ? dictateConfirmPair : (
                   <button
                     className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                     onPointerDown={warmMic}
@@ -11150,6 +11847,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                       </svg>
                     )}
                   </button>
+                  )
                   )}
                   </>
                   )}
@@ -11254,7 +11952,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                           <rect x="6" y="6" width="12" height="12" rx="2" />
                         </svg>
                       </button>
-                      {showDictateDuringStreaming && (
+                      {showDictateDuringStreaming && (dictateConfirming ? dictateConfirmPair : (
                         <button
                           className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
                           onClick={toggleRecording}
@@ -11304,7 +12002,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                             </svg>
                           )}
                         </button>
-                      )}
+                      ))}
                     </>
                   ) : showSendOnly ? (
                     <button

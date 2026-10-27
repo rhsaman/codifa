@@ -16,8 +16,10 @@ import {
   slashFlagAt,
   flagValues,
   flagValueRows,
+  flagPickInsert,
   parseScheduleFlags,
   stripFlagTokens,
+  hasLandedFlag,
   recordHistory,
   togglePin,
   historyRows,
@@ -435,6 +437,51 @@ console.log("19) flagValueRows: the rows a --flag token offers:")
     flagValueRows(skills, "brainstorming,").length === 2,
     flagValueRows(skills, "brainstorming,"),
   )
+  // The pick-again regression: a COMPLETE pick used to rank as a prefix, leave
+  // one row (itself), the picked-filter dropped it, and the popup collapsed to
+  // "All selected" with the whole rest of the list unshown.
+  check(
+    "a complete pick keeps offering the rest of the list",
+    flagValueRows(skills, "brainstorming").length === 2,
+    flagValueRows(skills, "brainstorming"),
+  )
+}
+
+console.log("20) flagPickInsert: what a value pick writes over the typed part:")
+{
+  const skills = ["anthropic-skills", "brainstorming", "data-analysis"]
+  // The pick-two regression: with `--skills=a` present, picking `b` wrote back
+  // only `b`, so the first pick vanished from the line.
+  check(
+    "a second pick appends to the first",
+    flagPickInsert("brainstorming", "data-analysis", skills) === "brainstorming,data-analysis",
+    flagPickInsert("brainstorming", "data-analysis", skills),
+  )
+  // A partial fragment is its completion, not a kept stray (`an` +
+  // `anthropic-skills` → `anthropic-skills`, never `an,anthropic-skills`).
+  check(
+    "a partial fragment is replaced by its completion",
+    flagPickInsert("an", "anthropic-skills", skills) === "anthropic-skills",
+    flagPickInsert("an", "anthropic-skills", skills),
+  )
+  check(
+    "a mixed list keeps complete picks and replaces the fragment",
+    flagPickInsert("anthropic-skills,an", "anthropic-skills", skills) === "anthropic-skills,anthropic-skills" &&
+      flagPickInsert("brainstorming,da", "data-analysis", skills) === "brainstorming,data-analysis",
+    flagPickInsert("brainstorming,da", "data-analysis", skills),
+  )
+  check("no pick yet writes the value itself", flagPickInsert("", "brainstorming", skills) === "brainstorming")
+}
+
+console.log("21) hasLandedFlag: when the flag menu stops auto-opening:")
+{
+  check("no flag is not landed", !hasLandedFlag(["create", "nightly", "report"]))
+  check("a bare --flag is open, not landed", !hasLandedFlag(["create", "--skills"]))
+  check("an empty value (--skills=) is open, not landed", !hasLandedFlag(["create", "--skills="]))
+  check("a value word lands the flag", hasLandedFlag(["create", "--skills=brainstorming"]))
+  check("a comma list lands the flag", hasLandedFlag(["create", "--skills=a,b", "nightly"]))
+  check("an em-dash token counts too", hasLandedFlag(["create", "—skills=a,b"]))
+  check("a non-flag word with = is prose, not landed", !hasLandedFlag(["create", "x=y"]))
 }
 
 if (failed > 0) {

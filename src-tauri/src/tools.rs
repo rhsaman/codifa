@@ -178,6 +178,11 @@ pub(crate) fn levers_fired(name: &str, result: &str) -> Vec<&'static str> {
     if matches!(name, "edit_file" | "write_file") && result.contains(POST_EDIT_DIAGNOSTICS_MARK) {
         out.push("post_edit_diagnostics");
     }
+    // A writer that landed on a file read earlier in the same step: its result
+    // carries the stale-source note steering the model off the pre-edit copy.
+    if matches!(name, "edit_file" | "write_file") && result.contains(POST_EDIT_STALE_NOTE) {
+        out.push("stale_source_note");
+    }
     if name == "grep" && result.contains(IDENTIFIER_SYMBOL_MARK) {
         out.push("identifier_grep_symbol");
     }
@@ -319,8 +324,17 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
         // `cargo` is exactly what the terminal does without asking, and the
         // login PATH is already trusted enough to launch every child process.
         // Without this, a plain `node script.js` asked for /opt/homebrew/bin
-        // or ~/.nvm/... on every round.
-        if target_canon.is_absolute() && tool_dirs().iter().any(|d| target_canon.starts_with(d)) {
+        // or ~/.nvm/... on every round. The lexical `target` counts too: a PATH
+        // binary is often a SYMLINK into a versioned dir (homebrew's
+        // /opt/homebrew/bin/node -> ../Cellar/node/x/bin/node), so the
+        // canonical form no longer carries the trusted prefix — the link
+        // itself was installed into the user's PATH dir, which is what the
+        // trust is about.
+        if target.is_absolute()
+            && tool_dirs()
+                .iter()
+                .any(|d| target_canon.starts_with(d) || target.starts_with(d))
+        {
             return Ok(target_canon);
         }
         if let Some(permit) = permit {
@@ -764,6 +778,25 @@ const NEAREST_HINT_BUDGET: usize = 1_200;
 /// Lines of context printed on each side of the closest match.
 const NEAREST_HINT_CONTEXT: usize = 4;
 
+/// Marker stamped on a successful writer's result when a `read`/`grep` of the
+/// SAME file ran EARLIER IN THE SAME STEP (batch readers run before the
+/// sequential writers). Measured in trace `mvpk9qxx` run=106: that pre-edit
+/// lookup kept its pre-edit text on the wire, the model rebuilt `old_string`
+/// from it and the edit failed 4 rounds in a row. The note tells the model its
+/// copy is stale NOW — one line, no content removed.
+pub(crate) const POST_EDIT_STALE_NOTE: &str =
+    "\n[stale-source note] a `read`/`grep` of this SAME file ran earlier IN THIS STEP, before \
+this edit landed; the text it returned is outdated. Treat only the post-edit state (or a \
+fresh `grep`/window read) as truth, never that earlier result.";
+
+/// Minimum shared-word ratio for showing a window at all. MEASURED at 0.5 the
+/// window kept a stale-edit loop alive: a traced run failed the same edit 4
+/// times because the "closest match" it was pointed at (score ~0.6) was the
+/// wrong neighbourhood — the model's copy came from a pre-edit grep elsewhere
+/// in the file. Only a near-exact line is copyable text; anything weaker means
+/// the model's copy is stale and it needs the current text from a tool call.
+const NEAREST_HINT_FLOOR: f64 = 0.75;
+
 /// Whitespace-insensitive form of a line: runs of whitespace become one space.
 fn squeeze(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -782,9 +815,10 @@ fn squeeze(line: &str) -> String {
 /// Matching is deliberately cheap and local: the first non-blank line of the
 /// missing text is compared with every line (whitespace-normalised, then by
 /// shared-word ratio) and the best line above the floor is shown with its
-/// neighbours under real line numbers. An empty result means "no confident
-/// match", so the caller keeps the plain error instead of printing a window
-/// that would mislead.
+/// neighbours under real line numbers. Below the floor the copy the model
+/// holds is stale, so no window is printed — a sentence instead names the
+/// staleness and points at a cheap `grep`/window read, which is what breaks
+/// the measured retry loop (4 failed edits off one pre-edit grep).
 fn nearest_hint(content: &str, old_string: &str) -> String {
     let probe = match old_string.lines().find(|l| !l.trim().is_empty()) {
         Some(l) => squeeze(l),
@@ -808,20 +842,30 @@ fn nearest_hint(content: &str, old_string: &str) -> String {
             let shared = probe_words.iter().filter(|w| line_words.contains(w)).count();
             shared as f64 / probe_words.len().max(line_words.len()) as f64
         };
-        if score >= 0.5 && best.is_none_or(|(b, _)| score > b) {
+        if score >= NEAREST_HINT_FLOOR && best.is_none_or(|(b, _)| score > b) {
             best = Some((score, i));
         }
     }
     let Some((_, hit)) = best else {
-        return String::new();
+        // No confident match means the string was rebuilt from a stale copy
+        // (the pre-edit read/grep still in the context above): pointing at any
+        // window would anchor the model to ANOTHER wrong neighbourhood, which
+        // is exactly the measured 4-round loop. Steer to the current text
+        // instead — one cheap lookup, then the edit lands.
+        return " Your copy of this file is STALE — it predates an edit above this turn. \
+Do NOT resend this old_string and do NOT reconstruct it from the earlier `read`/`grep` \
+result: `grep` for its distinctive token with path= the file (or `read` a narrow window \
+with ranges), and build old_string from THAT output."
+            .to_string();
     };
     let start = hit.saturating_sub(NEAREST_HINT_CONTEXT);
     let end = (hit + NEAREST_HINT_CONTEXT + 1).min(lines.len());
     let numbered: Vec<String> = lines[start..end].iter().map(|l| (*l).to_string()).collect();
     let window = numbered_window_capped("current text", start + 1, &numbered, NEAREST_HINT_BUDGET);
     format!(
-        " The text you sent is not in the file any more; this is the CURRENT text around the \
-closest match — copy the exact string from here (do NOT re-read the whole file):\n{window}"
+        " The text you sent is not in the file any more — your earlier `read`/`grep` of it is \
+out of date now. Copy the exact string from the CURRENT text below \
+(do NOT re-read the whole file: a small window covers it):\n{window}"
     )
 }
 
@@ -1516,10 +1560,16 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
+    // The app bundle's PATH misses the user's tool dirs (cargo lived outside
+    // it), so `cargo`-class calls died with `command not found` and each one
+    // billed a repair round. Inherit the LOGIN-shell PATH, probed once.
+    static LOGIN_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let login_path = LOGIN_PATH.get_or_init(crate::shell_env::shell_path);
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(root)
+        .env("PATH", login_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2455,8 +2505,8 @@ into one union — those lines are all above; do NOT re-read them]"
                         obj.insert("enabled".into(), json!(on));
                     }
                     // The run context: skills are names, connectors are names,
-                    // plugins are slugs whose skills + connectors are expanded
-                    // at run time (see scheduler::execute_schedule).
+                    // plugins are slugs whose skills + scripts + connectors are
+                    // expanded at run time (see scheduler::execute_schedule).
                     for key in ["skills", "mcp_servers", "plugins"] {
                         if let Some(list) = args[key].as_array() {
                             obj.insert(key.into(), json!(list));
@@ -2955,6 +3005,15 @@ mod tests {
         assert_eq!(levers_fired("edit_file", &diag), vec!["post_edit_diagnostics"]);
         // A silent edit (cold server, clean file) must NOT claim the lever.
         assert!(levers_fired("edit_file", "Successfully edited a.rs").is_empty());
+        // The stale-source lever: a writer landing on a file read earlier in
+        // the same step records it, so the trace can count the loop off
+        // `detail.levers` without re-parsing messages.
+        let stamped = format!("Successfully edited a.rs{}", POST_EDIT_STALE_NOTE);
+        assert_eq!(
+            levers_fired("edit_file", &stamped),
+            vec!["stale_source_note"]
+        );
+        assert!(levers_fired("grep", &stamped).is_empty());
         // The marker in the WRONG tool's result is not that tool's lever.
         assert!(levers_fired("read", &diag).is_empty());
 
@@ -3002,10 +3061,11 @@ mod tests {
     /// MEASURED: 20 of 25 traced edit failures sent text the file no longer had,
     /// and the bare "old_string not found" left the model to answer with a full
     /// re-read (4 cases) or a re-sent stale batch (median 2 extra rounds per
-    /// failure). Both halves are pinned here: the near-miss comes back as a
-    /// numbered window of the real text, and an unrecognisable miss stays
-    /// EMPTY so the caller keeps the plain error instead of pointing at an
-    /// unrelated line.
+    /// failure). Both halves are pinned here: a NEAR-EXACT miss comes back as a
+    /// numbered window of the real text, and a weaker miss prints NO window —
+    /// pointing at one anchored the model to another wrong neighbourhood (the
+    /// traced 4-round loop, run=106) and instead names the staleness and the
+    /// cheap lookup that finds the current text.
     #[test]
     fn a_missed_edit_shows_the_current_text_window() {
         let content = "fn alpha() {}\n\n    let total = compute_total(items);\n";
@@ -3027,10 +3087,33 @@ mod tests {
             "expected the current text for a whitespace drift, got: {ws}"
         );
 
-        // Nothing recognisable in the file: stay EMPTY rather than point at an
-        // unrelated line — the caller then keeps its plain error message.
+        // The traced loop, re-created: the model's copy carries the real head
+        // of the line and invents the rest (4 of 7 words shared = 0.57, under
+        // the 0.75 floor). Pointing at that window is what let the model fail
+        // the SAME edit 4 rounds in a row — so only the stale-copy guidance
+        // may come back, never a window.
+        let half = nearest_hint(
+            content,
+            "let total = compute_total(items) and then log_the_result_with_a_note;",
+        );
+        assert!(
+            half.contains("STALE") && !half.contains("current text"),
+            "a half-matching copy must get the stale guidance, not a window, got: {half}"
+        );
+
+        // Nothing recognisable in the file: the model's copy is stale, so NO
+        // window is printed — pointing at one would anchor it to another wrong
+        // neighbourhood (the measured 4-round edit-fail loop). The guidance
+        // instead sends the model to the CURRENT text with a cheap lookup.
         let none = nearest_hint(content, "a_completely_unrelated_statement_xyz");
-        assert!(none.is_empty(), "expected an empty hint, got: {none}");
+        assert!(
+            none.contains("STALE") && none.contains("grep") && none.contains("old_string"),
+            "expected stale-copy guidance, got: {none}"
+        );
+        assert!(
+            !none.contains("current text"),
+            "no window must be printed below the floor, got: {none}"
+        );
     }
 
 

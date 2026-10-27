@@ -16,6 +16,7 @@ import type {
   AgentMode,
   AgentModeDef,
   Chat,
+  ChatEditTarget,
   ChatDraft,
   ChatMessage,
   McpServerConfig,
@@ -1563,6 +1564,14 @@ interface State {
   setWindowFullscreen: (id: string | null) => void
   toggleWindowFullscreen: (id?: string) => void
   setChatMode: (id: string, mode: AgentMode) => void
+  /** Pin the open "editing" badge (what the agent last UPDATED in this chat):
+   *  while set, the chat's mode is FORCED to Build for the whole session (the
+   *  previous mode is saved on the chat and restored by ×) and sends go to the
+   *  target folder. */
+  setChatEditTarget: (id: string, target: ChatEditTarget) => boolean
+  /** Close the badge: the chat goes back to its own folder and the mode it
+   *  had before the pin. The ONLY way an update session ends. */
+  clearChatEditTarget: (id: string) => void
   /** Silent mode sync for backend-driven switches (plan approval → build via
    *  the `mode_changed` event): updates chat.mode WITHOUT the "[Mode switched
    *  …]" marker message — the backend already narrates the transition. */
@@ -4160,6 +4169,60 @@ export const useStore = create<State>((set, get) => ({
     if (!isChatBodyReady(id)) return
     set((s) => ({
       chats: s.chats.map((c) => (c.id === id ? { ...c, mode, updatedAt: Date.now() } : c)),
+    }))
+    get().persist()
+  },
+
+  setChatEditTarget: (id, target) => {
+    // ONE update session per chat: while a badge is open, a DIFFERENT target
+    // is refused — the × on the badge is the only way out. Re-pinning the SAME
+    // target is an echo and stays harmless.
+    // The session ALSO FORCES the chat's mode to Build for its whole length
+    // (saved first, restored by ×): so retries, resume and the composer's
+    // mode selector all agree with the badge — an update turn is never sent
+    // read-only because some other path read chat.mode directly.
+    let refused = false
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== id) return c
+        if (
+          c.editTarget &&
+          (c.editTarget.target !== target.target || c.editTarget.name !== target.name)
+        ) {
+          refused = true
+          return c
+        }
+        const prevMode = c.editTarget ? c.editTargetPrevMode : c.mode === "build" ? undefined : c.mode
+        return {
+          ...c,
+          editTarget: target,
+          // Save the chat's real mode only on FIRST pin (the echo keeps it).
+          editTargetPrevMode: prevMode,
+          // An update session IS a build session — force it now, not per-send.
+          mode: "build",
+          updatedAt: Date.now(),
+        }
+      }),
+    }))
+    if (!refused) get().persist()
+    return !refused
+  },
+
+  clearChatEditTarget: (id) => {
+    // ×: end the session — the badge goes and with it the Build override; the
+    // chat returns to the mode it had before the pin (anything but build).
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.editTarget
+          ? {
+              ...c,
+              editTarget: undefined,
+              mode: c.editTargetPrevMode ?? c.mode,
+              editTargetPrevMode: undefined,
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
     }))
     get().persist()
   },

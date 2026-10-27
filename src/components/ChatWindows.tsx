@@ -835,23 +835,6 @@ export function ChatWindows() {
       const t = e.target as HTMLElement | null;
       if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) return;
       const k = physicalKey(e as { code: string; key: string });
-      // Window fullscreen: Cmd/Ctrl+M expands the focused window to the whole
-      // chat area; pressing again restores the split. Focus lands back in
-      // the composer so typing can continue. Skipped in the terminal (the
-      // shell owns Ctrl chords there) and in dialogs/overlays.
-      if (k === 'm') {
-        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
-        if (t?.closest?.('.terminal-panel')) return;
-        e.preventDefault();
-        e.stopPropagation();
-        const st2 = useStore.getState();
-        const ids2 = st2.chatTree ? collectChatIds(st2.chatTree) : st2.visibleChatIds;
-        if (ids2.length < 2 && !st2.windowFullscreenId) return;
-        st2.toggleWindowFullscreen();
-        const after = useStore.getState().activeChatId;
-        if (after) requestAnimationFrame(() => focusChatInput(after));
-        return;
-      }
       // Window MOVE (swap positions): Shift+Alt(Option)+H/J/K/L. The plain
       // Ctrl+X chords move FOCUS between windows/panes (App.tsx) and never
       // swap chats; bare j/k stay free for transcript/sidebar scrolling.

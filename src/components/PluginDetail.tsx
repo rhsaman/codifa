@@ -62,7 +62,7 @@ function skillOutcome(out: SkillSyncResult): { ok: true } | { error: string } {
  *  that reach it.
  *
  *  Skills are matched by these phrases, so they carry the field. A connector or a
- *  script is invoked by name (`/plugin run …`, the MCP tool list) and its
+ *  script is invoked by name (`plugin` tool action `run`, the MCP tool list) and its
  *  metadata is never read by the keyword matcher, so `keywords` is passed as
  *  `null` for those: a field that changes nothing is worse than no field. */
 function MetaFields({
@@ -745,8 +745,8 @@ export function PluginDetail({
           {tab === 'scripts' ? (
             scripts.length === 0 ? (
               <div className="hint">
-                No scripts in this bundle. A script is a runnable entry point, invoked with{' '}
-                <code>/plugin run {plugin.slug} &lt;name&gt;</code>.
+                No scripts in this bundle. A script is a runnable entry point the assistant runs
+                during a turn when the bundle's skill calls for it.
               </div>
             ) : (
               scripts.map((row) => {
@@ -798,10 +798,8 @@ export function PluginDetail({
                         Delete
                       </button>
                       <span className="hint">
-                        Code lives in <code>{row.file ?? 'main.rs'}</code> — run it with{' '}
-                        <code>
-                          /plugin run {plugin.slug} {row.name}
-                        </code>
+                        Code lives in <code>{row.file ?? 'main.rs'}</code> — the assistant runs it
+                        during a turn when the bundle's skill calls for it.
                       </span>
                     </div>
                   </Part>

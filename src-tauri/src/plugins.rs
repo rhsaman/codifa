@@ -428,6 +428,12 @@ fn plugins_dir(root: &Path) -> PathBuf {
     root.join("plugins")
 }
 
+/// Public wrapper: one bundle's folder, so the agent loop can pin the folder an
+/// update should keep working in.
+pub fn plugin_dir_pub(root: &Path, plugin: &str) -> PathBuf {
+    plugin_dir(root, plugin)
+}
+
 fn plugin_dir(root: &Path, slug: &str) -> PathBuf {
     plugins_dir(root).join(crate::skills::safe_file(slug, "plugin"))
 }
@@ -438,7 +444,7 @@ fn plugin_slug(name: &str, given: &str) -> String {
     crate::skills::safe_file(&raw.trim().to_lowercase(), "plugin")
 }
 
-fn plugin_ref(body: &Value) -> String {
+pub fn plugin_ref(body: &Value) -> String {
     plugin_slug(
         body["name"].as_str().unwrap_or(""),
         body["slug"].as_str().unwrap_or(""),
@@ -841,9 +847,43 @@ fn rust_binary(dir: &Path, name: &str) -> PathBuf {
 
 /// Run one of a plugin's scripts, bounded exactly like `run_terminal`.
 ///
-/// Rust is compiled with `rustc` on first use and re-used until the source or
-/// the binary changes, so a repeat run costs nothing; the other languages go
-/// straight to their interpreter.
+/// KEY=VALUE pairs of the bundle's own `.env` — the home for API keys and other
+/// secrets so they never hard-code into a script source. Blank lines, `#`
+/// comments and malformed keys are skipped; an optional `export ` prefix and
+/// one pair of matching quotes are stripped. Values are never logged.
+pub(crate) fn load_plugin_env(dir: &Path) -> Vec<(String, String)> {
+    let Ok(text) = fs::read_to_string(dir.join(".env")) else {
+        return Vec::new();
+    };
+    let mut vars = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut value = value.trim().to_string();
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+        vars.push((key.to_string(), value));
+    }
+    vars
+}
+
+/// Run one of a bundle's scripts. Rust is compiled with `rustc` on first use
+/// and re-used until the source or the binary changes, so a repeat run costs
+/// nothing; the other languages go straight to their interpreter.
 pub fn run_plugin_script(root: &Path, body: &Value) -> Result<Value, String> {
     let plugin = plugin_ref(body);
     let name = body["name"].as_str().unwrap_or("").trim().to_string();
@@ -940,8 +980,15 @@ rust, python, node, bash"
         }
     };
 
+    // Secrets come from the bundle's own `.env` (see `load_plugin_env`): they
+    // are prefixed as shell assignments BEFORE our PATH assignment, so a plugin
+    // may shadow any variable it needs while PATH stays ours.
+    let env_prefix = load_plugin_env(&plugin_dir(root, &plugin))
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", sh_quote(&v)))
+        .collect::<String>();
     let mut command = format!(
-        "PATH={} {}",
+        "PATH={} {env_prefix}{}",
         sh_quote(&crate::shell_env::shell_path()),
         sh_quote(&program)
     );
@@ -989,6 +1036,9 @@ fn plugin_view(root: &Path, slug: &str) -> Value {
         manifest = json!({});
     }
     manifest["slug"] = json!(slug);
+    // Absolute folder — lets a client (e.g. the /plugin update badge) pin an
+    // update session to this bundle's directory without a second call.
+    manifest["dir"] = json!(plugin_dir(root, slug).to_string_lossy().to_string());
     manifest["skills"] = json!(skill_names(root, slug));
     manifest["mcp"] = json!(connector_names(root, slug));
     manifest["scripts"] = json!(script_names(root, slug));
@@ -1656,6 +1706,15 @@ pub fn skill_dir_for(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
     None
 }
 
+/// The folder an EDIT of this skill should pin: its own folder, whether it
+/// lives standalone under `<data>/skills` or inside a bundle under
+/// `<data>/plugins`. None when nothing is stored under the name yet — a first
+/// create is not an update.
+pub fn skill_update_dir(root: &Path, name_or_slug: &str) -> Option<PathBuf> {
+    skill_dir_for(root, name_or_slug)
+        .or_else(|| crate::skills::find_skill_dir_pub(root, name_or_slug))
+}
+
 /// Write one skill into the bundle that owns it, or into a NEW one named after it.
 ///
 /// A skill has no store of its own any more, so "where does this skill go" is
@@ -1807,6 +1866,28 @@ fn connector_target(root: &Path, body: &Value, name: &str, previous: &str) -> Op
     }
     connector_owner(root, name)
         .or_else(|| if previous.is_empty() { None } else { connector_owner(root, previous) })
+}
+
+/// Whether saving this connector is an EDIT of one already on disk (same bundle
+/// slug, same name, or a rename of `previous`), with the owning bundle's folder
+/// — a brand-new connector returns None, because creating is not updating.
+pub fn connector_update_target(
+    root: &Path,
+    body: &Value,
+    name: &str,
+    previous: &str,
+) -> Option<(String, PathBuf)> {
+    let slug = body["slug"].as_str().unwrap_or("").trim();
+    if !slug.is_empty() && read_manifest(root, slug).is_some() {
+        let dir = plugin_dir(root, slug);
+        return Some((slug.to_string(), dir));
+    }
+    connector_owner(root, name)
+        .or_else(|| if previous.is_empty() { None } else { connector_owner(root, previous) })
+        .map(|slug| {
+            let dir = plugin_dir(root, &slug);
+            (slug, dir)
+        })
 }
 
 /// Which bundle holds a connector by that name (first match, slug order).
@@ -2128,7 +2209,7 @@ fn apply_parts(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
 }
 
 /// Enabled plugin folders, sorted by slug.
-fn enabled_plugins(root: &Path) -> Vec<(String, Value)> {
+pub fn enabled_plugins(root: &Path) -> Vec<(String, Value)> {
     let base = plugins_dir(root);
     let Ok(entries) = fs::read_dir(&base) else {
         return Vec::new();
@@ -2163,6 +2244,13 @@ fn plugin_enabled(root: &Path, slug: &str) -> bool {
     read_manifest(root, slug)
         .map(|m| m["enabled"].as_bool().unwrap_or(true))
         .unwrap_or(false)
+}
+
+/// One plugin's manifest (`plugin.json`), or an empty object when the slug
+/// names no plugin — for callers that only want its display name and must not
+/// fail on a half-installed bundle.
+pub fn manifest_of(root: &Path, slug: &str) -> Value {
+    read_manifest(root, slug).unwrap_or(Value::Object(serde_json::Map::new()))
 }
 
 /// Skill rows of every ENABLED plugin, in the `skills::list_skills` shape plus a
@@ -2215,12 +2303,39 @@ pub fn all_plugin_connectors(root: &Path) -> Vec<Value> {
             out.push(json!({
                 "name": name,
                 "cfg": cfg,
+                // Owning bundle's absolute folder — what a `/mcp update <name>`
+                // session pins the composer badge to.
+                "dir": plugin_dir(root, &slug).to_string_lossy(),
                 "description": own["description"].as_str().unwrap_or(""),
                 KEYWORDS: own[KEYWORDS].clone(),
                 "plugin": label,
                 "plugin_slug": slug,
                 "plugin_enabled": enabled,
             }));
+        }
+    }
+    out
+}
+
+/// Skill NAMES carried by the NAMED plugins, skipping disabled ones — the
+/// scheduled-run counterpart of `mcp_of`. Naming a plugin in a task means
+/// "everything inside it", so its skills are attached outright, the way the
+/// input path (`resolvePluginTurn`) already does, instead of waiting for the
+/// model to discover them in the catalog. Slugs that are switched off or no
+/// longer exist contribute nothing, exactly like connectors.
+pub fn bundle_skill_names(root: &Path, slugs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (slug, _) in enabled_plugins(root) {
+        if !slugs.iter().any(|s| s == &slug) {
+            continue;
+        }
+        let listed = crate::skills::list_skills(&plugin_dir(root, &slug));
+        for row in listed["skills"].as_array().cloned().unwrap_or_default() {
+            if let Some(name) = row["name"].as_str() {
+                if !name.trim().is_empty() && !out.iter().any(|s| s == name) {
+                    out.push(name.to_string());
+                }
+            }
         }
     }
     out
@@ -2519,6 +2634,39 @@ mod tests {
         let after = enabled_connectors(&root);
         assert!(!after.contains_key("notes"), "{after:?}");
         assert!(after.contains_key("search"), "{after:?}");
+    }
+
+    #[test]
+    fn bundle_skill_names_of_named_plugins() {
+        // Naming a plugin in a scheduled task means "everything inside it": its
+        // skills are attached outright, the one-unit deal its connectors have.
+        let root = temp_root("bundle-skill-names");
+        create_plugin(
+            &root,
+            &json!({
+                "name": "Notes",
+                "skills": [{"name": "Notes", "content": "x"}]
+            }),
+        )
+        .unwrap();
+        create_plugin(
+            &root,
+            &json!({
+                "name": "Search",
+                "skills": [{"name": "Search", "content": "y"}]
+            }),
+        )
+        .unwrap();
+
+        let wanted = vec!["notes".to_string()];
+        assert_eq!(bundle_skill_names(&root, &wanted), vec!["Notes".to_string()]);
+        // An unknown slug contributes nothing instead of failing the run.
+        let ghost = vec!["ghost".to_string()];
+        assert!(bundle_skill_names(&root, &ghost).is_empty());
+        // A switched-off bundle is the off switch, same as its connectors.
+        toggle_plugin(&root, &json!({"slug": "notes", "enabled": false})).unwrap();
+        assert!(bundle_skill_names(&root, &wanted).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

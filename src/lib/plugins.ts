@@ -316,41 +316,6 @@ export async function installPlugin(body: {
   }
 }
 
-/** What one run of a plugin script returns. */
-export interface PluginScriptRun {
-  plugin: string
-  script: string
-  language: string
-  args: string[]
-  cwd: string
-  output: string
-}
-
-/** Run one of a plugin's scripts. Rust compiles on first use, so the first
- *  call can take a few seconds; the backend bounds it with a timeout. */
-export async function runPluginScript(body: {
-  slug: string
-  name: string
-  args?: string[]
-  timeout?: number
-  cwd?: string
-}): Promise<PluginScriptRun | { error: string }> {
-  const url = await ensureSidecar()
-  if (!url) return { error: 'the local backend is not ready' }
-  try {
-    const res = await fetch(`${url}/plugins/run`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    const data = (await res.json().catch(() => ({}))) as PluginScriptRun & { detail?: string }
-    if (!res.ok) return { error: data.detail || `run failed (${res.status})` }
-    return data
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) }
-  }
-}
-
 /** Switch a plugin on/off. `enabled` omitted = flip the current value. */
 export function togglePlugin(
   slug: string,

@@ -49,11 +49,21 @@ export function clampCodeFontSize(raw: unknown, fallback: number): number {
  *  the setting must re-apply the size AND re-fit each screen (the grid changes
  *  with the point size). Hosts add their screen here on mount and remove it on
  *  dispose; the store calls `applyTerminalFontSize` when the setting changes. */
-const liveScreens = new Set<{ term: { options: { fontSize?: number } }; refit: () => void }>()
+const liveScreens = new Set<{
+  term: { options: { fontSize?: number; theme?: ITheme } }
+  refit: () => void
+}>()
 
 export function registerTerminalScreen(
-  screen: { term: { options: { fontSize?: number } }; refit: () => void },
+  screen: { term: { options: { fontSize?: number; theme?: ITheme } }; refit: () => void },
 ): () => void {
+  // Re-derive the palette at ATTACH, not only on theme change (both hosts also
+  // listen for that). A screen that was built hours ago and is re-attached now
+  // — hidden tab re-shown, panel reopened, StrictMode remount — would keep the
+  // palette of its build moment forever: xterm never refreshes colors on its
+  // own, so one paint pass with a stale/garbled palette sticks for the whole
+  // session. This is the single point every terminal host passes through.
+  screen.term.options.theme = xtermTheme()
   liveScreens.add(screen)
   return () => {
     liveScreens.delete(screen)

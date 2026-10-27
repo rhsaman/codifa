@@ -1,10 +1,12 @@
 //! Native schedule execution loop (migrated from backend/scheduler.py +
 //! server.py's _start_schedule_loop / _run_due_schedules / _execute_schedule).
 //!
-//! Cron format: 5 fields (minute hour dom month dow), UTC. Presets
-//! ("once"/"hourly"/"daily"/"weekly"/"every N minutes|hours") are normalized
-//! to cron by the frontend before save, so the loop only sees real cron.
-//! All timestamps are epoch seconds (UTC), matching state_db's layout.
+//! Cron format: 5 fields (minute hour dom month dow), evaluated in the HOST's
+//! LOCAL time — "0 9 * * *" fires at 09:00 on the user's wall clock, whatever
+//! the UTC offset is. Presets ("once"/"hourly"/"daily"/"weekly"/"every N
+//! minutes|hours") are normalized to cron by the frontend before save, so the
+//! loop only sees real cron. Stored timestamps stay epoch seconds (UTC),
+//! matching state_db's layout; only the cron FIELD match converts to local.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -79,7 +81,7 @@ fn parse_field(field: &str, lo: u32, hi: u32) -> Result<Vec<u32>, String> {
 /// Validate a 5-field cron expression.
 #[allow(dead_code)]
 pub fn is_valid_cron(spec: &str) -> bool {
-    next_run_after(spec, 0.0).is_some() || spec.split_whitespace().count() == 5 && {
+    next_run_after(spec, 0.0, local_utc_offset_secs()).is_some() || spec.split_whitespace().count() == 5 && {
         let parts: Vec<&str> = spec.split_whitespace().collect();
         let bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
         parts
@@ -89,8 +91,10 @@ pub fn is_valid_cron(spec: &str) -> bool {
     }
 }
 
-/// Next fire time (epoch secs) strictly after `after_ts`; None for ""/once.
-pub fn next_run_after(cron: &str, after_ts: f64) -> Option<f64> {
+/// Next fire time (epoch secs) strictly after `after_ts`, matching the cron
+/// fields against the wall-clock time `utc_offset_secs` seconds ahead of UTC
+/// (the host's local time); None for ""/once.
+pub fn next_run_after(cron: &str, after_ts: f64, utc_offset_secs: i32) -> Option<f64> {
     let cron = cron.trim();
     if cron.is_empty() {
         return None;
@@ -107,8 +111,12 @@ pub fn next_run_after(cron: &str, after_ts: f64) -> Option<f64> {
     // Search minute-by-minute from the next whole minute after after_ts,
     // capped at ~2 years (any valid cron fires within that).
     let mut cursor = ((after_ts as i64) / 60) * 60 + 60;
+    // The cron fields are matched against the LOCAL wall clock: the epoch
+    // minute is shifted by the zone offset before its civil date/time is read,
+    // so "0 9 * * *" means 09:00 by the user's clock, not UTC's.
+    let shift = utc_offset_secs as i64;
     for _ in 0..(366 * 2 * 24 * 60) {
-        let dt = chrono::DateTime::from_timestamp(cursor, 0)?;
+        let dt = chrono::DateTime::from_timestamp(cursor + shift, 0)?;
         use chrono::{Datelike, Timelike};
         // Cron dow: 0 and 7 are both Sunday; chrono Sunday = 0.
         let cron_dow = dt.weekday().num_days_from_sunday();
@@ -142,7 +150,7 @@ pub fn compute_next_run(task: &Value, now: f64) -> Option<f64> {
     if cron.is_empty() {
         return if last == 0.0 { Some(now) } else { None };
     }
-    next_run_after(&cron, now.max(last))
+    next_run_after(&cron, now.max(last), local_utc_offset_secs())
 }
 
 /// True when the task is enabled and its stored next_run has come due
@@ -273,6 +281,80 @@ fn now_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// The host timezone's offset from UTC in seconds (e.g. Tehran +12_600).
+///
+/// This is the human time base for crons: the loop still stores epoch seconds,
+/// but a field match asks "is it 09:00 BY THE USER'S CLOCK". An offset that
+/// cannot be read falls back to 0 (UTC) rather than failing the loop.
+pub fn local_utc_offset_secs() -> i32 {
+    chrono::Local::now().offset().local_minus_utc()
+}
+
+/// The prompt's PLUGIN TOOLS block: the WHOLE bundle each named plugin carries
+/// — skills, runnable scripts and MCP connectors — as run-readable notes.
+///
+/// A task stores plugin SLUGS (the `schedule` tool), and until now only the
+/// connector half was expanded (`mcp_of`): the run never learned WHICH plugins
+/// it owned, so its scripts were unreachable — the model did not know they
+/// existed — and its skills had to be found by luck in the global catalog.
+/// Disabled or missing plugins are skipped: a switched-off bundle stays off,
+/// exactly like a normal turn.
+fn plugin_context_block(data_root: &Path, slugs: &[String]) -> String {
+    if slugs.is_empty() {
+        return String::new();
+    }
+    let enabled: std::collections::HashSet<String> = crate::plugins::enabled_plugins(data_root)
+        .into_iter()
+        .map(|(slug, _)| slug)
+        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    for slug in slugs {
+        if !enabled.contains(slug.as_str()) {
+            continue;
+        }
+        let manifest = crate::plugins::manifest_of(data_root, slug);
+        let label = manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(slug);
+        let mut block = format!(
+            "- plugin {slug} ({label}): its MCP connectors are loaded and its skills \
+             are attached to this run — load_skill only to re-read one."
+        );
+        let scripts = crate::plugins::list_scripts(data_root, slug);
+        if !scripts.is_empty() {
+            block.push_str(" Its runnable scripts (plugin tool, action=run):");
+            for s in &scripts {
+                let name = s["name"].as_str().unwrap_or_default().trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let lang = s["language"].as_str().unwrap_or("rust");
+                let description = s["description"].as_str().unwrap_or_default().trim();
+                block.push_str(&format!(
+                    "\n    · {name} [{lang}]{}",
+                    if description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {description}")
+                    }
+                ));
+            }
+        }
+        lines.push(block);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n=== PLUGIN TOOLS ===\n\
+         The user attached these plugins to this scheduled task — you may use \
+         everything inside them (run a script with the plugin tool, action=run):\n{}",
+        lines.join("\n")
+    )
 }
 
 /// All schedule tasks (mirror appstate::list_schedules, sorted by created_at).
@@ -467,6 +549,18 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         .unwrap_or_default()
         .trim()
         .to_string();
+    // The task's plugins expand into the PROMPT (the model must know what the
+    // task owns — scripts are otherwise invisible), not only into the
+    // connector map below.
+    let task_plugins = string_list(&task, "plugins");
+    let prompt = {
+        let block = plugin_context_block(data_root, &task_plugins);
+        if block.is_empty() {
+            prompt
+        } else {
+            format!("{prompt}{block}")
+        }
+    };
     let root = task
         .get("root")
         .and_then(Value::as_str)
@@ -598,10 +692,17 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         crate::agent::provider_model_reasoning(&providers_map, &provider_id, &model);
     // A scheduled run must see the SAME context a normal turn would: the skills
     // and MCP connectors the task names, plus everything carried by the plugins
-    // it names (a plugin is one unit — its connectors come along, and its skills
-    // already reach the router's catalog because it reads the enabled folders).
-    let task_skills: Vec<String> = string_list(&task, "skills");
-    let plugin_slugs: Vec<String> = string_list(&task, "plugins");
+    // it names (a plugin is one unit — its connectors COME ALONG and its skills
+    // are ATTACHED outright, mirroring the input path's resolvePluginTurn).
+    let plugin_slugs = task_plugins;
+    let mut task_skills: Vec<String> = string_list(&task, "skills");
+    for name in crate::plugins::bundle_skill_names(data_root, &plugin_slugs) {
+        // The task row wins on conflict: a skill named explicitly on the task
+        // is never displaced by a bundle's copy of it.
+        if !task_skills.iter().any(|s| s == &name) {
+            task_skills.push(name);
+        }
+    }
     let mut task_mcp = crate::plugins::mcp_of(data_root, &plugin_slugs);
     // A named connector now lives in a bundle, so the lookup is by name across
     // every ENABLED bundle — the `plugins` list already carries what the task
@@ -711,13 +812,15 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         cap: None,
     };
 
+    // Run once to know whether the chain was empty: an empty chain is the one
+    // failure mode that never reaches the loop, so nothing records an error.
+    let chain_rungs = chain.len();
     let mut final_text = String::new();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Walk the chain one rung per failure. A rejected key or an unknown model on
     // one rung must not end the run while the user's own fallback list still has
     // models in it — the same rule the interactive tools follow.
     let mut tried: Vec<String> = Vec::new();
-    let mut run_error = String::new();
     for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain {
         let mut rung = req.clone();
         rung.provider = kind;
@@ -755,7 +858,6 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
                 // instead of billing every fallback for a network problem.
                 let next = crate::llm::should_fall_back(&e);
                 tried.push(format!("{rung_model}: {e}"));
-                run_error = e;
                 if !next {
                     break;
                 }
@@ -764,14 +866,25 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     }
 
     let finished = now_secs();
-    if final_text.is_empty() && !run_error.is_empty() {
-        // Every rung failed: record the reasons instead of a "done" with no
-        // output, which read like the schedule had simply produced nothing.
+    if final_text.trim().is_empty() {
+        // An empty body is NEVER a success: record WHY it is empty instead of
+        // "done" with no output — that read like the schedule had simply
+        // produced nothing and left the inbox at a bare "No output".
+        let reason = if !tried.is_empty() {
+            // Every rung failed: record the reasons.
+            format!("every model failed — {}", tried.join("; "))
+        } else if chain_rungs == 0 {
+            // The model chain was empty: no endpoint was ever called.
+            "no model configured for the Schedule slot (Settings → Tools)".to_string()
+        } else {
+            // A rung succeeded but returned no text (refused/filtered reply).
+            format!("model returned no text after {chain_rungs} attempt(s)")
+        };
         save_run(
             data_root,
             &json!({
                 "id": run_id, "schedule_id": sid, "status": "error",
-                "error": format!("every model failed — {}", tried.join("; ")),
+                "error": reason,
                 "output": "", "started_at": started_at, "finished_at": finished,
             }),
         );
@@ -907,16 +1020,59 @@ mod tests {
 
     #[test]
     fn cron_next_run_matches_python_semantics() {
+        let off = local_utc_offset_secs();
         // Every minute: next after 00:00:30 is 00:01:00.
-        let n = next_run_after("* * * * *", 0.0).unwrap();
+        let n = next_run_after("* * * * *", 0.0, off).unwrap();
         assert_eq!(n, 60.0);
-        // Daily at 09:00: from 00:00:30 the next is today 09:00.
-        let n = next_run_after("0 9 * * *", 30.0).unwrap();
-        assert_eq!(n, 9.0 * 3600.0);
+        // Daily at 09:00 BY THE WALL CLOCK: from 00:00:30 the next fire is
+        // today 09:00 local, whichever zone the host runs in.
+        let n = next_run_after("0 9 * * *", 30.0, off).unwrap();
+        use chrono::Timelike;
+        let local = chrono::DateTime::from_timestamp(n as i64 + off as i64, 0).unwrap();
+        assert_eq!(local.hour(), 9);
+        assert_eq!(local.minute(), 0);
+        assert_eq!(local.second(), 0);
+        assert!(n > 30.0);
         // Once (empty cron) → None.
-        assert_eq!(next_run_after("", 0.0), None);
+        assert_eq!(next_run_after("", 0.0, off), None);
         // Invalid field count → None.
-        assert_eq!(next_run_after("0 9 * *", 0.0), None);
+        assert_eq!(next_run_after("0 9 * *", 0.0, off), None);
+    }
+
+    #[test]
+    fn plugin_context_lists_scripts_but_skips_disabled() {
+        let tmp = std::env::temp_dir().join(format!("sched-plug-test-{}", std::process::id()));
+        let plug = tmp.join("plugins/demo");
+        let off_plug = tmp.join("plugins/off-demo");
+        for dir in [
+            plug.join("scripts/cleanup"),
+            off_plug.join("scripts/ghost"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        std::fs::write(plug.join("plugin.json"), r#"{"name":"Demo","enabled":true}"#).unwrap();
+        std::fs::write(
+            plug.join("scripts/cleanup/script.json"),
+            r#"{"name":"cleanup","language":"rust","description":"wipe temp files"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            off_plug.join("plugin.json"),
+            r#"{"name":"Off","enabled":false}"#,
+        )
+        .unwrap();
+        let all = vec!["demo".to_string(), "off-demo".to_string()];
+        // The enabled bundle shows up with every script it carries.
+        let on = plugin_context_block(&tmp, &all[..1]);
+        assert!(on.contains("PLUGIN TOOLS"), "{on}");
+        assert!(on.contains("demo") && on.contains("[rust]") && on.contains("cleanup"), "{on}");
+        // A switched-off bundle contributes nothing — the toggle is the truth.
+        let disabled = plugin_context_block(&tmp, &all[1..]);
+        assert!(disabled.is_empty(), "{disabled}");
+        // No plugins at all → no block.
+        let none: Vec<String> = Vec::new();
+        assert!(plugin_context_block(&tmp, &none).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

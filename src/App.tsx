@@ -23,7 +23,7 @@ import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
 import { LoadingScreen } from './components/LoadingScreen'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isWindowMoveChord } from './lib/shortcuts'
+import { PREFIX_KEY, physicalKey, PREFIX_SHORTCUTS, panelToggleTarget, isWindowMoveChord, isApplePlatform } from './lib/shortcuts'
 import { resolveChatClose } from './lib/chatClose'
 import { collectChatIds, pickNeighborByRect, type WindowNavDir, type WindowRect } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
@@ -48,24 +48,36 @@ const TerminalPanel = lazy(() =>
  * Is this keyboard event's target (or the focused element) inside a TERMINAL?
  *
  * Two independent hosts run a pty: the bottom panel (`.terminal-panel`) and a
- * right-pane terminal TAB (`.terminal-tab-panel`). App-level chords (Cmd/Ctrl+W
+ * right-pane terminal TAB (`.terminal-tab-panel`). App-level chords (Cmd+W
  * and the move/h/j/k/l family) must be swallowed in EITHER of them, or the pane
  * tab never sees the key — and its Ctrl+W closed the wrong thing.
  */
-function isInsideTerminal(target: HTMLElement | null | undefined): boolean {
-  const sel = '.terminal-panel, .terminal-tab-panel'
+/** True when the key landed inside a host matching `sel` — the event target
+ *  OR the focused element (xterm focus can sit in a hidden helper). */
+function insideTerminalHost(target: HTMLElement | null | undefined, sel: string): boolean {
   return !!(target?.closest?.(sel) || document.activeElement?.closest?.(sel))
+}
+
+/** ANY terminal host: the bottom panel AND a right-pane terminal tab. Cmd+W
+ *  closes whichever one holds the caret; Ctrl+M only ever fullscreens the
+ *  bottom one (in a tab the pane below takes the fullscreen — see case 'm'). */
+function isInsideTerminal(target: HTMLElement | null | undefined): boolean {
+  return insideTerminalHost(target, '.terminal-panel, .terminal-tab-panel')
 }
 
 /** True when a direct Cmd/Ctrl+H/J/K/L window move must NOT run: inside a
  *  dialog/overlay (their own keys own the Ctrl chords there), inside a text
  *  input (readline keeps Ctrl+H as backspace and Ctrl+K kills the line), or
  *  when an @mention/command picker popup is open (its Ctrl+J/K walk its
- *  list). The terminal panels ARE in this list: xterm hands Ctrl+H/K/L to
- *  the shell (^H backspace, ^K kill-line). The terminal panel itself toggles
- *  ONLY through the Ctrl+X J prefix chord. */
-function isWindowMoveBlocked(t: HTMLElement | null | undefined): boolean {
-  if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay, .terminal-panel, .terminal-tab-panel')) return true
+ *  list). The terminals ARE in this list: xterm hands Ctrl+H/K/L to the shell
+ *  (^H backspace, ^K kill-line). One exception: in a right-pane terminal TAB
+ *  Ctrl+H (`left`) leaves the terminal for the chat — the way back from the
+ *  Ctrl+L that entered it; its other chords stay shell input. The bottom panel
+ *  keeps every one. The bottom panel itself toggles ONLY through the Ctrl+X J
+ *  prefix chord. */
+function isWindowMoveBlocked(t: HTMLElement | null | undefined, dir?: WindowNavDir | null): boolean {
+  if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay, .terminal-panel')) return true
+  if (t?.closest?.('.terminal-tab-panel') && dir !== 'left') return true
   // A text field only blocks the chord when the key could be TYPING. Every
   // move chord is Cmd/Ctrl+H/J/K/L (checked by isWindowMoveChord before this
   // runs), so a modified key is never plain text input: the chat composer's
@@ -76,7 +88,7 @@ function isWindowMoveBlocked(t: HTMLElement | null | undefined): boolean {
 }
 
 /**
- * Ctrl/Cmd+W while a terminal has focus: close the thing the user is looking at.
+ * Cmd+W while a terminal has focus: close the thing the user is looking at.
  *
  * The BOTTOM panel is a multi-tab host, so it owns that gesture itself (it
  * listens for `coder:close-terminal-tab` and closes its ACTIVE tab). A
@@ -331,7 +343,16 @@ export default function App() {
     function moveChatWindow(dir: WindowNavDir): boolean {
       const st = useStore.getState()
       const pane = activePane()
-      if (pane === 'terminal') return false
+      if (pane === 'terminal') {
+        // Only a right-pane terminal TAB hands the caret back (Ctrl+H); the
+        // bottom panel never reaches here (isWindowMoveBlocked), and any other
+        // chord stays shell input.
+        if (dir === 'left' && document.activeElement?.closest?.('.terminal-tab-panel')) {
+          focusAppPane('chat')
+          return true
+        }
+        return false
+      }
       if (pane === 'viewer' && dir === 'left') {
         focusAppPane('chat')
         return true
@@ -437,7 +458,7 @@ export default function App() {
       // keys. The terminal keeps its shell chords too (xterm sends ^H/^K/^L),
       // so a blocked chord falls through instead of returning.
       const winDir = e.defaultPrevented ? null : isWindowMoveChord(e)
-      if (winDir && !isWindowMoveBlocked(e.target as HTMLElement | null)) {
+      if (winDir && !isWindowMoveBlocked(e.target as HTMLElement | null, winDir)) {
         if (moveChatWindow(winDir)) {
           e.preventDefault()
           e.stopPropagation()
@@ -448,20 +469,35 @@ export default function App() {
       if (togglePanelFromKey(e)) return
       if (!(e.metaKey || e.ctrlKey)) return
       const k = physicalKey(e)
-      // VSCode-style close: Cmd/Ctrl+W closes whatever is in focus — the
-      // active TERMINAL tab while the terminal panel has focus, else the
-      // focused CHAT WINDOW in multi-window mode (chat stays in sidebar),
-      // else the active viewer tab, else the active chat tab. Skip while
+      // VSCode-style close: Cmd+W (Ctrl on non-Apple platforms) closes whatever
+      // is in focus — the active TERMINAL tab while the terminal has focus,
+      // else the focused CHAT WINDOW in multi-window mode (chat stays in
+      // sidebar), else the active viewer tab, else the active chat tab. The
+      // OTHER half of the chord is never a close: bare Ctrl+W on Apple is the
+      // shell's delete-previous-word (^W) inside a terminal, and merely
+      // swallowed elsewhere so it can never close the host window. Skip while
       // typing in the composer so a stray chord never eats the draft
       // mid-sentence (the xterm textarea does NOT count as "typing" here —
       // its chord closes the terminal tab). Multi-window chat windows are
-      // exempt: their draft survives in the sidebar, so Ctrl+W there always
-      // closes that window.
+      // exempt: their draft survives in the sidebar, so the close chord there
+      // always closes that window.
       if (k === 'w' && !e.shiftKey && !e.altKey) {
+        const isClosePlatformChord = isApplePlatform() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey
         const t = e.target as HTMLElement | null
         const inTerminal = isInsideTerminal(t)
+        if (!isClosePlatformChord) {
+          // Not the close half: outside a terminal it is swallowed so the
+          // host window never closes; inside one it is ordinary shell input
+          // (^W delete-word) and MUST reach the pty — no preventDefault there.
+          if (!inTerminal) {
+            e.preventDefault()
+            e.stopPropagation()
+          }
+          return
+        }
         const inDialog = !!t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')
-        // Multi-window: Ctrl+W on a chat window closes THAT window, even
+        // Multi-window: the platform close chord on a chat window closes THAT
+        // window, even
         // while typing in its composer (draft survives in the sidebar).
         // Resolved from the event target so a non-focused window closes
         // when its own composer has focus.
@@ -544,18 +580,36 @@ export default function App() {
           break
         }
         case 'm': {
-          // Window fullscreen inside the chat area (Tab still cycles agent
-          // modes, so Ctrl/Cmd+M is free for this). Dialogs keep their own
-          // Ctrl chords. While the terminal has focus the same chord
-          // fullscreens the terminal panel instead.
+          // Fullscreen ladder, decided by WHERE focus is: the BOTTOM terminal
+          // panel first (a right-pane terminal TAB belongs to the pane step
+          // below), then the right viewer pane — but only when the focus is
+          // INSIDE it, so a merely-open pane never steals the chord from a
+          // focused chat window — then the focused chat window (single window
+          // falls back to the whole chat area). Dialogs keep their own chords.
           const t = e.target as HTMLElement | null
           if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) break
           e.preventDefault()
-          if (isInsideTerminal(t)) {
+          if (insideTerminalHost(t, '.terminal-panel')) {
             useStore.getState().toggleTerminalFullscreen()
             break
           }
+          // The pane claims the chord only when FOCUS sits inside it (event
+          // target or the active element — xterm hosts the caret on its own
+          // helper node): a merely-open pane must never steal Ctrl+M from a
+          // focused chat window.
+          const paneEl =
+            t?.closest?.('.viewer-group') ||
+            document.activeElement?.closest?.('.viewer-group')
+          if (paneEl) {
+            const vt = useViewerTabs.getState()
+            const next = !vt.fullscreen
+            vt.setFullscreen(next)
+            if (next) useStore.getState().setChatFullscreen(false)
+            break
+          }
           useStore.getState().toggleWindowFullscreen()
+          const after = useStore.getState().activeChatId
+          if (after) requestAnimationFrame(() => focusChatInput(after))
           break
         }
         case 't': {

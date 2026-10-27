@@ -460,8 +460,10 @@ export function TerminalPanel() {
       })
       // Reserved chords must reach the window-level handler even while the
       // terminal has focus — return false so xterm neither sends them to the
-      // shell nor eats them: Cmd/Ctrl+W closes the active terminal tab (Cmd
-      // on Apple platforms, Ctrl elsewhere). The panel toggle (Ctrl+X J) is
+      // shell nor eats them: Cmd+W (Ctrl+W on other platforms) closes the
+      // active terminal tab, while the chord's OTHER half (bare Ctrl+W on
+      // Apple) stays ordinary shell input (^W delete-previous-word). The panel
+      // toggle (Ctrl+X J) is
       // consumed by the window handler, which also stops the second key so
       // the `j` never reaches this xterm.
       term.attachCustomKeyEventHandler((ev) => {

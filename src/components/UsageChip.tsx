@@ -477,7 +477,7 @@ export function UsageChip() {
       tabIndex={0}
       aria-haspopup="true"
       aria-expanded={open}
-      aria-label={`Total chat tokens: ${formatTokens(view.totalTokens)}${view.totalCached > 0 ? ` · cached: ${formatTokens(view.totalCached)}` : ""}`}
+      aria-label={`Fresh (non-cached) tokens: ${formatTokens(view.totalFresh)}${view.totalCached > 0 ? ` · cached: ${formatTokens(view.totalCached)}` : ""}`}
       onMouseEnter={openNow}
       onMouseLeave={scheduleClose}
       onClick={(e) => {
@@ -497,7 +497,7 @@ export function UsageChip() {
         }
       }}
     >
-      <span className="usage-chip-count">{formatTokens(view.totalTokens)}</span>
+      <span className="usage-chip-count">{formatTokens(view.totalFresh)}</span>
       {view.totalCached > 0 && (
         <span className="usage-chip-cached">
           <svg

@@ -38,6 +38,14 @@
         stub.probeSidecar = function () {
           return Promise.resolve(true);
         };
+        // The STT/TTS sidecar URL: media providers (STT transcribe, TTS speech,
+        // warm pings) resolve their endpoint through api.getSidecarUrl(). The
+        // local models server (stt-server.py) speaks the same /transcribe and
+        // /v1/audio/* API, so pointing the harness at it exercises the REAL
+        // streaming-dictate pipeline (VAD → whisper → partials → composer).
+        stub.getSidecarUrl = function () {
+          return Promise.resolve(window.__harnessSidecarUrl || 'http://127.0.0.1:8000');
+        };
         // A minimal WORKING pty: the right-pane terminal needs terminal_create
         // to resolve a session id, or terminalSessions rejects and xterm never
         // paints — which hid real paint-order bugs (the screen covering the tab

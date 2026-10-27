@@ -106,6 +106,35 @@ export function focusAppPane(pane: AppPane): void {
         if (tries++ < 20) requestAnimationFrame(land)
         return
       }
+      // A TERMINAL tab owns the pane: the caret must land in its xterm. The
+      // generic probe below picks the first focusable control instead, which in a
+      // terminal tab is a button of its tab strip — the pane got the ring but
+      // typing went nowhere. The session is mounted a commit or two after the
+      // pane opens, so wait for it the same way the pane itself is awaited.
+      // Decided from the DOM, not from store bookkeeping: whatever terminal is
+      // PAINTED in the pane gets the focus. The check after focus() matters too —
+      // a refused focus must not count as arrival (the pane was ringed while the
+      // xterm cursor stayed hollow, i.e. unfocused).
+      const termHost = root.querySelector<HTMLElement>('.terminal-tab-panel')
+      if (termHost) {
+        const input = termHost.querySelector<HTMLElement>('.xterm-helper-textarea')
+        if (input) {
+          input.focus({ preventScroll: true })
+          if (document.activeElement === input) {
+            flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || root)
+            return
+          }
+        }
+        // xterm not opened yet, or it refused the focus this frame: try again.
+        if (tries++ < 20) {
+          requestAnimationFrame(land)
+          return
+        }
+        console.warn('[paneFocus] a terminal tab is shown but its xterm input could not take the focus', {
+          hasInput: !!input,
+          active: document.activeElement?.tagName,
+        })
+      }
       const focusable = root.querySelector<HTMLElement>(
         'input:not([type="hidden"]), textarea, button, [tabindex]:not([tabindex="-1"])',
       )

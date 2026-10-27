@@ -502,6 +502,48 @@ export async function transcribeAudio(
   }
 }
 
+/**
+ * Warm the configured STT + TTS backend ahead of the first real request.
+ * Fire-and-forget, called when live voice or dictation STARTS (in parallel
+ * with opening the mic): the whisper load (~15-25s on CPU) and the TTS voice
+ * load (~1-2s) then happen while the user is still walking up to speak, so
+ * the first live dictation does not appear to hang.
+ *
+ * Only kind:'custom' providers get the warm ping (GET {base_url}/warm —
+ * implemented by the bundled local server); cloud endpoints are skipped and
+ * a failed warm (server off, 404, CORS) is swallowed: it is an optimization,
+ * the first real request still works and pays the same load.
+ */
+export async function warmStt(opts?: TranscribeProviderOpts): Promise<void> {
+  if (!opts || opts.kind !== 'custom' || !(opts.baseUrl ?? '').trim()) return
+  try {
+    await ensureSidecar()
+    // The sidecar forwards only POST/JSON bodies; the warm ping goes straight
+    // from the renderer. base_url already includes /v1 — the server accepts
+    // both spellings of the path.
+    await fetch(`${opts.baseUrl.replace(/\/+$/, '')}/warm`, { signal: AbortSignal.timeout(60_000) })
+  } catch {
+    // Best-effort: an unreachable or non-implementing server is fine here.
+  }
+}
+
+/** Warm the TTS voice for the given chain (same best-effort rules as warmStt). */
+export async function warmTts(chain?: SpeakProviderOpts | SpeakProviderOpts[]): Promise<void> {
+  const list = Array.isArray(chain) ? chain : chain ? [chain] : []
+  const target = list.find((p) => p.kind === 'custom' && (p.baseUrl ?? '').trim())
+  if (!target) return
+  try {
+    const params = new URLSearchParams({ tts: '1' })
+    if ((target.voice ?? '').trim()) params.set('voice', (target.voice ?? '').trim())
+    await ensureSidecar()
+    await fetch(`${target.baseUrl.replace(/\/+$/, '')}/warm?${params.toString()}`, {
+      signal: AbortSignal.timeout(60_000),
+    })
+  } catch {
+    // Best-effort.
+  }
+}
+
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {
   const url = await ensureSidecar()
   if (!url) throw new Error('the local backend is not ready')
@@ -1748,6 +1790,9 @@ export async function syncSkill(params: {
 export async function listMcp(): Promise<{
   mcpServers: Record<string, McpServerConfig>
   builtins: string[]
+  /** Connector name → owning bundle's absolute folder — what a
+   *  `/mcp update <name>` session pins the composer badge to. */
+  dirs?: Record<string, string>
 }> {
   // Read directly (not through lib/plugins) so this module keeps importing
   // nothing from a sibling that already imports it.
@@ -1760,15 +1805,18 @@ export async function listMcp(): Promise<{
       connectors?: Array<{
         name?: string
         cfg?: McpServerConfig
+        dir?: string
         plugin_enabled?: boolean
       }>
     }
     const out: Record<string, McpServerConfig> = {}
+    const dirs: Record<string, string> = {}
     for (const r of data.connectors ?? []) {
       if (!r.name || r.plugin_enabled === false) continue
       out[r.name] = r.cfg ?? {}
+      if (r.dir) dirs[r.name] = r.dir
     }
-    return { mcpServers: out, builtins: [] }
+    return { mcpServers: out, builtins: [], dirs }
   } catch {
     return { mcpServers: {}, builtins: [] }
   }
@@ -2172,6 +2220,10 @@ export interface ScheduleUpsert {
   mode: string
   provider_id?: string
   model?: string
+  /** اسکیل/کانکتور/پلاگین ضمیمهشده به هر اجرا (اسمها و slug). */
+  skills?: string[]
+  mcp_servers?: string[]
+  plugins?: string[]
 }
 
 /** لیست تسک‌های زمان‌بندی (همراه next_run محاسبه‌شده). */

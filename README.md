@@ -47,7 +47,7 @@ talk. Nothing leaves your machine unless you want it to.
 |     | Feature                             | Description                                                                                                                                                                                                                                                                                     |
 | --- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 🔌  | **Bring your own model**            | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI.                                                                                                                                            |
-| 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Cycle with `Cmd/Ctrl+M`.                                                                                           |
+| 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Switch with `Tab`.                                                                                           |
 | 🛠️  | **Tool-based agent**                | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
 | 🎤  | **Voice input**                     | Hold the mic, speak in Persian or English, get text. Speech is sent to the speech (STT) provider you configure in **Settings → Media Providers** — pick any OpenAI-compatible endpoint that serves `/audio/transcriptions`. A live "wave" equalizer animates while recording.                                                                                       |
 | 🧠  | **Memory**                          | Notes you ask the agent to remember are embedded and searchable per project — stored locally in your data folder.                                                                                                                                                                                |
@@ -182,7 +182,7 @@ Output lands in `src-tauri/target/release/bundle/`.
 | --------------------- | -------------------------------------------------- |
 | `Enter`                | Send message (`Shift+Enter` = newline)            |
 | `Cmd/Ctrl+Enter`      | Queue the message (sends after the current turn, won't interrupt) |
-| `Cmd/Ctrl+M`          | Cycle agent mode (Ask / Plan / Coder)              |
+| `Cmd/Ctrl+M`          | Fullscreen what has focus — terminal, side pane, else the focused chat window (press again to restore) |
 | `Cmd/Ctrl+P`          | Quick-open / search overlay (`⌘⇧F` = content grep) |
 | `Cmd/Ctrl+B`          | Toggle sidebar                                     |
 | `Cmd/Ctrl+,`          | Open settings                                      |
@@ -236,7 +236,7 @@ Data lives in ~/.codifa — settings, chats, skills, MCP, plans, traces.
 |     | ویژگی                          | توضیح                                                                                                                                                                                                                                                                                        |
 | --- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 🔌  | **مدل‌تان را خودتان بیاورید**  | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است.                                                                                                                        |
-| 🤖  | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Cmd/Ctrl+M` میان‌شان بچرخید.                                                                      |
+| 🤖  | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Tab` میان‌شان بچرخید.                                                                      |
 | 🛠️  | **عاملِ ابزارمحور**            | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
 | 🎤  | **ورودی صوتی**                 | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا به همان فراهم‌کنندهٔ گفتار (STT) که در **تنظیمات ← فراهم‌کننده‌های رسانه** پیکربندی کرده‌اید فرستاده می‌شود. هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود.                                                                 |
 | 🧠  | **حافظه**                      | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد، برای هر پروژه جاساز و قابل جستجو می‌شوند — به‌صورت محلی در پوشهٔ دادهٔ شما.                                                                                                                                                                  |
@@ -376,7 +376,7 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 | ---------------------- | ----------------------------------------------------- |
 | `Enter`               | ارسال پیام (`Shift+Enter` = خط جدید)                |
 | `Cmd/Ctrl+Enter`       | صف‌کردن پیام (بعد از پایان ترنِ فعلی ارسال می‌شود، بدون قطع) |
-| `Cmd/Ctrl+M`           | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
+| `Tab`                  | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
 | `Cmd/Ctrl+P`           | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا)    |
 | `Cmd/Ctrl+B`           | نمایش/پنهان‌کردن نوار کناری                           |
 | `Cmd/Ctrl+,`           | باز کردن تنظیمات                                      |

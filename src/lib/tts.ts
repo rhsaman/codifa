@@ -182,6 +182,14 @@ export function fetchSentenceRobust(
       speakTextStream(sentence, providerOpts, undefined, signal).then(
         (blob) => {
           clearTimeout(timer)
+          // A 200 with NO audio bytes is a provider failure, not a success:
+          // gateways and misconfigured endpoints answer OK but synthesize
+          // nothing. Reject so the NEXT provider in the chain is actually
+          // tried instead of silently dropping the sentence.
+          if (!blob || blob.size === 0) {
+            reject(new Error('speech synthesis returned no audio'))
+            return
+          }
           resolve(blob)
         },
         (err) => {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { deleteSchedule, listAllScheduleRuns, listSchedules } from "../lib/api";
+import { deleteSchedule, listAllScheduleRuns, listScheduleRuns, listSchedules, runScheduleNow, saveSchedule } from "../lib/api";
 import { formatTokens } from "../lib/context";
 import { taskTokenTotals } from "../lib/schedule-notify";
 import type { ScheduleRun, ScheduledTask } from "../types";
@@ -55,14 +55,21 @@ export function cronToPresetValue(cron: string | null | undefined): string {
   return legacy[c] ?? c;
 }
 
-/** One stored task: what it is set to, plus Delete and open-in-inbox.
- *
- *  Creating and editing moved to the `/schedule` chat command, so this row has
- *  no form, no pause and no run-now button — the panel only reports state. */
-function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: () => void }) {
-  const { task, tokens, onChanged } = props;
-  const [expanded, setExpanded] = useState(false);
+/** One stored task: always expanded — Run now, Pause/Resume, Delete and
+ *  open-in-inbox stay visible without a click. Creating and editing live in
+ *  the `/schedule` chat command — the row only toggles or fires the task. */
+function ScheduleRow(props: {
+  task: ScheduledTask;
+  tokens: number;
+  onChanged: () => void;
+  onError: (msg: string) => void;
+}) {
+  const { task, tokens, onChanged, onError } = props;
   const [busy, setBusy] = useState(false);
+  // Stays true from "Run now" until the SPAWNED run on the backend actually
+  // finishes (the POST returns at once — the run itself is async), so the
+  // button shows progress for the whole job, not just the request.
+  const [running, setRunning] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const dir = useStore((s) => s.dir);
   const openInbox = useStore((s) => s.setScheduleInboxOpen);
@@ -80,27 +87,46 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
     openInbox(true);
   };
 
+  const runNow = async () => {
+    setRunning(true);
+    const started = Date.now() / 1000;
+    const out = await runScheduleNow(task.id);
+    if ("error" in out) {
+      setRunning(false);
+      onError(`Run failed: ${out.error}`);
+      return;
+    }
+    onChanged();
+    // The backend writes status=running on disk and flips it to done/error at
+    // the end: poll the run history until OUR run (started just now) settles,
+    // with a hard cap (~15 min) so a stuck run never pins the button forever.
+    for (let i = 0; i < 450; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const runs = await listScheduleRuns(task.id, 5);
+      if ("error" in runs) break;
+      // Small skew allowance: the run row's started_at is the backend clock.
+      const live = runs.find((r) => r.started_at >= started - 1);
+      if (live && live.status !== "running") break;
+    }
+    setRunning(false);
+    onChanged();
+  };
+
+  // Pause/Resume is a full upsert of the stored task with `enabled` flipped:
+  // the backend keeps every other field and recomputes next_run on the next
+  // scheduler tick (a stale one is healed, never burst-run).
+  const toggleEnabled = async () => {
+    setBusy(true);
+    const out = await saveSchedule({ ...task, enabled: !task.enabled });
+    setBusy(false);
+    if ("error" in out) onError(out.error);
+    else onChanged();
+  };
+
   return (
     <div className={`schedule-item${task.enabled ? "" : " disabled"}`} dir={dir}>
-      <div
-        className="schedule-item-head"
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        aria-label={`${task.name} — ${expanded ? "collapse" : "expand"}`}
-        onClick={() => {
-          setExpanded((v) => !v);
-          setConfirmingDelete(false);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setExpanded((v) => !v);
-          }
-        }}
-      >
+      <div className="schedule-item-head">
         <span className={`schedule-status-dot${task.enabled ? "" : " paused"}`} aria-hidden="true" />
-        <span className="sidebar-panel-chevron" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
         <span className="schedule-item-name" title={task.name}>{task.name}</span>
         <span className="schedule-item-cron" title={task.cron || undefined}>{task.cron_label || task.cron || "Once"}</span>
       </div>
@@ -114,14 +140,29 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
         ) : null}
         {!task.enabled ? <span className="schedule-pill paused">Paused</span> : null}
       </div>
-      {expanded && (
-        <div className="schedule-item-body">
+      <div className="schedule-item-body">
           {task.prompt ? (
             <p className="schedule-prompt-text" title={task.prompt}>
               {task.prompt}
             </p>
           ) : null}
           <div className="schedule-row schedule-toolbar" role="toolbar" aria-label={`Actions for ${task.name}`}>
+            <button className="schedule-btn schedule-icon-btn" onClick={() => void runNow()} disabled={busy || running} title={running ? `Running ${task.name}…` : `Run ${task.name} now`} aria-label={running ? `Running ${task.name}` : `Run ${task.name} now`}>
+              {running ? (
+                <span className="schedule-btn-spinner" aria-hidden="true" />
+              ) : (
+                // A bolt, not a play triangle: Resume below is the play icon,
+                // and the two identical triangles read as one button twice.
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" /></svg>
+              )}
+            </button>
+            <button className="schedule-btn schedule-icon-btn" onClick={() => void toggleEnabled()} disabled={busy} title={task.enabled ? `Pause ${task.name}` : `Resume ${task.name}`} aria-label={task.enabled ? `Pause ${task.name}` : `Resume ${task.name}`}>
+              {task.enabled ? (
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></svg>
+              ) : (
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3" /></svg>
+              )}
+            </button>
             <button className={`schedule-btn schedule-icon-btn danger${confirmingDelete ? " active" : ""}`} onClick={() => setConfirmingDelete((v) => !v)} disabled={busy} title={`Delete ${task.name}`} aria-label={`Delete ${task.name}`} aria-expanded={confirmingDelete}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
             </button>
@@ -142,8 +183,7 @@ function ScheduleRow(props: { task: ScheduledTask; tokens: number; onChanged: ()
               </div>
             </div>
           ) : null}
-        </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -242,7 +282,7 @@ export function ScheduleSection() {
               </p>
             </div>
           ) : (
-            schedules.map((t) => <ScheduleRow key={t.id} task={t} tokens={taskTokens[t.id] ?? 0} onChanged={() => void refresh()} />)
+            schedules.map((t) => <ScheduleRow key={t.id} task={t} tokens={taskTokens[t.id] ?? 0} onChanged={() => void refresh()} onError={setError} />)
           )}
         </div>
       )}

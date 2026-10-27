@@ -47,6 +47,12 @@ fn chat_dir(root: &Path, chat_id: &str) -> PathBuf {
     artifacts_root(root).join(crate::skills::safe_file(id, "chat"))
 }
 
+/// Public wrapper: one artifact's folder (chat + artifact slug), so the agent
+/// loop can pin where an update to this document keeps working.
+pub fn chat_dir_pub(root: &Path, chat_id: &str, id: &str) -> PathBuf {
+    chat_dir(root, chat_id).join(crate::skills::safe_file(id, "artifact"))
+}
+
 /// `html` (the sandboxed preview) or `md` (prose). Anything else falls back to
 /// html, because the preview iframe is the only renderer.
 pub fn kind_of(body: &Value) -> String {
@@ -377,6 +383,9 @@ pub fn list(root: &Path, chat_id: &str) -> Result<Value, String> {
                 .unwrap_or(id);
             items.push(json!({
                 "id": id,
+                // Absolute folder — what an /artifact update session pins the
+                // composer badge to.
+                "dir": path.to_string_lossy(),
                 "title": title,
                 "kind": index["kind"].as_str().unwrap_or(DEFAULT_KIND),
                 "version": index["version"].as_u64().unwrap_or(1),

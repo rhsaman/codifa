@@ -4,8 +4,6 @@ import { prepareContent } from "../lib/bidi";
 import { collectChatIds } from "../lib/chatTree";
 import { dropSide, edgeScroll, inactiveTabIds, tabMove } from "../lib/tabBar";
 import { previewSlot } from "../lib/tabOrder";
-import { useViewerTabs } from "../lib/viewerTabs";
-import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { ChatRenameInput, normalizeRenameValue } from "./ChatRenameInput";
 
@@ -192,7 +190,6 @@ export function ChatTabBar() {
   const openChatIds = useStore((s) => s.openChatIds);
   const activeChatId = useStore((s) => s.activeChatId);
   const dir = useStore((s) => s.dir);
-  const chatFull = useStore((s) => s.chatFullscreen);
   const chats = useStore((s) =>
     s.chats.map((c) => ({
       id: c.id,
@@ -255,8 +252,8 @@ export function ChatTabBar() {
   // With an inline `order` the DOM's last tab is no longer the visible last one,
   // so the "drop past the end" target has to come from the previewed order.
   const tailId = dragPreview?.tailId ?? openChatIds[openChatIds.length - 1] ?? null;
-  // The "+" and fullscreen buttons trail the tabs in the DOM, so while a drag is
-  // active they must claim the slot right after the last tab (the previewed one).
+  // The "+" button trails the tabs in the DOM, so while a drag is
+  // active it must claim the slot right after the last tab (the previewed one).
   const tailOrder = dragId ? openChatIds.length : undefined;
 
   if (openChatIds.length === 0) return null;
@@ -434,24 +431,6 @@ export function ChatTabBar() {
         onClick={() => useStore.getState().newChat()}
       >
         +
-      </button>
-      <button
-        type="button"
-        className="editor-tab-full"
-        title={chatFull ? "Exit fullscreen" : "Fullscreen chat"}
-        aria-label={chatFull ? "Exit chat fullscreen" : "Fullscreen chat"}
-        aria-pressed={chatFull}
-        style={tailOrder === undefined ? undefined : { order: tailOrder + 1 }}
-        onClick={() => {
-          const st = useStore.getState();
-          const next = !st.chatFullscreen;
-          st.setChatFullscreen(next);
-          // Fullscreen modes are exclusive: maximizing the chat restores
-          // a maximized viewer.
-          if (next) useViewerTabs.getState().setFullscreen(false);
-        }}
-      >
-        {chatFull ? <CompressIcon /> : <ExpandIcon />}
       </button>
     </div>
   );

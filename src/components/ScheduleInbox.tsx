@@ -93,7 +93,14 @@ function InboxRunCard({ run }: { run: ScheduleRun }) {
         )}
       </div>
       {run.error && <div className="schedule-run-error">{run.error}</div>}
-      {run.output ? (
+      {run.status === "running" ? (
+        // A live run is IN PROGRESS: spinner + label, never a bare "No output"
+        // (that read like the run had finished and said nothing).
+        <div className="schedule-run-live">
+          <span className="schedule-run-spinner" aria-hidden="true" />
+          Running…
+        </div>
+      ) : run.output ? (
         <InboxMarkdown text={run.output.slice(0, 8000)} />
       ) : (
         !run.error && <div className="schedule-runs-empty">No output</div>

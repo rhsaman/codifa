@@ -512,7 +512,88 @@ const params = new URLSearchParams(window.location.search);
 };
 
 const root = createRoot(document.getElementById("root")!);
-if (params.get("scenario") === "diff") {
+if (params.get("scenario") === "schedules") {
+  // LIVE schedule-panel/inbox harness. The panel reads every row through the
+  // sidecar HTTP API, so point `getSidecarUrl` at a REAL backend_light server
+  // (examples/backend_live.rs) — its port arrives via `?backend=<port>` and is
+  // remembered in localStorage so a reload keeps the same server. With a real
+  // backend behind it this exercises the actual routes: save/toggle/run + the
+  // run rows the inbox renders (running spinner, error body, done output).
+  const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+  const remember = (port: string) => {
+    try {
+      localStorage.setItem("codifa-ui:backend", port);
+    } catch {
+      /* private mode — the URL param still works for this page load */
+    }
+  };
+  const fromUrl = params.get("backend");
+  if (fromUrl) remember(fromUrl);
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem("codifa-ui:backend");
+  } catch {
+    stored = null;
+  }
+  const port = fromUrl ?? stored;
+  if (!port) {
+    root.render(
+      <div style={{ padding: 24, font: "13px system-ui", color: "#e66" }}>
+        No backend port. Open with ?backend=&lt;port of examples/backend_live.rs&gt;
+      </div>,
+    );
+  } else {
+    const base = `http://127.0.0.1:${port}`;
+    coder.getSidecarUrl = () => Promise.resolve(base);
+    coder.probeSidecar = () => Promise.resolve(true);
+    const realFetch = window.fetch.bind(window);
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      // Same-origin absolutization: the panel builds paths like "/schedules",
+      // so prefix the live backend before they hit the page origin (vite).
+      const target = url.startsWith("/") ? `${base}${url}` : url;
+      return realFetch(target, init);
+    }) as typeof window.fetch;
+    const { ScheduleSection } = await import("../../src/components/SchedulePanel");
+    const { ScheduleInbox } = await import("../../src/components/ScheduleInbox");
+    const { useStore } = await import("../../src/lib/store");
+    (window as any).__ui.schedule = {
+      /** Seed the store rows directly (no listing round trip). */
+      seed(tasks: unknown[]) {
+        (useStore as any).setState({ schedules: tasks });
+        // The panel's mount effect fetches only once `loaded` is true (in the
+        // real app the persisted-state hydrate sets it); a bare mount in the
+        // harness never hydrates, so seed() opens the same gate itself.
+        (useStore as any).setState({ loaded: true });
+      },
+      /** Open the inbox overlay with one task selected. */
+      openInbox(id?: string) {
+        const s = (useStore as any).getState();
+        if (id) s.setScheduleInboxSelected(id);
+        s.setScheduleInboxOpen(true);
+      },
+      closeInbox() {
+        (useStore as any).getState().setScheduleInboxOpen(false);
+      },
+      /** Re-list from the backend into the store (the panel's own refresh). */
+      async refresh() {
+        const mod = await import("../../src/lib/api");
+        const rows = await mod.listSchedules();
+        if (!Array.isArray(rows)) return rows;
+        (useStore as any).setState({ schedules: rows });
+        return rows;
+      },
+    };
+    root.render(
+      <div style={{ display: "flex", height: "100vh", background: "var(--bg, #0b0e14)" }}>
+        <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }} dir="rtl">
+          <ScheduleSection />
+        </div>
+        <ScheduleInbox />
+      </div>,
+    );
+  }
+} else if (params.get("scenario") === "diff") {
   // DiffView alone: lets a browser driver select diff text and assert the
   // Copy/Reply toolbar appears instead of the comment editor opening directly.
   const { DiffView } = await import("../../src/components/ToolCallView");

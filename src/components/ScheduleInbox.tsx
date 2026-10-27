@@ -13,7 +13,7 @@ import { playAlarm } from "../lib/alarm";
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
-import { shownViewerTabId, useViewerTabs } from "../lib/viewerTabs";
+import { shownViewerTabId, useViewerScope, useViewerTabs } from "../lib/viewerTabs";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -801,8 +801,7 @@ export function ScheduleInboxButton() {
   // on the first press instead of being closed by it.
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
-  const activeChatId = useStore((s) => s.activeChatId);
-  const shown = shownViewerTabId(tabs, activeId, activeChatId) === 'inbox';
+  const shown = shownViewerTabId(tabs, activeId, useViewerScope()) === 'inbox';
   return (
     <button
       className="titlebar-icon-btn schedule-inbox-btn"

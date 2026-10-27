@@ -219,6 +219,9 @@ export interface Settings {
   /** User-level data root: skills/plans/mcp files live under this folder.
    *  Default: ~/.codifa. */
   dataPath?: string
+  /** Directory the Settings → Storage backup zip is written to.
+   *  Empty = the data root itself (~/.codifa by default). */
+  backupPath?: string
   /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId?: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions (e.g. whisper-1). */

@@ -101,14 +101,17 @@ const bridge: CoderApi = {
   // `program`/`args`: run THAT program instead of a login shell (the in-app
   // "Neovim" target). `shell`: the SHELL of a plain tab (Settings → Terminal) —
   // a separate param, so `zsh` never rides in as an argv-style program.
-  // Explicit nulls: a Tauri Command's `Option` params must be present in the
-  // payload, a missing key is rejected.
-  terminalCreate: (cwd, program, args, shell) =>
+  // `id`: the session id the CALLER derived (right-pane tabs) — the backend
+  // adopts it, so pty output emitted before the create answer already carries
+  // a routable name. Explicit nulls: a Tauri Command's `Option` params must be
+  // present in the payload, a missing key is rejected.
+  terminalCreate: (cwd, program, args, shell, id) =>
     invoke<TerminalSessionInfo>('terminal_create', {
       cwd,
       program: program ?? null,
       args: args ?? null,
       shell: shell ?? null,
+      requestedId: id ?? null,
     }),
   terminalList: () => invoke<TerminalSessionInfo[]>('terminal_list'),
   terminalWrite: (id, data) => invoke<boolean>('terminal_write', { id, data }),
@@ -127,6 +130,16 @@ const bridge: CoderApi = {
   },
   onMigrateProgress: (cb) =>
     eventSubscribe<{ label: string; pct: number }>('migrate:progress', (evt) => cb(evt)),
+  createBackup: (destDir) =>
+    invoke<{ path: string; files: number; bytes: number; elapsedMs: number }>('create_backup', {
+      destDir,
+    }),
+  cancelBackup: () => invoke<void>('cancel_backup'),
+  onBackupProgress: (cb) =>
+    eventSubscribe<{ label: string; pct: number; files: number; total: number }>(
+      'backup:progress',
+      (evt) => cb(evt),
+    ),
   checkForUpdates: () => invoke<UpdateInfo>('check_for_updates'),
   startUpdate: () => invoke<OpResult>('start_update'),
   onUpdateProgress: (cb) =>

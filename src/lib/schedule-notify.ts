@@ -38,6 +38,18 @@ export function findFinishedScheduleRuns(
   });
 }
 
+/** Schedule ids with a run still in flight, from the run rows. The schedule
+ *  page remounts on every tab switch, so component state cannot be the source
+ *  of truth for the spinner — the backend rows are (the inbox reads the same
+ *  rows). Pure for tests. */
+export function liveRunningMap(runs: ScheduleRun[]): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const r of runs ?? []) {
+    if (r && r.schedule_id && r.status === "running") out[r.schedule_id] = true;
+  }
+  return out;
+}
+
 /** اجازه اعلان سیستم‌عامل را در صورت نیاز می‌گیرد؛ false یعنی اعلان ممکن نیست. */
 export async function ensureScheduleNotificationPermission(): Promise<boolean> {
   try {

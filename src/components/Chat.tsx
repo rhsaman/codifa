@@ -42,6 +42,7 @@ import {
   parseScheduleFlags,
   stripFlagTokens,
   hasLandedFlag,
+  hasLandedValue,
   isFlagToken,
   normalizeFlagDashes,
   migrateCommandNames,
@@ -1010,6 +1011,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Slug/id → absolute folder per kind: lets a bare `update <name>` sub-command
   // pin the badge without a second fetch — the lists already carry the folder.
   const cmdArgDirsRef = useRef<Record<string, Record<string, string>>>({});
+  // id → display label per kind (e.g. schedule id → human name): the arg menu
+  // shows readable rows, while the token it inserts stays the id executors and
+  // tool calls resolve.
+  const cmdArgLabelsRef = useRef<Record<string, Record<string, string>>>({});
   const cmdArgFetchedAt = useRef(0);
   // One `/`-command per ENABLED PLUGIN (the bundle's slug), with its skills as
   // the sub-command level. Seeded from the module cache so a remount (chat
@@ -1251,7 +1256,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }),
       load('schedule', async () => {
         const tasks = await listSchedules();
-        return Array.isArray(tasks) ? tasks.map((t) => t.id) : (next.schedule ?? []);
+        if (!Array.isArray(tasks)) return next.schedule ?? [];
+        cmdArgLabelsRef.current.schedule = Object.fromEntries(
+          tasks.map((t) => [t.id, t.name ? (t.enabled ? t.name : `${t.name} (paused)`) : t.id]),
+        );
+        return tasks.map((t) => t.id);
       }),
     ]);
     cmdArgValuesRef.current = next;
@@ -1284,15 +1293,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const caret = cmdCaret;
     const q = cmdQuery.toLowerCase();
     if (caret && caret.index >= 2) {
-      const flags = commandFlags(caret.prev[0] ?? "");
       const subName = caret.prev[1] ?? "";
-      const afterFlagSub =
-        flags.length > 0 &&
-        (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).some((s) => s.name === subName);
-      // The empty word right after `create `/`update ` is the flag level: offer
+      // Sub-aware: the attachment flags are a CREATE-time level; `update` keeps
+      // what create set (after the pick the word is change prose), so its menu
+      // offers no `--skills/--mcp/--plugins` at all.
+      const flags = commandFlags(caret.prev[0] ?? "", subName);
+      const subDecl = (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).find(
+        (s) => s.name === subName,
+      );
+      const afterFlagSub = flags.length > 0 && !!subDecl;
+      // The sub-command's own `name` arg owns the fresh word until a value
+      // lands (`/schedule update ` → the task list); after the pick the word
+      // is the change prose or the next flag, and the flags own the menu.
+      const argOwns =
+        caret.index === 2 &&
+        subDecl?.arg === "name" &&
+        !hasLandedValue(caret.prev.slice(2));
+      // The empty word right after `create ` is the flag level: offer
       // the names instead of falling through to the sub-command's (absent) value
-      // menu, which rendered an empty box.
-      if (afterFlagSub && (!caret.word || isFlagToken(caret.word))) {
+      // menu, which rendered an empty box. After a `name`-arg sub-command
+      // (`update `) the empty word belongs to THAT menu until a value lands.
+      if (afterFlagSub && (isFlagToken(caret.word) || (!caret.word && !argOwns))) {
         const caretFlag = slashFlagAt(caret, caret.prev[0] ?? "");
         if (!caret.word.includes("=")) {
           // Rank by the straightened name: `—ski` (a smart-dash `--ski`) must
@@ -1408,6 +1429,32 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     if (!sub) return [];
     const kind: CmdArg | undefined = caret.index === 2 ? sub.arg : sub.rest;
     if (!kind || kind === "free") return [];
+    // Schedule tasks list their REAL rows here: the label is the human name
+    // (paused marked), the inserted token is the id the update/run/remove
+    // executors and the tool call resolve — a name would not survive them.
+    if (verb === "schedule" && kind === "name") {
+      const labels = cmdArgLabelsRef.current.schedule ?? {};
+      const tasks = (cmdArgValues.schedule ?? []).map((id) => ({
+        id,
+        label: labels[id] ?? id,
+      }));
+      if (tasks.length === 0) {
+        return [
+          {
+            key: `ensure:${verb}`,
+            label: cmdArgLoaded ? "No scheduled tasks" : "Loading…",
+            hint: verb,
+            insert: "",
+          },
+        ];
+      }
+      return rankMatches(tasks, caret.word, (t) => t.label).map((t) => ({
+        key: `val:schedule:${t.id}`,
+        label: t.label,
+        hint: "scheduled task",
+        insert: t.id,
+      }));
+    }
     const values = (kind === "repo" ? cmdArgValues.repo : cmdArgValues[verb]) ?? [];
     // The lists load lazily and the menu opens the moment the level does, so an
     // EMPTY map here usually means "still fetching", not "nothing installed" —
@@ -2250,6 +2297,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (!recordingRef.current) return;
+      // Streaming dictation is a composition mode: Space must TYPE a space
+      // into the composer, not end the dictation (only ✓ / Enter / ✕ end it).
+      if (dictateSessionRef.current) return;
       // Per-chat isolation: every mounted ChatPanel listens on document, so
       // without this guard a Space pressed in ANY chat would stop ALL
       // recording chats (and swallow the space keystroke).
@@ -6465,7 +6515,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             `user gave — and read its CURRENT prompt, cron, root, mode and attached ` +
             `skills/mcp_servers/plugins. Then call action=update with the SAME id and ` +
             `send only the fields that change (an omitted field keeps its stored ` +
-            `value).${updFlags ? ` Set these attached arrays exactly: ${updFlags}.` : ""} ` +
+            `value); its attached skills, mcp_servers and plugins stay exactly ` +
+            `as creation set them — change those only when the text above ` +
+            `explicitly asks.` +
+            `${updFlags ? ` Set these attached arrays exactly: ${updFlags}.` : ""} ` +
             `The cron is 5 fields in the machine's LOCAL time, and an empty cron makes it run once.`,
           [],
           [],
@@ -8148,7 +8201,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       setDictateConfirming(false);
       return;
     }
-    const typed = liveTypedRef.current;
+    // A turn-final onUserText delivery REPLACES the partial in the composer
+    // and empties the ref (Chat.tsx onUserText) — after any spoken pause the
+    // words the user is looking at live in `input`, not in the ref. ✓/Enter
+    // must send what the composer shows, so the ref is only the first pick.
+    const typed = liveTypedRef.current || input;
     liveTypedRef.current = "";
     dictateConfirmingRef.current = false;
     dictateAwaitRef.current = true;
@@ -8184,7 +8241,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       setDictateConfirming(false);
       return;
     }
+    // X's contract: cancel = nothing survives -- no send AND no text left
+    // behind. Partials live in the composer (and after a pause onUserText has
+    // already moved the final transcript there and emptied the ref), so the
+    // whole input is wiped, not just the ref-owned slice.
     clearLivePartial();
+    setInput("");
     dictatePendingFinalRef.current = "";
     dictateConfirmingRef.current = false;
     dictateAwaitRef.current = false;
@@ -9082,16 +9144,49 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         ? (SUBCOMMANDS[subVerb] ?? []).find((s) => s.name === subName)
         : undefined;
     const flagLevel =
-      caret.index >= 2 && commandFlags(subVerb).length > 0 && !!subDecl;
+      caret.index >= 2 &&
+      commandFlags(subVerb, subName).length > 0 &&
+      !!subDecl;
     // Flag menus auto-open only while a flag is being BUILT: the empty word
-    // right after `create `/`update ` (no flag landed yet), a `--name` being
+    // right after `create ` — the only sub that grows attachments (`update`
+    // keeps what create set, so its flag level is empty), a `--name` being
     // typed, or the value side of `--name=`. Prose (the prompt itself) and the
     // fresh word after a landed `--flag=value` do NOT pop the menu — a popup
     // over every word made the description unwritable. ArrowUp brings the menu
     // back by hand (next flag name, or the rest of a value list).
+    // The sub-command's own `name` value owns the word until it lands
+    // (`/schedule update ` → the task list is the level): typing there is
+    // FILTERING that list, not prose, so the flag rule must not close it.
+    const argValueOwns =
+      caret.index === 2 &&
+      !!subDecl &&
+      subDecl.arg === "name" &&
+      !hasLandedValue(caret.prev.slice(2));
     const proseWord = caret.word !== "" && !isFlagToken(caret.word);
     const afterLanded = caret.word === "" && hasLandedFlag(caret.prev.slice(2));
-    if (flagLevel && (proseWord || afterLanded)) {
+    if (flagLevel && !argValueOwns && (proseWord || afterLanded)) {
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    // A `--flag` token inside a sub that takes no flags (`update` keeps what
+    // create attached) is plain prose to the executor: no menu sits under it,
+    // so the flag menus are not offered here at all.
+    if (!flagLevel && caret.index >= 2 && !!subDecl && isFlagToken(caret.word)) {
+      setCmdOpen(null);
+      setCmdCaret(null);
+      return;
+    }
+    // The value HAS landed (`update <id> `): like a landed `--flag=value`, the
+    // value menu must not repop over the change prose the user is about to
+    // write. A flag token was handled above (create only), so every word here
+    // is the free change text and the palette stays closed.
+    const valueLanded =
+      caret.index === 2 &&
+      !!subDecl &&
+      subDecl.arg === "name" &&
+      hasLandedValue(caret.prev.slice(2));
+    if (valueLanded) {
       setCmdOpen(null);
       setCmdCaret(null);
       return;
@@ -9501,7 +9596,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // word opens the FLAG NAMES so the next flag can be picked.
       if (input.startsWith("/")) {
         const caret = slashCaretAt(input, el?.selectionStart ?? input.length);
-        const flags = caret ? commandFlags(caret.prev[0] ?? "") : [];
+        // Sub-aware: `update` (and run/remove) have no attachment flags, so
+        // ArrowUp over their prose does not resurrect a dead flag menu.
+        const flags = caret ? commandFlags(caret.prev[0] ?? "", caret.prev[1]) : [];
         const subDecl =
           caret && caret.index >= 2
             ? (SUBCOMMANDS[caret.prev[0] ?? ""] ?? []).find((s) => s.name === caret.prev[1])

@@ -17,7 +17,7 @@ import { ChatTabBar } from './components/ChatTabBar'
 import { ViewerTabBar } from './components/ViewerTabBar'
 import { ViewerWindows } from './components/ViewerWindows'
 import { clampSplitWidth, loadSplitWidth, persistSplitWidth, useViewerTabs } from './lib/viewerTabs'
-import { ViewerAddButton, ViewerPaneFullscreenButton, ViewerTabListButton } from './components/ViewerTabBar'
+import { ViewerAddButton, ViewerDockBar, ViewerPaneFullscreenButton, ViewerPaneToggleButton, ViewerTabListButton } from './components/ViewerTabBar'
 import { ChatTabListButton } from './components/ChatTabBar'
 import { SettingsModal } from './components/SettingsModal'
 import { SearchOverlay } from './components/SearchOverlay'
@@ -28,6 +28,9 @@ import { resolveChatClose } from './lib/chatClose'
 import { collectChatIds, pickNeighborByRect, type WindowNavDir, type WindowRect } from './lib/chatTree'
 import { focusChatInput } from './lib/chatFocus'
 import { activePane, focusAppPane } from './lib/paneFocus'
+import { nudgeChatWindowRepaint, setBorderRepaintLoop } from './lib/paneFlash'
+import { cyclePane } from './lib/paneCycle'
+import { paneOwner, snapshotIntent } from './lib/panePointer'
 import { flashOnEnter, flashPaneFocus } from './lib/paneFlash'
 import { applyInputSuppression } from './lib/inputSuppress'
 import { DEFAULT_THEME, THEMES } from './lib/themes'
@@ -123,12 +126,52 @@ export default function App() {
   const viewerFull = useViewerTabs((s) => s.fullscreen)
   const paneOpen = useViewerTabs((s) => s.paneOpen)
   const chatFull = useStore((s) => s.chatFullscreen)
+  // The right pane animates open/close: it stays MOUNTED through the close
+  // transition (`paneMounted`) and, on open, mounts collapsed and expands on
+  // the next frame (`paneRevealed`) so the width transition actually runs.
+  const [paneMounted, setPaneMounted] = useState(paneOpen)
+  const [paneRevealed, setPaneRevealed] = useState(paneOpen)
+  // True while the open/close transition runs: the pane then carries its own
+  // compositing layer (`.animating`), cleared at transitionend (with a timeout
+  // fallback) so its fixed popups anchor to the viewport again.
+  const [paneAnimating, setPaneAnimating] = useState(false)
+  const animatingTimer = useRef<number | null>(null)
+  const clearPaneAnimating = useCallback(() => {
+    if (animatingTimer.current !== null) {
+      window.clearTimeout(animatingTimer.current)
+      animatingTimer.current = null
+    }
+    setPaneAnimating(false)
+  }, [])
+  useEffect(() => {
+    if (paneOpen) {
+      setPaneMounted(true)
+      setPaneAnimating(true)
+      if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current)
+      animatingTimer.current = window.setTimeout(clearPaneAnimating, 400)
+      const raf = requestAnimationFrame(() => setPaneRevealed(true))
+      return () => cancelAnimationFrame(raf)
+    }
+    setPaneRevealed(false)
+    setPaneAnimating(true)
+    if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current)
+    animatingTimer.current = window.setTimeout(clearPaneAnimating, 400)
+    const t = window.setTimeout(() => setPaneMounted(false), 320)
+    return () => window.clearTimeout(t)
+  }, [paneOpen, clearPaneAnimating])
+  // While the pane animates, force per-frame chat-window repaints (the
+  // WKWebView stale-border hammer — see setBorderRepaintLoop).
+  useEffect(() => {
+    setBorderRepaintLoop(paneAnimating)
+    return () => setBorderRepaintLoop(false)
+  }, [paneAnimating])
   const [searchOpen, setSearchOpen] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   // VSCode-style split between chat group and viewer group. Default half
   // viewport, resizable via the dock handle, persisted in localStorage.
   const [splitW, setSplitW] = useState(() => loadSplitWidth(0.5))
   const splitDrag = useRef<{ startX: number; startW: number } | null>(null)
+  const viewerContentRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const onResize = () => setSplitW((w) => clampSplitWidth(w))
     window.addEventListener('resize', onResize)
@@ -334,33 +377,13 @@ export default function App() {
      *
      *  The target is the window that REALLY lies in that direction on screen
      *  (pickNeighborByRect: live rects, nearest edge, same row/column first).
-     *  With no window on that side the key never jumps to a window in another
-     *  direction. The OPEN side panels continue the same directions: Ctrl+L
-     *  from the rightmost window enters the right panel, Ctrl+H from the
-     *  leftmost enters the sidebar, and from inside them the opposite key
-     *  (Ctrl+H in the right panel, Ctrl+L in the sidebar) returns to the chat.
-     *  Returns false only when the chord is NOT ours (a terminal has the caret). */
+     *  With no window on that side the key does nothing — it NEVER crosses
+     *  into the sidebar, the right pane or the terminal: the three sections
+     *  are reached only through the Ctrl+X prefix (l/h/t). Returns false only
+     *  when the chord is NOT ours (the caret sits outside the chat windows). */
     function moveChatWindow(dir: WindowNavDir): boolean {
       const st = useStore.getState()
-      const pane = activePane()
-      if (pane === 'terminal') {
-        // Only a right-pane terminal TAB hands the caret back (Ctrl+H); the
-        // bottom panel never reaches here (isWindowMoveBlocked), and any other
-        // chord stays shell input.
-        if (dir === 'left' && document.activeElement?.closest?.('.terminal-tab-panel')) {
-          focusAppPane('chat')
-          return true
-        }
-        return false
-      }
-      if (pane === 'viewer' && dir === 'left') {
-        focusAppPane('chat')
-        return true
-      }
-      if (pane === 'sidebar' && dir === 'right') {
-        focusAppPane('chat')
-        return true
-      }
+      if (activePane() !== 'chat') return false
       const ids = st.chatTree ? collectChatIds(st.chatTree) : st.visibleChatIds
       const rects: Record<string, WindowRect> = {}
       document.querySelectorAll<HTMLElement>('[data-chat-window]').forEach((el) => {
@@ -382,14 +405,9 @@ export default function App() {
           // The ring says "you are now HERE" — same cue as a mouse press.
           flashPaneFocus(document.querySelector<HTMLElement>(`[data-chat-window="${CSS.escape(next)}"]`))
         })
-        return true
       }
-      // No chat window on that side: the open panel beyond the edge is next.
-      if (dir === 'right' && useViewerTabs.getState().paneOpen && !st.chatFullscreen) {
-        focusAppPane('viewer')
-      } else if (dir === 'left' && st.sidebarOpen) {
-        focusAppPane('sidebar')
-      }
+      // No neighbour on that side: consume the chord, move nothing. The panes
+      // beyond the edges are reached through the Ctrl+X prefix, never here.
       return true
     }
 
@@ -398,11 +416,12 @@ export default function App() {
       if (prefixActiveRef.current) {
         cancelPrefix()
         const k = physicalKey(e)
-        // The prefix carries NO window movement: focus between chat windows is
-        // the direct Ctrl+H/J/K/L chord (below) and nothing else. `j` is the
-        // ONLY letter of h/j/k/l the prefix knows — it toggles the terminal
-        // panel, also while the caret is inside a terminal. `h`/`k`/`l` mean
-        // nothing after Ctrl+X.
+        // The prefix owns the SECTION hops: l/h move focus across the app's
+        // three sections (sidebar ↔ chats ↔ right pane) and t lands in the
+        // bottom terminal. Window-level movement between split CHAT WINDOWS
+        // stays on the direct Ctrl+H/J/K/L chord (below) and is never taken
+        // here. `j` toggles the terminal panel, also while the caret is inside
+        // a terminal; `v`/Space are the voice toggles.
         // A key the prefix CONSUMES must not travel on: the capture listener
         // above xterm would otherwise let the second key through, and a
         // terminal with focus typed the `j` into the shell.
@@ -428,6 +447,23 @@ export default function App() {
           } else if (sc.action === 'terminal') {
             // Ctrl+X then J: toggle the bottom terminal panel.
             useStore.getState().toggleTerminalPanel()
+          } else if (sc.action === 'pane-right' || sc.action === 'pane-left') {
+            // Ctrl+X then L/H: the ONLY way focus crosses the three sections —
+            // the direct Ctrl+L/H chord never leaves the chat windows. A closed
+            // pane is a valid destination: the right pane is revealed by
+            // focusAppPane, so the sidebar opens here to match.
+            const current = activePane()
+            const next = cyclePane(current, sc.action === 'pane-right' ? 'l' : 'h')
+            if (next !== current) {
+              if (next === 'sidebar' && !useStore.getState().sidebarOpen) {
+                useStore.getState().setSidebarOpen(true)
+              }
+              focusAppPane(next)
+            }
+          } else if (sc.action === 'terminal-focus') {
+            // Ctrl+X then T: the caret lands in the bottom terminal (opening
+            // the panel first) — no toggle, so it never hides the panel.
+            focusAppPane('terminal')
           } else {
             window.dispatchEvent(new CustomEvent('coder:cmd', { detail: sc.cmd }))
           }
@@ -593,13 +629,25 @@ export default function App() {
             useStore.getState().toggleTerminalFullscreen()
             break
           }
-          // The pane claims the chord only when FOCUS sits inside it (event
-          // target or the active element — xterm hosts the caret on its own
-          // helper node): a merely-open pane must never steal Ctrl+M from a
-          // focused chat window.
+          // The pane claims the chord when FOCUS sits inside it (event target
+          // or the active element — xterm hosts the caret on its own helper
+          // node) — a merely-open pane must never steal Ctrl+M from a focused
+          // chat window. WebKit adds a wrinkle: clicking non-focusable pane
+          // content (a diff line, a code row) never MOVES focus, so the
+          // keydown still carries the composer's stale caret. The pointer
+          // intent (panePointer — the same source the Ctrl+X chords read)
+          // covers that case: the last-clicked pane claims the chord as long
+          // as no newer typing intent (a return to an input) outvotes it.
           const paneEl =
             t?.closest?.('.viewer-group') ||
-            document.activeElement?.closest?.('.viewer-group')
+            document.activeElement?.closest?.('.viewer-group') ||
+            (() => {
+              const owner = paneOwner()
+              if (!owner) return null
+              const st = snapshotIntent()
+              if (st.typingAt > st.regionAt) return null
+              return owner.closest?.('.viewer-group') ?? null
+            })()
           if (paneEl) {
             const vt = useViewerTabs.getState()
             const next = !vt.fullscreen
@@ -614,6 +662,21 @@ export default function App() {
         }
         case 't': {
           e.preventDefault()
+          // A terminal holding the caret owns the chord: Ctrl+T spawns another
+          // shell THERE (exactly what its own "+" does) instead of yanking the
+          // user out of the terminal into a new chat.
+          const termTarget = e.target as HTMLElement | null
+          if (insideTerminalHost(termTarget, '.terminal-panel')) {
+            window.dispatchEvent(new CustomEvent('coder:new-terminal'))
+            break
+          }
+          if (insideTerminalHost(termTarget, '.terminal-tab-panel')) {
+            useViewerTabs.getState().openTerminal({
+              cwd: useStore.getState().root,
+              fresh: true,
+            })
+            break
+          }
           useStore.getState().newChat()
           break
         }
@@ -733,9 +796,9 @@ export default function App() {
                 <ChatWindows />
               </main>
             </section>
-            {paneOpen && !chatFull && (
+            {paneMounted && !chatFull && (
               <>
-                {!viewerFull && (
+                {!viewerFull && paneOpen && (
                   <div
                     className="dock-resize-handle"
                     title="Drag to resize"
@@ -743,9 +806,13 @@ export default function App() {
                   />
                 )}
                 <section
-                  className="viewer-group"
+                  className={
+                    "viewer-group" +
+                    (paneRevealed ? "" : " closing") +
+                    (paneAnimating ? " animating" : "")
+                  }
                   style={
-                    viewerFull
+                    viewerFull && paneOpen
                       ? {
                           display: "flex",
                           flexDirection: "column",
@@ -753,25 +820,62 @@ export default function App() {
                           minWidth: 0,
                           overflow: "hidden",
                         }
-                      : ({
-                          flexBasis: splitW,
-                          width: splitW,
-                          display: "flex",
-                          flexDirection: "column",
-                          minHeight: 0,
-                          minWidth: 0,
-                          overflow: "hidden",
-                        } as React.CSSProperties)
+                      : paneOpen
+                        ? ({
+                            flexBasis: splitW,
+                            width: splitW,
+                            display: "flex",
+                            flexDirection: "column",
+                            minHeight: 0,
+                            minWidth: 0,
+                            overflow: "hidden",
+                          } as React.CSSProperties)
+                        : ({
+                            /* Collapsed mid-animation: the class carries the
+                               zero size so the transition has somewhere to go. */
+                            flexBasis: 0,
+                            width: 0,
+                            minWidth: 0,
+                            display: "flex",
+                            flexDirection: "column",
+                            minHeight: 0,
+                            overflow: "hidden",
+                          } as React.CSSProperties)
                   }
+                  onTransitionEnd={(e) => {
+                    // The width transition leaves a STALE focused-border tile
+                    // on the chat windows (WebKit keeps the last intermediate
+                    // paint); one repaint nudge at the end clears it. The
+                    // compositing promotion ends here too.
+                    if (e.target === e.currentTarget && (e.propertyName === 'width' || e.propertyName === 'flex-basis')) {
+                      nudgeChatWindowRepaint()
+                      clearPaneAnimating()
+                    }
+                  }}
                   aria-label="Viewers"
                 >
-                  {/* Pane body: viewer content beside a vertical icon rail
-                      pinned to the pane's right edge. Canonical rail order, top
-                      to bottom: [collapse | tab list | fullscreen | "+" | tab
-                      rows]. Pages have no fixed icons: the "+" opens them as
-                      ordinary tabs, so anything opened can also be closed. */}
+                  {/* Pane body: a titled tab strip along the TOP edge (files,
+                      browser, trace — the tab-like surfaces; "+" opens only
+                      the chat-owned Browser/Trace), the viewer content, and a
+                      fixed launcher dock along the BOTTOM edge that stays
+                      completely separate from the tabs (one permanent icon
+                      per page; clicking again closes the page). */}
                   <div className="viewer-pane-body">
+                    <div className="viewer-pane-head">
+                      <ViewerTabListButton />
+                      <ViewerTabBar />
+                      {/* The single tab entry point: its menu opens only the
+                          chat-owned pages (Browser/Trace) as ordinary tabs. */}
+                      <ViewerAddButton />
+                      <span className="viewer-pane-spacer" aria-hidden="true" />
+                      <div className="viewer-pane-actions">
+                        <ViewerPaneFullscreenButton />
+                        <ViewerPaneToggleButton />
+                      </div>
+                    </div>
                     <div
+                      ref={viewerContentRef}
+                      tabIndex={-1}
                       className="viewer-content"
                       style={{
                         flex: "1 1 auto",
@@ -781,32 +885,24 @@ export default function App() {
                         minWidth: 0,
                         overflow: "hidden",
                       }}
+                      // Click-to-focus: WebKit never moves the caret when a
+                      // click lands on non-focusable pane content (a diff
+                      // line, a code row), so the pane never "has focus" and
+                      // pane-scoped chords (Ctrl+M) misfire. Give the pane
+                      // host the caret — unless the click already landed on
+                      // something that takes focus of its own (a button, the
+                      // xterm textarea, the find box).
+                      onMouseDown={(e) => {
+                        const t = e.target as HTMLElement | null
+                        if (t?.closest?.(
+                          'input, textarea, select, button, a, [contenteditable="true" i], [tabindex]:not([tabindex="-1"])',
+                        )) return
+                        viewerContentRef.current?.focus({ preventScroll: true })
+                      }}
                     >
                       <ViewerWindows />
                     </div>
-                    <div className="viewer-pane-head">
-                      <div className="viewer-pane-actions">
-                        <button
-                          className="titlebar-icon-btn"
-                          title="Hide side pane"
-                          aria-label="Hide side pane"
-                          onClick={() => useViewerTabs.getState().setPaneOpen(false)}
-                        >
-                          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                            <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                            <path d="M15 4v16" />
-                            <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
-                          </svg>
-                        </button>
-                      </div>
-                      <ViewerTabListButton />
-                      <ViewerPaneFullscreenButton />
-                      {/* The single page entry point: its menu opens any page as
-                          a closable tab in the rows below. */}
-                      <ViewerAddButton />
-                      <ViewerTabBar />
-                      <span className="viewer-pane-spacer" aria-hidden="true" />
-                    </div>
+                    <ViewerDockBar />
                   </div>
                 </section>
               </>

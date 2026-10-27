@@ -9,6 +9,7 @@ import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch, physicalKey } from "../lib/shortcuts";
 import { stepChatId } from "../lib/sidebarStep";
 import { isVimRegionActive } from "../lib/panePointer";
+import { nudgeChatWindowRepaint, setBorderRepaintLoop } from "../lib/paneFlash";
 import { isPrefixArmed, watchPrefixFlag } from "../lib/prefixState";
 import { WindowStripCluster } from "./WindowStripCluster";
 
@@ -163,15 +164,121 @@ export function toggleGroupSelection(prev: Set<string>, groupIds: string[]): Set
 
 export function Sidebar() {
   // Lightweight shell: subscribes ONLY to the open flag so Cmd/Ctrl+B flips
-  // instantly without touching chats/workspaces. The heavy content (all chat
-  // subscriptions, grouping, search) mounts only when open and unmounts on
-  // close, so a toggle never walks a single message.
+  // instantly without touching chats/workspaces. The aside itself stays
+  // MOUNTED so open/close runs as a real width+fade transition (the closed
+  // class collapses it to zero); the heavy content (all chat subscriptions,
+  // grouping, search) mounts when open and unmounts only AFTER the close
+  // animation, so the collapse never flashes an empty strip.
   const open = useStore((s) => s.sidebarOpen);
-  if (!open) return null;
-  return <SidebarContent />;
+  const [contentMounted, setContentMounted] = useState(open);
+  // True while the open/close transition runs (the pane then carries its own
+  // compositing layer, cleared at transitionend + timeout fallback).
+  const [animating, setAnimating] = useState(false);
+  const animatingTimer = useRef<number | null>(null);
+  useEffect(() => {
+    if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current);
+    setAnimating(true);
+    animatingTimer.current = window.setTimeout(() => {
+      animatingTimer.current = null;
+      setAnimating(false);
+    }, 400);
+  }, [open]);
+  // Per-frame chat-window repaints while the sidebar animates (stale-border
+  // hammer — see setBorderRepaintLoop).
+  useEffect(() => {
+    setBorderRepaintLoop(animating);
+    return () => setBorderRepaintLoop(false);
+  }, [animating]);
+  useEffect(() => {
+    if (open) {
+      setContentMounted(true);
+      return;
+    }
+    const t = window.setTimeout(() => setContentMounted(false), 300);
+    return () => window.clearTimeout(t);
+  }, [open]);
+  // Sidebar width lives HERE (the shell owns the animated aside); the content
+  // only receives the drag handler. Previously the width sat below the shell,
+  // which produced a nested .sidebar whose fixed var() width clipped the
+  // resizable one.
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = localStorage.getItem("coder:sidebarWidth");
+    const n = saved ? parseInt(saved, 10) : 264;
+    return Number.isFinite(n) ? Math.max(180, Math.min(480, n)) : 264;
+  });
+  const sidebarDrag = useRef<{ startX: number; startW: number } | null>(null);
+  // Track the per-drag listeners so we can clean them up if the component
+  // unmounts mid-drag (e.g. user pressed ⌘B to toggle the sidebar off while
+  // still holding the resize handle — without this, the listeners would
+  // leak on `window` and keep firing against a torn-down state).
+  const sidebarDragCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    return () => {
+      sidebarDragCleanup.current?.();
+      sidebarDragCleanup.current = null;
+    };
+  }, []);
+  const startSidebarResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    sidebarDrag.current = { startX: e.clientX, startW: sidebarWidth };
+    const onMove = (ev: MouseEvent) => {
+      if (!sidebarDrag.current) return;
+      const w = Math.max(
+        180,
+        Math.min(
+          480,
+          sidebarDrag.current.startW +
+          (ev.clientX - sidebarDrag.current.startX),
+        ),
+      );
+      setSidebarWidth(w);
+      localStorage.setItem("coder:sidebarWidth", String(w));
+    };
+    const onUp = () => {
+      sidebarDrag.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      sidebarDragCleanup.current = null;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    sidebarDragCleanup.current = onUp;
+  };
+  return (
+    <aside
+      className={"sidebar" + (open ? "" : " closed") + (animating ? " animating" : "")}
+      aria-hidden={!open}
+      style={
+        {
+          flexBasis: open ? sidebarWidth : 0,
+          width: open ? sidebarWidth : 0,
+          "--sidebar-w": `${sidebarWidth}px`,
+        } as React.CSSProperties
+      }
+      onTransitionEnd={(e) => {
+        // Same stale-border fix as the right pane: the width transition can
+        // leave the focused chat window's border painted at an intermediate
+        // geometry; one repaint nudge at the end clears it. The compositing
+        // promotion ends here too.
+        if (e.target === e.currentTarget && (e.propertyName === 'width' || e.propertyName === 'flex-basis')) {
+          nudgeChatWindowRepaint();
+          if (animatingTimer.current !== null) window.clearTimeout(animatingTimer.current);
+          animatingTimer.current = null;
+          setAnimating(false);
+        }
+      }}
+    >
+      {contentMounted ? <SidebarContent onResizeStart={startSidebarResize} /> : null}
+    </aside>
+  );
 }
 
-function SidebarContent() {
+function SidebarContent({
+  onResizeStart,
+}: {
+  /** Drag-resize handler owned by the shell (which owns the animated aside). */
+  onResizeStart: (e: React.MouseEvent) => void;
+}) {
   // Subscribe to a lightweight chat SUMMARY (id/title/root/timestamps + flags),
   // not the full chat objects: message/stream/draft edits rebuild the chat
   // record but leave the summary identical, so the sidebar list does not
@@ -433,52 +540,6 @@ function SidebarContent() {
     };
   }, [collapsed]);
 
-  // Sidebar width — drag-resizable on the right edge (VSCode-style), persisted
-  // locally so the layout survives restarts.
-  const [sidebarWidth, setSidebarWidth] = useState(() => {
-    const saved = localStorage.getItem("coder:sidebarWidth");
-    const n = saved ? parseInt(saved, 10) : 264;
-    return Number.isFinite(n) ? Math.max(180, Math.min(480, n)) : 264;
-  });
-  const sidebarDrag = useRef<{ startX: number; startW: number } | null>(null);
-  // Track the per-drag listeners so we can clean them up if the component
-  // unmounts mid-drag (e.g. user pressed ⌘B to toggle the sidebar off while
-  // still holding the resize handle — without this, the listeners would
-  // leak on `window` and keep firing against a torn-down state).
-  const sidebarDragCleanup = useRef<(() => void) | null>(null);
-  useEffect(() => {
-    return () => {
-      sidebarDragCleanup.current?.();
-      sidebarDragCleanup.current = null;
-    };
-  }, []);
-  const startSidebarResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    sidebarDrag.current = { startX: e.clientX, startW: sidebarWidth };
-    const onMove = (ev: MouseEvent) => {
-      if (!sidebarDrag.current) return;
-      const w = Math.max(
-        180,
-        Math.min(
-          480,
-          sidebarDrag.current.startW +
-          (ev.clientX - sidebarDrag.current.startX),
-        ),
-      );
-      setSidebarWidth(w);
-      localStorage.setItem("coder:sidebarWidth", String(w));
-    };
-    const onUp = () => {
-      sidebarDrag.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      sidebarDragCleanup.current = null;
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    sidebarDragCleanup.current = onUp;
-  };
-
   // `buildGroups` walks every chat + sorts; memoize it so it only re-runs when
   // the underlying data actually changes (not on every unrelated re-render such
   // as hover/scroll state). `chats` is rebuilt by the store on each streamed
@@ -591,16 +652,7 @@ function SidebarContent() {
   };
 
   return (
-    <aside
-      className="sidebar"
-      style={
-        {
-          flexBasis: sidebarWidth,
-          width: sidebarWidth,
-          "--sidebar-w": `${sidebarWidth}px`,
-        } as React.CSSProperties
-      }
-    >
+    <div className="sidebar-inner">
       {/* macOS traffic-light strip: with the native title bar hidden the
           window buttons overlay this corner — the window-strip cluster
           (sidebar toggle + workspace + direction) lives here so those
@@ -612,7 +664,7 @@ function SidebarContent() {
       <div
         className="sidebar-resize-handle"
         title="Drag to resize sidebar"
-        onMouseDown={startSidebarResize}
+        onMouseDown={onResizeStart}
       />
       <div className="sidebar-head">
         <div className="sidebar-search-box">
@@ -1317,6 +1369,6 @@ function SidebarContent() {
         })}
       </div>
 
-    </aside>
+    </div>
   );
 }

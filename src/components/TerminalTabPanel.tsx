@@ -12,7 +12,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
-import { useViewerTabs, visibleTabs } from '../lib/viewerTabs'
+import { useViewerTabs, useViewerScope, visibleTabs } from '../lib/viewerTabs'
 import { xtermTheme } from '../lib/xtermTheme'
 import {
   attachTerminalScreen,
@@ -34,13 +34,14 @@ interface TerminalTabPanelProps {
 
 export function TerminalTabPanel({ tabId, cwd, program, args, shell }: TerminalTabPanelProps) {
   const theme = useStore((s) => s.theme)
-  // The strip lists EVERY terminal tab of the open chat, exactly like the bottom
-  // panel's strip lists its shells: the rail is an icon column, so a terminal
-  // tab was only discoverable as a hover-labelled glyph. Same chips, same +.
+  // The strip lists EVERY terminal tab of the focused workspace, exactly like
+  // the bottom panel's strip lists its shells: the rail is an icon strip, so a
+  // terminal tab was only discoverable as a hover-labelled glyph. Same chips,
+  // same +.
   const allTabs = useViewerTabs((s) => s.tabs)
   const activeId = useViewerTabs((s) => s.activeId)
-  const chatId = useViewerTabs((s) => s.tabs.find((t) => t.id === tabId)?.chatId ?? '')
-  const terminalTabs = visibleTabs(allTabs, chatId).filter((t) => t.kind === 'terminal')
+  const scope = useViewerScope()
+  const terminalTabs = visibleTabs(allTabs, scope).filter((t) => t.kind === 'terminal')
   const [error, setError] = useState<string | null>(null)
   const screenRef = useRef<HTMLDivElement | null>(null)
 

@@ -485,8 +485,14 @@ fn has_recent_running(data_root: &Path, schedule_id: &str, now: f64) -> bool {
     })
 }
 
-/// Close running runs orphaned by a dead process (status → error).
-fn mark_orphaned_running(data_root: &Path) -> usize {
+/// Close running runs orphaned by a dead process or a hung agent loop
+/// (status → error).
+///
+/// `min_age_secs` gates by the run's age: the STARTUP sweep passes 0 — no run
+/// of this process exists yet, so every stored "running" row is a leftover of
+/// a dead one — while the periodic loop passes ORPHAN_AFTER_SECS so a genuine
+/// long job is never touched.
+fn mark_orphaned_running(data_root: &Path, min_age_secs: f64) -> usize {
     let now = now_secs();
     let mut fixed = 0usize;
     for r in list_runs(data_root, "", 10_000) {
@@ -494,7 +500,7 @@ fn mark_orphaned_running(data_root: &Path) -> usize {
             continue;
         }
         let started = r.get("started_at").and_then(Value::as_f64).unwrap_or(0.0);
-        if started != 0.0 && (now - started) < ORPHAN_AFTER_SECS {
+        if started != 0.0 && (now - started) < min_age_secs {
             continue;
         }
         let mut fixed_run = r.clone();
@@ -782,9 +788,15 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // given. The workspace, the OS temp roots and `~/.codifa` stay open.
         allow_outside: false,
         allow_outside_folders: Vec::new(),
-        // A scheduled run has no UI session, so it uses the default engine
-        // chain (DuckDuckGo) rather than a user's Settings → Plugins order.
-        search_plugins: Vec::new(),
+        // The engine chain is the user's own Settings → Plugins order (tavily
+        // default, duckduckgo fallback…): the SAME list the chat sends —
+        // `search_with_engine` reads `order`/`enabled`/`apiKey`. The settings
+        // doc was already secret-decrypted above (searchPlugins keys too).
+        search_plugins: settings
+            .get("searchPlugins")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         // Headless runs have no UI to compact against, so they keep the
         // default threshold and no summarizer override; mid-turn compaction
         // still protects them from a "context length exceeded" hard failure.
@@ -810,6 +822,11 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // No renderer to send a table: `run_turn` derives it from the task's
         // mode, so a scheduled Ask run is read-only like an interactive one.
         cap: None,
+        // Headless: a mid-turn provider error must come back as `Err` so it
+        // reaches this run record and the fallback chain below. With the
+        // interactive protocol's swallow-as-Ok a run that died at step 5 was
+        // saved as "done" with the first narration message as its final answer.
+        headless: true,
     };
 
     // Run once to know whether the chain was empty: an empty chain is the one
@@ -821,6 +838,18 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     // one rung must not end the run while the user's own fallback list still has
     // models in it — the same rule the interactive tools follow.
     let mut tried: Vec<String> = Vec::new();
+    // The most text any rung produced before failing: a mid-turn provider error
+    // must still leave the work so far in the run record (the inbox shows it
+    // under the error line) instead of dropping the whole turn.
+    let mut partial_text = String::new();
+    // The last failure the chain saw, verbatim — the run record's `error` when
+    // no rung succeeded. A headless `run_turn` hands back the REAL provider
+    // error now, so the inbox no longer has to guess "model returned no text".
+    let mut last_error = String::new();
+    eprintln!(
+        "[schedule] run {run_id} for '{sid}' starting: {chain_rungs} rung(s), first '{}'",
+        chain.first().map(|(_, m, ..)| m.as_str()).unwrap_or("-")
+    );
     for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain {
         let mut rung = req.clone();
         rung.provider = kind;
@@ -839,25 +868,48 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // trace file has no `text` row at all (it records prompt/tool/llm/fold),
         // so reading it back always produced an empty output.
         let mut text = String::new();
+        let mut turn_errors: Vec<String> = Vec::new();
         let res = {
-            let mut emit = |ev: &crate::agent::AgentEvent| {
-                if let crate::agent::AgentEvent::Text { content } = ev {
-                    text.push_str(content);
+            let mut emit = |ev: &crate::agent::AgentEvent| match ev {
+                crate::agent::AgentEvent::Text { content } => text.push_str(content),
+                // Backstop: with `headless` set the stream-error path returns
+                // Err instead of emitting Error, but any other emitter must
+                // still fail the run — an error event is never a success.
+                crate::agent::AgentEvent::Error { content } => {
+                    turn_errors.push(content.clone());
                 }
+                _ => {}
             };
             crate::agent::run_turn(&rung, &mut emit, &cancel).await
         };
         match res {
-            Ok(()) => {
+            Ok(()) if turn_errors.is_empty() => {
                 final_text = text;
                 break;
             }
+            Ok(()) => {
+                let e = turn_errors.join("; ");
+                eprintln!("[schedule] run {run_id} rung '{rung_model}' reported error: {e}");
+                last_error = e.clone();
+                tried.push(format!("{rung_model}: {e}"));
+                if text.chars().count() > partial_text.chars().count() {
+                    partial_text = text;
+                }
+                if !crate::llm::should_fall_back(&e) {
+                    break;
+                }
+            }
             Err(e) => {
+                eprintln!("[schedule] run {run_id} rung '{rung_model}' failed: {e}");
                 // Only a model-side rejection moves to the next model. A dropped
                 // connection or a timeout ends the run with its own reason
                 // instead of billing every fallback for a network problem.
                 let next = crate::llm::should_fall_back(&e);
+                last_error = e.clone();
                 tried.push(format!("{rung_model}: {e}"));
+                if text.chars().count() > partial_text.chars().count() {
+                    partial_text = text;
+                }
                 if !next {
                     break;
                 }
@@ -870,9 +922,13 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // An empty body is NEVER a success: record WHY it is empty instead of
         // "done" with no output — that read like the schedule had simply
         // produced nothing and left the inbox at a bare "No output".
-        let reason = if !tried.is_empty() {
-            // Every rung failed: record the reasons.
+        let reason = if tried.len() > 1 {
+            // Several rungs failed: record all the reasons.
             format!("every model failed — {}", tried.join("; "))
+        } else if !last_error.is_empty() {
+            // One rung named the real failure (provider error, rejected key,
+            // mid-turn stream death): record IT, not a generic guess.
+            last_error.clone()
         } else if chain_rungs == 0 {
             // The model chain was empty: no endpoint was ever called.
             "no model configured for the Schedule slot (Settings → Tools)".to_string()
@@ -880,12 +936,20 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
             // A rung succeeded but returned no text (refused/filtered reply).
             format!("model returned no text after {chain_rungs} attempt(s)")
         };
+        let mut out_text = partial_text;
+        if out_text.chars().count() > RUN_OUTPUT_CAP {
+            out_text = out_text.chars().take(RUN_OUTPUT_CAP).collect();
+        }
+        eprintln!("[schedule] run {run_id} for '{sid}' finished: error — {reason}");
         save_run(
             data_root,
             &json!({
                 "id": run_id, "schedule_id": sid, "status": "error",
                 "error": reason,
-                "output": "", "started_at": started_at, "finished_at": finished,
+                // Whatever the turn produced before the failure stays visible in
+                // the inbox, under the error line — a half-finished turn is not
+                // "no output".
+                "output": out_text, "started_at": started_at, "finished_at": finished,
             }),
         );
     } else {
@@ -893,6 +957,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         if out_text.chars().count() > RUN_OUTPUT_CAP {
             out_text = out_text.chars().take(RUN_OUTPUT_CAP).collect();
         }
+        eprintln!(
+            "[schedule] run {run_id} for '{sid}' finished: done, {} chars",
+            out_text.chars().count()
+        );
         save_run(
             data_root,
             &json!({
@@ -1000,12 +1068,23 @@ pub fn start_loop(data_root: std::path::PathBuf) {
         rt.block_on(async move {
             // Small initial delay so startup can finish.
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let orphans = mark_orphaned_running(&data_root);
+            // (Re)start: no run of THIS process exists yet, so EVERY stored
+            // "running" row is a leftover of a dead one. Close all of them —
+            // the old check only caught runs older than an hour, so rows left
+            // by a crash minutes ago spun the schedule page AND the inbox for
+            // the rest of that hour.
+            let orphans = mark_orphaned_running(&data_root, 0.0);
             if orphans > 0 {
                 println!("[scheduler] closed {orphans} orphaned running runs");
             }
             loop {
                 let _ = run_due_schedules(&data_root).await;
+                // A run outliving ORPHAN_AFTER_SECS is a hung agent loop, not
+                // a long job — settle its row too, or its spinner never stops.
+                let hung = mark_orphaned_running(&data_root, ORPHAN_AFTER_SECS);
+                if hung > 0 {
+                    println!("[scheduler] closed {hung} hung running runs");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
             }
         });
@@ -1017,6 +1096,34 @@ pub fn start_loop(data_root: std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_sweep_min_age_zero_closes_fresh_running_rows() {
+        let tmp = std::env::temp_dir().join(format!("sched-orphan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        save_run(
+            &tmp,
+            &json!({"id": "run-orph-1", "schedule_id": "sch-x", "status": "running",
+                    "output": "", "started_at": now_secs()}),
+        );
+        save_run(
+            &tmp,
+            &json!({"id": "run-orph-2", "schedule_id": "sch-x", "status": "done",
+                    "output": "", "started_at": now_secs()}),
+        );
+        // A live long job is never touched by the periodic sweep.
+        assert_eq!(mark_orphaned_running(&tmp, ORPHAN_AFTER_SECS), 0);
+        // Startup sweep: the fresh "running" row is leftovers of a dead
+        // process — closed even though it is seconds old.
+        assert_eq!(mark_orphaned_running(&tmp, 0.0), 1);
+        let rows = list_runs(&tmp, "", 10);
+        let run = rows.iter().find(|r| r["id"] == "run-orph-1").unwrap();
+        assert_eq!(run["status"], "error");
+        assert_eq!(run["error"], "interrupted (app restarted)");
+        // Settled rows are never re-touched.
+        assert_eq!(mark_orphaned_running(&tmp, 0.0), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn cron_next_run_matches_python_semantics() {

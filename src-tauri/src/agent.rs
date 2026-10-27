@@ -1357,6 +1357,13 @@ pub struct AgentRequest {
     /// any headless caller omit it and get the mode's table row instead.
     #[serde(default)]
     pub cap: Option<ToolCaps>,
+    /// True when the caller is headless (the scheduler): there is no SSE client
+    /// to receive the `Error`/`Done` event protocol, so a mid-turn provider
+    /// error must come back as `Err` — the caller records the run and walks its
+    /// own fallback chain. With the interactive protocol's swallow-as-Ok this
+    /// caller saw a "successful" turn whose text was just the narration so far.
+    #[serde(default)]
+    pub headless: bool,
 }
 
 fn default_mode() -> String {
@@ -1651,6 +1658,9 @@ impl AgentRequest {
             // A research sub-agent has no mutating tool at all, so it runs with
             // the parent's capabilities unchanged.
             cap: self.cap.clone(),
+            // A headless parent (the scheduler) keeps a headless sub-agent: a
+            // mid-turn stream error must surface to the ladder as Err there too.
+            headless: self.headless,
         }
     }
 }
@@ -4418,7 +4428,7 @@ pub async fn run_turn(
         .await
         {
             Ok(acc) => acc,
-            Err((_, e)) => {
+            Err((status, e)) => {
                 // Stop is not a provider failure: stream_chat reports it as
                 // "aborted by user". Surfacing that as an error stacked a bogus
                 // error banner on a deliberate cancel (and, inside explore, read as
@@ -4451,14 +4461,40 @@ the Vision model's description instead.\n"
                         continue;
                     }
                 }
-                emit(&AgentEvent::Error {
-                    content: name_the_provider_in_error(
-                        e,
-                        &req.providers,
-                        &req.provider_id,
-                        &req.provider,
-                    ),
-                });
+                // stream_chat reports the HTTP status and the raw body as a
+                // tuple; run_turn used to throw the status away. Prefix it back
+                // on (under the `{kind} ` convention so the provider-label
+                // rewrite below still applies): "HTTP 429" is the difference
+                // between "come back later" and a broken model, and an empty
+                // body on its own made the whole error read as an empty string.
+                let body = if status > 0 && !e.is_empty() {
+                    format!("{} upstream HTTP {status}: {e}", req.provider)
+                } else if status > 0 {
+                    format!("{} upstream HTTP {status} (empty body)", req.provider)
+                } else {
+                    e
+                };
+                let named = name_the_provider_in_error(
+                    body,
+                    &req.providers,
+                    &req.provider_id,
+                    &req.provider,
+                );
+                // Log EVERY mid-turn stream failure to stderr (rust.log). This
+                // path used to be completely silent for the scheduler: the error
+                // was folded into `Ok(())` below and a half-finished turn was
+                // recorded as a successful run whose "final answer" was the
+                // first narration message, with nothing anywhere saying why the
+                // rest of the turn never happened.
+                eprintln!("[turn-end] chat={} step={} stream error: {named}", req.chat_id, step + 1);
+                if req.headless {
+                    // A headless caller (the scheduler) has no SSE client to
+                    // receive the Error/Done protocol: it records the run and
+                    // walks its own fallback chain, so the failure must come
+                    // back as `Err` or it is invisible.
+                    return Err(named);
+                }
+                emit(&AgentEvent::Error { content: named });
                 // Terminal `done` after the error: the event protocol requires
                 // it (the client treats an EOF without `done` as a dropped
                 // connection). Without it the stream ended silently and the UI
@@ -8536,6 +8572,10 @@ async fn run_subagent(
         images: Vec::new(),
         // A sub-agent inherits the parent's auto-fetch count.
         web_search_auto_fetch: parent.web_search_auto_fetch,
+        // …and the headless contract: a scheduled run's explore must also
+        // surface a mid-turn stream error instead of ending "successfully"
+        // with a partial report (the parent's ladder handles Err already).
+        headless: parent.headless,
         // …and its capabilities: a read-only parent must not become writable
         // just because it handed the work to a sub-agent.
         cap: parent.cap.clone(),
@@ -12286,6 +12326,8 @@ mod tests {
             web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
             // No renderer to send a table: derive it from the mode instead.
             cap: None,
+            // Tests exercise the interactive protocol (Error/Done events).
+            headless: false,
         }
     }
 
@@ -13021,6 +13063,108 @@ mod tests {
             }
         });
         bodies
+    }
+
+    /// A mock upstream that answers every call with an HTTP error status — the
+    /// provider-side failure the stream path must surface, never swallow.
+    async fn spawn_failing_mock_upstream(status: u16, reason: &str) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = json!({"error": {"message": reason}}).to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut tmp = [0u8; 4096];
+                    // Read the request head (best effort) so the client sees a
+                    // clean response, then answer with the failure.
+                    let _ = sock.read(&mut tmp).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn headless_turn_surfaces_a_provider_error_as_err() {
+        // THE SCHEDULE CONTRACT. A headless run_turn (the scheduler) must hand a
+        // mid-turn provider error back as Err — the old interactive swallow-as-Ok
+        // made the scheduler record a half-finished turn as a successful run
+        // whose "final answer" was the first narration message.
+        let base = spawn_failing_mock_upstream(500, "upstream exploded").await;
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/schedule-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-headless-error",
+            "mode": "build",
+            "prompt": "run the pipeline",
+            "history": [],
+            "chat_id": "schedule-sch-test",
+            "headless": true,
+            "data_root": "/tmp/codifa-headless-error-data"
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let res = run_turn(&req, &mut |_e: &AgentEvent| {}, &cancel).await;
+        let err = res.expect_err("a headless turn must return the provider error as Err");
+        assert!(
+            err.contains("upstream HTTP 500") && err.contains("upstream exploded"),
+            "the error must name the status and the body: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_turn_still_reports_a_provider_error_as_events() {
+        // The interactive protocol is unchanged: Error event + terminal done,
+        // then Ok(()) — the SSE client renders the banner, not a dropped stream.
+        let base = spawn_failing_mock_upstream(500, "upstream exploded").await;
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/interactive-model",
+            "base_url": format!("{base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-interactive-error",
+            "mode": "build",
+            "prompt": "run the pipeline",
+            "history": [],
+            "chat_id": "chat-interactive-test",
+            "data_root": "/tmp/codifa-interactive-error-data"
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let mut emit = move |e: &AgentEvent| ev.lock().unwrap().push(e.to_json());
+        let res = run_turn(&req, &mut emit, &cancel).await;
+        res.expect("the interactive protocol still ends Ok after an error event");
+        let evs = events.lock().unwrap().clone();
+        assert!(
+            evs.iter().any(|e| {
+                e["kind"] == "error"
+                    && e["content"].as_str().is_some_and(|c| {
+                        c.contains("upstream HTTP 500") && c.contains("upstream exploded")
+                    })
+            }),
+            "an Error event with the real provider error must be emitted: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| e["kind"] == "done"),
+            "a terminal done must follow the error: {evs:?}"
+        );
     }
 
     /// A mock upstream that answers BOTH shapes a turn needs: streaming SSE for

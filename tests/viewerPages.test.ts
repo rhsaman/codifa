@@ -80,6 +80,11 @@ const coder = new Proxy(
 }
 
 const { shownViewerTabId, useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs } = await import('../src/lib/viewerTabs')
+const { workspaceKey } = await import('../src/lib/store')
+
+// One shared fallback workspace for the hand-made chat ids in this file.
+const WS = workspaceKey('')
+const scopeC1 = { wsKey: WS, chatId: 'c1' }
 
 console.log('1) the schedule kind survives a restart, unknown kinds do not:')
 {
@@ -102,8 +107,8 @@ console.log('2) id, title and visibility follow the shared rules:')
     viewerTabTitle({ kind: 'schedule', title: 'whatever' }),
   )
   const tabs = useViewerTabs.getState().tabs
-  check('the schedule page is visible in every chat', visibleTabs(tabs, 'c1').some((t) => t.kind === 'schedule'))
-  check('…including one with no tabs of its own', visibleTabs(tabs, 'zzz').some((t) => t.kind === 'schedule'))
+  check('the schedule page is visible in every chat', visibleTabs(tabs, scopeC1).some((t) => t.kind === 'schedule'))
+  check('…including one with no tabs of its own', visibleTabs(tabs, { wsKey: WS, chatId: 'zzz' }).some((t) => t.kind === 'schedule'))
 }
 
 console.log('3) openSchedule creates exactly one tab and reveals the pane:')
@@ -129,15 +134,20 @@ console.log('3) openSchedule creates exactly one tab and reveals the pane:')
   check('the page needs no panel mode', !('panelMode' in again))
 }
 
-console.log('4) the "+" menu is the single entry point, and every page is a tab:')
+console.log('4) the "+" menu opens only Browser/Trace; the dock owns the pages:')
 {
   const barSrc = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
   check('the "+" menu exists', barSrc.includes('export function ViewerAddButton'))
-  check('it is mounted in the rail', readFileSync('src/App.tsx', 'utf8').includes('<ViewerAddButton />'))
-  // Every page the menu offers must be a REAL tab kind, so the row it lands on
-  // can be closed: the eight fixed icons are gone, nothing is icon-owned.
-  for (const kind of ['files', 'todos', 'artifacts', 'review', 'trace', 'browser', 'schedule', 'inbox']) {
+  check('it is mounted in the strip', readFileSync('src/App.tsx', 'utf8').includes('<ViewerAddButton />'))
+  check('the dock is mounted in the pane', readFileSync('src/App.tsx', 'utf8').includes('<ViewerDockBar />'))
+  // The menu offers ONLY the chat-owned pages (they are real tabs, closable
+  // from their row); the dock's fixed icons open every other page.
+  for (const kind of ['trace', 'browser']) {
     check(`the menu can open the ${kind} page`, barSrc.includes(`key: "${kind}"`), kind)
+  }
+  const dockSrc = barSrc
+  for (const kind of ['files', 'todos', 'artifacts', 'review', 'schedule', 'inbox', 'terminal']) {
+    check(`the dock opens the ${kind} page`, dockSrc.includes(`kind: "${kind}"`), kind)
   }
   // No page owns a fixed icon any more: those buttons are gone from the file.
   for (const btn of [
@@ -152,11 +162,11 @@ console.log('4) the "+" menu is the single entry point, and every page is a tab:
   ]) {
     check(`${btn} is gone`, !barSrc.includes(`export function ${btn}`), btn)
   }
-  // Every visible tab is a row now — pages included — so each one has a ✕.
-  // Terminals fold into ONE row; the pane body's chip strip is the real list.
+  // The strip draws its rows from viewerTabRows (tab kinds only — dock pages
+  // never appear there).
   check(
-    'the rail draws rows from viewerTabRows',
-    /const tabs = viewerTabRows\(allTabs, activeChatId, activeId\)/.test(barSrc),
+    'the strip draws rows from viewerTabRows',
+    /const tabs = viewerTabRows\(allTabs, scope, activeId\)/.test(barSrc),
     barSrc.slice(0, 0),
   )
 }
@@ -234,23 +244,23 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
   })
   const tabs: any[] = [tab('files:c1', 'files', { chatId: 'c1' }), tab('inbox', 'inbox')]
 
-  check('the active tab is the shown one', shownViewerTabId(tabs, 'inbox', 'c1') === 'inbox')
+  check('the active tab is the shown one', shownViewerTabId(tabs, 'inbox', scopeC1) === 'inbox')
   check(
     'an open tab that is not active is NOT shown',
-    shownViewerTabId(tabs, 'inbox', 'c1') !== 'files:c1',
+    shownViewerTabId(tabs, 'inbox', scopeC1) !== 'files:c1',
   )
   check(
     'promoting the open tab makes it the shown one',
-    shownViewerTabId(tabs, 'files:c1', 'c1') === 'files:c1',
+    shownViewerTabId(tabs, 'files:c1', scopeC1) === 'files:c1',
   )
-  check('an empty pane shows no page', shownViewerTabId([], null, 'c1') === null)
+  check('an empty pane shows no page', shownViewerTabId([], null, scopeC1) === null)
   check(
     'a stale activeId falls back to the first visible tab',
-    shownViewerTabId(tabs, 'gone', 'c1') === 'files:c1',
+    shownViewerTabId(tabs, 'gone', scopeC1) === 'files:c1',
   )
   check(
     "another chat's tab is not the shown one",
-    shownViewerTabId([tab('review:c2', 'review', { chatId: 'c2' })], 'review:c2', 'c1') === null,
+    shownViewerTabId([tab('review:c2', 'review', { chatId: 'c2' })], 'review:c2', scopeC1) === null,
   )
 
   // …and the rail really consumes that rule: the shown tab is the one the pane
@@ -259,7 +269,7 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
   const barSrc = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
   check(
     'the highlighted row comes from the shared "shown tab" rule',
-    barSrc.includes('shownViewerTabId(allTabs, activeId, activeChatId)'),
+    barSrc.includes('shownViewerTabId(allTabs, activeId, scope)'),
   )
   check('rows are drawn from every visible tab', barSrc.includes('viewerTabRows('))
   check(

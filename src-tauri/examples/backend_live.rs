@@ -15,6 +15,11 @@
 //! `--mock-provider`: also spawn a local OpenAI-compatible upstream and write
 //! a settings.json providing it, so `POST /schedules/:id/run` executes a REAL
 //! agent turn against a fixed completion — no network, no API key, no cost.
+//!
+//! `--scheduler`: ALSO start the real scheduler loop (start_loop). Off by
+//! default — cron must not fire tasks behind the test's back — but the
+//! startup orphan sweep and the due loop are exactly what a UI test needs to
+//! exercise, so the flag opts in.
 
 use std::path::PathBuf;
 
@@ -100,15 +105,37 @@ async fn main() {
                             );
                         }
                     }
+                    // Optional artificial latency: a live UI test holds the run
+                    // in `running` while it navigates away and back (remount
+                    // paths). Off by default.
+                    if let Ok(ms) = std::env::var("MOCK_UPSTREAM_DELAY_MS") {
+                        if let Ok(d) = ms.trim().parse::<u64>() {
+                            tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+                        }
+                    }
                     // The agent's `custom` kind asks for SSE (`stream: true`):
                     // answer with the same delta frames the real gateways send.
-                    let sse = concat!(
-                        r#"data: {"choices":[{"delta":{"content":"mock schedule run completed successfully"}}]}"#,
-                        "\n\n",
-                        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":21,"completion_tokens":7}}"#,
-                        "\n\n",
-                        "data: [DONE]\n\n"
-                    );
+                    // A prompt asking for web research instead gets a REAL
+                    // `web_search` tool call frame, so a live test can walk the
+                    // engine chain (Settings → Plugins) end to end.
+                    let wants_search = String::from_utf8_lossy(&buf).contains("Research AI news");
+                    let sse = if wants_search {
+                        concat!(
+                            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"ai news\",\"max\":3}"}}]}}]}"#,
+                            "\n\n",
+                            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                            "\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                    } else {
+                        concat!(
+                            r#"data: {"choices":[{"delta":{"content":"mock schedule run completed successfully"}}]}"#,
+                            "\n\n",
+                            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":21,"completion_tokens":7}}"#,
+                            "\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                    };
                     let mut resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
                         sse.len()
@@ -130,7 +157,15 @@ async fn main() {
                 "model": "mock-model",
                 "baseUrl": base,
                 "apiKey": "mock-key",
-            }]
+            }],
+            // The engine chain a scheduled run must inherit (Settings →
+            // Plugins): tavily primary + duckduckgo fallback, mirroring the
+            // real renderer's default so a web_search tool call walks this
+            // chain inside the run.
+            "searchPlugins": [
+                { "kind": "tavily", "label": "Tavily", "enabled": true, "order": 0, "apiKey": "tvly-mock-key" },
+                { "kind": "duckduckgo", "label": "DuckDuckGo", "enabled": true, "order": 1 }
+            ]
         });
         std::fs::write(
             root.join("settings.json"),
@@ -145,7 +180,11 @@ async fn main() {
     let port = listener.local_addr().expect("local addr").port();
     println!("PORT={port}");
 
-    let state = codifa::backend_light::new_state(root);
+    let state = codifa::backend_light::new_state(root.clone());
+    // Opt-in: the real scheduler loop (startup orphan sweep + cron ticks).
+    if std::env::args().any(|a| a == "--scheduler") {
+        codifa::scheduler::start_loop(root);
+    }
     axum::serve(listener, codifa::backend_light::router(state))
         .await
         .expect("serve");

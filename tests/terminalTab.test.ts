@@ -2,8 +2,9 @@
 //
 // What this locks, now that the old "dock the terminal into the pane" mode is
 // gone (the pane hosts ordinary tabs instead):
-//   * a terminal tab is an ORDINARY viewer tab — chat-scoped, closable,
-//     reorderable — so the pane's tab machinery treats it like any other;
+//   * a terminal tab is an ORDINARY viewer tab — workspace-scoped, closable —
+//     so the pane's tab machinery treats it like any other page; it is a DOCK
+//     page, so the top strip (viewerTabRows) never lists it;
 //   * the run target (program + argv) is part of the tab ID, so asking for the
 //     same file again FOCUSES that tab instead of paying for a second Neovim;
 //   * a terminal tab is NEVER persisted: restoring one would spawn a shell (or
@@ -38,8 +39,15 @@
 }
 
 const { useViewerTabs, viewerTabId, visibleTabs, viewerTabTitle, viewerTabRows, registerViewerTabCloseHook } = await import('../src/lib/viewerTabs')
-const { clampTerminalHeight, DEFAULT_TERMINAL_HEIGHT, MIN_TERMINAL_HEIGHT } = await import('../src/lib/store')
+const { clampTerminalHeight, DEFAULT_TERMINAL_HEIGHT, MIN_TERMINAL_HEIGHT, workspaceKey } = await import('../src/lib/store')
 const { NVIM_PROGRAM, nvimArgs, runTargetKey } = await import('../src/lib/nvimEdit')
+
+// The hand-made chat ids below have no chat rows in the store, so every
+// terminal resolves to the fallback workspace ("__none__") — one scope for
+// the whole file.
+const WS = workspaceKey('')
+const scopeC1 = { wsKey: WS, chatId: 'c1' }
+const scopeC2 = { wsKey: WS, chatId: 'c2' }
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown): void {
@@ -53,7 +61,7 @@ function check(name: string, cond: boolean, extra?: unknown): void {
 
 const vt = () => useViewerTabs.getState()
 
-console.log('1) a terminal tab is an ORDINARY, chat-scoped tab:')
+console.log('1) a terminal tab is an ORDINARY, workspace-scoped tab:')
 {
   useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
   vt().openTerminal({ chatId: 'c1', cwd: '/w' })
@@ -61,16 +69,16 @@ console.log('1) a terminal tab is an ORDINARY, chat-scoped tab:')
   check('exactly one tab was opened', tabs.length === 1, tabs)
   check('its kind is terminal', tabs[0]?.kind === 'terminal', tabs[0])
   check('it carries its chat', tabs[0]?.chatId === 'c1', tabs[0])
+  check('it carries its workspace (the pty belongs to the workspace)', tabs[0]?.wsKey === WS, tabs[0])
   check('it carries its cwd for the pty', tabs[0]?.terminalCwd === '/w', tabs[0])
   check('a bare terminal asks for NO program (a login shell runs)', !tabs[0]?.terminalProgram, tabs[0])
   check('it becomes the active tab', vt().activeId === tabs[0]?.id)
   check('opening it reveals the pane', vt().paneOpen === true)
-  // NOT chat-scoped like a file tab: the tab owns a LIVE pty, so hiding it
-  // with the chat that spawned it stranded a running shell — and because
-  // `active` then resolved to null, the pane fell back to the todos page and
-  // looked like a blank terminal.
-  check('it is visible in its own chat', visibleTabs(tabs, 'c1').length === 1)
-  check('and still visible in another chat (its pty is alive)', visibleTabs(tabs, 'c2').length === 1)
+  // Workspace-scoped: every chat of the workspace sees the terminal (its pty
+  // keeps running); only a WORKSPACE switch hides the row — the pty itself
+  // survives that, like any other hidden tab.
+  check('it is visible in its own chat', visibleTabs(tabs, scopeC1).length === 1)
+  check('and still visible in another chat of the same workspace (its pty is alive)', visibleTabs(tabs, scopeC2).length === 1)
 }
 
 console.log('2) the run target is the tab IDENTITY — same file focuses, not duplicates:')
@@ -92,8 +100,8 @@ console.log('2) the run target is the tab IDENTITY — same file focuses, not du
   // A different LINE is a different target, so it gets its own tab.
   vt().openTerminal({ chatId: 'c1', cwd: '/w', program: NVIM_PROGRAM, args: nvimArgs('/w/a.ts', 7) })
   check('another line is a second target', vt().tabs.length === 2, vt().tabs.map((t) => t.id))
-  const idA = viewerTabId('terminal', 'c1', runTargetKey([NVIM_PROGRAM, ...args]))
-  check('the id encodes program + argv', vt().tabs.some((t) => t.id === idA), idA)
+  const idA = viewerTabId('terminal', WS, runTargetKey([NVIM_PROGRAM, ...args]))
+  check('the id encodes workspace + program + argv', vt().tabs.some((t) => t.id === idA), idA)
 }
 
 console.log('2b) the SAME file in another chat reuses the running editor:')
@@ -136,8 +144,9 @@ console.log('4) the rail can tell two terminal tabs apart:')
   check('a titled tab keeps its own title', viewerTabTitle(editor) === 'nvim — a.ts')
 }
 
-console.log('6) MANY terminal tabs collapse into ONE rail row (the strip inside the')
-console.log('   pane is the real shell list — the rail must not list them twice):')
+console.log('6) terminals are DOCK pages — the top strip never lists them:')
+console.log('   (the chip strip inside the panel is the real shell list; the dock')
+console.log('   icon toggles the terminal, so strip rows would double it up)')
 {
   useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
   const st = useViewerTabs.getState()
@@ -150,23 +159,16 @@ console.log('   pane is the real shell list — the rail must not list them twic
 
   const activeTerm = tabs.find((t) => t.kind === 'terminal')!.id
   useViewerTabs.setState({ activeId: activeTerm })
-  const rows = viewerTabRows(tabs, 'c1', activeTerm)
-  check('ONE terminal row in the rail', rows.filter((t) => t.kind === 'terminal').length === 1, rows.map((t) => t.id))
-  check('non-terminal rows survive the fold', rows.some((t) => t.kind === 'file'), rows.map((t) => t.kind))
-  check('the row is the ACTIVE terminal (the pane paints it)', rows.find((t) => t.kind === 'terminal')?.id === activeTerm)
+  const rows = viewerTabRows(tabs, scopeC1, activeTerm)
+  check('NO terminal row in the strip (the dock owns it)', rows.every((t) => t.kind !== 'terminal'), rows.map((t) => t.id))
+  check('tab rows (files/browser/trace/…) survive', rows.some((t) => t.kind === 'file'), rows.map((t) => t.kind))
 
-  // Switching to another shell moves the highlight, never multiplies rows.
+  // Switching shells changes which terminal the pane paints — the strip is
+  // untouched either way.
   const secondTerm = tabs.filter((t) => t.kind === 'terminal')[1].id
   useViewerTabs.setState({ activeId: secondTerm })
-  const rows2 = viewerTabRows(tabs, 'c1', secondTerm)
-  check('still ONE terminal row after switching shells', rows2.filter((t) => t.kind === 'terminal').length === 1)
-  check('the representative follows the newly active shell', rows2.find((t) => t.kind === 'terminal')?.id === secondTerm)
-
-  // Collapsing must not eat the row when only one terminal exists — a single
-  // shell still needs its rail row (closing / focusing lives there too).
-  useViewerTabs.setState({ tabs: tabs.filter((t) => t.id === activeTerm), activeId: activeTerm })
-  const single = viewerTabRows(useViewerTabs.getState().tabs, 'c1', activeTerm)
-  check('a single terminal keeps its row', single.length === 1 && single[0].kind === 'terminal', single)
+  const rows2 = viewerTabRows(tabs, scopeC1, secondTerm)
+  check('still no terminal row after switching shells', rows2.every((t) => t.kind !== 'terminal'))
   useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
 }
 
@@ -188,7 +190,7 @@ console.log('7) capping tabs never leaks a session (and never resurrects one):')
   // must be closed at that moment — capping is otherwise a silent leak.
   const closed: string[] = []
   registerViewerTabCloseHook((id) => {
-    if (id.startsWith('terminal::')) closed.push(id)
+    if (id.startsWith('terminal:')) closed.push(id)
   })
   useViewerTabs.setState({ tabs: [], activeId: null, closedTabs: [] })
   // More tabs than TOTAL_TAB_CAP (30). Distinct run targets, because a terminal

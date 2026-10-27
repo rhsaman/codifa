@@ -240,6 +240,14 @@ pub fn terminal_create(
     program: Option<String>,
     args: Option<Vec<String>>,
     shell: Option<String>,
+    // Session id requested by the renderer. The pty emits from the reader
+    // thread the instant it spawns — before `terminal_create` can ANSWER — so
+    // the renderer cannot route that early output unless the id is known to it
+    // BEFORE the spawn. A tab derives a stable id (`<tabId>#pty`), so every
+    // early `terminal:data` event already carries the name the tab's screen
+    // listens for. None = the old behaviour (a fresh uuid) — the bottom panel
+    // and any other caller that does not pass an id keep working unchanged.
+    requested_id: Option<String>,
 ) -> Result<TerminalSessionInfo, String> {
     let cwd = valid_cwd(cwd);
     let (file, argv) = match program.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
@@ -310,7 +318,11 @@ pub fn terminal_create(
         .map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = requested_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let info = TerminalSessionInfo {
         id: id.clone(),
         shell: PathBuf::from(&file)
@@ -383,9 +395,14 @@ pub fn terminal_create(
                             }
                         }
                     }
-                    if emit_len > 0 {
-                        let data = String::from_utf8_lossy(&pending[..emit_len]).into_owned();
-                        pending.drain(..emit_len);
+                    // A colon SGR can straddle two reads: hold back a trailing,
+                    // still-unfinished CSI so the rewrite below always sees the
+                    // WHOLE sequence.
+                    let safe = emit_safe_len(&pending[..emit_len]);
+                    if safe > 0 {
+                        let cleaned = sanitize_colon_sgr(&pending[..safe]);
+                        pending.drain(..safe);
+                        let data = String::from_utf8_lossy(&cleaned).into_owned();
                         let _ = reader_app.emit("terminal:data", (reader_id.clone(), data));
                     }
                 }
@@ -418,6 +435,88 @@ pub fn terminal_create(
     });
 
     Ok(info)
+}
+
+/// Longest prefix of `data` that may be emitted right now: a trailing,
+/// unfinished CSI (`ESC[` followed by only parameter bytes, no final byte yet)
+/// is held back so the colon rewrite below always sees the WHOLE sequence. Only
+/// a CSI is ever held — string sequences (OSC/DCS) may want many more bytes and
+/// stream through safely; xterm.js re-assembles those itself.
+fn emit_safe_len(data: &[u8]) -> usize {
+    for i in (0..data.len()).rev() {
+        if data[i] == 0x1b {
+            let rest = &data[i..];
+            if rest.len() < 2 {
+                return i; // a bare trailing ESC — could still become a CSI
+            }
+            if rest[1] == b'[' {
+                let ends = rest[2..]
+                    .iter()
+                    .position(|&b| !(0x20..=0x3f).contains(&b))
+                    .map_or(rest.len(), |p| p + 2);
+                if ends == rest.len() {
+                    return i; // parameters so far, no final byte yet
+                }
+            }
+            return data.len();
+        }
+    }
+    data.len()
+}
+
+/// Rewrite iTerm2-style colon SGR truecolour into the semicolon form xterm.js
+/// parses: `ESC[38:2:R:G:B m` → `ESC[38;2;R;G;B m` (same for 48). xterm.js
+/// reads the colon form as the colourspace-first encoding (38:2:<cs>:R:G:B),
+/// shifting every channel — colour (25,23,36) painted as (23,36,0): the olive
+/// background and yellow text of the nvim screen. `TERM_PROGRAM` is forced at
+/// spawn so nvim never picks that encoding, but the value can leak back in
+/// (ssh, tmux, an rc file, a binary launched from iTerm), so this reader-level
+/// rewrite is the real guard: it is independent of the environment.
+fn sanitize_colon_sgr(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let start = i + 2;
+            let mut end = start;
+            while end < data.len() && (0x20..=0x3f).contains(&data[end]) {
+                end += 1;
+            }
+            if end < data.len() && data[end] == b'm' && start < end {
+                out.extend_from_slice(b"\x1b[");
+                let mut first = true;
+                for part in data[start..end].split(|&b| b == b';') {
+                    if !first {
+                        out.push(b';');
+                    }
+                    first = false;
+                    // 38:2:R:G:B (5 colon subparams, direct colour) is the one
+                    // form xterm.js misreads; the colourspace-carrying
+                    // 6-subparam form and everything else pass through.
+                    let subs: Vec<&[u8]> = part.split(|&b| b == b':').collect();
+                    let direct = subs.len() == 5
+                        && (subs[0] == b"38" || subs[0] == b"48")
+                        && subs[1] == b"2"
+                        && subs[2..].iter().all(|p| {
+                            !p.is_empty() && p.len() <= 3 && p.iter().all(|b| b.is_ascii_digit())
+                        });
+                    if direct {
+                        for &b in part {
+                            out.push(if b == b':' { b';' } else { b });
+                        }
+                    } else {
+                        out.extend_from_slice(part);
+                    }
+                }
+                out.push(b'm');
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
 }
 
 #[tauri::command]
@@ -526,6 +625,64 @@ pub fn kill_all_terminal_sessions(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colon_truecolor_sgr_is_rewritten_to_semicolons() {
+        // The exact bytes captured from nvim under TERM_PROGRAM=iTerm.app.
+        assert_eq!(
+            sanitize_colon_sgr(b"\x1b[38:2:224:222:244m"),
+            b"\x1b[38;2;224;222;244m".to_vec()
+        );
+        assert_eq!(
+            sanitize_colon_sgr(b"x\x1b[48:2:25:23:36m y"),
+            b"x\x1b[48;2;25;23;36m y".to_vec()
+        );
+        // A leading plain parameter must survive the flattening.
+        assert_eq!(
+            sanitize_colon_sgr(b"\x1b[0;38:2:110:106:134m"),
+            b"\x1b[0;38;2;110;106;134m".to_vec()
+        );
+    }
+
+    #[test]
+    fn other_sequences_pass_through_untouched() {
+        // The colourspace-carrying form xterm.js parses correctly.
+        assert_eq!(
+            sanitize_colon_sgr(b"\x1b[38:2:0:224:222:244m"),
+            b"\x1b[38:2:0:224:222:244m".to_vec()
+        );
+        // Underline colon SGR / a shorter colon parameter / a wrong colour id.
+        assert_eq!(
+            sanitize_colon_sgr(b"\x1b[58:2:1:2:3m"),
+            b"\x1b[58:2:1:2:3m".to_vec()
+        );
+        assert_eq!(
+            sanitize_colon_sgr(b"\x1b[38;2;1:2m z"),
+            b"\x1b[38;2;1:2m z".to_vec()
+        );
+        // Plain payload and non-SGR CSI.
+        assert_eq!(
+            sanitize_colon_sgr(b"hi\x1b[2K\x1b[1;5Hthere"),
+            b"hi\x1b[2K\x1b[1;5Hthere".to_vec()
+        );
+    }
+
+    #[test]
+    fn an_unfinished_csi_at_the_tail_is_held_back() {
+        assert_eq!(emit_safe_len(b"\x1b[38:2:110"), 0);
+        assert_eq!(emit_safe_len(b"\x1b[38"), 0);
+        assert_eq!(emit_safe_len(b"prep \x1b["), 5);
+        assert_eq!(emit_safe_len(b"pre\x1b[38:2:"), 3);
+        // A COMPLETE sequence — even colon-formed — is never held.
+        let done = b"\x1b[38:2:110;1m rest";
+        assert_eq!(emit_safe_len(done), done.len());
+        // Text around escapes survives: only the ESC tail is held.
+        assert_eq!(emit_safe_len(b"ab\x1b"), 2);
+        // String sequences (OSC) stream through even when unterminated.
+        let osc = b"a\x1b]0;title";
+        assert_eq!(emit_safe_len(osc), osc.len());
+        assert_eq!(emit_safe_len(b"\x1b[m"), 3);
+    }
 
     #[test]
     fn only_a_path_separator_makes_a_program_a_path() {

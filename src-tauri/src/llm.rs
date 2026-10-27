@@ -1369,7 +1369,11 @@ pub async fn stream_chat(
                 last_err = format!("key rejected ({status}): {body}");
                 continue;
             }
-            Err((_, body)) => return Err((0, body)),
+            // Keep the real status: the headless caller (the scheduler) prefixes
+            // "upstream HTTP {status}" onto the body so the run record names the
+            // failure. Zeroing it here made a 429/500 indistinguishable from a
+            // transport drop.
+            Err((status, body)) => return Err((status, body)),
         }
     }
     Err((0, last_err))

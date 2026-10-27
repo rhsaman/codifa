@@ -175,6 +175,19 @@ pub fn decrypt_at_rest(value: &str) -> String {
 /// backend path that reads that file directly (the scheduler) must decrypt it
 /// first — otherwise the "key" it sends is the `enc:v1:` ciphertext.
 pub fn decrypt_provider_secrets(doc: &mut serde_json::Value) {
+    // The renderer encrypts the engine keys too (Tavily under searchPlugins),
+    // so a headless reader that skips them would send the `enc:v1:` ciphertext
+    // as the bearer token and every engine key would "fail" upstream.
+    if let Some(plugins) = doc.get_mut("searchPlugins").and_then(|p| p.as_array_mut()) {
+        for p in plugins {
+            if let Some(s) = p.get("apiKey").and_then(|k| k.as_str()) {
+                let plain = decrypt_at_rest(s);
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("apiKey".into(), serde_json::Value::String(plain));
+                }
+            }
+        }
+    }
     let Some(providers) = doc.get_mut("providers").and_then(|p| p.as_array_mut()) else {
         return;
     };
@@ -193,5 +206,59 @@ pub fn decrypt_provider_secrets(doc: &mut serde_json::Value) {
                 obj.insert("apiKey".into(), serde_json::Value::String(plain));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scheduler reads settings.json directly, so the ENGINE keys (Tavily
+    /// under `searchPlugins`) must decrypt alongside the provider ones — a
+    /// ciphertext sent as the bearer token only produces an opaque 401.
+    #[test]
+    fn decrypts_search_plugin_keys() {
+        // Prime the process-global key with a fixed test key (no AppHandle in
+        // tests) — exactly the state the GUI setup hook installs.
+        *CACHED_KEY.lock().unwrap() = Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32]));
+
+        // Encrypt the way the renderer (secrets.ts) does: fresh 12-byte nonce,
+        // AES-256-GCM, `enc:v1:<b64 iv>.<b64 ct+tag>`.
+        let encrypt = |plain: &str| {
+            use aes_gcm::aead::{Aead, KeyInit};
+            use rand::RngCore;
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(CACHED_KEY.lock().unwrap().as_deref().unwrap())
+                .unwrap();
+            let mut iv = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut iv);
+            let ct = Aes256Gcm::new_from_slice(&key)
+                .unwrap()
+                .encrypt(Nonce::from_slice(&iv), plain.as_bytes())
+                .unwrap();
+            format!(
+                "{PREFIX_ENC}{}.{}",
+                base64::engine::general_purpose::STANDARD.encode(iv),
+                base64::engine::general_purpose::STANDARD.encode(ct)
+            )
+        };
+
+        let mut doc = serde_json::json!({
+            "searchPlugins": [
+                { "kind": "tavily", "enabled": true, "order": 0, "apiKey": encrypt("tvly-test-key") },
+                { "kind": "duckduckgo", "enabled": true, "order": 1 }
+            ],
+            "providers": [
+                { "id": "p1", "apiKey": encrypt("sk-test") }
+            ]
+        });
+        decrypt_provider_secrets(&mut doc);
+
+        let plugins = doc["searchPlugins"].as_array().unwrap();
+        assert_eq!(plugins[0]["apiKey"], "tvly-test-key");
+        // A plugin without a key stays keyless (no phantom empty string).
+        assert!(plugins[1].get("apiKey").is_none());
+        // The provider path still decrypts — existing behaviour intact.
+        assert_eq!(doc["providers"][0]["apiKey"], "sk-test");
     }
 }

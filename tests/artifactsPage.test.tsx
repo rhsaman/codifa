@@ -87,8 +87,8 @@ console.log('1) the kind is a global page opened as an ordinary tab:')
 {
   const kind = 'artifacts' as const
   check(
-    'it is drawn as a normal rail row (so it can be closed)',
-    viewerTabRows([{ kind, id: kind, title: 'Artifacts', createdAt: 1 } as any], 'c1').length === 1,
+    'it is a DOCK page, never a strip row (the dock icon owns it)',
+    viewerTabRows([{ kind, id: kind, title: 'Artifacts', createdAt: 1 } as any], { wsKey: 'w', chatId: 'c1' }).length === 0,
   )
   check(
     'its tab shows the page label',
@@ -162,12 +162,15 @@ console.log('5) a missing backend is an error, not a crash:')
   check('the list call reports an error', typeof out === 'object' && 'error' in out, out)
 }
 
-console.log('6) the rail opens the page from its "+" menu:')
+console.log('6) the dock opens the page (the "+" menu only offers Browser/Trace):')
 {
   const app = readFileSync('src/App.tsx', 'utf8')
-  check('the "+" menu is mounted in the rail', /<ViewerAddButton \/>/.test(app))
+  check('the "+" menu is mounted in the strip', /<ViewerAddButton \/>/.test(app))
+  check('the dock is mounted in the pane', /<ViewerDockBar \/>/.test(app))
   const bar = readFileSync('src/components/ViewerTabBar.tsx', 'utf8')
-  check('the menu offers the artifacts page', bar.includes('key: "artifacts"'))
+  // Artifacts is a DOCK page now: the dock's fixed icon opens it; the "+"
+  // menu only offers the chat-owned Browser/Trace tabs.
+  check('the dock offers the artifacts page', /kind: "artifacts"/.test(bar))
   // Both dispatchers must handle the kind BEFORE the inbox catch-all return.
   // Match the JSX TAG, not the lazy import at the top of the file.
   const content = readFileSync('src/components/ViewerContent.tsx', 'utf8')

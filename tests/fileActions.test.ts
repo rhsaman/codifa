@@ -115,7 +115,7 @@ console.log('5) every class the new rows use has a style:')
   }
   // The rail's "+" menu is the single entry point for the pages; its trigger
   // reuses the shared tab-list button shell.
-  check('the "+" menu trigger is styled', css.includes('.viewer-add-btn'), '.viewer-add-btn')
+  check('the "+" menu trigger is styled', css.includes('.viewer-pane-head .tab-list-btn'), '.viewer-pane-head .tab-list-btn')
 }
 
 console.log('6) every layer exposes copy and rename:')

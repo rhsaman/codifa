@@ -124,6 +124,17 @@ export function TerminalPanel() {
     return () => window.removeEventListener('coder:focus-terminal', onFocusRequest)
   }, [])
 
+  // A `coder:new-terminal` request is Ctrl+T fired while the BOTTOM panel holds
+  // the caret: spawn another shell here, the same thing the panel's own "+"
+  // does (a right-pane terminal tab handles its own Ctrl+T).
+  useEffect(() => {
+    const onNewRequest = () => {
+      newSessionRef.current?.()
+    }
+    window.addEventListener('coder:new-terminal', onNewRequest)
+    return () => window.removeEventListener('coder:new-terminal', onNewRequest)
+  }, [])
+
   const supported = hasTerminalApi()
 
   /** Fit + push the new cols/rows to the pty. Skips while hidden (0 size). */
@@ -344,6 +355,12 @@ export function TerminalPanel() {
     useStore.getState().setTerminalPanelOpen(true)
     void spawnSession()
   }, [spawnSession])
+  // The Ctrl+T listener above is registered once, before this callback exists:
+  // it reads the latest newSession through a ref instead.
+  const newSessionRef = useRef(newSession)
+  useEffect(() => {
+    newSessionRef.current = newSession
+  }, [newSession])
   // Cmd/Ctrl+W (routed from App.tsx while the terminal has focus) closes the
   // active terminal tab — closing the last one also hides the panel.
   useEffect(() => {

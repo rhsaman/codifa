@@ -20,6 +20,7 @@ import {
   parseScheduleFlags,
   stripFlagTokens,
   hasLandedFlag,
+  hasLandedValue,
   recordHistory,
   togglePin,
   historyRows,
@@ -355,6 +356,13 @@ console.log("17) schedule --flags: names, values and parsing:")
   )
   check("a command without flags offers none", commandFlags("/plugin").length === 0)
   check(
+    "schedule flags belong to create only — update/run/remove keep creation's attachments",
+    commandFlags("schedule", "update").length === 0 &&
+      commandFlags("schedule", "run").length === 0 &&
+      commandFlags("schedule", "remove").length === 0 &&
+      commandFlags("schedule", "create").length === 3,
+  )
+  check(
     "each flag reads a real value list",
     commandFlags("/schedule").map((f) => f.values).join(",") === "skill,mcp,plugin",
     commandFlags("/schedule").map((f) => f.values),
@@ -482,6 +490,14 @@ console.log("21) hasLandedFlag: when the flag menu stops auto-opening:")
   check("a comma list lands the flag", hasLandedFlag(["create", "--skills=a,b", "nightly"]))
   check("an em-dash token counts too", hasLandedFlag(["create", "—skills=a,b"]))
   check("a non-flag word with = is prose, not landed", !hasLandedFlag(["create", "x=y"]))
+}
+
+console.log("22) hasLandedValue: when the arg-value menu stops auto-opening (the words AFTER the sub-command, as the callers pass prev.slice(2)):")
+{
+  check("the fresh word after `update ` is not landed", !hasLandedValue(["schedule", "update"].slice(2)))
+  check("a flag token is not a landed value", !hasLandedValue(["--skills"]))
+  check("an id word lands the value", hasLandedValue(["sch-abc"]))
+  check("a prose word with = lands it too", hasLandedValue(["x=y"]))
 }
 
 if (failed > 0) {

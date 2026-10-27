@@ -298,6 +298,51 @@ textarea {
     inset -1px 0 0 color-mix(in srgb, var(--text) 5%, transparent),
     1px 0 12px -6px rgba(0, 0, 0, 0.25);
   position: relative;
+  /* Open/close animates as a real width+fade: the aside stays mounted and
+     only its content unmounts (after the close transition). */
+  transition:
+    flex-basis 0.26s cubic-bezier(0.4, 0, 0.2, 1),
+    width 0.26s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.2s ease;
+}
+
+/* Collapsed: the inline width already animates to 0 (the shell owns it), the
+   class only carries the faded/inert state. */
+.sidebar.closed {
+  min-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  box-shadow: none;
+}
+
+/* The shell's aside IS the sidebar; the content it mounts fills it. */
+.sidebar-inner {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* While the open/close transition runs, the animating pane gets its own
+   compositing layer too (App/Sidebar toggle the class, transitionend clears
+   it): its repaints then stay inside the layer instead of dirtying
+   neighbouring tiles. Only during the ~0.3s animation, so the panes' own
+   position:fixed popups (workspace menus, viewer comment pins) are anchored
+   to the viewport again the moment it ends. */
+.viewer-group.animating,
+.sidebar.animating {
+  transform: translateZ(0);
+}
+
+/* Accessibility: users who opt out of motion get the instant toggle back. */
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .viewer-group {
+    transition: none;
+  }
 }
 
 /* macOS frameless window: empty strip under the traffic lights. Dragging it
@@ -3199,13 +3244,21 @@ textarea {
 .chat-windows.multi .chat-window {
   position: relative;
   isolation: isolate;
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 10px;
   background: var(--bg-alt);
+  /* The window outline is painted as an INSET BOX-SHADOW, not a border:
+     shadows render in the same paint pass as the background, so during the
+     sidebar/pane width animations the outline can never lag behind the
+     background the way a real border did (the stale-border artifact). */
+  box-shadow: inset 0 0 0 1px var(--border);
+  /* Own compositing layer: when the sidebar/right pane animate the windows'
+     size, each window re-rasterizes from its own layer. */
+  transform: translateZ(0);
 }
 
 .chat-windows.multi .chat-window.focused {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
 /* Cheap focus cue: opacity only (no blur/filter), so unfocused windows
@@ -7539,6 +7592,33 @@ body.coder-dragging .chat-split-child {
   border-radius: 3px;
   background: var(--accent);
   transition: width 0.2s ease;
+}
+
+/* Backup progress (Settings → Storage): the current file path on the left,
+   percent + file counter on the right, cancel below. */
+.backup-progress-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-muted, var(--text));
+}
+
+.backup-progress-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-progress-pct {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.backup-progress-actions {
+  margin-top: 6px;
 }
 
 .data-path-row input {
@@ -19245,16 +19325,29 @@ mark.diff-hit-active {
   flex: 1 1 auto;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
-  background: var(--bg-input);
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 3px 8px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: var(--text-dim);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.review-search > svg {
+  flex: 0 0 auto;
+  opacity: 0.75;
 }
 
 .review-search:focus-within {
-  border-color: var(--accent-dim);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
 }
 
 .review-search-input {
@@ -19263,13 +19356,22 @@ mark.diff-hit-active {
   background: transparent;
   border: none;
   outline: none;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text);
+  /* type="search": WebKit's native clear button fights the pill's own
+     hit/nav affordances — hide it. */
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.review-search-input::-webkit-search-cancel-button,
+.review-search-input::-webkit-search-decoration {
+  display: none;
 }
 
 .review-search-input::placeholder {
   color: var(--text-dim);
-  opacity: 0.7;
+  opacity: 0.65;
 }
 
 .review-search-count {
@@ -21385,6 +21487,21 @@ mark.trace-hit-active {
       color-mix(in srgb, var(--bg-alt) 97%, var(--accent) 3%),
       var(--bg-alt));
   box-shadow: none;
+  /* Open/close animates as a real width+fade: the pane stays mounted through
+     the close transition and mounts collapsed on open (see App.tsx). */
+  transition:
+    flex-basis 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.24s ease;
+}
+
+/* Collapsed mid-animation: zero size (the inline style carries it too) and
+   invisible, so the shrink reads as the pane sliding away. */
+.viewer-group.closing {
+  min-width: 0;
+  max-width: none;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .dock-resize-handle {
@@ -25541,11 +25658,11 @@ tr[data-search-current] .fv-mark,
   }
 }
 
-/* --- vertical viewer tab rail -------------------------------------------
-   The side pane's tabs sit in an icon-only rail pinned to the pane's PHYSICAL
-   right edge (so it stays on the right in both directions). The rail keeps a
-   FIXED width: hovering never resizes the viewer content or repaints the rail
-   — a hovered tab instead unfolds its title leftward OVER the content. */
+/* --- side pane chrome -----------------------------------------------------
+   Three stacked regions: a titled tab strip along the TOP edge (every open
+   viewer tab, squeeze-to-fit), the viewer content, and a fixed launcher dock
+   along the BOTTOM edge (one permanent icon per page, T3-Code style — small
+   muted glyphs that light up when their page is on screen). */
 .viewer-pane-body {
   position: relative;
   flex: 1 1 auto;
@@ -25553,9 +25670,6 @@ tr[data-search-current] .fv-mark,
   flex-direction: column;
   min-height: 0;
   min-width: 0;
-  /* One icon wide: hovering a tab must never widen the rail (the viewer would
-     jump). The row's name floats BESIDE the rail while hovered instead. */
-  --viewer-rail-width: 42px;
 }
 
 .viewer-pane-body > .viewer-content {
@@ -25564,249 +25678,179 @@ tr[data-search-current] .fv-mark,
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
-  /* Constant rail gutter, so opening/closing tabs never shifts the viewer. */
-  padding-right: var(--viewer-rail-width);
+  /* The pane host takes the caret on click (click-to-focus); it must not
+     paint a ring for it — focus here is a state, not an affordance. */
+  outline: none;
 }
 
+/* Top strip: [tab-list chevron | tabs … | spacer | fullscreen]. A quiet
+   extension of the pane, separated from the content by a hairline. */
 .viewer-pane-body .viewer-pane-head {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: var(--viewer-rail-width);
-  height: auto;
+  flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
+  flex-direction: row;
+  align-items: center;
   gap: 4px;
-  padding: 6px 4px;
-  /* Physical layout: the rail hugs the window's right edge in RTL too. */
+  height: 38px;
+  padding: 0 8px 0 6px;
+  /* Physical layout: the strip reads left-to-right in RTL too. */
   direction: ltr;
   border: 0;
-  border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent);
   background: none;
-  /* The hovered tab's name is position:fixed, so it escapes this box even
-     with clipping; scrolling keeps the icons + tab rows inside the pane when
-     the pane is shorter than the icon column. */
-  overflow-x: hidden;
-  overflow-y: auto;
-  scrollbar-width: none;
-  z-index: 2;
-  /* The rail overlays the viewer content: it must never act as the frameless
-     window's drag region, or hovering/clicking its icons gets swallowed. */
+  overflow: hidden;
+  /* The strip must never act as the frameless window's drag region, or
+     hovering/clicking its tabs gets swallowed. */
   -webkit-app-region: no-drag;
 }
 
 .viewer-pane-body .viewer-pane-spacer {
-  /* The tab list already takes the rail's free height; the spacer must not
-     split it in half. */
-  flex: 0 0 auto;
-  min-height: 0;
+  flex: 1 1 auto;
+  min-width: 8px;
 }
 
-/* Panel/collapse icons lead the rail: pinned to its top edge. */
 .viewer-pane-body .viewer-pane-actions {
   flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   gap: 4px;
-  width: 100%;
   margin: 0;
   padding: 0;
 }
 
-/* The tab rows own the rail's free height below the fixed header buttons, so a
-   new tab can never be laid over one. */
-.viewer-pane-body .viewer-tabs-rail {
+/* --- top tab strip --------------------------------------------------------
+   Titled pills like the chat bar: icon + name + hover ✕. Tabs squeeze instead
+   of scrolling (the chevron beside them reaches everything). */
+.viewer-pane-body .viewer-tabs-top {
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 2px;
-  flex: 1 1 auto;
-  width: 100%;
-  /* Never collapse to 0 when the icon column fills the pane: a new tab row
-     must stay reachable (the rail scrolls inside itself). */
-  min-height: 64px;
-  /* A hairline + breathing room separates the tab rows from the page icons
-     above: a new tab must never read as one more icon button. */
-  margin-top: 6px;
-  padding: 6px 0 0;
-  border-top: 1px solid var(--hairline);
-  border-bottom: 0;
-  /* Rows scroll inside the rail instead of spilling past the pane's bottom
-     edge, where they used to paint over the fixed icon column. */
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-}
-
-/* A rail tab is one full-width icon row centered on the rail's axis — the
-   very same column as the panel/action icons stacked above it. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab {
-  position: relative;
-  width: 100%;
-  height: 30px;
-  min-width: 0;
-  max-width: none;
-  flex: 0 0 auto;
   flex-direction: row;
   align-items: center;
-  justify-content: center;
-  gap: 0;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
   padding: 0;
-  border-radius: 6px;
-  /* The floated name must be able to leave the row's box. */
-  overflow: visible;
+  border-bottom: 0;
+  overflow-x: hidden;
+  overflow-y: hidden;
 }
 
-/* Hovering must not nudge a rail icon off that center axis. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover {
-  transform: none;
-}
-
-.viewer-tabs-rail .viewer-tab-icon {
-  display: inline-flex;
-  flex: 0 0 auto;
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab {
+  position: relative;
+  display: flex;
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-}
-
-/* Rows are never translucent: a faded tab reads as disabled and its file
-   looks gone from the rail. The active tab is claimed by its own surface and
-   accent, not by dimming every other row, and a hovered row gets a solid
-   surface so it is unmistakably interactive. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab {
+  gap: 6px;
+  height: 28px;
+  width: auto;
+  min-width: 30px;
+  max-width: 200px;
+  flex: 0 1 auto;
+  padding: 0 5px 0 8px;
+  border-radius: 8px;
+  border: 1px solid transparent;
   opacity: 1;
+  overflow: hidden;
   transition:
     background 0.15s ease,
     color 0.15s ease,
     border-color 0.15s ease;
 }
 
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:not(.active) {
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:hover {
+  transform: none;
+}
+
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:not(.active) {
   color: var(--text-dim);
-  background: color-mix(in srgb, var(--text) 4%, transparent);
+  background: transparent;
 }
 
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:hover,
-.viewer-pane-body .viewer-tabs-rail .editor-tab.viewer-tab:focus-visible {
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:hover,
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab:focus-visible {
   color: var(--text);
-  background: color-mix(in srgb, var(--text) 14%, var(--bg-hover));
-  border-color: color-mix(in srgb, currentColor 22%, transparent);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: color-mix(in srgb, currentColor 16%, transparent);
 }
 
-/* Icon-only rail: a row's name is not painted inside the row. While the row is
-   hovered, ONE card replaces it: the card covers the row's own square and
-   extends leftwards over the content, holding the name AND the ✕ in a single
-   surface. Nothing widens — the card floats — so the rail stays one icon wide
-   and the viewer never jumps.
-   The card is a DOM child of the row, so moving the pointer onto it keeps the
-   row hovered: the name never vanishes halfway toward it. */
-.viewer-tabs-rail .editor-tab-label {
-  display: none;
+/* The active tab is claimed by a soft accent surface, not by dimming every
+   other tab. */
+.viewer-pane-body .viewer-tabs-top .editor-tab.viewer-tab.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
-/* HOVER ONLY. `:focus-within` used to keep the card painted after a click —
-   mouse focus stays on the row, so a stale card hovered over content and could
-   eat the next click. Keyboard users still get it through `:focus-visible`
-   (which mouse clicks do not trigger) and `:has(:focus-visible)` for the ✕. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-label,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-label,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .editor-tab-label {
+.viewer-pane-body .viewer-tabs-top .viewer-tab-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The label is ALWAYS visible here (unlike the old icon rail): name + ✕ in
+   one row, the name ellipsizing so a long path never pushes the ✕ out. */
+.viewer-pane-body .viewer-tabs-top .editor-tab-label {
   display: flex;
   align-items: center;
-  gap: 6px;
-  position: fixed;
-  /* The row publishes its own center and its own right edge, so the card lands
-     exactly on top of that row at any scroll position. */
-  top: var(--viewer-tab-hint-top, 50vh);
-  right: var(--viewer-tab-hint-right, calc(var(--viewer-rail-width) - 4px));
-  z-index: 60;
-  /* Same height as the row: the card IS the row, then some, so the ✕ it holds
-     sits on the square the kind icon used to occupy. */
-  height: 30px;
-  width: max-content;
-  max-width: 300px;
-  margin: 0;
-  padding: 0 4px 0 12px;
-  transform: translateY(-50%);
-  border: 1px solid color-mix(in srgb, currentColor 26%, transparent);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--text) 14%, var(--bg-hover));
-  box-shadow: 0 10px 24px -14px rgba(0, 0, 0, 0.7);
-  color: var(--text);
-  font-size: 11.5px;
-  font-weight: 500;
-  text-align: left;
-  white-space: nowrap;
-  pointer-events: auto;
+  gap: 2px;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 
-/* The name ellipsizes inside the card: a long path never pushes the ✕ out of
-   the pill. */
-.viewer-pane-body .viewer-tabs-rail .viewer-tab-name {
+.viewer-pane-body .viewer-tabs-top .viewer-tab-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 500;
 }
 
-/* The ✕ is the card's right-hand end — the very square the kind icon occupied,
-   which the card now covers. It paints no box and no background of its own, so
-   the pill reads as ONE tab with two hit areas: the name activates it, the ✕
-   beside the name closes it. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close {
+/* The ✕ is quiet until the tab is hovered: no box, no background — just the
+   glyph warming up, then turning red under the pointer. */
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close {
   position: static;
   flex: 0 0 auto;
-  width: 26px;
-  height: 26px;
+  width: 18px;
+  height: 18px;
   margin: 0;
   padding: 0;
   transform: none;
   border-radius: 5px;
-  opacity: 1;
-  pointer-events: auto;
+  opacity: 0;
+  pointer-events: none;
   background: none;
+  transition: opacity 0.12s ease, color 0.12s ease;
 }
 
-.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .editor-tab-close,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .editor-tab-close,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .editor-tab-close {
-  opacity: 1;
+.viewer-pane-body .viewer-tabs-top .editor-tab:hover .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab:focus-visible .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab.active .editor-tab-close,
+.viewer-pane-body .viewer-tabs-top .editor-tab:has(:focus-visible) .editor-tab-close {
+  opacity: 0.75;
   pointer-events: auto;
 }
 
-/* Hovering the ✕ only recolors its glyph: no box, no scale, so the card keeps
-   reading as one surface. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close:hover,
-.viewer-pane-body .viewer-tabs-rail .editor-tab .editor-tab-close:focus-visible {
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close:hover,
+.viewer-pane-body .viewer-tabs-top .editor-tab .editor-tab-close:focus-visible {
+  opacity: 1;
   transform: none;
   color: var(--danger);
   background: none;
   box-shadow: none;
 }
 
-/* The ✕ replaces the kind icon while the row is hovered/focused: one control
-   per square, nothing drawn on top of anything else. */
-.viewer-pane-body .viewer-tabs-rail .editor-tab:hover .viewer-tab-icon,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:focus-visible .viewer-tab-icon,
-.viewer-pane-body .viewer-tabs-rail .editor-tab:has(:focus-visible) .viewer-tab-icon {
-  opacity: 0;
-  pointer-events: none;
-}
-
-/* Drop feedback in the rail: no insertion line — the dragged tab is re-ordered
-   into its landing slot (inline CSS `order` set by ViewerTabBar, so the DOM node
-   never moves mid-drag) and drawn as a ghost, so the user sees where it lands. */
-.viewer-tabs-rail .editor-tab.drop-before,
-.viewer-tabs-rail .editor-tab.drop-after {
+/* Drop feedback in the strip: no insertion line — the dragged tab is
+   re-ordered into its landing slot (inline CSS `order` set by ViewerTabBar, so
+   the DOM node never moves mid-drag) and drawn as a ghost. */
+.viewer-tabs-top .editor-tab.drop-before,
+.viewer-tabs-top .editor-tab.drop-after {
   box-shadow: none;
 }
 
-.viewer-tabs-rail .editor-tab.drop-before::after,
-.viewer-tabs-rail .editor-tab.drop-after::after {
+.viewer-tabs-top .editor-tab.drop-before::after,
+.viewer-tabs-top .editor-tab.drop-after::after {
   display: none;
 }
 
@@ -25828,9 +25872,8 @@ tr[data-search-current] .fv-mark,
     box-shadow 0.12s ease;
 }
 
-/* Rail buttons (tab list, fullscreen, page icons) are icon squares: one
-   full-width row each, glyph centered on the rail's axis. Every page icon is a
-   `.titlebar-icon-btn`, so a new page inherits the row geometry for free. */
+/* Strip buttons (tab list chevron, fullscreen, "+") are 30px icon squares
+   centered on the strip's axis. */
 .viewer-pane-body .viewer-pane-head .tab-list-btn,
 .viewer-pane-body .viewer-pane-head .editor-tab-new,
 .viewer-pane-body .viewer-pane-head .editor-tab-full,
@@ -25849,28 +25892,82 @@ tr[data-search-current] .fv-mark,
   width: 30px;
 }
 
-/* One entry point for every page: the rail's "+" menu. It reuses the shared
-   tab-list dropdown shell (`.tab-list-btn`), which already carries this row's
-   geometry, so the glyph lands on the same center line as the icons above. */
-.viewer-pane-body .viewer-pane-head .viewer-add-btn {
-  width: 30px;
-  height: 30px;
-}
-
-/* The wraps keep their horizontal-bar paddings otherwise; in the rail every
-   button must fill the row so its glyph lands on the shared center line. */
 .viewer-pane-body .viewer-pane-head .tab-list-wrap {
   padding: 0;
+  flex: 0 0 auto;
 }
 
-/* `.tab-bar.viewer-tabs` re-declares the window drag region for the horizontal
-   strip; inside the overlaying rail that swallows hover/click on the icons. */
-.viewer-pane-body .viewer-pane-head .tab-bar.viewer-tabs {
-  flex: 1 1 auto;
-  min-height: 64px;
-  /* Tab rows own the rail's free height: the page icons keep their fixed box
-     above, so a new tab can never be laid over an icon. */
+/* --- bottom launcher dock -------------------------------------------------
+   A slim, always-present icon row (one button per page): quiet, evenly spaced
+   glyphs that read at a glance, mirroring the active page with a soft accent
+   pill. */
+.viewer-dock {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  height: 48px;
+  padding: 0 14px;
+  /* Physical layout: the dock reads left-to-right in RTL too. */
+  direction: ltr;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
   -webkit-app-region: no-drag;
+}
+
+.viewer-dock-btn {
+  width: 38px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease;
+}
+
+/* One uniform glyph size for every dock icon: the sources mix 13–17px
+   attributes, so the row used to look uneven and tiny. */
+.viewer-dock-btn svg {
+  display: block;
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.7;
+}
+
+.viewer-dock-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.viewer-dock-btn:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* The page currently on screen owns a soft accent pill — the same language as
+   the top strip's active tab, so dock + strip always agree. */
+.viewer-dock-btn.active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.viewer-dock-spacer {
+  flex: 1 1 auto;
+  min-width: 12px;
 }
 
 /* --- explore (sub-agent run): chat card + side panel ----------------------
@@ -27157,4 +27254,99 @@ tr[data-search-current] .fv-mark,
      `display: none` here, which is why a smaller window rendered every row as a
      bare name with no way to tell two parts apart; the two-line clamp above
      already keeps the row short. */
+}
+
+/* ==========================================================================
+   Modern-terminal polish layer — applies to EVERY page.
+   Global primitives only (scrollbars, selection, carets, numbers, focus,
+   baselines): the per-page themes already carry the identity, this layer
+   makes them all feel like one instrument panel. No layout changes.
+   ========================================================================== */
+
+/* Native widgets (checkboxes, radios, progress) pick up the theme accent. */
+:root {
+  accent-color: var(--accent);
+}
+
+/* The caret glows with the accent — a small but constant "live terminal" cue
+   in every input on every page. */
+input,
+textarea,
+[contenteditable="true" i],
+[contenteditable="plaintext-only" i] {
+  caret-color: var(--accent);
+}
+
+/* Numbers align in columns everywhere (usage chips, timestamps, diff counts,
+   token stats): the tabular read is half the terminal feel. */
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Text selection: a quiet accent wash instead of the platform default. */
+::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text);
+}
+
+/* Scrollbars: slimmer, translucent, and they fade up when the pane is
+   hovered — chrome that stays out of the way until wanted. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text) 26%, transparent);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Focus ring: one crisp accent line plus a soft halo — precise like a cursor
+   block, not a heavy 2px slab. */
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+/* Every button gets one shared interaction baseline, so hovers feel uniform
+   across pages even where a component declares none of its own. */
+button {
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease,
+    opacity 0.12s ease;
+}
+
+/* Inputs that no page styled explicitly still land on the shared shape. */
+:where(input[type="text"], input[type="search"], input:not([type])) {
+  border-radius: 8px;
+}
+
+/* Floating chrome (tab-list dropdown, workspace menu) turns into frosted
+   glass: translucent panel fill + backdrop blur reads modern without losing
+   the dark terminal weight. */
+.tab-list-menu {
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  backdrop-filter: blur(18px) saturate(1.1);
+}
+
+.ws-menu {
+  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(16px) saturate(1.1);
 }

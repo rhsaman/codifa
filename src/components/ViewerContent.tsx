@@ -1,5 +1,5 @@
 import { Suspense, lazy } from "react";
-import { useViewerTabs, visibleTabs } from "../lib/viewerTabs";
+import { useViewerTabs, useViewerScope, visibleTabs } from "../lib/viewerTabs";
 import { useStore } from "../lib/store";
 import { SchedulePage, TodosPage } from "./ViewerPages";
 
@@ -57,12 +57,13 @@ function ViewerContentInner() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const activeChatId = useStore((s) => s.activeChatId);
-  // Chat-scoped viewers: only the active chat's tabs (plus global inbox) show.
-  // Same resolution as `shownViewerTabId` in the store — that helper is the
-  // shared spelling of this rule behind the rail icons' pressed state, so keep
-  // the two in step.
-  const visible = visibleTabs(tabs, activeChatId);
-  // Same rule as `shownViewerTabId`: the chat's own tab beats a global page tab
+  // Scope-filtered viewers: the focused workspace's tabs, that chat's
+  // trace/browser, and the global pages. Same resolution as `shownViewerTabId`
+  // in the store — that helper is the shared spelling of this rule behind the
+  // rail icons' pressed state, so keep the two in step.
+  const scope = useViewerScope();
+  const visible = visibleTabs(tabs, scope);
+  // Same rule as `shownViewerTabId`: the chat's own tab beats a shared page tab
   // (schedule/inbox/…), so an open file never loses the pane to Schedule.
   const active =
     visible.find((t) => t.id === activeId) ??
@@ -147,14 +148,16 @@ function ViewerContentInner() {
   }
 
   if (active.kind === "trace") {
-    // No chatId passed on purpose: the trace always follows the active chat,
-    // so switching chats updates the trace view automatically.
-    // A sub-agent tab carries traceTaskId: same TracePanel, server-filtered
-    // to that job's entries (separate from the main chat trace).
+    // The trace follows ITS TAB's chat: for an ordinary tab that equals the
+    //  focused chat (the tab is only visible there), while a schedule-run
+    //  trace tab pins the synthetic `schedule-<sid>` chat wherever it was
+    //  opened from. A sub-agent tab carries traceTaskId: same TracePanel,
+    //  server-filtered to that job's entries (separate from the main trace).
     return (
       <TracePanel
         key={active.id}
         docked
+        chatId={active.chatId}
         initialTab={active.traceTab ?? "all"}
         taskId={active.traceTaskId}
         traceTitle={active.traceTitle}

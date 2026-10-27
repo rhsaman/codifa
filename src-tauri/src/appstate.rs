@@ -548,6 +548,12 @@ pub fn save_schedule(data_root: &Path, mut task: Value) -> Result<Value, String>
 
 pub fn delete_schedule(data_root: &Path, id: &str) -> Value {
     let ok = std::fs::remove_file(schedule_file(data_root, id)).is_ok();
+    // Runs log their trace under the synthetic chat `schedule-<id>` (scheduler.rs
+    // AgentRequest.chat_id). Ids double as file names, so they are already
+    // filesystem-safe — sanitize() is the identity here; recreate the exact
+    // path the writer produced and drop it together with the task.
+    let trace = data_root.join("traces").join(format!("schedule-{id}.jsonl"));
+    let _ = std::fs::remove_file(trace);
     json!({ "ok": ok })
 }
 

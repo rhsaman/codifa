@@ -65,6 +65,12 @@ export const api = {
   flushPersistDone: (): void => window.coder.flushPersistDone(),
   onMigrateProgress: (cb: (evt: { label: string; pct: number }) => void): (() => void) =>
     window.coder.onMigrateProgress(cb),
+  createBackup: (destDir: string): Promise<{ path: string; files: number; bytes: number; elapsedMs: number }> =>
+    window.coder.createBackup(destDir),
+  cancelBackup: (): Promise<void> => window.coder.cancelBackup(),
+  onBackupProgress: (
+    cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
+  ): (() => void) => window.coder.onBackupProgress(cb),
   openFileExternal: async (
     absPath: string,
     editor: 'nvim' | 'vscode' | 'cmux' | 'ghostty' | 'warp' | 'default',

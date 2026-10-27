@@ -1457,6 +1457,8 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setTerminalFontSize = useStore((s) => s.setTerminalFontSize)
   const dataPath = useStore((s) => s.dataPath)
   const setDataPath = useStore((s) => s.setDataPath)
+  const backupPath = useStore((s) => s.backupPath)
+  const setBackupPath = useStore((s) => s.setBackupPath)
   const sttProviderId = useStore((s) => s.sttProviderId)
   const sttModel = useStore((s) => s.sttModel)
   const setSttProviderId = useStore((s) => s.setSttProviderId)
@@ -1641,6 +1643,62 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   useEffect(() => {
     setCacheTtlInput(String(cacheTtlMinutes))
   }, [cacheTtlMinutes])
+
+  // ---- Backup (Settings → Storage) ----
+  // The input mirrors the persisted `backupPath` ('' = the data root, shown as
+  // the placeholder); every keystroke persists so the choice survives a restart.
+  const [backupDirInput, setBackupDirInput] = useState(backupPath)
+  useEffect(() => {
+    setBackupDirInput(backupPath)
+  }, [backupPath])
+  const [backingUp, setBackingUp] = useState(false)
+  const [backupPct, setBackupPct] = useState(0)
+  const [backupLabel, setBackupLabel] = useState('')
+  const [backupFiles, setBackupFiles] = useState<{ done: number; total: number } | null>(null)
+  const [backupMsg, setBackupMsg] = useState('')
+  const [backupFailed, setBackupFailed] = useState(false)
+
+  const browseBackupDir = async () => {
+    const picked = await api.selectFolder()
+    if (!picked) return
+    setBackupDirInput(picked)
+    setBackupPath(picked)
+  }
+
+  const startBackup = async () => {
+    setBackupMsg('')
+    setBackupFailed(false)
+    const dir = backupDirInput.trim()
+    setBackupPath(dir)
+    setBackingUp(true)
+    setBackupPct(0)
+    setBackupLabel('Preparing…')
+    setBackupFiles(null)
+    const unsub = api.onBackupProgress((evt) => {
+      setBackupLabel(evt.label)
+      setBackupPct(evt.pct)
+      setBackupFiles({ done: evt.files, total: evt.total })
+    })
+    try {
+      const res = await api.createBackup(dir)
+      const mb = (res.bytes / (1024 * 1024)).toFixed(1)
+      setBackupMsg(
+        `Backup ready: ${res.path} — ${res.files.toLocaleString()} files, ${mb} MB in ${(res.elapsedMs / 1000).toFixed(1)}s`,
+      )
+    } catch (err) {
+      const message = (err as Error).message || String(err)
+      const cancelled = message.toLowerCase().includes('cancel')
+      setBackupMsg(cancelled ? 'Backup cancelled.' : `Backup failed: ${message}`)
+      setBackupFailed(!cancelled)
+    } finally {
+      unsub()
+      setBackingUp(false)
+      setBackupLabel('')
+      setBackupPct(0)
+      setBackupFiles(null)
+    }
+  }
+
 
   const modes = allModes(settings)
 
@@ -3216,6 +3274,90 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 </div>
               )}
               {dataMsg && <div className="hint" style={{ color: 'var(--accent)' }}>{dataMsg}</div>}
+            </div>
+          </div>
+
+          {/* ===== Backup ===== */}
+          <div className="settings-group">
+            <div className="settings-group-head">
+              <span className="settings-group-icon">💾</span>
+              <div>
+                <div className="settings-group-title">Backup</div>
+                <div className="settings-group-desc">
+                  Packs the whole app into one <code>codifa-backup-&lt;date&gt;.zip</code>:
+                  settings and providers, chats, plugins (skills + MCP connectors), plans,
+                  schedules, artifacts and uploads. Traces, checkpoints, memory, caches and the
+                  browser profile are left out — the app re-creates those on demand.
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row settings-row-stack">
+              <div className="settings-row-label">
+                <div className="settings-row-title">Backup location</div>
+                <div className="settings-row-desc">
+                  Where the archive is written. Empty = the data path{' '}
+                  (<code dir="ltr">{dataPath || '~/.codifa'}</code>).
+                </div>
+              </div>
+              <div className="data-path-row">
+                <input
+                  value={backupDirInput}
+                  onChange={(e) => {
+                    setBackupDirInput(e.target.value)
+                    setBackupPath(e.target.value)
+                  }}
+                  placeholder={dataPath || '~/.codifa'}
+                  dir="ltr"
+                  disabled={backingUp}
+                  aria-label="Backup destination folder"
+                />
+                <button className="btn tiny" onClick={browseBackupDir} disabled={backingUp}>
+                  Browse…
+                </button>
+                <button className="btn tiny" onClick={startBackup} disabled={backingUp}>
+                  {backingUp ? 'Backing up…' : 'Back up now'}
+                </button>
+              </div>
+              {backingUp && (
+                <div className="migrate-progress">
+                  <div className="migrate-bar-track">
+                    <div className="migrate-bar-fill" style={{ width: `${backupPct}%` }} />
+                  </div>
+                  <div className="backup-progress-line">
+                    <span className="backup-progress-label" dir="ltr">{backupLabel}</span>
+                    <span className="backup-progress-pct">
+                      {backupPct}%
+                      {backupFiles && backupFiles.total > 0
+                        ? ` · ${backupFiles.done.toLocaleString()}/${backupFiles.total.toLocaleString()} files`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="backup-progress-actions">
+                    <button className="btn tiny" onClick={() => void api.cancelBackup()}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {backupMsg && (
+                <div
+                  className="hint"
+                  style={{ color: backupFailed ? 'var(--danger)' : 'var(--accent)', wordBreak: 'break-all' }}
+                >
+                  {backupMsg}
+                </div>
+              )}
+              {!backingUp && backupMsg && !backupFailed && (
+                <div>
+                  <button
+                    className="btn tiny"
+                    onClick={() => void api.openWorkspaceFolder(backupDirInput.trim() || dataPath || '~/.codifa')}
+                  >
+                    Show folder
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 

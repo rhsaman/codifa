@@ -49,9 +49,10 @@ const entries = new Map<string, TerminalSessionEntry>()
 const tabByPtyId = new Map<string, string>()
 /** Output that arrived while its screen did not exist yet (see the router and
  *  openTerminalSession). Keyed by pty id, replayed in order once the screen is
- *  built. Only the tiny window between the pty id becoming known and xterm's
- *  write path being wired can put anything here — but in that window EVERY byte
- *  used to be silently dropped, which is exactly the "sometimes empty" nvim
+ *  built. Two keys share this map: `pending:<tabId>` parks bytes that raced
+ *  AHEAD of the terminal_create answer, and the real pty id holds everything
+ *  between the answer and xterm's write path being wired. In that window EVERY
+ *  byte used to be silently dropped, which is exactly the "sometimes empty" nvim
  *  screen. */
 const earlyOutput = new Map<string, string[]>()
 /** In-flight creates, so a double mount never spawns two ptys for one tab. */
@@ -142,38 +143,48 @@ export function openTerminalSession(
   if (!hasTerminalApi()) return Promise.reject(new Error('terminal API unavailable'))
   ensureTransport()
 
-  // THE PTY STARTS EMITTING WHEN THE BACKEND SPAWNS IT — before this function
-  // even knows the pty id. Without a bucket ready from this moment, the buffer
-  // only starts after `terminal_create` ANSWERS, and anything nvim printed in
-  // the gap was dropped by the router (no routing existed yet) — nvim's welcome
-  // frame, which IS its first screenful, was exactly that kind of output. The
-  // backend (pty.rs) routes data through tauri events only after it has an id
-  // to name, so in practice these buckets stay empty until the answer arrives;
-  // but nothing in the IPC contract guarantees that ordering, so the safe
-  // behaviour is to always be able to hold early bytes.
-  const idBucket = collectPtyOutput('pending:' + tabId)
+  // THE PTY STARTS EMITTING WHEN THE BACKEND SPAWNS IT — the reader thread is
+  // live before `terminal_create` can ANSWER, and nvim paints its welcome frame
+  // exactly inside that window. The renderer used to learn the pty id only from
+  // the ANSWER, so every byte of that window was dropped by the router: the tab
+  // opened on a permanently blank screen. Now this side MINTS the session id
+  // from the tab id and sends it with the create request; the backend adopts
+  // it, so even the very first `terminal:data` event already carries a name
+  // this file can route — the bucket below exists from before the pty does,
+  // and the replay further down feeds it into the screen in arrival order.
+  const requestedId = `${tabId}#pty`
+  collectPtyOutput(requestedId)
 
   const created = (async () => {
-    const info = await window.coder.terminalCreate(cwd, program, args, program ? undefined : shell)
+    const info = await window.coder.terminalCreate(
+      cwd,
+      program,
+      args,
+      program ? undefined : shell,
+      requestedId,
+    )
     const id = info?.id
     // The render reads `id`; a malformed reply must not create a phantom entry.
-    if (!id || typeof id !== 'string') throw new Error('terminal_create returned no session id')
+    if (!id || typeof id !== 'string') {
+      earlyOutput.delete(requestedId)
+      throw new Error('terminal_create returned no session id')
+    }
 
     // MAP THE PTY ID *BEFORE* ANY SCREEN IS BUILT. The pty is already running
     // (`terminal_create` resolved), so `onTerminalData(id, …)` can fire at any
     // microtask from here on — nvim paints its first frame the moment it boots.
-     // Registering the route AFTER `buildTerminal` (the order this file used to
+    // Registering the route AFTER `buildTerminal` (the order this file used to
     // use) dropped those early bytes: the router looked the id up, found
     // nothing and silently discarded them, so nvim came up next to a BLANK
     // screen — the "sometimes opens empty" bug.
     tabByPtyId.set(id, tabId)
-    // Chunks captured under the pending key (in case any arrived before the
-    // answer) move under the REAL pty id so the router keeps buffering them.
-    if (idBucket.length) {
-      const moved = collectPtyOutput(id)
-      moved.push(...idBucket)
-    }
-    earlyOutput.delete('pending:' + tabId)
+    // Chunks parked while in flight keep buffering under their key (id ===
+    // requestedId on a current backend) until the replay below drains them. A
+    // mismatched answer means the backend ignored the requested id: anything
+    // it emitted before the answer was unattributable and is gone, so the
+    // stray bucket is simply dropped.
+    collectPtyOutput(id)
+    if (id !== requestedId) earlyOutput.delete(requestedId)
 
     const { term, fit } = buildTerminal(id)
     // Register for live point-size changes; the fit makes the new size visible

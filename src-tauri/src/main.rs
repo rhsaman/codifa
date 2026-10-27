@@ -7,6 +7,7 @@
 
 mod agent;
 mod artifacts;
+mod backup;
 mod browser;
 mod browser_driver;
 mod computer;
@@ -158,6 +159,7 @@ fn main() {
         // the Electron build's saveWindowState).
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(state::DataRoot::new())
+        .manage(backup::BackupState::new())
         .manage(pty::TerminalState::new())
         .manage(pty::TerminalMasters::new())
         .manage(Quitting(std::sync::atomic::AtomicBool::new(false)))
@@ -198,6 +200,9 @@ fn main() {
             commands::get_data_path,
             commands::has_settings_file,
             commands::move_data_path,
+            // backup (Settings → Storage)
+            backup::create_backup,
+            backup::cancel_backup,
             // local backend endpoint (native router port)
             commands::sidecar_url,
             commands::sidecar_probe,

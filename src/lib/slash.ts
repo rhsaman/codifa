@@ -126,9 +126,15 @@ export const COMMAND_FLAGS: Record<string, CommandFlag[]> = {
   ],
 }
 
-/** Every flag name the caret's command accepts, for the name level. */
-export function commandFlags(command: string): CommandFlag[] {
+/** Every flag name the caret's command accepts, for the name level.
+ *
+ *  `sub` narrows by sub-command: the schedule flags attach skills/mcp/plugins
+ *  to every run, and that only makes sense while CREATING a task — `update`
+ *  keeps whatever create attached (its tail is change prose), and `run` /
+ *  `remove` take no attachments, so those menus offer no flags. */
+export function commandFlags(command: string, sub?: string): CommandFlag[] {
   const key = command.startsWith('/') ? command.slice(1) : command
+  if (sub && sub !== 'create') return []
   return COMMAND_FLAGS[key] ?? []
 }
 
@@ -204,6 +210,14 @@ export function hasLandedFlag(words: string[]): boolean {
     const eq = w.indexOf('=')
     return eq >= 0 && isFlagToken(w) && flagValues(w.slice(eq + 1)).length > 0
   })
+}
+
+/** Has the sub-command's own value already landed — a non-flag word after it
+ *  (`update <id> `)? One landed value is where the VALUE menu stops
+ *  auto-opening, the mirror of `hasLandedFlag` on the arg level: from there
+ *  on the line carries the change prose, and ArrowUp brings a menu back. */
+export function hasLandedValue(words: string[]): boolean {
+  return words.some((w) => w !== "" && !isFlagToken(w))
 }
 
 /** The rows a `--flag=<typed>` token offers, from the installed list.

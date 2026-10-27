@@ -29,6 +29,10 @@ export class Terminal {
     }
     this._el = null
     this._onResize = null
+    /** Chunks THIS terminal received, in order (write() also feeds the shared
+     *  `written` list, which older tests assert on — this adds per-instance
+     *  capture so a test can tell SEVERAL terminals apart). */
+    this.written = []
   }
 
   loadAddon(addon) {
@@ -52,6 +56,7 @@ export class Terminal {
 
   /** Every chunk the app pushes at the screen (an echo of pty output). */
   write(data) {
+    this.written.push(data)
     written.push(data)
   }
   onResize(cb) {

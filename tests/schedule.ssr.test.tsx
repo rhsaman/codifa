@@ -37,7 +37,7 @@ const { formatNextRunFa, runStatusFa, cronToPresetValue } = await import(
   "../src/components/SchedulePanel"
 )
 const { unseenRunCount, unseenRunCountForTask, pickInboxTask } = await import("../src/components/ScheduleInbox")
-const { scheduleRunTokenTotal, taskTokenTotals, findFinishedScheduleRuns } = await import(
+const { scheduleRunTokenTotal, taskTokenTotals, findFinishedScheduleRuns, liveRunningMap } = await import(
   "../src/lib/schedule-notify"
 )
 
@@ -169,6 +169,22 @@ console.log("۱۰) findFinishedScheduleRuns — فقط پایان کار اعل�
   check("ران قبلاً پایانیافته دوباره اعلان نمی‌دهد", noChange.length === 0, noChange)
   const stillRunning = findFinishedScheduleRuns(new Map([["b", "running" as const]]), [runs[1]])
   check("ران هنوز running اعلان نمی‌دهد", stillRunning.length === 0, stillRunning)
+}
+
+console.log("۱۱) liveRunningMap — اسپینر از داده بکاند مشتق می شود نه استیت لوکال:")
+{
+  const runs = [
+    { id: "a", schedule_id: "s1", status: "running", started_at: 1 },
+    { id: "b", schedule_id: "s2", status: "done", started_at: 2 },
+    { id: "c", schedule_id: "s1", status: "done", started_at: 3 },
+    { id: "d", schedule_id: "", status: "running", started_at: 4 },
+  ] as any
+  const map = liveRunningMap(runs)
+  check("s1 با ران running → true", map["s1"] === true, map)
+  check("s2 با ران done → رأی ندارد", !("s2" in map), map)
+  check("ران بدون schedule_id نادیده", !("" in map), map)
+  check("فقط s1 رأی در حال اجرا دارد", Object.keys(map).length === 1, map)
+  check("لیست خالی → map خالی", Object.keys(liveRunningMap([])).length === 0)
 }
 
 if (failed > 0) {

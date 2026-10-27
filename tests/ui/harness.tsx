@@ -557,6 +557,12 @@ if (params.get("scenario") === "schedules") {
     const { ScheduleSection } = await import("../../src/components/SchedulePanel");
     const { ScheduleInbox } = await import("../../src/components/ScheduleInbox");
     const { useStore } = await import("../../src/lib/store");
+    const { useViewerTabs } = await import("../../src/lib/viewerTabs");
+    (window as any).__ui.viewerTabs = useViewerTabs;
+    // Mirror the app's persisted-state hydrate, which is what opens the
+    //  panel's fetch gate (`loaded`) there. A bare reload otherwise sits on
+    //  "Loading schedules…" forever — no hydrate path exists in the harness.
+    (useStore as any).setState({ loaded: true });
     (window as any).__ui.schedule = {
       /** Seed the store rows directly (no listing round trip). */
       seed(tasks: unknown[]) {
@@ -584,12 +590,24 @@ if (params.get("scenario") === "schedules") {
         return rows;
       },
     };
+    // `?trace=<scheduleId>` docks the run trace of that task's synthetic chat
+    //  (`schedule-<id>` — where scheduler.rs logs every run) beside the panel,
+    //  so a driver can assert real prompt/llm rows fetched from the backend.
+    const traceSid = params.get("trace");
+    const TracePanel = traceSid
+      ? (await import("../../src/components/TracePanel")).TracePanel
+      : null;
     root.render(
       <div style={{ display: "flex", height: "100vh", background: "var(--bg, #0b0e14)" }}>
         <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }} dir="rtl">
           <ScheduleSection />
         </div>
         <ScheduleInbox />
+        {traceSid && TracePanel ? (
+          <div style={{ width: "46%", minWidth: 0, borderLeft: "1px solid #232838" }}>
+            <TracePanel docked chatId={`schedule-${traceSid}`} traceTitle={traceSid} />
+          </div>
+        ) : null}
       </div>,
     );
   }
@@ -650,9 +668,112 @@ if (params.get("scenario") === "schedules") {
     resizes,
     writes,
     emitData: (data: string) => dataCbs.forEach((cb) => cb("t1", data)),
+    /** Color probe: emit a colon-SGR line and the FIXED (semicolon) form, then
+     *  let the driver read back what the screen actually painted — the live
+     *  proof that the Rust-side colon rewrite leaves xterm with RIGHT colors. */
+    colorProbe: async () => {
+      const cTag = "COLONPROBE ";
+      const sTag = "SEMIPROBE ";
+      const COLON = cTag + "\x1b[38:2:224:222:244;48:2:25:23:36mcolon-form\x1b[0m";
+      const SEMI = sTag + "\x1b[38;2;224;222;244;48;2;25;23;36msemicolon-form\x1b[0m";
+      dataCbs.forEach((cb) => cb("t1", "\r\n" + COLON + "\r\n\r\n" + SEMI + "\r\n"));
+      await new Promise((r) => setTimeout(r, 250));
+      const rows = [
+        ...document.querySelectorAll(".terminal-panel .xterm-rows span, .xterm-rows span"),
+      ] as HTMLElement[];
+      const read = (prefix: string) => {
+        const s = rows.find((sp) => sp.textContent?.startsWith(prefix));
+        if (!s) return { found: false };
+        const cs = getComputedStyle(s);
+        const parse = (rgb: string) => {
+          const m = rgb.match(/\d+/g);
+          return m ? m.slice(0, 3).map(Number).join(",") : rgb;
+        };
+        return { found: true, fg: parse(cs.color), bg: parse(cs.backgroundColor) };
+      };
+      return { colon: read(cTag), semi: read(sTag) };
+    },
   };
   const { TerminalPanel } = await import("../../src/components/TerminalPanel");
   root.render(<TerminalPanel />);
+} else if (params.get("scenario") === "terminal-tab") {
+  // RIGHT-PANE terminal TAB (TerminalTabPanel -> openTerminalSession) in a real
+  // xterm screen, against the NEW early-data contract, reproducing the ORIGINAL
+  // "nvim opens blank" race live: the stub's pty emits its welcome frame the
+  // instant it "spawns" — BEFORE the terminal_create answer resolves — exactly
+  // like the Rust reader thread in pty.rs. The tab must open on that frame.
+  const dataCbs: Array<(id: string, data: string) => void> = [];
+  const writes: string[] = [];
+  const created: Array<string | null> = [];
+  let answeredId = "";
+  const WELCOME =
+    "\x1b[32mRACE WELCOME: emitted BEFORE terminal_create answered\x1b[0m\r\n" +
+    "second line of the very first frame\r\n";
+  const coder = (window as unknown as { coder: Record<string, unknown> }).coder;
+  coder.terminalCreate = (
+    cwd: string,
+    _program: unknown,
+    _args: unknown,
+    _shell: unknown,
+    requestedId?: string,
+  ) =>
+    new Promise((resolve) => {
+      created.push(requestedId ?? null);
+      // Reader thread: bytes leave the pty BEFORE the create answer (+30 vs
+      // +180) — the window the old router silently dropped.
+      setTimeout(() => {
+        const id = requestedId && requestedId.trim() ? requestedId : "legacy-pty";
+        dataCbs.forEach((cb) => cb(id, WELCOME));
+        setTimeout(() => {
+          answeredId = id;
+          // The REAL reply shape (pty.rs TerminalSessionInfo).
+          resolve({ id, shell: "zsh", cwd, program: "zsh --login" });
+        }, 150);
+      }, 30);
+    });
+  coder.terminalWrite = (_id: string, data: string) => {
+    writes.push(data);
+    return Promise.resolve(true);
+  };
+  coder.terminalResize = () => Promise.resolve(true);
+  coder.terminalKill = () => Promise.resolve(true);
+  coder.terminalList = () =>
+    Promise.resolve(
+      answeredId ? [{ id: answeredId, shell: "zsh", cwd: "/tmp/terminal-race" }] : [],
+    );
+  coder.onTerminalData = (cb: (id: string, data: string) => void) => {
+    dataCbs.push(cb);
+    return () => {
+      const i = dataCbs.indexOf(cb);
+      if (i >= 0) dataCbs.splice(i, 1);
+    };
+  };
+  coder.onTerminalExit = () => () => {};
+  const { TerminalTabPanel } = await import("../../src/components/TerminalTabPanel");
+  const { useViewerTabs } = await import("../../src/lib/viewerTabs");
+  (window as any).__ui.viewer = useViewerTabs;
+  // Through the app's OWN open action (like a real click would), so the panel's
+  // chip strip renders from real store state.
+  useViewerTabs.getState().openTerminal({
+    cwd: "/tmp/terminal-race",
+    shell: "zsh",
+    chatId: "c1",
+    title: "zsh — race",
+  });
+  const TAB = useViewerTabs.getState().activeId ?? "";
+  root.render(
+    <div style={{ height: "100vh", background: "var(--bg, #0b0e14)" }}>
+      <TerminalTabPanel tabId={TAB} cwd="/tmp/terminal-race" program="" args={[]} shell="zsh" />
+    </div>,
+  );
+  (window as any).__term = {
+    tab: () => TAB,
+    created: () => created,
+    answered: () => answeredId,
+    writes,
+    /** Post-answer stream: the live pipe must keep flowing after the replay. */
+    emit: (data: string) => answeredId && dataCbs.forEach((cb) => cb(answeredId, data)),
+  };
 } else if (params.get("scenario") === "diff") {
   // Diff panel (git/review) for the highlight -> Copy/Reply flow: a selection
   // must arm the toolbar, and the reply must state the path + line ONCE (the

@@ -134,7 +134,10 @@ export function ArtifactsPanel() {
       {searchable && (
         <div className="review-search-row">
           <label className="review-search" dir="ltr">
-            <span aria-hidden="true">🔍</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" />
+          </svg>
             <input
               className="review-search-input"
               type="search"

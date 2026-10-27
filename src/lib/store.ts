@@ -921,8 +921,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -1007,7 +1007,7 @@ if (typeof window !== 'undefined') {
 // A monotonic counter drops any snapshot that a newer writeStateNow superseded.
 let persistSeq = 0
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -1023,7 +1023,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, sttPrompt, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1409,6 +1409,10 @@ interface State {
   /** User-level data root (skills/plans/mcp). */
   dataPath: string
   setDataPath: (p: string) => void
+  /** Directory the Settings → Storage backup zip is written to.
+   *  "" = the data root itself (~/.codifa unless moved). */
+  backupPath: string
+  setBackupPath: (p: string) => void
   /** STT source: a settings.providers id (remote OpenAI-compatible endpoint). */
   sttProviderId: string
   /** Remote STT model id sent to {base_url}/audio/transcriptions. */
@@ -2079,6 +2083,7 @@ export const useStore = create<State>((set, get) => ({
   terminalFullscreen: typeof window !== 'undefined' ? loadTerminalFullscreen() : false,
   terminalHeight: typeof window !== 'undefined' ? loadTerminalHeight() : DEFAULT_TERMINAL_HEIGHT,
   dataPath: '',
+  backupPath: '',
   workspaceColors: {},
   pinnedWorkspaces: [],
   pinnedChats: [],
@@ -2512,6 +2517,9 @@ export const useStore = create<State>((set, get) => ({
       dir: raw.dir === 'ltr' ? 'ltr' : 'rtl',
       fontSize,
       dataPath: typeof raw.dataPath === 'string' && raw.dataPath.trim() ? raw.dataPath : (realDataPath || ''),
+      backupPath: typeof (raw as Record<string, unknown>).backupPath === 'string'
+        ? ((raw as Record<string, unknown>).backupPath as string).trim()
+        : '',
       // No on-device STT anymore: an empty id means "not selected", never a
       // magic 'local' row (the legacy value is migrated away here).
       sttProviderId:
@@ -3113,6 +3121,11 @@ export const useStore = create<State>((set, get) => ({
 
   setDataPath: (dataPath) => {
     set({ dataPath: (dataPath ?? '').trim() })
+    get().persist()
+  },
+
+  setBackupPath: (backupPath) => {
+    set({ backupPath: (backupPath ?? '').trim() })
     get().persist()
   },
 

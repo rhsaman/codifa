@@ -158,7 +158,7 @@ console.log("۶-ب) planDisplay — متن پلن بین دو ابزار (update
 }
 
 const { useViewerTabs, visibleTabs } = await import("../src/lib/viewerTabs")
-const { useStore } = await import("../src/lib/store")
+const { useStore, workspaceKey } = await import("../src/lib/store")
 
 console.log("۷) تب Plan — openPlan تب plan می‌سازد و فعال می‌کند:")
 {
@@ -196,19 +196,22 @@ console.log("۷-ب) تب Browser — openBrowser تب browser را می‌ساز
   check("closeViewer حذف می‌کند", !useViewerTabs.getState().tabs.some((t) => t.kind === "browser"))
 }
 
-console.log("۷-ه) تب‌های browser/git چت‌محورند — هر چت تب‌های خودش را دارد:")
+console.log("۷-ه) تب browser چت‌محور است و تب git ورک‌اسپیس‌محور:")
 {
+  // The hand-made chat ids have no store rows, so both resolve to the same
+  // fallback workspace — exactly the case the split is about.
+  const WS = workspaceKey("")
   useViewerTabs.getState().openBrowser("chat-a")
   useViewerTabs.getState().openGitDiff("chat-a")
   useViewerTabs.getState().openBrowser("chat-b")
   const s = useViewerTabs.getState()
   check("دو تب browser جدا برای دو چت", s.tabs.filter((t) => t.kind === "browser").length === 2, s.tabs.map((t) => t.id))
-  const visA = visibleTabs(s.tabs, "chat-a")
-  const visB = visibleTabs(s.tabs, "chat-b")
+  const visA = visibleTabs(s.tabs, { wsKey: WS, chatId: "chat-a" })
+  const visB = visibleTabs(s.tabs, { wsKey: WS, chatId: "chat-b" })
   check("چت a تب browser خودش را می‌بیند", visA.some((t) => t.id === "browser:chat-a"))
   check("چت b تب browser چت a را نمی‌بیند", !visB.some((t) => t.id === "browser:chat-a"))
   check("چت a تب browser چت b را نمی‌بیند", !visA.some((t) => t.id === "browser:chat-b"))
-  check("تب git هم چت‌محور است", visA.some((t) => t.id === "review:chat-a") && !visB.some((t) => t.id === "review:chat-a"))
+  check("تب git برای کل ورک‌اسپیس یکی است و هر دو چت می‌بینند", visA.some((t) => t.kind === "review") && visB.some((t) => t.kind === "review") && s.tabs.filter((t) => t.kind === "review").length === 1, s.tabs.map((t) => t.id))
   // پاک‌سازی تب‌های این تست
   for (const t of s.tabs.filter((t) => t.kind === "browser" || t.kind === "review")) useViewerTabs.getState().closeViewer(t.id)
 }

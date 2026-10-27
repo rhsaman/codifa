@@ -3,7 +3,7 @@ import { useStore } from "../lib/store";
 import { prepareContent } from "../lib/bidi";
 import { dropSide, edgeScroll, tabMove } from "../lib/tabBar";
 import { previewSlot } from "../lib/tabOrder";
-import { shownViewerTabId, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerTab } from "../lib/viewerTabs";
+import { shownViewerTabId, TAB_STRIP_KINDS, useViewerScope, useViewerTabs, viewerTabRows, viewerTabTitle, visibleTabs, type ClosedViewerTab, type ViewerKind, type ViewerScope, type ViewerTab } from "../lib/viewerTabs";
 import { setViewerDragData } from "./ViewerWindows";
 import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
@@ -180,35 +180,41 @@ export function viewerTabIcon(t: ViewerTab): React.ReactNode {
 
 /** Build the viewer tab-list sections (visible open tabs, then recently
  *  closed tabs). Single source of truth for the header dropdown and the
- *  inline empty-state list. */
+ *  inline empty-state list. DOCK PAGES NEVER APPEAR HERE: the bottom dock's
+ *  fixed icons own those pages (they toggle from there), so the tab list —
+ *  and its close buttons — stay purely about the top strip's tabs. */
 export function buildViewerTabListSections(
   tabs: ViewerTab[],
   closed: ClosedViewerTab[],
   activeId: string | null,
-  activeChatId: string,
+  scope: ViewerScope,
 ): TabListSection[] {
   return [
     {
       label: "Open tabs",
-      entries: visibleTabs(tabs, activeChatId).map((t) => ({
-        key: t.id,
-        title: viewerTabTitle(t),
-        icon: viewerTabIcon(t),
-        age: t.createdAt,
-        active: t.id === activeId,
-        onOpen: () => useViewerTabs.getState().setActiveViewer(t.id),
-        onClose: () => useViewerTabs.getState().closeViewer(t.id),
-      })),
+      entries: visibleTabs(tabs, scope)
+        .filter((t) => TAB_STRIP_KINDS.has(t.kind))
+        .map((t) => ({
+          key: t.id,
+          title: viewerTabTitle(t),
+          icon: viewerTabIcon(t),
+          age: t.createdAt,
+          active: t.id === activeId,
+          onOpen: () => useViewerTabs.getState().setActiveViewer(t.id),
+          onClose: () => useViewerTabs.getState().closeViewer(t.id),
+        })),
     },
     {
       label: "Recently closed tabs",
-      entries: closed.map((c) => ({
-        key: `closed-${c.tab.id}`,
-        title: viewerTabTitle(c.tab),
-        icon: viewerTabIcon(c.tab),
-        age: c.closedAt,
-        onOpen: () => useViewerTabs.getState().reopenClosedViewerTab(c.tab.id),
-      })),
+      entries: closed
+        .filter((c) => TAB_STRIP_KINDS.has(c.tab.kind))
+        .map((c) => ({
+          key: `closed-${c.tab.id}`,
+          title: viewerTabTitle(c.tab),
+          icon: viewerTabIcon(c.tab),
+          age: c.closedAt,
+          onOpen: () => useViewerTabs.getState().reopenClosedViewerTab(c.tab.id),
+        })),
     },
   ];
 }
@@ -263,20 +269,24 @@ export function ViewerTabListButton() {
   const tabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
   const closed = useViewerTabs((s) => s.closedTabs);
-  const activeChatId = useStore((s) => s.activeChatId);
-  const sections = buildViewerTabListSections(tabs, closed, activeId, activeChatId);
-  const visibleCount = visibleTabs(tabs, activeChatId).length;
+  const scope = useViewerScope();
+  const sections = buildViewerTabListSections(tabs, closed, activeId, scope);
+  // The count (and the bulk close) covers the STRIP tabs only — dock pages are
+  // toggled from the dock, never swept by the tab list.
+  const stripTabs = visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind));
   return (
     <TabListButton
       sections={sections}
       label="Tab list"
-      placement="left"
+      placement="bottom"
       menuWidth={TAB_LIST_MENU_WIDTH}
       footer={{
-        label: visibleCount > 0 ? `Close all tabs (${visibleCount})` : "No open tabs",
-        title: "Close all tabs of the active chat (kept in Recently closed)",
-        disabled: visibleCount === 0,
-        onPress: () => useViewerTabs.getState().closeAllViewers(activeChatId),
+        label: stripTabs.length > 0 ? `Close all tabs (${stripTabs.length})` : "No open tabs",
+        title: "Close every open tab of the active chat (kept in Recently closed)",
+        disabled: stripTabs.length === 0,
+        onPress: () => {
+          for (const t of stripTabs) useViewerTabs.getState().closeViewer(t.id);
+        },
       }}
     />
   );
@@ -292,34 +302,26 @@ export function openTerminalTab(): void {
   useViewerTabs.getState().openTerminal({ cwd: useStore.getState().root });
 }
 
-/** Publish a rail row's box to CSS so its floating name can be positioned by
- *  the stylesheet: `--viewer-tab-hint-top` (vertical center) and
- *  `--viewer-tab-hint-right` (distance from the viewport's right edge to the
- *  row's left edge). The rail scrolls, so both are measured per hover instead
- *  of being hard-coded; the rail's own width is never touched. */
-function publishHintAnchor(row: HTMLElement): void {
-  const rect = row.getBoundingClientRect();
-  row.style.setProperty("--viewer-tab-hint-top", `${Math.round(rect.top + rect.height / 2)}px`);
-  row.style.setProperty(
-    "--viewer-tab-hint-right",
-    `${Math.round(window.innerWidth - rect.right)}px`,
-  );
-}
-
-/** VSCode-style tab bar for the right editor group (diff / trace / inbox). */
+/** VSCode-style tab strip for the right editor group (diff / trace / files /
+ * pages) — a horizontal, titled tab row along the pane's TOP edge. Tabs
+ * squeeze instead of scrolling; the tab-list chevron beside it reaches the
+ * rest. */
 export function ViewerTabBar() {
   const allTabs = useViewerTabs((s) => s.tabs);
   const activeId = useViewerTabs((s) => s.activeId);
-  const activeChatId = useStore((s) => s.activeChatId);
-  // Every visible tab is a row — pages included, since the "+" menu opens them
+  const scope = useViewerScope();
+  // Every visible tab is a row — pages included, since the dock opens them
   // as ordinary tabs, so each one can be closed from its own row. Terminal tabs
   // are the exception: they collapse into ONE row (their shells are listed in
-  // the pane body's own chip strip), and the single row highlights the ACTIVE
+  // the panel's own chip strip), and the single row highlights the ACTIVE
   // shell.
-  const tabs = viewerTabRows(allTabs, activeChatId, activeId);
+  const tabs = viewerTabRows(allTabs, scope, activeId);
   // Same rule the pane body uses, so the highlighted row is the painted page.
-  const activeRowId = shownViewerTabId(allTabs, activeId, activeChatId);
-  const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : tabs[0]?.id ?? null;
+  // NO fallback to the first tab: when a DOCK page (todos/git/terminal…) is on
+  // screen the strip highlights nothing — the dock's own button carries the
+  // pressed state, and the two surfaces stay separate.
+  const activeRowId = shownViewerTabId(allTabs, activeId, scope);
+  const shownActiveId = tabs.some((t) => t.id === activeRowId) ? activeRowId : null;
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -371,10 +373,10 @@ export function ViewerTabBar() {
   return (
     <div
       ref={barRef}
-      className="tab-bar viewer-tabs viewer-tabs-rail"
+      className="tab-bar viewer-tabs viewer-tabs-top"
       role="tablist"
       aria-label="Viewers"
-      aria-orientation="vertical"
+      aria-orientation="horizontal"
       onDragOver={(e) => {
         if (!dragId) return;
         e.preventDefault();
@@ -382,12 +384,12 @@ export function ViewerTabBar() {
         const bar = barRef.current;
         if (!bar) return;
         // Dragging near the rail's edge scrolls it, so off-screen tabs stay reachable.
-        const delta = edgeScroll(e.clientY, bar.getBoundingClientRect(), "y");
-        if (delta) bar.scrollTop += delta;
+        const delta = edgeScroll(e.clientX, bar.getBoundingClientRect(), "x");
+        if (delta) bar.scrollLeft += delta;
         // Empty space past the visible last tab previews a landing at the very end.
         if (!tailId || tailId === dragId) return;
         const tailEl = bar.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`);
-        if (!tailEl || e.clientY <= tailEl.getBoundingClientRect().bottom) return;
+        if (!tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
         setDropTarget((prev) =>
           prev?.id === tailId && prev.after ? prev : { id: tailId, after: true },
         );
@@ -402,7 +404,7 @@ export function ViewerTabBar() {
         const tailEl = tailId
           ? barRef.current?.querySelector<HTMLElement>(`[data-tab-id="${tailId}"]`)
           : null;
-        if (!tailId || !tailEl || e.clientY <= tailEl.getBoundingClientRect().bottom) return;
+        if (!tailId || !tailEl || e.clientX <= tailEl.getBoundingClientRect().right) return;
         const from = e.dataTransfer.getData("text/plain") || dragId;
         if (!from || from === tailId) return;
         e.preventDefault();
@@ -430,15 +432,7 @@ export function ViewerTabBar() {
             className={`editor-tab viewer-tab kind-${t.kind}${active ? " active" : ""}${dragId === t.id ? " dragging drop-preview" : ""}${dropCls}`}
             style={order === undefined ? undefined : { order }}
             aria-label={title}
-            // No `title`: while hovered the name is painted on the tab itself,
-            // so a native tooltip would repeat it.
-            // The row publishes where the floating name must land: vertically
-            // centered on the hovered row and flush against its left edge. Both
-            // are measured here (not in CSS) because the rail scrolls.
-            onMouseEnter={(e) => publishHintAnchor(e.currentTarget)}
-            // Keyboard focus shows the same name; React's focus event bubbles,
-            // so focusing the row or its ✕ both land here.
-            onFocus={(e) => publishHintAnchor(e.currentTarget)}
+            title={title}
             onClick={() => useViewerTabs.getState().setActiveViewer(t.id)}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
@@ -447,7 +441,7 @@ export function ViewerTabBar() {
                 return;
               }
               // Alt+Arrow moves the focused tab without dragging the mouse.
-              const target = tabMove(tabs.map((x) => x.id), t.id, e.key, e.altKey, "y");
+              const target = tabMove(tabs.map((x) => x.id), t.id, e.key, e.altKey, "x");
               if (!target) return;
               e.preventDefault();
               useViewerTabs.getState().moveViewerTab(t.id, target.toId, target.after);
@@ -464,7 +458,7 @@ export function ViewerTabBar() {
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-              const after = dropSide(e.clientY, rect, "y") === "after";
+              const after = dropSide(e.clientX, rect, "x") === "after";
               setDropTarget((prev) =>
                 prev?.id === t.id && prev.after === after ? prev : { id: t.id, after },
               );
@@ -477,7 +471,7 @@ export function ViewerTabBar() {
               const from = e.dataTransfer.getData("text/plain") || dragId;
               if (from && from !== t.id) {
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                const after = dropSide(e.clientY, rect, "y") === "after";
+                const after = dropSide(e.clientX, rect, "x") === "after";
                 useViewerTabs.getState().moveViewerTab(from, t.id, after);
               }
               clearDrag();
@@ -491,12 +485,10 @@ export function ViewerTabBar() {
                 <Icon />
               )}
             </span>
-            {/* One card holds BOTH halves: the name (clicking it activates the
-                tab — the event bubbles to the row) and the ✕ at its right end
-                (which closes, and sits where the kind icon was). The card is
-                only painted while hovered; at rest the rail stays icon-only.
-                Because that ✕ covers the row's square, it only closes the tab
-                that is ON SCREEN — an inactive row is switched to instead. */}
+            {/* The label holds the name (clicking it activates the tab — the
+                event bubbles to the row) and the ✕ at its right end, which
+                closes THIS tab: the strip shows one ✕ per tab, like the chat
+                bar. A middle-click closes too. */}
             <span className="editor-tab-label" dir="ltr">
               <span className="viewer-tab-name">{title}</span>
               <button
@@ -506,17 +498,6 @@ export function ViewerTabBar() {
                 draggable={false}
                 onClick={(e) => {
                   e.stopPropagation();
-                  // The card's ✕ sits exactly on the row's icon square (hover
-                  // replaces the kind icon), so the click that was meant to
-                  // SWITCH to this tab lands on the ✕. Closing the tab the user
-                  // meant to open is how open files kept disappearing from the
-                  // rail. Only the SHOWN tab's ✕ closes; an inactive row is
-                  // activated instead. Other rows close from the tab list
-                  // (its own ✕) or with a middle-click.
-                  if (!active) {
-                    useViewerTabs.getState().setActiveViewer(t.id);
-                    return;
-                  }
                   useViewerTabs.getState().closeViewer(t.id);
                 }}
               >
@@ -530,11 +511,9 @@ export function ViewerTabBar() {
   );
 }
 
-/** Fullscreen toggle for the whole side pane — lives in the pane header,
- *  directly below the tab-list chevron and above the "+" page menu (not inside
- *  the tab bar). Canonical rail order, top to bottom: [collapse | tab list |
- *  fullscreen | "+" | tab rows]. ALWAYS rendered: the pane itself can be
- *  expanded with no tab open (its body then shows the todos fallback). */
+/** Fullscreen toggle for the whole side pane — lives in the pane's top strip,
+ *  at its right end (after the tab rows). ALWAYS rendered: the pane itself can
+ *  be expanded with no tab open (its body then shows the todos fallback). */
 export function ViewerPaneFullscreenButton() {
   const viewerFull = useViewerTabs((s) => s.fullscreen);
   return (
@@ -578,29 +557,15 @@ function TodosIcon() {
 export function ViewerAddButton() {
   const activeChatId = useStore((s) => s.activeChatId);
   const vt = () => useViewerTabs.getState();
+  // ONLY the chat-owned pages live here: everything else is a permanent dock
+  // icon at the pane's bottom edge (ViewerDockBar), so the menu stays two
+  // entries small.
   const sections: TabListSection[] = [
     {
-      label: "Pane",
+      label: "Chat pages",
       entries: [
-        {
-          key: "terminal",
-          title: "Terminal",
-          icon: <TerminalIcon />,
-          onOpen: openTerminalTab,
-        },
-      ],
-    },
-    {
-      label: "Open a page",
-      entries: [
-        { key: "files", title: "Files", icon: <FilesIcon />, onOpen: () => vt().openFiles() },
-        { key: "todos", title: "Todos", icon: <TodosIcon />, onOpen: () => vt().openTodos(activeChatId) },
-        { key: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onOpen: () => vt().openArtifacts() },
-        { key: "review", title: "Git diff", icon: <ReviewIcon />, onOpen: () => vt().openGitDiff(activeChatId) },
-        { key: "trace", title: "Trace", icon: <TraceIcon />, onOpen: () => vt().openTraces(activeChatId) },
         { key: "browser", title: "Browser", icon: <BrowserIcon />, onOpen: () => vt().openBrowser(activeChatId) },
-        { key: "schedule", title: "Schedule", icon: <ScheduleIcon />, onOpen: () => vt().openSchedule() },
-        { key: "inbox", title: "Inbox", icon: <InboxIcon />, onOpen: () => vt().openInbox() },
+        { key: "trace", title: "Trace", icon: <TraceIcon />, onOpen: () => vt().openTraces(activeChatId) },
       ],
     },
   ];
@@ -611,6 +576,80 @@ export function ViewerAddButton() {
       className="viewer-add-btn"
       icon={<AddIcon />}
     />
+  );
+}
+
+/** Fixed launcher dock along the pane's BOTTOM edge — a slim, always-present
+ *  icon row (one button per page, T3-Code style). COMPLETELY SEPARATE from the
+ *  top tab strip: these pages never become tab rows up there. A click opens
+ *  the page; clicking again (while its page is on screen) closes it, so the
+ *  dock is a switcher, not a launcher that litters the strip. Browser/Trace
+ *  are chat-owned TABS and come from the strip's "+" menu instead. */
+export function ViewerDockBar() {
+  const allTabs = useViewerTabs((s) => s.tabs);
+  const activeId = useViewerTabs((s) => s.activeId);
+  const scope = useViewerScope();
+  // Same rule the pane body uses: the pressed dock button mirrors the page
+  // that is actually painted right now.
+  const shownTab = allTabs.find((t) => t.id === shownViewerTabId(allTabs, activeId, scope));
+  const vt = () => useViewerTabs.getState();
+  const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; onPress: () => void }> = [
+    { kind: "files", title: "Files", icon: <FilesIcon />, onPress: () => vt().openFiles() },
+    { kind: "todos", title: "Todos", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
+    { kind: "review", title: "Git diff", icon: <ReviewIcon />, onPress: () => vt().openGitDiff(scope.chatId) },
+    { kind: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onPress: () => vt().openArtifacts() },
+    { kind: "schedule", title: "Schedule", icon: <ScheduleIcon />, onPress: () => vt().openSchedule() },
+    { kind: "inbox", title: "Inbox", icon: <InboxIcon />, onPress: () => vt().openInbox() },
+    { kind: "terminal", title: "Terminal", icon: <TerminalIcon />, onPress: openTerminalTab },
+  ];
+  return (
+    <div className="viewer-dock" role="toolbar" aria-label="Pane pages">
+      {dock.map((d) => {
+        const active = shownTab?.kind === d.kind;
+        return (
+          <button
+            key={d.kind}
+            type="button"
+            className={`viewer-dock-btn${active ? " active" : ""}`}
+            title={d.title}
+            aria-label={d.title}
+            aria-pressed={active}
+            onClick={() => {
+              // Toggle: the page is on screen → close it (the pane falls back
+              // to the next tab or the todos page). Otherwise open/focus it.
+              if (active && shownTab) {
+                vt().closeViewer(shownTab.id);
+                return;
+              }
+              d.onPress();
+            }}
+          >
+            {d.icon}
+          </button>
+        );
+      })}
+      <span className="viewer-dock-spacer" aria-hidden="true" />
+    </div>
+  );
+}
+
+/** Hide-side-pane toggle for the TOP strip's right end — sits to the right of
+ *  the fullscreen button. */
+export function ViewerPaneToggleButton() {
+  return (
+    <button
+      type="button"
+      className="titlebar-icon-btn viewer-pane-toggle"
+      title="Hide side pane"
+      aria-label="Hide side pane"
+      onClick={() => useViewerTabs.getState().setPaneOpen(false)}
+    >
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2.5" />
+        <path d="M15 4v16" />
+        <rect x="16.2" y="6.5" width="4.1" height="11" rx="1.2" fill="currentColor" stroke="none" opacity="0.55" className="panel-toggle-fill" />
+      </svg>
+    </button>
   );
 }
 

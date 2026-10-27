@@ -66,8 +66,10 @@ export interface PrefixShortcut {
   label: string;
   /** Non-command actions that App.tsx dispatches directly. `live` toggles
    *  the realtime voice session; `voice` is hold-Space dictation; `terminal`
-   *  toggles the bottom terminal panel. */
-  action?: "voice" | "live" | "terminal";
+   *  toggles the bottom terminal panel; `pane-left`/`pane-right` move focus
+   *  across the app's three sections (sidebar ↔ chats ↔ right pane); and
+   *  `terminal-focus` lands the caret in the bottom terminal, opening it. */
+  action?: "voice" | "live" | "terminal" | "pane-left" | "pane-right" | "terminal-focus";
 }
 
 /** Second key (after Ctrl+X) -> the command it runs. Order is display order.
@@ -80,6 +82,9 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   v: { cmd: "/voice", label: "Toggle the live voice session", action: "live" },
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
   j: { cmd: "", label: "Toggle the terminal panel", action: "terminal" },
+  l: { cmd: "", label: "Move focus right: sidebar → chats → right pane", action: "pane-right" },
+  h: { cmd: "", label: "Move focus left: right pane → chats → sidebar", action: "pane-left" },
+  t: { cmd: "", label: "Focus the terminal (opens it if closed)", action: "terminal-focus" },
 };
 
 /** Move direction for the direct chord (Cmd/Ctrl + H/J/K/L, no Ctrl+X prefix).
@@ -147,7 +152,7 @@ export const GLOBAL_SHORTCUTS: GlobalShortcut[] = [
   { keys: "Cmd/Ctrl+B", label: "Toggle sidebar" },
   { keys: "Cmd/Ctrl+Shift+B", label: "Toggle right panel" },
   { keys: "Ctrl+X then J", label: "Toggle the terminal panel (the only terminal toggle — works while the caret is inside the terminal too)" },
-  { keys: "Ctrl+H/J/K/L", label: "Move focus vim-style (k=up, j=down, h=left, l=right): to the chat window that really lies in that direction; past the rightmost window l enters the open right panel, past the leftmost h enters the open sidebar, and h/l return from them to the chat (Ctrl+H also leaves a terminal tab of the right panel; the bottom terminal keeps Ctrl+H for the shell)" },
+  { keys: "Ctrl+H/J/K/L", label: "Move focus between the split CHAT windows vim-style (k=up, j=down, h=left, l=right) — to the window that really lies in that direction, nothing beyond them. The three sections (sidebar / chats / right pane / terminal) are reached only with Ctrl+X then L/H/T" },
   { keys: "Shift+Alt(Option)+H/J/K/L", label: "Swap (move) chat window positions in the same vim directions" },
   {
     keys: "Cmd+W",

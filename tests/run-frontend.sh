@@ -198,6 +198,7 @@ settingsSuggestions|tests/settingsSuggestions.ssr.test.tsx|--jsx=automatic --pac
 xtermTheme|tests/xtermTheme.test.ts|--jsx=automatic --packages=external --alias:@xterm/xterm=./tests/xterm-stub.js --alias:@xterm/addon-fit=./tests/xterm-stub.js --alias:@xterm/addon-web-links=./tests/xterm-stub.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js --external:electron
 terminalTab|tests/terminalTab.test.ts|--packages=external --external:electron
 terminalSessionKeys|tests/terminalSessionKeys.test.ts|--packages=external --external:electron --alias:@xterm/xterm=./tests/xterm-spy.js --alias:@xterm/addon-fit=./tests/xterm-spy.js --alias:@xterm/addon-web-links=./tests/xterm-spy.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js
+terminalEarlyData|tests/terminalEarlyData.test.ts|--packages=external --external:electron --alias:@xterm/xterm=./tests/xterm-spy.js --alias:@xterm/addon-fit=./tests/xterm-spy.js --alias:@xterm/addon-web-links=./tests/xterm-spy.js --alias:@xterm/xterm/css/xterm.css=./tests/css-stub.js
 terminalTheme|tests/terminalTheme.test.ts|-
 fileTree|tests/fileTree.test.ts|--packages=external --external:electron
 fileActions|tests/fileActions.test.ts|--packages=external --external:electron

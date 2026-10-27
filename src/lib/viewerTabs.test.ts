@@ -35,7 +35,7 @@ const memStore = new Map<string, string>()
 
 const { useViewerTabs, viewerTabId, viewerTabTitle, visibleTabs, resolveViewerForChat, syncViewerToChat, shownViewerTabId } = await import('./viewerTabs')
 const { collectChatIds, leafCount } = await import('./chatTree')
-const { useStore, normalizeVisibleChats, normalizeChatLayout } = await import('./store')
+const { useStore, normalizeVisibleChats, normalizeChatLayout, workspaceKey } = await import('./store')
 
 export {}
 
@@ -49,56 +49,72 @@ function check(name: string, cond: boolean, extra?: unknown) {
   }
 }
 
+/** A chat rooted in its own workspace, activated (open* actions scope to the
+ *  focused chat's workspace). Returns [chatId, workspaceKey]. */
+function chatInWs(root: string): [string, string] {
+  const id = useStore.getState().newChatInRoot(root)
+  useStore.setState({ activeChatId: id })
+  return [id, workspaceKey(root)]
+}
+
+function scopeOf(chatId: string, wsKey: string) {
+  return { wsKey, chatId }
+}
+
 function resetViewer() {
   useViewerTabs.setState({ tabs: [], activeId: null })
   memStore.clear()
 }
 
-console.log('1) viewerTabId — file and text are chat-scoped:')
+console.log('1) viewerTabId — the key is opaque (chat id or workspace key):')
 {
-  check('file id carries chat', viewerTabId('file', 'c1') === 'file:c1')
-  check('text id carries chat', viewerTabId('text', 'c1') === 'text:c1')
-  check('review stays chat-scoped', viewerTabId('review', 'c9') === 'review:c9')
+  check('file id carries its scope key', viewerTabId('file', 'c1') === 'file:c1')
+  check('text id carries its scope key', viewerTabId('text', 'c1') === 'text:c1')
+  check('review id carries its scope key', viewerTabId('review', 'c9') === 'review:c9')
 }
 
-console.log('2) openFile — one tab per file per chat, reopen retargets line:')
+console.log('2) openFile — one tab per file per WORKSPACE, reopen retargets line:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
-  vt().openFile('src/App.tsx', 10, '/root', c1)
-  vt().openFile('src/App.tsx', 42, '/root', c1)
-  vt().openFile('src/other.ts', undefined, '/root', c1)
+  const [c1, wsA] = chatInWs('/ws-a')
+  vt().openFile('src/App.tsx', 10, '/ws-a', c1)
+  vt().openFile('src/App.tsx', 42, '/ws-a', c1)
+  vt().openFile('src/other.ts', undefined, '/ws-a', c1)
   const tabs = vt().tabs
   check('two file tabs (no stacking)', tabs.length === 2, tabs.length)
-  const app = tabs.find((t) => t.id === `file:${c1}:src/App.tsx`)
-  check('scoped id carries chat', !!app, tabs.map((t) => t.id))
+  const app = tabs.find((t) => t.id === `file:${wsA}:src/App.tsx`)
+  check('scoped id carries the workspace key', !!app, tabs.map((t) => t.id))
   check('reopen updates line', app?.fileLine === 42, app?.fileLine)
-  check('root captured', app?.fileRoot === '/root', app?.fileRoot)
-  check('active is last opened', vt().activeId === `file:${c1}:src/other.ts`, vt().activeId)
-  const c2 = useStore.getState().newChat('ask')
-  vt().openFile('src/App.tsx', 7, '/root', c2)
-  check('same path in another chat is a separate tab', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
+  check('root captured', app?.fileRoot === '/ws-a', app?.fileRoot)
+  check('active is last opened', vt().activeId === `file:${wsA}:src/other.ts`, vt().activeId)
+  const [c2] = chatInWs('/ws-a')
+  vt().openFile('src/App.tsx', 7, '/ws-a', c2)
+  check('same path from another chat of the SAME workspace retargets the tab', vt().tabs.length === 2, vt().tabs.map((t) => t.id))
+  const [c3, wsB] = chatInWs('/ws-b')
+  vt().openFile('src/App.tsx', 7, '/ws-b', c3)
+  check('same path in ANOTHER workspace is a separate tab', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
+  check('the other workspace tab carries its own key', vt().tabs.some((t) => t.id === `file:${wsB}:src/App.tsx`), vt().tabs.map((t) => t.id))
   check('blank path ignored', (() => {
     vt().openFile('   ')
     return vt().tabs.length === 3
   })())
 }
 
-console.log('3) openText — one tab per chat, reopen updates in place:')
+console.log('3) openText — one tab per WORKSPACE, reopen updates in place:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const chatId = useStore.getState().newChat('ask')
+  const [, wsA] = chatInWs('/ws-a')
   vt().openText('First', 'body-one', 'text')
   vt().openText('Second', 'body-two', 'md')
   const tabs = vt().tabs
-  check('single text tab per chat', tabs.filter((t) => t.kind === 'text').length === 1, tabs.length)
+  check('single text tab per workspace', tabs.filter((t) => t.kind === 'text').length === 1, tabs.length)
   const tab = tabs.find((t) => t.kind === 'text')
   check('title updated', tab?.title === 'Second', tab?.title)
   check('body updated', tab?.textBody === 'body-two', tab?.textBody)
   check('format hint updated', tab?.textFormat === 'md', tab?.textFormat)
-  check('chat-scoped id', tab?.id === `text:${chatId}`, tab?.id)
+  check('workspace-scoped id', tab?.id === `text:${wsA}`, tab?.id)
   check('empty body ignored', (() => {
     vt().openText('Empty', '')
     return vt().tabs.length === 1
@@ -107,24 +123,24 @@ console.log('3) openText — one tab per chat, reopen updates in place:')
   check('format switches to text', useViewerTabs.getState().tabs.find((t) => t.kind === 'text')?.textFormat === 'text')
 }
 
-console.log('4) visibleTabs — file tabs follow their chat, legacy global stays visible:')
+console.log('4) visibleTabs — tabs follow their WORKSPACE, legacy global file stays visible:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
-  vt().openFile('a.ts', undefined, undefined, c1)
+  const [c1, wsA] = chatInWs('/ws-a')
+  vt().openFile('a.ts', undefined, '/ws-a', c1)
   vt().openText('T1', 'b1')
-  const c2 = useStore.getState().newChat('ask')
+  const [c2, wsB] = chatInWs('/ws-b')
   vt().openText('T2', 'b2')
   const all = vt().tabs
-  const v1 = visibleTabs(all, c1)
-  const v2 = visibleTabs(all, c2)
-  check('file tab visible only in owning chat', v1.some((t) => t.kind === 'file') && !v2.some((t) => t.kind === 'file'), v2.map((t) => t.id))
-  check('chat1 sees its own text', v1.some((t) => t.textBody === 'b1') && !v1.some((t) => t.textBody === 'b2'))
-  check('chat2 sees its own text', v2.some((t) => t.textBody === 'b2') && !v2.some((t) => t.textBody === 'b1'))
+  const v1 = visibleTabs(all, scopeOf(c1, wsA))
+  const v2 = visibleTabs(all, scopeOf(c2, wsB))
+  check('file tab visible only in its own workspace', v1.some((t) => t.kind === 'file') && !v2.some((t) => t.kind === 'file'), v2.map((t) => t.id))
+  check('ws-a sees its own text', v1.some((t) => t.textBody === 'b1') && !v1.some((t) => t.textBody === 'b2'))
+  check('ws-b sees its own text', v2.some((t) => t.textBody === 'b2') && !v2.some((t) => t.textBody === 'b1'))
   check('legacy global file tab visible everywhere', (() => {
     const legacy = [{ id: 'file:old.ts', kind: 'file', title: 'old.ts', filePath: 'old.ts', createdAt: Date.now() }] as any[]
-    return visibleTabs(legacy, c1).length === 1 && visibleTabs(legacy, c2).length === 1
+    return visibleTabs(legacy, scopeOf(c1, wsA)).length === 1 && visibleTabs(legacy, scopeOf(c2, wsB)).length === 1
   })())
 }
 
@@ -157,6 +173,24 @@ console.log('6) openTraces — sub-agent gets its own filtered trace tab:')
   check('sub-agent tab carries task id', !!sub, tabs)
   check('sub-agent tab id is per-task', sub?.id === `trace:${chatId}:task-abc`, sub?.id)
   check('active is sub-agent tab', vt().activeId === sub?.id, vt().activeId)
+}
+
+console.log('6b) schedule-run trace — synthetic-chat tab visible from ANY chat:')
+{
+  resetViewer()
+  const vt = () => useViewerTabs.getState()
+  const chatId = useStore.getState().newChat('ask')
+  vt().openTraces('schedule-sch-abc', 'all', undefined, 'Nightly Report')
+  const tab = vt().tabs.find((t) => t.id === 'trace:schedule-sch-abc')
+  check('schedule trace tab created', !!tab, tab)
+  check('title carries the task label', tab?.title === 'Trace · Nightly Report', tab?.title)
+  const anyScope = { wsKey: 'ws-other', chatId }
+  check('visible while another chat focused', visibleTabs(vt().tabs, anyScope).some((t) => t.id === tab?.id))
+  check('rail title keeps the label', viewerTabTitle(tab as any) === 'Trace · Nightly Report')
+  // An ordinary chat trace stays scoped as before.
+  vt().openTraces(chatId, 'all')
+  const otherScope = { wsKey: 'ws-other', chatId: 'c-other' }
+  check('ordinary trace hidden from other chats', !visibleTabs(vt().tabs, otherScope).some((t) => t.chatId === chatId))
 }
 
 console.log('7) viewerTabTitle — sub-agent trace keeps its own title:')
@@ -220,12 +254,13 @@ console.log('8c) chat window limits — min size constants and max windows:')
 console.log('9) resolveViewerForChat — focused chat restores its own tab:')
 {
   const tabs = [
-    { id: 'review:c1', kind: 'review', chatId: 'c1' },
-    { id: 'review:c2', kind: 'review', chatId: 'c2' },
+    { id: 'trace:c1', kind: 'trace', chatId: 'c1' },
+    { id: 'trace:c2', kind: 'trace', chatId: 'c2' },
   ] as any[]
-  const v2 = visibleTabs(tabs, 'c2')
-  check('remembers c2 tab', resolveViewerForChat(v2, { c2: 'review:c2' }, 'c2') === 'review:c2')
-  check('stale memory falls back to first visible', resolveViewerForChat(v2, { c2: 'review:c9' }, 'c2') === 'review:c2')
+  const scope2 = scopeOf('c2', 'w')
+  const v2 = visibleTabs(tabs, scope2)
+  check('remembers c2 tab', resolveViewerForChat(v2, { c2: 'trace:c2' }, 'c2') === 'trace:c2')
+  check('stale memory falls back to first visible', resolveViewerForChat(v2, { c2: 'trace:c9' }, 'c2') === 'trace:c2')
   check('no tabs -> null', resolveViewerForChat([], {}, 'c2') === null)
 }
 
@@ -246,11 +281,11 @@ console.log('11) viewer multi-window tree — split, focus, close:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const cid = useStore.getState().newChat('ask')
+  const [cid, wsA] = chatInWs('/ws-a')
   vt().openGitDiff(cid)
-  const gitId = viewerTabId('review', cid)
+  const gitId = `review:${wsA}`
   vt().openTraces(cid, 'all')
-  const traceId = viewerTabId('trace', cid)
+  const traceId = `trace:${cid}`
   vt().ensureViewerTree()
   check('single leaf mirrors active tab', (() => {
     const t = vt().viewerTree
@@ -279,60 +314,75 @@ console.log('12) split width — drag caps at half viewport:')
   check('min width kept', clampSplitWidth(100, 1280) === 320, clampSplitWidth(100, 1280))
 }
 
-console.log('13) openPlan — one chat-scoped plan tab, auto-opens pane:')
+console.log('13) openPlan — one workspace-scoped plan tab, auto-opens pane:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
+  const [c1, wsA] = chatInWs('/ws-a')
   vt().openPlan(c1)
-  const planId = `plan:${c1}`
-  check('plan tab created with chat id', vt().tabs.some((t) => t.id === planId && t.kind === 'plan' && t.chatId === c1), vt().tabs)
+  const planId = `plan:${wsA}`
+  check('plan tab created with workspace key', vt().tabs.some((t) => t.id === planId && t.kind === 'plan' && t.chatId === c1), vt().tabs)
   check('plan tab is active', vt().activeId === planId, vt().activeId)
   check('pane auto-opens', vt().paneOpen === true, vt().paneOpen)
   vt().openPlan(c1)
   check('reopen does not duplicate', vt().tabs.filter((t) => t.kind === 'plan').length === 1, vt().tabs.length)
-  const c2 = useStore.getState().newChat('ask')
+  const [c2] = chatInWs('/ws-a')
   vt().openPlan(c2)
-  check('second chat gets own plan tab', vt().tabs.some((t) => t.id === `plan:${c2}`), vt().tabs.map((t) => t.id))
-  const v1 = visibleTabs(vt().tabs, c1)
-  check('plan tab follows its own chat', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${c2}`), v1.map((t) => t.id))
+  check('another chat of the SAME workspace retargets the tab', vt().tabs.filter((t) => t.kind === 'plan').length === 1, vt().tabs.map((t) => t.id))
+  check('the retargeted tab now belongs to c2', vt().tabs.find((t) => t.kind === 'plan')?.chatId === c2, vt().tabs)
+  const [c3, wsB] = chatInWs('/ws-b')
+  vt().openPlan(c3)
+  check('another WORKSPACE gets its own plan tab', vt().tabs.some((t) => t.id === `plan:${wsB}`), vt().tabs.map((t) => t.id))
+  const v1 = visibleTabs(vt().tabs, scopeOf(c1, wsA))
+  check('plan tab follows its own workspace', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${wsB}`), v1.map((t) => t.id))
 }
 
-console.log('14) syncViewerToChat — a chat switch follows the focused chat:')
+console.log('14) syncViewerToChat — trace follows the chat, workspace tabs stick:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
-  const c2 = useStore.getState().newChat('ask')
+  const [c1, wsA] = chatInWs('/ws-a')
+  const [c2] = chatInWs('/ws-a')
   vt().openGitDiff(c1)
-  vt().openGitDiff(c2)
+  vt().openTraces(c1, 'all')
+  vt().openTraces(c2, 'all')
+  // Put the workspace Git tab on screen (as a deliberate click would), then
+  // switch chats inside the workspace: the pane must NOT be yanked away.
+  vt().setActiveViewer(`review:${wsA}`)
   syncViewerToChat(c2)
-  check('switching chat shows its own tab', vt().activeId === `review:${c2}`, vt().activeId)
+  check('workspace tab sticks across a chat switch', vt().activeId === `review:${wsA}`, vt().activeId)
   syncViewerToChat(c1)
-  check('switching back shows the first chat tab', vt().activeId === `review:${c1}`, vt().activeId)
+  check('workspace tab sticks back too', vt().activeId === `review:${wsA}`, vt().activeId)
+  // Activate chat 1's trace: now a chat-scoped tab owns the pane, and a
+  // switch to chat 2 follows the focused chat again.
+  vt().setActiveViewer(`trace:${c1}`)
+  syncViewerToChat(c2)
+  check('switching chat shows its own trace', vt().activeId === `trace:${c2}`, vt().activeId)
+  syncViewerToChat(c1)
+  check('switching back shows the first chat trace', vt().activeId === `trace:${c1}`, vt().activeId)
 }
 
 console.log('14b) a global page tab never takes the pane from an open file:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
+  const [c1, wsA] = chatInWs('/ws-a')
   vt().openSchedule()
-  vt().openFile('src/App.tsx', 1, '/root', c1)
-  const fileId = `file:${c1}:src/App.tsx`
+  vt().openFile('src/App.tsx', 1, '/ws-a', c1)
+  const fileId = `file:${wsA}:src/App.tsx`
   // An untouched chat (no remembered tab, whose `lastActiveByChat` entry is
   // gone after a restart) must resolve to the chat's OWN tab, never to the
   // global schedule tab sitting first in `tabs`.
   check(
     'fallback prefers the chat tab over the global page tab',
-    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1) === fileId,
-    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1),
+    resolveViewerForChat(visibleTabs(vt().tabs, scopeOf(c1, wsA)), {}, c1) === fileId,
+    resolveViewerForChat(visibleTabs(vt().tabs, scopeOf(c1, wsA)), {}, c1),
   )
   const remembered = { ...vt().lastActiveByChat, [c1]: 'schedule' }
   check(
     'a remembered page tab is not reused when the chat owns a tab',
-    resolveViewerForChat(visibleTabs(vt().tabs, c1), {}, c1) === fileId,
-    resolveViewerForChat(visibleTabs(vt().tabs, c1), remembered, c1),
+    resolveViewerForChat(visibleTabs(vt().tabs, scopeOf(c1, wsA)), {}, c1) === fileId,
+    resolveViewerForChat(visibleTabs(vt().tabs, scopeOf(c1, wsA)), {}, c1),
   )
   // Sets activeId aside first (as a restart does), then syncs the chat.
   useViewerTabs.setState({ activeId: 'schedule' })
@@ -341,8 +391,8 @@ console.log('14b) a global page tab never takes the pane from an open file:')
   check('the schedule tab is still open (nothing was closed)', vt().tabs.some((t) => t.id === 'schedule'), vt().tabs.map((t) => t.id))
   check(
     'the schedule page is not what the pane shows',
-    shownViewerTabId(vt().tabs, vt().activeId, c1) === fileId,
-    shownViewerTabId(vt().tabs, vt().activeId, c1),
+    shownViewerTabId(vt().tabs, vt().activeId, scopeOf(c1, wsA)) === fileId,
+    shownViewerTabId(vt().tabs, vt().activeId, scopeOf(c1, wsA)),
   )
 }
 
@@ -350,10 +400,10 @@ console.log('14c) a reopened/resumed split tree follows the active tab:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
+  const [c1, wsA] = chatInWs('/ws-a')
   vt().openSchedule()
-  vt().openFile('src/App.tsx', 1, '/root', c1)
-  const fileId = `file:${c1}:src/App.tsx`
+  vt().openFile('src/App.tsx', 1, '/ws-a', c1)
+  const fileId = `file:${wsA}:src/App.tsx`
   // A resumed split: the schedule page and a file, side by side. The panes paint
   // ONLY tree leaves, so a tab without a leaf used to render nowhere and the
   // previous page stayed on screen — the reported "clicking a file closed the
@@ -369,36 +419,38 @@ console.log('14c) a reopened/resumed split tree follows the active tab:')
     focusedViewerId: fileId,
     activeId: fileId,
   })
-  vt().openFile('src/lib/bidi.ts', undefined, '/root', c1)
-  const bidiId = `file:${c1}:src/lib/bidi.ts`
+  vt().openFile('src/lib/bidi.ts', undefined, '/ws-a', c1)
+  const bidiId = `file:${wsA}:src/lib/bidi.ts`
   vt().ensureViewerTree()
   const tree = vt().viewerTree
   check('opening a file keeps the split pane count', !!tree && leafCount(tree) === 2, tree)
   check('the new tab is revealed in a pane', !!tree && collectChatIds(tree).includes(bidiId), tree && collectChatIds(tree))
   check('the focused pane is the new tab', vt().focusedViewerId === bidiId, vt().focusedViewerId)
   check('nothing was closed by opening it', vt().tabs.some((t) => t.id === fileId) && vt().tabs.some((t) => t.id === 'schedule'), vt().tabs.map((t) => t.id))
-  // Clicking a rail row must show THAT row, not the page that happened to be
+  // Clicking a tab must show THAT tab, not the page that happened to be
   // painted in the focused pane.
   vt().setActiveViewer(fileId)
-  check('clicking a row reveals it in the pane', !!vt().viewerTree && collectChatIds(vt().viewerTree as any).includes(fileId), vt().viewerTree && collectChatIds(vt().viewerTree as any))
-  check('clicking a row focuses it', vt().focusedViewerId === fileId, vt().focusedViewerId)
-  check('clicking a row closed nothing', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
+  check('clicking a tab reveals it in the pane', !!vt().viewerTree && collectChatIds(vt().viewerTree as any).includes(fileId), vt().viewerTree && collectChatIds(vt().viewerTree as any))
+  check('clicking a tab focuses it', vt().focusedViewerId === fileId, vt().focusedViewerId)
+  check('clicking a tab closed nothing', vt().tabs.length === 3, vt().tabs.map((t) => t.id))
 }
 
-console.log('15) closeAllViewers — closes only the active chat tabs, keeps history:')
+console.log('15) closeAllViewers — closes only the focused scope, keeps history:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
-  const c1 = useStore.getState().newChat('ask')
-  const c2 = useStore.getState().newChat('ask')
+  const [c1, wsA] = chatInWs('/ws-a')
+  const [c2] = chatInWs('/ws-a')
   vt().openGitDiff(c1)
   vt().openTraces(c1, 'all')
-  vt().openGitDiff(c2)
+  vt().openTraces(c2, 'all')
   check('three tabs open', vt().tabs.length === 3, vt().tabs.length)
   vt().closeAllViewers(c1)
-  check('only other chat tab remains', vt().tabs.length === 1 && vt().tabs[0].id === `review:${c2}`, vt().tabs.map((t) => t.id))
+  // The workspace Git tab + chat 1's trace are visible in c1's scope; chat 2's
+  // trace is not.
+  check('only the other chat trace remains', vt().tabs.length === 1 && vt().tabs[0].id === `trace:${c2}`, vt().tabs.map((t) => t.id))
   check('closed tabs kept for reopen', vt().closedTabs.length === 2, vt().closedTabs.length)
-  check('active falls back to remaining tab', vt().activeId === `review:${c2}`, vt().activeId)
+  check('active falls back to remaining tab', vt().activeId === `trace:${c2}`, vt().activeId)
   vt().closeAllViewers()
   check('close-all empties the list', vt().tabs.length === 0, vt().tabs.length)
   check('no-op on empty list', (() => {

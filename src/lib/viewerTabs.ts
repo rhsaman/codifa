@@ -3,23 +3,26 @@ import type { ReviewSource } from './reviewPanel'
 import type { TraceTab } from './tracePanel'
 import { runTargetKey } from './nvimEdit'
 import { DEFAULT_TERMINAL_SHELL, shellLabel } from './nvimTerminals'
-import { registerChatDeleteHook, useStore } from './store'
+import { registerChatDeleteHook, useStore, workspaceKey } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, replaceChat as replaceViewerLeafTab, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
 export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'terminal'
 
-/** Kinds that belong to ONE chat. File tabs are chat-scoped too
- *  (`file:<chatId>:<path>`) so each chat keeps its own open files and
- *  live edits only refresh the owning chat. Inbox, Schedule and artifact tabs
- *  stay global: an artifact is opened from the Artifacts page and from a
- *  transcript card, and hiding it whenever another chat had focus made the
- *  row look broken (the document opened onto a tab that chat could not show). */
+/** Kinds that belong to ONE chat: their rail icon follows the focused chat.
+ *  Only Trace and Browser remain chat-owned — everything else is scoped to
+ *  the focused chat's WORKSPACE (or global), so switching chats inside one
+ *  workspace never rearranges the rail. */
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser'])
+
+/** Kinds scoped to the WORKSPACE of the focused chat: one tab per workspace
+ *  (`<kind>:<wsKey>`), shared by every chat of that workspace. File tabs add
+ *  the path (`file:<wsKey>:<path>`), terminals the run target. */
 // `files` is NOT here: the explorer is ONE global tab whose root follows the
 // focused chat. A per-chat explorer gave every chat its own `files:<chatId>`
 // tab, so the rail showed one icon per chat AND activating it pushed the open
 // file tab out of the rail.
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['review', 'trace', 'plan', 'browser', 'text', 'file', 'explore', 'todos', 'terminal'])
+const WORKSPACE_SCOPED_KINDS = new Set<ViewerKind>(['review', 'plan', 'todos', 'text', 'explore', 'file', 'terminal'])
 
 /** Kinds that are NEVER written to localStorage. A terminal tab is a live pty:
  *  restoring one after a restart would spawn a shell (or an editor) the user
@@ -30,12 +33,13 @@ const EPHEMERAL_KINDS = new Set<ViewerKind>(['terminal'])
  *  collide when two clicks land in the same millisecond. */
 let shellCounter = 0
 
-export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): string {
+export function viewerTabId(kind: ViewerKind, scopeKey: string, path?: string): string {
   if (kind === 'file') {
     const clean = (path ?? '').trim()
-    // Chat-scoped file id `file:<chatId>:<path>` (one tab per file per chat).
-    // Without a path keep the `file:<chatId>` prefix so existing callers keep working.
-    return clean ? `file:${chatId}:${clean}` : `file:${chatId}`
+    // Workspace-scoped file id `file:<wsKey>:<path>` (one tab per file per
+    // workspace). Without a path keep the `file:<wsKey>` prefix so existing
+    // callers keep working.
+    return clean ? `file:${scopeKey}:${clean}` : `file:${scopeKey}`
   }
   if (kind === 'terminal') {
     // `target` is the run target (a bare shell, or the argv of an editor
@@ -43,9 +47,45 @@ export function viewerTabId(kind: ViewerKind, chatId: string, path?: string): st
     // tab that already edits it instead of starting a second Neovim — the whole
     // point, since one nvim with a plugin stack costs hundreds of MB.
     const target = (path ?? '').trim()
-    return target ? `terminal:${chatId}:${target}` : `terminal:${chatId}`
+    return target ? `terminal:${scopeKey}:${target}` : `terminal:${scopeKey}`
   }
-  return CHAT_SCOPED_KINDS.has(kind) ? `${kind}:${chatId}` : kind
+  // Chat-scoped kinds key on the chat id; workspace-scoped kinds on the
+  // workspace key; global pages own their kind alone. The key is opaque here —
+  // callers pass the right one for the kind.
+  return CHAT_SCOPED_KINDS.has(kind) || WORKSPACE_SCOPED_KINDS.has(kind) ? `${kind}:${scopeKey}` : kind
+}
+
+/** Workspace scoping context: which tabs the pane shows. `wsKey` is the
+ *  `workspaceKey` of the focused chat's root (workspace-scoped kinds match
+ *  it), `chatId` the focused chat itself (trace/browser match it). */
+export interface ViewerScope {
+  wsKey: string
+  chatId: string
+}
+
+/** Workspace key of `chatId`'s chat, falling back to the app root when the
+ *  chat is unknown or carries no root of its own. */
+export function workspaceKeyForChat(chatId?: string): string {
+  const st = useStore.getState()
+  const root = (chatId ? st.chats.find((c) => c.id === chatId)?.root : undefined) ?? st.root ?? ''
+  return workspaceKey(root)
+}
+
+/** Scope of a chat (defaults to the focused one) for the store actions. */
+export function viewerScopeForChat(chatId?: string): ViewerScope {
+  return { wsKey: workspaceKeyForChat(chatId), chatId: chatId ?? currentChatId() }
+}
+
+/** Reactive scope of the FOCUSED chat — the visibility key the rail and the
+ *  pane body filter tabs with. Subscribes to the store, so a chat switch (or
+ *  a root change) re-renders every consumer. */
+export function useViewerScope(): ViewerScope {
+  const chatId = useStore((s) => s.activeChatId) ?? ''
+  const chatRoot = useStore((s) => s.chats.find((c) => c.id === s.activeChatId)?.root)
+  const appRoot = useStore((s) => s.root)
+  // A chat WITHOUT a root lands in the same "__none__" bucket the sidebar
+  // uses, never silently inheriting the app root.
+  return { wsKey: workspaceKey(chatRoot ?? appRoot ?? ''), chatId }
 }
 
 /** Every kind the store may rehydrate. An unknown kind (an older/newer build,
@@ -98,27 +138,29 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
  *  look like the main chat trace, and two artifacts of one chat must be
  *  tellable apart (they are one tab per document). Every other kind shows the
  *  shared kind label. Pure, for tests. */
-export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId'>): string {
+export function viewerTabTitle(t: Pick<ViewerTab, 'kind' | 'title' | 'traceTaskId' | 'traceTitle'>): string {
   if (t.kind === 'file' || t.kind === 'text' || t.kind === 'explore') return t.title
   if (t.kind === 'artifact') return t.title || VIEWER_KIND_LABEL.artifact
   // A terminal tab carries its own title ("nvim — a.ts" / "zsh"), so two of
   // them are tellable apart in the rail.
   if (t.kind === 'terminal') return t.title || VIEWER_KIND_LABEL.terminal
-  if (t.kind === 'trace' && (t.traceTaskId ?? '').trim()) return t.title
+  if (t.kind === 'trace' && ((t.traceTaskId ?? '').trim() || (t.traceTitle ?? '').trim())) return t.title
   return VIEWER_KIND_LABEL[t.kind] ?? t.title
 }
 
-/** Tabs visible while `chatId` is active: global tabs + that chat's own tabs.
- *  Legacy global file tabs (no chatId, pre chat-scoping) stay visible in
- *  every chat so old sessions don't lose them. */
-export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
+/** Tabs visible while `scope` is focused: global pages + the focused
+ *  workspace's own tabs + that chat's trace/browser. A legacy global file tab
+ *  (pre chat-scoping: no chat, no workspace) stays visible in every chat so
+ *  old sessions don't lose it. Pure, for tests. */
+export function visibleTabs(tabs: ViewerTab[], scope: ViewerScope): ViewerTab[] {
   return tabs.filter((t) => {
-    if (t.kind === 'file' && !t.chatId) return true
-    // A terminal tab hosts a LIVE pty that no chat owns: hiding it with the
-    // chat that happened to spawn it would strand a running shell (and the
-    // pane fell back to the todos page — a blank-looking pane).
-    if (t.kind === 'terminal') return true
-    return !CHAT_SCOPED_KINDS.has(t.kind) || t.chatId === chatId
+    if (t.kind === 'file' && !t.chatId && !t.wsKey) return true
+    // A schedule-run trace belongs to the synthetic chat `schedule-<sid>` that
+    //  no focused chat owns — visible from every chat (like a global page).
+    if (t.kind === 'trace' && (t.chatId ?? '').startsWith('schedule-')) return true
+    if (CHAT_SCOPED_KINDS.has(t.kind)) return t.chatId === scope.chatId
+    if (WORKSPACE_SCOPED_KINDS.has(t.kind)) return (t.wsKey ?? '') === scope.wsKey
+    return true
   })
 }
 
@@ -130,49 +172,56 @@ export function visibleTabs(tabs: ViewerTab[], chatId: string): ViewerTab[] {
 export function shownViewerTabId(
   tabs: ViewerTab[],
   activeId: string | null,
-  chatId: string,
+  scope: ViewerScope,
 ): string | null {
-  const visible = visibleTabs(tabs, chatId)
-  // Falls back to the chat's own tab before a global page tab, so the pane
-  // never lands on Schedule while the chat still has a file open.
+  const visible = visibleTabs(tabs, scope)
+  // Falls back to the chat's own tab before a shared tab, so the pane never
+  // lands on Schedule while the chat still has a trace/browser open.
   const active =
     visible.find((t) => t.id === activeId) ??
-    visible.find((t) => t.chatId === chatId) ??
+    visible.find((t) => t.chatId === scope.chatId) ??
     visible[0] ??
     null
   return active?.id ?? null
 }
 
-/** Tabs the pane rail draws as ROWS: every tab visible in the active chat.
- *  A page opened from the rail's "+" menu is an ordinary tab, so it is
- *  closable and reorderable exactly like a file tab — no page owns a fixed
- *  icon any more. Pure, for tests.
- *
- *  TERMINAL tabs collapse into ONE rail row: the terminal body paints its own
- *  horizontal chip strip (TerminalTabPanel's .terminal-tabs), which is the real
- *  shell list — a rail row per shell would list the same shells twice in two
- *  places. The representative row is the ACTIVE terminal tab (or the first), so
- *  the row highlights exactly when the pane is painting a terminal. */
-export function viewerTabRows(tabs: ViewerTab[], chatId: string, activeId?: string | null): ViewerTab[] {
-  const visible = visibleTabs(tabs, chatId)
-  const terminals = visible.filter((t) => t.kind === 'terminal')
-  if (terminals.length < 2) return visible
-  const rep = (activeId && terminals.find((t) => t.id === activeId)) || terminals[0]
-  return [...visible.filter((t) => t.kind !== 'terminal'), rep]
+/** Kinds that render as TABS in the pane's top strip: documents and chat-owned
+ *  surfaces (files, browser, trace, …). The dock pages below never appear
+ *  there — the dock's fixed icons are their only affordance, which keeps the
+ *  bottom row completely separate from the tab strip. */
+export const TAB_STRIP_KINDS: ReadonlySet<ViewerKind> = new Set<ViewerKind>([
+  'file',
+  'browser',
+  'trace',
+  'text',
+  'explore',
+  'artifact',
+])
+
+/** Tabs the pane's top strip draws: the visible tabs of the tab-strip kinds.
+ *  Dock pages (todos/git/artifacts/schedule/inbox/terminal + the explorer) are
+ *  NOT here — the bottom dock's fixed icons represent them. Pure, for tests. */
+export function viewerTabRows(tabs: ViewerTab[], scope: ViewerScope, _activeId?: string | null): ViewerTab[] {
+  return visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind))
 }
 
 /** True when the viewer tab-list has anything to show inline (visible open
  *  tabs or recently closed tabs). Pure, for the empty-state fallback. */
-export function hasViewerTabListEntries(tabs: ViewerTab[], closedTabs: ClosedViewerTab[], chatId: string): boolean {
+export function hasViewerTabListEntries(tabs: ViewerTab[], closedTabs: ClosedViewerTab[], scope: ViewerScope): boolean {
   if (closedTabs.length > 0) return true
-  return visibleTabs(tabs, chatId).length > 0
+  return visibleTabs(tabs, scope).length > 0
 }
 
 export interface ViewerTab {
   id: string
   kind: ViewerKind
-  /** Owning chat for chat-scoped kinds (review/trace/plan/browser/text/file). */
+  /** Owning chat for chat-scoped kinds (trace/browser); the OPENER chat for
+   *  workspace-scoped kinds (used by panels that follow one chat). */
   chatId?: string
+  /** Owning workspace (workspaceKey of the chat root) for workspace-scoped
+   *  kinds: the tab is shared by every chat of that workspace and hidden in
+   *  other workspaces. Global kinds carry none. */
+  wsKey?: string
   title: string
   reviewMessageId?: string | null
   reviewPath?: string
@@ -502,16 +551,19 @@ function loadPersisted(): {
           (t) => t && typeof t.id === 'string' && VALID_KINDS.has(t.kind) && !EPHEMERAL_KINDS.has(t.kind),
         )
       : []
-    // One tab per kind per chat (one per sub-agent for trace tabs).
+    // One tab per kind per workspace (one per sub-agent for trace tabs).
     // Legacy GLOBAL file tabs (pre chat-scoping, no chatId, id `file:<path>`)
-    // are kept so old sessions don't lose them; every other chat-scoped kind
-    // without an owner is dropped — its owner chat is unknowable. Artifact
+    // are kept so old sessions don't lose them; every other scoped kind
+    // without an owner chat is dropped — its owner is unknowable. Artifact
     // tabs are global, so an ownerless one is kept too: its id still carries
     // the artifact id, which is all the panel needs to re-read the body.
+    // Ids keep their persisted shape here (older builds stored
+    // `<kind>:<chatId>` for the now workspace-scoped kinds); the one-time
+    // scope migration below re-keys them once the chat index is hydrated.
     const seen = new Set<string>()
     const tabs: ViewerTab[] = []
     for (const t of valid) {
-      if (CHAT_SCOPED_KINDS.has(t.kind) && !t.chatId && t.kind !== 'file') continue
+      if (t.kind !== 'file' && !t.chatId && (CHAT_SCOPED_KINDS.has(t.kind) || WORKSPACE_SCOPED_KINDS.has(t.kind))) continue
       // File tabs keep their full id (`file:<path>` legacy, `file:<chatId>:<path>`
       // scoped): recomputing via viewerTabId would collapse every file of one
       // chat into a single `file:<chatId>` id.
@@ -799,15 +851,18 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openReview: (messageId, path, chatId) =>
     set((s) => {
-      // One diff tab per chat: reopening a diff updates it in place.
+      // One diff tab per WORKSPACE: reopening a diff from any chat of the
+      // workspace retargets the same tab in place.
       // User-gesture open: show the pane. Automatic (stream-driven) opens
       // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const cid = chatId ?? currentChatId()
-      const id = viewerTabId('review', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('review', wsKey)
       const tab: ViewerTab = {
         id,
         kind: 'review',
         chatId: cid,
+        wsKey,
         title: 'Git',
         reviewMessageId: messageId,
         reviewPath: path,
@@ -824,15 +879,17 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openGitDiff: (chatId) =>
     set((s) => {
-      // One diff tab per chat: the uncommitted view replaces it in place.
+      // One diff tab per WORKSPACE: the uncommitted view replaces it in place.
       // User-gesture open: show the pane. Automatic (stream-driven) opens
       // happen only for plan/browser in Chat.tsx; nothing else auto-opens.
       const cid = chatId ?? currentChatId()
-      const id = viewerTabId('review', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('review', wsKey)
       const tab: ViewerTab = {
         id,
         kind: 'review',
         chatId: cid,
+        wsKey,
         title: 'Git',
         reviewMessageId: null,
         reviewSource: 'uncommitted',
@@ -860,7 +917,13 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         id,
         kind: 'trace',
         chatId: cid,
-        title: tid ? `Trace · ${label ? label.slice(0, 28) : short}` : 'Trace',
+        title: tid
+          ? `Trace · ${label ? label.slice(0, 28) : short}`
+          : // No sub-agent id (e.g. a schedule-run trace): the label is the
+            //  only thing telling two such tabs apart in the rail.
+            label
+            ? `Trace · ${label.slice(0, 28)}`
+            : 'Trace',
         traceChatId: chatId,
         traceTab: tab,
         traceTaskId: tid || undefined,
@@ -935,17 +998,24 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openPlan: (chatId) =>
     set((s) => {
-      // One plan tab per chat (PlanPanel reads the live activeChatId).
+      // One plan tab per WORKSPACE: opening it from another chat of the same
+      // workspace retargets the tab (owner chat + scope) in place.
       const cid = chatId ?? currentChatId()
-      const id = viewerTabId('plan', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('plan', wsKey)
       const entry: ViewerTab = {
         id,
         kind: 'plan',
         chatId: cid,
+        wsKey,
         title: 'Plan',
         createdAt: Date.now(),
       }
-      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const tabs = capTabs(
+        s.tabs.some((t) => t.id === id)
+          ? s.tabs.map((t) => (t.id === id ? { ...t, chatId: cid, wsKey } : t))
+          : [...s.tabs, entry],
+      )
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -1013,11 +1083,10 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openFile: (path, line, root, chatId) => {
     // An explicit `chatId` means a chat's OWN surface opened the file (its file
-    // explorer / files panel). The pane group paints the FOCUSED chat's tabs, so
-    // without focusing the owner the new tab was scoped to a chat that is not
-    // on screen: `visibleTabs` filtered it out and the pane kept showing the
-    // other chat's page (the reported "clicking a file in the explorer shows
-    // Trace"). Focus the owner so the pane, the rail and the new tab agree.
+    // explorer / files panel). The tab is workspace-scoped, so the pane shows it
+    // from any chat of the workspace — but the OWNER chat is still focused so
+    // viewer comments (and the pane's own surfaces) land in the chat the user
+    // opened the file FROM.
     const owner = (chatId ?? '').trim()
     if (owner) {
       const st = useStore.getState()
@@ -1031,15 +1100,16 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     return set((s) => {
       const clean = path.trim()
       if (!clean) return {}
-      // Chat-scoped file tab: each chat keeps its own open files, so live
-      // edits refresh only the owning chat and switching chats swaps the
-      // visible files. Only path/line/root persist — never the file body.
+      // Workspace-scoped file tab: one tab per path per workspace, shared by
+      // every chat of that workspace. Only path/line/root persist — never the
+      // file body.
       const cid = (chatId ?? currentChatId()).trim()
-      const id = cid ? viewerTabId('file', cid, clean) : `file:${clean}`
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = cid ? viewerTabId('file', wsKey, clean) : `file:${clean}`
       const entry: ViewerTab = {
         id,
         kind: 'file',
-        ...(cid ? { chatId: cid } : {}),
+        ...(cid ? { chatId: cid, wsKey } : {}),
         title: clean.split(/[\\/]/).pop() || clean,
         filePath: clean,
         fileLine: line,
@@ -1047,7 +1117,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         createdAt: Date.now(),
       }
       const raw = s.tabs.some((t) => t.id === id)
-        ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line, fileRoot: root ?? t.fileRoot } : t))
+        ? s.tabs.map((t) => (t.id === id ? { ...t, fileLine: line, fileRoot: root ?? t.fileRoot, ...(cid ? { chatId: cid, wsKey } : {}) } : t))
         : [...s.tabs, entry]
       const tabs = capTabs(raw)
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
@@ -1068,14 +1138,16 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   openText: (title, body, format) =>
     set((s) => {
       if (!body) return {}
-      // One text tab per chat: reopening updates it in place, never stacks
-      // a new tab per click.
+      // One text tab per WORKSPACE: reopening updates it in place, never
+      // stacks a new tab per click.
       const cid = currentChatId()
-      const id = viewerTabId('text', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('text', wsKey)
       const entry: ViewerTab = {
         id,
         kind: 'text',
         chatId: cid,
+        wsKey,
         title: title.trim() || 'Text',
         textBody: body,
         textFormat: format,
@@ -1091,14 +1163,17 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openExplore: (messageId, index, title, chatId) =>
     set((s) => {
-      // One explore tab per chat: reopening retargets the same tab in place.
+      // One explore tab per WORKSPACE: reopening retargets the same tab in
+      // place.
       const cid = chatId ?? currentChatId()
-      const id = viewerTabId('explore', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('explore', wsKey)
       const label = (title ?? '').trim()
       const entry: ViewerTab = {
         id,
         kind: 'explore',
         chatId: cid,
+        wsKey,
         title: label ? `Explore · ${label.slice(0, 60)}` : 'Explore',
         exploreMessageId: messageId,
         exploreIndex: index,
@@ -1114,17 +1189,25 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openTodos: (chatId) =>
     set((s) => {
-      // One todos tab per chat: the page reads that chat's own usage + plan.
+      // One todos tab per WORKSPACE: the page reads the focused chat's own
+      // usage + plan, so the tab stays put while chats switch inside the
+      // workspace.
       const cid = chatId ?? currentChatId()
-      const id = viewerTabId('todos', cid)
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = viewerTabId('todos', wsKey)
       const entry: ViewerTab = {
         id,
         kind: 'todos',
         chatId: cid,
+        wsKey,
         title: 'Todos',
         createdAt: Date.now(),
       }
-      const tabs = capTabs(s.tabs.some((t) => t.id === id) ? s.tabs : [...s.tabs, entry])
+      const tabs = capTabs(
+        s.tabs.some((t) => t.id === id)
+          ? s.tabs.map((t) => (t.id === id ? { ...t, chatId: cid, wsKey } : t))
+          : [...s.tabs, entry],
+      )
       const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
       const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       persist(next.tabs, next.activeId)
@@ -1149,6 +1232,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
   openTerminal: (opts) =>
     set((s) => {
       const cid = opts?.chatId ?? currentChatId()
+      const wsKey = workspaceKeyForChat(cid || undefined)
       const program = (opts?.program ?? '').trim()
       const args = opts?.args ?? []
       // The run target is the tab's IDENTITY, not just its payload: re-asking
@@ -1163,7 +1247,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         : opts?.fresh
           ? `shell-${Date.now()}-${shellCounter++}`
           : 'shell'
-      const id = viewerTabId('terminal', cid, target)
+      const id = viewerTabId('terminal', wsKey, target)
       // Reuse ANY tab already running this run target, not just one with an
       // identical id: the id is scoped per chat, so opening the same file from
       // two chats (or a second window) minted a second tab and a SECOND nvim
@@ -1190,6 +1274,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
         id,
         kind: 'terminal',
         chatId: cid,
+        wsKey,
         // A terminal tab shows WHAT it runs ("nvim — a.ts", "zsh — codifa"):
         // "Terminal" for every one of them would make the rail unreadable.
         title: opts?.title || (program ? program : shellLabel(opts?.shell || DEFAULT_TERMINAL_SHELL)),
@@ -1263,7 +1348,7 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   closeAllViewers: (chatId) =>
     set((s) => {
-      const toClose = chatId ? visibleTabs(s.tabs, chatId) : s.tabs
+      const toClose = chatId ? visibleTabs(s.tabs, viewerScopeForChat(chatId)) : s.tabs
       if (toClose.length === 0) return {}
       const closeIds = new Set(toClose.map((t) => t.id))
       for (const t of toClose) notifyTabClosed(t.id)
@@ -1510,16 +1595,23 @@ export function resolveViewerForChat(
  *  already active. */
 export function syncViewerToChat(chatId: string): void {
   const vt = useViewerTabs.getState()
-  const visible = visibleTabs(vt.tabs, chatId)
+  const scope = viewerScopeForChat(chatId)
+  const visible = visibleTabs(vt.tabs, scope)
   if (visible.length === 0) return
-  // The pane already shows a tab of THIS chat: nothing to retarget. This
-  // effect runs AFTER a focus change, i.e. it can land right after the click
-  // that opened a file — without this guard it yanked the pane back to the
-  // chat's remembered tab (trace), which read as "clicking a file opened
-  // trace". A deliberate open/activate always wins over the memory.
+  // The pane already shows a tab of THIS chat or a shared tab of THIS
+  // workspace: nothing to retarget. This effect runs AFTER a focus change,
+  // i.e. it can land right after the click that opened a file — without this
+  // guard it yanked the pane back to the chat's remembered tab (trace), which
+  // read as "clicking a file opened trace". A deliberate open/activate always
+  // wins over the memory. Workspace tabs STICK across chat switches (that is
+  // the point of workspace scoping); a global page does NOT — the chat's own
+  // remembered tab still wins over Schedule/Inbox, exactly as before.
   if (vt.activeId && visible.some((t) => t.id === vt.activeId)) {
     const shownTab = vt.tabs.find((t) => t.id === vt.activeId)
-    if (shownTab?.chatId === chatId) return
+    const sticky =
+      (shownTab && shownTab.wsKey != null && shownTab.wsKey === scope.wsKey) ||
+      (shownTab && CHAT_SCOPED_KINDS.has(shownTab.kind) && shownTab.chatId === chatId)
+    if (sticky) return
   }
   const target = resolveViewerForChat(visible, vt.lastActiveByChat, chatId)
   if (target && vt.activeId !== target) {
@@ -1575,3 +1667,72 @@ export function clampSplitWidth(w: number, vw?: number): number {
 registerChatDeleteHook((chatId) => {
   useViewerTabs.getState().closeAllViewers(chatId)
 })
+
+// --- one-time scope migration ---------------------------------------------
+// Tabs persisted before workspace scoping key on the chat (`review:<chatId>`),
+// and the chat index hydrates ASYNC, after this module's loadPersisted ran.
+// The first store update that carries chats re-keys every workspace-scoped tab
+// to its chat's workspace (`<kind>:<wsKey>`), so two chats of one workspace
+// share ONE Git/plan/file tab instead of stacking per-chat duplicates the
+// visibility filter can no longer tell apart. Runs at most once.
+let scopesMigrated = false
+let unsubScopeMigration: (() => void) | null = null
+function migrateTabScopes(): void {
+  if (scopesMigrated) return
+  const st = useStore.getState()
+  if (!Array.isArray(st.chats) || st.chats.length === 0) return
+  scopesMigrated = true
+  unsubScopeMigration?.()
+  const keyFor = (chatId?: string) => {
+    const root = (chatId ? st.chats.find((c) => c.id === chatId)?.root : undefined) ?? st.root ?? ''
+    return workspaceKey(root)
+  }
+  const vt = useViewerTabs.getState()
+  let changed = false
+  let activeId = vt.activeId
+  const seen = new Set<string>()
+  const remap = new Map<string, string>()
+  const migrate = (tab: ViewerTab): ViewerTab => {
+    if (!WORKSPACE_SCOPED_KINDS.has(tab.kind) || tab.wsKey) return tab
+    // A pre-workspace GLOBAL file tab (no owner chat) stays global.
+    if (tab.kind === 'file' && !tab.chatId) return tab
+    const wsKey = keyFor(tab.chatId)
+    const id =
+      tab.kind !== 'file'
+        ? viewerTabId(tab.kind, wsKey)
+        : (tab.filePath ?? '').trim()
+          ? viewerTabId('file', wsKey, tab.filePath)
+          : tab.id
+    if (id === tab.id) return { ...tab, wsKey }
+    changed = true
+    remap.set(tab.id, id)
+    if (activeId === tab.id) activeId = id
+    return { ...tab, id, wsKey }
+  }
+  const tabs: ViewerTab[] = []
+  for (const tab of vt.tabs) {
+    const next = migrate(tab)
+    if (seen.has(next.id)) {
+      // Two chats of one workspace each used to own a tab for this kind: the
+      // duplicate is a real closure now, so its resources are released.
+      notifyTabClosed(tab.id)
+      if (activeId === tab.id) activeId = remap.get(tab.id) ?? tabs[tabs.length - 1]?.id ?? null
+      changed = true
+      continue
+    }
+    seen.add(next.id)
+    if (next !== tab) changed = true
+    tabs.push(next)
+  }
+  let closedChanged = false
+  const closedTabs = vt.closedTabs.map((c) => {
+    const tab = migrate(c.tab)
+    if (tab !== c.tab) closedChanged = true
+    return { ...c, tab }
+  })
+  if (!changed && !closedChanged) return
+  persist(tabs, activeId, closedTabs)
+  useViewerTabs.setState({ tabs, activeId, closedTabs })
+}
+migrateTabScopes()
+unsubScopeMigration = useStore.subscribe(migrateTabScopes)

@@ -123,6 +123,10 @@ export interface CoderApi {
     program?: string | null,
     args?: string[] | null,
     shell?: string | null,
+    /** Requested session id. The pty emits from the reader thread the instant
+     *  it spawns — before terminal_create answers — so a host that can already
+     *  route by id (right-pane tabs) sends one and loses no early byte. */
+    id?: string | null,
   ): Promise<TerminalSessionInfo>
   terminalList(): Promise<TerminalSessionInfo[]>
   terminalWrite(id: string, data: string): Promise<boolean>
@@ -136,6 +140,14 @@ export interface CoderApi {
   onFlushPersist(cb: () => void): () => void
   flushPersistDone(): void
   onMigrateProgress(cb: (evt: { label: string; pct: number }) => void): () => void
+  /** Full-app backup (Settings → Storage): packs the data root into
+   *  codifa-backup-<stamp>.zip under destDir ('' = the data root). Progress
+   *  arrives via onBackupProgress; cancelBackup stops it mid-run. */
+  createBackup(destDir: string): Promise<{ path: string; files: number; bytes: number; elapsedMs: number }>
+  cancelBackup(): Promise<void>
+  onBackupProgress(
+    cb: (evt: { label: string; pct: number; files: number; total: number }) => void,
+  ): () => void
   checkForUpdates(): Promise<UpdateInfo>
   startUpdate(): Promise<OpResult>
   onUpdateProgress(cb: (p: UpdateProgress) => void): () => void

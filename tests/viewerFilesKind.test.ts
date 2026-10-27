@@ -104,9 +104,9 @@ console.log('2) id and title follow the shared rules:')
 console.log('3) visibility is global:')
 {
   const tabs = useViewerTabs.getState().tabs
-  const mine = visibleTabs(tabs, 'c1').map((t) => t.kind)
+  const mine = visibleTabs(tabs, { wsKey: 'w1', chatId: 'c1' }).map((t) => t.kind)
   check('the owning chat sees the files tab', mine.includes('files'), mine)
-  const other = visibleTabs(tabs, 'c2').map((t) => t.kind)
+  const other = visibleTabs(tabs, { wsKey: 'w2', chatId: 'c2' }).map((t) => t.kind)
   check('another chat sees the SAME single files tab', other.includes('files'), other)
   check(
     'no second files tab appears for another chat',

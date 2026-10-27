@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod artifacts;
+pub mod backup;
 pub mod browser;
 pub mod browser_driver;
 pub mod computer;

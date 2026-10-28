@@ -48,9 +48,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # The action wants bare target triples; matrix.args carries them with
-          # a "--target " flag prefix (for tauri-action) that rustup rejects.
-          targets: ${{ replace(matrix.args, '--target ', '') }}
+          # Same pattern as the official tauri-action template: the action
+          # splits this on commas/whitespace, so give it bare triples (a
+          # "--target " prefix makes rustup fail with "a value is required
+          # for '--target <TARGET>'"). Both mac triples are harmless on
+          # either runner; empty on Windows/Linux.
+          targets: ${{ startsWith(matrix.os, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2

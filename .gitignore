@@ -130,7 +130,11 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
-Icon?
+# macOS custom-icon metadata is "Icon" + a carriage return. A bare `Icon?`
+# here case-insensitively matched the src-tauri/icons DIRECTORY (i-c-o-n-s)
+# on macOS and silently unshipped every Tauri bundle icon from CI. The
+# negations for src-tauri/icons at the bottom of this file win over it.
+# Icon?
 .AppleDouble
 .LSOverride
 .DocumentRevisions-V100

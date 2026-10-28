@@ -48,7 +48,9 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ contains(matrix.args, '--target') && matrix.args || '' }}
+          # The action wants bare target triples; matrix.args carries them with
+          # a "--target " flag prefix (for tauri-action) that rustup rejects.
+          targets: ${{ replace(matrix.args, '--target ', '') }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2

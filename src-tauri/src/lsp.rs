@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 // `process_group` on `Command` (own process group per language server).
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -475,7 +476,8 @@ impl Server {
             .ok_or_else(|| format!("no language server registered for {language}"))?;
         let path_env = augmented_path();
         let program = resolve_binary(&cmd[0], &path_env);
-        let mut process = Command::new(&program)
+        let mut command = Command::new(&program);
+        command
             .args(&cmd[1..])
             .env("PATH", &path_env)
             // Cap the cargo/rustc subprocesses a check or build-script run can
@@ -494,14 +496,17 @@ impl Server {
             // non-node servers (rust-analyzer is a native binary). Appended to any
             // NODE_OPTIONS the user already set, never replacing it.
             .env("NODE_OPTIONS", node_options_with_heap_cap())
-            .current_dir(root)
-            // Give the server its OWN process group so it dies with everything it
-            // spawns. A language server is a launcher: `typescript-language-server`
-            // forks `tsserver`, and that child is where the project index lives
-            // (measured ~294 MB for one workspace). Without a group, killing the
-            // launcher orphaned the child, so the memory was never released — and
-            // the orphan kept a whole workspace index resident for good.
-            .process_group(0)
+            .current_dir(root);
+        // Give the server its OWN process group so it dies with everything it
+        // spawns. A language server is a launcher: `typescript-language-server`
+        // forks `tsserver`, and that child is where the project index lives
+        // (measured ~294 MB for one workspace). Without a group, killing the
+        // launcher orphaned the child, so the memory was never released — and
+        // the orphan kept a whole workspace index resident for good.
+        // (`process_group` is the Unix-only `CommandExt` method.)
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut process = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -902,8 +907,16 @@ impl Drop for Server {
         // SAFETY: `kill(2)` takes plain integers (pid/pgid + signal). A negative
         // pid signals the process group with that id. When the child is already
         // gone this fails harmlessly with ESRCH.
+        #[cfg(unix)]
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no process groups through std here; a hard kill on the
+            // direct child is as much as `Child` exposes. Any helper processes a
+            // Node launcher left behind cannot be reached — accepted for now.
+            let _ = pgid;
         }
         let _ = self.child.kill();
         let _ = self.child.wait();

@@ -65,6 +65,11 @@ aes-gcm = "0.10"
 # Tavily keeps using reqwest; primp is only for DuckDuckGo.
 primp = { version = "2", default-features = false, features = ["gzip", "brotli", "deflate", "cookies", "form"] }
 
+# Windows process checks (pid_alive in commands.rs) call the Win32 API directly;
+# `libc` has no kill() there. 0.52 is already in the graph via tauri.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 # Desktop control needs what the `screenshots` crate cannot do: read the cursor
 # position, preflight the Screen Recording permission (macOS silently returns an
 # image with every OTHER app's windows removed without it) and inject mouse

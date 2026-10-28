@@ -127,7 +127,14 @@ mod tests {
         // existing, and `kill(pid, 0)` then fails with ESRCH.
         let mut reaped = false;
         for _ in 0..200 {
+            #[cfg(unix)]
             if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
                 reaped = true;
                 break;
             }
@@ -1764,7 +1771,37 @@ fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    // Windows: `kill(2)` does not exist. Open a minimal handle — the same
+    // privilege Task Manager uses — and treat a live process or an access
+    // denied (a protected system process, mirroring the Unix EPERM case) as
+    // alive. A closed handle is required or the pid leaks a kernel object.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // GetExitCodeProcess reports a live-but-unexited process with this
+        // sentinel instead of a real exit code (not exported by windows-sys).
+        const STILL_ACTIVE: u32 = 259;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        // HANDLE is `isize` in windows-sys: 0 is the invalid handle.
+        if h == 0 {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code: u32 = 0;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code != STILL_ACTIVE;
+        CloseHandle(h);
+        alive
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true // conservative: report alive rather than drop a live session
+    }
 }
 
 

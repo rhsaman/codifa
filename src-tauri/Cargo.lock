@@ -807,6 +807,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "uuid",
+ "windows-sys 0.52.0",
  "zip 9.0.5",
 ]
 

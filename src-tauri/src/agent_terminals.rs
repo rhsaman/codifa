@@ -168,7 +168,7 @@ pub fn stop(id: &str) -> bool {
     if !row.info.running {
         return false;
     }
-    kill_row(row, libc::SIGTERM);
+    kill_row(row, SIG_TERM);
     drop(reg);
     // Escalation lives on its own thread so a child that ignores TERM (a
     // misbehaving server) cannot make the Stop click hang.
@@ -178,11 +178,22 @@ pub fn stop(id: &str) -> bool {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         let Some(row) = reg.get_mut(&escalate) else { return };
         if row.info.running {
-            kill_row(row, libc::SIGKILL);
+            kill_row(row, SIG_KILL);
         }
     });
     true
 }
+
+// libc's signal numbers only exist on Unix; the Windows build passes a dummy
+// (kill_row then ignores the signal and kills the direct child).
+#[cfg(unix)]
+const SIG_TERM: i32 = libc::SIGTERM;
+#[cfg(unix)]
+const SIG_KILL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIG_TERM: i32 = 0;
+#[cfg(not(unix))]
+const SIG_KILL: i32 = 0;
 
 /// Signal a row's process (group). Unix uses the group so the command's own
 /// children die too; elsewhere only the direct child can be reached.
@@ -260,7 +271,7 @@ pub fn kill_all() {
         .collect();
     for mut row in rows {
         if row.info.running {
-            kill_row(&mut row, libc::SIGKILL);
+            kill_row(&mut row, SIG_KILL);
         }
     }
 }

@@ -116,11 +116,18 @@ jobs:
           # identity instead of silently going ad-hoc.
           DEFAULT_IDENTITY: "Coder Dev Signing"
         run: |
-          # Exported only when an identity really exists: an empty
-          # APPLE_SIGNING_IDENTITY makes the bundler run `codesign -s ""` and
-          # fail, so the unconfigured case has to export nothing at all.
+          # With no secrets, export the ad-hoc identity so the hard-coded
+          # signingIdentity in tauri.conf.json gets overridden (see below).
           if [ -z "$CERT" ] || [ -z "$CERT_PASSWORD" ]; then
-            echo "No Apple signing secrets — building ad-hoc (Screen Recording will not persist)."
+            # tauri.conf.json hard-codes a signing identity, and the bundler
+            # runs `codesign -s "Coder Dev Signing"` with it even when no
+            # certificate was imported (run #60: "Coder Dev Signing: no
+            # identity found"). Exporting the ad-hoc identity "-" overrides
+            # the config, keeps codesign passing and matches the linker's
+            # default, so behavior is identical to before the config gained
+            # the identity field.
+            echo "No Apple signing secrets — exporting ad-hoc identity."
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
             exit 0
           fi
 

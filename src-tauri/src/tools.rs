@@ -15,6 +15,17 @@ pub const MAX_READ_BYTES: usize = 2_000_000;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const MAX_FILES: usize = 10_000;
 pub const MAX_TERMINAL_OUTPUT: usize = 10_000;
+
+/// Hard ceiling for a foreground terminal call, whichever side asks for it.
+///
+/// The schema hands `timeout` to the MODEL, and nothing validated it: a prompt
+/// that wanted a long-running monitor once sent a 5400-second foreground call
+/// and the tool sat on it for the full 90 minutes while the turn (and the
+/// scheduled run row) stayed `running` with no error anywhere. A long job is
+/// what `background=true` is for — the schema says so — so a foreground call
+/// longer than this is clipped to the ceiling, mirroring the plugin-script
+/// ceiling (`SCRIPT_TIMEOUT_MAX` in plugins.rs).
+pub const MAX_TERMINAL_TIMEOUT_SECS: u64 = 600;
 /// Hard depth cap for filesystem walks (`collect_files`) — a second belt next
 /// to the canonical-path visited set, so a pathological tree cannot blow the
 /// stack.
@@ -1560,6 +1571,18 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
+    // Second belt beside the dispatch-side clamp: EVERY caller of this
+    // function (plugin scripts included) is bounded by the same ceiling, so a
+    // future caller cannot re-open the hole the dispatch clamp closed.
+    let timeout_secs = {
+        let clamped = timeout_secs.min(MAX_TERMINAL_TIMEOUT_SECS);
+        if clamped != timeout_secs {
+            eprintln!(
+                "[tool] run_terminal: caller asked for {timeout_secs}s; bounded to {clamped}s"
+            );
+        }
+        clamped
+    };
     // The app bundle's PATH misses the user's tool dirs (cargo lived outside
     // it), so `cargo`-class calls died with `command not found` and each one
     // billed a repair round. Inherit the LOGIN-shell PATH, probed once.
@@ -2202,7 +2225,21 @@ into one union — those lines are all above; do NOT re-read them]"
             Ok(format!("{edit}{}", post_edit_diagnostics(root, &path)))
         }
         "run_terminal" => {
-            let timeout = args["timeout"].as_u64().unwrap_or(120);
+            let requested = args["timeout"].as_u64().unwrap_or(120);
+            // Validation at the boundary: the MODEL picks this number via the
+            // schema, and an unclamped large value pinned a worker for the
+            // whole of it (a scheduled monitor call ran 90 minutes with the
+            // run row parked on "running" and not one line in rust.log).
+            // Long jobs belong in `background=true` terminals, so anything
+            // past the ceiling is CLAMPED, not failed.
+            let timeout = requested.min(crate::tools::MAX_TERMINAL_TIMEOUT_SECS);
+            if timeout != requested {
+                eprintln!(
+                    "[tool] run_terminal: requested timeout {requested}s exceeds the {}s ceiling; \
+clamped to {timeout}s (long jobs must use background=true)",
+                    crate::tools::MAX_TERMINAL_TIMEOUT_SECS
+                );
+            }
             run_terminal(root, &s("command"), timeout)
         }
         "current_time" => {
@@ -2854,6 +2891,19 @@ pub fn find_symbol_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_timeout_is_clamped_to_the_ceiling() {
+        // The MODEL picks `timeout` via the schema; a monitor-style prompt once
+        // sent 5400 and the foreground call sat on it for 90 minutes with the
+        // run row parked on "running". The clamp (not the model) decides.
+        assert_eq!(
+            run_terminal("/tmp", "echo ok", MAX_TERMINAL_TIMEOUT_SECS + 3_600)
+                .unwrap()
+                .trim(),
+            "ok"
+        );
+    }
 
     /// Every `plugin` action that WRITES a bundle must say when it landed bare.
     ///

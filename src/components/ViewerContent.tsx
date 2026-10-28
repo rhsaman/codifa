@@ -221,6 +221,7 @@ function ViewerContentInner() {
         program={active.terminalProgram ?? ""}
         args={active.terminalArgs ?? []}
         shell={active.terminalShell ?? ""}
+        reopenSeq={active.reopenSeq}
       />
     );
   }

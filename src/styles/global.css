@@ -1,10 +1,10 @@
 :root {
-  /* Pre-hydration fallback: mirrors DEFAULT_THEME (rose-pine) so the first
+  /* Pre-hydration fallback: mirrors DEFAULT_THEME (codex / Onyx) so the first
      paint matches the theme the app settles on — no flash of another palette
      before injectThemeStyles() + the App effect apply [data-theme]. */
-  --bg: #191724;
-  --bg-alt: #191724;
-  --bg-panel: #1f1d2e;
+  --bg: #0d0d0d;
+  --bg-alt: #0d0d0d;
+  --bg-panel: #1a1a1a;
   /* Inset "well" surface for expanded tool bodies (DURATION/SUMMARY/ARGS):
      derived from the theme itself — sits between the chat background (--bg)
      and the card frame (--bg-panel), so the body reads as recessed vs the
@@ -22,31 +22,31 @@
      from the theme (like --bg-raised) so every palette gets its own lift
      instead of a literal that would stay Rose Pine everywhere. */
   --bg-elev: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
-  --bg-input: #26233a;
-  --bg-hover: #403d52;
-  --border: #524f67;
-  --text: #e0def4;
-  --text-dim: #b0abc8;
-  --accent: #ebbcba;
-  --accent-dim: #403d52;
-  --on-accent: #191724;
-  --danger: #eb6f92;
-  --success: #9ccfd8;
-  --link: #4a9bc0;
+  --bg-input: #202020;
+  --bg-hover: #262626;
+  --border: #2e2e2e;
+  --text: #c7c7c7;
+  --text-dim: #9b9b9b;
+  --accent: #ffffff;
+  --accent-dim: #333333;
+  --on-accent: #0d0d0d;
+  --danger: #ff6b6b;
+  --success: #3fb27f;
+  --link: #7fb0ff;
   /* Freshly-processed (non-cached) tokens, shown next to the cached (⚡)
      badge in the Model usage panel -- Rose Pine gold. */
   --fresh: #f6c177;
   /* Per-provider dot colors for the Model usage panel — fallback (Rose Pine). */
-  --provider-openrouter: #f6c177;
-  --provider-google: #9ccfd8;
-  --provider-nvidia: #31748f;
-  --provider-cloudflare: #c4a7e7;
-  --provider-ollama: #6e6a86;
-  --provider-custom: #e0def4;
+  --provider-openrouter: #d6d6d6;
+  --provider-google: #8fb4e3;
+  --provider-nvidia: #9dd6b0;
+  --provider-cloudflare: #c9b8e8;
+  --provider-ollama: #e0b48a;
+  --provider-custom: #a8a8a8;
   /* Tool-call category colors are derived from the theme accent via
      --tool-color overrides on each card class: single = full accent,
      group = muted mix, explore = dimmer mix. No fixed per-category vars. */
-  --thinking: #f6c177;
+  --thinking: #c9c9c9;
   --radius: 14px;
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
   --focus-ring: 0 0 0 2px color-mix(in srgb, var(--text) 25%, transparent);

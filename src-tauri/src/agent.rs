@@ -2654,7 +2654,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused. For a LONG-RUNNING process (dev server, watcher) set background=true: it starts detached, output goes to a log file the result names, and the tool returns AT ONCE instead of blocking the turn until the timeout.",
             json!({
                 "command": {"type": "string"},
-                "timeout": {"type": "integer"},
+                "timeout": {"type": "integer", "description": "max seconds to wait (default 120, hard ceiling 600 — for anything longer use background=true)"},
                 "background": {"type": "boolean"}
             }),
         ),
@@ -4991,6 +4991,13 @@ the Vision model's description instead.\n"
                 let (result, ok) = handle
                     .await
                     .unwrap_or(("tool task failed".into(), false));
+                // Headless error log — see the sequential arm below.
+                if !ok && req.headless {
+                    let brief: String = result.chars().take(200).collect();
+                    eprintln!(
+                        "[tool] {name} failed: {brief}"
+                    );
+                }
                 if let Some(p) = crate::commands::image_read_path(&result) {
                     step_read_images.push(p);
                 }
@@ -5193,19 +5200,26 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
                             args,
                             result,
                             ok,
-                        } => finish_tool(
-                            &mut messages,
-                            emit,
-                            &trace,
-                            &id,
-                            &name,
-                            &args,
-                            result,
-                            ok,
-                            req.mode == "subagent",
-                            None,
-                            None,
-                        ),
+                        } => {
+                            // Headless error log — see the sequential arm below.
+                            if !ok && req.headless {
+                                let brief: String = result.chars().take(200).collect();
+                                eprintln!("[tool] {name} failed: {brief}");
+                            }
+                            finish_tool(
+                                &mut messages,
+                                emit,
+                                &trace,
+                                &id,
+                                &name,
+                                &args,
+                                result,
+                                ok,
+                                req.mode == "subagent",
+                                None,
+                                None,
+                            );
+                        }
                     }
                 }
             };
@@ -6000,6 +6014,15 @@ call fetch_url again with offset={next} for the rest]",
             }
             if let Some(p) = crate::commands::image_read_path(&applied) {
                 step_read_images.push(p);
+            }
+            // Headless error log: a scheduled run has no chat panel, so a
+            // failed tool card had NO trace in rust.log — the run row flipped
+            // to `error` at the end carrying a reason nobody could trace back
+            // to its step. One line per real failure; the interactive path is
+            // untouched (its failure is already visible on its own card).
+            if !ok && req.headless {
+                let brief: String = applied.chars().take(200).collect();
+                eprintln!("[tool] {name} failed: {brief}");
             }
             finish_tool(
                 &mut messages,

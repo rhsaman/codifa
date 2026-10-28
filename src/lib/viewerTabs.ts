@@ -312,6 +312,10 @@ export interface ViewerTab {
   /** Shell a program-less terminal tab runs ("" = the OS login shell). The
    *  session is created when the tab mounts, so the tab carries the choice. */
   terminalShell?: string
+  /** Bumped every time this tab's target is re-opened while the tab still
+   *  exists. The panel keys its spawn effect on it so it can replace a session
+   *  whose program exited — the store cannot see pty liveness, the panel can. */
+  reopenSeq?: number
   createdAt: number
 }
 
@@ -1299,9 +1303,14 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
           ) ?? s.tabs.find((t) => t.id === id)
         : s.tabs.find((t) => t.id === id)
       if (existing) {
-        // Focus (and re-title) the tab that already runs this target.
+        // Focus (and re-title) the tab that already runs this target. The
+        // sequence bump tells the panel the target was asked for AGAIN: for a
+        // live session it is a no-op (keep nvim + its scrollback), for one
+        // whose program ended it respawns — re-focusing a dead nvim used to
+        // read as "the file does not open", with no error anywhere.
+        const reopenSeq = (existing.reopenSeq ?? 0) + 1
         const title = opts?.title ?? existing.title
-        const tabs = title === existing.title ? s.tabs : s.tabs.map((t) => (t === existing ? { ...t, title } : t))
+        const tabs = s.tabs.map((t) => (t === existing ? { ...t, title, reopenSeq } : t))
         const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: existing.id } : s.lastActiveByChat
         return { tabs, activeId: existing.id, paneOpen: true, lastActiveByChat, focusedViewerId: existing.id }
       }

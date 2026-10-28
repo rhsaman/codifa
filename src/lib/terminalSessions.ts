@@ -33,6 +33,10 @@ export interface TerminalSessionEntry {
   /** Detaches this screen from the live-font registry (Settings → Appearance
    *  re-applies the terminal point size to every registered screen). */
   offFont: () => void
+  /** The pty's program ended on its own. The tab keeps its scrollback readable,
+   *  but re-opening this tab's target must spawn a FRESH pty — re-focusing a
+   *  dead nvim read as "the file does not open", with no error anywhere. */
+  exited: boolean
 }
 
 const entries = new Map<string, TerminalSessionEntry>()
@@ -103,10 +107,14 @@ function ensureTransport(): void {
     else entryByPtyId(id)?.term.write(data)
   })
   const offExit = window.coder.onTerminalExit((id) => {
-    // The program ended on its own (`exit`): the tab stays and reports the
-    // shell's exit, mirroring the bottom panel, which keeps the buffer so the
-    // last output is still readable.
-    entryByPtyId(id)?.term.write('\r\n')
+    // The program ended on its own (`exit`): the tab stays and says so, keeping
+    // the buffer readable like the bottom panel. Marking the entry is what lets
+    // a later re-open of the same target spawn a fresh pty — without the mark
+    // the request only re-focused this dead pane.
+    const entry = entryByPtyId(id)
+    if (!entry) return
+    entry.exited = true
+    entry.term.write('\r\n\x1b[2m[process exited]\x1b[0m\r\n')
   })
   transportOff = () => {
     offData()
@@ -124,6 +132,17 @@ export function peekTerminalSession(tabId: string): TerminalSessionEntry | null 
   return entries.get(tabId) ?? null
 }
 
+/** Dispose a session whose pty ended on its own so its tab can spawn a fresh
+ *  one. Unlike closeTerminalSession this kills nothing — the pty is already
+ *  gone; only the renderer-side maps and the screen still reference it. */
+function resetDeadSession(tabId: string, entry: TerminalSessionEntry): void {
+  entries.delete(tabId)
+  tabByPtyId.delete(entry.id)
+  earlyOutput.delete(entry.id)
+  entry.offFont()
+  entry.term.dispose()
+}
+
 /** Spawn (once) the pty behind a terminal tab and return its xterm entry.
  *  `program`/`args` run one program instead of a login shell — that is how the
  *  in-app "Neovim" target works. `shell` picks the SHELL of a plain tab without
@@ -137,7 +156,10 @@ export function openTerminalSession(
   shell?: string,
 ): Promise<TerminalSessionEntry> {
   const existing = entries.get(tabId)
-  if (existing) return Promise.resolve(existing)
+  // A session whose program already exited is replaced, not returned: its pty
+  // is gone, so "reopening" it would park the request on a dead pane.
+  if (existing && !existing.exited) return Promise.resolve(existing)
+  if (existing) resetDeadSession(tabId, existing)
   const inflight = pending.get(tabId)
   if (inflight) return inflight
   if (!hasTerminalApi()) return Promise.reject(new Error('terminal API unavailable'))
@@ -190,7 +212,7 @@ export function openTerminalSession(
     // Register for live point-size changes; the fit makes the new size visible
     // immediately instead of on the next resize.
     const offFont = registerTerminalScreen({ term, refit: fit.fit.bind(fit) })
-    const entry: TerminalSessionEntry = { id, term, fit, el: null, mounted: false, offFont }
+    const entry: TerminalSessionEntry = { id, term, fit, el: null, mounted: false, offFont, exited: false }
     // Keyed by the TAB id, never the pty id: every consumer (peek/attach/fit/
     // close) only ever knows the tab id. Keying this map by the pty id made
     // every lookup miss — the screen was never fitted (so xterm stayed on its

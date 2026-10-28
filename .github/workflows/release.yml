@@ -32,7 +32,10 @@ jobs:
             os: macos-latest
             args: --target aarch64-apple-darwin
           - name: macOS (Intel)
-            os: macos-13
+            # macos-13 (the last default Intel image) was retired on 2025-12-04
+            # and its jobs queue forever; macos-15-intel is GitHub's
+            # x86_64 image until Aug 2027 (actions/runner-images#13045).
+            os: macos-15-intel
             args: --target x86_64-apple-darwin
           - name: Windows
             os: windows-latest

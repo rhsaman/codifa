@@ -292,10 +292,14 @@ export function claimFindPaint(token: symbol): void {
   ownerListeners.forEach((fn) => fn(paintOwner));
 }
 
+/** Clear the owner when the owning bar goes away. Deliberately SILENT: the
+ *  only bar that cares is the one releasing (its subscription would otherwise
+ *  fire during its own unmount and re-run its close path — the "Escape closed
+ *  the bar but focus jumped to the transcript" regression). A claim by a new
+ *  bar is the only owner change that needs announcing. */
 export function releaseFindPaint(token: symbol): void {
   if (paintOwner !== token) return;
   paintOwner = null;
-  ownerListeners.forEach((fn) => fn(null));
 }
 
 export function onFindPaintOwner(fn: (t: symbol | null) => void): () => void {

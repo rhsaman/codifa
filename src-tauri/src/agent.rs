@@ -2651,8 +2651,12 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             // The schema is where the model learns the DIVISION OF LABOUR: the
             // backend refuses a shell read/search (MEASURED: the model reached
             // for `cat`/`sed -n` whenever the tool list did not say so).
-            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused.",
-            json!({"command": {"type": "string"}, "timeout": {"type": "integer"}}),
+            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused. For a LONG-RUNNING process (dev server, watcher) set background=true: it starts detached, output goes to a log file the result names, and the tool returns AT ONCE instead of blocking the turn until the timeout.",
+            json!({
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"},
+                "background": {"type": "boolean"}
+            }),
         ),
         ("current_time", "Current UTC time.", json!({})),
         // Bounded read/search: the main agent may read what the step already
@@ -5340,6 +5344,19 @@ Valid names: {}",
                         .into(),
                     false,
                 )
+            } else if name == "run_terminal" && args["background"].as_bool().unwrap_or(false) {
+                // Background terminal — the agent's dev-server/watcher escape.
+                // The command detaches, output streams into a log, and THIS
+                // call returns at once, so a `vite` never burns the timeout on
+                // the turn. Deliberately AFTER the read-only gate above: a
+                // background command writes the world exactly like a
+                // foreground one, so a read-only mode is still read-only here.
+                // Attributed to req.chat_id so the right panel lists the
+                // terminal under the chat that started it.
+                match crate::agent_terminals::spawn(&root, &req.chat_id, args["command"].as_str().unwrap_or_default()) {
+                    Ok(info) => (crate::agent_terminals::model_text(&info), true),
+                    Err(e) => (format!("cannot start background terminal: {e}"), false),
+                }
             } else if name == "plugin" {
                 // The ONE door to a bundle's scripts. Binding the whole tool
                 // behind the authoring flag meant a scheduled Build run — which

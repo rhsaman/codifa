@@ -68,12 +68,14 @@ export interface PrefixShortcut {
   label: string;
   /** Non-command actions that App.tsx dispatches directly. `live` toggles
    *  the realtime voice session; `voice` is hold-Space dictation; `terminal`
-   *  toggles the bottom terminal panel; `pane-left`/`pane-right` move focus
-   *  across the app's three sections (sidebar ↔ chats ↔ right pane); and
-   *  `terminal-focus` lands the caret in the bottom terminal, opening it.
+ *  toggles the bottom terminal panel; `pane-left`/`pane-right` move focus
+ *  across the app's three sections (sidebar ↔ chats ↔ right pane); and
+ *  `terminal-focus` lands the caret in the RIGHT-PANE terminal tab,
+ *  spawning one when none exists.
    *  `terminal-next`/`terminal-prev` cycle the TERMINAL TABS ([ = previous,
    *  ] = next): right-pane terminal tabs first, the bottom panel's shells
-   *  as the fallback. */
+   *  as the fallback. `files`/`git`/`artifacts`/`schedule` open their right
+   *  pane pages (`files` also focuses the explorer's filter box). */
   action?:
     | "voice"
     | "live"
@@ -82,7 +84,11 @@ export interface PrefixShortcut {
     | "pane-right"
     | "terminal-focus"
     | "terminal-next"
-    | "terminal-prev";
+    | "terminal-prev"
+    | "files"
+    | "git"
+    | "artifacts"
+    | "schedule";
 }
 
 /** Second key (after Ctrl+X) -> the command it runs. Order is display order.
@@ -95,9 +101,13 @@ export const PREFIX_SHORTCUTS: Record<string, PrefixShortcut> = {
   v: { cmd: "/voice", label: "Toggle the live voice session", action: "live" },
   " ": { cmd: "/voice", label: "Hold Space to record voice", action: "voice" },
   j: { cmd: "", label: "Toggle the terminal panel", action: "terminal" },
+  e: { cmd: "", label: "Open the file explorer (right pane) and focus its filter", action: "files" },
+  g: { cmd: "", label: "Open the git diff panel (right pane)", action: "git" },
+  a: { cmd: "", label: "Open the artifacts panel (right pane)", action: "artifacts" },
+  s: { cmd: "", label: "Open the schedule panel (right pane)", action: "schedule" },
   l: { cmd: "", label: "Move focus right: sidebar → chats → right pane", action: "pane-right" },
   h: { cmd: "", label: "Move focus left: right pane → chats → sidebar", action: "pane-left" },
-  t: { cmd: "", label: "Focus the terminal (opens it if closed)", action: "terminal-focus" },
+  t: { cmd: "", label: "Focus the terminal tab in the right pane (spawns one if there is none)", action: "terminal-focus" },
   "[": { cmd: "", label: "Previous terminal tab", action: "terminal-prev" },
   "]": { cmd: "", label: "Next terminal tab", action: "terminal-next" },
 };

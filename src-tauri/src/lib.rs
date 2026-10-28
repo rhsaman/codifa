@@ -9,6 +9,7 @@
 //! its own copy of the tree, so nothing about the shipped app changes.
 
 pub mod agent;
+pub mod agent_terminals;
 pub mod artifacts;
 pub mod backup;
 pub mod browser;

@@ -1711,6 +1711,37 @@ struct PlanQuery {
     chat_id: String,
 }
 
+// ---------- agent background terminals ----------
+// The right panel's Terminals section polls the live list for the ACTIVE chat
+// (the section exists only while something runs) and posts a Stop here — the
+// same loopback surface every other panel uses, no Tauri-event plumbing.
+
+#[derive(serde::Deserialize)]
+struct AgentTerminalsQuery {
+    #[serde(default)]
+    chat_id: String,
+}
+
+async fn agent_terminals_list(Query(q): Query<AgentTerminalsQuery>) -> Response<Body> {
+    Json(json!({
+        "terminals": crate::agent_terminals::list(&q.chat_id),
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AgentTerminalStopBody {
+    #[serde(default)]
+    id: String,
+}
+
+async fn agent_terminals_stop(Json(body): Json<AgentTerminalStopBody>) -> Response<Body> {
+    if body.id.trim().is_empty() {
+        return bad_request("id is required");
+    }
+    Json(json!({ "ok": crate::agent_terminals::stop(body.id.trim()) })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct PlanChecklistBody {
     root: String,
@@ -2033,6 +2064,10 @@ pub fn router(state: AppState) -> Router {
         .route("/schedule-runs/orphans", delete(crate::appstate::orphan_schedule_runs_clear))
         .route("/schedule-runs/:run_id", delete(crate::appstate::schedule_run_delete))
         .route("/chats/title", post(crate::appstate::chat_title))
+        // Agent background terminals: the right panel's Terminals section
+        // polls the list for the active chat and posts a Stop here.
+        .route("/agent-terminals", get(agent_terminals_list))
+        .route("/agent-terminals/stop", post(agent_terminals_stop))
         // Persian trigger phrases for a part's English description. The catalog
         // matches on keywords, so a skill whose description is English-only is
         // unreachable from a Persian request until someone writes them down.
@@ -2278,6 +2313,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn agent_terminals_lists_and_stops_over_http() {
+        // The renderer's Terminals section polls GET /agent-terminals for the
+        // ACTIVE chat and posts Stop here — this exercises that whole surface
+        // against a real background process.
+        let app = router(new_state(std::env::temp_dir()));
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let info = crate::agent_terminals::spawn(&root, "chat-router-test", "sleep 30").unwrap();
+
+        // The chat filter is on the wire: this chat's row is visible…
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agent-terminals?chat_id=chat-router-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = body["terminals"].as_array().expect("terminals array");
+        assert!(rows.iter().any(|r| r["id"] == info.id && r["running"] == true));
+
+        // …and another chat's filter does not see it.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/agent-terminals?chat_id=some-other-chat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!body["terminals"].as_array().unwrap().iter().any(|r| r["id"] == info.id));
+
+        // Stop over POST — the button's call.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agent-terminals/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "id": info.id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+
+        // An empty id is a 400, not a silent no-op.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agent-terminals/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "id": "" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
     }
 
     #[tokio::test]

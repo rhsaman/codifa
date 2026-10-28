@@ -200,7 +200,7 @@ console.log('۹) کلیدهای فیزیکی براکت — چرخه تب ترم
   const second: readonly string[] = PREFIX_SECOND_KEYS
   check('براکت‌ها کلید دوم پیشوند داخل ترمینال‌اند', second.includes('[') && second.includes(']'))
   // هر action باید در اپ وایر شده باشد — یک تایپو بی‌صدا کورد را می‌بلعد.
-  const known = new Set(['voice', 'live', 'terminal', 'pane-left', 'pane-right', 'terminal-focus', 'terminal-next', 'terminal-prev'])
+  const known = new Set(['voice', 'live', 'terminal', 'pane-left', 'pane-right', 'terminal-focus', 'terminal-next', 'terminal-prev', 'files', 'git', 'artifacts', 'schedule'])
   const unknown = Object.values(PREFIX_SHORTCUTS).filter((s) => s.action && !known.has(s.action))
   check('همهٔ actionها وایر شده‌اند', unknown.length === 0, unknown)
 }

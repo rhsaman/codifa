@@ -4,25 +4,23 @@
 
 **The offline-first AI coding assistant for your own machine.**
 
-Codifa is a desktop IDE-style workspace — file explorer, Monaco editor and a
-streaming AI chat — powered by a real **agent** that reads, searches and edits
-your code _itself_, confined to the folder you choose. Bring your own model:
-OpenRouter, any OpenAI-compatible API, or a fully local endpoint. Type, or just
-talk. Nothing leaves your machine unless you want it to.
+Codifa is a desktop workspace for working on your projects with an AI agent —
+file explorer, code editor, terminal and a streaming chat in one window. The
+agent reads, searches and edits your code _itself_, confined to the folder you
+choose. Bring your own model: OpenRouter, any OpenAI-compatible API, or a fully
+local endpoint. Type, or just talk. Nothing leaves your machine unless you want
+it to.
 
-کدیفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری تمام‌عیار با کاوشگر فایل،
-ویرایشگر کد و چتِ هوش مصنوعیِ زنده. در قلب آن یک **عامل واقعی** نشسته که
-فایل‌های شما را خودش می‌خواند، جستجو و ویرایش می‌کند — و همه‌چیز فقط در همان
+کدیفا یک دستیار کدنویسی دسکتاپی است؛ یک فضای کاری کامل با کاوشگر فایل،
+ویرایشگر کد، ترمینال و چتِ هوش مصنوعیِ زنده. در قلب آن یک **عامل واقعی** نشسته
+که فایل‌های شما را خودش می‌خواند، جستجو و ویرایش می‌کند — و همه‌چیز فقط در همان
 پوشه‌ای که انتخاب کرده‌اید. مدل‌تان را خودتان بیاورید: OpenRouter، هر API سازگار
-با OpenAI یا یک مدل کاملاً محلی. تایپ کنید یا حرف بزنید. مگر
-اینکه خودتان بخواهید، هیچ‌چیز از دستگاه شما بیرون نمی‌رود.
+با OpenAI یا یک مدل کاملاً محلی. تایپ کنید یا حرف بزنید. مگر اینکه خودتان
+بخواهید، هیچ‌چیز از دستگاه شما بیرون نمی‌رود.
 
 [English](#english-english) · [فارسی](#persian-فارسی)
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
-![Rust](https://img.shields.io/badge/Rust-1.77+-000000?logo=rust&logoColor=white)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 ![GitHub stars](https://img.shields.io/github/stars/rhsaman/codifa?style=social)
 ![GitHub downloads](https://img.shields.io/github/downloads/rhsaman/codifa/total)
@@ -44,34 +42,31 @@ talk. Nothing leaves your machine unless you want it to.
 
 ### ✨ Features
 
-|     | Feature                             | Description                                                                                                                                                                                                                                                                                     |
-| --- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🔌  | **Bring your own model**            | OpenRouter, any OpenAI-compatible API, or a local endpoint (Ollama / llama.cpp / vLLM). Models are fetched live and switchable straight from the UI.                                                                                                                                            |
-| 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (read-only mentor), **Plan** (read-only planner that scouts the code and writes an implementation plan) and **Coder** (autonomous code-writing agent). Switch with `Tab`.                                                                                           |
-| 🛠️  | **Tool-based agent**                | The agent searches and lists your files and creates or edits them by itself — confined to the folder you opened, so it never touches anything outside your project. Skills and MCP connectors you ask it to install are saved inside the app, never scattered into other tools' config folders. |
-| 🎤  | **Voice input**                     | Hold the mic, speak in Persian or English, get text. Speech is sent to the speech (STT) provider you configure in **Settings → Media Providers** — pick any OpenAI-compatible endpoint that serves `/audio/transcriptions`. A live "wave" equalizer animates while recording.                                                                                       |
-| 🧠  | **Memory**                          | Notes you ask the agent to remember are embedded and searchable per project — stored locally in your data folder.                                                                                                                                                                                |
-| 📊  | **Live context meter**              | The context-usage bar updates in real time using the provider's exact per-request token counts, not an estimate.                                                                                                                                                                                |
-| 🛟  | **Graceful small-context handling** | Works smoothly even on small 8K local models — history is compacted automatically before context runs out, so the agent keeps going instead of crashing.                                                                                                                                        |
-| 🖥️  | **Full IDE UI**                     | Resizable file explorer (left), Monaco editor (center), streaming markdown chat with syntax highlighting (right), dark/light theme.                                                                                                                                                             |
-| 🌐  | **RTL / LTR**                       | Persian and English mix correctly in chat — parentheses and arrows are never mirrored, and markdown (bold, headings, lists, tables) still renders properly in RTL. The whole UI and this README support both directions.                                                                        |
-| 💾  | **Durable storage**                 | Settings, chat history, skills, connectors and plans are saved safely and never written inside your project.                                                                                                                                                                                    |
-| 🗂️  | **RAG memory**                      | Notes you ask the agent to remember and saved web pages are embedded and searchable per project — fully offline.                                                                                                                                                                                |
-| 🔁  | **Streaming + persistence**         | Token-by-token streaming replies; multiple parallel chats.                                                                                                                                                                                                                                      |
-| ⌨️  | **Slash commands**                  | `/compact` (summarize into a running summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`.                                                                                                                                                                                |
-
-### 📦 Requirements
-
-- Node.js ≥ 20 and npm
-- [Rust](https://rustup.rs/) (stable) and the Tauri prerequisites for your OS
+|     | Feature                             | Description                                                                                                                                                                                                                                                                                    |
+| --- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔌  | **Bring your own model**            | Connect OpenRouter, any OpenAI-compatible API, or a local server (Ollama / llama.cpp / vLLM). Models load live and switch right from the header.                                                                                                                                                |
+| 🤖  | **A real agent, not autocomplete**  | Three modes — **Ask** (questions and explanations), **Plan** (explores the code and writes an implementation plan) and **Coder** (writes and edits files by itself). Cycle with `Tab`.                                                                                                          |
+| 🛠️  | **Works inside your project**       | The agent searches, opens, creates and edits files on its own — always confined to the folder you opened, never touching anything outside your project.                                                                                                                                         |
+| 🔍  | **Find in chat**                    | Press `Cmd/Ctrl+F` to search any conversation — every match is highlighted; step between results with `Enter`/`Shift+Enter`.                                                                                                                                                                    |
+| 🪟  | **Many chats at once**              | Run parallel conversations, split the chat area into several windows and arrange them however you like.                                                                                                                                                                                          |
+| 🖥️  | **Built-in terminal**               | Real terminal sessions — a bottom panel, plus terminal tabs in the side pane, right next to your chat.                                                                                                                                                                                           |
+| 🌿  | **Git diff panel**                  | See exactly what changed — per file, with add/remove stats, in the side pane.                                                                                                                                                                                                                    |
+| 📦  | **Artifacts**                       | The agent can build previewable HTML/Markdown documents — dashboards, reports, small tools — that run right inside the app (`/artifact create …`).                                                                                                                                               |
+| 🗓️  | **Scheduled tasks**                 | Set a task to run on a schedule (e.g. `/schedule create every day at 9am …`) and collect the results in an inbox.                                                                                                                                                                                |
+| 🎯  | **Persistent goals**                | Give the agent a standing goal (e.g. `/goal all tests pass`) and it keeps working toward it across turns.                                                                                                                                                                                        |
+| 🎤  | **Voice**                           | Hold the mic and speak in Persian or English to get text — or open a live voice conversation and just talk back and forth. Both use the speech services you configure in **Settings → Media Providers**.                                                                                          |
+| 🧠  | **Memory**                          | Ask the agent to remember things — notes and saved pages are kept per project and searchable later, fully on your machine.                                                                                                                                                                       |
+| 🧩  | **Skills, connectors, plugins**     | Ask the agent to install skills, MCP connectors or plugins (from a repo or a docs page) and they live inside the app itself — nothing is written into other tools' config folders.                                                                                                               |
+| 🛟  | **Smooth with small models**        | Works comfortably even with small 8K local models — history is summarized automatically before the context runs out, so the work keeps going instead of stopping.                                                                                                                                |
+| 🎨  | **15 themes + full RTL**            | 15 dark and light themes, and Persian/English mix correctly everywhere — parentheses, arrows and markdown never break in RTL.                                                                                                                                                                    |
+| ⌨️  | **Slash commands**                  | `/help`, `/compact`, `/clear`, `/new`, `/plan`, `/undo`, `/redo`, `/skill`, `/mcp`, `/plugin`, `/artifact`, `/schedule`, `/goal`.                                                                                                                                                                |
 
 ### 📥 Installing (end users)
 
-If you just want to run Codifa — not build it — grab the installer instead of
-the source. Codifa is **not signed with an Apple Developer ID**, so macOS
-quarantines the downloaded image and refuses the first launch with _"Codifa is
-damaged and can't be opened"_ or _"Apple could not verify…"_. Clearing that flag
-normally needs a Terminal command; the installer does it for you.
+If you just want to run Codifa — not build it — grab the installer. Codifa is
+**not signed with an Apple Developer ID**, so macOS quarantines the downloaded
+image and refuses the first launch with _"Codifa is damaged and can't be
+opened"_ or _"Apple could not verify…"_. The installer clears that flag for you.
 
 **Option A — one-command install (recommended):**
 
@@ -81,7 +76,8 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 
 It downloads the latest release, verifies the app's code signature, clears the
 quarantine attribute and copies the app into `/Applications`. Every step is
-printed so you can read what happened. To pin a specific release, pass the tag:
+printed so you can read what happened. To install a specific release, pass the
+tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v1.7.0
@@ -98,83 +94,30 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 
 3. Open Codifa from `/Applications`. If macOS still blocks it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
-**Requirements:** macOS 11 or newer. The published builds are **Apple Silicon
-(arm64) only** — there is no Intel macOS build, and the installer refuses to run
-on one rather than install a binary the CPU cannot execute.
+**Requirements:** macOS 13.4 or newer, Apple Silicon. There is no Intel macOS
+build; the installer refuses to run on one rather than install a binary the CPU
+cannot execute.
 
-**Permissions:** Codifa asks for the microphone (voice dictation) and screen
+**Permissions:** Codifa asks for the microphone (voice input) and screen
 recording (Computer Use). Grant them in **System Settings → Privacy & Security**;
-because the app is not notarized, you may need to toggle them on and relaunch
-the app once after an update.
+because the app is not notarized, you may need to toggle them off and on once
+and relaunch the app after an update.
 
-### 🚀 Setup
+### 🚀 Getting started
 
-```bash
-npm install       # JavaScript dependencies
-```
-
-There is no backend to install: the agent, tools, MCP client, skills, document
-readers and providers all run inside the Rust shell.
-
-### 🧑‍💻 Development
-
-```bash
-npm run dev
-```
-
-Opens the Tauri window with a hot-reloading renderer. The Rust side owns the
-agent loop and serves the renderer's local HTTP API (`/chat/stream`, `/skills`,
-`/mcp`, `/doc/read`, …). When launched from the packaged `.app`, Codifa merges
-the GUI PATH with your login-shell path so tools like `docker` (used by MCP
-stdio connectors) are found.
-
-### 🏗️ Building / packaging
-
-```bash
-npm run build       # typecheck + build renderer
-npm run dist        # package for the current OS
-npm run dist:mac    # only macOS (app / dmg)
-npm run dist:win    # only Windows (NSIS)
-npm run dist:linux  # only Linux (AppImage)
-```
-
-Output lands in `src-tauri/target/release/bundle/`.
-
-> **macOS Gatekeeper warning:** the packaged app is ad-hoc signed (not
-> notarized), so the first launch from Finder may show _"Codifa has been blocked
-> because it may reduce your privacy…"_. This is expected for locally-built apps.
-> Fix: right-click the app → **Open** → **Open**. If copied from a download,
-> also clear the quarantine flag:
->
-> ```bash
-> xattr -dr com.apple.quarantine /path/to/Codifa.app
-> ```
->
-> Distributing to someone else? Point them at
-> [`scripts/install-macos.sh`](scripts/install-macos.sh) — see
-> [Installing (end users)](#-installing-end-users) — rather than embedding the
-> `xattr` line in your instructions. The installer prints each step, so the
-> recipient never has to read shell syntax.
-
-### 🖱️ Usage
-
-1. Click **Open Folder** (or `Cmd/Ctrl+O`) and select your project root.
+1. Click **Open Folder** (or `Cmd/Ctrl+O`) and select your project folder.
 2. Open settings (`Cmd/Ctrl+,`). Pick OpenRouter, a custom OpenAI-compatible
-   API, or a local endpoint (Ollama / llama.cpp / vLLM); enter your API key /
-   base URL and choose a model.
-3. Choose an agent mode: **Ask**, **Plan** or **Coder**.
-4. Type a message and press `Enter` (or use the mic button). The agent
-   streams its reply and uses its tools to inspect or modify files — always
-   confined to the folder you opened. In **Plan** mode the finished plan is saved
-   for that project and auto-loaded on your next Plan/Coder run. If you ask the
-   agent to install skills or MCP connectors (from a repo, a docs page, etc.),
-   it saves them into the app itself — it never writes files into other tools'
-   config folders, even if the source's instructions say so.
+   API, or a local server (Ollama / llama.cpp / vLLM); enter your API key and
+   choose a model.
+3. Choose a mode: **Ask**, **Plan** or **Coder**.
+4. Type a message and press `Enter` (or hold the mic button). The agent streams
+   its answer and works on your files by itself — always inside the folder you
+   opened. In **Plan** mode the finished plan is saved for that project and
+   loaded again on your next Plan/Coder run.
 
-> 💡 The app **Data path** is configurable. Its default is `~/.codifa` on every
-> OS: `~/.codifa` (macOS), `/home/<user>/.codifa` (Linux) and
-> `C:\Users\<user>\.codifa` (Windows). Changing it moves your data to the new
-> folder, keeping a backup of the old one — all from **Settings → Memory**.
+> 💡 Your data (chats, settings, skills, memory) lives outside your projects —
+> by default in `~/.codifa` on every OS. The path is changeable from
+> **Settings → Memory**, and moving it keeps a backup of the old folder.
 
 ### ⌨️ Keyboard shortcuts
 
@@ -182,43 +125,27 @@ Output lands in `src-tauri/target/release/bundle/`.
 | --------------------- | -------------------------------------------------- |
 | `Enter`                | Send message (`Shift+Enter` = newline)            |
 | `Cmd/Ctrl+Enter`      | Queue the message (sends after the current turn, won't interrupt) |
+| `Cmd/Ctrl+F`          | Find in the focused chat transcript — highlights every match; `Enter`/`Shift+Enter` step next/previous, `Esc` closes |
 | `Cmd/Ctrl+M`          | Fullscreen what has focus — terminal, side pane, else the focused chat window (press again to restore) |
-| `Cmd/Ctrl+P`          | Quick-open / search overlay (`⌘⇧F` = content grep) |
+| `Cmd/Ctrl+P`          | Quick-open / search overlay (`⌘⇧F` = content search) |
 | `Cmd/Ctrl+B`          | Toggle sidebar                                     |
 | `Cmd/Ctrl+,`          | Open settings                                      |
 | `Cmd/Ctrl+S`          | Save current file                                  |
 | `Cmd/Ctrl+T`          | New chat                                           |
+| `Cmd/Ctrl+O`          | Open a project folder                              |
 | `Ctrl+H/J/K/L`        | Move focus vim-style between chat windows (k=up, j=down, h=left, l=right) |
 | `Shift+Alt(Option)+H/J/K/L` | Swap (move) chat window positions in the same vim directions |
 | `Ctrl+X` then `j`     | Toggle the terminal panel (tmux-style prefix)      |
+| `Ctrl+X` then `e`     | Open the file explorer (right pane) and focus its filter (tmux-style prefix) |
+| `Ctrl+X` then `g`     | Open the git diff panel (tmux-style prefix)        |
+| `Ctrl+X` then `a`     | Open the artifacts panel (tmux-style prefix)       |
+| `Ctrl+X` then `s`     | Open the schedule panel (tmux-style prefix)        |
+| `Ctrl+X` then `t`     | Focus the terminal tab in the right pane (spawns one if there is none) |
 | `Ctrl+X` then `u`     | Undo last exchange (tmux-style prefix)             |
 | `Ctrl+X` then `r`     | Redo last undone exchange (tmux-style prefix)      |
 | `Ctrl+X` then `c`     | Compact the chat context (tmux-style prefix)       |
 | `Ctrl+X` then `v`     | Toggle the live voice session (tmux-style prefix)  |
 | `Ctrl+X` then `Space` | Hold to record voice (tmux-style prefix)           |
-
-### 🏛️ Architecture
-
-```
-┌───────────────────────────── Tauri v2 ─────────────────────────────┐
-│ Rust shell (src-tauri/src)                                         │
-│   agent.rs       agent loop: stream, tools, compact, steer         │
-│   backend_light  the renderer's whole HTTP API (loopback)          │
-│   tools.rs       fs / search / edit / terminal, sandboxed to root  │
-│   skills.rs      built-in + user skills (~/.codifa/skills)         │
-│   mcp.rs  lsp.rs  docs.rs  media.rs  git.rs  plans.rs  …           │
-│   pty.rs         real terminal sessions                            │
-│   store.rs       settings + chats, atomic writes                   │
-└──────────────┬───────────────────────────────▲─────────────────────┘
-               │ IPC (invoke/listen)           │ HTTP + SSE (127.0.0.1)
-┌──────────────▼───────────────────────────────┴─────────────────────┐
-│ Renderer (src) — React + Monaco + xterm                            │
-│   chat (SSE) · file explorer · editor · terminal · viewers         │
-└────────────────────────────────────────────────────────────────────┘
-
-Providers (bring your own): OpenRouter · OpenAI-compatible · local endpoint
-Data lives in ~/.codifa — settings, chats, skills, MCP, plans, traces.
-```
 
 </details>
 
@@ -235,33 +162,30 @@ Data lives in ~/.codifa — settings, chats, skills, MCP, plans, traces.
 
 |     | ویژگی                          | توضیح                                                                                                                                                                                                                                                                                        |
 | --- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🔌  | **مدل‌تان را خودتان بیاورید**  | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان رابط کاربری قابل تعویض است.                                                                                                                        |
-| 🤖  | **هدف حقیقی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (مربیِ فقط‌خواندنی)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (عاملِ خودمختاری که مستقلاً کد می‌نویسد). با `Tab` میان‌شان بچرخید.                                                                      |
-| 🛠️  | **عاملِ ابزارمحور**            | عامل خودش فایل‌ها را جستجو و فهرست می‌کند و می‌سازد یا ویرایش می‌کند — اما فقط داخل همان پوشه‌ای که باز کرده‌اید، پس هرگز به بیرون از پروژهٔ شما دست نمی‌زند. مهارت‌ها و اتصال‌های MCP را هم که بخواهید، داخل خودِ برنامه ذخیره می‌کند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد. |
-| 🎤  | **ورودی صوتی**                 | دکمهٔ میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید؛ صدا به همان فراهم‌کنندهٔ گفتار (STT) که در **تنظیمات ← فراهم‌کننده‌های رسانه** پیکربندی کرده‌اید فرستاده می‌شود. هنگام ضبط، یک اکولایزر موج‌دارِ متحرک نمایش داده می‌شود.                                                                 |
-| 🧠  | **حافظه**                      | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد، برای هر پروژه جاساز و قابل جستجو می‌شوند — به‌صورت محلی در پوشهٔ دادهٔ شما.                                                                                                                                                                  |
-| 📊  | **نوار استفادهٔ بافتِ زنده**   | نوار مصرف بافت در لحظه و بر پایهٔ شمار توکنِ دقیقی که فراهم‌کننده اعلام می‌کند به‌روز می‌شود، نه برآورد.                                                                                                                                                                                     |
-| 🛟  | **مدیریت هوشمند بافتِ کم**     | حتی با مدل‌های کوچک محلی (مثلاً ۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن بافت، تاریخچه به‌طور خودکار فشرده می‌شود تا به‌جای توقف، کار پیش برود.                                                                                                                                     |
-| 🖥️  | **رابطی به بلندِ یک IDE**      | کاوشگر فایل با اندازهٔ قابل تنظیم (چپ)، ویرایشگر Monaco (وسط) و چتِ مارک‌داون با هایلایت سینتکس (راست)، به‌همراه تم تیره و روشن.                                                                                                                                                             |
-| 🌐  | **راست‌به‌چپ / چپ‌به‌راست**    | ترکیب فارسی و انگلیسی در چت درست نمایش داده می‌شود — پرانتزها و فلش‌ها برعکس نمی‌شوند و مارک‌داون (بولد، تیتر، لیست، جدول) در متن راست‌به‌چپ هم درست رندر می‌شود. رابط کاربری و همین مستندات هر دو دوزبانه‌اند.                                                                              |
-| 💾  | **ذخیره‌سازی ماندگار**         | تنظیمات، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌ها و برنامه‌ها به‌شکل امن ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما نوشته نمی‌شوند.                                                                                                                                                              |
-| 🗂️  | **حافظهٔ RAG**                 | یادداشت‌هایی که از عامل می‌خواهید به خاطر بسپارد و صفحات وبِ ذخیره‌شده، برای هر پروژه جاساز و قابل جستجو می‌شوند — کاملاً آفلاین.                                                                                                                                                            |
-| 🔁  | **استریم و ماندگاری**          | پاسخ‌ها قطعه‌به‌قطعه می‌رسند؛ چند گفتگوی موازی.                                                                                                                                                                                                                                              |
-| ⌨️  | **دستورهای اسلش**              | `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`، `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`.                                                                                                                                                                             |
-
-### 📦 پیش‌نیازها
-
-- Node.js نسخهٔ ۲۰ به بالا و npm
-- [Rust](https://rustup.rs/) (پایدار) و پیش‌نیازهای Tauri برای سیستم‌عامل شما
+| 🔌  | **مدل‌تان را خودتان بیاورید**  | به OpenRouter، هر API سازگار با OpenAI یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل می‌شود. فهرست مدل‌ها به‌روز گرفته می‌شود و از همان بالای پنجره قابل تعویض است.                                                                                                                        |
+| 🤖  | **عامل واقعی، نه تکمیل خودکار** | سه حالت دارد — «پرسش» (پاسخ و توضیح)، «برنامه» (کد را می‌کاود و برنامهٔ پیاده‌سازی می‌نویسد) و «نویسندهٔ کد» (خودش فایل‌ها را می‌سازد و ویرایش می‌کند). با `Tab` میان‌شان بچرخید.                                                                                                            |
+| 🛠️  | **داخل پروژهٔ شما کار می‌کند** | عامل خودش فایل‌ها را جستجو، باز، ساختن و ویرایش می‌کند — اما همیشه فقط داخل همان پوشه‌ای که باز کرده‌اید و هرگز به بیرون از پروژه دست نمی‌زند.                                                                                                                                             |
+| 🔍  | **جستجو در چت**                | با `Cmd/Ctrl+F` هر گفتگو را جستجو کنید — همهٔ نتایج هایلایت می‌شوند و با `Enter`/`Shift+Enter` میان‌شان جابه‌جا شوید.                                                                                                                                                                         |
+| 🪟  | **چند گفتگوی هم‌زمان**         | چند گفتگوی موازی داشته باشید، ناحیهٔ چت را به چند پنجره بشکنید و هرطور که خواستید بچینید.                                                                                                                                                                                                     |
+| 🖥️  | **ترمینال داخلی**              | نشست‌های واقعی ترمینال — یک پنل پایین و چند تب ترمینال در پنل کناری، درست کنار چت.                                                                                                                                                                                                            |
+| 🌿  | **پنل Git diff**               | دقیقاً ببینید چه چیزی تغییر کرده — فایل‌به‌فایل، با آمار افزوده/حذف‌شده، در پنل کناری.                                                                                                                                                                                                       |
+| 📦  | **آرتیفکت‌ها**                 | عامل می‌تواند سندهای HTML/مارک‌داونِ قابل پیش‌نمایش بسازد — داشبورد، گزارش، ابزار کوچک — که داخل خود برنامه اجرا می‌شوند (`/artifact create …`).                                                                                                                                             |
+| 🗓️  | **کارهای زمان‌بندی‌شده**       | کاری را روی یک زمان‌بندی بسپارید (مثلاً `/schedule create every day at 9am …`) و نتایج را در صندوق ورودی ببینید.                                                                                                                                                                              |
+| 🎯  | **هدفِ ماندگار**               | به عامل یک هدفِ ثابت بدهید (مثلاً `/goal all tests pass`) تا ترن‌به‌ترن به سمتش پیش برود.                                                                                                                                                                                                    |
+| 🎤  | **صدا**                        | میکروفون را نگه دارید و به فارسی یا انگلیسی صحبت کنید تا متن شود — یا یک گفتگوی صدای زنده باز کنید و رفت‌وبرگشتی حرف بزنید. هر دو از سرویس‌های گفتاری استفاده می‌کنند که در **تنظیمات ← فراهم‌کننده‌های رسانه** پیکربندی می‌کنید.                                                            |
+| 🧠  | **حافظه**                      | از عامل بخواهید چیزها را به خاطر بسپارد — یادداشت‌ها و صفحات ذخیره‌شده برای هر پروژه نگه داشته می‌شوند و بعداً قابل جستجو هستند؛ کاملاً روی دستگاه خودتان.                                                                                                                                   |
+| 🧩  | **مهارت، اتصال، پلاگین**       | از عامل بخواهید مهارت، اتصال MCP یا پلاگین نصب کند (از یک مخزن یا صفحهٔ مستندات) — همه داخل خود برنامه ذخیره می‌شوند و در پوشه‌های پیکربندیِ ابزارهای دیگر چیزی نوشته نمی‌شود.                                                                                                              |
+| 🛟  | **روان با مدل‌های کوچک**       | حتی با مدل‌های محلی کوچک (۸ هزار توکن) هم روان کار می‌کند — پیش از تمام‌شدن ظرفیت، تاریخچه خودکار خلاصه می‌شود تا به‌جای توقف، کار پیش برود.                                                                                                                                                 |
+| 🎨  | **۱۵ تم + راست‌به‌چپ کامل**    | ۱۵ تم تیره و روشن، و ترکیب فارسی/انگلیسی همه‌جا درست نمایش داده می‌شود — پرانتز و فلش و مارک‌داون در حالت راست‌به‌چپ هرگز به‌هم نمی‌ریزند.                                                                                                                                                  |
+| ⌨️  | **دستورهای اسلش**              | `/help`، `/compact`، `/clear`، `/new`، `/plan`، `/undo`، `/redo`، `/skill`، `/mcp`، `/plugin`، `/artifact`، `/schedule`، `/goal`.                                                                                                                                                            |
 
 ### 📥 نصب برای کاربران نهایی
 
-اگر فقط می‌خواهید Codifa را اجرا کنید — نه اینکه از سورس بسازید — همان
-نصب‌کننده را بردارید. Codifa با **گواهی Developer ID اپل امضا نشده است**،
-بنابراین مک فایل دانلودشده را قرنطینه می‌کند و اجرای اول با پیام
-_«Codifa خراب است و باز نمی‌شود»_ یا _«اپل نتوانست تأیید کند…»_ رد می‌شود. پاک
-کردن آن فلگ معمولاً به دستور ترمینال نیاز دارد؛ اسکریپت نصب این کار را برای
-شما انجام می‌دهد.
+اگر فقط می‌خواهید Codifa را اجرا کنید، همان نصب‌کننده را بردارید. Codifa با
+**گواهی Developer ID اپل امضا نشده است**، بنابراین مک فایل دانلودشده را
+قرنطینه می‌کند و اجرای اول با پیام _«Codifa خراب است و باز نمی‌شود»_ یا
+_«اپل نتوانست تأیید کند…»_ رد می‌شود. اسکریپت نصب این فلگ را برایتان پاک
+می‌کند.
 
 **راه ۱ — نصب با یک دستور (پیشنهادی):**
 
@@ -288,87 +212,34 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 
 ۳. Codifa را از `/Applications` باز کنید. اگر مک باز هم مسدود کرد، به **System Settings → Privacy & Security** بروید و **Open Anyway** را بزنید.
 
-**پیش‌نیاز:** مک‌اواس ۱۱ یا بالاتر. نسخه‌های منتشرشده **فقط اپل سیلیکون
-(arm64)** هستند — نسخهٔ اینتل برای مک وجود ندارد، و اسکریپت نصب روی مک اینتل
-اجرا نمی‌شود تا باینری‌ای نصب نکند که پردازنده نمی‌تواند اجرا کند.
+**پیش‌نیاز:** مک‌اواس ۱۳.۴ یا بالاتر، اپل سیلیکون. نسخهٔ اینتل برای مک وجود
+ندارد و اسکریپت نصب روی مک اینتل اجرا نمی‌شود تا باینری‌ای نصب نکند که
+پردازنده نمی‌تواند اجرا کند.
 
-**مجوزها:** Codifa میکروفون (دیکتهٔ صوتی) و ضبط صفحه (Computer Use) را می‌خواهد.
+**مجوزها:** Codifa میکروفون (ورودی صوتی) و ضبط صفحه (Computer Use) را می‌خواهد.
 آن‌ها را در **System Settings → Privacy & Security** بدهید؛ چون اپ notarize
 نشده است، ممکن است لازم باشد بعد از هر به‌روزرسانی آن‌ها را یک‌بار خاموش و
 روشن کنید و اپ را دوباره باز کنید.
 
-### 🚀 نصب
+### 🚀 شروع سریع
 
-```bash
-npm install       # نصب وابستگی‌های جاوااسکریپت
-```
+۱. روی **باز کردن پوشه** کلیک کنید (یا `Cmd/Ctrl+O`) و پوشهٔ پروژه‌تان را انتخاب کنید.
 
-هیچ بک‌اندی برای نصب نیست: عامل، ابزارها، کلاینت MCP، مهارت‌ها، خوانندهٔ
-سند‌ها و فراهم‌کننده‌ها همه داخل پوستهٔ Rust اجرا می‌شوند.
+۲. تنظیمات را باز کنید (`Cmd/Ctrl+,`). OpenRouter یا یک API سازگار با OpenAI یا
+یک سرور محلی (Ollama / llama.cpp / vLLM) را انتخاب کنید، کلید API را وارد کنید
+و مدل را برگزینید.
 
-### 🧑‍💻 توسعه
+۳. حالت را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
 
-```bash
-npm run dev
-```
+۴. پیام خود را بنویسید و `Enter` را بزنید (یا دکمهٔ میکروفون را نگه دارید).
+عامل پاسخ را زنده نمایش می‌دهد و خودش روی فایل‌هایتان کار می‌کند — همیشه فقط
+داخل همان پوشه‌ای که باز کرده‌اید. در حالتِ «برنامه»، برنامهٔ نهایی برای همان
+پروژه ذخیره و در اجرای بعدیِ حالت برنامه/نویسندهٔ کد دوباره بارگذاری می‌شود.
 
-پنجرهٔ Tauri با رابطِ گرم (hot-reload) باز می‌شود. سمت Rust حلقهٔ عامل را
-در اختیار دارد و API محلیِ رابط کاربری را سرو می‌کند (`/chat/stream`،
-`/skills`، `/mcp`، `/doc/read`، …). در نسخهٔ بسته‌بندی‌شده نیز PATH رابط
-گرافیکی با PATH شلِ ورود ترکیب می‌شود تا ابزارهایی مانند `docker`
-(موردنیاز اتصال‌های MCP) پیدا شوند.
-
-### 🏗️ ساخت و بسته‌بندی
-
-```bash
-npm run build       # typecheck + ساخت renderer
-npm run dist        # بسته‌بندی برای سیستم‌عاملِ فعلی
-npm run dist:mac    # فقط مک (app / dmg)
-npm run dist:win    # فقط ویندوز (NSIS)
-npm run dist:linux  # فقط لینوکس (AppImage)
-```
-
-خروجی در `src-tauri/target/release/bundle/` قرار می‌گیرد.
-
-> **هشدار Gatekeeper در مک:** نسخهٔ بسته‌بندی‌شده فقط ad-hoc امضا شده است
-> (notarize نشده)، بنابراین نخستین اجرا از Finder ممکن است هشدار _«Codifa به
-> خاطر کاهش حریم خصوصی مسدود شده است��_ را نشان دهد. این برای برنامه‌های
-> ساخته‌شدهٔ محلی طبیعی است. راه‌حل: روی برنامه کلیک راست کنید ← **Open** ←
-> **Open**. اگر از اینترنت کپی شده است، فلگ قرنطینه را هم پاک کنید:
->
-> ```bash
-> xattr -dr com.apple.quarantine /path/to/Codifa.app
-> ```
->
-> می‌خواهید برای کس دیگری بفرستید؟ او را به
-> [`scripts/install-macos.sh`](scripts/install-macos.sh) ارجاع دهید — بخش
-> [نصب برای کاربران نهایی](#-نصب-برای-کاربران-نهایی) — و خط `xattr` را در
-> دستورهایتان نگذارید. اسکریپت نصب هر گام را چاپ می‌کند، پس گیرندهٔ کار
-> نیازی به خواندن سینتکس شل ندارد.
-
-### 🖱️ کاربرد
-
-۱. روی **باز کردن پوشه** کلیک کنید (یا `Cmd/Ctrl+O`) و ریشهٔ پروژه را انتخاب کنید.
-
-۲. تنظیمات را باز کنید (`Cmd/Ctrl+,`). به OpenRouter، یک API سازگار با OpenAI
-یا یک سرور محلی (Ollama / llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه
-را وارد کنید و مدل را برگزینید.
-
-۳. حالتِ عامل را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
-
-۴. پیام خود را بنویسید و `Enter` را بزنید (یا دکمهٔ میکروفون را
-فشار دهید). عامل پاسخ را زنده نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از
-ابزارهایش بهره می‌گیرد — همیشه فقط در همان پوشه‌ای که باز کرده‌اید. در حالتِ
-برنامه، برنامهٔ نهایی برای همان پروژه ذخیره و در اجرای بعدیِ حالت
-برنامه/نویسندهٔ کد خودکار بارگذاری می‌شود. اگر از عامل بخواهید مهارت‌ها یا
-اتصال‌های MCP را نصب کند (از یک مخزن، صفحهٔ مستندات و …)، آن‌ها را داخل خودِ
-برنامه ذخیره می‌کند — حتی اگر دستورالعملِ منبع چنین بگوید، در پوشه‌های
-پیکربندیِ ابزارهای دیگر چیزی نمی‌نویسد.
-
-> 💡 «مسیر داده» برنامه قابل تنظیم است و پیش‌فرض آن در هر سیستم‌عاملی
-> `~/.codifa` است: `~/.codifa` (مک)، `/home/<user>/.codifa` (لینوکس) و
-> `C:\Users\<user>\.codifa` (ویندوز). تغییر آن، داده‌هایتان را به پوشهٔ جدید
-> منتقل و از پوشهٔ قبلی پشتیبان نگه می‌دارد — همه از **تنظیمات ← حافظه**.
+> 💡 داده‌های شما (گفتگوها، تنظیمات، مهارت‌ها، حافظه) بیرون از پروژه‌هایتان
+> نگه داشته می‌شود — به‌صورت پیش‌فرض در `~/.codifa` روی هر سیستم‌عاملی. این مسیر
+> از **تنظیمات ← حافظه** قابل تغییر است و هنگام جابه‌جایی، از پوشهٔ قبلی پشتیبان
+> گرفته می‌شود.
 
 ### ⌨️ میان‌برهای صفحه‌کلید
 
@@ -376,43 +247,27 @@ npm run dist:linux  # فقط لینوکس (AppImage)
 | ---------------------- | ----------------------------------------------------- |
 | `Enter`               | ارسال پیام (`Shift+Enter` = خط جدید)                |
 | `Cmd/Ctrl+Enter`       | صف‌کردن پیام (بعد از پایان ترنِ فعلی ارسال می‌شود، بدون قطع) |
-| `Tab`                  | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
+| `Cmd/Ctrl+F`           | جستجو در چتِ در فوکوس — همهٔ نتایج هایلایت می‌شوند؛ `Enter`/`Shift+Enter` نتیجهٔ بعدی/قبلی، `Esc` می‌بندد |
+| `Cmd/Ctrl+M`           | تمام‌صفحه‌کردن هرچه در فوکوس است — ترمینال، پنل کناری، وگرنه پنجرهٔ چت (دوباره بزنید تا برگردد) |
 | `Cmd/Ctrl+P`           | جستجوی سریع و سریع‌باز کردن (`⌘⇧F` = جستجوی محتوا)    |
 | `Cmd/Ctrl+B`           | نمایش/پنهان‌کردن نوار کناری                           |
 | `Cmd/Ctrl+,`           | باز کردن تنظیمات                                      |
 | `Cmd/Ctrl+S`           | ذخیرهٔ فایل جاری                                      |
 | `Cmd/Ctrl+T`           | گفتگوی تازه                                           |
+| `Cmd/Ctrl+O`           | باز کردن پوشهٔ پروژه                                   |
 | `Ctrl+H/J/K/L`        | جابه‌جایی فوکوس میان پنجره‌های چت به سبک ویم (k=بالا، j=پایین، h=چپ، l=راست) |
 | `Shift+Alt(Option)+H/J/K/L` | جابه‌جایی (سواپ) جای پنجره‌های چت در همان جهت‌های ویم |
 | `Ctrl+X` و سپس `j`     | نمایش/پنهان‌کردن پنل ترمینال (پیشوندِ سبک tmux)      |
+| `Ctrl+X` و سپس `e`     | باز کردن فایل اکسپلورر (پنل راست) با فوکوس روی فیلتر آن (پیشوندِ سبک tmux) |
+| `Ctrl+X` و سپس `g`     | باز کردن پنل Git diff (پیشوندِ سبک tmux)             |
+| `Ctrl+X` و سپس `a`     | باز کردن پنل آرتیفکت‌ها (پیشوندِ سبک tmux)           |
+| `Ctrl+X` و سپس `s`     | باز کردن پنل Schedule (پیشوندِ سبک tmux)             |
+| `Ctrl+X` و سپس `t`     | فوکوس تب ترمینال در پنل راست (اگر وجود نداشته باشد ساخته می‌شود) |
 | `Ctrl+X` و سپس `u`     | بازگردانی آخرین تبادل (پیشوندِ سبک tmux)              |
 | `Ctrl+X` و سپس `r`     | بازانجام آخرین تبادل بازگردانی‌شده (پیشوندِ سبک tmux) |
 | `Ctrl+X` و سپس `c`     | فشرده‌سازی زمینهٔ گفتگو (پیشوندِ سبک tmux)            |
 | `Ctrl+X` و سپس `v`     | نمایش/پنهان‌کردن نشست صدای زنده (پیشوندِ سبک tmux)    |
 | `Ctrl+X` و سپس `Space` | نگه‌داشتن Space برای ضبط صدا (پیشوندِ سبک tmux)       |
-
-### 🏛️ معماری
-
-```
-┌───────────────────────────── Tauri v2 ─────────────────────────────┐
-│ پوستهٔ Rust (src-tauri/src)                                         │
-│   agent.rs       حلقهٔ عامل: استریم، ابزارها، فشرده‌سازی، steer       │
-│   backend_light  کلِ API محلیِ رابط کاربری (loopback)                │
-│   tools.rs       فایل/جستجو/ویرایش/ترمینال، محدود به ریشهٔ پروژه     │
-│   skills.rs      مهارت‌های داخلی + کاربری (~/.codifa/skills)          │
-│   mcp.rs  lsp.rs  docs.rs  media.rs  git.rs  plans.rs  …            │
-│   pty.rs         نشست‌های واقعی ترمینال                              │
-│   store.rs       تنظیمات + گفتگوها، نوشتن اتمیک                      │
-└──────────────┬───────────────────────────────▲─────────────────────┘
-               │ IPC (invoke/listen)           │ HTTP + SSE (127.0.0.1)
-┌──────────────▼───────────────────────────────┴─────────────────────┐
-│ رابط کاربری (src) — React + Monaco + xterm                          │
-│   چت (SSE) · کاوشگر فایل · ویرایشگر · ترمینال · نمایشگرها            │
-└────────────────────────────────────────────────────────────────────┘
-
-فراهم‌کننده‌ها (مدل خودتان): OpenRouter · سازگار با OpenAI · سرور محلی
-داده‌ها در ~/.codifa است — تنظیمات، گفتگوها، مهارت‌ها، MCP، پلن‌ها، trace.
-```
 
 </div>
 </details>

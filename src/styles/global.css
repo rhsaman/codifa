@@ -4287,14 +4287,18 @@ body.coder-dragging .chat-split-child {
   transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
-.chat-find-input:focus {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
-}
-
 .chat-find-input::placeholder {
   color: var(--text-dim);
   opacity: 0.7;
+}
+
+/* No focus ring on the find fields: the global :focus-visible outline + halo
+   doubled the field's own border into a loud double ring. The field border
+   plus the caret are the focus indicator. */
+.chat-find-input:focus-visible,
+.files-filter-input:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 
 .chat-find-count {
@@ -19601,6 +19605,130 @@ mark.diff-hit-active {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* ---- بخش Terminals پنل راست — ترمینال‌های بک‌گراند ایجنت ---- */
+/* همان کارت داک‌شدهٔ تودوها؛ فقط وقتی ترمینال زنده‌ای هست اصلاً مونت می‌شود. */
+.sidebar-panel.terminals-docked {
+  position: static;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: linear-gradient(to bottom,
+      color-mix(in srgb, var(--accent) 4%, var(--bg-panel)),
+      var(--bg-panel));
+  box-shadow: var(--shadow-card);
+}
+
+.sidebar-panel.terminals-docked .sidebar-panel-head {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* شمارندهٔ «N in background» — خنثی و کم‌رنگ، برخلاف قرص رنگی تودوها:
+   وضعیت زندهٔ پس‌زمینه است نه نتیجهٔ کاری که باید تیک بخورد. */
+.terminals-bg-count {
+  margin-inline-start: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.terminals-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.terminals-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.terminals-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  margin-top: 1px;
+  color: var(--text-dim);
+}
+
+.terminals-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* خودِ دستور — توضیح ردیف است؛ دستور بلند در یک خط با سه‌نقطه تمام می‌شود و
+   کل متن (دستور + cwd + مسیر لاگ) در tooltip هست. */
+.terminals-command {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+  text-align: start;
+}
+
+.terminals-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.terminals-elapsed {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminals-stop {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.terminals-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+.terminals-stop:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* مربع توپرِ دکمهٔ Stop — همان نشان zcode */
+.terminals-stop-square {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
 }
 
 /* ---- بخش «این ترن» (اسکیل/MCP/پلاگین) زیر تودوها در پنل راست ---- */

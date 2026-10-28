@@ -416,9 +416,26 @@ export default function App() {
               focusAppPane(next, { ring: true })
             }
           } else if (sc.action === 'terminal-focus') {
-            // Ctrl+X then T: the caret lands in the bottom terminal (opening
-            // the panel first) — no toggle, so it never hides the panel.
-            focusAppPane('terminal', { ring: true })
+            // Ctrl+X then T: the RIGHT-PANE terminal tab — focus the plain
+            // shell tab (spawning it when none exists; the pane opens with
+            // it) and land the caret in its xterm. The BOTTOM panel keeps
+            // its own chords: Ctrl+X then J toggles it.
+            useViewerTabs.getState().openTerminal({ cwd: useStore.getState().root ?? undefined })
+            focusAppPane('viewer', { ring: true })
+          } else if (sc.action === 'files') {
+            // Ctrl+X then E: the file explorer tab (opens the pane) with its
+            // filter box focused. This used to sit on Ctrl/Cmd+F; that chord
+            // now belongs to the chat transcript's find bar.
+            useViewerTabs.getState().focusFilesFilter()
+          } else if (sc.action === 'git') {
+            // Ctrl+X then G: the focused chat's git diff page.
+            useViewerTabs.getState().openGitDiff(useStore.getState().activeChatId ?? undefined)
+          } else if (sc.action === 'artifacts') {
+            // Ctrl+X then A: the artifacts page.
+            useViewerTabs.getState().openArtifacts()
+          } else if (sc.action === 'schedule') {
+            // Ctrl+X then S: the schedule page.
+            useViewerTabs.getState().openSchedule()
           } else if (sc.action === 'terminal-next' || sc.action === 'terminal-prev') {
             // Ctrl+X then ] / [: cycle the TERMINAL tabs — right-pane terminal
             // tabs (revealing the pane if closed), falling back to the bottom

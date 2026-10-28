@@ -2426,3 +2426,54 @@ export async function listAllScheduleRuns(
   if ('error' in out) return out
   return out.runs ?? []
 }
+
+// ---------- ترمینال‌های بک‌گراند ایجنت ----------
+// سمت بک‌اند: agent_terminals.rs — دستورِ run_terminal با background=true یک
+// پروسهٔ جداشده می‌سازد؛ پنل راست این‌ها را با «Running for …» و دکمهٔ Stop
+// نشان می‌دهد (مثل بخش Terminals در zcode).
+
+/** یک ترمینال بک‌گراند ایجنت؛ `running` تعیین می‌کند در پنل لیست شود یا نه. */
+export interface AgentTerminalInfo {
+  id: string
+  chat_id: string
+  /** خودِ دستور — همان توضیحی که در پنل نمایش داده می‌شود. */
+  command: string
+  cwd: string
+  /** epoch ms؛ تایمر «Running for …» سمت کلاینت از همین محاسبه می‌شود. */
+  started_at_ms: number
+  running: boolean
+  exit_code?: number | null
+  /** مسیر لاگ خروجی (بیرون از workspace؛ زیر data root). */
+  log_path: string
+  /** PID پروسه — روی یونیکس همان رهبر گروه است (kill -- -PID). */
+  pid: number
+}
+
+/** لیست ترمینال‌های بک‌گراند یک چت (chat_id خالی = همه). */
+export async function listAgentTerminals(
+  chatId: string,
+): Promise<AgentTerminalInfo[]> {
+  const out = await sidecarGet<{ terminals: AgentTerminalInfo[] }>(
+    `/agent-terminals?chat_id=${encodeURIComponent(chatId)}`,
+  )
+  if ('error' in out) return []
+  return out.terminals ?? []
+}
+
+/** توقف یک ترمینال بک‌گراند (SIGTERM به کل گروه، بعد از grace رسانی SIGKILL). */
+export async function stopAgentTerminal(id: string): Promise<boolean> {
+  const url = await ensureSidecar()
+  if (!url || !id) return false
+  try {
+    const res = await fetch(`${url}/agent-terminals/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    })
+    if (!res.ok) return false
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
+    return body.ok === true
+  } catch {
+    return false
+  }
+}

@@ -1,5 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, normPath, resolveWorkspacePath, suggestSimilarFiles, workspaceFiles, type WorkspaceFile } from "../lib/fs";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { NVIM_PROGRAM, nvimArgs } from "../lib/nvimEdit";
@@ -10,6 +12,7 @@ import { useStore } from "../lib/store";
 import { copyToClipboard } from "../lib/clipboard";
 import { IMAGE_EXTS, defaultAppForExt, extOf, fileBasename } from "../lib/fileTypes";
 import { FileChip, FileIcon } from "./FileIcon";
+import { mdComponents } from "./ChatMessage";
 import { getHighlightedLines } from "../lib/highlight";
 import { toWorkspacePath } from "../lib/fileTree";
 import { useVimScroll } from "../lib/useVimScroll";
@@ -256,6 +259,10 @@ export function FileViewerPanel({
     : `${(root || "").replace(/\/+$/, "")}/${cleanFilePath}`;
   const ext = extOf(filePath);
   const isImage = IMAGE_EXTS.has(ext);
+  // Markdown files render by default (same rendering as the chat text viewer);
+  // the header toggle switches to the line-numbered raw view. A file opened at
+  // a specific line (jump, search hit) starts raw so the target row is visible.
+  const isMarkdownFile = ext === "md" || ext === "markdown" || ext === "mdx";
   // Office documents (Word/Excel/PDF) open in the system default app
   // (Word/Excel/PDF viewer) — code editors are hidden for these types.
   const defaultApp = defaultAppForExt(ext);
@@ -321,6 +328,9 @@ export function FileViewerPanel({
   // In-viewer search (Ctrl+F + search box): query, open state, match index.
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // Markdown vs raw for .md files. Search and line comments live on the raw
+  // line rows, so both routes force the raw view (the toggle flips back).
+  const [mdView, setMdView] = useState<"md" | "raw">(() => (fileLine ? "raw" : "md"));
   const [matchIdx, setMatchIdx] = useState(0);
   const [gridActiveRow, setGridActiveRow] = useState<number | undefined>(undefined);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -340,8 +350,9 @@ export function FileViewerPanel({
     setCommentOpen(false);
     setAnchorPos(null);
     setSelBar(null);
+    setMdView(fileLine ? "raw" : "md");
     savedRangeRef.current = null;
-  }, [absPath]);
+  }, [absPath, fileLine]);
   // Highlighted text for the "Add comment" action (-> owning chat's queue).
   // Selection events only: no timers, no polling. The highlight alone never
   // opens the editor: it only arms a small floating trigger at the highlight
@@ -423,6 +434,9 @@ export function FileViewerPanel({
   // focus/typing; closes only via Enter (send), Esc (cancel), outside press
   // with empty draft, or file change.
   const refreshSelection = (target?: EventTarget | null) => {
+    // Rendered markdown has no line rows: selection comments (which quote
+    // line ranges) only make sense in the raw view.
+    if (isMarkdownFile && mdView === "md") return;
     const el = target as HTMLElement | null | undefined;
     if (el && typeof el.closest === "function" && el.closest("input, textarea, .fv-comment-float, .fv-comment-input, .fv-search-bar, .fv-sheet-form, .fv-open-menu")) return;
     // Freeze while the popup is open: opening the box (and focusing its
@@ -610,6 +624,9 @@ export function FileViewerPanel({
         if (tgt?.closest?.(".files-panel")) return;
         ev.preventDefault();
         ev.stopPropagation();
+        // Search matches live on the raw line rows: a find over rendered
+        // markdown flips the view so the hits are actually visible.
+        if (isMarkdownFile) setMdView("raw");
         setSearchOpen(true);
       } else if (ev.key === "Escape" && searchOpen) {
         setSearchOpen(false);
@@ -1085,13 +1102,42 @@ export function FileViewerPanel({
             )}
           </form>
         )}
+        {isMarkdownFile && state.content != null && !binary && (
+          <div className="tv-view-toggle" role="group" aria-label="Render mode">
+            <button
+              type="button"
+              className={mdView === "md" ? "active" : ""}
+              title="Render as markdown"
+              aria-pressed={mdView === "md"}
+              onClick={() => {
+                setMdView("md");
+                setSearchOpen(false);
+                setQuery("");
+              }}
+            >
+              MD
+            </button>
+            <button
+              type="button"
+              className={mdView === "raw" ? "active" : ""}
+              title="Raw text with line numbers"
+              aria-pressed={mdView === "raw"}
+              onClick={() => setMdView("raw")}
+            >
+              Raw
+            </button>
+          </div>
+        )}
         <button
           type="button"
           className="fv-icon-btn"
           title="Search in this file (Ctrl+F)"
           aria-label="Search in this file"
           aria-expanded={searchOpen}
-          onClick={() => setSearchOpen((o) => !o)}
+          onClick={() => {
+            if (!searchOpen && isMarkdownFile) setMdView("raw");
+            setSearchOpen((o) => !o);
+          }}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
         </button>
@@ -1247,6 +1293,20 @@ export function FileViewerPanel({
       // grid from the same text content, so the raw text body must stay hidden
       // or every CSV shows twice (table on top, raw lines below). */}
       {state.content != null && !binary && !isImage && !(isGridDoc && sheetTables.length > 0) && (
+        isMarkdownFile && mdView === "md" ? (
+          <div className="file-viewer-body text-viewer-md" dir="ltr" style={{ direction: "ltr" }}>
+            <div className="chat-message markdown-body" dir="ltr">
+              {/* Same rules as TextViewerPanel: rendered verbatim — no
+                  prepareContent (bodies may legally contain ``` runs) and no
+                  raw HTML (react-markdown never executes it, so a file is
+                  inert). The raw view above keeps line numbers for search,
+                  jumps and selection comments. */}
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                {shown}
+              </ReactMarkdown>
+            </div>
+          </div>
+        ) : (
         <div className="file-viewer-body" ref={bodyRef} dir="ltr" style={{ direction: "ltr" }} onScroll={(e) => setViewTop(e.currentTarget.scrollTop)}>
           <pre className="file-viewer-pre hljs">
             {topPad > 0 && <span className="fv-pad" aria-hidden="true" style={{ height: topPad }} />}
@@ -1285,6 +1345,7 @@ export function FileViewerPanel({
             </div>
           )}
         </div>
+        )
       )}
     </div>
   );

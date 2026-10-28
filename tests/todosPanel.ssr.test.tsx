@@ -378,6 +378,42 @@ console.log("۲۳) دکمهٔ نمایش پلن در هدر Todos:")
   )
 }
 
+console.log("۲۴) بخش Terminals — ترمینال‌های بک‌گراند ایجنت در پنل راست:")
+{
+  const { readFileSync } = await import("node:fs")
+  const src = readFileSync("src/components/TodosPanel.tsx", "utf8")
+  // هدر به سبک zcode: عنوان + شمارندهٔ «N in background»
+  check("عنوان بخش Terminals هست", src.includes(">Terminals</span>"))
+  check("شمارندهٔ in background هست", src.includes("in background"))
+  // تایمر «Running for …» از helper خالص می‌آید (تست‌پذیر) و هر ثانیه تیک می‌خورد
+  check("تایمر از formatRunningFor می‌خواند", src.includes("formatRunningFor(now - t.started_at_ms)"))
+  check("تیک ثانیه‌ای فقط با ردیف زنده", src.includes("hasRunning"))
+  // دکمهٔ Stop با POST سمت بک‌اند وصل است
+  check("دکمهٔ Stop هست", src.includes('className="terminals-stop"'))
+  check("Stop به stopAgentTerminal وصل است", src.includes("stopAgentTerminal(id)"))
+  // پولینگ per-chat: فقط ترمینال‌های چت فعال، نه همهٔ چت‌ها
+  check("فهرست با activeChatId پول می‌شود", src.includes("listAgentTerminals(activeChatId)"))
+  // جای بخش: بین TurnUsagePanel و TodosSection — وضعیت زنده بالای چک‌لیست
+  const usageIdx = src.indexOf("<TurnUsagePanel />")
+  const terminalsIdx = src.indexOf("<TerminalsSection />")
+  const todosIdx = src.indexOf("<TodosSection />")
+  check(
+    "جای بخش: بعد از This turn و قبل از Todos",
+    usageIdx !== -1 && terminalsIdx > usageIdx && todosIdx > terminalsIdx,
+    { usageIdx, terminalsIdx, todosIdx },
+  )
+  // helperهای خالص جدا تست می‌شوند (tests/agentTerminals.test.ts)؛ اینجا فقط
+  // مطمئن می‌شویم رندر فقط ردیف‌های زنده را نشان می‌دهد
+  const { runningAgentTerminals, formatRunningFor } = await import("../src/lib/agentTerminals")
+  check("فیلتر ردیف‌های زنده از helper خالص می‌آید", src.includes("runningAgentTerminals(terminals)"))
+  const rows = [
+    { id: "a", running: true, started_at_ms: 0 },
+    { id: "b", running: false },
+  ] as any
+  check("خروجی‌شده‌ها در فهرست نمی‌آیند", runningAgentTerminals(rows).length === 1)
+  check("قالب زمان سبک zcode است", formatRunningFor(18 * 60_000 + 35_000) === "18m 35s")
+}
+
 if (failed > 0) {
   console.error(`\n${failed} تست شکست خورد ❌`)
   process.exit(1)

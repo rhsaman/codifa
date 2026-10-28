@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod agent_terminals;
 mod artifacts;
 mod backup;
 mod browser;
@@ -63,6 +64,10 @@ struct Quitting(std::sync::atomic::AtomicBool);
 /// second call then finds nothing to reap.
 fn shutdown_children(app: &tauri::AppHandle) {
     pty::kill_all_terminal_sessions(app);
+    // Background terminals the AGENT started (dev servers, watchers) die with
+    // the app too: they are children of this process and would otherwise be
+    // reparented to launchd and keep their ports busy for days.
+    agent_terminals::kill_all();
     // Chromium sessions are per-chat and outlive the panel, so they must be
     // reaped here or every visited chat leaves a browser process behind.
     browser::kill_all_sessions();

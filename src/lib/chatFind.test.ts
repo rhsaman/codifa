@@ -151,11 +151,14 @@ console.log("7) paint-owner claim (document-global, one bar at a time):");
   releaseFindPaint(a);
   check("stale release is a no-op", currentFindOwner() === b);
   releaseFindPaint(b);
-  check("owner release clears", currentFindOwner() === null && seen[seen.length - 1] === null);
+  // Release is SILENT by design: the releasing bar's own subscription must
+  // not fire during its unmount and re-run its close path (the focus-steal
+  // regression). Only claims are announced.
+  check("release clears silently", currentFindOwner() === null && seen.length === 2);
   off();
   claimFindPaint(a);
   releaseFindPaint(a);
-  check("unsubscribed listener sees nothing", seen.length === 3);
+  check("unsubscribed listener sees nothing", seen.length === 2);
 }
 
 if (failed > 0) {

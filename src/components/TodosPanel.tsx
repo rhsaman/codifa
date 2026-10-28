@@ -2,6 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { ensureChatHydrated, useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { prepareContent } from "../lib/bidi";
+import { listAgentTerminals, stopAgentTerminal } from "../lib/api";
+import type { AgentTerminalInfo } from "../lib/api";
+import {
+  formatRunningFor,
+  runningAgentTerminals,
+} from "../lib/agentTerminals";
 import { TurnUsagePanel } from "./TurnUsagePanel";
 import type { ChatMessage } from "../types";
 
@@ -275,6 +281,118 @@ export function TodosPanel() {
   return null;
 }
 
+/** بخش Terminals — ترمینال‌های بک‌گراندِ ایجنت (run_terminal با background=true،
+ *  مثل «Start vite dev server» در zcode): عنوان + شمارندهٔ «N in background»،
+ *  یک ردیف به‌ازای هر ترمینال زندهٔ همین چت با تایمر «Running for …» و دکمهٔ
+ *  Stop. فهرست هر ۲ ثانیه از بک‌اند پول می‌شود (registry سمت Rust است و بعد از
+ *  تمام‌شدن ترن هم زنده می‌ماند)؛ تایمر خودش هر ثانیه تیک می‌خورد. چیزی برای
+ *  نشان‌دادن نیست، بخش اصلاً رندر نمی‌شود تا پنل بی‌دلیل شلوغ نشود. */
+export function TerminalsSection() {
+  const activeChatId = useStore((s) => s.activeChatId);
+  const dir = useStore((s) => s.dir);
+  const [terminals, setTerminals] = useState<AgentTerminalInfo[]>([]);
+  // دکمه‌هایی که کلیک شده‌اند تا پول بعدی تایید کند — بدون این، دابل‌کلیک دو
+  // بار POST می‌زد و دکمه تا تایید بک‌اند فعال می‌ماند.
+  const [stopping, setStopping] = useState<ReadonlySet<string>>(() => new Set());
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!activeChatId) return;
+    let alive = true;
+    let timer: number | undefined;
+    const tick = async () => {
+      try {
+        const rows = await listAgentTerminals(activeChatId);
+        if (alive) setTerminals(rows);
+      } catch {
+        /* بک‌اند هنوز بالا نیست — آخرین فهرست می‌ماند */
+      }
+      if (alive) timer = window.setTimeout(tick, 2000);
+    };
+    void tick();
+    return () => {
+      alive = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeChatId]);
+
+  const running = runningAgentTerminals(terminals);
+  // تیک ثانیه‌ای فقط وقتی چیزی در حال اجراست — وقتی ردیفی نیست، هیچ چیز هر
+  // ثانیه عوض نمی‌شود که رندر تازه بخواهد.
+  const hasRunning = running.length > 0;
+  useEffect(() => {
+    if (!hasRunning) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [hasRunning]);
+
+  if (!hasRunning) return null;
+
+  const stop = (id: string) => {
+    setStopping((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    void stopAgentTerminal(id);
+  };
+
+  return (
+    <div className="sidebar-panel terminals-docked" dir={dir}>
+      <div className="sidebar-panel-head">
+        <span className="sidebar-panel-title">Terminals</span>
+        <span className="terminals-bg-count">
+          {running.length} in background
+        </span>
+      </div>
+      <ul className="terminals-list">
+        {running.map((t) => (
+          <li className="terminals-item" key={t.id}>
+            <span className="terminals-icon" aria-hidden="true">
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="2.5" y="4" width="19" height="16" rx="3" />
+                <path d="M7 9.5l3 2.8-3 2.8" />
+                <path d="M12.5 15.5H17" />
+              </svg>
+            </span>
+            <div className="terminals-body">
+              <div
+                className="terminals-command"
+                title={`${t.command}\n${t.cwd}\nLog: ${t.log_path}`}
+              >
+                {t.command}
+              </div>
+              <div className="terminals-meta">
+                <span className="terminals-elapsed">
+                  Running for {formatRunningFor(now - t.started_at_ms)}
+                </span>
+                <button
+                  type="button"
+                  className="terminals-stop"
+                  disabled={stopping.has(t.id)}
+                  onClick={() => stop(t.id)}
+                >
+                  <span className="terminals-stop-square" aria-hidden="true" />
+                  {stopping.has(t.id) ? "Stopping…" : "Stop"}
+                </button>
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** پنل راست داک‌شده به سبک کلود — میزبان تودوها و بخش‌های آینده.
  *  عرض با درگ لبه (مثل سایدبار، معکوس چون به راست داک شده) و ذخیرهٔ محلی
  *  مثل سایدبار تا بین بازشدن‌ها حفظ شود. */
@@ -382,6 +500,9 @@ function RightPanelContent() {
             answer "is the right tool set loaded?" before the checklist of what
             it did — and it is the card that changes turn to turn. */}
         <TurnUsagePanel />
+        {/* ترمینال‌های بک‌گراند ایجنت بالای تودوها: وضعیت «الان زنده» است و
+            ردیفش با خروج پروسه محو می‌شود؛ وقتی چیزی نیست اصلاً رندر نمی‌شود. */}
+        <TerminalsSection />
         <TodosSection />
       </div>
     </aside>

@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useStore } from "../lib/store";
-import { useViewerTabs } from "../lib/viewerTabs";
 import type { ChatDropPos, ChatTreeNode } from "../lib/chatTree";
 import { beforePos, buildFromList, CHAT_WINDOW_MAX, CHAT_WINDOW_MIN_H, CHAT_WINDOW_MIN_W, collectChatIds, dirForPos, findNodeById, flexWeights, ghostInsertIndex, isVacatedByDrag, leafCount, normalizeTree, pickNeighborWindow, resolveLeafPos, shouldShowNestedGhost, shouldShowSiblingGhost } from "../lib/chatTree";
 import { focusChatInput } from "../lib/chatFocus";
@@ -794,33 +793,11 @@ export function ChatWindows() {
     if (activeChatId) syncViewerToChat(activeChatId);
   }, [activeChatId]);
 
-  // App-wide Ctrl/Cmd+F: the file explorer's name filter. The explorer tab is
-  // often NOT the active rail tab (opening a file switches the rail to that
-  // file), and the panel is then unmounted, so this handler has to exist
-  // outside it. Deliberately LAST in the chord chain: a dialog/overlay, the
-  // terminal and the file viewer all keep their own find, and a press INSIDE
-  // the explorer is handled by the panel itself (focus stays where the user put
-  // it). Only when none of them claims the key does this activate the tab and
-  // focus its box.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
-      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
-      if (physicalKey(e as { code: string; key: string }) !== "f") return;
-      const t = e.target as HTMLElement | null;
-      if (t?.closest?.(".files-panel")) return;
-      if (t?.closest?.('[role="dialog"], .settings-modal, .search-overlay')) return;
-      const st = useStore.getState();
-      const chatId = st.activeChatId;
-      const chat = chatId ? st.chats.find((c) => c.id === chatId) : undefined;
-      if (!chat?.root) return;
-      e.preventDefault();
-      e.stopPropagation();
-      useViewerTabs.getState().focusFilesFilter();
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, []);
+  // The app-wide Ctrl/Cmd+F → explorer handler lived here; it moved to
+  // Ctrl+X then E (PREFIX_SHORTCUTS `files`, dispatched in App.tsx) so plain
+  // Cmd/Ctrl+F belongs to the chat transcript's find bar (ChatFindBar). The
+  // explorer keeps Ctrl/Cmd+F INSIDE the panel (FilesPanel focuses its
+  // filter) and dialogs/overlays/the viewer keep their own finds.
 
   // Vim-style window navigation: Ctrl+H/J/K/L moves focus between windows
   // (h=left, j=down, k=up, l=right) and drops the caret into the new

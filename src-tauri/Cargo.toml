@@ -50,6 +50,21 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (local time).
 chrono = "0.4"
 
+# Cross-platform parsers/protocols used on EVERY target (document readers,
+# web search, secret encryption). They used to sit in the macOS section below
+# and broke the Windows/Linux release builds with unresolved-import errors.
+pdf-extract = "0.12.1"
+calamine = "0.36.1"
+csv = "1.4.0"
+roxmltree = "0.21.1"
+aes-gcm = "0.10"
+# DuckDuckGo's HTML endpoint refuses a plain TLS client (anti-bot challenge /
+# handshake timeout — verified with curl, reqwest and httpx alike). The Python
+# `ddgs` package solves this with `primp`'s browser TLS impersonation, and
+# `primp` is itself a Rust crate, so the keyless engine uses it directly.
+# Tavily keeps using reqwest; primp is only for DuckDuckGo.
+primp = { version = "2", default-features = false, features = ["gzip", "brotli", "deflate", "cookies", "form"] }
+
 # Desktop control needs what the `screenshots` crate cannot do: read the cursor
 # position, preflight the Screen Recording permission (macOS silently returns an
 # image with every OTHER app's windows removed without it) and inject mouse
@@ -58,17 +73,6 @@ chrono = "0.4"
 # the only scroll constructor Rust can call (the other one is variadic).
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.23.2", features = ["highsierra"] }
-# DuckDuckGo's HTML endpoint refuses a plain TLS client (anti-bot challenge /
-# handshake timeout — verified with curl, reqwest and httpx alike). The Python
-# `ddgs` package solves this with `primp`'s browser TLS impersonation, and
-# `primp` is itself a Rust crate, so the keyless engine uses it directly.
-# Tavily keeps using reqwest; primp is only for DuckDuckGo.
-primp = { version = "2", default-features = false, features = ["gzip", "brotli", "deflate", "cookies", "form"] }
-pdf-extract = "0.12.1"
-calamine = "0.36.1"
-csv = "1.4.0"
-roxmltree = "0.21.1"
-aes-gcm = "0.10"
 
 # Release profile tuned for an 8 GB machine.
 #

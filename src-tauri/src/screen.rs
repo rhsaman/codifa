@@ -517,6 +517,7 @@ pub fn scroll(lines: i32) -> Result<(), String> {
 }
 
 /// Press and release one virtual key code.
+#[cfg(target_os = "macos")]
 pub fn press_key(code: u16) -> Result<(), String> {
     let source = event_source()?;
     for down in [true, false] {
@@ -669,6 +670,11 @@ fn post_mouse(
 
 #[cfg(not(target_os = "macos"))]
 fn post_scroll(_direction: i32) -> Result<(), String> {
+    Err(unsupported())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn press_key(_code: u16) -> Result<(), String> {
     Err(unsupported())
 }
 

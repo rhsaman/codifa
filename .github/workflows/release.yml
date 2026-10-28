@@ -7,6 +7,12 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # primp (the DuckDuckGo TLS client) pulls aws-lc-sys, which compiles
+  # BoringSSL-derived assembly. On x86_64-pc-windows-msvc that normally needs
+  # NASM on PATH; this switches the build to the crate's bundled prebuilt
+  # objects (shipped for non-FIPS x86_64-windows), so the Windows job builds
+  # with no extra runner tooling. Ignored on macOS/Linux.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
 
 concurrency:
   group: release-${{ github.ref }}

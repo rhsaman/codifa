@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useStore } from "../lib/store";
 import { api } from "../lib/fs";
-import { deleteSchedule, listAllScheduleRuns, listScheduleRuns, listSchedules, runScheduleNow, saveSchedule } from "../lib/api";
+import { deleteSchedule, listAllScheduleRuns, listScheduleRuns, listSchedules, runScheduleNow, saveSchedule, stopScheduleRun } from "../lib/api";
 import { formatTokens } from "../lib/context";
 import { liveRunningMap, taskTokenTotals } from "../lib/schedule-notify";
 import type { ScheduleRun, ScheduledTask } from "../types";
@@ -132,6 +132,19 @@ function ScheduleRow(props: {
     onChanged();
   };
 
+  // Stop ends the run in flight: the backend flags it, the run records itself
+  // as "stopped by user" and the derived spinner settles on the next poll.
+  const stopRun = async () => {
+    setBusy(true);
+    const out = await stopScheduleRun(task.id);
+    setBusy(false);
+    if ("error" in out) {
+      onError(`Stop failed: ${out.error}`);
+      return;
+    }
+    onChanged();
+  };
+
   // Pause/Resume is a full upsert of the stored task with `enabled` flipped:
   // the backend keeps every other field and recomputes next_run on the next
   // scheduler tick (a stale one is healed, never burst-run).
@@ -167,9 +180,10 @@ function ScheduleRow(props: {
             </p>
           ) : null}
           <div className="schedule-row schedule-toolbar" role="toolbar" aria-label={`Actions for ${task.name}`}>
-            <button className="schedule-btn schedule-icon-btn" onClick={() => void runNow()} disabled={busy || isRunning} title={isRunning ? `Running ${task.name}…` : `Run ${task.name} now`} aria-label={isRunning ? `Running ${task.name}` : `Run ${task.name} now`}>
+            <button className={`schedule-btn schedule-icon-btn${isRunning ? " danger" : ""}`} onClick={() => void (isRunning ? stopRun() : runNow())} disabled={busy} title={isRunning ? `Stop ${task.name}` : `Run ${task.name} now`} aria-label={isRunning ? `Stop ${task.name}` : `Run ${task.name} now`}>
               {isRunning ? (
-                <span className="schedule-btn-spinner" aria-hidden="true" />
+                // A square: the run is live, so this button now ENDS it.
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
               ) : (
                 // A bolt, not a play triangle: Resume below is the play icon,
                 // and the two identical triangles read as one button twice.

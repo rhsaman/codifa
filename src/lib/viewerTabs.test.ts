@@ -314,27 +314,28 @@ console.log('12) split width — drag caps at half viewport:')
   check('min width kept', clampSplitWidth(100, 1280) === 320, clampSplitWidth(100, 1280))
 }
 
-console.log('13) openPlan — one workspace-scoped plan tab, auto-opens pane:')
+console.log('13) openPlan — one plan tab per CHAT, auto-opens pane:')
 {
   resetViewer()
   const vt = () => useViewerTabs.getState()
   const [c1, wsA] = chatInWs('/ws-a')
   vt().openPlan(c1)
-  const planId = `plan:${wsA}`
-  check('plan tab created with workspace key', vt().tabs.some((t) => t.id === planId && t.kind === 'plan' && t.chatId === c1), vt().tabs)
-  check('plan tab is active', vt().activeId === planId, vt().activeId)
+  const plan1 = `plan:${c1}`
+  check('plan tab keyed by chat id', vt().tabs.some((t) => t.id === plan1 && t.kind === 'plan' && t.chatId === c1), vt().tabs)
+  check('plan tab is active', vt().activeId === plan1, vt().activeId)
   check('pane auto-opens', vt().paneOpen === true, vt().paneOpen)
   vt().openPlan(c1)
   check('reopen does not duplicate', vt().tabs.filter((t) => t.kind === 'plan').length === 1, vt().tabs.length)
   const [c2] = chatInWs('/ws-a')
   vt().openPlan(c2)
-  check('another chat of the SAME workspace retargets the tab', vt().tabs.filter((t) => t.kind === 'plan').length === 1, vt().tabs.map((t) => t.id))
-  check('the retargeted tab now belongs to c2', vt().tabs.find((t) => t.kind === 'plan')?.chatId === c2, vt().tabs)
+  const plan2 = `plan:${c2}`
+  check('a sibling chat gets its OWN plan tab (no retarget)', vt().tabs.filter((t) => t.kind === 'plan').length === 2, vt().tabs.map((t) => t.id))
+  check('each plan tab belongs to its chat', vt().tabs.find((t) => t.id === plan1)?.chatId === c1 && vt().tabs.find((t) => t.id === plan2)?.chatId === c2, vt().tabs)
   const [c3, wsB] = chatInWs('/ws-b')
   vt().openPlan(c3)
-  check('another WORKSPACE gets its own plan tab', vt().tabs.some((t) => t.id === `plan:${wsB}`), vt().tabs.map((t) => t.id))
+  check('another WORKSPACE gets its own plan tab', vt().tabs.some((t) => t.id === `plan:${c3}`), vt().tabs.map((t) => t.id))
   const v1 = visibleTabs(vt().tabs, scopeOf(c1, wsA))
-  check('plan tab follows its own workspace', v1.some((t) => t.id === planId) && !v1.some((t) => t.id === `plan:${wsB}`), v1.map((t) => t.id))
+  check('plan tab follows its OWN chat only', v1.some((t) => t.id === plan1) && !v1.some((t) => t.id === plan2) && !v1.some((t) => t.id === `plan:${c3}`), v1.map((t) => t.id))
 }
 
 console.log('14) syncViewerToChat — trace follows the chat, workspace tabs stick:')

@@ -281,7 +281,7 @@ pub async fn compact_history(
     force: bool,
 ) -> Result<Option<CompactOutcome>, String> {
     compact_history_with_progress(
-        client, model, fallbacks, history, ctx, max_output, force, &mut |_| {},
+        client, model, fallbacks, history, ctx, max_output, force, false, &mut |_| {},
     )
     .await
 }
@@ -308,6 +308,19 @@ pub fn compact_chain<'a>(model: &'a LlmConfig, fallbacks: &'a [LlmConfig]) -> Ve
 /// the UI can show the phase, the attempt and the elapsed time instead of an
 /// anonymous spinner. Used by the streaming `/chat/compact` route and by the
 /// mid-turn auto-compaction.
+///
+/// `summarize_all` is for the MID-TURN caller only. This function normally
+/// keeps a token-budgeted verbatim tail out of the summarizer — a tail the
+/// `/chat/compact` route hands back to the renderer via `keep`, so it survives
+/// on the wire. The mid-turn caller rebuilds the wire from the returned summary
+/// plus its own in-flight step alone and never splices that tail back, so
+/// excluding it from the summary dropped it from BOTH: traced on the Oct 29
+/// corpus, a compaction at 64.8K tokens left 4 wire messages and a summary that
+/// covered only the oldest quarter — the newest ~40% of the work history was in
+/// neither (the model then re-read files it had already read, paying extra
+/// round-trips to recover what the tail selection had silently discarded).
+/// With `summarize_all` the whole foldable history is summarized instead:
+/// nothing is dropped silently, and the wire still shrinks to the summary.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_history_with_progress(
     client: &reqwest::Client,
@@ -317,6 +330,7 @@ pub async fn compact_history_with_progress(
     ctx: usize,
     max_output: usize,
     force: bool,
+    summarize_all: bool,
     on_progress: &mut (dyn FnMut(&CompactProgress) + Send),
 ) -> Result<Option<CompactOutcome>, String> {
     let started = std::time::Instant::now();
@@ -329,33 +343,38 @@ pub async fn compact_history_with_progress(
     let ctx = if ctx == 0 { crate::agent::DEFAULT_CONTEXT_WINDOW } else { ctx };
     let tail_budget = recent_tail_budget(ctx, max_output, None);
 
-    // Select the recent tail (whole messages, backward walk).
+    // Select the recent tail (whole messages, backward walk). Skipped entirely
+    // when `summarize_all` is set — see the doc on
+    // `compact_history_with_progress` for why the mid-turn caller must not
+    // leave a verbatim tail behind that it will never splice back.
     let mut tail: Vec<Value> = Vec::new();
     let mut tail_tokens = 0usize;
-    for m in history.iter().rev() {
-        let est = estimate_tokens(&content_of(m));
-        if !tail.is_empty() && tail_tokens + est > tail_budget {
-            break;
-        }
-        tail.push(m.clone());
-        tail_tokens += est;
-    }
-    tail.reverse();
-    clean_tail(&mut tail);
-
-    // Protect the in-flight step (assistant tool_calls + its tool results).
-    let mut in_flight: Option<usize> = None;
-    for i in (0..history.len()).rev() {
-        if history[i]["role"] == "assistant" {
-            if history[i + 1..].iter().any(|m| m["role"] == "tool") {
-                in_flight = Some(i);
+    if !summarize_all {
+        for m in history.iter().rev() {
+            let est = estimate_tokens(&content_of(m));
+            if !tail.is_empty() && tail_tokens + est > tail_budget {
+                break;
             }
-            break;
+            tail.push(m.clone());
+            tail_tokens += est;
         }
-    }
-    if let Some(i) = in_flight {
-        if i < history.len() - tail.len() {
-            tail = history[i..].to_vec();
+        tail.reverse();
+        clean_tail(&mut tail);
+
+        // Protect the in-flight step (assistant tool_calls + its tool results).
+        let mut in_flight: Option<usize> = None;
+        for i in (0..history.len()).rev() {
+            if history[i]["role"] == "assistant" {
+                if history[i + 1..].iter().any(|m| m["role"] == "tool") {
+                    in_flight = Some(i);
+                }
+                break;
+            }
+        }
+        if let Some(i) = in_flight {
+            if i < history.len() - tail.len() {
+                tail = history[i..].to_vec();
+            }
         }
     }
 
@@ -397,7 +416,12 @@ pub async fn compact_history_with_progress(
     // O(n²) and on a huge history stalled here for a long time BEFORE the
     // summarizer call, where the UI shows no progress at all.
     let mut texts: Vec<String> = older_turns.iter().map(serialize).collect();
-    let max_head_tokens = usable_tokens(ctx, max_output, None).saturating_sub(tail_budget + 512).max(1024);
+    // The verbatim tail rides to the summarizer as context, not as head — cap
+    // the head by what the tail ACTUALLY kept (not the full budget), so a
+    // short tail leaves the room to the head. With `summarize_all` the tail is
+    // empty and the whole budget goes to the head.
+    let max_head_tokens =
+        usable_tokens(ctx, max_output, None).saturating_sub(tail_tokens + 512).max(1024);
     // `join("\n\n")` contributes one separator per boundary — count it so the
     // incremental total matches what the joined string really costs.
     let sep_tokens = estimate_tokens("\n\n");
@@ -749,6 +773,7 @@ mod tests {
             1_000_000,
             0,
             true,
+            false,
             &mut |_| {},
         )
         .await
@@ -786,6 +811,7 @@ mod tests {
             1_000_000,
             0,
             true,
+            false,
             &mut |_| {},
         )
         .await;
@@ -816,6 +842,7 @@ mod tests {
             1_000_000,
             0,
             true,
+            false,
             &mut |_| {},
         )
         .await;
@@ -831,5 +858,120 @@ mod tests {
                 assert!(e.contains("also-dead"), "the fallback model must be named too, got: {e}");
             }
         }
+    }
+
+    /// A stub that ANSWERS like [`stub_server`] but also CAPTURES the request
+    /// body, so a test can assert what the summarizer actually received.
+    fn capturing_stub(captured: std::sync::Arc<std::sync::Mutex<String>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Some(Ok(mut conn)) = listener.incoming().next() {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")?
+                                    .trim()
+                                    .parse()
+                                    .ok()
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < pos + 4 + len {
+                            match conn.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        *captured.lock().unwrap() =
+                            String::from_utf8_lossy(&buf[pos + 4..]).to_string();
+                        break;
+                    }
+                }
+                let body = r#"{"choices":[{"message":{"content":"SUMMARY"}}]}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = conn.write_all(reply.as_bytes());
+                let _ = conn.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The mid-turn caller rebuilds its wire from the returned summary plus its
+    /// own in-flight tail ONLY — it never splices a verbatim tail back. With the
+    /// default tail selection the newest messages therefore reached NEITHER the
+    /// summary NOR the wire (traced Oct 29: a compaction at 64.8K tokens left
+    /// the newest ~40% of the work history in both places' complement). With
+    /// `summarize_all` every foldable message must reach the SUMMARIZER.
+    #[tokio::test]
+    async fn summarize_all_sends_the_whole_history_to_the_summarizer() {
+        // ~300 est tokens per message against a 2_000-token tail budget (40% of
+        // the 5_000 window): the default path keeps the newest SIX messages
+        // verbatim (out of the summarizer) while the head cap keeps the front
+        // intact; summarize_all must hand EVERY message over.
+        let msgs: Vec<Value> = (0..10)
+            .map(|i| msg("user", &format!("MARK-{i} {}", "x".repeat(1_200))))
+            .collect();
+        let mut model = cfg("custom", "summarizer", "");
+        model.timeout_secs = 5;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let url = capturing_stub(captured.clone());
+        model.base_url = url.clone();
+        compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &msgs,
+            5_000,
+            0,
+            true,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .expect("the stub answers");
+        let default_body = captured.lock().unwrap().clone();
+        assert!(default_body.contains("MARK-0"), "the head is summarized");
+        assert!(
+            !default_body.contains("MARK-8") && !default_body.contains("MARK-9"),
+            "the default path keeps the newest messages out of the summarizer"
+        );
+
+        let captured_all = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let url_all = capturing_stub(captured_all.clone());
+        model.base_url = url_all;
+        compact_history_with_progress(
+            &llm::http_client(),
+            &model,
+            &[],
+            &msgs,
+            5_000,
+            0,
+            true,
+            true,
+            &mut |_| {},
+        )
+        .await
+        .expect("the stub answers");
+        let all_body = captured_all.lock().unwrap().clone();
+        assert!(
+            all_body.contains("MARK-8") && all_body.contains("MARK-9"),
+            "summarize_all must put the newest messages IN the summarizer prompt — \
+             the mid-turn caller has no verbatim tail to keep them on the wire"
+        );
     }
 }

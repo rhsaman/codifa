@@ -17,6 +17,7 @@ import type {
   AgentModeDef,
   Chat,
   ChatEditTarget,
+  PluginSession,
   ChatDraft,
   ChatMessage,
   McpServerConfig,
@@ -1589,6 +1590,13 @@ interface State {
   /** Close the badge: the chat goes back to its own folder and the mode it
    *  had before the pin. The ONLY way an update session ends. */
   clearChatEditTarget: (id: string) => void
+  /** Pin the plugin-USE session badge (invoking a bundle by its / command):
+   *  every later send keeps the bundle's skills/connectors attached until ×.
+   *  No folder and NO mode is forced — using a plugin is not editing it. */
+  setChatPluginSession: (id: string, session: PluginSession) => void
+  /** Close the plugin-use session: the × on that badge is the ONLY way —
+   *  afterwards the bundle is no longer auto-attached to sends. */
+  clearChatPluginSession: (id: string) => void
   /** Silent mode sync for backend-driven switches (plan approval → build via
    *  the `mode_changed` event): updates chat.mode WITHOUT the "[Mode switched
    *  …]" marker message — the backend already narrates the transition. */
@@ -4247,6 +4255,30 @@ export const useStore = create<State>((set, get) => ({
               editTargetPrevMode: undefined,
               updatedAt: Date.now(),
             }
+          : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  setChatPluginSession: (id, session) => {
+    // Using a plugin through its / command: (re-)pin the use-session. NO mode
+    // and NO folder change — using a plugin is not an edit session.
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id ? { ...c, pluginSession: session, updatedAt: Date.now() } : c,
+      ),
+    }))
+    get().persist()
+  },
+
+  clearChatPluginSession: (id) => {
+    // ×: detach the bundle — sends no longer carry it. Re-pinning happens only
+    // by invoking the plugin's / command again.
+    set((s) => ({
+      chats: s.chats.map((c) =>
+        c.id === id && c.pluginSession
+          ? { ...c, pluginSession: undefined, updatedAt: Date.now() }
           : c,
       ),
     }))

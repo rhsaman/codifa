@@ -19,6 +19,13 @@ const DUE_GRACE_SECS: f64 = 90.0;
 const RUNNING_WINDOW_SECS: f64 = 15.0 * 60.0;
 /// Running runs older than this are orphans from a dead process → error.
 const ORPHAN_AFTER_SECS: f64 = 60.0 * 60.0;
+/// Hard wall-clock cap of ONE model rung of a scheduled run. A run whose tool
+/// call never returns would otherwise sit "running" until the orphan sweep.
+/// Kept equal to RUNNING_WINDOW_SECS so a live run never overlaps a second copy.
+const RUN_TIMEOUT_SECS: u64 = 15 * 60;
+/// How long a run gets to wind down on its own after a stop was requested before
+/// its turn is dropped (a tool blocked on a child process never reads the flag).
+const STOP_GRACE_SECS: u64 = 5;
 /// Headless run output cap (chars), mirroring the sidecar's 8000.
 const RUN_OUTPUT_CAP: usize = 8000;
 
@@ -517,6 +524,90 @@ fn mark_orphaned_running(data_root: &Path, min_age_secs: f64) -> usize {
 
 // --- headless execution -------------------------------------------------------
 
+/// Cancel flags of the runs in flight, per schedule id. A run registers its flag
+/// when it starts and the guard removes it on EVERY exit path, so the stop
+/// command can reach a run that lives in another task.
+type LiveRuns = std::sync::Mutex<
+    std::collections::HashMap<String, Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+>;
+
+fn live_runs() -> &'static LiveRuns {
+    static LIVE: std::sync::OnceLock<LiveRuns> = std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+struct LiveRunGuard {
+    sid: String,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LiveRunGuard {
+    fn drop(&mut self) {
+        let mut map = live_runs().lock().unwrap_or_else(|e| e.into_inner());
+        let empty = map
+            .get_mut(&self.sid)
+            .map(|list| {
+                list.retain(|f| !std::sync::Arc::ptr_eq(f, &self.flag));
+                list.is_empty()
+            })
+            .unwrap_or(false);
+        if empty {
+            map.remove(&self.sid);
+        }
+    }
+}
+
+fn register_live_run(
+    sid: &str,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> LiveRunGuard {
+    live_runs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(sid.to_string())
+        .or_default()
+        .push(flag.clone());
+    LiveRunGuard { sid: sid.to_string(), flag: flag.clone() }
+}
+
+/// Ask every in-flight run of a schedule to stop; returns how many runs were
+/// affected. When no run of THIS process is alive, a stored "running" row is a
+/// leftover (a dead loop): it is settled to an error so its spinner stops too.
+pub fn stop_schedule(data_root: &Path, sid: &str) -> usize {
+    {
+        let map = live_runs().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(flags) = map.get(sid) {
+            for f in flags {
+                f.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return flags.len();
+        }
+    }
+    let now = now_secs();
+    let mut settled = 0usize;
+    for mut run in list_runs(data_root, sid, 200) {
+        if run.get("status").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        if let Some(obj) = run.as_object_mut() {
+            obj.insert("status".into(), json!("error"));
+            obj.insert("error".into(), json!("stopped by user"));
+            obj.insert("finished_at".into(), json!(now));
+        }
+        save_run(data_root, &run);
+        settled += 1;
+    }
+    settled
+}
+
+/// Resolves once a stop was requested AND the grace period has passed.
+async fn stop_requested(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(STOP_GRACE_SECS)).await;
+}
+
 /// Resolve the provider config for a task: task.providerId → settings
 /// providers match → first provider (mirror of _execute_schedule).
 fn resolve_provider(data_root: &Path, task: &Value) -> Option<Value> {
@@ -576,6 +667,14 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     if sid.is_empty() || prompt.is_empty() {
         return;
     }
+    // A schedule keeps ONE chat id (`schedule-<id>`) across runs, so the plan
+    // folder (checklist) of the previous run would leak into this one and make
+    // the model skip steps it never did. Every run starts with a clean plan.
+    let _ = crate::plans::delete_plan(
+        &data_root.to_string_lossy(),
+        &crate::plans::workspace_slug_for_root(&root),
+        &format!("schedule-{sid}"),
+    );
     let started_at = now_secs();
     // The run id becomes the run's FILE NAME, and listings sort/truncate by
     // file name — so the timestamp goes first. With the old random-uuid name
@@ -834,6 +933,8 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     let chain_rungs = chain.len();
     let mut final_text = String::new();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Reachable from the stop command for as long as this run lives.
+    let _live = register_live_run(&sid, &cancel);
     // Walk the chain one rung per failure. A rejected key or an unknown model on
     // one rung must not end the run while the user's own fallback list still has
     // models in it — the same rule the interactive tools follow.
@@ -851,6 +952,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         chain.first().map(|(_, m, ..)| m.as_str()).unwrap_or("-")
     );
     for (kind, rung_model, rung_base, rung_keys, rung_provider_id) in chain {
+        // A stop request ends the whole chain, not just the current rung.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let mut rung = req.clone();
         rung.provider = kind;
         rung.model = rung_model.clone();
@@ -869,6 +974,7 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // so reading it back always produced an empty output.
         let mut text = String::new();
         let mut turn_errors: Vec<String> = Vec::new();
+        let mut timed_out = false;
         let res = {
             let mut emit = |ev: &crate::agent::AgentEvent| match ev {
                 crate::agent::AgentEvent::Text { content } => text.push_str(content),
@@ -880,7 +986,16 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
                 }
                 _ => {}
             };
-            crate::agent::run_turn(&rung, &mut emit, &cancel).await
+            tokio::select! {
+                r = crate::agent::run_turn(&rung, &mut emit, &cancel) => r,
+                // Stop pressed: the turn gets a short grace to end by itself,
+                // then it is dropped so a hung tool cannot pin the run.
+                _ = stop_requested(&cancel) => Err("stopped by user".to_string()),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(RUN_TIMEOUT_SECS)) => {
+                    timed_out = true;
+                    Err(format!("run timed out after {} min", RUN_TIMEOUT_SECS / 60))
+                }
+            }
         };
         match res {
             Ok(()) if turn_errors.is_empty() => {
@@ -910,7 +1025,7 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
                 if text.chars().count() > partial_text.chars().count() {
                     partial_text = text;
                 }
-                if !next {
+                if !next || timed_out {
                     break;
                 }
             }
@@ -918,11 +1033,19 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
     }
 
     let finished = now_secs();
+    // A stopped run is NEVER recorded as done, even when the turn happened to
+    // finish a text before the flag was read: its text becomes the partial output.
+    let user_stopped = cancel.load(std::sync::atomic::Ordering::Relaxed);
+    if user_stopped && !final_text.trim().is_empty() {
+        partial_text = std::mem::take(&mut final_text);
+    }
     if final_text.trim().is_empty() {
         // An empty body is NEVER a success: record WHY it is empty instead of
         // "done" with no output — that read like the schedule had simply
         // produced nothing and left the inbox at a bare "No output".
-        let reason = if tried.len() > 1 {
+        let reason = if user_stopped {
+            "stopped by user".to_string()
+        } else if tried.len() > 1 {
             // Several rungs failed: record all the reasons.
             format!("every model failed — {}", tried.join("; "))
         } else if !last_error.is_empty() {
@@ -1179,6 +1302,31 @@ mod tests {
         // No plugins at all → no block.
         let none: Vec<String> = Vec::new();
         assert!(plugin_context_block(&tmp, &none).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stop_signals_live_runs_and_settles_stale_rows() {
+        let tmp = std::env::temp_dir().join(format!("sched-stop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _live = register_live_run("sch-stop", &flag);
+            assert_eq!(stop_schedule(&tmp, "sch-stop"), 1);
+            assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // The guard is gone: no live run, so a stored "running" row is a
+        // leftover and gets settled instead of spinning forever.
+        save_run(
+            &tmp,
+            &json!({"id": "run-stop-1", "schedule_id": "sch-stop", "status": "running",
+                    "output": "", "started_at": now_secs()}),
+        );
+        assert_eq!(stop_schedule(&tmp, "sch-stop"), 1);
+        let rows = list_runs(&tmp, "sch-stop", 10);
+        assert_eq!(rows[0]["status"], "error");
+        assert_eq!(rows[0]["error"], "stopped by user");
+        assert_eq!(stop_schedule(&tmp, "sch-stop"), 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

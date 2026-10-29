@@ -594,6 +594,15 @@ async fn degrade_images_to_text(
 
 /// Maximum tool-loop iterations per turn (mirrors graph.py MAX_STEPS).
 const MAX_STEPS: usize = 60;
+/// Main-agent wrap-up: how many steps before [`MAX_STEPS`] the wrap-up nudge
+/// lands (once). Traced Oct 29: three of twenty runs ran into the cap and were
+/// cut with `finish_reason: tool_calls` on every round — no final answer, no
+/// "what is done / what remains", and the user's follow-up message paid another
+/// full-context round-trip just to continue. The explore sub-agent already
+/// gets the same treatment (its two budget nudges), and the wording asks for a
+/// clean stop, not for quality to be traded away: finish what is in flight,
+/// never start new work, and report.
+const MAIN_WRAPUP_STEPS_LEFT: usize = 5;
 /// Mid-turn auto-compaction: how many times ONE turn may fold its history.
 /// A single turn can run MAX_STEPS tool calls, so a fold has to be possible
 /// while the agent works — but more than a handful would mean the summarizer
@@ -915,6 +924,34 @@ const SUB_FOLD_ENABLED: bool = false;
 /// is testable without running a turn.
 fn fold_pays_off(calls_left: usize) -> bool {
     calls_left >= FOLD_MIN_REMAINING_CALLS
+}
+
+/// The main agent's wrap-up nudge, delivered once a few steps before
+/// [`MAX_STEPS`].
+///
+/// Traced Oct 29: three of twenty runs ran into the 60-step cap and were cut
+/// with `finish_reason: tool_calls` on every round — no final answer, no
+/// done/remaining report, and the user's follow-up message paid another
+/// full-context round-trip just to continue. The explore sub-agent already
+/// gets budget nudges (see the loop); this mirrors them for the main turn.
+/// The wording asks for a CLEAN stop — finish what is in flight, never start
+/// new work, report — so quality goes up, not down. A pure function of the
+/// loop state so the once-only rule is testable without running a turn.
+fn main_wrapup_message(
+    step: usize,
+    max_steps: usize,
+    delivered: bool,
+    mode: &str,
+) -> Option<&'static str> {
+    if mode == "subagent" || delivered || step + MAIN_WRAPUP_STEPS_LEFT != max_steps {
+        return None;
+    }
+    Some(
+        "Step budget is nearly exhausted — wrap up this turn NOW: finish the operation \
+         already in flight (or stop it cleanly), do NOT start new work, and give the user \
+         a clear summary of what was completed and what remains. Only call a tool if it is \
+         essential to leave the work in a consistent state.",
+    )
 }
 
 /// Record one in-turn fold in the trace.
@@ -1502,7 +1539,8 @@ fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     Some(format!(
         "blocked: this turn is read-only — `{name}` is not available in this mode, so it \
 cannot {action}. Answer with the concrete change instead: which file, which line, and the \
-exact old text → new text. Tell the user to switch to Build mode if they want it applied."
+exact old text → new text. Tell the user to switch to Build mode if they want it applied. \
+(Do NOT re-call it in this turn — a repeat burns a round and gets the same refusal.)"
     ))
 }
 
@@ -1515,6 +1553,38 @@ exact old text → new text. Tell the user to switch to Build mode if they want 
 /// bundle stays behind the flag.
 fn plugin_action_needs_authoring(action: &str) -> bool {
     matches!(action, "install" | "create" | "update" | "toggle" | "delete")
+}
+
+/// The mode half of the `plugin` gate: why this turn refuses an action.
+///
+/// `run` follows the terminal capability alone: a bundle's script IS dispatched
+/// exactly like a `run_terminal` line, so a mode that may run commands — Ask
+/// included — may run it, and Ask's own mutating-command gate still covers what
+/// the script does to the disk. Gating `run` on `write_files` as well was the
+/// MT5 bug: Ask refused every plugin script only because it forbids edits,
+/// while plain shell commands were fine. The AUTHORING actions are the mirror
+/// image: they WRITE the bundle, so they follow `write_files` — `allow_create`
+/// alone cannot arm them in a read-only turn, because the flag is sticky from
+/// the conversation history (an authoring request earlier in the chat keeps it
+/// set) and the compacted schema is only the first line of defence.
+fn plugin_mode_refusal(action: &str, caps: &ToolCaps) -> Option<String> {
+    if action == "run" && !caps.run_terminal {
+        Some(
+            "blocked: this turn cannot run commands — running a plugin script is the same \
+act as a terminal command, which this mode does not allow. Switch to Build mode to run it."
+                .into(),
+        )
+    } else if plugin_action_needs_authoring(action) && !caps.write_files {
+        Some(
+            format!(
+                "blocked: this turn is read-only — `plugin action={action}` saves a bundle, \
+which this mode does not allow. Run the bundle's script instead (action=run), or ask the \
+user to switch to Build mode to edit the plugin."
+            ),
+        )
+    } else {
+        None
+    }
 }
 
 /// Mode gating, part one: drop every tool this turn may not use. The model
@@ -3002,37 +3072,44 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         })
         .collect();
     if !allow_create {
-        // A plain turn keeps the door to a bundle's scripts, but NOT the
-        // authoring prose: the full schema is ~2.9K chars and is re-sent on
-        // every round-trip, so the authoring description would tax every turn
-        // to describe actions this one cannot call. The compact schema carries
-        // only what `list`/`run` need — the enum IS the gate, since the model
-        // cannot pick an action it cannot name (the loop keeps a second gate for
-        // a stale transcript).
-        for s in out.iter_mut() {
-            if s["function"]["name"] != "plugin" {
-                continue;
-            }
-            *s = json!({
-                "type": "function",
-                "function": {
-                    "name": "plugin",
-                    "description": "A plugin bundle's scripts: `list` names the bundles and their \
-scripts, `run` executes one on disk. Saving a bundle needs the user to ask for it.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "action": {"type": "string", "enum": ["list", "run"]},
-                            "slug": {"type": "string", "description": "Plugin folder slug"},
-                            "name": {"type": "string", "description": "run: script name"},
-                            "args": {"type": "array", "items": {"type": "string"}},
-                        },
-                    },
-                },
-            });
-        }
+        compact_plugin_schema(&mut out);
     }
     out
+}
+
+/// Swap the `plugin` tool's full schema for the compact one: a plain turn keeps
+/// the door to a bundle's scripts (`list`/`run`) but NOT the authoring prose.
+/// The full schema is ~2.9K chars and is re-sent on every round-trip, so the
+/// authoring description would tax every turn to describe actions this one
+/// cannot call. This is ALSO the honest gate in read-only modes: `allow_create`
+/// is sticky (granted by an authoring request earlier in the history), so an
+/// Ask turn can still carry it — with the full enum the model then names
+/// `action=update` where only `run` is possible. A mode that cannot write
+/// files therefore gets the compact form too; the loop keeps a second gate for
+/// a stale transcript.
+fn compact_plugin_schema(schemas: &mut [Value]) {
+    for s in schemas.iter_mut() {
+        if s["function"]["name"] != "plugin" {
+            continue;
+        }
+        *s = json!({
+            "type": "function",
+            "function": {
+                "name": "plugin",
+                "description": "A plugin bundle's scripts: `list` names the bundles and their \
+scripts, `run` executes one on disk. Saving a bundle needs the user to ask for it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "run"]},
+                        "slug": {"type": "string", "description": "Plugin folder slug"},
+                        "name": {"type": "string", "description": "run: script name"},
+                        "args": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        });
+    }
 }
 
 /// The POSITION-based LSP lookups: definition, references, hover — plus
@@ -3804,6 +3881,14 @@ pub async fn run_turn(
     // Gate the native set BEFORE the MCP merge below: a connector must not be
     // able to re-introduce a tool the mode forbids (`write_file` through MCP).
     retain_allowed_tools(&mut schemas, &caps, &req.mode);
+    // A read-only mode never sees the authoring enum: `allow_create` is sticky
+    // from the conversation history, so an Ask turn can carry it while the mode
+    // forbids saving a bundle — with the full enum the model then names
+    // `action=update` (the "updates the plugin instead of running it" report).
+    // The compact form keeps the door open for `list`/`run` only.
+    if !caps.write_files {
+        compact_plugin_schema(&mut schemas);
+    }
     // MCP connectors switched on in the composer become extra tools named
     // `mcp__<server>__<tool>`; their schemas come from each server's
     // tools/list. An ENABLED plugin's connectors ride along without the user
@@ -4045,6 +4130,9 @@ pub async fn run_turn(
     // nothing real to show. Kept in order, one entry per round, so
     // `plans::plan_text` can pick the rounds that carry the plan.
     let mut prior_text: Vec<String> = Vec::new();
+    // The main-agent wrap-up nudge is delivered once per turn (see
+    // `main_wrapup_message`); the flag keeps a later step from re-sending it.
+    let mut wrapup_delivered = false;
     for step in 0..max_steps {
         // Drain any mid-turn steer BEFORE this model call: the steer is appended
         // as an extra user message, so the model keeps the whole conversation
@@ -4086,6 +4174,17 @@ pub async fn run_turn(
                 "role": "user",
                 "content": "The 3-step budget is spent. Write the report NOW from what you already have. If a specific fact is still missing, fetch ALL of it in ONE batch of calls next to the report — do not keep fetching one thing per round."
             }));
+        }
+        // Wrap-up nudge (main agent only), once, a few steps before the cap.
+        // Traced Oct 29: three of twenty runs hit MAX_STEPS and were cut with
+        // `finish_reason: tool_calls` on every round — the turn ended mid-work
+        // with no final answer, and the user's follow-up message re-read the
+        // whole context just to continue. The nudge is a tail append (cache
+        // safe) and asks for a clean stop, mirroring the sub-agent nudges.
+        if let Some(text) = main_wrapup_message(step, max_steps, wrapup_delivered, req.mode.as_str())
+        {
+            wrapup_delivered = true;
+            messages.push(json!({ "role": "user", "content": text }));
         }
 
         // --- In-turn stale-result elision -----------------------------------
@@ -4330,6 +4429,16 @@ pub async fn run_turn(
                     ctx,
                     COMPACT_MAX_OUTPUT,
                     true,
+                    // `summarize_all`: this caller rebuilds the wire from the
+                    // returned summary plus its own in-flight tail ONLY — it
+                    // never splices a verbatim tail back. Letting compact.rs
+                    // exclude its 40% tail from the summary dropped that tail
+                    // from BOTH the summary and the wire (traced Oct 29: a
+                    // compaction at 64.8K tokens left the newest ~40% of the
+                    // work history in neither, and the model paid extra
+                    // round-trips re-reading what it had already read). Every
+                    // foldable message must therefore reach the summarizer.
+                    true,
                     &mut |p: &crate::compact::CompactProgress| {
                         emit(&AgentEvent::CompactProgress {
                             phase: p.phase.to_string(),
@@ -4385,6 +4494,32 @@ pub async fn run_turn(
                             content: summary_text,
                             keep,
                             usage: out.usage,
+                        });
+                        // Trace the fold so a later token audit can join it
+                        // against the `llm` rows around it (the same contract
+                        // `record_fold` serves for the in-turn elision). A
+                        // compaction used to leave NO trace row at all: the only
+                        // evidence was the summary bubble in the UI, so its
+                        // re-bill was indistinguishable from a provider-side
+                        // cache miss.
+                        let after_est = estimate_prompt_tokens(&messages, tools_chars);
+                        trace.record(crate::trace::TraceEntry {
+                            kind: "compact".into(),
+                            summary: format!(
+                                "mid-turn compact: {} msg(s) folded, ~{} tok in, ~{} tok out",
+                                older.len(),
+                                measured,
+                                after_est
+                            ),
+                            detail: Some(serde_json::json!({
+                                "step": step + 1,
+                                "folded_messages": older.len(),
+                                "kept_messages": tail.len(),
+                                "before_tokens_est": measured,
+                                "after_tokens_est": after_est,
+                                "summarize_all": true,
+                            })),
+                            ..Default::default()
                         });
                     }
                     Ok(_) => {
@@ -4916,7 +5051,17 @@ the Vision model's description instead.\n"
                     is_shell_read_only(args["command"].as_str().unwrap_or_default(), &root)
                 }
             };
-            if is_readonly(name) || shell_read {
+            // A background=true terminal is NEVER batch-dispatched: the batch
+            // phase calls tools::dispatch directly and that has no background
+            // branch — the call would run to its timeout in the foreground
+            // (measured: `sleep 45` with background:true sat out its full 45 s
+            // there, `sleep 300` hit the 120 s ceiling) and the Terminals
+            // panel would never list it. The sequential arm is the only path
+            // whose chain ends in agent_terminals::spawn (with the chat_id the
+            // panel needs), so a background call must always land there.
+            let background_call = name == "run_terminal"
+                && args["background"].as_bool().unwrap_or(false);
+            if is_readonly(name) || (shell_read && !background_call) {
                 emit(&AgentEvent::Status {
                     stage: "tool".into(),
                     content: name.clone(),
@@ -5351,13 +5496,20 @@ Valid names: {}",
                 // shell either: `echo x > f`, `sed -i`, `git commit` all change
                 // the workspace without ever calling `write_file`, so gating the
                 // tool NAME alone left Plan mode able to rewrite the whole tree.
-                (
-                    "blocked: this turn is read-only — `run_terminal` may only inspect here \
+                // A GUI-app launcher is NOT a workspace write, but it is not an
+                // inspection either (traced mvrvau0r r63: MT5 launch in ask) —
+                // it gets its own line in the refusal so the model does not
+                // retry the SAME command and burn the round twice.
+                let cmd = args["command"].as_str().unwrap_or_default();
+                let mut msg = "blocked: this turn is read-only — `run_terminal` may only inspect here \
 (build, test, lint, git status/diff/log). Writing through the shell is not allowed in this \
  mode; give the concrete change instead and tell the user to switch to Build mode to apply it."
-                        .into(),
-                    false,
-                )
+                        .to_string();
+                if !is_mutating_command(cmd) {
+                    msg.push_str("\n(this command itself is not a workspace write — it launches or \
+controls an outside app; switch to Build mode, or ask the user to run it)");
+                }
+                (msg, false)
             } else if name == "run_terminal" && args["background"].as_bool().unwrap_or(false) {
                 // Background terminal — the agent's dev-server/watcher escape.
                 // The command detaches, output streams into a log, and THIS
@@ -5390,24 +5542,31 @@ user to ask for it. Available this turn: `list` and `run`."
                         ),
                         false,
                     )
-                } else if action == "run" && !(caps.run_terminal && caps.write_files) {
-                    // A script's effect is unknown, so it is treated the way a
-                    // mutating shell command is: refused in a read-only mode
-                    // rather than trusted.
-                    (
-                        "blocked: this turn is read-only — running a plugin script runs code \
-on disk, which this mode does not allow. Switch to Build mode to run it."
-                            .into(),
-                        false,
-                    )
+                } else if let Some(refusal) = plugin_mode_refusal(&action, &caps) {
+                    // A bundle's script IS a command: it follows the terminal
+                    // capability, not `write_files` (see plugin_mode_refusal).
+                    (refusal, false)
                 } else {
-                    match tools::dispatch_with_data_root(
-                        &root,
-                        name,
-                        &args,
-                        permit.as_ref(),
-                        Some(&skill_root),
-                    ) {
+                    // Sequential dispatch must NOT park the async worker: these
+                    // handlers block (terminal, plugin scripts — up to the 600s
+                    // ceiling). Same pattern as the read-only batch loop above.
+                    let root_sb = root.clone();
+                    let name_sb = name.to_string();
+                    let args_sb = args.clone();
+                    let permit_sb = permit.clone();
+                    let skill_root_sb = skill_root.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        tools::dispatch_with_data_root(
+                            &root_sb,
+                            &name_sb,
+                            &args_sb,
+                            permit_sb.as_ref(),
+                            Some(&skill_root_sb),
+                        )
+                    })
+                    .await
+                    .unwrap_or(Err("tool task failed".into()))
+                    {
                         Ok(r) => {
                             // Only an UPDATE pins the badge: a fresh install or
                             // create announces itself once and is done — the
@@ -5943,13 +6102,25 @@ call fetch_url again with offset={next} for the rest]",
                 // the call (an EDIT, not a create)? The event goes out only when
                 // the save succeeds.
                 let was_update = edit_target_of(name, &args, std::path::Path::new(&skill_root));
-                match tools::dispatch_with_data_root(
-                    &root,
-                    name,
-                    &args,
-                    None,
-                    Some(&skill_root),
-                ) {
+                // Same worker protection as the plugin arm above: generic
+                // sequential handlers (terminal-capable skills, connectors)
+                // block too, so they run on the blocking pool.
+                let root_sb = root.clone();
+                let name_sb = name.to_string();
+                let args_sb = args.clone();
+                let skill_root_sb = skill_root.clone();
+                match tokio::task::spawn_blocking(move || {
+                    tools::dispatch_with_data_root(
+                        &root_sb,
+                        &name_sb,
+                        &args_sb,
+                        None,
+                        Some(&skill_root_sb),
+                    )
+                })
+                .await
+                .unwrap_or(Err("tool task failed".into()))
+                {
                     Ok(r) => {
                         if let Some((target, pin_name, pin_path)) = was_update {
                             emit(&AgentEvent::EditTarget {
@@ -6889,7 +7060,11 @@ fn redirects_to_a_file(s: &str) -> bool {
             .trim_matches(['"', '\'']);
         // An empty target is a dangling operator; `&` is a descriptor move; a
         // `/dev/*` node absorbs the stream without touching the workspace.
-        if !word.is_empty() && !word.starts_with('&') && !word.starts_with("/dev/") {
+        if !word.is_empty()
+            && !word.starts_with('&')
+            && !word.starts_with("/dev/")
+            && !always_allowed_target(word)
+        {
             return true;
         }
         rest = after;
@@ -6904,6 +7079,10 @@ fn redirects_to_a_file(s: &str) -> bool {
 /// Plan turn whose terminal is "inspection only" could otherwise rewrite the
 /// tree from the shell.
 fn is_mutating_command(cmd: &str) -> bool {
+    is_mutating_depth(cmd, 0)
+}
+
+fn is_mutating_depth(cmd: &str, depth: usize) -> bool {
     let mut scrubbed = cmd.to_lowercase();
     // `2>&1` / `>&2` duplicate a descriptor — they create no file, so they are
     // stripped first or every redirected build/test would look like a write.
@@ -6952,6 +7131,31 @@ fn is_mutating_command(cmd: &str) -> bool {
             _ => &[],
         };
         if args.iter().any(|w| eval_flags.contains(w)) {
+            // The payload IS code the shell will run, so it is only as writable
+            // as its contents: decide from the payload itself (bounded depth).
+            // MEASURED (mvrvau0r r1): a read-only turn's login-PATH probe
+            // (`/bin/zsh -l -c 'echo -n $PATH'`) was refused wholesale and burned
+            // a round. Only the POSIX shells parse reliably; interpreters whose
+            // payloads can write without any shell token (`python -c "open('a',
+            // 'w')"`, `node -e fs.writeFileSync`) stay refused wholesale.
+            if matches!(cmd, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+                if depth >= 3 {
+                    return true;
+                }
+                if let Some(pos) = args.iter().position(|w| eval_flags.contains(w)) {
+                    // The payload is EVERYTHING after the flag (a quoted
+                    // `sh -c 'rm -rf src'` arrives as three whitespace-split
+                    // words); rejoin it and strip the quote wrapper before the
+                    // recursive gate.
+                    let payload = args[pos + 1..]
+                        .join(" ")
+                        .trim_matches(['\'', '"'])
+                        .to_string();
+                    if !payload.trim().is_empty() {
+                        return is_mutating_depth(&payload, depth + 1);
+                    }
+                }
+            }
             return true;
         }
         // In-place editors: `sed -i`, `sed -i.bak`, `perl -pi`/`-pni` (the flag
@@ -7143,7 +7347,22 @@ fn is_file_search_command(cmd: &str, root: &str) -> bool {
         let mut stage_ws = false;
         let mut skipped_pattern = false;
         let mut after_first_flag = false;
-        for w in &stage.words[idx + 1..] {
+        // sed/awk/gawk take a PROGRAM as their first non-flag argument — not a
+        // pattern, not a scope. Its slashes/braces (`'s/…/…/'`, `'{print}'`)
+        // used to be read as a path fragment and drag the scanner into the
+        // workspace while its REAL file argument sat outside (traced:
+        // mvrv45fv r29 `sed 's/x//g' /tmp/win.log | grep …`). Skip it here so
+        // the loop below starts at the first FILE argument.
+        let mut start = idx + 1;
+        if matches!(verb.as_str(), "sed" | "awk" | "gawk") {
+            while start < stage.words.len() && stage.words[start].starts_with('-') {
+                start += 1;
+            }
+            if start < stage.words.len() {
+                start += 1; // the program text itself
+            }
+        }
+        for w in &stage.words[start..] {
             if w.starts_with('-') {
                 after_first_flag = true;
                 continue;
@@ -7168,8 +7387,25 @@ fn is_file_search_command(cmd: &str, root: &str) -> bool {
             saw_pathish = true;
             let abs = resolve_scope(&base, w);
             if abs.is_empty() {
-                // A program fragment or unexpanded variable — not a path
-                // token; it invents no scope and must not count as one.
+                // A program fragment or unexpanded variable ($D/mod.rs, "{a,b}",
+                // a quoted "$f") — not a path token: it invents no scope, so it
+                // must not count as a workspace scope EITHER. MEASURED
+                // (mvrv45fv r29): a `grep … $D/src/Windows/…` over the cargo
+                // registry was refused as a workspace search (3+ retry rounds)
+                // because unexpanded tokens fell through to the implied-CWD
+                // branch. Skipping it WITHOUT marking a workspace hit keeps
+                // both sides honest: no invented scope, and such a stage is
+                // still judged by its REAL tokens below.
+                continue;
+            }
+            if always_allowed_target(&abs) {
+                // ~/.codifa, /tmp and /dev sit outside the workspace, where no
+                // native lookup answers — refusing these burns a round with no
+                // cheaper substitute (traced: greps over traces/, logs and
+                // plugin trees). "Allowed elsewhere" is not a workspace scope.
+                // A variable-prefixed FILE arg (`"$P/Cargo.toml"`) resolves
+                // empty above and already skips a workspace hit; nothing more
+                // is needed here.
                 continue;
             }
             if crate::tools::is_inside_root(root, &abs) {
@@ -7179,9 +7415,13 @@ fn is_file_search_command(cmd: &str, root: &str) -> bool {
         if stage_ws {
             has_ws_scope = true;
         }
-        // No path token at all: grep-family searches the CWD, and run_terminal
-        // spawns with the workspace root as cwd — an implied workspace scope.
-        if patterned && !saw_pathish {
+        // grep-family with no path token searches the CWD, which run_terminal
+        // spawns at the workspace root — an implied workspace scope. ONLY the
+        // stage that OWNS its input can imply one: a middle/last pipeline stage
+        // (`perl … | grep -nE x | head`) filters another command's stream —
+        // the same exemption `cargo test | grep` gets at the top of this gate
+        // (traced: mvrv45fv r31, mvrvau0r r1).
+        if patterned && !saw_pathish && stage.owns_input {
             implied_ws = true;
         }
     }
@@ -7214,7 +7454,22 @@ fn shell_stages(cmd: &str) -> Vec<ShellStage> {
     let mut tok = String::new();
     let mut owns = true;
     let mut quote: Option<char> = None;
-    for c in cmd.chars() {
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        // A backslash escapes the NEXT character outside quotes (`Application\
+        // Support`, `foo\ bar.rs`): the pair names ONE path token. Without this
+        // the space split the token and the orphan half (`support`) resolved as
+        // a RELATIVE path inside the workspace — refusing a find over ~/Library
+        // that the workspace has nothing to do with (mvrxj97c r21).
+        if c == '\\' && quote.is_none() {
+            if let Some(&n) = chars.peek() {
+                if n == ' ' || n == '\\' || n == '$' {
+                    tok.push(n);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
         match c {
             '\'' | '"' if quote.is_none() || quote == Some(c) => {
                 quote = if quote.is_none() { Some(c) } else { None };
@@ -7237,6 +7492,26 @@ fn shell_stages(cmd: &str) -> Vec<ShellStage> {
         }
     }
     flush(&mut out, &mut words, &mut tok, owns);
+    // Redirect plumbing is DROPPED, as the doc comment has always claimed:
+    // `2>/dev/null` is an fd shim that names no file the command reads, and
+    // `> /tmp/o` / `<<EOF` are writes heredocs the mutation gate owns — none
+    // of them is a search scope or a read target. Leaving them in tokenised
+    // every unquoted `2>/dev/null` as a BARE token that resolved INSIDE the
+    // workspace (the file does not exist) and refused 19 traced lookups
+    // (7 files, one day). Unquoted `> f` survives as its own token and is
+    // filtered by the same rule; `<<'PY'` still arrives as one token.
+    for st in out.iter_mut() {
+        st.words.retain(|w| {
+            let unq = w.trim_matches(['"', '\'']);
+            // a heredoc INTRODUCER is plumbing itself (its body is a separate
+            // statement via newlines); a bare `>`/`>>` operator is plumbing;
+            // `N>target` is an fd shim; `target>…` never happens bare.
+            !(unq.contains("<<")
+                || unq == ">"
+                || unq == ">>"
+                || (unq.starts_with(['1', '2']) && unq.contains('>')))
+        });
+    }
     out
 }
 
@@ -7381,54 +7656,54 @@ fn is_file_dump_command(cmd: &str) -> bool {
 /// the workspace. A `cd <dir>` statement moves the base, so the same relative
 /// target is judged in the directory it is really read from.
 fn workspace_file_read(cmd: &str, root: &str) -> bool {
+    // The SAME quote-aware stages the search gate uses. shell_statements split
+    // on every `;` — including one inside a sed program (`sed 's/[0-9;]*m//g'`)
+    // — and judged the program TEXT a file target, refusing `sed … /tmp/x.log`
+    // as a workspace dump (mvrv45fv r29Today). Stages drop redirect plumbing
+    // and keep statements intact, so the dumper scan below sees real words.
     let mut base = root.to_string();
-    for st in shell_statements(cmd) {
-        let mut words = st.split_whitespace();
-        let verb = words.next().unwrap_or_default().to_string();
+    for stage in shell_stages(cmd) {
+        let words = &stage.words;
+        let Some(verb) = words.first() else { continue };
         if verb == "cd" {
-            if let Some(dir) = words.next() {
+            if let Some(dir) = words.get(1) {
                 base = cd_base(&base, dir);
             }
             continue;
         }
-        if !DUMPER_VERBS.contains(&verb.as_str()) || st.contains(" -i") {
+        if !DUMPER_VERBS.contains(&verb.as_str()) || stage.words.iter().any(|w| w == "-i") {
             continue;
         }
-        // Strip redirect plumbing BEFORE choosing the target: `cat f.json
-        // 2>/dev/null` reads f.json — the shim alone billed run59 a round
-        // because the raw last token `2>/dev/null` resolved as a relative
-        // (hence "workspace") path. A WRITE redirect (`> out`, `>>x`, `&>x`)
-        // or a heredoc makes this the mutation gate's business, not a dump.
-        let mut writer = false;
-        let mut clean: Vec<&str> = Vec::new();
-        for w in st.split_whitespace() {
-            if w.contains("<<") {
-                writer = true;
-                break;
+        // sed/awk/gawk take a program as their FIRST non-flag argument; without
+        // this skip a bare `sed -n 5p` (stdin read) would judge the program
+        // text the read target and invent a workspace file.
+        let mut args: Vec<&String> = words[1..].iter().collect();
+        if matches!(verb.as_str(), "sed" | "awk" | "gawk") {
+            while args.first().is_some_and(|w| w.starts_with('-')) {
+                args.remove(0);
             }
-            if w.contains('>') {
-                if w.starts_with('1') || w.starts_with('2') {
-                    continue; // fd shim, not a file the dumper reads
-                }
-                writer = true;
-                break;
+            if !args.is_empty() {
+                args.remove(0); // the program text
             }
-            if w == "<" {
-                continue; // stdin redirect: the operand IS the read target
-            }
-            if w == "&1" {
-                continue;
-            }
-            clean.push(w);
         }
-        if writer {
+        // Stages already dropped `2>/dev/null`, bare `>`/`>>` operators and
+        // heredoc introducers; a surviving write redirect (attached form
+        // `>out` on a non-fd token) makes this the mutation gate's business.
+        if words.iter().any(|w| {
+            w.contains('>') && !(w.starts_with('1') || w.starts_with('2'))
+        }) {
             continue;
         }
-        let Some(target) = clean.last() else {
-            continue;
-        };
+        let Some(target) = args.last() else { continue };
         let target = target.trim_matches(['"', '\'']);
-        if target.is_empty() || target.starts_with('-') {
+        // An UNRESOLVED VARIABLE ($B, ${B}, $HOME/…) names no file the gate can
+        // judge: it was once resolved RELATIVELY into "<ws>/$B", a path that
+        // exists only inside the gate, and every traced `B=<ws path>; strings
+        // $B | grep …` was billed a false dump refusal (mvrxj97c r15/r21 — six
+        // retries of the same probe on the NEW build). A variable target is
+        // unprovable either way, so the gate stays silent; the assignment pass
+        // above (B=…) could inline it, but only exactly and only here.
+        if target.is_empty() || target.starts_with('-') || target.starts_with('$') {
             continue;
         }
         let abs = if target.starts_with('/') || target.starts_with('~') {
@@ -7478,7 +7753,21 @@ fn always_allowed_target(abs: &str) -> bool {
         }
     }
     let cfg = format!("{home}/.codifa");
-    a == cfg || a.starts_with(&format!("{cfg}/"))
+    if a == cfg || a.starts_with(&format!("{cfg}/")) {
+        return true;
+    }
+    // The app's own data root (~/Library/Application Support/com.codifa.app by
+    // default) — same class of trusted home as ~/.codifa: schedules, terminal
+    // logs, data-root.json. Traced: reads of them got billed as workspace
+    // dump/search refusals and burned rounds on the app's OWN files.
+    if let Some(app_root) = crate::state::current_data_root() {
+        let ap = app_root.to_string_lossy().to_lowercase();
+        let ap = ap.trim_end_matches('/').to_string();
+        if !ap.is_empty() && (a == ap || a.starts_with(&format!("{ap}/"))) {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when a `run_terminal` command is a pure READ: it neither writes, nor
@@ -9829,6 +10118,33 @@ mod tests {
     }
 
     #[test]
+    fn plugin_run_follows_the_terminal_cap_not_write_files() {
+        // "ترید کن" in Ask must fire an MT5-style plugin script: the script is
+        // a command like any other and Ask's mutating-command gate covers its
+        // effect. The old gate demanded `write_files` too, so Ask refused every
+        // plugin run purely for not allowing edits — while shell commands ran.
+        assert!(plugin_mode_refusal("run", &caps_for_mode("ask")).is_none());
+        assert!(plugin_mode_refusal("run", &caps_for_mode("build")).is_none());
+        // Without the terminal there is nothing to run the script with.
+        assert!(plugin_mode_refusal(
+            "run",
+            &ToolCaps {
+                run_terminal: false,
+                ..ToolCaps::default()
+            }
+        )
+        .is_some());
+        // The mirror image: authoring actions WRITE the bundle, so a read-only
+        // mode refuses them even when sticky allow_create armed the tool —
+        // this is the gate that stops Ask from "updating the plugin" instead
+        // of running it. Build may still author.
+        assert!(plugin_mode_refusal("update", &caps_for_mode("ask")).is_some());
+        assert!(plugin_mode_refusal("toggle", &caps_for_mode("ask")).is_some());
+        assert!(plugin_mode_refusal("update", &caps_for_mode("build")).is_none());
+        assert!(plugin_mode_refusal("list", &caps_for_mode("plan")).is_none());
+    }
+
+    #[test]
     fn discovery_tools_are_withheld_from_the_main_agent_by_name() {
         // The schema list is not the only gate: a stale transcript can still
         // call a withheld name, so the retainer must drop it for the main agent
@@ -10074,6 +10390,98 @@ mod tests {
     }
 
     #[test]
+    fn traced_oct28_refusals_stay_free() {
+        // Five parsing bugs billed a full retry round each on the live traces
+        // (26 refusals in one day, 14 of them followed by a SAME-tool retry).
+        // One guard per root cause, straight from the traced command text.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let free = [
+            // mvrv45fv r29: sed PROGRAM text (`s/[0-9;]*m//g`) read as a scope
+            // dragged a /tmp/-targeted pipeline into "workspace search" and the
+            // dump reader judged the program text the file target.
+            "sed 's/ESC\\[[0-9;]*m//g' /tmp/win.log | grep -E \"^error|-->\" | head -50",
+            // mvrvau0r r7: grep over $D (cargo registry), fd shim 2>/dev/null
+            // used to resolve as a bare RELATIVE scope inside the workspace.
+            "D=~/.cargo/registry/src/i/windows-sys; grep -rE \"pub fn\" $D/src/lib.rs 2>/dev/null | head -40",
+            // mvnrjdlx r37: ~/.codifa plugin/skills grep — allowed tree.
+            "grep -ril -E \"metatrader\" ~/.codifa/plugins ~/.codifa/skills 2>/dev/null | head -30",
+            // mvrxj97c r21: backslash-escaped space split the token and the
+            // orphan half (`Support`) resolved as a relative workspace path.
+            "find ~/Library/Application\\ Support -maxdepth 3 -name runs 2>/dev/null",
+            // mvrxj97c r21: ~/Library/Logs grep, same fd-shim scope bug.
+            "grep -rn \"schedule\" ~/Library/Logs/Codifa/rust.log 2>/dev/null | tail -20",
+            // heredoc bodies keep their own statement semantics; `<<'PY'` must
+            // never turn a python filter into a scope (mvptzxmh r23 class).
+            "cat > /tmp/x.py <<'PY'\nprint(1)\nPY",
+        ];
+        for cmd in free {
+            assert!(
+                !workspace_file_read(cmd, root),
+                "read-gate refused a free traced command: {cmd}"
+            );
+            assert!(
+                !is_file_search_command(cmd, root),
+                "search gate refused a free traced command: {cmd}"
+            );
+        }
+    }
+
+
+    #[test]
+    fn traced_gates_still_catch_the_real_thing() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // The refusals that were CORRECT must stay refusals — the native tool
+        // answers them in the same round instead of a second terminal round.
+        assert!(workspace_file_read(
+            "sed -n '6906,7000p' src/agent.rs",
+            root
+        )); // mvctumh7 r48 class: `read` serves it
+        assert!(is_file_search_command(
+            "grep -rn \"run_terminal\" src/agent.rs | head -8",
+            root
+        )); // mvrxj97c r30 class: native grep serves it
+        assert!(is_file_search_command(
+            "grep -n stream src-tauri/src/llm.rs | head -40",
+            root
+        )); // mvrxj97c r24 class
+        // NEW-build retraces (Oct 28 evening, mvrxj97c r15/r21/r36): a shell
+        // VARIABLE as the dump target ($B, "$NEW") names no judgeable file —
+        // the old gate resolved it RELATIVELY into "<ws>/$B", a path that only
+        // exists inside the gate, and billed 6+ false dump refusals while the
+        // model retried the same probe.
+        for c in [
+            "B=/Users/saman/Documents/code/codifa/src-tauri/target/release/codifa; strings \"$B\" | grep -c \"sent no response headers\"",
+            "NEW=$(ls -t \"$HOME/Library/Application Support/com.codifa.app/terminal-logs/\"*.log | head -1); tail -c 600 \"$NEW\"",
+            // `[1] strings(...)`: the app's own data root — same trusted class
+            // as ~/.codifa — stays a terminal read, not a workspace dump.
+            "grep -rn \"schedule\" \"$HOME/Library/Application Support/com.codifa.app/\" 2>/dev/null | tail -20",
+        ] {
+            assert!(
+                !workspace_file_read(c, root),
+                "{c:?} must stay a legal terminal read"
+            );
+        }
+        assert!(workspace_file_read("tail -c 800 src-tauri/src/llm.rs", root));
+        assert!(is_file_search_command(
+            "grep -c \"single.instance\" src-tauri/Cargo.toml",
+            root
+        ));
+        // mvrv45fv r47: the read-only turn guard keeps its teeth for the traced
+        // write shape `git push`.
+        assert!(is_mutating_command("cd . && git push origin main 2>&1 | tail -3"));
+        // mvjpmw3h r63: a GUI-app launcher (`open -a`) is deliberately a READ —
+        // it starts a program and writes no files, so a read-only turn can
+        // raise MetaTrader 5 and act through its plugin.
+        assert!(!is_mutating_command(
+            "if ! pgrep -f terminal64 >/dev/null; then\n  open -a MT5\nfi"
+        ));
+        // ...and stays a READ when only /dev absorbs the stream.
+        assert!(!is_mutating_command(
+            "for f in ~/.zshenv ~/.zshrc; do grep -n path \"$f\" 2>/dev/null | head; done; uptime"
+        ));
+    }
+
+    #[test]
     fn a_prefixed_search_cannot_sneak_past_the_gate() {
         let root = env!("CARGO_MANIFEST_DIR");
         // MEASURED on the live build: 63% of `run_terminal` calls arrive as
@@ -10188,6 +10596,52 @@ mod tests {
         assert!(workspace_file_read(
             "cat /Users/saman/.codifa/x 2>/dev/null; cat src/main.rs",
             root
+        ));
+    }
+
+    #[test]
+    fn traced_terminal_refusals_stay_allowed() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // mvrv45fv r29: a shell VARIABLE is a named-but-unresolvable scope — it
+        // must not silently become a workspace scope (cargo-registry grep).
+        assert!(!is_file_search_command(
+            "D=~/.cargo/registry/src/index.crates.io-1/windows-sys-0.52.0; grep -rE \"pub fn OpenProcess\" $D/src/Windows/Win32/System/Threading/mod.rs",
+            root
+        ));
+        // mvrxj97c r21/24/30: greps over ~/.codifa and /tmp have NO cheaper
+        // native substitute (they are outside `read`'s reach) — allowed.
+        assert!(!is_file_search_command(
+            "grep -ril -E \"metatrader|mql5\" ~/.codifa/plugins ~/.codifa/skills 2>/dev/null | head -30; ls ~/.codifa 2>/dev/null",
+            root
+        ));
+        assert!(!is_file_search_command(
+            "grep -c ERR /tmp/agent-bench.log",
+            root
+        ));
+        // mvrv45fv r31 + mvrvau0r r1: middle/last pipeline stages FILTER a
+        // stream; they own no file scope at all.
+        assert!(!is_file_search_command(
+            "perl -ne 'print if /mod.rs/' list.txt | grep -nE \"fn OpenProcess\" | head -20",
+            root
+        ));
+        // Negatives: a named workspace search stays refused…
+        assert!(is_file_search_command("grep -rn TODO src/", root));
+        // …and so does an owning grep that names NO scope (implied CWD = root).
+        assert!(is_file_search_command("rg foo", root));
+    }
+
+    #[test]
+    fn readonly_shell_probes_stay_allowed_when_the_payload_is_clean() {
+        // mvrvau0r r1: the login-PATH probe through `zsh -l -c` inspects, not
+        // writes — the payload gate now decides.
+        assert!(!is_mutating_command(
+            "echo \"== nvim:\"; command -v -a nvim 2>/dev/null; /bin/zsh -l -c 'echo -n $PATH'"
+        ));
+        // A writing payload through the same shell is still refused…
+        assert!(is_mutating_command("/bin/zsh -c 'echo x > src/main.rs'"));
+        // …and a redirect into the always-allowed areas stays a read.
+        assert!(!is_mutating_command(
+            "cargo build > ~/.codifa/traces/build.log 2>&1"
         ));
     }
 
@@ -14454,6 +14908,28 @@ mod tests {
         // The guard must not shadow the elision it protects: it sits far below
         // the run length, so an explore run that folds at all still folds.
         assert!(SUBAGENT_MAX_STEPS > FOLD_MIN_REMAINING_CALLS);
+    }
+
+    #[test]
+    fn main_wrapup_nudge_fires_once_short_of_the_cap() {
+        // Traced Oct 29: three of twenty runs hit MAX_STEPS and were cut with
+        // `finish_reason: tool_calls` on every round — no final answer at all.
+        // The nudge must land MAIN_WRAPUP_STEPS_LEFT rounds before the cap,
+        // exactly once, and never inside a sub-agent (which owns its nudges).
+        let early = MAX_STEPS - MAIN_WRAPUP_STEPS_LEFT - 1;
+        assert!(main_wrapup_message(early, MAX_STEPS, false, "main").is_none());
+        let at = MAX_STEPS - MAIN_WRAPUP_STEPS_LEFT;
+        assert!(main_wrapup_message(at, MAX_STEPS, false, "main").is_some());
+        // After delivery (any later step) it stays silent: a repeated nudge
+        // would be re-billed on every remaining round for no new information.
+        assert!(main_wrapup_message(at + 1, MAX_STEPS, true, "main").is_none());
+        assert!(main_wrapup_message(MAX_STEPS - 1, MAX_STEPS, true, "main").is_none());
+        // Sub-agents never see it — their budget nudges already cover them.
+        assert!(main_wrapup_message(at, MAX_STEPS, false, "subagent").is_none());
+        // The margin leaves room to actually wrap up: at least one round to
+        // read the nudge, one to answer. A margin of 1 would nudge on the very
+        // last round, where nothing can come of it.
+        assert!(MAIN_WRAPUP_STEPS_LEFT >= 2);
     }
 
     #[test]

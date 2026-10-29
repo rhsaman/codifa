@@ -127,11 +127,42 @@ export function buildSttPrompt(
 ): string {
   void lang
   const parts: string[] = []
-  const own = (custom ?? '').trim()
-  if (own) parts.push(tailWords(own, 60, 400))
+  const own = tailWords(custom ?? '', 60, 400)
+  if (own) parts.push(own)
   const tail = tailWords(contextTail ?? '', 25, 200)
   if (tail) parts.push(tail)
   return parts.join(' ').trim()
+}
+
+/**
+ * Auto-glossary for the STT prompt: technical identifiers harvested from the
+ * recent conversation / open editors (file names, function names, library
+ * names) — exactly the words Whisper misspells when Persian speech mixes mid
+ * English tokens. A word LIST carries no grammar, so it cannot make the model
+ * emit a sentence, and stripSttPromptEcho still guards a stray echo.
+ */
+export function extractSttVocab(texts: Array<string | undefined>, maxWords = 30): string {
+  const counts = new Map<string, number>()
+  // Identifiers: camelCase/snake_case/kebab-case tokens WITH a separator or a
+  // case bump, plus dotted/extension names. Plain lower-case English words are
+  // NOT vocabulary (they transcribe fine); Persian words never are.
+  const ident = /[A-Za-z_$][A-Za-z0-9_$/-]*[A-Z_-][A-Za-z0-9_$/-]*|\w+\.\w{1,4}\b/g
+  for (const raw of texts) {
+    if (!raw) continue
+    const s = raw.length > 12000 ? raw.slice(raw.length - 12000) : raw
+    for (const m of s.matchAll(ident)) {
+      const w = m[0].replace(/^[\W_]+|[\W_]+$/g, '')
+      if (w.length < 4 || w.length > 32) continue
+      if (/^\d/.test(w)) continue
+      counts.set(w, (counts.get(w) ?? 0) + 1)
+    }
+  }
+  // Most-seen first; a capped, deterministic list keeps the prompt stable.
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, maxWords)
+    .map(([w]) => w)
+    .join(' ')
 }
 
 /** Minimum word run that counts as the prompt being echoed, not a coincidence. */

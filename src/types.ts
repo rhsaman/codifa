@@ -613,6 +613,23 @@ export interface ChatEditTarget {
   path: string
 }
 
+/** An OPEN PLUGIN-USE session (the \`/slug mt5-trading\` badge): keeps the
+ *  named bundle attached to every send until the user closes it with ×.
+ *  Unlike ChatEditTarget this pins NO folder, NO mode and NO authoring right —
+ *  using a plugin's skills/connectors is not editing it. */
+export interface PluginSession {
+  /** The bundle's slug — the command word (\`mt5\`). */
+  slug: string
+  /** Display name from the bundle (\`MT5 demo trading\`). */
+  label: string
+  /** Skills of the bundle at pin time — re-attached on every send. */
+  skills: string[]
+  /** Connector ids of the bundle at pin time, when it ships any. */
+  mcpServers?: string[]
+  /** Full connector configs (when available) so sends need no re-resolve. */
+  mcpConfig?: Record<string, McpServerConfig>
+}
+
 export interface Chat {
   id: string
   title: string
@@ -633,6 +650,10 @@ export interface Chat {
   /** The mode the chat had BEFORE the edit badge forced Build (undefined =
    *  no session open). × on the badge restores it. */
   editTargetPrevMode?: AgentMode
+  /** Open plugin-USE session (see PluginSession): pinned by invoking the
+   *  bundle through its / command; every send keeps the bundle attached and
+   *  the badge shows only the plugin name until × closes it. */
+  pluginSession?: PluginSession
   messages: ChatMessage[]
   /** Cumulative per-model token usage for this chat (session totals). */
   usage?: ChatUsage

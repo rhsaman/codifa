@@ -48,6 +48,41 @@ function hasTerminalApi(): boolean {
   return typeof window !== 'undefined' && typeof window.coder?.terminalCreate === 'function'
 }
 
+/** Rolling raw-output tail per pty id, kept at MODULE level (the component's
+ *  refs die with it; a pty outlives the panel). The pty starts emitting the
+ *  moment the backend spawns it — long before React has mounted the screen div
+ *  and built the xterm — and a TUI like nvim paints its ENTIRE first frame in
+ *  that window and then sits idle: without this tail those bytes were dropped
+ *  forever and the tab stayed blank with just a cursor. The tail is replayed
+ *  into every xterm built for the tab (first mount AND rebuilds after a screen
+ *  remount, which previously started empty). Capped; trimmed from the front. */
+const rawTail = new Map<string, { parts: string[]; len: number }>()
+const RAW_TAIL_LIMIT = 512 * 1024
+
+/** Re-fit moments after the panel opens. The panel grows with a 0.26s CSS height
+ *  transition, so a fit can land mid-animation and lock the pty at a two-row
+ *  grid — a TUI then paints its whole frame into those two rows, which reads as
+ *  "the terminal opened but shows nothing". One shot is therefore a coin flip:
+ *  this ladder outlives the transition and settles on the real geometry. */
+const REFIT_DELAYS = [50, 120, 220, 320, 500, 800]
+
+function recordRaw(id: string, data: string): void {
+  const tail = rawTail.get(id) ?? { parts: [], len: 0 }
+  tail.parts.push(data)
+  tail.len += data.length
+  if (tail.len > RAW_TAIL_LIMIT) {
+    while (tail.parts.length > 1 && tail.len - tail.parts[0].length > RAW_TAIL_LIMIT) {
+      tail.len -= tail.parts[0].length
+      tail.parts.shift()
+    }
+    if (tail.len > RAW_TAIL_LIMIT) {
+      tail.parts[0] = tail.parts[0].slice(tail.len - RAW_TAIL_LIMIT)
+      tail.len = Math.min(tail.len, RAW_TAIL_LIMIT)
+    }
+  }
+  rawTail.set(id, tail)
+}
+
 /** Does a freshly opened panel owe the user a login shell? Only when it has no
  *  tab at all: a panel that adopted surviving ptys must not start a second
  *  shell. Pure, for tests. */
@@ -90,7 +125,16 @@ export function TerminalPanel() {
   activeIdRef.current = activeId
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{ startY: number; startH: number } | null>(null)
-  const fitRaf = useRef<number | null>(null)
+  const fitTimer = useRef<number | null>(null)
+  // Frames spent waiting for the panel to finish growing (see fitActive).
+  const fitRetry = useRef(0)
+  const fitActiveRef = useRef<(id: string | null) => void>(() => {})
+  // Attempts spent waiting for the screen div to get real height before xterm
+  // may be opened on it (see attachScreen).
+  const mountRetry = useRef(0)
+  const attachScreenRef = useRef<(tab: TerminalTab, el: HTMLElement | null) => void>(
+    () => {},
+  )
 
   // Chat that was focused before the terminal opened; closing the panel
   // returns the caret to its composer input.
@@ -155,14 +199,29 @@ export function TerminalPanel() {
 
   const supported = hasTerminalApi()
 
-  /** Fit + push the new cols/rows to the pty. Skips while hidden (0 size). */
+  /** Fit + push the new cols/rows to the pty. Skips while hidden (0 size),
+   *  but RETRIES: the panel animates its height open, so the first fit can land
+   *  while the body is still a few pixels tall — that locked the pty at 2 rows
+   *  and a TUI (nvim) then painted into a 2-row screen, which reads as "the
+   *  terminal opened but shows nothing". The retry is TIMER-based on purpose:
+   *  WKWebView suspends requestAnimationFrame while the window is occluded or
+   *  unfocused, so an rAF retry chain stalls exactly when the fit never ran. */
   const fitActive = useCallback((id: string | null) => {
     if (!id) return
     const entry = entries.current.get(id)
     const el = entry?.el
     if (!entry || !el) return
     const rect = el.getBoundingClientRect()
-    if (rect.width < 40 || rect.height < 40) return
+    if (rect.width < 40 || rect.height < 40) {
+      // A HIDDEN panel is 0-sized by design: stop after ~3s of retries instead
+      // of spinning, and let the `open` effect restart the count.
+      if (fitRetry.current < 30) {
+        fitRetry.current += 1
+        window.setTimeout(() => fitActiveRef.current(id), 100)
+      }
+      return
+    }
+    fitRetry.current = 0
     try {
       // FitAddon + ResizeObserver can oscillate: a fit toggles the scrollbar,
       // which changes the body size, which schedules another fit — and every
@@ -177,13 +236,22 @@ export function TerminalPanel() {
       /* fit before open() completed */
     }
   }, [])
+  // `fitActive` retries itself through this ref: the retry loop must not close
+  // over a stale callback identity.
+  fitActiveRef.current = fitActive
 
   const scheduleFit = useCallback(() => {
-    if (fitRaf.current !== null) cancelAnimationFrame(fitRaf.current)
-    fitRaf.current = requestAnimationFrame(() => {
-      fitRaf.current = null
+    // A fresh geometry change restarts the grow-retry budget: the panel may be
+    // mid-animation, which is exactly when fitActive gives up early.
+    fitRetry.current = 0
+    if (fitTimer.current !== null) window.clearTimeout(fitTimer.current)
+    // Timer, not requestAnimationFrame: WKWebView stops painting frames while
+    // the window is occluded, and a pending rAF would never fire — the fit then
+    // silently never runs and the pty keeps the 80x24 the backend spawned with.
+    fitTimer.current = window.setTimeout(() => {
+      fitTimer.current = null
       fitActive(activeId)
-    })
+    }, 16)
   }, [activeId, fitActive])
 
   const spawnSession = useCallback(async (cwd?: string, program?: string, args?: string[]) => {
@@ -267,9 +335,13 @@ export function TerminalPanel() {
   useEffect(() => {
     if (!supported) return
     const offData = window.coder.onTerminalData((id, data) => {
-      entries.current.get(id)?.term.write(data)
+      // Record FIRST: a screen built later for this tab replays from here.
+      recordRaw(id, data)
+      const entry = entries.current.get(id)
+      if (entry) entry.term.write(data)
     })
     const offExit = window.coder.onTerminalExit((id) => {
+      rawTail.delete(id)
       const entry = entries.current.get(id)
       if (entry) {
         entry.offFont()
@@ -309,25 +381,48 @@ export function TerminalPanel() {
   }, [theme])
 
   // Open/close is a CSS toggle (sessions keep running while hidden); on open
-  // the geometry changed while display:none, so refit and hand over focus.
+  // the geometry changed while display:none, so refit and hand over focus. The
+  // refit is a LADDER, not one timer: the panel animates its height open, and a
+  // single fit can land while the body is still a couple of rows tall (see
+  // REFIT_DELAYS).
   useEffect(() => {
     if (!open || !activeId) return
+    mountRetry.current = 0
     scheduleFit()
-    const t = window.setTimeout(() => {
-      fitActive(activeId)
+    const timers = REFIT_DELAYS.map((ms) =>
+      window.setTimeout(() => fitActive(activeId), ms),
+    )
+    const focusTimer = window.setTimeout(() => {
       entries.current.get(activeId)?.term.focus()
-    }, 50)
-    return () => window.clearTimeout(t)
+    }, 320)
+    return () => {
+      for (const t of timers) window.clearTimeout(t)
+      window.clearTimeout(focusTimer)
+    }
   }, [open, activeId, scheduleFit, fitActive])
 
-  // Panel geometry changes (window resize, height drag) → refit.
-  useEffect(() => {
-    const el = bodyRef.current
-    if (!el || typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(() => scheduleFit())
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [scheduleFit])
+  // Panel geometry changes (window resize, height drag) → refit. The observer is
+  // attached from a CALLBACK ref, not an effect: on the very first render this
+  // component returns null (the panel has never been opened), so an effect
+  // would find `bodyRef.current === null` and — with no dep of its own changing
+  // afterwards — never observe the body at all. Without that observer nothing
+  // ever refits after the open animation, which is how the pty stayed at 2 rows.
+  const bodyObserver = useRef<ResizeObserver | null>(null)
+  const observeBody = useCallback(
+    (el: HTMLDivElement | null) => {
+      bodyRef.current = el
+      if (bodyObserver.current) {
+        bodyObserver.current.disconnect()
+        bodyObserver.current = null
+      }
+      if (!el || typeof ResizeObserver === 'undefined') return
+      const ro = new ResizeObserver(() => scheduleFit())
+      ro.observe(el)
+      bodyObserver.current = ro
+    },
+    [scheduleFit],
+  )
+  useEffect(() => () => bodyObserver.current?.disconnect(), [])
 
   useEffect(() => {
     const onResize = () => scheduleFit()
@@ -361,6 +456,8 @@ export function TerminalPanel() {
       entries.current.delete(id)
       screens.current.delete(id)
     }
+    // Drop the replay tail with the session: this tab is gone for good.
+    rawTail.delete(id)
     const next = tabsRef.current.filter((t) => t.id !== id)
     tabsRef.current = next
     setTabs(next)
@@ -433,22 +530,53 @@ export function TerminalPanel() {
   // again with null on unmount — the xterm entry survives that (the div comes
   // back on the next render); it is disposed explicitly in closeSession/exit.
   const attachScreen = useCallback(
-    (tab: TerminalTab, el: HTMLDivElement | null) => {
+    (tab: TerminalTab, el: HTMLElement | null) => {
       screens.current.set(tab.id, el)
       if (!el) return
       const existing = entries.current.get(tab.id)
       if (existing) {
         if (existing.el === el) return
         // The screen div was remounted (StrictMode double-mount, HMR, layout
-        // switch): the old xterm is bound to a detached element but its onData
-        // handler is still live — two handlers would write every keystroke to
-        // the pty twice (duplicated typing). Dispose the stale instance and
-        // rebuild on the new element.
+        // switch). MOVE the live xterm node into the new div instead of
+        // rebuilding it: xterm only references `term.element`, never its
+        // parent, so re-parenting keeps the buffer, the scrollback and whatever
+        // a running TUI (nvim) has painted — with exactly one screen and one
+        // onData handler, so no keystroke is sent to the pty twice.
+        //
+        // Disposing here threw the alternate screen away and replayed only a
+        // byte tail into a fresh terminal, so a tab holding nvim came back
+        // blank with nothing but a cursor (the side pane never had this bug: it
+        // re-parents the same way, see attachTerminalScreen).
+        const screen = existing.term.element
+        if (screen) {
+          el.appendChild(screen)
+          existing.el = el
+          scheduleFit()
+          return
+        }
         existing.term.dispose()
         existing.offFont()
         entries.current.delete(tab.id)
       }
       if (!hasTerminalApi()) return
+      // xterm measures its character cell when open() runs. Opening inside the
+      // panel's 0.26s height transition measures a ZERO cell, and the renderer
+      // then gives every row no height: the pty grid still grows (fit runs and
+      // resizes it) while the visible rows stay collapsed, so a TUI paints into
+      // nothing. Wait for real geometry instead — the pty's output is already
+      // kept in rawTail and replayed below, so the wait costs nothing.
+      if (el.getBoundingClientRect().height < 40) {
+        // Bounded: a panel left closed must not spin forever. The open effect
+        // restarts the count, so a later open still mounts the screen.
+        if (mountRetry.current < 40) {
+          mountRetry.current += 1
+          window.setTimeout(() => {
+            attachScreenRef.current(tab, screens.current.get(tab.id) ?? null)
+          }, 50)
+        }
+        return
+      }
+      mountRetry.current = 0
       const term = new Terminal({
         // Live size from Settings → Appearance (same setting the right-pane
         // terminal tabs read, so both hosts stay in step).
@@ -528,15 +656,28 @@ export function TerminalPanel() {
         ev.preventDefault()
         return false
       })
+      // Replay everything the pty already emitted (its whole nvim frame, the
+      // shell session so far) into the fresh screen. Replayed query sequences
+      // (DA/DSR) make xterm emit their answers into the pty again — the same
+      // trade every reconnecting terminal makes; programs drop a stale reply.
+      const tail = rawTail.get(tab.id)
+      if (tail) term.write(tail.parts.join(''))
       entries.current.set(tab.id, {
         term,
         fit,
         el,
         offFont: registerTerminalScreen({ term, refit: () => fitActive(tab.id) }),
       })
-      scheduleFit()
+      // A screen built here can be mounted at ANY point relative to the panel's
+      // open animation and to the rawTail replay above, so one fit is a coin
+      // flip: measured on the signed bundle the same launch produced a 88x10 pty
+      // one run and 88x3 the next. Run the whole ladder from THIS moment, which
+      // is the only moment that is guaranteed to precede a settled geometry.
+      for (const delay of REFIT_DELAYS) {
+        window.setTimeout(() => fitActive(tab.id), delay)
+      }
     },
-    [scheduleFit],
+    [scheduleFit, fitActive],
   )
 
   // Nothing before the first open — no shells spawn just because the app booted.
@@ -636,7 +777,7 @@ export function TerminalPanel() {
           </button>
         </div>
       </header>
-      <div className="terminal-body" ref={bodyRef}>
+      <div className="terminal-body" ref={observeBody}>
         {!supported ? (
           <div className="terminal-unsupported">
             The terminal panel needs the desktop app. In the browser build, use your

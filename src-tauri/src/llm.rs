@@ -511,6 +511,17 @@ pub const HEADER_TIMEOUT_SECS_DEFAULT: u64 = 24 * 60 * 60;
 /// Override with `CODIFA_STREAM_IDLE_SECS`.
 pub const IDLE_TIMEOUT_SECS_DEFAULT: u64 = 600;
 
+/// Wait this long for a STREAMING request to flush its response headers
+/// before giving up and reporting an error. This bounds ONLY the connect+
+/// TTFB phase, never the answer: headers carry no payload, so a provider
+/// that has them ready will return them in seconds. The SSE idle guard
+/// below arms only AFTER the headers arrive, so without this ceiling a
+/// black-holed connection (sleep/wake, NAT rebinding — days of silent TCP
+/// retransmit with NO transport error) parks a headless run at "running"
+/// forever: no trace row, no log line, no timeout anywhere in the chain.
+/// Override with `CODIFA_HEADER_WAIT_SECS`.
+pub const HEADER_WAIT_SECS_DEFAULT: u64 = 60;
+
 /// Resolve the stream idle budget, allowing an env override for long-running
 /// local models that emit nothing while they compute.
 fn stream_idle_secs() -> u64 {
@@ -519,6 +530,19 @@ fn stream_idle_secs() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(IDLE_TIMEOUT_SECS_DEFAULT)
+}
+
+/// Resolve the wait for a streaming request's response HEADERS. Headers carry
+/// no answer payload, so this can be far tighter than the idle budget: a
+/// provider that accepts the request but cannot flush headers within this
+/// budget has a dead connection (sleep/wake black-hole), not a slow model.
+/// Override with `CODIFA_HEADER_WAIT_SECS`.
+fn header_wait_secs() -> u64 {
+    std::env::var("CODIFA_HEADER_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HEADER_WAIT_SECS_DEFAULT)
 }
 
 /// The process-wide provider HTTP client.
@@ -1401,6 +1425,15 @@ async fn stream_with_key(
 
     // Set only after a gateway refused `stream_options`: see the retry below.
     let mut without_stream_options: Option<Value> = None;
+    // Bound ONLY the wait for the response headers — never the answer. After a
+    // sleep/wake or a NAT rebinding a dead connection can sit in TCP
+    // retransmit for tens of minutes reporting NO error, which defeats the
+    // "the transport surfaces a dead connection instantly" assumption below;
+    // the SSE idle guard only arms AFTER `break resp`, so a headless run
+    // parked right here forever: trace silent, log silent, run row stuck at
+    // "running". A provider that cannot flush HEADERS within this budget will
+    // not answer either; the env override covers an exotic queued gateway.
+    let header_wait = std::time::Duration::from_secs(header_wait_secs());
     let resp = loop {
         let send_body = without_stream_options.as_ref().unwrap_or(body);
         let mut req = client
@@ -1410,12 +1443,18 @@ async fn stream_with_key(
         if cfg.provider == "anthropic" {
             req = req.header("anthropic-version", "2023-06-01");
         }
-        // No header deadline — see the one-shot path above. The transport
-        // reports a genuinely dead connection (TCP error) immediately; the
-        // clock never does.
         let resp = tokio::select! {
             biased;
             _ = wait_cancel(cancel) => return Err((0u16, "aborted by user".into())),
+            _ = tokio::time::sleep(header_wait) => {
+                return Err((
+                    0u16,
+                    format!(
+                        "provider sent no response headers within {}s (connection black-holed; raise CODIFA_HEADER_WAIT_SECS if your gateway is slower)",
+                        header_wait_secs()
+                    ),
+                ))
+            }
             r = req.send() => r.map_err(|e| (0u16, e.to_string()))?,
         };
         let status = resp.status().as_u16();
@@ -1579,6 +1618,67 @@ fn extract_completion(provider: &str, v: &Value) -> Result<LlmResult, (u16, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A black-holed streaming connection must FAIL AFTER THE HEADER BUDGET,
+    /// not park the caller forever: `req.send()` never resolves and reports
+    /// no error while TCP keeps retransmitting, and the SSE idle guard only
+    /// arms after headers arrive. This test serves the clock — it expects the
+    /// header-timeout error string from `stream_with_key`, proving the new
+    /// select arm fires; before the fix this request simply hung.
+    #[test]
+    fn a_stream_that_never_sends_headers_errors_within_the_header_budget() {
+        // A server that accepts the connection and then sends NOTHING.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept and hold the socket open, writing never.
+            let (_s, _keep) = listener.accept().expect("accept");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let c = cfg("custom", &format!("http://127.0.0.1:{port}"), &["k"]);
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        // Override the budget (env is the production knob): 2s budget against a
+        // server that would hold the connection 5s, so only the CLOCK can end it.
+        let prev = std::env::var("CODIFA_HEADER_WAIT_SECS").ok();
+        std::env::set_var("CODIFA_HEADER_WAIT_SECS", "2");
+        let mut silent = |_sig: StreamSignal<'_>| {};
+        let mut sink: SignalSink<'_> = &mut silent;
+        let started = std::time::Instant::now();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            stream_chat(
+                &http_client(),
+                &c,
+                &msgs,
+                None,
+                &mut sink,
+                None,
+                None,
+            )
+            .await
+            .expect_err("header timeout must produce an error")
+        });
+        // Drop the IO runtime BEFORE the timing assert: its background workers
+        // keep the accept-thread's sockets alive past the scope otherwise.
+        rt.shutdown_timeout(std::time::Duration::from_millis(200));
+        match prev {
+            Some(v) => std::env::set_var("CODIFA_HEADER_WAIT_SECS", v),
+            None => std::env::remove_var("CODIFA_HEADER_WAIT_SECS"),
+        }
+        // The clock, not the 5s hold, released us: under the hold time.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "must fail via the header budget, not after the server hold"
+        );
+        assert_eq!(err.0, 0);
+        assert!(
+            err.1.contains("no response headers"),
+            "unexpected error: {err:?}"
+        );
+    }
 
     fn cfg(provider: &str, base: &str, keys: &[&str]) -> LlmConfig {
         LlmConfig {

@@ -1384,6 +1384,9 @@ async fn compact_worker(
         compact_ctx,
         body.max_output,
         true,
+        // The manual route hands `keep` back to the renderer, which keeps the
+        // verbatim tail on the wire — the tail must stay out of the summary.
+        false,
         &mut |p: &compact::CompactProgress| send_compact_frame(tx, compact_progress_frame(p)),
     )
     .await
@@ -2058,6 +2061,7 @@ pub fn router(state: AppState) -> Router {
         .route("/schedules", post(crate::appstate::schedules_upsert))
         .route("/schedules/:id", delete(crate::appstate::schedules_delete))
         .route("/schedules/:id/run", post(crate::appstate::schedules_run))
+        .route("/schedules/:id/stop", post(crate::appstate::schedules_stop))
         .route("/schedules/:id/runs", get(crate::appstate::schedule_runs_list))
         .route("/schedules/:id/runs", delete(crate::appstate::schedule_runs_clear))
         .route("/schedule-runs", get(crate::appstate::all_schedule_runs))

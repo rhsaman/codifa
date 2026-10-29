@@ -317,6 +317,19 @@ pub fn resolve_safe(root: &str, rel: &str, allow_coder: bool, permit: Option<&Va
                     return Ok(target_canon);
                 }
             }
+            // The app's own data root (default `~/Library/Application
+            // Support/com.codifa.app`) is the SAME class of trusted home as
+            // ~/.codifa: schedules, terminal-logs and data-root.json live
+            // here. Every native read/write of them was refused as "path
+            // escapes project root" — a false round-trip on the app's OWN
+            // data (traced: mvrxj97c r36, mvscczhm r26).
+            if let Some(app_root) = crate::state::current_data_root() {
+                if let Ok(app_canon) = app_root.canonicalize() {
+                    if target_canon == app_canon || target_canon.starts_with(&app_canon) {
+                        return Ok(target_canon);
+                    }
+                }
+            }
         }
         // OS temp dirs are always accessible (background terminal logs,
         // throwaway test files). env::temp_dir() is the per-user tree on
@@ -479,8 +492,10 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
-/// The user-level data folder (CODER_DATA_DIR or ~/.codifa) — readable without
-/// a permission prompt when `allow_coder` is set.
+/// The user-level data folder (CODER_DATA_DIR or ~/.codifa) — readable AND
+/// writable without a permission prompt when `allow_coder` is set: plugins and
+/// skills LIVE here, so refusing writes burned a traced round on "path escapes
+/// project root" for every plugin/skill update.
 fn coder_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CODER_DATA_DIR") {
         if !dir.is_empty() {
@@ -516,7 +531,22 @@ enum Window {
 /// Read one window of a file (1-indexed offset, line count) with the same
 /// truncation rules as tools.py: 2MB byte cap, 2000-char line cap.
 fn file_window(abs: &Path, offset: usize, limit: usize) -> Result<Window, String> {
-    let meta = fs::metadata(abs).map_err(|e| format!("file not found: {e}"))?;
+    let meta = fs::metadata(abs).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // A guessed filename returning a bare ENOENT made the model retry
+            // blind (traced: 2 rounds on a typo'd/guessed path). Name the
+            // siblings so the retry lands first try.
+            let dir = abs.parent().map(|p| p.display().to_string()).unwrap_or_default();
+            let listing = read_window(abs.parent().unwrap_or(Path::new(".")), 0, 30)
+                .unwrap_or_else(|_| "(directory not readable)".into());
+            format!(
+                "file not found: {} (no such file)\nreal files in {dir}:\n{listing}",
+                abs.file_name().and_then(|p| p.to_str()).unwrap_or("?")
+            )
+        } else {
+            format!("file not found: {e}")
+        }
+    })?;
     if meta.len() as usize > MAX_READ_BYTES {
         return Err(format!(
             "file too large to read in one call ({} bytes > {MAX_READ_BYTES}); use offset/limit windows",
@@ -1102,7 +1132,16 @@ fn rg_binary() -> String {
     // Probed once per process: every grep used to spawn an extra `rg --version`.
     static RG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RG.get_or_init(|| {
-        const CANDIDATES: &[&str] = &["rg", "/opt/homebrew/bin/rg", "/usr/local/bin/rg"];
+        const CANDIDATES: &[&str] = &[
+            "rg",
+            "/opt/homebrew/bin/rg",
+            "/usr/local/bin/rg",
+            // The login shell's PATH (where the app-bundle PATH misses Homebrew
+            // et al.) — the same source the terminal inherits, so `grep` cannot
+            // die with ENOENT while `run_terminal` finds the same binary.
+            // Measured: a live grep failed "No such file or directory" while
+            // /opt/homebrew/bin/rg existed (mvscczhm r40).
+        ];
         for c in CANDIDATES {
             if std::process::Command::new(c)
                 .arg("--version")
@@ -1111,6 +1150,25 @@ fn rg_binary() -> String {
                 .unwrap_or(false)
             {
                 return (*c).to_string();
+            }
+        }
+        // Last resort: the merged login-shell PATH (the same source the
+        // terminal inherits), so `grep` cannot die with ENOENT while
+        // `run_terminal` finds the same binary. Measured: a live grep failed
+        // "No such file or directory" while /opt/homebrew/bin/rg existed
+        // (mvscczhm r40).
+        for dir in crate::shell_env::shell_path().split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let cand = std::path::Path::new(dir).join("rg");
+            if std::process::Command::new(&cand)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return cand.to_string_lossy().into_owned();
             }
         }
         "rg".to_string()
@@ -1498,7 +1556,9 @@ mod diff_tests {
 
 /// Overwrite a file with new content (brand-new files or full rewrites).
 pub fn write_file(root: &str, path: &str, content: &str, permit: Option<&Value>) -> Result<String, String> {
-    let target = resolve_safe(root, path, false, permit)?;
+    // `true`: ~/.codifa (plugins, skills) is the agent's own store — writing it
+    // without a popup is the same trust reading already has.
+    let target = resolve_safe(root, path, true, permit)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("cannot create parent dir: {e}"))?;
     }
@@ -1519,7 +1579,7 @@ pub fn edit_file(
     if old_string == new_string {
         return Err("old_string and new_string are identical".into());
     }
-    let target = resolve_safe(root, path, false, permit)?;
+    let target = resolve_safe(root, path, true, permit)?;
     if !target.exists() {
         return Err("file not found".into());
     }
@@ -1982,6 +2042,23 @@ pub fn dispatch_with_data_root(
                 }
             }
             if !targets.is_empty() {
+                // A batch whose top-level `filePath` names a DIRECTORY resolves
+                // each RELATIVE `ranges` entry against it. MEASURED
+                // (mvrv45fv r0+r29): `filePath=<src dir>` with
+                // `path:"secrets.rs"` fell back to the workspace root, every
+                // window died with ENOENT, and each one cost a retry round.
+                if !path.is_empty() {
+                    if let Ok(abs_dir) = resolve_safe(root, &path, true, permit) {
+                        if abs_dir.is_dir() {
+                            let base = abs_dir.to_string_lossy().trim_end_matches('/').to_string();
+                            for t in targets.iter_mut() {
+                                if !t.0.starts_with('/') && !t.0.starts_with('~') && !t.0.is_empty() {
+                                    t.0 = format!("{base}/{}", t.0);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Overlapping windows of one file collapse into their union
                 // (see `merge_read_targets`) before a single byte is read, so
                 // the model never pays twice for lines it asked for once.
@@ -2132,7 +2209,9 @@ into one union — those lines are all above; do NOT re-read them]"
                 if edits.is_empty() {
                     return Err("edits must be a non-empty list".into());
                 }
-                let target = resolve_safe(root, &path, false, permit)?;
+                // `true`: plugin trees live under ~/.codifa — traced batch edits
+                // there died on "path escapes project root".
+                let target = resolve_safe(root, &path, true, permit)?;
                 // Same size guard as the single-edit path below. Without it the
                 // batch form read (and then copied 1-2 more times via
                 // replace/replacen) an arbitrarily large file — a multi-GB

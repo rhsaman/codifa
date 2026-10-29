@@ -35,6 +35,11 @@ import {
 
 export type LocalLiveState = 'idle' | 'connecting' | 'live' | 'speaking' | 'closed' | 'error';
 
+/** Fire the full-clip decode this long after the last voiced frame: the turn is
+ *  then PROBABLY over, so its server round-trip overlaps the remaining pause.
+ *  If speech returns the stale result is discarded (fuller-wins at delivery). */
+const SPECULATIVE_DECODE_MS = 350;
+
 export interface LocalLiveOptions {
   deviceId?: string;
   /**
@@ -106,17 +111,21 @@ export const LOCAL_LIVE_DEFAULTS = {
   // clicks and background noise from starting turns.
   levelThreshold: 0.008,
   frameMs: 100,
-  // Chunk cadence. Short clips are exactly where non-streaming ASR fails: at
-  // 700 ms a Persian chunk is two or three words, and the model has to guess
-  // word endings and the identity of any word whose beginning was cut off — so
-  // live voice "transcribed wrong" while dictation (one long clip) was fine.
-  // The per-request cost is NOT proportional to the clip: Whisper always runs
-  // its 30 s mel window, so the local server (medium, CPU) pays a fixed
-  // ~2.2 s encoder cost per request. At 1.4 s the CPU model spent more compute
-  // than the speech produced (rtf ≈ 1.9, benchmarked) and the chunk queue fell
-  // seconds behind instead of streaming; 2.8 s halves the per-second overhead
-  // so partials keep up with speech. Remote providers run at rtf ≪ 1 anyway.
-  chunkMs: 2800,
+  // Chunk cadence. Chunks are only PREVIEWS now: the delivered text comes from
+  // the single-clip decode at turn end (see transcribeWholeTurn). With the
+  // whisper.cpp/Metal backend (rtf ≪ 1) a 1.6 s chunk keeps the preview
+  // visibly current; the old 2800 ms was tuned for the CPU medium model where
+  // per-request encoder overhead dominated and short chunks fell behind.
+  //
+  // ARCHITECTURE DECISION — one model for previews AND final decode. A
+  // two-model split (small fast model for chunks + accurate model for the
+  // final clip) was evaluated and rejected: it doubles resident RAM (against
+  // the WHISPER_IDLE_TTL unload contract), needs a second model download,
+  // and Metal turbo decodes a 1.6 s preview well under the chunk interval —
+  // a second model cannot buy latency the first one has not already spent.
+  // The default model (whisper-1 when unset) is server-side; benchmark real
+  // candidates with CODIFA_STT_DEBUG=1 before changing it.
+  chunkMs: 1600,
   /**
    * Audio kept before the detected onset so the first word is intact.
    *
@@ -172,6 +181,19 @@ export function computeRms(frame: ArrayLike<number>): number {
 /** True when the frame level counts as speech. */
 export function isSpeechLevel(rms: number, threshold: number = LOCAL_LIVE_DEFAULTS.levelThreshold): boolean {
   return rms >= threshold;
+}
+
+/**
+ * Open-turn hangover: whether an OPEN turn should STAY open on this frame.
+ * Uses a LOWER bar than the onset gate (hysteresis) so Persian fricatives
+ * (س، ش، ف) and soft word gaps — low-energy but still voiced — pre-roll the
+ * turn across short pauses instead of closing mid-word and orphaning the
+ * sentence tail. Noise floor tracking still dominates true silence, and the
+ * 800 ms `silenceMs` timer is what actually ends the turn.
+ */
+export const SPEECH_HANGOVER_RATIO = 0.5;
+export function isSpeechHangover(rms: number, threshold: number): boolean {
+  return rms >= threshold * SPEECH_HANGOVER_RATIO;
 }
 
 /**
@@ -630,6 +652,18 @@ export class LocalLiveSession {
   /** True once the turn outgrew one ASR window: its audio is incomplete, so the
    *  single-clip decode must not be used (it would drop the last words). */
   private turnAudioTruncated = false;
+  /** Speculative full-clip decode started ~350 ms into a pause, so its
+   *  server round-trip overlaps the rest of the silence gap. Consumed at
+   *  finishTurn (same turn token only); a snapshot, so the buffer it read is
+   *  NOT consumed and the 350→800 ms tail still reaches the chunk previews. */
+  private specWholeP: Promise<string> | null = null;
+  private specToken = -1;
+  /** DICTATE: transcripts of earlier full windows for utterances longer than
+   *  one ASR window (see fireCheckpoint). Prependied to the final decode. */
+  private dictateWholePrefix = '';
+  /** SERIALises the checkpoint decodes and lets the final whole-clip decode
+   *  wait for every pending checkpoint before reading the prefix. */
+  private checkpointP: Promise<void> | null = null;
   /** Applies chunk results in order (merging is order-sensitive). */
   private chain: Promise<void> = Promise.resolve();
   /** Chunk requests actually running right now (bounded by maxInflight). */
@@ -952,7 +986,14 @@ export class LocalLiveSession {
       if (this.turnAudioLen < cap) {
         this.turnAudio.push(frame);
         this.turnAudioLen += frame.length;
-        if (this.turnAudioLen > cap) this.turnAudioTruncated = true;
+        if (this.turnAudioLen > cap) {
+          // DICTATE: at the window boundary decode the buffered window as a
+          // CHECKPOINT and let the buffer restart empty — a long dictation is
+          // then fully covered (each 30 s window decoded in order) instead of
+          // silently degrading to the chunk previews past 30 s.
+          if (this.dictate) this.fireCheckpoint();
+          else this.turnAudioTruncated = true;
+        }
       } else {
         this.turnAudioTruncated = true;
       }
@@ -1040,6 +1081,10 @@ export class LocalLiveSession {
     this.turnAudio = [];
     this.turnAudioLen = 0;
     this.turnAudioTruncated = false;
+    this.specWholeP = null;
+    this.specToken = -1;
+    this.dictateWholePrefix = '';
+    this.checkpointP = null;
     if (this.captureNode) {
       try {
         if ('port' in this.captureNode) {
@@ -1171,24 +1216,38 @@ export class LocalLiveSession {
    * delivered; the chunk transcript stays only as a fallback for a turn too
    * long for a single window, or for a failed request.
    */
-  private async transcribeWholeTurn(token: number): Promise<string> {
+  private async transcribeWholeTurn(): Promise<string> {
     // A turn that outgrew the ASR window cannot be decoded in one request, and
     // the buffered audio would be missing its tail — take nothing and let the
-    // chunk transcript stand.
+    // chunk transcript stand. (DICTATE never truncates: fireCheckpoint recycles
+    // the window, so only live voice lands here.)
     if (this.turnAudioTruncated) {
       this.takeTurnAudio();
       return '';
     }
+    // Checkpoints of earlier windows decode out of band; their text is part of
+    // the delivery, so wait for them before reading the prefix.
+    if (this.checkpointP) {
+      try {
+        await this.checkpointP;
+      } catch {
+        // The checkpoint chain never rejects; keep going with what landed.
+      }
+    }
     const samples = this.takeTurnAudio();
     if (samples.length === 0) return '';
-    const wav = this.encodeTurnAudio(samples);
+    const wav = this.encodeSamples(samples);
     if (!wav) return '';
     const lang = this.options.lang ?? 'fa';
     const prompt = buildSttPrompt(lang, this.options.prompt);
-    const raw = await this.requestChunk(wav, lang, prompt, token, true);
+    const raw = await this.requestChunk(wav, lang, prompt, true);
     // Same cleanup as a chunk: an error page or a prompt echo must never be
     // delivered as the user's words.
-    return stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+    const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+    // Prepend the earlier windows' checkpoint text: the final window decode
+    // never saw that audio.
+    const base = this.dictateWholePrefix.trim();
+    return base && clean ? `${base} ${clean}` : base || clean;
   }
 
   /** Copy the turn's audio out and reset the buffer for the next turn. */
@@ -1201,13 +1260,58 @@ export class LocalLiveSession {
   }
 
   /** Turn audio → the same 16 kHz mono WAV dictate sends. Null when unusable. */
-  private encodeTurnAudio(samples: Float32Array): Blob | null {
+  private encodeSamples(samples: Float32Array): Blob | null {
     const resampled = downsampleFloat32(samples, this.captureRate, STT_SAMPLE_RATE);
     const trimmed = trimSilence(resampled, STT_SAMPLE_RATE);
     if (trimmed.speechMs < MIN_CHUNK_SPEECH_MS) return null;
     const wav = encodeWavPcm16(normalizePeak(trimmed.pcm), STT_SAMPLE_RATE);
     if (wav.size <= 44) return null;
     return wav;
+  }
+
+  /**
+   * DICTATE: decode one full window and accumulate it into `dictateWholePrefix`.
+   * Fired the moment the turn buffer reaches the ASR window cap, from the
+   * capture callback; runs detached and serialized through `checkpointP` so the
+   * final decode (transcribeWholeTurn) can await every pending checkpoint.
+   */
+  private fireCheckpoint(): void {
+    const samples = this.takeTurnAudio();
+    if (samples.length === 0) return;
+    const lang = this.options.lang ?? 'fa';
+    const prompt = buildSttPrompt(lang, this.options.prompt);
+    const run = async (): Promise<void> => {
+      try {
+        if (this.stopped) return;
+        const wav = this.encodeSamples(samples);
+        if (!wav) return;
+        const raw = await this.requestChunk(wav, lang, prompt);
+        const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+        if (clean && !isHallucinatedTranscript(clean, lang)) {
+          this.dictateWholePrefix = mergeTranscripts(this.dictateWholePrefix, clean, { headSilent: true });
+        }
+      } catch {
+        // A failed checkpoint degrades to the chunk previews for that window;
+        // it must never break capture.
+      }
+    };
+    this.checkpointP = (this.checkpointP ?? Promise.resolve()).then(run, run);
+  }
+
+  /**
+   * Speculative, NON-DESTRUCTIVE full-clip decode of the current turn buffer.
+   * Same cleanup as transcribeWholeTurn; never consumes `turnAudio`, so speech
+   * that returns after the fire keeps buffering normally.
+   */
+  private async transcribeSnapshot(): Promise<string> {
+    if (this.turnAudioTruncated || this.turnAudioLen === 0) return '';
+    const samples = concatFloat32(this.turnAudio);
+    const wav = this.encodeSamples(samples);
+    if (!wav) return '';
+    const lang = this.options.lang ?? 'fa';
+    const prompt = buildSttPrompt(lang, this.options.prompt);
+    const raw = await this.requestChunk(wav, lang, prompt, true);
+    return stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
   }
 
   private startMonitor(): void {
@@ -1252,7 +1356,12 @@ export class LocalLiveSession {
         this.ttsSpeaking,
       );
       const now = Date.now();
-      const speech = isSpeechLevel(rms, adaptive);
+      // Hysteresis: once a turn is OPEN the frame bar drops to 0.5x, so
+      // fricatives and word gaps keep the turn alive — see isSpeechHangover.
+      const speech =
+        this.hasSpeech && !this.dictate
+          ? isSpeechHangover(rms, adaptive)
+          : isSpeechLevel(rms, adaptive);
       if (!speech) {
         speechStreak = 0;
         if (!this.hasSpeech) return;
@@ -1266,6 +1375,20 @@ export class LocalLiveSession {
         if (shouldEndTurn(now - this.lastSpeechAt, silenceMs)) {
           void this.finishTurn();
           return;
+        }
+        // Speculative decode: ~350 ms into a pause the turn is PROBABLY over —
+        // fire the full-clip request now so its round-trip overlaps the rest of
+        // the silence gap and finishTurn finds the text already arriving. The
+        // snapshot is non-destructive: if speech returns the turn keeps
+        // buffering, the stale result is discarded (fuller-wins at delivery),
+        // and the tail audio still reaches the chunk previews.
+        if (
+          this.specWholeP === null &&
+          !this.transcribing &&
+          now - this.lastSpeechAt >= SPECULATIVE_DECODE_MS
+        ) {
+          this.specToken = this.turnToken;
+          this.specWholeP = this.transcribeSnapshot();
         }
         // A short pause keeps the turn open: keep cutting chunks so the tail
         // is already transcribed by the time the user really stops.
@@ -1326,6 +1449,11 @@ export class LocalLiveSession {
     // it may still be draining towards delivery, and its holder is what
     // finishTurn() reads.
     this.turn = { token: this.turnToken, text: '' };
+    // A new turn invalidates any speculative decode of the previous one: drop
+    // it (the request may still be in flight — its result is simply discarded).
+    this.specWholeP = null;
+    this.specToken = -1;
+    this.dictateWholePrefix = '';
     this.speechStartAt = now;
     this.lastSpeechAt = now;
     this.lastFlushAt = now;
@@ -1374,7 +1502,6 @@ export class LocalLiveSession {
     // is actually sent, not from a quiet tail that would let the words clip.
     const wav = encodeWavPcm16(normalizePeak(trimmed.pcm), STT_SAMPLE_RATE);
     if (wav.size <= 44) return;
-    const token = this.turnToken;
     const owner = this.turn;
     const lang = this.options.lang ?? 'fa';
     this.pending++;
@@ -1389,7 +1516,7 @@ export class LocalLiveSession {
     // (bounded by maxInflight). Awaiting the previous chunk's round-trip before
     // even sending the next one is what put the partial transcript seconds
     // behind the voice. Only the MERGE stays ordered, below.
-    const request = this.requestChunk(wav, lang, prompt, owner.token);
+    const request = this.requestChunk(wav, lang, prompt);
     this.chain = this.chain
       .then(async () => {
         const raw = await request;
@@ -1422,12 +1549,12 @@ export class LocalLiveSession {
       });
   }
 
-  /** Run one chunk request once a slot is free. Failures yield ''. */
+  /** Run one chunk request once a slot is free. Failures yield '' — the
+   *  turn text decides between whole-clip and preview; never throws. */
   private async requestChunk(
     wav: Blob,
     lang: string,
     prompt: string,
-    token: number,
     skipSlot = false,
   ): Promise<string> {
     // The full-clip decode is the request that produces the delivered text, so
@@ -1512,11 +1639,31 @@ export class LocalLiveSession {
       // Fire the single-clip decode FIRST so it runs in parallel with the
       // chunk drain below: the turn then costs no extra latency compared with
       // delivering the preview, but its text is as accurate as dictation.
-      const wholeP = this.transcribeWholeTurn(token);
+      // Read BEFORE the call: transcribeWholeTurn consumes the turn buffer.
+      const wholeUsable = !this.turnAudioTruncated && this.turnAudioLen > 0;
+      // Reuse the speculative decode fired ~350 ms into the pause when it is
+      // still valid (same turn): its round-trip already started, so the turn
+      // lands without paying upload+encode again. Otherwise decode the buffered
+      // clip now — the destructive path that also consumes the tail audio.
+      let wholeP: Promise<string>;
+      if (this.specWholeP && this.specToken === token) {
+        wholeP = this.specWholeP;
+      } else {
+        wholeP = this.transcribeWholeTurn();
+      }
+      this.specWholeP = null;
+      this.specToken = -1;
       const headSilent = this.boundarySilent;
       const rest = this.takePcm(0);
       const minSamples = Math.floor((this.captureRate * 200) / 1000);
-      if (rest.length >= minSamples) this.queueChunk(rest, headSilent);
+      // The tail chunk is only a FALLBACK when the single-clip decode can cover
+      // the turn: for a short utterance no chunk was cut yet, so `rest` is the
+      // same audio the full decode already carries — sending both doubled the
+      // requests (and the provider load) for the most common live turn.
+      const queueTail = () => {
+        if (rest.length >= minSamples) this.queueChunk(rest, headSilent);
+      };
+      if (!wholeUsable) queueTail();
       // Wait for every queued chunk, but with a hard cap: a slow provider must
       // only delay the turn, never hang live voice. Whatever arrived by then is
       // merged into the owning turn and delivered as the turn. The cap is the
@@ -1524,9 +1671,28 @@ export class LocalLiveSession {
       // delivery stays inside one bound.
       const budgetLeft = () =>
         Math.max(0, LOCAL_LIVE_DEFAULTS.turnDeliverBudgetMs - (Date.now() - startedAt));
-      await this.waitForDrain(
-        Math.min(LOCAL_LIVE_DEFAULTS.drainTimeoutMs, budgetLeft()),
-      );
+      let whole = '';
+      let wholeTimer: ReturnType<typeof setTimeout> | undefined;
+      if (wholeUsable) {
+        // The full-clip decode is what gets delivered, so wait for IT first:
+        // draining the preview queue before looking at it delayed the turn
+        // whenever the previews were backed up.
+        whole = await Promise.race([
+          wholeP,
+          new Promise<string>((resolve) => {
+            wholeTimer = setTimeout(() => resolve(''), budgetLeft());
+          }),
+        ]);
+        if (wholeTimer) clearTimeout(wholeTimer);
+        if (!whole.trim()) queueTail();
+      }
+      // Drain the previews only when they can still matter: no usable full
+      // decode (too long / failed / empty).
+      if (!whole.trim()) {
+        await this.waitForDrain(
+          Math.min(LOCAL_LIVE_DEFAULTS.drainTimeoutMs, budgetLeft()),
+        );
+      }
       // Read from the turn we started with, NOT the shared current one. If the
       // user began speaking again during the drain a new turn already owns the
       // session, and gating delivery on the token here discarded the utterance
@@ -1534,15 +1700,15 @@ export class LocalLiveSession {
       // Prefer the full-clip decode; fall back to the preview when it failed,
       // timed out, or the utterance was too long for one window. The wait is
       // capped so a slow provider can never hang the turn.
-      let whole = '';
-      let wholeTimer: ReturnType<typeof setTimeout> | undefined;
-      whole = await Promise.race([
-        wholeP,
-        new Promise<string>((resolve) => {
-          wholeTimer = setTimeout(() => resolve(''), budgetLeft());
-        }),
-      ]);
-      if (wholeTimer) clearTimeout(wholeTimer);
+      if (!wholeUsable) {
+        whole = await Promise.race([
+          wholeP,
+          new Promise<string>((resolve) => {
+            wholeTimer = setTimeout(() => resolve(''), budgetLeft());
+          }),
+        ]);
+        if (wholeTimer) clearTimeout(wholeTimer);
+      }
       // The FULLER text wins, not "whole blindly": the turn buffer is capped
       // at ONE ASR window (wholeTurnMaxMs) and a single-clip decode can come
       // back with only the tail of a long utterance — the chunk merge then

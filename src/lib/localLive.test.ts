@@ -20,6 +20,7 @@ function check(name: string, cond: boolean, extra?: unknown) {
 const {
   computeRms,
   isSpeechLevel,
+  isSpeechHangover,
   shouldEndTurn,
   isLocalTranscriptJunk,
   sanitizeLocalTranscript,
@@ -124,6 +125,15 @@ console.log('1) VAD helpers:')
   check('speech over a noisy room is detected', isSpeechLevel(0.09, speechThreshold(loud)))
   check('steady noisy-room hum never opens the gate', !isSpeechLevel(0.03, speechThreshold(loud)))
   check('a silent room keeps the absolute minimum gate', updateNoiseFloor(0, 0) === NOISE_FLOOR_MIN)
+  // Hysteresis: an OPEN turn must survive fricatives and word gaps whose RMS
+  // sits between 0.5x and 1x the onset gate — the exact frames where the old
+  // single-threshold VAD closed mid-word (the "پاک شدن متن بعد مکث" bug).
+  const hystereisGate = 0.02
+  check(
+    'hangover keeps the turn open at half the gate',
+    isSpeechHangover(0.011, hystereisGate) && !isSpeechLevel(0.011, hystereisGate),
+  )
+  check('hangover still yields to true silence', !isSpeechHangover(0.005, hystereisGate))
   check(
     'one loud frame cannot spike the floor and close the gate',
     updateNoiseFloor(0.006, 0.4) < 0.02,

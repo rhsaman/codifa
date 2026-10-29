@@ -400,7 +400,7 @@ pub fn terminal_create(
                     // WHOLE sequence.
                     let safe = emit_safe_len(&pending[..emit_len]);
                     if safe > 0 {
-                        let cleaned = sanitize_colon_sgr(&pending[..safe]);
+                        let cleaned = sanitize_colon_sgr(&strip_decrqm(&pending[..safe]));
                         pending.drain(..safe);
                         let data = String::from_utf8_lossy(&cleaned).into_owned();
                         let _ = reader_app.emit("terminal:data", (reader_id.clone(), data));
@@ -462,6 +462,43 @@ fn emit_safe_len(data: &[u8]) -> usize {
         }
     }
     data.len()
+}
+
+/// Remove DECRQM requests (`CSI ? <params> $ p` — request DEC private mode)
+/// from a pty byte chunk. Programs like nvim ≥ 0.11 ask the emulator about
+/// synchronized output and friends during startup; xterm.js 6.0.0's parser
+/// DEADLOCKS the whole write queue on them inside WKWebView (the identical
+/// byte stream parses fine under V8/Node, bisected per-sequence). The queries
+/// are pure feature probes — dropping them makes the program take the
+/// not-supported path, which is exactly how a terminal without those modes
+/// behaves. Everything else (DA1, DSR, OSC 11) still reaches xterm and is
+/// answered there, so no startup wait/E1568 remains. `emit_safe_len` above
+/// guarantees a chunk never ends mid-CSI, so every `$p` seen here is complete.
+fn strip_decrqm(data: &[u8]) -> Vec<u8> {
+    // Fast path: no DEC intermediate ('$' = 0x24) means nothing to strip.
+    if !data.contains(&0x24) {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        // Candidate CSI: ESC [ ... private/params ... intermediate '$' final 'p'.
+        // '$' (0x24) IS in the parameter/intermediate scan range, so the scan
+        // stops on the FINAL byte ('p'); the '$' is the byte before it.
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < data.len() && (0x20..=0x3f).contains(&data[j]) {
+                j += 1;
+            }
+            if j < data.len() && data[j] == b'p' && j >= i + 3 && data[j - 1] == 0x24 {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Rewrite iTerm2-style colon SGR truecolour into the semicolon form xterm.js
@@ -625,6 +662,30 @@ pub fn kill_all_terminal_sessions(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decrqm_probes_are_stripped() {
+        // nvim 0.11's startup feature probes — the exact set that deadlocks
+        // xterm.js 6 inside WKWebView. Each must vanish entirely.
+        assert_eq!(strip_decrqm(b"\x1b[?69$p\x1b[?2026$p"), Vec::<u8>::new());
+        let nvim = b"\x1b[?1049h\x1b[?69$p\x1b[?2026$p\x1b[?2048$p\x1b[c";
+        assert_eq!(
+            strip_decrqm(nvim),
+            b"\x1b[?1049h\x1b[c".to_vec(),
+            "surrounding sequences survive"
+        );
+        // A query split across chunks never reaches here (emit_safe_len holds
+        // a trailing partial CSI back), but a COMPLETE non-DECRQM CSI with a
+        // '$' elsewhere in the chunk must pass through untouched.
+        assert_eq!(strip_decrqm(b"\x1b[4:3mok"), b"\x1b[4:3mok".to_vec());
+        assert_eq!(strip_decrqm(b"a$b c"), b"a$b c".to_vec());
+        // DECRPM-style requests without the '?' private marker are still
+        // DECRQM (ANSI modes) and deadlock xterm the same way.
+        assert_eq!(strip_decrqm(b"\x1b[4$p"), Vec::<u8>::new());
+        // An unfinished candidate at the chunk end is left alone (it cannot be
+        // complete — emit_safe_len would have held it — but never eat bytes).
+        assert_eq!(strip_decrqm(b"\x1b[?2048$"), b"\x1b[?2048$".to_vec());
+    }
 
     #[test]
     fn colon_truecolor_sgr_is_rewritten_to_semicolons() {

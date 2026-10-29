@@ -927,7 +927,7 @@ rust, python, node, bash"
         ));
     }
 
-    let args: Vec<String> = body["args"]
+    let mut args: Vec<String> = body["args"]
         .as_array()
         .map(|items| {
             items
@@ -936,6 +936,12 @@ rust, python, node, bash"
                 .collect()
         })
         .unwrap_or_default();
+    // Models often repeat the script's own name as the first argument (seen on
+    // every call of a scheduled run), and the script then reads it as DATA: a
+    // topic became "generate-article <topic>". The name is never an argument.
+    if args.first().map(|a| a.trim()) == Some(name.as_str()) {
+        args.remove(0);
+    }
     let timeout = body["timeout"]
         .as_u64()
         .filter(|t| *t > 0)
@@ -982,16 +988,25 @@ rust, python, node, bash"
 
     // Secrets come from the bundle's own `.env` (see `load_plugin_env`): they
     // are prefixed as shell assignments BEFORE our PATH assignment, so a plugin
-    // may shadow any variable it needs while PATH stays ours.
-    let env_prefix = load_plugin_env(&plugin_dir(root, &plugin))
-        .into_iter()
-        .map(|(k, v)| format!("{k}={}", sh_quote(&v)))
-        .collect::<String>();
-    let mut command = format!(
-        "PATH={} {env_prefix}{}",
-        sh_quote(&crate::shell_env::shell_path()),
-        sh_quote(&program)
-    );
+    // may shadow any variable it needs while PATH stays ours (the LAST
+    // duplicate assignment wins).
+    //
+    // Every piece — each KEY=VALUE, our PATH and the program path — is quoted
+    // SEPARATELY and joined with explicit spaces. The old concatenation glued
+    // them into ONE word, so `sh` saw a single never-found command and the
+    // args became its arguments: every run of a bundle with a .env died with
+    // exit 127 "command not found".
+    let mut command = String::new();
+    for (k, v) in load_plugin_env(&plugin_dir(root, &plugin)) {
+        command.push_str(&format!("{k}={}", sh_quote(&v)));
+        command.push(' ');
+    }
+    command.push_str(&format!(
+        "PATH={}",
+        sh_quote(&crate::shell_env::shell_path())
+    ));
+    command.push(' ');
+    command.push_str(&sh_quote(&program));
     // An interpreter needs the FILE as its own first argument. The Rust branch's
     // `program` is the compiled binary, which is self-contained — passing the
     // source to it would only be read as an argument.
@@ -2577,6 +2592,40 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         tmp
+    }
+
+    #[test]
+    fn a_script_runs_with_env_and_args_instead_of_exit_127() {
+        // The reported bug: env pairs, PATH and the program path were glued
+        // into ONE shell word, so any bundle with a .env made `sh` see a
+        // single never-found command and the args became its arguments —
+        // every run died with exit 127 "command not found".
+        let root = temp_root("script-env");
+        fs::create_dir_all(root.join("plugins/mylib/scripts/echo")).unwrap();
+        fs::write(
+            root.join("plugins/mylib/plugin.json"),
+            json!({"name": "mylib"}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.join("plugins/mylib/.env"), "GREETING=hello plugin").unwrap();
+        fs::write(
+            root.join("plugins/mylib/scripts/echo/script.json"),
+            json!({"name": "echo", "language": "bash"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("plugins/mylib/scripts/echo/main.sh"),
+            "printf '%s|%s' \"$GREETING\" \"$1\"",
+        )
+        .unwrap();
+
+        let out = run_plugin_script(
+            &root,
+            &json!({"slug": "mylib", "name": "echo", "args": ["world"]}),
+        )
+        .expect("the script must run once env/PATH/program are separate words");
+        assert_eq!(out["output"], json!("hello plugin|world"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

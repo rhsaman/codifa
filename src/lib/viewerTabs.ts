@@ -10,10 +10,12 @@ import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, colle
 export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'terminal'
 
 /** Kinds that belong to ONE chat: their rail icon follows the focused chat.
- *  Only Trace and Browser remain chat-owned — everything else is scoped to
- *  the focused chat's WORKSPACE (or global), so switching chats inside one
- *  workspace never rearranges the rail. */
-const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser'])
+ *  Trace/Browser are session surfaces of one run; Plan (the saved plan.md of
+ *  `plan/<ws>/<chat>/plan`) is a PER-CHAT document — the disk path is keyed by
+ *  chat id, so a workspace-level tab would leak chat A's plan into chat B.
+ *  Everything else is scoped to the focused chat's WORKSPACE (or global), so
+ *  switching chats inside one workspace never rearranges the rail. */
+const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser', 'plan'])
 
 /** Kinds scoped to the WORKSPACE of the focused chat: one tab per workspace
  *  (`<kind>:<wsKey>`), shared by every chat of that workspace. File tabs add
@@ -1038,11 +1040,13 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
     }),
   openPlan: (chatId) =>
     set((s) => {
-      // One plan tab per WORKSPACE: opening it from another chat of the same
-      // workspace retargets the tab (owner chat + scope) in place.
+      // One plan tab per CHAT (`plan:<chatId>`): the plan document is stored
+      // per chat on disk (plan/<ws>/<chat>/plan.md), so sharing one tab across
+      // a workspace made chat A's plan leak into chat B. Reopening the SAME
+      // chat's plan focuses it instead of duplicating.
       const cid = chatId ?? currentChatId()
       const wsKey = workspaceKeyForChat(cid || undefined)
-      const id = viewerTabId('plan', wsKey)
+      const id = viewerTabId('plan', cid)
       const entry: ViewerTab = {
         id,
         kind: 'plan',
@@ -1718,7 +1722,7 @@ registerChatDeleteHook((chatId) => {
 // and the chat index hydrates ASYNC, after this module's loadPersisted ran.
 // The first store update that carries chats re-keys every workspace-scoped tab
 // to its chat's workspace (`<kind>:<wsKey>`), so two chats of one workspace
-// share ONE Git/plan/file tab instead of stacking per-chat duplicates the
+// share ONE Git/file tab instead of stacking per-chat duplicates the
 // visibility filter can no longer tell apart. Runs at most once.
 let scopesMigrated = false
 let unsubScopeMigration: (() => void) | null = null
@@ -1738,6 +1742,18 @@ function migrateTabScopes(): void {
   const seen = new Set<string>()
   const remap = new Map<string, string>()
   const migrate = (tab: ViewerTab): ViewerTab => {
+    // A plan tab persisted by the OLD workspace scoping (`plan:<wsKey>`)
+    // re-keys onto its owner chat: the plan document on disk lives per chat,
+    // so the tab id must be too. Chat-keyed ids (the new format) recompute
+    // to themselves and return untouched.
+    if (tab.kind === 'plan' && tab.chatId) {
+      const id = viewerTabId('plan', tab.chatId)
+      if (id === tab.id) return tab
+      changed = true
+      remap.set(tab.id, id)
+      if (activeId === tab.id) activeId = id
+      return { ...tab, id }
+    }
     if (!WORKSPACE_SCOPED_KINDS.has(tab.kind) || tab.wsKey) return tab
     // A pre-workspace GLOBAL file tab (no owner chat) stays global.
     if (tab.kind === 'file' && !tab.chatId) return tab

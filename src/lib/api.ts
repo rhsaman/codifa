@@ -2289,6 +2289,23 @@ export async function runScheduleNow(id: string): Promise<{ ok: true; run_id?: s
   }
 }
 
+/** توقف اجرای در حال کار یک تسک؛ اجرا با خطای «stopped by user» بسته می‌شود. */
+export async function stopScheduleRun(id: string): Promise<{ ok: true; stopped: number } | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: "the local backend is not ready" }
+  try {
+    const res = await fetch(`${url}/schedules/${encodeURIComponent(id)}/stop`, { method: "POST" })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { detail?: string }
+      return { error: body.detail || `stop failed (${res.status})` }
+    }
+    const body = (await res.json().catch(() => ({}))) as { stopped?: number }
+    return { ok: true, stopped: typeof body.stopped === "number" ? body.stopped : 0 }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** تاریخچه اجراهای یک تسک (جدیدترین اول). */
 export async function listScheduleRuns(
   id: string,

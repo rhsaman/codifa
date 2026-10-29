@@ -1612,7 +1612,28 @@ pub fn hover(root: &str, file_path: &str, line: i64, character: i64) -> Result<S
 
 /// lsp_symbols: document symbols sorted by line, optional substring filter.
 pub fn symbols(root: &str, file_path: &str, query: &str) -> Result<String, String> {
-    let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
+    let abs = match PathBuf::from(resolve_safe(root, file_path, true, None)?) {
+        p if p.exists() => p,
+        _ => {
+            // A hallucinated/guessed filename died as a bare ENOENT and the
+            // follow-up grep burned a whole round (traced mvs53lu5 r52). Name
+            // the real siblings instead so the retry lands first try.
+            let dir = std::path::Path::new(file_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or(".");
+            let name = std::path::Path::new(file_path)
+                .file_name()
+                .and_then(|p| p.to_str())
+                .unwrap_or(file_path);
+            if let Ok(listing) = crate::tools::read_window(std::path::Path::new(&format!("{root}/{dir}")), 0, 40) {
+                return Ok(format!(
+                    "file not found: {name} — real files in {dir}:\n{listing}"
+                ));
+            }
+            return Ok(format!("file not found: {file_path}"));
+        }
+    };
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;

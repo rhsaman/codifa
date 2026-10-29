@@ -10,19 +10,19 @@
 //! agent's background command needs no input, only the combined output of a
 //! plain pipe, which `tail` can read back from the log.
 
-use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One agent background terminal as the renderer sees it. `running` decides
 /// whether the panel lists it; an exited row is kept briefly so the exit code
 /// survives at least one poll, then pruned.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTerminalInfo {
     pub id: String,
     pub chat_id: String,
@@ -69,6 +69,83 @@ fn log_dir() -> PathBuf {
     crate::state::current_data_root()
         .unwrap_or_else(std::env::temp_dir)
         .join("terminal-logs")
+}
+
+/// One row file per terminal, next to its log: `<data root>/terminal-logs/<id>.json`.
+///
+/// The live map (with the `Child` handles) is per-process — but the user runs
+/// several app instances side by side (a release bundle next to a dev build),
+/// and a panel in ANY of them must list — and be able to stop — a terminal
+/// that any of them spawned. So every row is mirrored to the shared data root:
+/// the owning instance's watcher keeps its file's `running`/`exit_code` fresh,
+/// while every other instance merges the file in and judges liveness by
+/// probing the pid. The guard keeps ids (which arrive from HTTP) from naming
+/// paths outside this directory.
+fn row_file(id: &str) -> Option<PathBuf> {
+    if !id.starts_with("bg-") || id.contains(['/', '\\', '.']) {
+        return None;
+    }
+    Some(log_dir().join(format!("{id}.json")))
+}
+
+/// Persist one row (atomic rename so a concurrent `list` never reads half a
+/// file); a row that cannot be serialized is a bug upstream, not worth
+/// failing a spawn over.
+fn write_row_file(info: &AgentTerminalInfo) {
+    let Some(path) = row_file(&info.id) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(info) {
+        if fs::write(&tmp, &bytes).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Read every row file on disk, ignoring malformed or half-written ones.
+fn disk_rows() -> Vec<AgentTerminalInfo> {
+    let Ok(entries) = fs::read_dir(log_dir()) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(info) = serde_json::from_slice::<AgentTerminalInfo>(&bytes) {
+                rows.push(info);
+            }
+        }
+    }
+    rows
+}
+
+/// Is a foreign row's pid still alive? `kill(pid, 0)` succeeds for a live
+/// process we can signal; EPERM also means alive (owned by another user).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Row files of terminals that exited over a day ago are deleted on the next
+/// spawn — panels only ever list running rows, so this just stops the folder
+/// from growing forever.
+fn prune_disk_rows() {
+    let cutoff = crate::state::now_ms() as u64 - 24 * 60 * 60 * 1000;
+    for info in disk_rows() {
+        if !info.running && info.started_at_ms < cutoff {
+            if let Some(path) = row_file(&info.id) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
 
 /// Spawn `command` in `root` detached, append its output to a fresh log, and
@@ -128,30 +205,43 @@ pub fn spawn(root: &str, chat_id: &str, command: &str) -> Result<AgentTerminalIn
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), AgentTerminalRow { info: info.clone(), child: Some(child) });
 
+    // Publish to the SHARED data root so panels of other app instances list —
+    // and can stop — this terminal too; the in-memory registry is per-process.
+    write_row_file(&info);
+    prune_disk_rows();
+
     // Watcher: reap the exit whenever it comes (the turn that started this
     // terminal has long moved on by then). try_wait under the short lock —
     // never a blocking wait, or a stop would stall behind it.
     let watch_id = id;
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(500));
-        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(row) = reg.get_mut(&watch_id) else { return };
-        let Some(child) = row.child.as_mut() else { return };
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                row.info.running = false;
-                row.info.exit_code = status.code();
-                // The child is reaped; drop the handle.
-                row.child = None;
-                return;
+        let done = {
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(row) = reg.get_mut(&watch_id) else { return };
+            let Some(child) = row.child.as_mut() else { return };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    row.info.running = false;
+                    row.info.exit_code = status.code();
+                    // The child is reaped; drop the handle.
+                    row.child = None;
+                    Some(row.info.clone())
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    row.info.running = false;
+                    row.info.exit_code = Some(-1);
+                    row.child = None;
+                    Some(row.info.clone())
+                }
             }
-            Ok(None) => {}
-            Err(_) => {
-                row.info.running = false;
-                row.info.exit_code = Some(-1);
-                row.child = None;
-                return;
-            }
+        };
+        // Publish the exit to the shared data root so other instances' panels
+        // drop this terminal on their next poll.
+        if let Some(done) = done {
+            write_row_file(&done);
+            return;
         }
     });
 
@@ -161,24 +251,79 @@ pub fn spawn(root: &str, chat_id: &str, command: &str) -> Result<AgentTerminalIn
 /// Stop one terminal: TERM the whole group (unix), escalate to KILL after a
 /// short grace. The watcher thread reaps the exit and flips `running`.
 pub fn stop(id: &str) -> bool {
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(row) = reg.get_mut(id) else {
+    {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(row) = reg.get_mut(id) {
+            if !row.info.running {
+                return false;
+            }
+            kill_row(row, SIG_TERM);
+            drop(reg);
+            // Escalation lives on its own thread so a child that ignores TERM
+            // (a misbehaving server) cannot make the Stop click hang.
+            let escalate = id.to_string();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+                let Some(row) = reg.get_mut(&escalate) else { return };
+                if row.info.running {
+                    kill_row(row, SIG_KILL);
+                }
+            });
+            return true;
+        }
+    }
+    // Not ours: the terminal was spawned by ANOTHER app instance. Its child
+    // handle is over there, but the pid is the process-GROUP leader, so the
+    // same signals reach the whole tree from here.
+    stop_foreign(id)
+}
+
+/// Kill a pid (and, on unix, its whole group) from a process that holds no
+/// `Child` handle.
+#[cfg(unix)]
+fn kill_pid(pid: u32, sig: i32) {
+    // SAFETY: `kill(2)` takes plain integers; ESRCH on an already-dead pid is
+    // harmless. Same group rule as `kill_row`.
+    unsafe {
+        libc::kill(pid as i32, sig);
+        libc::kill(-(pid as i32), sig);
+    }
+}
+
+/// Foreign stop is a unix capability (group signals by pid); on Windows an
+/// instance can only manage its own children.
+#[cfg(not(unix))]
+fn stop_foreign(_id: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn stop_foreign(id: &str) -> bool {
+    let Some(info) = disk_rows().into_iter().find(|i| i.id == id) else {
         return false;
     };
-    if !row.info.running {
+    if !info.running || !pid_alive(info.pid) {
         return false;
     }
-    kill_row(row, SIG_TERM);
-    drop(reg);
-    // Escalation lives on its own thread so a child that ignores TERM (a
-    // misbehaving server) cannot make the Stop click hang.
-    let escalate = id.to_string();
+    kill_pid(info.pid, SIG_TERM);
+    let escalate = info.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1500));
-        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(row) = reg.get_mut(&escalate) else { return };
-        if row.info.running {
-            kill_row(row, SIG_KILL);
+        if pid_alive(escalate.pid) {
+            kill_pid(escalate.pid, SIG_KILL);
+        }
+        // The owner's watcher publishes the real exit; heal the file ourselves
+        // only once the process is gone (a still-alive pid is left alone so
+        // the owner can reap it and write the true exit code).
+        for _ in 0..15 {
+            if !pid_alive(escalate.pid) {
+                let mut done = escalate.clone();
+                done.running = false;
+                write_row_file(&done);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     });
     true
@@ -220,14 +365,36 @@ fn kill_row(row: &mut AgentTerminalRow, sig: i32) {
 
 /// Every live terminal, newest first; an empty `chat_id` lists them all (the
 /// renderer always passes the active chat, scheduled headless runs pass none).
+///
+/// In-memory rows are authoritative (their `Child` is here); rows mirrored by
+/// OTHER app instances are merged in from the shared data root, their
+/// liveness judged by probing the pid — a stale file whose process is gone is
+/// healed to `running: false` so panels drop it.
 pub fn list(chat_id: &str) -> Vec<AgentTerminalInfo> {
-    let mut rows: Vec<AgentTerminalInfo> = registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .map(|r| r.info.clone())
-        .filter(|i| chat_id.is_empty() || i.chat_id == chat_id)
-        .collect();
+    let mut rows: Vec<AgentTerminalInfo>;
+    let foreign: Vec<AgentTerminalInfo>;
+    {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        rows = reg
+            .values()
+            .map(|r| r.info.clone())
+            .filter(|i| chat_id.is_empty() || i.chat_id == chat_id)
+            .collect();
+        let local: HashSet<&str> = reg.keys().map(String::as_str).collect();
+        foreign = disk_rows()
+            .into_iter()
+            .filter(|i| !local.contains(i.id.as_str()))
+            .filter(|i| chat_id.is_empty() || i.chat_id == chat_id)
+            .collect();
+    }
+    for mut info in foreign {
+        if info.running && !pid_alive(info.pid) {
+            info.running = false;
+            info.exit_code = info.exit_code.or(Some(-1));
+            write_row_file(&info);
+        }
+        rows.push(info);
+    }
     rows.sort_by(|a, b| {
         b.running
             .cmp(&a.running)
@@ -430,5 +597,94 @@ mod tests {
         assert!(text.contains("/logs/bg-abcd1234.log"));
         assert!(text.contains("kill -TERM -- -4242"));
         assert!(text.contains("tail -c 4000"));
+    }
+
+    #[test]
+    fn a_spawned_row_is_published_to_disk() {
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let info = spawn(&root, "chat-disk", "true").unwrap();
+        let file = std::path::PathBuf::from(&root)
+            .join("terminal-logs")
+            .join(format!("{}.json", info.id));
+        let bytes = std::fs::read(&file).expect("row file must exist next to the log");
+        let on_disk: AgentTerminalInfo = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(on_disk.id, info.id);
+        assert!(on_disk.running);
+        // Prune needs a day to reach a fresh file — clean this test's up now.
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn list_merges_foreign_rows_and_heals_dead_pids() {
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        // A row written by "another instance": running, but nobody is home.
+        let dead = AgentTerminalInfo {
+            id: "bg-deadtest".into(),
+            chat_id: "chat-foreign".into(),
+            command: "echo hi".into(),
+            cwd: root.clone(),
+            started_at_ms: 1,
+            running: true,
+            exit_code: None,
+            log_path: "/dev/null".into(),
+            pid: u32::MAX - 1, // reserved pid: never alive, never ours
+        };
+        write_row_file(&dead);
+        let row = list("chat-foreign")
+            .into_iter()
+            .find(|i| i.id == "bg-deadtest")
+            .expect("foreign row must merge in");
+        assert!(!row.running, "a dead pid must be healed to not-running");
+        assert_eq!(row.exit_code, Some(-1));
+        // The healed file is written back so the next list is stable…
+        let healed: AgentTerminalInfo = serde_json::from_slice(
+            &std::fs::read(
+                std::path::PathBuf::from(&root).join("terminal-logs/bg-deadtest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!healed.running);
+        // …and stop on it is a plain false (nothing running to signal).
+        assert!(!stop("bg-deadtest"));
+        let _ = std::fs::remove_file(
+            std::path::PathBuf::from(&root).join("terminal-logs/bg-deadtest.json"),
+        );
+    }
+
+    #[test]
+    fn a_row_id_that_escapes_the_log_dir_is_never_written() {
+        assert!(row_file("../escape").is_none());
+        assert!(row_file("bg-ok").is_some());
+        assert!(row_file("not-a-terminal").is_none());
+    }
+
+    /// The per-chat filter must hold for rows MERGED FROM DISK too: a panel
+    /// polling chat-viewer (another instance, another chat) never sees a
+    /// terminal started in chat-own, on disk or in memory.
+    #[test]
+    fn a_foreign_row_from_another_chat_stays_filtered_out() {
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let foreign = AgentTerminalInfo {
+            id: "bg-othchat".into(),
+            chat_id: "chat-own".into(),
+            command: "echo hi".into(),
+            cwd: root.clone(),
+            started_at_ms: 1,
+            running: true,
+            exit_code: None,
+            log_path: "/dev/null".into(),
+            pid: u32::MAX - 2, // reserved pid: never ours; liveness is irrelevant here
+        };
+        write_row_file(&foreign);
+        assert!(
+            !list("chat-viewer").iter().any(|i| i.id == "bg-othchat"),
+            "another chat's disk row leaked through the filter"
+        );
+        // its own chat still sees it across instances
+        assert!(list("chat-own").iter().any(|i| i.id == "bg-othchat"));
+        let _ = std::fs::remove_file(
+            std::path::PathBuf::from(&root).join("terminal-logs/bg-othchat.json"),
+        );
     }
 }

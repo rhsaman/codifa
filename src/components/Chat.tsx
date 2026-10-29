@@ -228,7 +228,7 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
 import { LocalLiveSession, isHallucinatedTranscript, releaseWarmLiveMic, sanitizeLocalTranscript } from "../lib/localLive";
-import { analyzeClip16k, buildSttPrompt, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
+import { analyzeClip16k, buildSttPrompt, extractSttVocab, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
 import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
 import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
 import { buildLiveSpeakSuffix } from "../lib/livePrompt";
@@ -376,6 +376,31 @@ function openEditTargetSession(
   });
 }
 
+/** `chatId:target:name` pins the user closed with the badge's ×. The turn that
+ *  produced the pin keeps streaming and often emits the SAME `edit_target`
+ *  event after the click; re-pinning from that echo would make the × a lie
+ *  (the badge returns and Build stays forced). Deliberate `/plugin update`
+ *  commands re-open the session through openEditTargetSession, which does not
+ *  consult this set. */
+const dismissedEditTargets = new Set<string>();
+
+function dismissedEditTargetKey(chatId: string, target: string, name: string): string {
+  return `${chatId}:${target}:${name}`;
+}
+
+/** × on the badge: end the session and remember the target was closed, so the
+ *  trailing `edit_target` events of the running turn cannot re-pin it. */
+function dismissEditTarget(chatId: string, t: ChatEditTarget | null | undefined): void {
+  if (!t) return;
+  dismissedEditTargets.add(dismissedEditTargetKey(chatId, t.target, t.name));
+  // FIFO trim: only recent closes can be re-echoed by a live stream.
+  if (dismissedEditTargets.size > 200) {
+    const oldest = dismissedEditTargets.values().next().value;
+    if (oldest) dismissedEditTargets.delete(oldest);
+  }
+  useStore.getState().clearChatEditTarget(chatId);
+}
+
 /** System-prompt suffix while an edit badge is open: the agent must know it is
  *  working INSIDE the pinned folder — and for plugins, where secrets live
  *  (the runner injects the plugin folder's .env into every script run). */
@@ -385,7 +410,10 @@ function editTargetSuffix(t?: ChatEditTarget | null): string {
     `EDIT SESSION ACTIVE: you are updating the ${t.target} "${t.name}" — its folder on disk is ${t.path}. ` +
     "Make every change inside that folder and nowhere else. The edit session stays open across turns " +
     "until the user closes the badge above the composer — never treat the session as finished on your own, " +
-    "and never ask the user to re-run the update command for follow-up changes.";
+    "and never ask the user to re-run the update command for follow-up changes. " +
+    "The session only pins WHERE you edit; it does not turn every request into more editing. When the " +
+    "user asks to RUN this target (fire its script, trade through its plugin, run its build), run it " +
+    "now in this Build-mode session — do not switch to updating the target instead.";
   if (t.target === "plugin") {
     return (
       base +
@@ -1664,6 +1692,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
   const sttLanguage = useStore((s) => s.sttLanguage);
   const sttPrompt = useStore((s) => s.sttPrompt);
+  // Auto-glossary (file/function/library names from the recent conversation and
+  // open editors) fed to buildSttPrompt as the preview context tail. Kept in a
+  // ref: the transcribe path must not re-render when the chat history changes.
+  const sttVocabRef = useRef("");
+  useEffect(() => {
+    const sync = () => {
+      const st = useStore.getState();
+      const chat = st.chats.find((c) => c.id === st.activeChatId);
+      const texts = (chat?.messages ?? [])
+        .slice(-12)
+        .map((m) => m.content)
+        .filter((c): c is string => typeof c === 'string' && c.length > 0);
+      const vocab = extractSttVocab(texts);
+      if (vocab !== sttVocabRef.current) sttVocabRef.current = vocab;
+    };
+    sync();
+    // The glossary follows the conversation: refresh on a light tick without
+    // re-rendering the panel on every message.
+    const t = setInterval(sync, 2500);
+    return () => clearInterval(t);
+  }, []);
   // Live voice settings: a realtime provider makes live run speech-to-speech;
   // empty keeps the provider-agnostic chunked pipeline.
   const liveProviderId = useStore((s) => s.liveProviderId);
@@ -1672,12 +1721,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Text we last pushed into the composer from live STT: ownership marker so a
   // chunk update never overwrites something the user typed themselves.
   const liveTypedRef = useRef("");
+  // Set when the user edits the composer while dictation is live (Backspace on
+  // the transcript, correcting a word…). From that moment the transcript
+  // engine LOSES ownership: partials must not retype the composer over the
+  // user's edit, and ✓/Enter must send the composer's visible text.
+  const liveUserEditedRef = useRef(false);
   /** Write the live partial into the composer (chunk by chunk). */
   const applyLivePartial = (text: string) => {
     if (!text) return;
     // ✓/✕ already acted (or ✓ is draining the final decode): an in-flight
     // chunk reply must not retype the composer over the send/wipe decision.
     if (dictateAwaitRef.current || dictateSuppressedRef.current) return;
+    // The user edited the transcript in the composer: they own the text now.
+    // Partials are cumulative, so a later chunk would resurrect every word
+    // they deleted and would clobber their correction — hands off.
+    if (liveUserEditedRef.current) return;
     // The ownership marker must advance OUTSIDE the updater: React may run an
     // updater twice (StrictMode dev, interrupted renders). Writing the ref
     // inside made the second run see a mismatched `prev` and commit the FIRST
@@ -1707,6 +1765,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     liveTypedRef.current = "";
     if (!ours) return;
     setInput((prev) => (prev === ours ? "" : prev));
+  };
+  /** Hand composer ownership to the user: partials stop retyping and ✓/Enter
+   *  will deliver exactly what is on screen. Set on any manual edit while
+   *  dictation is live. */
+  const markLiveUserEdited = () => {
+    if (!recordingRef.current && !dictateSessionRef.current) return;
+    liveUserEditedRef.current = true;
   };
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   /**
@@ -4266,16 +4331,26 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     }
     const { skills: mentionSkills, cleaned: cleanedText } =
       extractMentionSkills(text, mentionCatalog());
-    const effectiveSkills = overrides?.skills ?? Array.from(mentionSkills);
-    const effectiveMcpServers: Record<string, McpServerConfig> =
-      overrides?.mcpServers ??
-      (() => {
+    // Plugin-USE session (the /slug badge): while open, its skills and
+    // connectors ride along on EVERY send — unless this very turn carries its
+    // own override (a /command turn or explicit @mentions), which wins.
+    const session = chat.pluginSession;
+    const sessionSkills = session && !overrides?.skills ? session.skills : [];
+    const sessionMcp =
+      session && !overrides?.mcpServers ? session.mcpConfig : undefined;
+    const effectiveSkills = Array.from(
+      new Set([...Array.from(mentionSkills), ...sessionSkills]),
+    );
+    const effectiveMcpServers: Record<string, McpServerConfig> = {
+      ...(() => {
         const all = s.settings.mcpServers ?? {};
         const enabled = s.settings.mcpEnabled ?? [];
         const sel: Record<string, McpServerConfig> = {};
         for (const n of enabled) if (all[n]) sel[n] = all[n];
         return sel;
-      })();
+      })(),
+      ...(sessionMcp ?? {}),
+    };
     const finalPrompt =
       skillNotes.length > 0
         ? `${cleanedText}\n\n=== USER-SELECTED SKILLS/TOOLS FOR THIS TURN ===\n${skillNotes.join(
@@ -5301,7 +5376,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         if (
           (kind === "plugin" || kind === "skill" || kind === "mcp" || kind === "artifact") &&
           name &&
-          path
+          path &&
+          // The user closed this exact badge with ×: the turn's trailing echo
+          // of this event must not pin it right back.
+          !dismissedEditTargets.has(dismissedEditTargetKey(chat.id, kind, name))
         ) {
           useStore
             .getState()
@@ -7021,10 +7099,34 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // to the task ("/plugin موضوع جدید بساز"), so keep all of it. A
           // `mcp…` selector is the turn's target, not part of the task.
           const task = (named || mcpNarrow ? tail : [head, ...tail]).join(' ').trim();
+          // Invoking the bundle through its command OPENS the plugin-use
+          // session: the badge now shows the plugin and every later send
+          // keeps the bundle attached until its × is clicked.
+          useStore.getState().setChatPluginSession(ch.id, {
+            slug: plug.name,
+            label: plug.hint,
+            skills: plug.skills.map((sk) => sk.skill),
+          });
           void resolvePluginTurn(plug, {
             ...(named ? { onlySkill: named.skill } : {}),
             ...(mcpNarrow ? { onlyMcp: onlyMcp ?? [] } : {}),
           }).then((bundle) => {
+            // Re-pin with the RESOLVED bundle: connector configs are only
+            // known here, and the session must equal what THIS turn attaches.
+            const pinned = useStore
+              .getState()
+              .chats.find((c) => c.id === ch.id)?.pluginSession;
+            if (pinned?.slug === plug.name) {
+              useStore.getState().setChatPluginSession(ch.id, {
+                ...pinned,
+                ...(bundle.mcpServers && Object.keys(bundle.mcpServers).length > 0
+                  ? {
+                      mcpServers: Object.keys(bundle.mcpServers),
+                      mcpConfig: bundle.mcpServers,
+                    }
+                  : {}),
+              });
+            }
             const skills = mcpNarrow ? [] : named ? [named.skill] : bundle.skills;
             // The banner is added AFTER the user's message so the bundle's
             // contents read as the result of naming it.
@@ -7857,7 +7959,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // direction (Persian for RTL): without a language hint short Persian
     // chunks come back transliterated or in Arabic orthography.
     const effectiveLang = lang || chainLang || 'fa';
-    const chainPrompt = prompt || buildSttPrompt(effectiveLang, sttPrompt);
+    const chainPrompt =
+      prompt ||
+      buildSttPrompt(effectiveLang, sttPrompt, sttVocabRef.current);
     let lastError: unknown = null;
     for (const opts of chains) {
       try {
@@ -8122,7 +8226,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             lang,
           });
           // Try each STT target in order; first success wins.
-          const sttPromptText = buildSttPrompt(lang, sttPrompt);
+          const sttPromptText = buildSttPrompt(lang, sttPrompt, sttVocabRef.current);
           let text = "";
           let lastError: unknown = null;
           for (const opts of chains) {
@@ -8255,8 +8359,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // and empties the ref (Chat.tsx onUserText) — after any spoken pause the
     // words the user is looking at live in `input`, not in the ref. ✓/Enter
     // must send what the composer shows, so the ref is only the first pick.
-    const typed = liveTypedRef.current || input;
+    // Capture the flag BEFORE resetting it: the drain callback below must know
+    // whether the user had edited, long after this synchronous body returned.
+    const userEdited = liveUserEditedRef.current;
+    const typed = userEdited
+      ? // The user corrected the transcript: send EXACTLY what they see, not
+        // a parked full-clip decode of the uncorrected audio.
+        input
+      : liveTypedRef.current || input;
     liveTypedRef.current = "";
+    liveUserEditedRef.current = false;
     dictateConfirmingRef.current = false;
     dictateAwaitRef.current = true;
     dictateSuppressedRef.current = true;
@@ -8268,8 +8380,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       .then(() => {
         // In dictate mode the whole-clip decode lands DURING this drain (the
         // turn only closes on stop) — prefer the parked, fuller transcript over
-        // the last chunk partial.
-        const pending = dictatePendingFinalRef.current.trim();
+        // the last chunk partial. NEVER when the user edited the text: their
+        // correction outranks anything decoded from the raw audio.
+        const pending = userEdited
+          ? ""
+          : dictatePendingFinalRef.current.trim();
         dictatePendingFinalRef.current = "";
         const text =
           pending.length > typed.trim().length ? pending : typed.trim();
@@ -9474,6 +9589,10 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     const v = e.target.value;
     const prev = input;
     setInput(v);
+    // A keystroke during dictation takes over the composer: later partials
+    // must not retype the transcript over this edit, and ✓/Enter must send
+    // the edited text, not whatever the engine last transcribed.
+    if (v !== prev) markLiveUserEdited();
     // Typing diverges from the history preview: dismiss the popup but keep
     // the edited text so the user can refine the previewed row.
     if (historyOpen) setHistoryOpen(false);
@@ -11736,8 +11855,27 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 </span>
                 <button
                   className="edit-target-x"
-                  onClick={() => useStore.getState().clearChatEditTarget(chat.id)}
+                  onClick={() => dismissEditTarget(chat.id, chat.editTarget)}
                   title="پایان ویرایش — بازگشت به پوشهٔ ورک‌اسپیس و مود قبلی"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+            {chat.pluginSession && (
+              <div
+                className="edit-target-badge plugin-session-badge"
+                dir="ltr"
+                title={`${chat.pluginSession.slug} — plugin session`}
+              >
+                <span className="edit-target-glyph" aria-hidden="true">
+                  ◈
+                </span>
+                <span className="edit-target-name">{chat.pluginSession.label}</span>
+                <button
+                  className="edit-target-x"
+                  onClick={() => useStore.getState().clearChatPluginSession(chat.id)}
+                  title="پایان استفاده از پلاگین — از این بعد خودکار ضمیمه نمی‌شود"
                 >
                   ×
                 </button>

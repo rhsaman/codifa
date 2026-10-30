@@ -15,21 +15,23 @@
 # Usage:
 #   bash install-macos.sh [version]
 #
-#   version  Optional release tag to install (e.g. v1.7.0). Defaults to the
+#   version  Optional release tag to install (e.g. v2.0.1). Defaults to the
 #            latest published release.
 #
-# Note: the project currently publishes an Apple Silicon (arm64) DMG only, so
-# this script refuses to run on Intel Macs instead of installing a binary that
-# cannot execute.
+# The CPU is detected with `uname -m` and the matching disk image is picked:
+# `Codifa_<version>_aarch64.dmg` on Apple Silicon, `Codifa_<version>_x64.dmg` on
+# Intel. A Mac whose architecture has no asset in that release fails loudly
+# instead of installing a binary the CPU cannot execute.
 
 set -euo pipefail
 
 REPO="rhsaman/codifa"
 APP_NAME="Codifa"
-MIN_MACOS_MAJOR=11
+# Mirrors bundle.macOS.minimumSystemVersion in tauri.conf.json.
+MIN_MACOS_VERSION="13.4"
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -52,15 +54,28 @@ for tool in curl hdiutil ditto codesign; do
   command -v "$tool" >/dev/null 2>&1 || die "'$tool' is missing; it ships with macOS."
 done
 
-os_major="$(sw_vers -productVersion | cut -d. -f1)"
-(( os_major >= MIN_MACOS_MAJOR )) || die "macOS ${MIN_MACOS_MAJOR}+ is required (found $(sw_vers -productVersion))."
-
-# Only an arm64 build is published today (see the header). Failing loudly here
-# beats installing a binary that the CPU cannot run.
-if [[ "$(uname -m)" != "arm64" ]]; then
-  die "this release ships an Apple Silicon (arm64) build only, and this Mac is $(uname -m).
-       Track Intel support at https://github.com/${REPO}/issues"
+macos_version="$(sw_vers -productVersion)"
+# Compare dotted versions field by field; `sort -V` is not available everywhere
+# but the awk below is plain POSIX.
+if ! awk -v have="$macos_version" -v need="$MIN_MACOS_VERSION" 'BEGIN {
+      split(have, h, "."); split(need, n, ".");
+      for (i = 1; i <= 3; i++) {
+        if ((h[i] + 0) > (n[i] + 0)) exit 0;
+        if ((h[i] + 0) < (n[i] + 0)) exit 1;
+      }
+      exit 0;
+    }'; then
+  die "macOS ${MIN_MACOS_VERSION}+ is required (found ${macos_version})."
 fi
+
+# The bundler names its disk images after the Rust target's arch, so the CPU
+# decides which asset to fetch. An architecture with no asset fails here rather
+# than installing a binary this Mac cannot run.
+case "$(uname -m)" in
+  arm64)  DMG_ARCH="aarch64" ;;
+  x86_64) DMG_ARCH="x64" ;;
+  *) die "unsupported CPU '$(uname -m)'; Codifa ships aarch64 (Apple Silicon) and x64 (Intel) builds." ;;
+esac
 
 if [[ -n "$VERSION" ]]; then
   RELEASE_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
@@ -72,24 +87,24 @@ fi
 
 # --- locate the DMG ---------------------------------------------------------
 
-# The bundler names its macOS disk images "Codifa-<version>-arm64.dmg"; the
-# version comes from package.json at build time, so it is read from the release
-# API instead of being hard-coded here.
+# Disk images are named "Codifa_<version>_<arch>.dmg"; the version comes from
+# package.json at build time, so it is read from the release API instead of
+# being hard-coded here.
 log "Finding the ${APP_NAME} release…"
 release_json="$(curl -fsSL "$api_url")" \
   || die "could not reach GitHub. Check your connection and try again."
 
 dmg_name="$(printf '%s' "$release_json" \
-  | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*-arm64\.dmg"' \
+  | grep -o "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*_${DMG_ARCH}\\.dmg\"" \
   | head -n1 \
   | sed 's/.*"\([^"]*\)"$/\1/')"
 
 if [[ -z "$dmg_name" ]]; then
-  die "no arm64 DMG in that release. Assets found: $(printf '%s' "$release_json" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | tr '\n' ' ')"
+  die "no ${DMG_ARCH} DMG in that release. Assets found: $(printf '%s' "$release_json" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | tr '\n' ' ')"
 fi
 
 version_label="$(printf '%s' "$release_json" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
-log "Installing ${APP_NAME} ${version_label:-} (arm64) — ${dmg_name}"
+log "Installing ${APP_NAME} ${version_label:-} (${DMG_ARCH}) — ${dmg_name}"
 
 # --- download into a private temp dir ---------------------------------------
 

@@ -63,10 +63,16 @@ it to.
 
 ### 📥 Installing (end users)
 
-If you just want to run Codifa — not build it — grab the installer. Codifa is
-**not signed with an Apple Developer ID**, so macOS quarantines the downloaded
-image and refuses the first launch with _"Codifa is damaged and can't be
-opened"_ or _"Apple could not verify…"_. The installer clears that flag for you.
+If you just want to run Codifa — not build it — grab the installer for your OS
+from the [latest release](https://github.com/rhsaman/codifa/releases/latest).
+The app is **not signed with an Apple Developer ID** and the Windows installers
+are **not code-signed**, so each OS shows an extra warning on the first launch;
+the steps below clear it.
+
+#### 🍎 macOS (Apple Silicon & Intel)
+
+**Requirements:** macOS 13.4 or newer. Both `aarch64` (Apple Silicon: M1–M4)
+and `x64` (Intel) builds are published; pick the one your Mac runs.
 
 **Option A — one-command install (recommended):**
 
@@ -74,18 +80,24 @@ opened"_ or _"Apple could not verify…"_. The installer clears that flag for yo
 curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash
 ```
 
-It downloads the latest release, verifies the app's code signature, clears the
-quarantine attribute and copies the app into `/Applications`. Every step is
-printed so you can read what happened. To install a specific release, pass the
-tag:
+It detects your CPU, downloads the matching disk image, verifies the app's code
+signature, clears the quarantine attribute and copies the app into
+`/Applications`. Every step is printed so you can read what happened. To install
+a specific release, pass the tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v1.7.0
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v2.0.1
 ```
 
 **Option B — manual install:**
 
-1. Download the `.dmg` from the [latest release](https://github.com/rhsaman/codifa/releases/latest) and drag **Codifa** into `/Applications`.
+1. Download the `.dmg` for your CPU from the [latest release](https://github.com/rhsaman/codifa/releases/latest) and drag **Codifa** into `/Applications`.
+
+   | CPU | File |
+   | --- | --- |
+   | Apple Silicon (M-series) | `Codifa_<version>_aarch64.dmg` |
+   | Intel | `Codifa_<version>_x64.dmg` |
+
 2. Clear the quarantine flag, or macOS will refuse to open it:
 
    ```bash
@@ -94,14 +106,86 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 
 3. Open Codifa from `/Applications`. If macOS still blocks it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
-**Requirements:** macOS 13.4 or newer, Apple Silicon. There is no Intel macOS
-build; the installer refuses to run on one rather than install a binary the CPU
-cannot execute.
-
 **Permissions:** Codifa asks for the microphone (voice input) and screen
 recording (Computer Use). Grant them in **System Settings → Privacy & Security**;
 because the app is not notarized, you may need to toggle them off and on once
 and relaunch the app after an update.
+
+#### 🪟 Windows 10 / 11 (x64)
+
+**Requirements:** 64-bit Windows 10 or newer. The installer brings the
+**WebView2 runtime** with it: Tauri's default install mode downloads the
+bootstrapper when the runtime is missing, so there is nothing extra to fetch.
+On an offline machine, preinstall it from
+[Microsoft's WebView2 page](https://developer.microsoft.com/microsoft-edge/webview2/)
+first.
+
+**Option A — installer (recommended):**
+
+1. Download `Codifa_<version>_x64-setup.exe` from the [latest release](https://github.com/rhsaman/codifa/releases/latest) and run it.
+2. Windows SmartScreen shows _"Windows protected your PC"_ because the
+   installer is not code-signed. Click **More info → Run anyway**.
+3. Codifa is installed per-user and appears in the Start menu.
+
+**Option B — MSI (for managed installs):** `Codifa_<version>_x64_en-US.msi`
+installs the same app for machines where `.exe` bootstrappers are blocked;
+`msiexec /i Codifa_<version>_x64_en-US.msi` runs it silently from a script.
+
+To uninstall, use **Settings → Apps → Installed apps → Codifa → Uninstall**.
+
+#### 🐧 Linux (x86_64)
+
+The Linux bundles need a GTK 3 / WebKitGTK 4.1 stack. `apt` pulls these in on
+its own when you install the `.deb`; install them by hand only if you use the
+`.AppImage`, or on a minimal system:
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1
+```
+
+On Fedora use `webkit2gtk4.1`, `gtk3` and `libappindicator-gtk3`; on Arch
+`webkit2gtk-4.1`, `gtk3` and `libayatana-appindicator`. Then pick one package:
+
+| Package | Use it when | Install |
+| --- | --- | --- |
+| `.deb` | Debian / Ubuntu | `sudo apt install ./Codifa_<version>_amd64.deb` |
+| `.rpm` | Fedora / openSUSE | `sudo dnf install ./Codifa-<version>-1.x86_64.rpm` |
+| `.AppImage` | any distro, no root | `chmod +x Codifa_<version>_amd64.AppImage && ./Codifa_<version>_amd64.AppImage` |
+
+`apt install ./<file>.deb` (with the leading `./`) resolves the dependencies for
+you; plain `dpkg -i` does not. On Ubuntu 22.04+ the `.AppImage` additionally
+needs `sudo apt install libfuse2`. Wayland sessions run through XWayland by
+default — if the window misbehaves, launch with `GDK_BACKEND=x11`.
+
+#### 🌐 Any OS — server build (browser only)
+
+`codifa-server-<platform>.zip` in each release contains the same binary without
+an installer, for machines you drive from a browser instead of a desktop. Unzip
+it, run `codifa serve`, and open the printed URL. See
+[Server mode](#-server-mode-use-it-from-a-browser) for the flags, the token and
+the systemd/launchd units.
+
+**Linux server — one command (recommended):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | bash
+```
+
+It downloads `codifa-server-x86_64-unknown-linux-gnu.zip`, unpacks it to
+`~/.local/lib/codifa-server` and links `codifa` into `~/.local/bin`. Re-running it
+upgrades in place. For a system-wide install every user can reach:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | sudo PREFIX=/usr/local bash
+```
+
+To pin a release, pass the tag: `... | bash -s -- v2.0.1`.
+
+The server binary is the desktop binary with the window stripped, so it still
+needs the GTK 3 / WebKitGTK 4.1 libraries listed in the Linux section above; the
+installer warns and names the packages when they are missing. Only `x86_64` is
+published — on an ARM server, build from a checkout with
+`cargo build --release` instead.
 
 ### 🚀 Getting started
 
@@ -152,6 +236,12 @@ schedules. The token is persisted in `~/.codifa/web-token`, the first
 # Windows / Linux (release zips named codifa-server-<platform>.zip)
 codifa serve
 ```
+
+On Linux the server binary is the same desktop binary, so it wants the GTK/
+WebKit shared libraries installed (`libwebkit2gtk-4.1`, `libgtk-3`, … — the
+list CI installs). A headless box without a display needs a virtual one:
+`xvfb-run -a codifa serve`. The zip is a glibc build (Ubuntu-based) — mainstream
+distros run it as-is; Alpine needs a musl build from source.
 
 **Useful flags & env** (all optional): `--host` (default `127.0.0.1`;
 `0.0.0.0` for LAN), `--port` (default `8787`), `--foreground` to keep the
@@ -243,11 +333,16 @@ desktop app; use API keys on a server.
 
 ### 📥 نصب برای کاربران نهایی
 
-اگر فقط می‌خواهید Codifa را اجرا کنید، همان نصب‌کننده را بردارید. Codifa با
-**گواهی Developer ID اپل امضا نشده است**، بنابراین مک فایل دانلودشده را
-قرنطینه می‌کند و اجرای اول با پیام _«Codifa خراب است و باز نمی‌شود»_ یا
-_«اپل نتوانست تأیید کند…»_ رد می‌شود. اسکریپت نصب این فلگ را برایتان پاک
-می‌کند.
+اگر فقط می‌خواهید Codifa را اجرا کنید، نصب‌کنندهٔ سیستم‌عامل خودتان را از
+[آخرین نسخه](https://github.com/rhsaman/codifa/releases/latest) بردارید. این اپ با
+**گواهی Developer ID اپل امضا نشده** و نصب‌کننده‌های ویندوز هم **کدساین نشده‌اند**،
+بنابراین هر سیستم‌عامل در اجرای اول یک هشدار اضافه نشان می‌دهد؛ گام‌های زیر آن را
+برمی‌دارند.
+
+#### 🍎 مک (اپل سیلیکون و اینتل)
+
+**پیش‌نیاز:** مک‌اواس ۱۳.۴ یا بالاتر. هر دو بیلد `aarch64` (اپل سیلیکون: M1 تا M4)
+و `x64` (اینتل) منتشر می‌شوند؛ همان را بردارید که مک شما اجرا می‌کند.
 
 **راه ۱ — نصب با یک دستور (پیشنهادی):**
 
@@ -255,17 +350,23 @@ _«اپل نتوانست تأیید کند…»_ رد می‌شود. اسکری�
 curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash
 ```
 
-آخرین نسخه را دانلود می‌کند، امضای کد اپ را بررسی می‌کند، فلگ قرنطینه را پاک
-می‌کند و اپ را در `/Applications` می‌گذارد. هر گام چاپ می‌شود تا ببینید چه
-اتفاقی افتاده است. برای نصب یک نسخهٔ مشخص، تگ را بدهید:
+پردازنده را تشخیص می‌دهد، دیسک‌ایمیج متناسب را دانلود می‌کند، امضای کد اپ را
+بررسی می‌کند، فلگ قرنطینه را پاک می‌کند و اپ را در `/Applications` می‌گذارد. هر گام
+چاپ می‌شود تا ببینید چه اتفاقی افتاده است. برای نصب یک نسخهٔ مشخص، تگ را بدهید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v1.7.0
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-macos.sh | bash -s -- v2.0.1
 ```
 
 **راه ۲ — نصب دستی:**
 
-۱. فایل `.dmg` را از [آخرین نسخه](https://github.com/rhsaman/codifa/releases/latest) دانلود کنید و **Codifa** را به `/Applications` بکشید.
+۱. فایل `.dmg` مناسب پردازندهٔ خود را از [آخرین نسخه](https://github.com/rhsaman/codifa/releases/latest) دانلود کنید و **Codifa** را به `/Applications` بکشید.
+
+   | پردازنده | فایل |
+   | --- | --- |
+   | اپل سیلیکون (سری M) | `Codifa_<version>_aarch64.dmg` |
+   | اینتل | `Codifa_<version>_x64.dmg` |
+
 ۲. فلگ قرنطینه را پاک کنید، وگرنه مک از باز کردن آن سرباز می‌زند:
 
    ```bash
@@ -274,14 +375,83 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 
 ۳. Codifa را از `/Applications` باز کنید. اگر مک باز هم مسدود کرد، به **System Settings → Privacy & Security** بروید و **Open Anyway** را بزنید.
 
-**پیش‌نیاز:** مک‌اواس ۱۳.۴ یا بالاتر، اپل سیلیکون. نسخهٔ اینتل برای مک وجود
-ندارد و اسکریپت نصب روی مک اینتل اجرا نمی‌شود تا باینری‌ای نصب نکند که
-پردازنده نمی‌تواند اجرا کند.
-
 **مجوزها:** Codifa میکروفون (ورودی صوتی) و ضبط صفحه (Computer Use) را می‌خواهد.
 آن‌ها را در **System Settings → Privacy & Security** بدهید؛ چون اپ notarize
 نشده است، ممکن است لازم باشد بعد از هر به‌روزرسانی آن‌ها را یک‌بار خاموش و
 روشن کنید و اپ را دوباره باز کنید.
+
+#### 🪟 ویندوز ۱۰ و ۱۱ (x64)
+
+**پیش‌نیاز:** ویندوز ۶۴-بیتی ۱۰ یا بالاتر. نصب‌کننده **WebView2 runtime** را با
+خودش می‌آورد: حالت پیش‌فرض Tauri وقتی runtime نصب نباشد bootstrapper را دانلود
+می‌کند، پس چیز اضافه‌ای لازم نیست. روی ماشین بدون اینترنت، اول از
+[صفحهٔ WebView2 مایکروسافت](https://developer.microsoft.com/microsoft-edge/webview2/)
+نصبش کنید.
+
+**راه ۱ — نصب‌کننده (پیشنهادی):**
+
+۱. فایل `Codifa_<version>_x64-setup.exe` را از [آخرین نسخه](https://github.com/rhsaman/codifa/releases/latest) دانلود و اجرا کنید.
+۲. چون نصب‌کننده کدساین نشده است، SmartScreen پیام _«Windows protected your PC»_ نشان می‌دهد. روی **More info → Run anyway** بزنید.
+۳. Codifa به‌صورت per-user نصب می‌شود و در منوی Start ظاهر می‌شود.
+
+**راه ۲ — MSI (برای نصب مدیریت‌شده):** فایل `Codifa_<version>_x64_en-US.msi`
+همان اپ را برای ماشین‌هایی نصب می‌کند که `.exe` را مسدود می‌کنند؛
+`msiexec /i Codifa_<version>_x64_en-US.msi` آن را بی‌صدا از اسکریپت اجرا می‌کند.
+
+برای حذف: **Settings → Apps → Installed apps → Codifa → Uninstall**.
+
+#### 🐧 لینوکس (x86_64)
+
+باندل‌های لینوکس به GTK 3 و WebKitGTK 4.1 نیاز دارند. وقتی `.deb` را نصب می‌کنید،
+`apt` خودش این‌ها را می‌آورد؛ دستی فقط وقتی لازم است که از `.AppImage` استفاده
+می‌کنید یا سیستم‌تان حداقلی است:
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1
+```
+
+روی فدورا `webkit2gtk4.1`، `gtk3` و `libappindicator-gtk3`؛ روی آرچ
+`webkit2gtk-4.1`، `gtk3` و `libayatana-appindicator`. بعد یکی از بسته‌ها را بردارید:
+
+| بسته | کِی به کار می‌آید | نصب |
+| --- | --- | --- |
+| `.deb` | دبیان / اوبونتو | `sudo apt install ./Codifa_<version>_amd64.deb` |
+| `.rpm` | فدورا / openSUSE | `sudo dnf install ./Codifa-<version>-1.x86_64.rpm` |
+| `.AppImage` | هر توزیعی، بدون root | `chmod +x Codifa_<version>_amd64.AppImage && ./Codifa_<version>_amd64.AppImage` |
+
+`apt install ./<file>.deb` (با `./` ابتدای مسیر) وابستگی‌ها را خودش حل می‌کند،
+`dpkg -i` این کار را نمی‌کند. روی اوبونتو ۲۲.۰۴ به بعد، `.AppImage` به
+`sudo apt install libfuse2` هم نیاز دارد. نشست‌های Wayland به‌طور پیش‌فرض از
+XWayland استفاده می‌کنند؛ اگر پنجره بدرفتاری کرد، با `GDK_BACKEND=x11` اجرا کنید.
+
+#### 🌐 هر سیستم‌عامل — بیلد سرور (فقط مرورگر)
+
+فایل `codifa-server-<platform>.zip` در هر نسخه همان باینری را بدون نصب‌کننده
+دارد، برای ماشین‌هایی که از مرورگر کنترل می‌کنید نه از دسکتاپ. بازش کنید،
+`codifa serve` را اجرا کنید و آدرس چاپ‌شده را باز کنید. فلگ‌ها، توکن و یونیت‌های
+systemd/launchd در بخش [حالت سرور](#-حالت-سرور-استفاده-از-مرورگر) آمده است.
+
+**سرور لینوکس — نصب یک‌خطی (پیشنهادی):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | bash
+```
+
+اسکریپت فایل `codifa-server-x86_64-unknown-linux-gnu.zip` را می‌گیرد، در
+`~/.local/lib/codifa-server` باز می‌کند و `codifa` را در `~/.local/bin` لینک
+می‌کند؛ اجرای دوباره‌اش نسخه را به‌روز می‌کند. برای نصب سیستم‌گسترده که همهٔ
+کاربران ببینند:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | sudo PREFIX=/usr/local bash
+```
+
+برای قفل‌کردن روی یک نسخهٔ خاص، تگ را بدهید: `... | bash -s -- v2.0.1`.
+
+باینری سرور همان باینری دسکتاپ بدون پنجره است، پس همچنان به کتابخانه‌های
+GTK 3 / WebKitGTK 4.1 بخش لینوکس بالا نیاز دارد؛ اسکریپت اگر پیدا نشوند هشدار
+می‌دهد و نام پکیج هر توزیع را می‌گوید. فقط معماری `x86_64` منتشر می‌شود — روی
+سرور ARM، از سورس با `cargo build --release` بسازید.
 
 ### 🚀 شروع سریع
 

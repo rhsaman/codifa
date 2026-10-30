@@ -18947,10 +18947,11 @@ body.coder-dragging .chat-split-child {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  /* Same RTL guard as .plan-panel-body: a stray horizontal scroll offset in
-     the docked review/git panel visually swallows the right inset. Wide diff
-     rows wrap instead of ever scrolling sideways. */
-  overflow-x: hidden;
+  /* Horizontal scrolling of wide diff rows lives HERE (the diff itself does
+     not scroll sideways in this pane, see `.review-diff .diff-unified`): this
+     box is height-bounded, so its bar always sits on the visible bottom edge
+     instead of at the end of a long diff. */
+  overflow-x: auto;
 }
 
 .review-file-block {
@@ -19019,10 +19020,11 @@ body.coder-dragging .chat-split-child {
   white-space: nowrap;
 }
 
-/* دیف داخل بلوک آکاردئون — اسکرول عمودی را خودِ لیست (.review-files) دارد،
-   پس اینجا فقط اسکرول افقی برای خطوط بلند می‌گذاریم. */
+/* دیف داخل بلوک آکاردئون — هم اسکرول عمودی و هم افقی را خودِ لیست
+   (.review-files) دارد؛ اینجا اسکرول نمی‌گذاریم تا نوار افقی ته یک دیف بلند
+   گم نشود. */
 .review-diff {
-  overflow-x: auto;
+  overflow: visible;
   background: color-mix(in srgb, var(--text) 3%, transparent);
 }
 
@@ -19122,6 +19124,15 @@ body.coder-dragging .chat-split-child {
   width: max-content;
   min-width: 100%;
   box-sizing: border-box;
+}
+
+/* Where the pane around the diff already scrolls (the right-docked Review list
+   and the chat preview card), sideways scrolling lives THERE, not on the diff.
+   A scroller as tall as the whole diff draws its bar at the diff's bottom
+   edge — below the fold for any long diff — so the bar looked missing. */
+.review-diff .diff-unified,
+.diff-preview-body .diff-unified {
+  overflow-x: visible;
 }
 
 /* گاتر علامت +/− با نوار رنگی کناری */

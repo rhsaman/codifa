@@ -12,10 +12,14 @@
 # read what happened. Re-running it upgrades in place.
 #
 # Usage:
-#   bash install-linux-server.sh [version]
+#   bash install-linux-server.sh [--service] [version]
 #
-#   version  Optional release tag to install (e.g. v2.0.1). Defaults to the
-#            latest published release.
+#   --service  Also install a HARDENED systemd unit and start the server now:
+#              loopback-only bind (reach it via an SSH tunnel or a TLS proxy),
+#              Restart=always, and the standard systemd sandbox flags. The
+#              unit lands in /etc/systemd/system/codifa.service (needs sudo).
+#   version    Optional release tag to install (e.g. v2.0.1). Defaults to the
+#              latest published release.
 #
 # Environment:
 #   PREFIX   Install prefix (default: $HOME/.local). For a system-wide install
@@ -48,6 +52,7 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 case "${1:-}" in
   -h|--help) usage 0 ;;
   "")        VERSION="" ;;
+  --service) SERVICE=1; VERSION="" ;;
   -*)        die "unknown option '$1' (try --help)." ;;
   *)         VERSION="$1" ;;
 esac
@@ -202,6 +207,104 @@ case ":$PATH:" in
 esac
 
 log "Installed ${BIN_NAME} ${label} → ${link}"
+
+# --- optional: hardened systemd service (--service) -------------------------
+#
+# The secure default posture: the server binds 127.0.0.1 ONLY — nothing is
+# reachable from the network until the operator deliberately opens a path
+# (an SSH tunnel, a TLS proxy, or editing the unit to bind 0.0.0.0). The
+# systemd sandbox caps the blast radius of a server whose whole job is,
+# by design, to run commands.
+if [[ "${SERVICE:-0}" == "1" ]]; then
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    warn "systemd is not running here — skipping the service setup."
+  else
+    # Headless box (no display): the GTK event loop needs one, so wrap the
+    # start in xvfb-run when it exists and say exactly what to install when
+    # it does not.
+    exec_start="${bindir}/${BIN_NAME} serve --foreground --host 127.0.0.1 --port 8787"
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+      xvfb="$(command -v xvfb-run || true)"
+      if [ -n "$xvfb" ]; then
+        exec_start="${xvfb} -a ${exec_start}"
+        log "No display detected — the service will run under xvfb-run."
+      else
+        warn "no display and no xvfb-run: on a headless server install it first"
+        echo "       (Debian/Ubuntu: sudo apt-get install -y xvfb) and re-run with --service." >&2
+      fi
+    fi
+
+    unit="${libdir}/codifa.service"
+    cat > "$unit" <<UNIT
+[Unit]
+Description=Codifa web server (token-gated; binds 127.0.0.1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${USER}
+ExecStart=${exec_start}
+Restart=always
+RestartSec=2
+# Sandbox: the server runs shell commands by design, so contain what a
+# compromise could touch. ~/.codifa (chats, settings, the token) stays
+# writable; the rest of $HOME is read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${HOME}/.codifa
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 "$unit"
+
+    if sudo -n true 2>/dev/null || sudo -v; then
+      log "Installing the systemd unit (sudo)…"
+      sudo install -m 0644 "$unit" /etc/systemd/system/codifa.service \
+        || die "could not write /etc/systemd/system/codifa.service."
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now codifa.service
+      sleep 2
+      if systemctl is-active --quiet codifa.service; then
+        log "Service is running (systemd keeps it alive across reboots)."
+      else
+        warn "service did not come up — check: journalctl -u codifa -n 50"
+      fi
+    else
+      warn "no sudo — the unit is written but not installed. Finish by hand:"
+      echo "      sudo install -m 0644 ${unit} /etc/systemd/system/codifa.service" >&2
+      echo "      sudo systemctl daemon-reload && sudo systemctl enable --now codifa" >&2
+    fi
+
+    echo
+    echo "  Access (the server binds 127.0.0.1 only — nothing is network-exposed):"
+    echo "    · from your machine, tunnel:  ssh -L 8787:127.0.0.1:8787 ${USER}@<server>"
+    echo "      then open the URL below on YOUR machine"
+    echo "    · or put a TLS proxy in front (Caddy/nginx → 127.0.0.1:8787)"
+    echo "    · LAN without TLS: edit ExecStart to --host 0.0.0.0 (token-gated,"
+    echo "      plain HTTP — trusted networks only)"
+    echo
+    echo "  Logs: journalctl -u codifa -f      Stop: sudo systemctl disable --now codifa"
+  fi
+fi
+
+echo
 echo
 echo "  Start the server (it prints the access URL with its token):"
 echo "      ${BIN_NAME} serve --host 0.0.0.0 --port 8787"

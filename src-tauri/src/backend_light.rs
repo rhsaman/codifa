@@ -1868,13 +1868,27 @@ async fn web_auth(req: Request<Body>, next: Next) -> Response<Body> {
 
     match candidate {
         Some(t) if crate::webmode::token_matches(&t) => {
+            // Behind a TLS proxy (which sets x-forwarded-proto) the session
+            // cookie gets `Secure` so it never rides a plain-HTTP downgrade;
+            // a direct loopback session stays without it — `Secure` would
+            // stop the cookie being sent over the http:// URLs that
+            // legitimately have no TLS. Read before `next.run(req)`: the
+            // request is consumed there.
+            let https = req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|v| v.trim().eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
             let mut res = next.run(req).await;
             if from_query {
                 // Plant the session cookie: every later request (assets, the
                 // terminal WebSocket) authenticates itself without the token
                 // sitting in the URL bar / history.
                 let cookie = format!(
-                    "codifa_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
+                    "codifa_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
+                    if https { "; Secure" } else { "" }
                 );
                 if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
                     res.headers_mut()

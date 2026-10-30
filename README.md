@@ -179,6 +179,19 @@ upgrades in place. For a system-wide install every user can reach:
 curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | sudo PREFIX=/usr/local bash
 ```
 
+**The hardened way** — also install a systemd service: the server binds
+`127.0.0.1` ONLY (nothing network-exposed; reach it through an SSH tunnel or
+a TLS proxy), restarts on failure, and runs inside the systemd sandbox
+(read-only `$HOME`, private tmp, no capabilities). On a headless box it wraps
+the server in `xvfb-run` automatically (install `xvfb` first). When it
+starts, the token URL is printed and stored in `~/.codifa/web-token`; tunnel
+with `ssh -L 8787:127.0.0.1:8787 user@server` and open the URL on your own
+machine.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | bash -s -- --service
+```
+
 To pin a release, pass the tag: `... | bash -s -- v2.0.1`.
 
 The server binary is the desktop binary with the window stripped, so it still
@@ -266,10 +279,15 @@ WantedBy=multi-user.target
 **Security:** the web surface is token-gated (cookie, `Authorization: Bearer`
 or `?token=`), but the server can run commands and read/write files on its
 machine — put it behind TLS (a reverse proxy) or a VPN, and do not expose it
-to an untrusted network. Desktop-only capabilities degrade gracefully in the
-browser: opening a workspace asks for an absolute server path, files open in
-the in-app viewer, and screen capture is disabled. Google sign-in needs the
-desktop app; use API keys on a server.
+to an untrusted network. The token is generated once, persisted with `0600`
+permissions in `~/.codifa/web-token`, and compared in constant time; behind a
+TLS proxy the session cookie is automatically flagged `Secure`. The strongest
+default is the `--service` install above: loopback-only bind, the systemd
+sandbox around it, and access through an SSH tunnel or a TLS proxy — nothing
+listens on the network until you deliberately change that. Desktop-only
+capabilities degrade gracefully in the browser: opening a workspace asks for
+an absolute server path, files open in the in-app viewer, and screen capture
+is disabled. Google sign-in needs the desktop app; use API keys on a server.
 
 ### ⌨️ Keyboard shortcuts
 
@@ -446,6 +464,19 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | sudo PREFIX=/usr/local bash
 ```
 
+**راه سخت‌گیرانه** — علاوه بر نصب، یک سرویس systemd هم راه می‌اندازد: سرور فقط
+روی `127.0.0.1` می‌شنود (هیچ چیزی به شبکه باز نیست؛ با SSH tunnel یا TLS proxy
+برسید)، موقع خرابی ری‌استارت می‌شود و داخل سندباکس systemd اجرا می‌شود
+(`$HOME` فقط-خواندنی، tmp خصوصی، بدون هیچ capability). روی سرور بدون مانیتور
+خودش سرور را داخل `xvfb-run` می‌پیچد (اول `xvfb` را نصب کنید). موقع استارت،
+آدرس توکن چاپ و در `~/.codifa/web-token` ذخیره می‌شود؛ با
+`ssh -L 8787:127.0.0.1:8787 user@server` تونل بزنید و URL را روی دستگاه خودتان
+باز کنید.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install-linux-server.sh | bash -s -- --service
+```
+
 برای قفل‌کردن روی یک نسخهٔ خاص، تگ را بدهید: `... | bash -s -- v2.0.1`.
 
 باینری سرور همان باینری دسکتاپ بدون پنجره است، پس همچنان به کتابخانه‌های
@@ -528,8 +559,13 @@ WantedBy=multi-user.target
 
 **امنیت:** سطح وب با توکن محافظت می‌شود (کوکی، `Authorization: Bearer` یا
 `?token=`)، اما سرور می‌تواند روی ماشین خودش دستور اجرا کند و فایل بخواند/بنویسد —
-پشت TLS (reverse proxy) یا VPN بگذارید و روی شبکه‌ی نامطمئن باز نکنید.
-قابلیت‌های فقط-دسکتاپ در مرورگر با ملایمت غیرفعال می‌شوند: انتخاب پوشه‌ی پروژه
+پشت TLS (reverse proxy) یا VPN بگذارید و روی شبکه‌ی نامطمئن باز نکنید. توکن
+یک بار ساخته می‌شود، با دسترسی `0600` در `~/.codifa/web-token` ذخیره می‌شود و
+با مقایسه‌ی زمان-ثابت سنجیده می‌شود؛ پشت پراکسی TLS، کوکی نشست خودکار پرچم
+`Secure` می‌گیرد. مطمئن‌ترین حالت همان نصب `--service` بالاست: bind فقط روی
+loopback، سندباکس systemd دور آن، و دسترسی از راه SSH tunnel یا TLS — تا وقتی
+خودتان عمداً عوضش نکنید، هیچ چیزی روی شبکه گوش نمی‌دهد. قابلیت‌های
+فقط-دسکتاپ در مرورگر با ملایمت غیرفعال می‌شوند: انتخاب پوشه‌ی پروژه
 مسیر مطلق سمت سرور را می‌پرسد، فایل‌ها در نمایشگر داخلی باز می‌شوند و ضبط صفحه
 از دسترس خارج است. ورود گوگل به اپ دسکتاپ نیاز دارد؛ روی سرور از کلید API
 استفاده کنید.

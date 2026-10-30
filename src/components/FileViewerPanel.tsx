@@ -16,6 +16,7 @@ import { mdComponents } from "./ChatMessage";
 import { getHighlightedLines } from "../lib/highlight";
 import { toWorkspacePath } from "../lib/fileTree";
 import { useVimScroll } from "../lib/useVimScroll";
+import { isEditableTarget } from "../lib/panePointer";
 
 /** Native PDF pane: WKWebView renders PDFs itself, so the viewer shows the
  *  file through a Blob object URL instead of backend-rasterized page images.
@@ -978,8 +979,28 @@ export function FileViewerPanel({
 
   useVimScroll(rootRef);
 
+  // A file opened from Ctrl+P, a chat chip or the explorer must land FOCUSED.
+  // The pane mounts fresh while the caret is still wherever it was (the
+  // quick-open box, the composer), and WebKit does not move focus on a click
+  // into non-editable text — so without this the vim scroll keys stay dead
+  // until the user clicks the pane (and clicks through its chrome twice).
+  useEffect(() => {
+    rootRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  // One click inside the viewer hands it the keyboard. The root is a tab
+  // stop (tabIndex -1 below); focusing it on mousedown gives panePointer a
+  // real caret inside the pane instead of the stale composer caret WebKit
+  // keeps parked, so h/j/k/l scroll on the FIRST click. Interactive targets
+  // keep their own focus (a button or the find box takes it after us).
+  const focusRootOnPointerDown = (e: React.MouseEvent) => {
+    const t = e.target as HTMLElement | null;
+    if (t && (isEditableTarget(t) || t.closest("button, a, select"))) return;
+    rootRef.current?.focus({ preventScroll: true });
+  };
+
   return (
-    <div ref={rootRef} className={`file-viewer${commentOpen ? " has-comment-open" : ""}`} dir={appDir} onMouseUp={(e) => { const t = e.target; requestAnimationFrame(() => requestAnimationFrame(() => refreshSelection(t))); }} onKeyUp={(e) => refreshSelection(e.target)}>
+    <div ref={rootRef} tabIndex={-1} className={`file-viewer${commentOpen ? " has-comment-open" : ""}`} dir={appDir} onMouseDown={focusRootOnPointerDown} onMouseUp={(e) => { const t = e.target; requestAnimationFrame(() => requestAnimationFrame(() => refreshSelection(t))); }} onKeyUp={(e) => refreshSelection(e.target)}>
       <div className="file-viewer-head" dir="ltr" style={{ direction: "ltr" }}>
         <FileIcon path={filePath} size={20} />
         {/* The name doubles as "show me this in the explorer": it activates the

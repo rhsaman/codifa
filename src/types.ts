@@ -230,8 +230,6 @@ export interface Settings {
   sttFallbacks?: SttFallback[]
   /** STT language hint sent to the provider ('fa', 'en', …). Empty = auto. */
   sttLanguage?: string
-  /** Extra STT prompt/glossary prepended to the built-in per-language prompt. */
-  sttPrompt?: string
   /** TTS source: a settings.providers id (remote OpenAI-compatible /audio/speech). */
   ttsProviderId?: string
   /** TTS model id sent to {base_url}/audio/speech (e.g. tts-1). */
@@ -408,6 +406,11 @@ export interface ToolActivity {
    *  search). Those results carry no file paths, so `items` stays empty and
    *  the text is rendered as-is instead of being dropped. */
   resultText?: string
+  /** Live output tail of a still-RUNNING `run_terminal` call (`tool_output`
+   *  events). Rendered as a live feed in the running card with a download
+   *  progress bar parsed out of it; cleared when the card resolves — the
+   *  final output arrives on the tool_result event. */
+  liveTail?: string
 }
 
 export interface TokenUsage {
@@ -809,7 +812,7 @@ export interface LspStatus {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'edit_target' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'tool_output' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'retry_giveup' | 'compact' | 'compact_start' | 'compact_progress' | 'compact_failed' | 'plan' | 'plan_card' | 'artifact' | 'edit_target' | 'mode_changed' | 'ctx_parts' | 'permission' | 'ask' | 'skill' | 'mcp' | 'mcp_loaded' | 'steer_applied' | 'steer_interrupt' | 'steer_dropped' | 'status' | 'keepalive'
   /** Status stage (e.g. 'lsp' for language-server install/update progress). */
   stage?: string
   /** edit_target: what an update session pins on the composer badge (the
@@ -868,6 +871,9 @@ export interface SidecarEvent {
    *  extracts file paths from it and renders clickable file chips instead
    *  of dumping the raw text. */
   result?: string
+  /** tool_output: live output tail of a still-RUNNING `run_terminal` call
+   *  (streamed every ~500 ms while the command runs). Pairs with `id`. */
+  tail?: string
   /** Which web-search provider produced the results (e.g. 'tavily'). */
   engine?: string
   /** True for events emitted by a sub-agent (explore's internal read/grep/glob)

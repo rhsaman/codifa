@@ -422,18 +422,12 @@ export async function transcribeAudio(
   onModelLoading?: (loading: boolean) => void,
   lang?: string,
   opts?: TranscribeProviderOpts,
-  prompt?: string,
 ): Promise<string> {
   const url = await ensureSidecar()
   if (!url) throw new Error('the local backend is not ready')
   const form = new FormData()
   form.append('audio', blob, 'clip.wav')
   if (lang) form.append('lang', lang)
-  // The prompt is BIASING CONTEXT for Whisper, not an instruction: the model
-  // treats it as text that preceded this audio and may continue it. Callers
-  // therefore send only a user glossary (see buildSttPrompt); an empty prompt
-  // is omitted entirely rather than substituted with a fabricated sentence.
-  if (prompt) form.append('prompt', prompt)
   if (opts) {
     form.append('provider', opts.kind)
     form.append('base_url', opts.baseUrl)
@@ -1573,6 +1567,28 @@ export async function respondPermission(
   return postAnswer('/permission/respond', { id, allowed })
 }
 
+/**
+ * Persist an "Always allow" folder grant for keeps.
+ *
+ * The renderer's own list is in-memory, so a folder approved "always" was asked
+ * for again after every relaunch. The backend stores the canonical path in
+ * `<data-root>/trusted-folders.json` and merges it into every later turn.
+ */
+export async function trustOutsideFolder(folder: string): Promise<boolean> {
+  return postAnswer('/permission/trust', { folder })
+}
+
+/**
+ * Persist an "Always allow" SSH host grant for keeps.
+ *
+ * The SSH connection gate stores the destination (`user@host`) in
+ * `<data-root>/trusted-hosts.json` and re-reads it on every terminal call, so
+ * a server approved here never asks again — in this workspace or a later one.
+ */
+export async function trustSshHost(host: string): Promise<boolean> {
+  return postAnswer('/permission/trust-host', { host })
+}
+
 /** Answer a pending ask_user question (multiple-choice or free-text) from the agent. */
 export async function respondAsk(id: string, answer: string): Promise<boolean> {
   return postAnswer('/ask/respond', { id, answer })
@@ -2460,6 +2476,8 @@ export interface AgentTerminalInfo {
   started_at_ms: number
   running: boolean
   exit_code?: number | null
+  /** زمانِ مشاهدهٔ خروج (epoch ms) — پنل ردیف را تا پایان پنجرهٔ grace نشان می‌دهد. */
+  exited_at_ms?: number | null
   /** مسیر لاگ خروجی (بیرون از workspace؛ زیر data root). */
   log_path: string
   /** PID پروسه — روی یونیکس همان رهبر گروه است (kill -- -PID). */

@@ -1715,6 +1715,42 @@ async fn permission_respond(Json(body): Json<Value>) -> Response<Body> {
     Json(json!({ "ok": ok })).into_response()
 }
 
+/// POST /permission/trust — persist an "Always allow" folder grant.
+///
+/// The popup's "Always allow" only updated the renderer's in-memory list, so the
+/// SAME folder was asked for again after every relaunch and workspace switch.
+/// This writes the canonical path into `<data-root>/trusted-folders.json`, which
+/// `outside_permit` merges into every later turn — interactive AND scheduled.
+async fn permission_trust(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    let folder = body["folder"].as_str().unwrap_or("").trim().to_string();
+    if folder.is_empty() {
+        return bad_request("folder is required");
+    }
+    let root = st.root().to_string_lossy().to_string();
+    match crate::agent::add_trusted_folder(&root, &folder) {
+        Ok(stored) => Json(json!({ "ok": true, "folder": stored })).into_response(),
+        Err(e) => bad_request(&e),
+    }
+}
+
+/// POST /permission/trust-host — persist an "Always allow" SSH host grant.
+///
+/// The SSH connection gate (`agent::ask_ssh_access`) reads
+/// `<data-root>/trusted-hosts.json` on every `run_terminal` call, so a host
+/// approved here never prompts again — the SSH counterpart of the folder
+/// grant above.
+async fn permission_trust_host(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
+    let host = body["host"].as_str().unwrap_or("").trim().to_string();
+    if host.is_empty() {
+        return bad_request("host is required");
+    }
+    let root = st.root().to_string_lossy().to_string();
+    match crate::agent::add_trusted_host(&root, &host) {
+        Ok(stored) => Json(json!({ "ok": true, "host": stored })).into_response(),
+        Err(e) => bad_request(&e),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct PlanQuery {
     root: String,
@@ -2320,6 +2356,8 @@ pub fn router(state: AppState) -> Router {
         // while the agent stayed blocked forever.
         .route("/ask/respond", post(ask_respond))
         .route("/permission/respond", post(permission_respond))
+        .route("/permission/trust", post(permission_trust))
+        .route("/permission/trust-host", post(permission_trust_host))
         .route("/chats/:chat_id/traces", get(crate::trace::traces_list))
         .route("/chats/:chat_id/traces", delete(crate::trace::traces_clear))
         .route("/plan", get(plan_get))

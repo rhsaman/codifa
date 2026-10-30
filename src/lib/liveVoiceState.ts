@@ -40,6 +40,20 @@ export function claimLiveVoice(chatId: string | null): boolean {
 }
 
 /**
+ * Peek at the current lease holder WITHOUT claiming it.
+ *
+ * The store's live-voice state only knows about LIVE sessions, so a panel
+ * cannot see from the store alone that another chat's DICTATE session is
+ * holding the microphone. Callers check here before they stamp 'connecting'
+ * into the store or open a fallback capture: both used to proceed against a
+ * hidden dictate session, leaving a ghost live panel in one chat while the
+ * dictating chat kept the mic.
+ */
+export function liveVoiceLeaseHolder(): string | null {
+  return liveVoiceLease;
+}
+
+/**
  * Bind the lease to the live state so it is never left dangling: a session that
  * is already running takes the lease for its chat, and the lease is released as
  * soon as no session is busy — which also covers an owner panel that unmounted
@@ -50,7 +64,12 @@ export function syncLiveVoiceLease(chatId: string | null | undefined, busy: bool
     liveVoiceLease = null;
     return;
   }
-  if (chatId) liveVoiceLease = chatId;
+  // Bind, never STEAL: a panel whose startLive stamped 'connecting' into the
+  // store and then lost the claim must not overwrite the lease of the chat
+  // that actually holds the microphone — the dictating chat would keep
+  // running with its release silently broken, and every later session in any
+  // chat would be refused against a holder that no longer exists.
+  if (chatId && (liveVoiceLease === null || liveVoiceLease === chatId)) liveVoiceLease = chatId;
 }
 
 /** Release the lease, optionally only when it belongs to `chatId`. */

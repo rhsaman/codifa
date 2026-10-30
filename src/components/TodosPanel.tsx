@@ -6,7 +6,8 @@ import { listAgentTerminals, stopAgentTerminal } from "../lib/api";
 import type { AgentTerminalInfo } from "../lib/api";
 import {
   formatRunningFor,
-  runningAgentTerminals,
+  visibleAgentTerminals,
+  terminalExitLabel,
 } from "../lib/agentTerminals";
 import { TurnUsagePanel } from "./TurnUsagePanel";
 import type { ChatMessage } from "../types";
@@ -271,7 +272,9 @@ export function TodosPanel() {
  *  مثل «Start vite dev server» در zcode): عنوان + شمارندهٔ «N running»،
  *  یک ردیف به‌ازای هر ترمینال زندهٔ همین چت با تایمر «Running for …» و دکمهٔ
  *  Stop. فهرست هر ۲ ثانیه از بک‌اند پول می‌شود (registry سمت Rust است و بعد از
- *  تمام‌شدن ترن هم زنده می‌ماند)؛ تایمر خودش هر ثانیه تیک می‌خورد. چیزی برای
+ *  تمام‌شدن ترن هم زنده می‌ماند)؛ تایمر خودش هر ثانیه تیک می‌خورد. ردیف‌های
+ *  خروج‌یافتهٔ تازه هم تا پایان پنجرهٔ grace با کد خروج می‌مانند — دستور کوتاهی
+ *  که بین دو پول تمام می‌شود بدون این هیچ‌وقت دیده نمی‌شد. چیزی برای
  *  نشان‌دادن نیست، بخش اصلاً رندر نمی‌شود تا پنل بی‌دلیل شلوغ نشود. */
 export function TerminalsSection() {
   const activeChatId = useStore((s) => s.activeChatId);
@@ -301,7 +304,11 @@ export function TerminalsSection() {
     };
   }, [activeChatId]);
 
-  const running = runningAgentTerminals(terminals);
+  // زنده‌ها + خروج‌یافته‌های داخل پنجرهٔ grace. با Date.now() در خودِ رندر
+  // محاسبه می‌شود تا انقضای grace بدون تایمر اضافه، با همان پول بعدی (≤۲s)
+  // اعمال شود — نه state اضافه، نه رندر تازه‌ای که فقط برای انقضا بخورد.
+  const visible = visibleAgentTerminals(terminals, Date.now());
+  const running = visible.filter((t) => t.running);
   // تیک ثانیه‌ای فقط وقتی چیزی در حال اجراست — وقتی ردیفی نیست، هیچ چیز هر
   // ثانیه عوض نمی‌شود که رندر تازه بخواهد.
   const hasRunning = running.length > 0;
@@ -311,7 +318,7 @@ export function TerminalsSection() {
     return () => window.clearInterval(t);
   }, [hasRunning]);
 
-  if (!hasRunning) return null;
+  if (visible.length === 0) return null;
 
   const stop = (id: string) => {
     setStopping((prev) => {
@@ -328,13 +335,18 @@ export function TerminalsSection() {
     <div className="sidebar-panel terminals-docked" dir="ltr">
       <div className="sidebar-panel-head">
         <span className="sidebar-panel-title">Background terminals</span>
-        <span className="terminals-bg-count">
-          {running.length} running
-        </span>
+        {hasRunning && (
+          <span className="terminals-bg-count">
+            {running.length} running
+          </span>
+        )}
       </div>
       <ul className="terminals-list">
-        {running.map((t) => (
-          <li className="terminals-item" key={t.id}>
+        {visible.map((t) => (
+          <li
+            className={`terminals-item${t.running ? "" : " exited"}`}
+            key={t.id}
+          >
             <span className="terminals-icon" aria-hidden="true">
               <svg
                 width="15"
@@ -359,18 +371,28 @@ export function TerminalsSection() {
                 {t.command}
               </div>
               <div className="terminals-meta">
-                <span className="terminals-elapsed">
-                  Running for {formatRunningFor(now - t.started_at_ms)}
-                </span>
-                <button
-                  type="button"
-                  className="terminals-stop"
-                  disabled={stopping.has(t.id)}
-                  onClick={() => stop(t.id)}
-                >
-                  <span className="terminals-stop-square" aria-hidden="true" />
-                  {stopping.has(t.id) ? "Stopping…" : "Stop"}
-                </button>
+                {t.running ? (
+                  <>
+                    <span className="terminals-elapsed">
+                      Running for {formatRunningFor(now - t.started_at_ms)}
+                    </span>
+                    <button
+                      type="button"
+                      className="terminals-stop"
+                      disabled={stopping.has(t.id)}
+                      onClick={() => stop(t.id)}
+                    >
+                      <span className="terminals-stop-square" aria-hidden="true" />
+                      {stopping.has(t.id) ? "Stopping…" : "Stop"}
+                    </button>
+                  </>
+                ) : (
+                  <span
+                    className={`terminals-exit${t.exit_code ? " bad" : ""}`}
+                  >
+                    {terminalExitLabel(t)}
+                  </span>
+                )}
               </div>
             </div>
           </li>

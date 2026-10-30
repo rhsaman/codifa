@@ -10,22 +10,43 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub const MAX_READ_BYTES: usize = 2_000_000;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const MAX_FILES: usize = 10_000;
 pub const MAX_TERMINAL_OUTPUT: usize = 10_000;
 
-/// Hard ceiling for a foreground terminal call, whichever side asks for it.
+/// The ONE budget of a foreground tool wait — chat and scheduled alike.
 ///
 /// The schema hands `timeout` to the MODEL, and nothing validated it: a prompt
 /// that wanted a long-running monitor once sent a 5400-second foreground call
 /// and the tool sat on it for the full 90 minutes while the turn (and the
 /// scheduled run row) stayed `running` with no error anywhere. A long job is
-/// what `background=true` is for — the schema says so — so a foreground call
-/// longer than this is clipped to the ceiling, mirroring the plugin-script
-/// ceiling (`SCRIPT_TIMEOUT_MAX` in plugins.rs).
-pub const MAX_TERMINAL_TIMEOUT_SECS: u64 = 600;
+/// what `background=true` is for, so a foreground call past this is clipped.
+///
+/// Deliberately ONE number: there is no second, larger "headless" budget. A paid
+/// plugin script (article + image) legitimately takes minutes, and a run killed
+/// mid-way pays for the same work twice, so the wait has to outlast the work in
+/// both contexts.
+pub const MAX_TERMINAL_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Live-output sink for a RUNNING terminal command: called periodically with
+/// the current tail of the combined output while the child is still alive.
+/// The agent loop forwards it to the UI as `ToolOutput` events, so a long
+/// download or build is visible in the chat while it runs instead of only
+/// after the command returns.
+pub type TailSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Minimum wall-clock gap between two `TailSink` calls for one command. The
+/// poll loop ticks every 20 ms; without this gate a 30-minute command would
+/// push a tail 90 000 times.
+const TERMINAL_TAIL_EMIT_MS: u64 = 500;
+
+/// Size of the live tail handed to `TailSink` — the LAST bytes of the output.
+/// A curl progress refresh writes ~90 bytes per second, so this covers the
+/// most recent minute or so of a typical download.
+const TERMINAL_TAIL_BYTES: usize = 4096;
 /// Hard depth cap for filesystem walks (`collect_files`) — a second belt next
 /// to the canonical-path visited set, so a pathological tree cannot blow the
 /// stack.
@@ -80,10 +101,11 @@ fn grep_followup_hint(pattern: &str, result: &str) -> String {
     // guess must be a different NAME, not a wider window of the same file.
     if result.starts_with("no matches") {
         return clip_hint(
-            "\n[hint] No hit anywhere in that scope — do not re-read the file to confirm. \
-Name the token differently (a sibling symbol, a call site, the type it flows into) or widen \
-path/include once; if the name is one identifier, `find_symbol` also reports every USAGE, \
-which a grep on a single spelling misses.",
+            "\n[hint] No hit anywhere in that scope — spelling variants (snake/camel/Pascal) \
+were already searched automatically, so the name itself is absent: do not re-read the file \
+to confirm. Think of a DIFFERENT name (a sibling symbol, a call site, the type it flows into) \
+or widen path/include once; if the concept is an identifier you can name, `find_symbol` also \
+reports every USAGE.",
         );
     }
     let alts: Vec<&str> = pattern.split('|').map(str::trim).filter(|p| !p.is_empty()).collect();
@@ -125,9 +147,9 @@ reading several of them.",
 ///
 /// Bounded like every other tool result: the window it rides on is small, and
 /// a server that lists dozens of errors must not blow the edit's own budget.
-fn post_edit_diagnostics(root: &str, path: &str) -> String {
+fn post_edit_diagnostics(root: &str, path: &str, permit: Option<&Value>) -> String {
     const POST_EDIT_DIAGNOSTICS_CAP: usize = 2_000;
-    let Some(text) = crate::lsp::diagnostics_if_warm(root, path) else {
+    let Some(text) = crate::lsp::diagnostics_if_warm(root, path, permit) else {
         return String::new();
     };
     // "No diagnostics" is worth saying: it is the answer that saves the
@@ -474,6 +496,37 @@ pub fn lookup_paths(name: &str, args: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// The path a WRITER or script-run call would touch, for the pre-flight access
+/// gate. Kept apart from `lookup_paths` because the caller gates it on the
+/// mode's write capability: a read-only mode refuses these calls outright, so
+/// asking for a folder first would only show a popup whose answer changes
+/// nothing.
+///
+/// Without this, an out-of-tree write was answered by its own `resolve_safe`
+/// refusal AFTER the round was paid (traced: `edit_file` on
+/// `~/local-models-server/stt-server.py` refused, the model re-attempted the
+/// change through a shell one-liner, and THAT asked the popup the write should
+/// have asked — one grant served two tools, one refusal served none).
+pub fn writer_gate_paths(name: &str, args: &Value) -> Vec<String> {
+    let one = |key: &str| -> Vec<String> {
+        let p = args[key].as_str().unwrap_or_default().trim().to_string();
+        if p.is_empty() {
+            Vec::new()
+        } else {
+            vec![p]
+        }
+    };
+    match name {
+        "write_file" | "edit_file" => one("path"),
+        // A script run with an explicit working folder reads and writes around
+        // it; the DEFAULT (the bundle's own folder inside ~/.codifa) needs no
+        // gate, an explicit one does. This is the plugin-side rule: the bundle
+        // folder, ~/.codifa and the OS temp tree stay open, anything else asks.
+        "plugin" => one("cwd"),
+        _ => Vec::new(),
+    }
 }
 
 /// Lexical normalization without requiring the path to exist: collapses `.`
@@ -1250,7 +1303,11 @@ pub fn grep_scope_in(
         .arg("--json")
         .arg("--line-number")
         .arg("--max-count")
-        .arg(cap.to_string())
+        // Per-FILE bound only: the global budget is applied at formatting time
+        // (definition lines first, then a fair spread across files), so the
+        // count has to be large enough that the selection sees the real mass
+        // of a file instead of the first `cap` hits rg happens to emit.
+        .arg(RG_PER_FILE_MATCH_CAP.to_string())
         .arg("--no-messages");
     if ctx > 0 {
         cmd.arg("--context").arg(ctx.to_string());
@@ -1272,87 +1329,342 @@ pub fn grep_scope_in(
         return Err(String::from_utf8_lossy(&raw.stderr).trim().to_string());
     }
 
-    // Parse rg --json events and rebuild the walker's header+marker format.
-    let mut out = String::new();
-    let mut hits = 0usize;
-    let mut current_file = String::new();
-    let mut pending: Vec<(bool, u64, String)> = Vec::new(); // (is_match, line_no, text)
-    // Index in `pending` of the first match dropped because the cap was reached.
-    // Everything from there on belongs to that dropped match (its before/after
-    // context), so the block is cut at that index. `--max-count` is per FILE,
-    // so later files kept emitting context after the global cap was hit and the
-    // output ended with blocks that had NO match in them — pure waste.
-    let mut drop_from: Option<usize> = None;
-    for line in String::from_utf8_lossy(&raw.stdout).lines() {
-        let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
-        let kind = ev["type"].as_str().unwrap_or_default();
-        if kind == "begin" {
-            let path = ev["data"]["path"]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            // Join against search_dir (the scope's PARENT when the scope is a
-            // single file) — joining against scope_abs itself doubled the
-            // path (file/filename), producing unopenable chips.
-            let abs = search_dir.join(&path);
-            let abs = abs.components().collect::<std::path::PathBuf>();
-            current_file = abs
-                .strip_prefix(&root_real)
-                .unwrap_or(&abs)
-                .to_string_lossy()
-                .to_string();
-            drop_from = None;
-        } else if kind == "match" || kind == "context" {
-            let text = ev["data"]["lines"]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .trim_end_matches('\n')
-                .to_string();
-            let line_no = ev["data"]["line_number"].as_u64().unwrap_or(0);
-            if kind == "match" {
-                if hits >= cap {
-                    if drop_from.is_none() {
-                        drop_from = Some(pending.len());
+    let (out, shown, total_matches, files_with_matches) =
+        format_rg_output(&raw.stdout, &search_dir, &root_real, cap, ctx);
+    if total_matches == 0 {
+        // A literal miss is often a SPELLING mismatch, not a wrong idea: the
+        // model greps `script.json` and the code says `script_json`. Trace,
+        // Oct 30: that exact refinement cost a second round-trip — the model
+        // re-grepped with `script\.json|fa_keywords`, then again with
+        // `script\.json|script_json|ScriptJson`. Run the convention variants
+        // ONCE here, in the same call, and label them so the model knows the
+        // literal itself has no hit. Fires only on a single identifier-ish
+        // token (no regex metachars, no `|`), never replaces a real hit.
+        if let Some(variants) = name_variant_pattern(pattern) {
+            let mut vcmd = std::process::Command::new(rg_binary());
+            vcmd.current_dir(&search_dir)
+                .arg("--json")
+                .arg("--line-number")
+                .arg("--max-count")
+                .arg(RG_PER_FILE_MATCH_CAP.to_string())
+                .arg("--no-messages");
+            if ctx > 0 {
+                vcmd.arg("--context").arg(ctx.to_string());
+            }
+            if ignore_case {
+                vcmd.arg("--ignore-case");
+            }
+            if !include.is_empty() {
+                vcmd.arg("--glob").arg(include);
+            }
+            vcmd.arg("--").arg(&variants).arg(&search_target);
+            if let Ok(vraw) = vcmd.output() {
+                if vraw.status.code() != Some(2) {
+                    let (vout, _vshown, vtotal, _) =
+                        format_rg_output(&vraw.stdout, &search_dir, &root_real, cap, ctx);
+                    if vtotal > 0 {
+                        return Ok(format!(
+                            "[no literal hit for {pattern:?} in this scope — the matches below \
+are SPELLING-VARIANT hits ({variants}); the exact string does not exist]\n\n{vout}"
+                        ));
                     }
-                    continue;
                 }
-                hits += 1;
-            }
-            pending.push((kind == "match", line_no, text));
-        } else if kind == "end" {
-            if let Some(cut) = drop_from {
-                pending.truncate(cut);
-            }
-            // A block is worth printing only while it still CONTAINS a match:
-            // context lines of a dropped match carry no information the model
-            // can act on and cost tokens on every later step of the turn.
-            let has_match = pending.iter().any(|(is_match, _, _)| *is_match);
-            if has_match && !current_file.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&current_file);
-                out.push_str(":\n");
-                for (is_match, line_no, text) in &pending {
-                    let marker = if *is_match { ">" } else { " " };
-                    // Char-boundary-safe: a raw byte slice panics (and with
-                    // panic=abort kills the app) on a multi-byte Persian char.
-                    let body = truncated_line(text);
-                    out.push_str(&format!("{marker}{line_no}: {body}\n"));
-                }
-                pending.clear();
             }
         }
-    }
-    if hits >= cap {
-        out.push_str(&format!(
-            "\n[truncated — {hits}+ matches; read the shown files instead of re-grepping]\n"
-        ));
-    }
-    if hits == 0 {
         return Ok("no matches".into());
     }
+    let _ = (shown, files_with_matches);
     Ok(out)
+}
+
+/// rg emits at most this many matches PER FILE; the global budget is applied
+/// when formatting. Large enough to see a file's real mass, small enough that
+/// a minified bundle cannot flood the parse.
+const RG_PER_FILE_MATCH_CAP: usize = 400;
+/// Hard bound on collected match/context rows across ALL files, so a huge
+/// multi-file hit set stays a bounded parse (rows beyond it are simply not
+/// candidates for display; the counts already collected still report).
+const RG_COLLECT_ROW_CAP: usize = 20_000;
+
+/// One file's parsed rg stream: every match/context row rg emitted for it, in
+/// order, plus the indices of the match rows.
+struct GrepFile {
+    name: String,
+    lines: Vec<(bool, u64, String)>,
+    matches: Vec<usize>,
+}
+
+/// True when a line LOOKS like a code declaration — the thing a code search
+/// is usually hunting. Definition lines are shown first inside the budget:
+/// traced refinement chains (grep → weaker-than-hoped hits → re-grep with a
+/// narrower pattern) almost always started from a cap that spent its lines on
+/// call sites while the declaration the model needed sat past the cut.
+fn looks_like_definition(line: &str) -> bool {
+    let mut t = line.trim_start();
+    if let Some(rest) = t.strip_prefix("pub ") {
+        t = rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("export ") {
+        t = rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("default ") {
+        t = rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("async ") {
+        t = rest.trim_start();
+    }
+    ["struct ", "enum ", "fn ", "impl ", "trait ", "const ", "static ", "type ", "mod ",
+     "class ", "def ", "interface ", "function ", "func ", "macro_rules"]
+        .iter()
+        .any(|kw| t.starts_with(kw))
+}
+
+/// Parse `rg --json` output and build the display: per-file blocks, the global
+/// budget of `cap` MATCH lines spent definition-lines-first and then spread
+/// fairly across files, context windows around shown matches, and a one-line
+/// mass signal for every matching file whose hits did not make the budget.
+/// Returns (text, shown_matches, total_matches, files_with_matches).
+fn format_rg_output(
+    stdout: &[u8],
+    search_dir: &std::path::Path,
+    root_real: &std::path::Path,
+    cap: usize,
+    ctx: usize,
+) -> (String, usize, usize, usize) {
+    // ---- parse ------------------------------------------------------------
+    let mut files: Vec<GrepFile> = Vec::new();
+    let mut total_matches = 0usize;
+    let mut rows = 0usize;
+    {
+        let mut current: Option<GrepFile> = None;
+        for line in String::from_utf8_lossy(stdout).lines() {
+            let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+            let kind = ev["type"].as_str().unwrap_or_default();
+            if kind == "begin" {
+                let path = ev["data"]["path"]["text"].as_str().unwrap_or_default();
+                let abs = search_dir.join(path);
+                let abs = abs.components().collect::<std::path::PathBuf>();
+                let name = abs
+                    .strip_prefix(root_real)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(f) = current.take() {
+                    files.push(f);
+                }
+                current = Some(GrepFile { name, lines: Vec::new(), matches: Vec::new() });
+            } else if (kind == "match" || kind == "context") && current.is_some() {
+                if rows >= RG_COLLECT_ROW_CAP {
+                    continue;
+                }
+                rows += 1;
+                let text = ev["data"]["lines"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_end_matches('\n')
+                    .to_string();
+                let line_no = ev["data"]["line_number"].as_u64().unwrap_or(0);
+                let f = current.as_mut().unwrap();
+                if kind == "match" {
+                    f.matches.push(f.lines.len());
+                    total_matches += 1;
+                }
+                f.lines.push((kind == "match", line_no, text));
+            } else if kind == "end" {
+                if let Some(f) = current.take() {
+                    files.push(f);
+                }
+            }
+        }
+        if let Some(f) = current.take() {
+            files.push(f);
+        }
+    }
+    let files: Vec<GrepFile> = files.into_iter().filter(|f| !f.matches.is_empty()).collect();
+    let files_with_matches = files.len();
+    if total_matches == 0 || files.is_empty() {
+        return (String::new(), 0, total_matches, 0);
+    }
+
+    // ---- select: definitions first, then a fair spread ---------------------
+    let mut selected: Vec<Vec<usize>> = files.iter().map(|_| Vec::new()).collect();
+    let mut taken = 0usize;
+    'defs: for f in 0..files.len() {
+        let defs: Vec<usize> = files[f]
+            .matches
+            .iter()
+            .copied()
+            .filter(|i| looks_like_definition(&files[f].lines[*i].2))
+            .collect();
+        for i in defs.into_iter().take(3) {
+            if taken >= cap {
+                break 'defs;
+            }
+            selected[f].push(i);
+            taken += 1;
+        }
+    }
+    'fill: loop {
+        let mut progressed = false;
+        for f in 0..files.len() {
+            if taken >= cap {
+                break 'fill;
+            }
+            if let Some(i) = files[f].matches.iter().find(|i| !selected[f].contains(i)) {
+                selected[f].push(*i);
+                taken += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let shown = taken;
+
+    // ---- format ------------------------------------------------------------
+    let mut out = String::new();
+    let mut shown_files = 0usize;
+    for (f, file) in files.iter().enumerate() {
+        if selected[f].is_empty() {
+            continue;
+        }
+        shown_files += 1;
+        // Expand each selected match to its context window over the file's
+        // stream, merge overlaps, emit in stream order.
+        let mut want = vec![false; file.lines.len()];
+        for &i in &selected[f] {
+            let lo = i.saturating_sub(ctx);
+            let hi = (i + ctx).min(file.lines.len().saturating_sub(1));
+            for w in lo..=hi {
+                want[w] = true;
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&file.name);
+        out.push_str(":\n");
+        let mut emitted_match = false;
+        for (i, (is_match, line_no, text)) in file.lines.iter().enumerate() {
+            if !want[i] {
+                continue;
+            }
+            let marker = if *is_match { ">" } else { " " };
+            if *is_match {
+                emitted_match = true;
+            }
+            // Char-boundary-safe: a raw byte slice panics (and with
+            // panic=abort kills the app) on a multi-byte Persian char.
+            let body = truncated_line(text);
+            out.push_str(&format!("{marker}{line_no}: {body}\n"));
+        }
+        debug_assert!(emitted_match);
+    }
+    // The files the budget could not reach still carry signal — the mass
+    // tells the model where to read WITHOUT a second, narrowed grep.
+    let silent: Vec<String> = files
+        .iter()
+        .enumerate()
+        .filter(|(f, _)| selected[*f].is_empty())
+        .map(|(_, file)| {
+            format!(
+                "{}: {} match(es) not shown",
+                file.name,
+                file.matches.len().min(RG_PER_FILE_MATCH_CAP)
+            )
+        })
+        .collect();
+    if !silent.is_empty() {
+        out.push_str(&format!("\n{}\n", silent.join("\n")));
+    }
+    if total_matches > shown {
+        out.push_str(&format!(
+            "\n[truncated — {total_matches} matches in {files_with_matches} file(s), {shown} shown \
+across {shown_files} file(s); narrow with path/include, or read a named file]\n"
+        ));
+    }
+    (out, shown, total_matches, files_with_matches)
+}
+
+/// Split an identifier-ish token into its alpha segments across naming
+/// conventions: `script.json` / `SCRIPT_TIMEOUT` / `scriptJson` / `script-json`
+/// all split to ["script", "json"]. `None` when the token is not a plain name
+/// (regex metachars, too long, empty) — a variant search only makes sense for
+/// identifiers.
+fn identifier_segments(token: &str) -> Option<Vec<String>> {
+    if token.is_empty() || token.len() > 64 || token.contains('|') {
+        return None;
+    }
+    // A model writes a literal dot as `\.` (traced miss: `script\.json`).
+    // Strip the regex escapes — the remaining shape decides whether this is a
+    // plain name worth re-spelling.
+    let cleaned: String = token.chars().filter(|c| *c != '\\').collect();
+    if cleaned.is_empty()
+        || !cleaned
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let mut segs: Vec<String> = Vec::new();
+    for part in cleaned.split(|c| c == '_' || c == '-' || c == '.') {
+        if part.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = part.chars().collect();
+        let mut cur = String::new();
+        for (i, &c) in chars.iter().enumerate() {
+            // camelCase / PascalCase boundary: an uppercase that follows a
+            // lowercase. ALL-CAPS parts rely on the `_`/`.`/`-` split above.
+            if c.is_uppercase() && i > 0 && chars[i - 1].is_lowercase() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            segs.push(cur);
+        }
+    }
+    if segs.is_empty() {
+        None
+    } else {
+        Some(segs.iter().map(|s| s.to_lowercase()).collect())
+    }
+}
+
+/// The spelling variants of a segmented name as one alternation:
+/// ["script","json"] → `script_json|scriptJson|ScriptJson|SCRIPT_JSON`.
+/// `None` when the input has no segments or every variant equals the input
+/// (nothing to learn from a re-spelling of itself).
+fn name_variant_pattern(pattern: &str) -> Option<String> {
+    let segs = identifier_segments(pattern)?;
+    let cap_first = |s: &str| -> String {
+        let mut cs = s.chars();
+        match cs.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
+            None => String::new(),
+        }
+    };
+    let snake = segs.join("_");
+    let camel = format!(
+        "{}{}",
+        segs[0],
+        segs[1..].iter().map(|s| cap_first(s)).collect::<String>()
+    );
+    let pascal: String = segs.iter().map(|s| cap_first(s)).collect();
+    let upper = snake.to_uppercase();
+    let mut variants = vec![snake.clone(), camel, pascal, upper];
+    let kebab = segs.join("-");
+    if kebab != snake {
+        variants.push(kebab);
+    }
+    variants.sort();
+    variants.dedup();
+    if variants.len() == 1 && variants[0] == pattern {
+        return None;
+    }
+    Some(variants.join("|"))
 }
 
 /// Translate a glob like `*.{ts,tsx}`, `**/*.test.py` or `src/**/mod.rs` into
@@ -1624,6 +1936,50 @@ pub fn edit_file(
 /// Run a shell command in `root` with a timeout, returning combined output.
 /// Mirrors tools.py run_terminal: kill on timeout, cap the output.
 pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
+    run_terminal_bounded(root, command, timeout_secs, MAX_TERMINAL_TIMEOUT_SECS)
+}
+
+/// Same as [`run_terminal`], with an explicit ceiling instead of the global
+/// one.
+///
+/// A plugin-script run passes its own bound here: a paid article/image call
+/// legitimately takes minutes, so the script's window is decided by the plugin
+/// layer rather than inherited from the terminal default.
+pub fn run_terminal_bounded(
+    root: &str,
+    command: &str,
+    timeout_secs: u64,
+    ceiling: u64,
+) -> Result<String, String> {
+    run_terminal_bounded_with(root, command, timeout_secs, ceiling, None)
+}
+
+/// The last `max` bytes of the combined output buffer, as lossy UTF-8 cut on a
+/// char boundary (the buffer can end mid-char while a reader holds half of a
+/// Persian/emoji codepoint).
+fn combined_tail(output: &Mutex<Vec<u8>>, max: usize) -> String {
+    let guard = output.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        return String::new();
+    }
+    let mut cut = guard.len().saturating_sub(max);
+    // A byte position is a char boundary unless it lands INSIDE a multi-byte
+    // UTF-8 sequence (a continuation byte: 0b10xxxxxx).
+    while cut < guard.len() && (guard[cut] & 0xC0) == 0x80 {
+        cut += 1;
+    }
+    String::from_utf8_lossy(&guard[cut..]).into_owned()
+}
+
+/// Same as [`run_terminal_bounded`], plus an optional [`TailSink`] that
+/// receives the live output tail while the command is still running.
+pub fn run_terminal_bounded_with(
+    root: &str,
+    command: &str,
+    timeout_secs: u64,
+    ceiling: u64,
+    on_tail: Option<&TailSink>,
+) -> Result<String, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1632,10 +1988,20 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
 
     let start = Instant::now();
     // Second belt beside the dispatch-side clamp: EVERY caller of this
-    // function (plugin scripts included) is bounded by the same ceiling, so a
-    // future caller cannot re-open the hole the dispatch clamp closed.
-    let timeout_secs = {
-        let clamped = timeout_secs.min(MAX_TERMINAL_TIMEOUT_SECS);
+    // function is bounded by the caller's ceiling, so a future caller cannot
+    // re-open the hole the dispatch clamp closed.
+    //
+    // TWO zeroes mean "wait for the child, however long it takes":
+    //  * `timeout_secs == 0` — the caller wants no deadline (a plugin script,
+    //    which must never be killed after it has already paid for its work);
+    //  * `ceiling == 0` — the caller has no cap to impose, so its own value is
+    //    used as given instead of being clipped.
+    let timeout_secs = if timeout_secs == 0 {
+        0
+    } else if ceiling == 0 {
+        timeout_secs
+    } else {
+        let clamped = timeout_secs.min(ceiling);
         if clamped != timeout_secs {
             eprintln!(
                 "[tool] run_terminal: caller asked for {timeout_secs}s; bounded to {clamped}s"
@@ -1658,7 +2024,9 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
         .spawn()
         .map_err(|e| format!("cannot spawn: {e}"))?;
 
-    let deadline = Duration::from_secs(timeout_secs);
+    // `None` = unbounded: the loop below then only exits on child exit or a
+    // full output buffer.
+    let deadline = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
     let cap = MAX_TERMINAL_OUTPUT * 2;
     let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let drained = Arc::new(AtomicUsize::new(0));
@@ -1682,10 +2050,15 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.len() >= cap {
-                            break;
+                        // Past the cap the bytes are DISCARDED but the pipe keeps
+                        // being drained: an unbounded child (a plugin script) that
+                        // writes more than the buffer must never block on a full
+                        // pipe, because there is no deadline left to rescue it.
+                        if guard.len() < cap {
+                            let room = cap - guard.len();
+                            let take = n.min(room);
+                            guard.extend_from_slice(&buf[..take]);
                         }
-                        guard.extend_from_slice(&buf[..n]);
                     }
                 }
             }
@@ -1703,10 +2076,11 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.len() >= cap {
-                            break;
+                        if guard.len() < cap {
+                            let room = cap - guard.len();
+                            let take = n.min(room);
+                            guard.extend_from_slice(&buf[..take]);
                         }
-                        guard.extend_from_slice(&buf[..n]);
                     }
                 }
             }
@@ -1716,8 +2090,14 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
     }
 
     let mut overflowed = false;
+    // Live-output ticker: every TERMINAL_TAIL_EMIT_MS the current tail of the
+    // combined output goes to `on_tail` while the child is still alive. Only a
+    // GROWN buffer emits — a command sitting quiet (a build with no new
+    // output) does not re-send the same bytes.
+    let mut next_tail = Duration::from_millis(TERMINAL_TAIL_EMIT_MS);
+    let mut last_tail_len = 0usize;
     let timed_out = loop {
-        if start.elapsed() > deadline {
+        if deadline.map(|d| start.elapsed() > d).unwrap_or(false) {
             break true;
         }
         match child.try_wait() {
@@ -1725,12 +2105,31 @@ pub fn run_terminal(root: &str, command: &str, timeout_secs: u64) -> Result<Stri
             // Still running (or the wait itself failed) — keep polling.
             Ok(None) | Err(_) => {}
         }
-        // Once either stream filled the cap there is nothing left to gain by
-        // waiting: the child is killed below, which also closes the pipes.
-        let full = output.lock().map(|o| o.len() >= cap).unwrap_or(false);
-        if full {
-            overflowed = true;
-            break false;
+        // Once either stream filled the cap a BOUNDED call has nothing left to
+        // gain by waiting: the child is killed below, which also closes the
+        // pipes. An UNBOUNDED one (a plugin script) is never killed for talking
+        // too much — it keeps running to completion and its output is truncated
+        // at the end, since killing it after it already paid for its work is the
+        // very bug this budget was introduced to stop.
+        if deadline.is_some() {
+            let full = output.lock().map(|o| o.len() >= cap).unwrap_or(false);
+            if full {
+                overflowed = true;
+                break false;
+            }
+        }
+        if let Some(sink) = on_tail {
+            if start.elapsed() >= next_tail {
+                next_tail = start.elapsed() + Duration::from_millis(TERMINAL_TAIL_EMIT_MS);
+                let len = output.lock().map(|o| o.len()).unwrap_or(0);
+                if len != last_tail_len {
+                    last_tail_len = len;
+                    let tail = combined_tail(&output, TERMINAL_TAIL_BYTES);
+                    if !tail.is_empty() {
+                        sink(&tail);
+                    }
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -1916,6 +2315,33 @@ fn plugin_keyword_warning(store: &Path, view: &Value) -> String {
     )
 }
 
+/// Warn when a bundle's scripts hard-code a `$HOME` path outside their own
+/// folder.
+///
+/// Same shape as [`plugin_keyword_warning`]: the model writes the source, and a
+/// literal home path looks perfectly fine until the bundle runs somewhere else —
+/// or, worse, until a scheduled run (who nobody can answer a permission gate)
+/// touches it. The warning rides AFTER the JSON so the reply stays
+/// machine-readable up to the first newline.
+fn plugin_detached_path_warning(store: &Path, view: &Value) -> String {
+    let Some(slug) = view["slug"].as_str() else {
+        return String::new();
+    };
+    let paths = crate::plugins::script_outside_paths(store, slug);
+    if paths.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nWARNING: these absolute $HOME paths are hard-coded in the bundle's scripts but sit \
+         OUTSIDE the bundle folder: {}. A bundle must resolve its own files relative to itself \
+         (the runner starts a script with the bundle as its working directory) — a literal stops \
+         being true when the bundle is installed elsewhere, and any other $HOME path is outside \
+         every root a scheduled run may touch, which stalls the run on a permission gate nobody \
+         can answer. Rewrite them with action=update.",
+        paths.join(", ")
+    )
+}
+
 /// Find a skill by words when the prompt's catalog does not cover the task.
 ///
 /// The catalog is byte-capped, so a store with hundreds of skills cannot list
@@ -1978,6 +2404,40 @@ pub fn dispatch_with_data_root(
     permit: Option<&Value>,
     data_root: Option<&str>,
 ) -> Result<String, String> {
+    dispatch_bounded(root, name, args, permit, data_root)
+}
+
+/// The dispatch every caller ends up in, whatever spawned it (main agent,
+/// sub-agent, scheduler, HTTP route).
+///
+/// There is no headless/interactive distinction here on purpose: one budget
+/// ([`MAX_TERMINAL_TIMEOUT_SECS`]) covers every foreground wait, so a scheduled
+/// run and a chat turn can never disagree about how long work may take.
+pub fn dispatch_bounded(
+    root: &str,
+    name: &str,
+    args: &Value,
+    permit: Option<&Value>,
+    data_root: Option<&str>,
+) -> Result<String, String> {
+    dispatch_bounded_with(root, name, args, permit, data_root, None)
+}
+
+/// Same as [`dispatch_bounded`], with an optional [`TailSink`] for the
+/// `run_terminal` handler: while a dispatched command runs, its live output
+/// tail flows to the sink (the agent loop turns it into UI events). Every
+/// other handler ignores it. Callers that hold the sink keep the call alive —
+/// the sink is `Option<&TailSink>`, borrowed for the dispatch's duration.
+pub fn dispatch_bounded_with(
+    root: &str,
+    name: &str,
+    args: &Value,
+    permit: Option<&Value>,
+    data_root: Option<&str>,
+    on_tail: Option<&TailSink>,
+) -> Result<String, String> {
+    // One number for every wait this dispatch may block on.
+    let ceiling = MAX_TERMINAL_TIMEOUT_SECS;
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
     // Bounded discovery — the ONE place every search passes through, so no
     // caller (main agent, sub-agent, MCP) can flood a context by accident.
@@ -2279,7 +2739,7 @@ into one union — those lines are all above; do NOT re-read them]"
                     return Ok(format!(
                         "Successfully edited {path} ({} edits applied).{}",
                         edits.len(),
-                        post_edit_diagnostics(root, &path)
+                        post_edit_diagnostics(root, &path, permit)
                     ));
                 }
                 if applied == 0 {
@@ -2290,7 +2750,7 @@ into one union — those lines are all above; do NOT re-read them]"
                     edits.len(),
                     failures.len(),
                     failures.join("; "),
-                    post_edit_diagnostics(root, &path)
+                    post_edit_diagnostics(root, &path, permit)
                 ));
             }
             let edit = edit_file(
@@ -2301,7 +2761,7 @@ into one union — those lines are all above; do NOT re-read them]"
                 args["replace_all"].as_bool().unwrap_or(false),
                 permit,
             )?;
-            Ok(format!("{edit}{}", post_edit_diagnostics(root, &path)))
+            Ok(format!("{edit}{}", post_edit_diagnostics(root, &path, permit)))
         }
         "run_terminal" => {
             let requested = args["timeout"].as_u64().unwrap_or(120);
@@ -2311,15 +2771,16 @@ into one union — those lines are all above; do NOT re-read them]"
             // run row parked on "running" and not one line in rust.log).
             // Long jobs belong in `background=true` terminals, so anything
             // past the ceiling is CLAMPED, not failed.
-            let timeout = requested.min(crate::tools::MAX_TERMINAL_TIMEOUT_SECS);
+            let timeout = requested.min(ceiling);
             if timeout != requested {
                 eprintln!(
-                    "[tool] run_terminal: requested timeout {requested}s exceeds the {}s ceiling; \
-clamped to {timeout}s (long jobs must use background=true)",
-                    crate::tools::MAX_TERMINAL_TIMEOUT_SECS
+                    "[tool] run_terminal: requested timeout {requested}s exceeds the {ceiling}s \
+ceiling; clamped to {timeout}s (long jobs must use background=true)"
                 );
             }
-            run_terminal(root, &s("command"), timeout)
+            // The ceiling is passed through explicitly so the inner clamp
+            // cannot re-open a smaller bound than the one this dispatch chose.
+            run_terminal_bounded_with(root, &s("command"), timeout, ceiling, on_tail)
         }
         "current_time" => {
             let now = std::time::SystemTime::now()
@@ -2340,20 +2801,20 @@ clamped to {timeout}s (long jobs must use background=true)",
             let file = s("filePath");
             let symbol = s("symbol");
             let (line, character) = if !symbol.trim().is_empty() {
-                crate::lsp::locate_symbol(root, &file, symbol.trim(), args["line"].as_i64())?
+                crate::lsp::locate_symbol(root, &file, symbol.trim(), args["line"].as_i64(), permit)?
             } else if let Some(line) = args["line"].as_i64() {
                 (line, args["character"].as_i64().unwrap_or(0))
             } else {
                 return Err("pass filePath + symbol=<identifier> (preferred), or filePath + line + character".into());
             };
             match name {
-                "lsp_definition" => crate::lsp::definition(root, &file, line, character),
-                "lsp_references" => crate::lsp::references(root, &file, line, character),
-                _ => crate::lsp::hover(root, &file, line, character),
+                "lsp_definition" => crate::lsp::definition(root, &file, line, character, permit),
+                "lsp_references" => crate::lsp::references(root, &file, line, character, permit),
+                _ => crate::lsp::hover(root, &file, line, character, permit),
             }
         }
-        "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query")),
-        "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath")),
+        "lsp_symbols" => crate::lsp::symbols(root, &s("filePath"), &s("query"), permit),
+        "lsp_diagnostics" => crate::lsp::diagnostics(root, &s("filePath"), permit),
         // Native memory store (JSONL layer of memory_manager.py).
         "delete_memory" => {
             // Accept both spellings: the schema advertises `memory_id`, but a
@@ -2550,23 +3011,29 @@ clamped to {timeout}s (long jobs must use background=true)",
                 "list" => Ok(crate::plugins::list_plugins(store).to_string()),
                 "install" => crate::plugins::install_plugin(store, args).map(|v| {
                     let warning = plugin_keyword_warning(store, &v["plugin"]);
-                    format!("{v}{warning}")
+                    let detached = plugin_detached_path_warning(store, &v["plugin"]);
+                    format!("{v}{warning}{detached}")
                 }),
                 // Creating and updating a bundle writes skills exactly like an
                 // install does, so both say the same thing when they land bare.
                 "create" => crate::plugins::create_plugin(store, args).map(|v| {
                     let warning = plugin_keyword_warning(store, &v);
-                    format!("{v}{warning}")
+                    let detached = plugin_detached_path_warning(store, &v);
+                    format!("{v}{warning}{detached}")
                 }),
                 "update" => crate::plugins::update_plugin(store, args).map(|v| {
                     let warning = plugin_keyword_warning(store, &v);
-                    format!("{v}{warning}")
+                    let detached = plugin_detached_path_warning(store, &v);
+                    format!("{v}{warning}{detached}")
                 }),
                 "toggle" => crate::plugins::toggle_plugin(store, args).map(|v| {
                     let on = v["enabled"].as_bool().unwrap_or(false);
                     format!("{}\n{}", if on { "Plugin enabled" } else { "Plugin disabled" }, v)
                 }),
                 "delete" => crate::plugins::delete_plugin(store, args).map(|v| v.to_string()),
+                // The script's own window is decided by the plugin layer alone:
+                // no plugin default and no caller ceiling, so a paid script is
+                // never cut off mid-flight.
                 "run" => crate::plugins::run_plugin_script(store, args).map(|v| v.to_string()),
                 other => Err(format!(
                     "plugin requires action one of list/install/create/update/toggle/delete/run \
@@ -3177,11 +3644,11 @@ mod tests {
 
         // No server has ever run for this throwaway project, so this must return
         // the empty string instead of spawning one.
-        let quiet = post_edit_diagnostics(root, "a.rs");
+        let quiet = post_edit_diagnostics(root, "a.rs", None);
         assert!(quiet.is_empty(), "{quiet}");
         // An unusable path is silent too — diagnostics are a bonus, not a failure.
-        assert!(post_edit_diagnostics(root, "missing.rs").is_empty());
-        assert!(post_edit_diagnostics(root, "../escape.rs").is_empty());
+        assert!(post_edit_diagnostics(root, "missing.rs", None).is_empty());
+        assert!(post_edit_diagnostics(root, "../escape.rs", None).is_empty());
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -3750,6 +4217,94 @@ mod tests {
     }
 
     #[test]
+    fn grep_budget_spends_definition_lines_first_and_spreads_across_files() {
+        // Traced refinement chains started from a cap that spent its lines on
+        // call-site hits in the FIRST file (rg's walk order) while the
+        // declaration the model was hunting sat in a later file, past the cut
+        // — the model then re-grepped with a narrower pattern (a wasted round
+        // trip). The budget must buy definition lines FIRST and give every
+        // matching file a share, with the unseen files' mass reported.
+        let tmp = std::env::temp_dir().join("codifa-grep-fair-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Walk-order FIRST file: one declaration buried in noise.
+        fs::write(
+            tmp.join("a_noise.rs"),
+            "token call 1\ntoken call 2\ntoken call 3\nstruct token_def { x: u8 }\ntoken call 4\ntoken call 5\ntoken call 6\ntoken call 7\n",
+        )
+        .unwrap();
+        // A middle file with NO declarations: the fair spread must skip its
+        // call sites first and report its mass instead of hiding it.
+        fs::write(tmp.join("m_mid.rs"), "token mid 1
+token mid 2
+token mid 3
+").unwrap();
+        // Walk-order LAST file: the target declaration.
+        fs::write(tmp.join("z_late.rs"), "let token = 1;\nstruct token_target;\n").unwrap();
+        let out = grep_scope(&tmp, "", "token", "", 3, 0, false).unwrap();
+        // The buried declaration in the first file made the cut...
+        assert!(
+            out.contains("struct token_def"),
+            "definition line must beat call sites inside the budget:\n{out}"
+        );
+        // ...AND the late file's declaration got a share (fair spread)...
+        assert!(
+            out.contains("struct token_target"),
+            "a later file's definition must not be eaten by the first file:\n{out}"
+        );
+        // ...AND the unseen mass is announced instead of silently cut.
+        assert!(
+            out.contains("not shown"),
+            "files past the budget must be named with their hit count:\n{out}"
+        );
+        assert!(out.contains("truncated"), "{out}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn grep_miss_searches_spelling_variants_in_the_same_call() {
+        // Traced: a literal miss (`script.json`) cost a second round-trip
+        // before the model tried `script_json`. The variant pass runs HERE, in
+        // the same call, labeled so the model knows the literal is absent.
+        let tmp = std::env::temp_dir().join("codifa-grep-variant-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("m.rs"), "const SCRIPT_JSON_NAME: &str = \"script_json\";\n").unwrap();
+        // The traced miss shape: the model writes the literal dot ESCAPED
+        // (`script\.json`), which no longer matches `script_json` as a regex.
+        let out = grep_scope(&tmp, "", "script\\.json", "", 10, 0, false).unwrap();
+        assert!(
+            out.contains("SPELLING-VARIANT"),
+            "a literal miss must run the variant pass:\n{out}"
+        );
+        assert!(out.contains("script_json"), "{out}");
+        // A miss whose variants also miss stays a plain miss.
+        let miss = grep_scope(&tmp, "", "zzz_nothing", "", 10, 0, false).unwrap();
+        assert_eq!(miss, "no matches");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn name_variants_cover_the_naming_conventions() {
+        // `script.json` → the four code conventions; separators normalize to _.
+        let v = name_variant_pattern("script.json").unwrap();
+        assert!(v.contains("script_json") && v.contains("ScriptJson") && v.contains("scriptJson"), "{v}");
+        assert!(v.contains("SCRIPT_JSON"), "{v}");
+        // ALL-CAPS and kebab inputs split to the same segments.
+        let v2 = name_variant_pattern("SCRIPT_TIMEOUT").unwrap();
+        assert!(v2.contains("script_timeout") && v2.contains("ScriptTimeout"), "{v2}");
+        let v3 = name_variant_pattern("my-var_name").unwrap();
+        assert!(v3.contains("myVarName"), "{v3}");
+        // A single lowercase word still gains its case variants (constants!).
+        let v4 = name_variant_pattern("timeout").unwrap();
+        assert!(v4.contains("TIMEOUT"), "{v4}");
+        // Regex-ish or multi-alternative input never goes through variants.
+        assert!(name_variant_pattern("a|b").is_none());
+        assert!(name_variant_pattern("fn\\s+[a-z]+").is_none());
+        assert!(name_variant_pattern("").is_none());
+    }
+
+    #[test]
     fn grep_refuses_unscoped_broad_patterns() {
         let tmp = std::env::temp_dir().join("codifa-grep-broad");
         fs::create_dir_all(&tmp).unwrap();
@@ -3886,6 +4441,39 @@ mod tests {
         let out = run_terminal(tmp.to_str().unwrap(), "exit 3", 10).unwrap();
         assert!(out.contains("EXIT CODE: 3"));
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn terminal_streams_live_tail_while_running() {
+        let tmp = std::env::temp_dir().join("codifa-term-tail-test");
+        fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_str().unwrap().to_string();
+        // A command that prints a progress-style line every ~200 ms for ~1.5 s:
+        // the sink must fire SEVERAL times while the child is still alive,
+        // each time with the newest line in the tail.
+        let sink: TailSink = Arc::new(|tail: &str| {
+            TAILS.with(|t| t.borrow_mut().push(tail.to_string()));
+        });
+        let out = run_terminal_bounded_with(
+            &root,
+            "for i in 1 2 3 4 5 6 7; do echo \"tick $i\"; sleep 0.2; done",
+            15,
+            MAX_TERMINAL_TIMEOUT_SECS,
+            Some(&sink),
+        )
+        .unwrap();
+        let tails = TAILS.with(|t| std::mem::take(&mut *t.borrow_mut()));
+        assert!(out.contains("tick 7"), "{out}");
+        // At least two mid-run emissions (the command runs ~1.4 s; the gate is
+        // 500 ms), and the last one already saw a later tick than the first.
+        assert!(tails.len() >= 2, "expected >=2 live tails, got {}", tails.len());
+        assert!(!tails[0].contains("tick 7"), "first tail must be mid-run");
+        assert!(tails.last().unwrap().contains("tick"), "{}", tails.last().unwrap());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    thread_local! {
+        static TAILS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 }
 

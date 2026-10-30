@@ -98,6 +98,8 @@ import {
   createRealtimeSession,
   respondPermission,
   respondAsk,
+  trustOutsideFolder,
+  trustSshHost,
   listSkills,
   listAvailableSkills,
   listSchedules,
@@ -227,14 +229,14 @@ import { useViewerTabs } from "../lib/viewerTabs";
 // graph.py's PLAN_APPROVE_TOKEN / PLAN_DISMISS_TOKEN. The visible option label
 // is never sent, so localization can't break the protocol; free text goes
 // through verbatim as planner revision feedback.
-import { LocalLiveSession, isHallucinatedTranscript, releaseWarmLiveMic, sanitizeLocalTranscript } from "../lib/localLive";
-import { analyzeClip16k, buildSttPrompt, extractSttVocab, normalizeTranscript, resolveSttLanguage, stripSttPromptEcho } from "../lib/stt";
+import { LocalLiveSession, isHallucinatedTranscript, liveEditDelta, releaseWarmLiveMic, sanitizeLocalTranscript } from "../lib/localLive";
+import { analyzeClip16k, normalizeTranscript, resolveSttLanguage } from "../lib/stt";
 import { isHtmlTranscriptJunk, LiveVoiceSession, sanitizeTranscriptText } from "../lib/realtimeLive";
 import { buildRealtimeTarget, finalizeLiveTranscript, mergeLiveTranscript, resolveLiveMode } from "../lib/liveSession";
 import { buildLiveSpeakSuffix } from "../lib/livePrompt";
 import { playTts, playTtsStream, stopTts, speakableMessageText, subscribeTts } from "../lib/tts";
 import type { LiveVoiceState } from "../lib/liveVoiceState";
-import { claimLiveVoice, isLiveVoiceBusy, syncLiveVoiceLease } from "../lib/liveVoiceState";
+import { claimLiveVoice, isLiveVoiceBusy, liveVoiceLeaseHolder, syncLiveVoiceLease } from "../lib/liveVoiceState";
 const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
@@ -1691,28 +1693,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const sttModel = useStore((s) => s.sttModel);
   const sttFallbacks = useStore((s) => s.sttFallbacks ?? []);
   const sttLanguage = useStore((s) => s.sttLanguage);
-  const sttPrompt = useStore((s) => s.sttPrompt);
-  // Auto-glossary (file/function/library names from the recent conversation and
-  // open editors) fed to buildSttPrompt as the preview context tail. Kept in a
-  // ref: the transcribe path must not re-render when the chat history changes.
-  const sttVocabRef = useRef("");
-  useEffect(() => {
-    const sync = () => {
-      const st = useStore.getState();
-      const chat = st.chats.find((c) => c.id === st.activeChatId);
-      const texts = (chat?.messages ?? [])
-        .slice(-12)
-        .map((m) => m.content)
-        .filter((c): c is string => typeof c === 'string' && c.length > 0);
-      const vocab = extractSttVocab(texts);
-      if (vocab !== sttVocabRef.current) sttVocabRef.current = vocab;
-    };
-    sync();
-    // The glossary follows the conversation: refresh on a light tick without
-    // re-rendering the panel on every message.
-    const t = setInterval(sync, 2500);
-    return () => clearInterval(t);
-  }, []);
   // Live voice settings: a realtime provider makes live run speech-to-speech;
   // empty keeps the provider-agnostic chunked pipeline.
   const liveProviderId = useStore((s) => s.liveProviderId);
@@ -1721,10 +1701,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // Text we last pushed into the composer from live STT: ownership marker so a
   // chunk update never overwrites something the user typed themselves.
   const liveTypedRef = useRef("");
+  // Engine text the composer currently REFLECTS — the cumulative transcript at
+  // the last write, whether it replaced the composer or was appended after a
+  // user edit. The delta of the next partial beyond this point is exactly what
+  // the user has spoken but not yet seen (see liveEditDelta).
+  const liveEngineReflectedRef = useRef("");
   // Set when the user edits the composer while dictation is live (Backspace on
   // the transcript, correcting a word…). From that moment the transcript
-  // engine LOSES ownership: partials must not retype the composer over the
-  // user's edit, and ✓/Enter must send the composer's visible text.
+  // engine LOSES ownership of what is on screen: partials must not retype it,
+  // and ✓/Enter must send the composer's visible text. New speech is not lost
+  // though — it is APPENDED after the user's text (see applyLivePartial).
   const liveUserEditedRef = useRef(false);
   /** Write the live partial into the composer (chunk by chunk). */
   const applyLivePartial = (text: string) => {
@@ -1732,10 +1718,18 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // ✓/✕ already acted (or ✓ is draining the final decode): an in-flight
     // chunk reply must not retype the composer over the send/wipe decision.
     if (dictateAwaitRef.current || dictateSuppressedRef.current) return;
-    // The user edited the transcript in the composer: they own the text now.
-    // Partials are cumulative, so a later chunk would resurrect every word
-    // they deleted and would clobber their correction — hands off.
-    if (liveUserEditedRef.current) return;
+    if (liveUserEditedRef.current) {
+      // The user corrected the transcript: their text stays, but the words
+      // they speak from now on must still land — this was the "I edit while
+      // transcribing, then speak, and the new text never comes" bug (the
+      // server transcribed it, the composer just never showed it). Append
+      // only the suffix beyond what is already on screen.
+      const delta = liveEditDelta(liveEngineReflectedRef.current, text);
+      liveEngineReflectedRef.current = text;
+      if (!delta) return;
+      setInput((prev) => `${prev.trimEnd()}${prev.trim() ? " " : ""}${delta}`);
+      return;
+    }
     // The ownership marker must advance OUTSIDE the updater: React may run an
     // updater twice (StrictMode dev, interrupted renders). Writing the ref
     // inside made the second run see a mismatched `prev` and commit the FIRST
@@ -1743,6 +1737,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // rejected forever and the composer froze on the first chunk.
     const ours = liveTypedRef.current;
     liveTypedRef.current = text;
+    liveEngineReflectedRef.current = text;
     setInput((prev) => {
       if (prev.trim() !== "" && prev !== ours) return prev;
       return text;
@@ -1758,19 +1753,29 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
    */
   const dropLivePartial = () => {
     liveTypedRef.current = "";
+    liveEngineReflectedRef.current = "";
   };
   /** Drop the live preview, but only if the composer still holds our text. */
   const clearLivePartial = () => {
     const ours = liveTypedRef.current;
     liveTypedRef.current = "";
+    liveEngineReflectedRef.current = "";
     if (!ours) return;
     setInput((prev) => (prev === ours ? "" : prev));
   };
-  /** Hand composer ownership to the user: partials stop retyping and ✓/Enter
-   *  will deliver exactly what is on screen. Set on any manual edit while
-   *  dictation is live. */
-  const markLiveUserEdited = () => {
+  /** Hand composer ownership to the user: partials stop RETYPING and switch to
+   *  appending only the newly spoken words, and ✓/Enter will deliver exactly
+   *  what is on screen. Set on any manual edit while dictation is live — but
+   *  ONLY while something is left on screen: a user who deleted everything is
+   *  not correcting a transcript anymore, they cleared the stage, and the flag
+   *  must not keep the engine muted for the rest of the session (that read as
+   *  "STT stopped writing into the input"). */
+  const markLiveUserEdited = (value: string) => {
     if (!recordingRef.current && !dictateSessionRef.current) return;
+    if (!value.trim()) {
+      liveUserEditedRef.current = false;
+      return;
+    }
     liveUserEditedRef.current = true;
   };
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -7959,9 +7964,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // direction (Persian for RTL): without a language hint short Persian
     // chunks come back transliterated or in Arabic orthography.
     const effectiveLang = lang || chainLang || 'fa';
-    const chainPrompt =
-      prompt ||
-      buildSttPrompt(effectiveLang, sttPrompt, sttVocabRef.current);
     let lastError: unknown = null;
     for (const opts of chains) {
       try {
@@ -7970,7 +7972,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           undefined,
           effectiveLang,
           opts,
-          chainPrompt || undefined,
         );
         lastError = null;
         return text;
@@ -8003,7 +8004,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             dictate: true,
             chatId: chatIdRef.current,
             lang: lang || undefined,
-            prompt: sttPrompt || undefined,
             // Same chain-walking transcriber live voice uses: when a provider
             // fails (denied, offline, timeout — e.g. Groq unreachable), the
             // next STT fallback (the local whisper server) takes over instead
@@ -8084,6 +8084,16 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             dictateAwaitRef.current = false;
             dictatePendingFinalRef.current = "";
             dictateSuppressedRef.current = false;
+            // A fresh session owns the composer again. The edit flag is STICKY
+            // by design within one session (a user correction must not be
+            // clobbered by partials), but it was never cleared HERE: one
+            // keystroke during a previous dictation — a stray Space among
+            // them — froze every partial of every later session, the composer
+            // stayed empty while the STT server kept transcribing ("STT
+            // writes nothing into the input").
+            liveTypedRef.current = "";
+            liveEngineReflectedRef.current = "";
+            liveUserEditedRef.current = false;
             // Streaming dictate opened: swap the animated mic button for the
             // ✓/✕ confirm pair.
             setDictateConfirming(true);
@@ -8107,6 +8117,25 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         throw new Error(
           "Microphone unavailable — grant Codifa microphone access in System Settings, then restart the app.",
         );
+      }
+      // The streaming engine refused (or is unavailable for this press), but
+      // the classic pipeline used to bypass the microphone lease entirely:
+      // with another chat's live session already holding the mic — its stop
+      // button invisible in THIS panel — the user dictated here while the
+      // live chat transcribed the SAME voice and auto-sent it there ("I
+      // dictated in one chat, live came on in another and wrote my words").
+      // Respect the lease and say which chat is holding it.
+      {
+        const leaseHolder = liveVoiceLeaseHolder();
+        if (leaseHolder && leaseHolder !== chatIdRef.current) {
+          const id = chatIdRef.current;
+          if (id)
+            useStore.getState().setChatCmdError(
+              id,
+              "میکروفون در اختیار دیکتیت یا لایوِ چت دیگری است — اول آن سشن را از همان چت متوقف کن.",
+            );
+          return;
+        }
       }
       const stream = await acquireMic();
       // Pick a container this WebView can ALSO decode back (analyzeClip16k runs
@@ -8226,7 +8255,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             lang,
           });
           // Try each STT target in order; first success wins.
-          const sttPromptText = buildSttPrompt(lang, sttPrompt, sttVocabRef.current);
           let text = "";
           let lastError: unknown = null;
           for (const opts of chains) {
@@ -8236,7 +8264,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 setTranscribing,
                 lang || undefined,
                 opts,
-                sttPromptText || undefined,
               );
               lastError = null;
               break;
@@ -8247,7 +8274,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           if (lastError) throw lastError;
           // Drop any echo of the prompt we sent: a provider that continues the
           // prompt would otherwise auto-send our own glossary back as a turn.
-          const finalText = normalizeTranscript(stripSttPromptEcho((text ?? "").trim(), sttPromptText));
+          const finalText = normalizeTranscript((text ?? "").trim());
           // A request for Persian that comes back as bare Latin noise («PYM JBZ»
           // for «سلام») means the endpoint has no real ASR model behind it —
           // typical of a chat model served on an OpenAI-compatible proxy. Typing
@@ -8363,11 +8390,12 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // whether the user had edited, long after this synchronous body returned.
     const userEdited = liveUserEditedRef.current;
     const typed = userEdited
-      ? // The user corrected the transcript: send EXACTLY what they see, not
-        // a parked full-clip decode of the uncorrected audio.
+      ? // The user corrected the transcript: send EXACTLY what they see —
+        // their correction plus the words appended after the edit.
         input
       : liveTypedRef.current || input;
     liveTypedRef.current = "";
+    liveEngineReflectedRef.current = "";
     liveUserEditedRef.current = false;
     dictateConfirmingRef.current = false;
     dictateAwaitRef.current = true;
@@ -8386,8 +8414,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           ? ""
           : dictatePendingFinalRef.current.trim();
         dictatePendingFinalRef.current = "";
-        const text =
-          pending.length > typed.trim().length ? pending : typed.trim();
+        // The parked whole-clip decode wins whenever it exists. It is the only
+        // text decoded from the full utterance; `typed` is the accumulated
+        // chunk preview, and a 1.6 s chunk pads its edges with a plausible word
+        // that was never spoken, so the preview is ALWAYS the longer (and the
+        // wrong) one. The old `pending.length > typed.length` test therefore
+        // sent the hallucinated preview every time.
+        const text = pending || typed.trim();
         setInput((prev) => (prev === typed ? "" : prev));
         if (text) void submit(text);
       })
@@ -8558,6 +8591,20 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const startLive = async () => {
     if (liveOwnedByOtherChat) return;
     if (liveState === 'connecting' || isLiveVoiceActive) return;
+    // The store guard above only sees LIVE sessions: a DICTATE session in
+    // another chat holds the same microphone lease invisibly to it. Starting
+    // here anyway would stamp this chat 'connecting', fail the claim inside
+    // connect(), and leave a ghost live panel in this chat while the
+    // dictating chat kept the mic. Say what is actually holding it instead.
+    {
+      const holder = liveVoiceLeaseHolder();
+      if (holder && holder !== chatIdRef.current) {
+        reportLiveError(
+          "میکروفون در اختیار دیکتیت یا لایوِ چت دیگری است — اول آن سشن را از همان چت متوقف کن.",
+        );
+        return;
+      }
+    }
     if (recording) stopRecording();
     stopStreamingDictateKeepText();
     stopTts(LIVE_TTS_OWNER);
@@ -8894,7 +8941,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
          */
         chatId: chatIdRef.current,
         lang: liveLang,
-        prompt: sttPrompt,
         transcribe: transcribeChunk,
         onPartial: (text) => {
           // Progressive transcript mirrors into the CHAT (same as the realtime
@@ -9060,9 +9106,21 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       await live.connect(chatIdRef.current);
       if (!claimLiveVoice(chatIdRef.current ?? null)) {
         // Lost the race: tear this session down instead of leaving a panel
-        // showing live voice that has no working microphone.
+        // showing live voice that has no working microphone. The store was
+        // already stamped 'connecting' at the top of startLive — leaving it
+        // there kept THIS panel showing the live animation forever, with no
+        // session behind it (and the lease-sync effect then bound the lease to
+        // this chat, stealing it from the chat that actually holds the mic).
         liveSessionRef.current = null;
-        live.disconnect();
+        try {
+          live.disconnect();
+        } catch {
+          // Already closed.
+        }
+        setLiveVoiceSession(null, "idle");
+        reportLiveError(
+          "میکروفون در اختیار دیکتیت یا لایوِ چت دیگری است — اول آن سشن را از همان چت متوقف کن.",
+        );
         return;
       }
     } catch (err) {
@@ -9592,7 +9650,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // A keystroke during dictation takes over the composer: later partials
     // must not retype the transcript over this edit, and ✓/Enter must send
     // the edited text, not whatever the engine last transcribed.
-    if (v !== prev) markLiveUserEdited();
+    if (v !== prev) markLiveUserEdited(v);
     // Typing diverges from the history preview: dismiss the popup but keep
     // the edited text so the user can refine the previewed row.
     if (historyOpen) setHistoryOpen(false);
@@ -11149,6 +11207,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             const fa = detectDir(permissionReq.action) === "rtl";
             const isConfirm = permissionReq.scope === "confirm";
             const isComputer = permissionReq.scope === "computer";
+            const isSsh = permissionReq.scope === "ssh";
             const title = isConfirm
               ? fa
                 ? "تأیید عملیات"
@@ -11157,9 +11216,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ? fa
                   ? "کنترل اپ‌های دسکتاپ"
                   : "Desktop app control"
-                : fa
-                  ? "دسترسی بیرون از ورکاسپیس"
-                  : "Outside workspace access";
+                : isSsh
+                  ? fa
+                    ? "اتصال به سرور (SSH)"
+                    : "SSH server connection"
+                  : fa
+                    ? "دسترسی بیرون از ورکاسپیس"
+                    : "Outside workspace access";
             const note = isConfirm
               ? fa
                 ? "عامل این عملیات را مهم یا غیرقابل بازگشت می‌داند و منتظر شماست."
@@ -11168,14 +11231,22 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                 ? fa
                   ? "این به عامل اجازه می‌دهد اپ‌های دیگر را از طریق Accessibility Tree ببیند و کنترل کند."
                   : "This lets the agent see and control other apps via the Accessibility Tree."
-                : fa
-                  ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
-                  : "This lets the agent work outside your current workspace.";
+                : isSsh
+                  ? fa
+                    ? "این به عامل اجازه می‌دهد با SSH به این سرور متصل شود و آنجا دستور اجرا کند. تا زمانی که اجازه ندهید هیچ دستوری روی سرور اجرا نمی‌شود."
+                    : "This lets the agent open an SSH connection to this server and run commands there. Nothing runs on the server until you allow it."
+                  : fa
+                    ? "این به عامل اجازه می‌دهد بیرون از ورکاسپیس فعلی شما کار کند."
+                    : "This lets the agent work outside your current workspace.";
             const folderNote =
-              !isConfirm && !isComputer && permissionReq.folder
+              !isConfirm && !isComputer && permissionReq.folder && !isSsh
                 ? fa
                   ? "اجازه فقط برای همین پوشه و زیرپوشه‌هایش ثبت می‌شود؛ سایر مسیرهای بیرون از ورک‌اسپیس همچنان مجوز جداگانه می‌خواهند."
                   : "The grant applies only to this folder and its subfolders; other outside-workspace paths still need a fresh permission."
+                : isSsh
+                  ? fa
+                    ? "اجازه فقط برای همین مقصد (user@host) ثبت می‌شود؛ سرورهای دیگر همچنان مجوز جداگانه می‌خواهند."
+                    : "The grant applies only to this destination (user@host); other servers still need a fresh permission."
                 : null;
             const denyLabel = fa ? "رد کردن" : "Deny";
             return (
@@ -11263,17 +11334,30 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
                         className="btn perm-allow-always"
                         onClick={() => {
                           // scope-aware: "Always allow" persists the grant matching
-                          // the dialog's scope — computer vs outside-workspace.
+                          // the dialog's scope — computer vs ssh vs outside-workspace.
                           if (permissionReq.scope === "computer") {
                             useStore.getState().setComputerUse(true);
+                          } else if (permissionReq.scope === "ssh") {
+                            // Per-host grant: the destination (`user@host`)
+                            // lands in trusted-hosts.json and never prompts
+                            // again — NOT the whole outside space, and the
+                            // host string must NOT go through the folder
+                            // trust (it would fail canonicalization).
+                            void trustSshHost(
+                              permissionReq.folder || permissionReq.path || "",
+                            );
                           } else if (permissionReq.folder) {
                             // Per-folder grant: only the requested folder's
-                            // subtree stays approved for the session — NOT the
-                            // whole outside-workspace space. The folder is
+                            // subtree stays approved — NOT the whole
+                            // outside-workspace space. The folder is
                             // backend-normalized (nearest existing parent).
+                            // Persisted too: the in-memory list dies with the
+                            // session, and an "always" grant that asks again
+                            // after every relaunch is not "always".
                             useStore
                               .getState()
                               .addOutsideFolder(permissionReq.folder);
+                            void trustOutsideFolder(permissionReq.folder);
                           } else {
                             useStore.getState().setOutsideAllowed(true);
                           }

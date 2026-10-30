@@ -37,23 +37,28 @@ const {
   onsetFramesRequired,
   TTS_ECHO_GATE_MULT,
   TTS_ECHO_MIN_GATE,
+  TTS_BLEED_GATE_MULT,
+  TTS_ECHO_GATE_MAX,
   TTS_ONSET_FRAMES,
+  liveEditDelta,
+  decayPeakRms,
+  PEAK_RMS_DECAY,
   LocalLiveSession,
 } = await import('./localLive')
 
-type Reply = string | ((blob: Blob, lang?: string, prompt?: string) => string | Promise<string>)
+type Reply = string | ((blob: Blob, lang?: string) => string | Promise<string>)
 
 /** A session wired to fakes, with its private capture state ready to inject. */
 function makeSession(reply: Reply = '') {
-  const calls: Array<{ size: number; type: string; lang?: string; prompt?: string }> = []
+  const calls: Array<{ size: number; type: string; lang?: string }> = []
   const partials: string[] = []
   const finals: string[] = []
   const errors: unknown[] = []
   const session = new LocalLiveSession({
     lang: 'fa',
-    transcribe: async (blob, lang, prompt) => {
-      calls.push({ size: blob.size, type: blob.type, lang, prompt })
-      return typeof reply === 'function' ? await reply(blob, lang, prompt) : reply
+    transcribe: async (blob, lang) => {
+      calls.push({ size: blob.size, type: blob.type, lang })
+      return typeof reply === 'function' ? await reply(blob, lang) : reply
     },
     onUserText: (text) => {
       finals.push(text)
@@ -263,14 +268,10 @@ console.log('6) chunks are cut while the user is still speaking:')
       overlap,
     })
     check('language hint is sent', calls[0].lang === 'fa')
-    // Regression: the turn text so far used to be fed back as Whisper context.
-    // The model then CONTINUED that text instead of transcribing the new audio,
-    // so the composer looked frozen ("it types nothing") or repeated itself.
-    // Only the user's own glossary may ever be sent as a prompt.
-    check('the turn text is never fed back as a prompt', !(calls[0].prompt ?? '').includes('متن قبلی'), {
-      prompt: calls[0].prompt,
-    })
-    check('no prompt at all when the user set no glossary', calls[0].prompt === '', { prompt: calls[0].prompt })
+    // Regression: the turn text so far was once fed back as Whisper context and
+    // the model CONTINUED it instead of transcribing the new audio, so the
+    // composer looked frozen ("it types nothing") or repeated itself. The whole
+    // prompt mechanism is gone now: the transcriber only ever gets audio+lang.
   }
   check('partial text is emitted for the composer', partials[0] === 'متن قبلی سلام', { partials })
   check('public partialText mirrors the turn', session.partialText === 'متن قبلی سلام', {
@@ -555,7 +556,7 @@ console.log('15) a turn ending during a drain is retried, not lost:')
   check('no chunk request was needed to close it', calls === 0, { calls })
 }
 
-console.log('16) the agent\'s own voice cannot interrupt it:')
+console.log('16) the agent\'s own voice cannot interrupt it, but the user can:')
 {
   // Regression: the mic stays open during TTS, so the agent's own playback
   // bleed crossed the normal gate, fired onSpeechStart and stopped playback —
@@ -564,19 +565,24 @@ console.log('16) the agent\'s own voice cannot interrupt it:')
     raised: echoSafeThreshold(0.01, true),
   })
   check('the gate is unchanged when it is quiet', echoSafeThreshold(0.01, false) === 0.01)
-  // Speaker bleed after echo cancellation sits up to ~0.02 RMS: it must stay
-  // below the gate, otherwise the agent cuts itself off mid-sentence.
-  check('typical speaker bleed cannot open the gate', 0.02 < echoSafeThreshold(0.008, true), {
-    bleed: 0.02,
-    gate: echoSafeThreshold(0.008, true),
+  // THE barge-in fix: the old FIXED 0.025 floor sat above a quiet mic's voice,
+  // so the user could never interrupt the agent and had to wait for the whole
+  // answer. The gate now anchors on the measured between-syllable residual:
+  // well below speech when the AEC works, above the residual always.
+  const quietBleedGate = echoSafeThreshold(0.008, true, 0.004)
+  check('a quiet residual keeps the gate below ordinary speech', quietBleedGate <= 0.02, {
+    gate: quietBleedGate,
   })
-  // Regression: the floor used to sit at 0.06, ABOVE ordinary speech on a quiet
-  // laptop mic (~0.03), so while the agent was working the mic was deaf and the
-  // user's sentence only became text after the turn had ended.
-  check('quiet speech opens the gate while the agent speaks', 0.03 >= echoSafeThreshold(0.008, true), {
-    speech: 0.03,
-    gate: echoSafeThreshold(0.008, true),
+  check('the gate still sits above the measured residual', quietBleedGate >= 0.004 * TTS_BLEED_GATE_MULT)
+  // A leaky AEC (loud residual) raises the gate instead of letting the agent
+  // cut itself off — the fixed floor's job, now adaptive.
+  const loudBleedGate = echoSafeThreshold(0.008, true, 0.012)
+  check('a loud residual raises the gate above it', loudBleedGate >= 0.012 * TTS_BLEED_GATE_MULT, {
+    gate: loudBleedGate,
   })
+  check('the adaptive gate is capped so the mic stays reachable', loudBleedGate <= TTS_ECHO_GATE_MAX)
+  // Transient bleed peaks are the streak's job: they last a frame or two,
+  // never the four frames a real barge-in sustains.
   check('onset needs a longer streak while speaking', onsetFramesRequired(true) === TTS_ONSET_FRAMES)
   check(
     'onset is unchanged when the agent is silent',
@@ -586,6 +592,35 @@ console.log('16) the agent\'s own voice cannot interrupt it:')
   // A realistic loud barge-in must still get through the raised gate.
   check('a person talking over the agent still starts a turn', 0.25 >= echoSafeThreshold(0.008, true), {
     gate: echoSafeThreshold(0.008, true),
+  })
+  check('quiet speech barges in over a quiet residual', 0.03 >= quietBleedGate, {
+    speech: 0.03,
+    gate: quietBleedGate,
+  })
+}
+
+console.log('16b) a barge-in turn does not inherit the agent\'s voice:')
+{
+  // The pre-roll buffered before the onset is, during playback, the agent's
+  // own voice through the speakers. Seeding the turn buffer with it used to
+  // transcribe the agent's sentence INTO the user's interrupting message.
+  const { priv, session } = makeSession()
+  priv['ttsSpeaking'] = true
+  priv['pcmFrames'] = [new Float32Array(8000).fill(0.02)] // agent bleed
+  ;(session as unknown as { beginTurn: (now: number) => void }).beginTurn(1000)
+  check('the bleed pre-roll is not part of the turn', priv['turnAudioLen'] === 0, {
+    turnAudioLen: priv['turnAudioLen'],
+  })
+  check('the buffered capture is dropped too', buffered(priv) === 0, { kept: buffered(priv) })
+  check('a barge-in turn is a fresh turn', priv['hasSpeech'] === true)
+
+  // Normal (agent silent) turns keep the pre-roll: the first syllable survives.
+  const normal = makeSession()
+  normal.priv['ttsSpeaking'] = false
+  normal.priv['pcmFrames'] = [speechPcm(8000)]
+  ;(normal.session as unknown as { beginTurn: (now: number) => void }).beginTurn(1000)
+  check('a normal turn still keeps the pre-roll', (normal.priv['turnAudioLen'] as number) > 0, {
+    turnAudioLen: normal.priv['turnAudioLen'],
   })
 }
 
@@ -623,6 +658,139 @@ console.log('17) the delivered text comes from ONE full-clip decode, like dictat
   check('the turn audio buffer is released', priv['turnAudioLen'] === 0, {
     turnAudioLen: priv['turnAudioLen'],
   })
+}
+
+console.log('17b) an inflated chunk preview never outranks the full-clip decode:')
+{
+  // Regression, measured on the live engine: a 1.6 s chunk is far below
+  // Whisper's 30 s training window, so every chunk pads its edges with a
+  // plausible word that was NEVER SPOKEN (truth «یک کتاب» cut mid-word decoded
+  // as «یکیتی», then «یکی»). The merged preview is therefore always LONGER
+  // than the clean single-clip decode — 12/16/29 words against a truth of
+  // 7/11/15 — and the old "fuller wins" rule delivered the invented half every
+  // single time. The whole-clip decode must win even when it is shorter.
+  const { priv, session, finals } = makeSession('سلام امروز هوا خوب است')
+  priv['hasSpeech'] = true
+  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(
+    speechPcm(16000),
+  )
+  priv['pcmFrames'] = []
+  // A bloated preview: the clean decode is a strict SUBSET of it, exactly the
+  // shape the hallucinating chunks produced.
+  priv['turn'] = {
+    token: priv['turnToken'] as number,
+    text: 'سلامه، سلامه. سلام امروز هوا خوب است. امروز هوا خوب است.',
+  }
+  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+
+  check('the shorter, clean full-clip text is delivered', finals[0] === 'سلام امروز هوا خوب است', {
+    finals,
+  })
+  check('no invented repetition reaches the user', !(finals[0] ?? '').includes('سلامه'), {
+    finals,
+  })
+}
+
+console.log('17c) a speculative snapshot from a mid-turn pause is never delivered as the turn:')
+{
+  // Regression: the snapshot fires ~350 ms into a pause and decodes the turn
+  // buffer AS IT WAS THEN. When the user resumed speaking and the turn ended
+  // later, finishTurn reused the matching-token snapshot and — under the
+  // "single-clip decode always wins" rule — delivered the PRE-PAUSE fragment
+  // as the whole utterance («کاربرها بتونن از طریق API به» — everything after
+  // the thinking pause vanished, the message went out mid-sentence). The
+  // monitor now drops the snapshot on the first resumed frame; the turn end
+  // must then decode the FULL buffer instead.
+  const { priv, session, finals, calls } = makeSession('متن کامل بعد از مکث')
+  priv['hasSpeech'] = true
+  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(speechPcm(16000))
+  priv['pcmFrames'] = []
+  priv['turn'] = { token: priv['turnToken'] as number, text: 'پیش‌نمایش' }
+  // The stale snapshot: text decoded from the pre-pause audio only, but still
+  // carrying the current turn's token — exactly what the old code reused.
+  priv['specWholeP'] = Promise.resolve('متن بریده در مکث')
+  priv['specToken'] = priv['turnToken'] as number
+  // Speech resumed: the monitor calls this on the first voiced frame.
+  ;(session as unknown as { invalidateStaleSnapshot: () => void }).invalidateStaleSnapshot()
+  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+
+  check('the stale snapshot is dropped', priv['specWholeP'] === null)
+  check('the full turn audio is decoded instead', calls.length === 1, { calls: calls.length })
+  check(
+    'the delivered text covers the words after the pause',
+    finals[0] === 'متن کامل بعد از مکث',
+    { finals },
+  )
+}
+
+console.log('17d) a still-valid speculative snapshot is still reused:')
+{
+  // The invalidation must not cost the latency optimization: a snapshot with
+  // no speech after it (the turn really ended inside that pause) is consumed
+  // by finishTurn as-is — no second decode is paid.
+  const { priv, session, finals, calls } = makeSession('هر چیزی')
+  priv['hasSpeech'] = true
+  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(speechPcm(16000))
+  priv['pcmFrames'] = []
+  priv['turn'] = { token: priv['turnToken'] as number, text: 'پیش‌نمایش' }
+  priv['specWholeP'] = Promise.resolve('متن اسنپ‌شات کامل')
+  priv['specToken'] = priv['turnToken'] as number
+  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+
+  check('the snapshot text is delivered', finals[0] === 'متن اسنپ‌شات کامل', { finals })
+  check('no extra decode was paid', calls.length === 0, { calls: calls.length })
+  check(
+    'turn-end silence tolerates mid-sentence pauses',
+    LOCAL_LIVE_DEFAULTS.silenceMs >= 1200,
+    { silenceMs: LOCAL_LIVE_DEFAULTS.silenceMs },
+  )
+}
+
+console.log('17e) a late chunk reply cannot ghost a second message after delivery:')
+{
+  // Regression: a preview chunk cut before the turn ended could resolve AFTER
+  // the delivery. Its merge fired onPartial again, and the chat mirror — whose
+  // preview bubble the delivery had just released — created a FRESH user
+  // message out of it: the user's last words appeared twice, the second one
+  // never actually sent and never answered («۰۰ تومن میخوام.»). A finalized
+  // turn must drop every reply that lands after its delivery.
+  let replies = 0
+  let release!: (t: string) => void
+  const gate = new Promise<string>((resolve) => {
+    release = resolve
+  })
+  const { priv, session, partials, finals } = makeSession(() => {
+    replies++
+    // Call 1 = the preview chunk cut below: its reply is held back until the
+    // turn has delivered. Call 2 = the turn-end single-clip decode: at once.
+    return replies === 1 ? gate : 'متن کامل نهایی'
+  })
+  priv['hasSpeech'] = true
+  ;(session as unknown as { pushPcm: (f: Float32Array) => void }).pushPcm(speechPcm(16000))
+  ;(session as unknown as { flushChunk: () => void }).flushChunk()
+  await new Promise((r) => setTimeout(r, 0))
+  await (session as unknown as { finishTurn: () => Promise<void> }).finishTurn()
+
+  check('the turn delivered exactly once', finals.length === 1 && finals[0] === 'متن کامل نهایی', {
+    finals,
+  })
+  check('the turn is marked delivered', (priv['turn'] as { delivered?: boolean }).delivered === true)
+
+  release('۰۰ تومن میخوام.')
+  await priv['chain']
+  await new Promise((r) => setTimeout(r, 10))
+
+  check(
+    'the late chunk reply never reaches the transcript',
+    !(partials as string[]).includes('۰۰ تومن میخوام.'),
+    { partials },
+  )
+  check('no second delivery after the late reply', finals.length === 1, { finals })
+  check(
+    'chunk cadence suits a serial local server',
+    LOCAL_LIVE_DEFAULTS.chunkMs >= 2500,
+    { chunkMs: LOCAL_LIVE_DEFAULTS.chunkMs },
+  )
 }
 
 console.log('18) a failed full-clip decode still delivers the preview:')
@@ -795,6 +963,70 @@ console.log('21) multi-chunk dictate accumulates (the "only the first chunk" reg
     delivered.includes('سلام خوبی') && delivered.includes('پایانی'),
     { finals },
   )
+}
+
+console.log('22) a mid-dictation edit appends only the newly spoken words:')
+{
+  // Regression: the first keystroke during dictation muted the engine for the
+  // REST of the session — the user corrected a word, kept talking, the server
+  // transcribed every new chunk, and the composer never showed any of it.
+  // Partials are cumulative over the whole turn and the merge only appends,
+  // so the new words are exactly the suffix beyond the last reflected text.
+  check('nothing new when the text is unchanged', liveEditDelta('سلام خوبی', 'سلام خوبی') === '')
+  check(
+    'the suffix after the reflected text is the delta',
+    liveEditDelta('سلام خوبی', 'سلام خوبی امروز هوا چطوره') === 'امروز هوا چطوره',
+  )
+  check('an empty base means everything is new', liveEditDelta('', 'سلام خوبی') === 'سلام خوبی')
+  check('an empty partial adds nothing', liveEditDelta('سلام', '') === '')
+  // A re-worded seam (the provider re-transcribed the overlap into different
+  // words) is not an extension: appending it would duplicate words, so it
+  // contributes nothing this round.
+  check(
+    'a re-worded seam adds nothing rather than duplicating',
+    liveEditDelta('سلام خوبی', 'سلام چطوری امروز') === '',
+  )
+  // A word-boundary extension that merely CONTINUES the last word («خوبی» ->
+  // «خوبی‌تر») is still a string prefix: the delta glues onto the composer's
+  // current text and reads correctly.
+  check(
+    'a same-word continuation is a plain suffix',
+    liveEditDelta('سلام خوبی', 'سلام خوبی‌تر امروز') === '‌تر امروز',
+  )
+  check(
+    'persian half-spaces survive inside the delta',
+    liveEditDelta('میخوام', 'میخوام نیم‌فاصله') === 'نیم‌فاصله',
+  )
+}
+
+console.log('23) one loud transient must not deafen the VAD for the session:')
+{
+  // Regression: peakRms was a hold-forever maximum feeding the gate's safety
+  // cap (0.3× peak). A single click or desk bump pinned it far above speech
+  // and the gate never opened again — no chunks, no requests, no error.
+  let peak = 0
+  peak = decayPeakRms(peak, 0.5) // the bang
+  check('a transient sets the peak', peak === 0.5)
+  // Silence frames: the peak must decay fast enough that normal speech
+  // (≈0.03-0.1 RMS) crosses the 0.3× cap again within a few seconds —
+  // 0.95 per 100 ms frame ≈ 1.4 s half-life, so ≈3.2 s after the bang.
+  let frames = 0
+  while (peak * 0.3 > 0.03 && frames < 100) {
+    peak = decayPeakRms(peak, 0.001)
+    frames++
+  }
+  check('silence decays the peak below the speech cap quickly', frames <= 35, {
+    frames,
+    peak,
+  })
+  // Real speech keeps re-raising the reference: the cap must never fall below
+  // the level the user actually talks at.
+  peak = 0.5
+  for (let i = 0; i < 50; i++) peak = decayPeakRms(peak, 0.08)
+  check('ongoing speech holds the peak at the speech level', Math.abs(peak - 0.08) < 0.005, {
+    peak,
+  })
+  check('the decay is per-frame bounded', PEAK_RMS_DECAY > 0.9 && PEAK_RMS_DECAY < 1)
 }
 
 if (failed > 0) {

@@ -20,7 +20,6 @@
 import { claimLiveVoice, releaseLiveVoice } from './liveVoiceState';
 import {
   STT_SAMPLE_RATE,
-  buildSttPrompt,
   concatFloat32,
   downsampleFloat32,
   encodeWavPcm16,
@@ -28,7 +27,6 @@ import {
   mergeTranscripts,
   normalizePeak,
   normalizeTranscript,
-  stripSttPromptEcho,
   trimSilence,
   SILENCE_RMS,
 } from './stt';
@@ -37,7 +35,9 @@ export type LocalLiveState = 'idle' | 'connecting' | 'live' | 'speaking' | 'clos
 
 /** Fire the full-clip decode this long after the last voiced frame: the turn is
  *  then PROBABLY over, so its server round-trip overlaps the remaining pause.
- *  If speech returns the stale result is discarded (fuller-wins at delivery). */
+ *  If speech returns, the snapshot is dropped (invalidateStaleSnapshot) and a
+ *  fresh one is taken at the next pause — a snapshot must never survive the
+ *  speech that came after it, or the turn would deliver the pre-pause text. */
 const SPECULATIVE_DECODE_MS = 350;
 
 export interface LocalLiveOptions {
@@ -52,10 +52,8 @@ export interface LocalLiveOptions {
   chatId?: string | null;
   /** Language hint sent to the provider ('fa', 'en', …). */
   lang?: string;
-  /** Extra vocabulary / prompt for the provider (user setting). */
-  prompt?: string;
   /** Transcribe one complete WAV chunk. */
-  transcribe: (blob: Blob, lang?: string, prompt?: string) => Promise<string>;
+  transcribe: (blob: Blob, lang?: string) => Promise<string>;
   /** A finished turn: the full merged transcript. */
   onUserText: (text: string) => void | Promise<void>;
   /** Progressive transcript for the turn in progress ('' clears it). */
@@ -85,20 +83,17 @@ export interface LocalLiveOptions {
 // ("yes", "go on") are never swallowed. The level gate sits above
 // typical ambient noise (fans, distant talk) so only close-mic voice
 // starts a turn.
-/** Word count of a transcript — the "which decode saw more speech" metric. */
-function wordCount(s: string): number {
-  return s ? s.split(/\s+/).filter(Boolean).length : 0;
-}
 
 export const LOCAL_LIVE_DEFAULTS = {
-  // Turn end must feel immediate: 650 ms of silence is long enough that a
-  // natural mid-sentence pause does not split a turn, short enough that the
-  // handoff to STT does not feel like waiting.
-  // A natural mid-sentence pause is 300-700 ms. Ending the turn there splits
-  // one thought into two cold-start segments, and each segment has less
-  // context to disambiguate similar Persian words. 800 ms costs nothing
-  // perceptible on turn end and keeps whole sentences in one segment.
-  silenceMs: 800,
+  // Turn end must feel immediate, but not so eager it fires mid-thought.
+  // The old 800 ms ended the turn on every thinking pause: Persian speech
+  // routinely pauses 1 s+ between clauses («کاربرها بتونن از طریق API به» …
+  // «مدل‌هایی که میخوان متصل بشن») and each pause shipped the half sentence
+  // as its own message. 1200 ms still feels like a handoff (the speculative
+  // decode below has been running since 350 ms into the pause, so the text
+  // is usually already decoding) while real mid-sentence pauses stay inside
+  // one turn.
+  silenceMs: 1200,
   minSpeechMs: 400,
   maxChunkMs: 20000,
   // Linear RMS of the raw mic frame (no AGC, no dB conversion). Comfortable
@@ -112,20 +107,15 @@ export const LOCAL_LIVE_DEFAULTS = {
   levelThreshold: 0.008,
   frameMs: 100,
   // Chunk cadence. Chunks are only PREVIEWS now: the delivered text comes from
-  // the single-clip decode at turn end (see transcribeWholeTurn). With the
-  // whisper.cpp/Metal backend (rtf ≪ 1) a 1.6 s chunk keeps the preview
-  // visibly current; the old 2800 ms was tuned for the CPU medium model where
-  // per-request encoder overhead dominated and short chunks fell behind.
-  //
-  // ARCHITECTURE DECISION — one model for previews AND final decode. A
-  // two-model split (small fast model for chunks + accurate model for the
-  // final clip) was evaluated and rejected: it doubles resident RAM (against
-  // the WHISPER_IDLE_TTL unload contract), needs a second model download,
-  // and Metal turbo decodes a 1.6 s preview well under the chunk interval —
-  // a second model cannot buy latency the first one has not already spent.
-  // The default model (whisper-1 when unset) is server-side; benchmark real
-  // candidates with CODIFA_STT_DEBUG=1 before changing it.
-  chunkMs: 1600,
+  // the single-clip decode at turn end (see transcribeWholeTurn). The old
+  // 1600 ms was tuned for a whisper.cpp/Metal backend with rtf ≪ 1; the local
+  // server this build actually talks to decodes at rtf ≈ 1.2, so 1.6 s chunks
+  // queued two-deep on its serial worker — previews lagged seconds behind the
+  // voice AND each extra cut lands inside a word, which is where the preview's
+  // wrong words come from («تومن» cut mid-word -> «تنر», a padded «من» that
+  // was never spoken). 2.8 s chunks halve both the cut points and the backlog;
+  // the turn-end single-clip decode is what the user is charged with anyway.
+  chunkMs: 2800,
   /**
    * Audio kept before the detected onset so the first word is intact.
    *
@@ -223,6 +213,25 @@ export const NOISE_FLOOR_MULT = 2.5;
  * reached by real sound, whatever the floor drifted to.
  */
 export const NOISE_FLOOR_PEAK_CAP = 0.3;
+
+/** How much of the loudest-RMS reference survives one quiet monitor frame.
+ *
+ * `peakRms` feeds the gate's safety cap (`NOISE_FLOOR_PEAK_CAP` sits at 0.3×
+ * the peak), and the peak used to be a hold-forever maximum: ONE loud
+ * transient — a click, a cough, a desk bump, a notification chime — pinned it
+ * far above speech level, the cap then sat above everything the user said
+ * after it, and the VAD stayed deaf for the rest of the session with no
+ * chunk ever cut and no request ever sent ("sometimes it works, sometimes
+ * not a single request leaves"). Real speech re-raises the peak on every
+ * voiced frame, so a decay only ever forgets transients, never the level the
+ * user actually talks at. 0.95 per 100 ms frame ≈ 1.4 s half-life: a bang
+ * costs a couple of seconds of deafness at worst, not the whole session. */
+export const PEAK_RMS_DECAY = 0.95;
+
+/** One monitor step of the peak-RMS reference (see PEAK_RMS_DECAY). */
+export function decayPeakRms(prev: number, rms: number): number {
+  return Math.max(rms, prev * PEAK_RMS_DECAY);
+}
 
 /**
  * Track the ambient noise floor from recent frames.
@@ -355,34 +364,73 @@ export const TTS_ECHO_GATE_MULT = 2;
 /**
  * Absolute gate floor while the agent speaks.
  *
- * Speaker bleed after echo cancellation sits around 0.01-0.04 RMS, well above
- * the 0.008 gate that is right for a quiet room (the room really is that
- * quiet then — the agent's own audio is what is new). A relative multiplier
- * alone is not enough, because the ambient floor during playback is still the
- * room's, not the speaker's.
- *
- * The floor sits BELOW the loudest residual bleed on purpose: speech on a quiet
- * laptop mic starts around 0.03, so the old 0.06 floor made the mic deaf for
- * the whole answer — the user had to wait for the turn to end before STT heard
- * a word. Echo cancellation removes most bleed; the onset streak below is what
- * rejects the rest.
+ * Speaker bleed after echo cancellation sits well below speech on most macs,
+ * but the floor still has to reject the burst-y residual peaks of a loud
+ * speaker for the single frames the onset streak cannot catch. It is the
+ * FLOOR now, not the gate itself: the adaptive term (see echoSafeThreshold)
+ * anchors on the measured residual, which is what let a quiet mic barge in.
  */
-export const TTS_ECHO_MIN_GATE = 0.025;
+export const TTS_ECHO_MIN_GATE = 0.014;
 
 /**
  * Onset frames required while the agent speaks (bleed must not trip it).
  *
- * Four, not three: the floor above was lowered to 0.025, so the residual bleed
- * that now leans on this streak instead of the level gate needs the extra frame
- * to be rejected. The quiet-room streak stays at LIVE_SPEECH_ONSET_FRAMES, and
- * 400 ms of sustained voice is still an instant barge-in.
+ * Four, not three: the residual speaker bleed is speech-SHAPED (it IS the
+ * agent's voice), so its syllable peaks can cross a level gate for a frame or
+ * two. Four sustained frames (~400 ms) is what a human barge-in produces and
+ * what scattered bleed peaks never do — the valleys between the agent's own
+ * syllables reset the streak before it accumulates.
  */
 export const TTS_ONSET_FRAMES = 4;
 
-/** Effective gate, raised while the agent's own audio is playing. */
-export function echoSafeThreshold(threshold: number, ttsSpeaking: boolean): number {
+/**
+ * How much of the between-syllable bleed residual survives one playback frame.
+ *
+ * While the agent speaks, the session tracks the QUIETEST mic frame (the
+ * residual the echo canceller leaves between the agent's syllables) and the
+ * barge-in gate anchors on it. The release term lets the estimate creep back
+ * up when the agent's audio gets louder overall, so one loud answer does not
+ * pin a stale low floor forever.
+ */
+export const TTS_BLEED_RELEASE = 1.04;
+
+/**
+ * The barge-in gate sits at this multiple of the tracked bleed residual.
+ *
+ * This is the fix for "I have to wait for the agent to finish": the old gate
+ * was a FIXED 0.025 RMS floor while the agent spoke, and on a quiet mic the
+ * user's own voice never crossed it — barge-in simply never fired. The
+ * residual the AEC leaves between the agent's syllables is far lower (and
+ * device-dependent), so anchoring on it lets a quiet voice interrupt while
+ * still sitting a clear factor above the bleed the canceller actually leaves.
+ */
+export const TTS_BLEED_GATE_MULT = 3;
+
+/** Hard ceiling for the playback-time gate, so a poisoned bleed estimate can
+ *  never deafen the mic completely. */
+export const TTS_ECHO_GATE_MAX = 0.04;
+
+/** Effective gate, raised while the agent's own audio is playing.
+ *
+ * `bleedFloor` is the between-syllable residual tracked during playback (0 =
+ * unknown — nothing played yet, or the module-level callers that predate the
+ * adaptive term). The gate then:
+ *  - never drops below `threshold * TTS_ECHO_GATE_MULT` and the absolute
+ *    TTS_ECHO_MIN_GATE floor (bleed bursts must not trip it),
+ *  - anchors on the measured residual × TTS_BLEED_GATE_MULT when that is
+ *    higher,
+ *  - and is capped at TTS_ECHO_GATE_MAX so the mic stays reachable. */
+export function echoSafeThreshold(
+  threshold: number,
+  ttsSpeaking: boolean,
+  bleedFloor = 0,
+): number {
   if (!ttsSpeaking) return threshold;
-  return Math.max(threshold * TTS_ECHO_GATE_MULT, TTS_ECHO_MIN_GATE);
+  const bleedTerm = bleedFloor > 0 ? bleedFloor * TTS_BLEED_GATE_MULT : 0;
+  return Math.min(
+    Math.max(threshold * TTS_ECHO_GATE_MULT, TTS_ECHO_MIN_GATE, bleedTerm),
+    TTS_ECHO_GATE_MAX,
+  );
 }
 
 /** Consecutive loud frames needed to start a turn in the current state. */
@@ -426,8 +474,32 @@ export function sanitizeLocalTranscript(raw: string, lang?: string): string {
   return normalizeTranscript(text);
 }
 
-/** True when a transcript looks like a Whisper noise hallucination. */
-export function isHallucinatedTranscript(text: string, lang?: string): boolean {
+/**
+ * The words spoken AFTER a mid-dictation edit, given the engine's cumulative
+ * turn transcript and the last engine text reflected into the composer.
+ *
+ * While the user corrects the transcript, the engine must not retype the
+ * composer over their edit — but the words they speak AFTER the edit still
+ * have to land. Partials are cumulative over the whole turn and the chunk
+ * merge only ever APPENDS to the engine text (mergeTranscripts returns
+ * `a` or `a + new words`, never a rewrite), so the new words are exactly the
+ * suffix beyond the last reflected text, and a prefix check is exact.
+ *
+ * Returns '' when nothing new was spoken, and also when the seam was
+ * re-worded (a checkpoint or provider re-transcribed the overlap differently,
+ * so the text is no longer an extension): appending it would duplicate words,
+ * and the next merge restores the prefix shape.
+ */
+export function liveEditDelta(base: string, text: string): string {
+  const t = (text ?? '').trim();
+  const b = (base ?? '').trim();
+  if (!t) return '';
+  if (!b) return t;
+  if (t === b) return '';
+  return t.startsWith(b) ? t.slice(b.length).trim() : '';
+}
+
+/** True when a transcript looks like a Whisper noise hallucination. */export function isHallucinatedTranscript(text: string, lang?: string): boolean {
   const t = (text ?? '').trim();
   if (!t) return true;
   if (t.length <= 1) return true;
@@ -624,6 +696,10 @@ export class LocalLiveSession {
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   /** True while the agent's TTS audio is playing through the speakers. */
   private ttsSpeaking = false;
+  /** Quietest mic frame observed during the current playback: the residual the
+   *  echo canceller leaves between the agent's syllables. Anchors the barge-in
+   *  gate (see echoSafeThreshold); re-armed on every playback start/stop. */
+  private ttsBleedFloor = 0;
   /** Retry timer for a turn whose delivery was deferred by a drain. */
   private finishTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -641,8 +717,17 @@ export class LocalLiveSession {
    *  OBJECT, not a shared string, so a turn that is still draining keeps its own
    *  text after beginTurn has already started the next one. A shared string was
    *  cleared by the next turn, and finishTurn then returned early on the token
-   *  mismatch — silently dropping a whole utterance the user had spoken. */
-  private turn: { token: number; text: string } = { token: 0, text: '' };
+   *  mismatch — silently dropping a whole utterance the user had spoken.
+   *  `delivered` freezes the turn once its text went out: chunk replies that
+   *  land AFTER the delivery belong to audio the final decode already covered,
+   *  and merging them again would fire onPartial with a resurrected preview —
+   *  which the chat mirror renders as a SECOND user message («the last words
+   *  are written twice, I said them once»). */
+  private turn: { token: number; text: string; delivered: boolean } = {
+    token: 0,
+    text: '',
+    delivered: false,
+  };
   /** Increments per turn so a late chunk result can never land in the next. */
   private turnToken = 0;
   /** Every sample of the turn in progress, kept so the finished utterance can
@@ -658,6 +743,24 @@ export class LocalLiveSession {
    *  NOT consumed and the 350→800 ms tail still reaches the chunk previews. */
   private specWholeP: Promise<string> | null = null;
   private specToken = -1;
+
+  /**
+   * Drop the speculative snapshot of the turn in progress.
+   *
+   * The snapshot decodes the turn buffer AS IT WAS at ~350 ms into a pause.
+   * When the user resumes speaking inside the same turn, everything after
+   * that pause is missing from it — and `finishTurn` reused it whenever the
+   * token still matched, delivering the pre-pause fragment as the WHOLE
+   * utterance (the message went out cut exactly at the first thinking pause).
+   * The monitor calls this on the first voiced frame after the pause, so the
+   * next pause re-snapshots with the resumed words and the turn end always
+   * decodes audio that covers the entire utterance.
+   */
+  private invalidateStaleSnapshot(): void {
+    if (this.specWholeP === null) return;
+    this.specWholeP = null;
+    this.specToken = -1;
+  }
   /** DICTATE: transcripts of earlier full windows for utterances longer than
    *  one ASR window (see fireCheckpoint). Prependied to the final decode. */
   private dictateWholePrefix = '';
@@ -770,7 +873,10 @@ export class LocalLiveSession {
     this.stopped = true;
     this.stopMonitor();
     this.closeMic();
-    releaseLiveVoice(this.leaseChatId);
+    // Release only a lease THIS session holds: a session refused at connect()
+    // (another chat owns the mic) never claimed one, and releasing "its" null
+    // lease here cleared the REFUSED-to holder's lease out from under it.
+    if (this.leaseChatId !== null) releaseLiveVoice(this.leaseChatId);
     this.leaseChatId = null;
     this.setState('closed');
   }
@@ -791,6 +897,9 @@ export class LocalLiveSession {
     // Remembered beyond the state machine: the VAD gate uses it to ignore the
     // agent's own voice leaking through the speakers.
     this.ttsSpeaking = speaking;
+    // A new playback has a new residual: re-arm the bleed estimate either way,
+    // so a floor tracked against the PREVIOUS clip never anchors this one.
+    this.ttsBleedFloor = 0;
     if (speaking) {
       if (this.state === 'live') this.setState('speaking');
     } else {
@@ -1239,11 +1348,10 @@ export class LocalLiveSession {
     const wav = this.encodeSamples(samples);
     if (!wav) return '';
     const lang = this.options.lang ?? 'fa';
-    const prompt = buildSttPrompt(lang, this.options.prompt);
-    const raw = await this.requestChunk(wav, lang, prompt, true);
-    // Same cleanup as a chunk: an error page or a prompt echo must never be
-    // delivered as the user's words.
-    const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+    const raw = await this.requestChunk(wav, lang, true);
+    // Same cleanup as a chunk: an error page must never be delivered as the
+    // user's words.
+    const clean = sanitizeLocalTranscript(raw, lang).trim();
     // Prepend the earlier windows' checkpoint text: the final window decode
     // never saw that audio.
     const base = this.dictateWholePrefix.trim();
@@ -1279,14 +1387,13 @@ export class LocalLiveSession {
     const samples = this.takeTurnAudio();
     if (samples.length === 0) return;
     const lang = this.options.lang ?? 'fa';
-    const prompt = buildSttPrompt(lang, this.options.prompt);
     const run = async (): Promise<void> => {
       try {
         if (this.stopped) return;
         const wav = this.encodeSamples(samples);
         if (!wav) return;
-        const raw = await this.requestChunk(wav, lang, prompt);
-        const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+        const raw = await this.requestChunk(wav, lang);
+        const clean = sanitizeLocalTranscript(raw, lang).trim();
         if (clean && !isHallucinatedTranscript(clean, lang)) {
           this.dictateWholePrefix = mergeTranscripts(this.dictateWholePrefix, clean, { headSilent: true });
         }
@@ -1309,9 +1416,8 @@ export class LocalLiveSession {
     const wav = this.encodeSamples(samples);
     if (!wav) return '';
     const lang = this.options.lang ?? 'fa';
-    const prompt = buildSttPrompt(lang, this.options.prompt);
-    const raw = await this.requestChunk(wav, lang, prompt, true);
-    return stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt).trim();
+    const raw = await this.requestChunk(wav, lang, true);
+    return sanitizeLocalTranscript(raw, lang).trim();
   }
 
   private startMonitor(): void {
@@ -1337,7 +1443,8 @@ export class LocalLiveSession {
         return;
       }
       const rms = computeRms(buf);
-      if (rms > this.peakRms) this.peakRms = rms;
+      // Decay-hold, not hold-forever: see PEAK_RMS_DECAY.
+      this.peakRms = decayPeakRms(this.peakRms, rms);
       // Calibrate the room, then FREEZE the estimate while a turn is open: the
       // user's own voice must never raise the very gate that is trying to
       // detect it. Only genuine silence between turns may move the floor.
@@ -1351,9 +1458,20 @@ export class LocalLiveSession {
         // (echoSafeThreshold) is what handles that case explicitly.
         this.noiseFloor = updateNoiseFloor(this.noiseFloor, rms, false);
       }
+      // While the agent speaks, track the between-syllable residual: the
+      // quietest frame is what the echo canceller actually leaves, and the
+      // barge-in gate anchors on it (see echoSafeThreshold) — a FIXED gate
+      // was what made barge-in impossible on quiet mics.
+      if (this.ttsSpeaking) {
+        this.ttsBleedFloor =
+          this.ttsBleedFloor <= 0
+            ? rms
+            : Math.min(this.ttsBleedFloor * TTS_BLEED_RELEASE, rms);
+      }
       const adaptive = echoSafeThreshold(
         speechThreshold(this.noiseFloor, threshold, this.peakRms),
         this.ttsSpeaking,
+        this.ttsBleedFloor,
       );
       const now = Date.now();
       // Hysteresis: once a turn is OPEN the frame bar drops to 0.5x, so
@@ -1406,6 +1524,11 @@ export class LocalLiveSession {
         return;
       }
       this.lastSpeechAt = now;
+      // The user resumed speaking inside the open turn: any speculative
+      // snapshot taken at the pause we just left is missing every word from
+      // here on. Drop it (see invalidateStaleSnapshot) or finishTurn would
+      // deliver the pre-pause fragment as the whole utterance.
+      this.invalidateStaleSnapshot();
       this.tickChunks(now, chunkMs, maxChunkMs);
     }, frameMs);
   }
@@ -1448,7 +1571,7 @@ export class LocalLiveSession {
     // A fresh owner object per turn. The previous turn's text is NOT cleared:
     // it may still be draining towards delivery, and its holder is what
     // finishTurn() reads.
-    this.turn = { token: this.turnToken, text: '' };
+    this.turn = { token: this.turnToken, text: '', delivered: false };
     // A new turn invalidates any speculative decode of the previous one: drop
     // it (the request may still be in flight — its result is simply discarded).
     this.specWholeP = null;
@@ -1457,13 +1580,24 @@ export class LocalLiveSession {
     this.speechStartAt = now;
     this.lastSpeechAt = now;
     this.lastFlushAt = now;
-    this.trimToMs(LOCAL_LIVE_DEFAULTS.preRollMs);
-    // Seed the full-turn buffer with the pre-roll, so the first syllable is
-    // part of the single-clip decode too (the chunk cuts already rely on it).
-    this.turnAudio = this.pcmFrames.slice();
-    this.turnAudioLen = 0;
+    // Barge-in: everything buffered before the onset is the agent's own voice
+    // bleeding through the speakers — keeping it would transcribe the agent's
+    // words INTO the user's interrupting message. The onset streak has already
+    // consumed part of the user's first syllable either way; a clean transcript
+    // beats a complete clip here.
+    if (this.ttsSpeaking) {
+      this.trimToMs(0);
+      this.turnAudio = [];
+      this.turnAudioLen = 0;
+    } else {
+      this.trimToMs(LOCAL_LIVE_DEFAULTS.preRollMs);
+      // Seed the full-turn buffer with the pre-roll, so the first syllable is
+      // part of the single-clip decode too (the chunk cuts already rely on it).
+      this.turnAudio = this.pcmFrames.slice();
+      this.turnAudioLen = 0;
+      for (const f of this.turnAudio) this.turnAudioLen += f.length;
+    }
     this.turnAudioTruncated = false;
-    for (const f of this.turnAudio) this.turnAudioLen += f.length;
     try {
       this.options.onSpeechStart?.();
     } catch {
@@ -1510,21 +1644,24 @@ export class LocalLiveSession {
     // screen instead of the new audio: the merged result was unchanged, so the
     // composer looked frozen and the turn often ended with the same words (or,
     // after merging, nothing at all). Chunk continuity is the audio overlap's
-    // job (takePcm above), not the prompt's.
-    const prompt = buildSttPrompt(lang, this.options.prompt);
+
     // Fire the request NOW, in parallel with the other in-flight chunks
     // (bounded by maxInflight). Awaiting the previous chunk's round-trip before
     // even sending the next one is what put the partial transcript seconds
     // behind the voice. Only the MERGE stays ordered, below.
-    const request = this.requestChunk(wav, lang, prompt);
+    const request = this.requestChunk(wav, lang);
     this.chain = this.chain
       .then(async () => {
         const raw = await request;
         if (this.stopped) return;
-        // Strip any prompt echo BEFORE merging: providers that continue the
-        // prompt instead of transcribing the clip would otherwise splice our
-        // own context (or the previous chunk's tail) into the user's words.
-        const clean = stripSttPromptEcho(sanitizeLocalTranscript(raw, lang), prompt);
+        // The turn already delivered (or was finalized empty): its text went
+        // out and the chat moved on. Merging this late reply would fire
+        // onPartial with a preview of audio the final decode already covered —
+        // after delivery the mirror creates a FRESH user bubble for it, and
+        // the user sees their last words written twice as a second "message"
+        // that was never sent. Drop it.
+        if (owner.delivered) return;
+        const clean = sanitizeLocalTranscript(raw, lang);
         if (!clean || isHallucinatedTranscript(clean, lang)) return;
         // Merge into the turn that OWNS this chunk, even once a newer turn has
         // started: the owning turn may still be draining and its finishTurn()
@@ -1554,7 +1691,6 @@ export class LocalLiveSession {
   private async requestChunk(
     wav: Blob,
     lang: string,
-    prompt: string,
     skipSlot = false,
   ): Promise<string> {
     // The full-clip decode is the request that produces the delivered text, so
@@ -1567,7 +1703,7 @@ export class LocalLiveSession {
       // its text is what finishTurn() is about to deliver. Only a stopped
       // session needs no round-trip at all.
       if (this.stopped) return '';
-      return await this.options.transcribe(wav, lang, prompt);
+      return await this.options.transcribe(wav, lang);
     } catch (err) {
       try {
         this.options.onError?.(err);
@@ -1642,9 +1778,11 @@ export class LocalLiveSession {
       // Read BEFORE the call: transcribeWholeTurn consumes the turn buffer.
       const wholeUsable = !this.turnAudioTruncated && this.turnAudioLen > 0;
       // Reuse the speculative decode fired ~350 ms into the pause when it is
-      // still valid (same turn): its round-trip already started, so the turn
-      // lands without paying upload+encode again. Otherwise decode the buffered
-      // clip now — the destructive path that also consumes the tail audio.
+      // still valid: same turn AND no speech after it (the monitor invalidates
+      // the snapshot on the first resumed frame, so a surviving snapshot always
+      // covers the whole utterance). Its round-trip already started, so the
+      // turn lands without paying upload+encode again. Otherwise decode the
+      // buffered clip now — the destructive path that also consumes the tail.
       let wholeP: Promise<string>;
       if (this.specWholeP && this.specToken === token) {
         wholeP = this.specWholeP;
@@ -1709,17 +1847,29 @@ export class LocalLiveSession {
         ]);
         if (wholeTimer) clearTimeout(wholeTimer);
       }
-      // The FULLER text wins, not "whole blindly": the turn buffer is capped
-      // at ONE ASR window (wholeTurnMaxMs) and a single-clip decode can come
-      // back with only the tail of a long utterance — the chunk merge then
-      // already holds every sentence the preview chunks recognized, so
-      // delivering the whole-side fragment erased them ("live only typed the
-      // LAST sentence"). Word count decides; a tie keeps the full-clip
-      // result, which is the more accurate decode of the same words.
+      // A SUCCESSFUL single-clip decode ALWAYS wins. It is the only text decoded
+      // from the whole utterance, so it sees the words in context the way the
+      // model was trained (30 s windows).
+      //
+      // This used to be "fuller wins" by word count, and that rule shipped the
+      // exact opposite of its intent: a 1.6 s chunk is far below Whisper's
+      // training window, so every chunk pads its edges with a plausible word
+      // that was NEVER SPOKEN ("یک کتاب" cut mid-word -> "یکیتی", then "یکی"),
+      // and the merged preview was therefore always LONGER than the clean
+      // decode. Measured on three Persian clips: truth 7/11/15 words, clean
+      // whole-clip decode 7/11/15, merged preview 12/16/29 — the invented half
+      // was delivered every time. The old comment's worry (a long turn whose
+      // whole decode covers only the tail) is handled where it belongs: past
+      // `wholeTurnMaxMs` the buffer is truncated, `wholeUsable` is false, and
+      // the preview is used on its own below — never blended by word count.
       const wholeText = whole.trim();
       const previewText = turn.text.trim();
-      const text =
-        wordCount(wholeText) >= wordCount(previewText) ? wholeText : previewText;
+      const text = wholeText || previewText;
+      // The turn is finalized as of HERE — delivered, filtered-empty or not.
+      // Every chunk reply that resolves after this line describes audio the
+      // delivered decode already covered; merging it would only resurrect the
+      // preview after the fact (the duplicate-message bug this flag closes).
+      turn.delivered = true;
       if (token === this.turnToken) {
         turn.text = '';
         this.trimToMs(0);

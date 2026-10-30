@@ -4,11 +4,12 @@
 //
 //  1. No `language` hint in several paths — Whisper then auto-detects on a
 //     short clip and returns transliterated/garbled words.
-//  2. A FABRICATED `prompt` — Whisper does not read its prompt as an
-//     instruction, it reads it as the text that came BEFORE this audio and
-//     CONTINUES it. A polished sentence therefore comes back to the user as if
-//     they had spoken it. See buildSttPrompt() below: there is no built-in
-//     prompt any more, only the user's own glossary is ever sent.
+//  2. A `prompt` at all — Whisper does not read its prompt as an instruction,
+//     it reads it as the text that came BEFORE this audio and CONTINUES it. A
+//     polished sentence came back to the user as if they had spoken it, and
+//     even a plain word list measurably raised the error rate (24.5% → 26.9%
+//     on the Persian bench, one clip dropped entirely). No prompt is sent from
+//     any path any more.
 //
 // The WAV encoder is what makes chunk-by-chunk live transcription possible at
 // all: raw PCM can be cut at any sample boundary and wrapped in a complete,
@@ -40,22 +41,6 @@ export const STT_LANGUAGES: ReadonlyArray<{ code: string; label: string }> = [
   { code: 'hi', label: 'Hindi — हिन्दी' },
 ]
 
-// There is deliberately NO built-in prompt. Until this fix every request
-// carried a tidy sentence per language ("سلام، این یک پیام صوتی فارسی است.
-// متن را با املای درست فارسی … بنویس."), on the theory that Whisper mirrors
-// the style of its prompt. It does — by CONTINUING it. A two-second
-// «سلام چطوری» came back as:
-//
-//   «چطوری؟ این یک پیام صوتی فارسی است. متن را با املای درست فارسی است.
-//    نیمفاصله و علائم نگارشی بنویس. چطوری؟ خوبی»
-//
-// i.e. the model wrote our own sentence back to the user and dropped the
-// audio. The same echo also explains "live voice sometimes types nothing":
-// the echoed sentence deduped to nothing in mergeTranscripts(), so no new
-// partial ever appeared. Removing the fabricated prompt is the fix; a word
-// list (see buildSttPrompt) has no grammar to continue, so it biases spelling
-// without giving the model a sentence it can keep writing.
-
 /** Persian/Arabic script range — used to detect the language of typed text. */
 const RTL_TEXT_RE = /[\u0600-\u06FF]/
 
@@ -77,29 +62,6 @@ export function resolveSttLanguage(
   return dir === 'rtl' ? 'fa' : ''
 }
 
-/** Keep only the last `maxWords` words of a transcript (prompt context). */
-function tailWords(text: string, maxWords: number, maxChars: number): string {
-  const words = (text ?? '').trim().split(/\s+/).filter(Boolean)
-  const tail = words.slice(Math.max(0, words.length - maxWords)).join(' ')
-  return tail.length > maxChars ? tail.slice(tail.length - maxChars) : tail
-}
-
-/**
- * Build the Whisper `prompt` for a request.
- *
- * Whisper's prompt is BIASING CONTEXT, not an instruction: the model treats it
- * as text that preceded this audio and may continue it. That is why only the
- * user's own glossary is ever sent here — a word list has no sentence for the
- * model to keep writing, so it nudges spelling without being echoed back as
- * speech. When nothing is configured the prompt is omitted entirely; an absent
- * prompt is always safer than a fabricated one.
- *
- * `contextTail` is opt-in and must be REAL previously-transcribed speech. Live
- * voice deliberately does NOT pass it: chunk continuity is already handled by
- * the audio overlap plus mergeTranscripts(), and feeding the turn so far back
- * in made the model re-emit it instead of the new audio (a chunk that
- * re-recognized only old text merges to nothing, i.e. "it typed nothing").
- */
 /**
  * Decoding parameters that make a transcription reproducible.
  *
@@ -118,69 +80,6 @@ export function sttDecodeFields(model?: string): Record<string, string> {
   const m = (model ?? '').trim().toLowerCase()
   const whisperFamily = m === '' || m.includes('whisper')
   return whisperFamily ? { temperature: '0' } : {}
-}
-
-export function buildSttPrompt(
-  lang: string,
-  custom?: string,
-  contextTail?: string,
-): string {
-  void lang
-  const parts: string[] = []
-  const own = tailWords(custom ?? '', 60, 400)
-  if (own) parts.push(own)
-  const tail = tailWords(contextTail ?? '', 25, 200)
-  if (tail) parts.push(tail)
-  return parts.join(' ').trim()
-}
-
-/**
- * Auto-glossary for the STT prompt: technical identifiers harvested from the
- * recent conversation / open editors (file names, function names, library
- * names) — exactly the words Whisper misspells when Persian speech mixes mid
- * English tokens. A word LIST carries no grammar, so it cannot make the model
- * emit a sentence, and stripSttPromptEcho still guards a stray echo.
- */
-export function extractSttVocab(texts: Array<string | undefined>, maxWords = 30): string {
-  const counts = new Map<string, number>()
-  // Identifiers: camelCase/snake_case/kebab-case tokens WITH a separator or a
-  // case bump, plus dotted/extension names. Plain lower-case English words are
-  // NOT vocabulary (they transcribe fine); Persian words never are.
-  const ident = /[A-Za-z_$][A-Za-z0-9_$/-]*[A-Z_-][A-Za-z0-9_$/-]*|\w+\.\w{1,4}\b/g
-  for (const raw of texts) {
-    if (!raw) continue
-    const s = raw.length > 12000 ? raw.slice(raw.length - 12000) : raw
-    for (const m of s.matchAll(ident)) {
-      const w = m[0].replace(/^[\W_]+|[\W_]+$/g, '')
-      if (w.length < 4 || w.length > 32) continue
-      if (/^\d/.test(w)) continue
-      counts.set(w, (counts.get(w) ?? 0) + 1)
-    }
-  }
-  // Most-seen first; a capped, deterministic list keeps the prompt stable.
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, maxWords)
-    .map(([w]) => w)
-    .join(' ')
-}
-
-/** Minimum word run that counts as the prompt being echoed, not a coincidence. */
-const MIN_ECHO_RUN = 5
-
-/**
- * Comparison form of a word: punctuation, harakat, tatweel and the Arabic
- * look-alike letters are folded, so «فارسی،» and «فارسي» compare equal.
- */
-function normalizeWord(word: string): string {
-  return (word ?? '')
-    .replace(/[\u064B-\u0652\u0670\u0640\u200c]/g, '')
-    .replace(/[يىئ]/g, 'ی')
-    .replace(/ك/g, 'ک')
-    .replace(/[أإآا]/g, 'ا')
-    .replace(/ة/g, 'ه')
-    .replace(/[\u060C\u061B\u061F«»"'`.,!?:;()\[\]{}…-]/g, '')
-    .toLowerCase()
 }
 
 /**
@@ -227,48 +126,6 @@ export function normalizeTranscript(text: string): string {
   out = out.replace(HARAKAT_AND_TATWEEL, '')
   for (const [re, repl] of ARABIC_LOOKALIKES) out = out.replace(re, repl)
   return out.replace(/\s+/g, ' ').trim()
-}
-
-/**
- * Remove a prompt echo from a transcript.
- *
- * Even with the fabricated prompt gone, BIASING CONTEXT can still come back as
- * output: a provider may continue the glossary, or splice it into the middle of
- * the real words. Any run of at least MIN_ECHO_RUN consecutive words that also
- * occurs as a run inside the prompt is deleted. Requiring a 5-word run means a
- * short glossary (a name or two) can never eat a legitimate phrase by
- * coincidence, so this only ever fires on a real echo.
- */
-export function stripSttPromptEcho(transcript: string, prompt?: string): string {
-  const text = (transcript ?? '').trim()
-  const ctx = (prompt ?? '').trim()
-  if (!text || !ctx) return text
-  const words = text.split(/\s+/).filter(Boolean)
-  const echoed = ctx.split(/\s+/).map(normalizeWord).filter(Boolean)
-  if (words.length < MIN_ECHO_RUN || echoed.length < MIN_ECHO_RUN) return text
-  const norm = words.map(normalizeWord)
-  const drop = new Array<boolean>(words.length).fill(false)
-  for (let i = 0; i + MIN_ECHO_RUN <= words.length; i++) {
-    if (drop[i]) continue
-    let best = 0
-    for (let j = 0; j < echoed.length; j++) {
-      if (echoed[j] !== norm[i]) continue
-      let n = 0
-      while (
-        i + n < words.length &&
-        j + n < echoed.length &&
-        echoed[j + n] === norm[i + n]
-      ) {
-        n++
-      }
-      if (n > best) best = n
-    }
-    if (best >= MIN_ECHO_RUN) {
-      for (let n = 0; n < best; n++) drop[i + n] = true
-      i += best - 1
-    }
-  }
-  return words.filter((_, i) => !drop[i]).join(' ').trim()
 }
 
 /** Concatenate float PCM blocks into one contiguous buffer. */

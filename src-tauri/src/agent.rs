@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::llm::{http_client, stream_chat, InterruptSignal, LlmConfig, StreamAcc, StreamSignal};
 use crate::tools;
@@ -1991,20 +1992,116 @@ async fn await_answer(
     }
 }
 
-/// The turn's out-of-workspace permit, built ONCE from the renderer's grants.
+/// The turn's out-of-workspace permit, built ONCE from the renderer's grants
+/// PLUS the folders the user approved with "Always allow" in ANY earlier turn.
 ///
 /// `resolve_safe` has always honoured a `permit` (workspace, tmp and `~/.codifa`
 /// pass without one); the loop simply never built it, so the user's popup answer
-/// dead-ended. Passing `None` when nothing is granted keeps the old refusal text
-/// for a path the user never approved.
+/// could not reach the sandbox.
 fn outside_permit(req: &AgentRequest) -> Option<Value> {
-    if !req.allow_outside && req.allow_outside_folders.is_empty() {
+    // "Always allow" must outlive the session: the renderer's own grant list is
+    // in-memory state, so a folder approved for keeps was asked for AGAIN after
+    // every relaunch and every workspace switch — the ask the button exists to
+    // end. The persisted copy (data root, `trusted-folders.json`) rides along.
+    let mut folders = req.allow_outside_folders.clone();
+    folders.extend(trusted_folders(&turn_data_root(req)));
+    if !req.allow_outside && folders.is_empty() {
         return None;
     }
     Some(json!({
         "outside": req.allow_outside,
-        "folders": req.allow_outside_folders,
+        "folders": folders,
     }))
+}
+
+/// The data root THIS turn reads its stores from (the caller's value, else the
+/// live one). The same rule `skill_root` uses below.
+fn turn_data_root(req: &AgentRequest) -> String {
+    if req.data_root.trim().is_empty() {
+        native_data_root()
+    } else {
+        req.data_root.clone()
+    }
+}
+
+/// The persisted "Always allow" folder grants: `<data-root>/trusted-folders.json`,
+/// a JSON array of canonical absolute paths. Written by POST /permission/trust
+/// when the user clicks "Always allow" on an outside-workspace popup; read by
+/// every turn so the grant survives restarts. A headless (scheduled) run reads
+/// the SAME file, which is how a schedule keeps touching an approved folder
+/// without ever prompting.
+fn trusted_folders(data_root: &str) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(trusted_folders_file(data_root)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+}
+
+fn trusted_folders_file(data_root: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_root).join("trusted-folders.json")
+}
+
+/// Persist one "Always allow" folder. The path is stored CANONICAL so the
+/// matcher in `resolve_safe` (which canonicalizes both sides) can never be
+/// defeated by a symlinked spelling of the same folder. Returns the stored path.
+pub fn add_trusted_folder(data_root: &str, folder: &str) -> Result<String, String> {
+    let trimmed = folder.trim();
+    if trimmed.is_empty() {
+        return Err("folder is required".into());
+    }
+    let canon = std::fs::canonicalize(trimmed)
+        .map_err(|_| format!("folder does not exist: {trimmed}"))?
+        .to_string_lossy()
+        .to_string();
+    let mut all = trusted_folders(data_root);
+    if all.iter().any(|f| f == &canon) {
+        return Ok(canon);
+    }
+    all.push(canon.clone());
+    let file = trusted_folders_file(data_root);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into()))
+        .map_err(|e| format!("cannot write trusted folders: {e}"))?;
+    Ok(canon)
+}
+
+/// The persisted "Always allow" SSH hosts: `<data-root>/trusted-hosts.json`,
+/// a JSON array of destinations (`user@host`). Written by POST
+/// /permission/trust-host when the user clicks "Always allow" on the SSH
+/// connection popup; read by the `run_terminal` SSH gate so an approved server
+/// never asks again — the SAME semantics the folder grant has for paths.
+fn trusted_hosts(data_root: &str) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(trusted_hosts_file(data_root)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+}
+
+fn trusted_hosts_file(data_root: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_root).join("trusted-hosts.json")
+}
+
+/// Persist one "Always allow" SSH destination. Stored verbatim (trimmed) — the
+/// gate compares it against the exact string `ssh_destination` extracted from
+/// the command, so no canonicalization is possible or needed.
+pub fn add_trusted_host(data_root: &str, host: &str) -> Result<String, String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err("host is required".into());
+    }
+    let mut all = trusted_hosts(data_root);
+    if !all.iter().any(|h| h == trimmed) {
+        all.push(trimmed.to_string());
+    }
+    let file = trusted_hosts_file(data_root);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into()))
+        .map_err(|e| format!("cannot write trusted hosts: {e}"))?;
+    Ok(trimmed.to_string())
 }
 
 /// Ask the user to approve an out-of-workspace path, then report whether the
@@ -2021,7 +2118,21 @@ async fn ask_outside_access(
     cancel: &std::sync::atomic::AtomicBool,
     action: &str,
     path: &std::path::Path,
+    headless: bool,
 ) -> bool {
+    // A scheduled run has NO renderer: the `Permission` event is dropped by its
+    // `emit` closure, so waiting for `await_answer` blocked the run FOREVER —
+    // measured on a live trace, a paid article run stopped one call after the
+    // model asked to touch a path outside the allowed roots and sat on
+    // "running" with no timeout, no log line and no popup anywhere. Deny at
+    // once instead, so the model gets an answer it can act on.
+    if headless {
+        eprintln!(
+            "[tool] {action}: refused (scheduled run has no user to approve {})",
+            path.display()
+        );
+        return false;
+    }
     let gate = next_gate_id();
     let folder = path.to_string_lossy().to_string();
     emit(&AgentEvent::Permission {
@@ -2036,6 +2147,246 @@ async fn ask_outside_access(
         Some(v) => v["allowed"].as_bool().unwrap_or(false),
         None => false,
     }
+}
+
+/// Ask the user to approve an SSH connection to `dest` (`user@host`), then
+/// report whether the answer was "allow".
+///
+/// Every command that would open an SSH session passes through here the FIRST
+/// time it names a server the user has not yet approved — the connection is an
+/// outward-facing act the user must own, the same class as the
+/// out-of-workspace popup above. The popup's "Always allow" persists the host
+/// (POST /permission/trust-host), so ONE answer covers the whole project;
+/// a denied connection returns false and the call answers with
+/// [`denied_ssh`].
+async fn ask_ssh_access(
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+    chat_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    dest: &str,
+    headless: bool,
+) -> bool {
+    // A scheduled run has NO renderer: same trap as `ask_outside_access` —
+    // waiting on `await_answer` would park the run forever. Deny at once.
+    if headless {
+        eprintln!("[tool] run_terminal: refused (scheduled run has no user to approve SSH to {dest})");
+        return false;
+    }
+    let gate = next_gate_id();
+    emit(&AgentEvent::Permission {
+        id: gate.clone(),
+        action: format!("ssh {dest}"),
+        path: dest.to_string(),
+        reason: "SSH connection to a remote server".to_string(),
+        scope: "ssh".to_string(),
+        folder: dest.to_string(),
+    });
+    match await_answer(&gate, chat_id, cancel).await {
+        Some(v) => v["allowed"].as_bool().unwrap_or(false),
+        None => false,
+    }
+}
+
+/// The answer to a DENIED SSH connection. It must not read as a tool error the
+/// model retries: it says what happened and what the model CAN do instead.
+fn denied_ssh(dest: &str) -> String {
+    format!(
+        "The user DENIED the SSH connection to {dest}. Nothing was run — do NOT retry this \
+connection. Work only on the local workspace, or ask the user to run the remote steps \
+themselves."
+    )
+}
+
+/// Every SSH destination a shell command would connect to, in first-seen
+/// order, deduplicated.
+///
+/// An empty result means the command opens no SSH session, so the gate stays
+/// silent. Chains and pipelines are walked segment by segment (like
+/// `is_mutating_depth`), because one `run_terminal` line may legitimately
+/// touch SEVERAL servers (`ssh h1 …; ssh h2 …`) and each new destination must
+/// prompt. Only the direct form and a `sh -c`/`bash -c` wrapper are followed —
+/// the same boundary the mutating-command gate draws; deeper obfuscation is
+/// the user's own shell, not a pattern the model emits in practice.
+///
+/// The recognized surface is the ssh-family binaries: `ssh`, `slogin`, `scp`,
+/// `sftp`, `mosh`, `rsync` (remote specs `[[user@]host:]path` / `rsync://`),
+/// and `sshpass` unwrapped one level so a password helper cannot smuggle the
+/// connection past the gate.
+fn ssh_destinations(cmd: &str) -> Vec<String> {
+    ssh_destinations_depth(cmd, 0)
+}
+
+fn ssh_destinations_depth(cmd: &str, depth: usize) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for seg in cmd.split([';', '|', '&', '\n']) {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        // Strip a leading path so `/usr/bin/ssh` is caught as well.
+        let bin = first.rsplit('/').next().unwrap_or(first).to_lowercase();
+        // A `sh -c '…'` payload is code the shell will run: decide from the
+        // payload itself, bounded like the mutating gate.
+        if matches!(bin.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+            if let Some(pos) = words.iter().position(|w| *w == "-c") {
+                let payload = words[pos + 1..].join(" ").trim_matches(['\'', '"']).to_string();
+                if !payload.trim().is_empty() && depth < 3 {
+                    for d in ssh_destinations_depth(&payload, depth + 1) {
+                        if !found.contains(&d) {
+                            found.push(d);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        // `sshpass -p PW ssh …`: drop the helper and its option/value pair,
+        // then parse the wrapped command as the segment's head.
+        let words: Vec<&str> = if bin == "sshpass" {
+            let mut rest = words[1..].to_vec();
+            if let Some(second) = rest.first() {
+                if matches!(*second, "-f" | "-p" | "-d" | "-P" | "-e") && rest.len() > 1 {
+                    rest.drain(0..2);
+                }
+            }
+            rest
+        } else {
+            words
+        };
+        let head = words
+            .first()
+            .map(|w| w.rsplit('/').next().unwrap_or(w).to_lowercase())
+            .unwrap_or_default();
+        let Some(dest) = (match head.as_str() {
+            "ssh" | "slogin" | "mosh" => Some(dest_of_ssh_like(&words[1..])),
+            "scp" => Some(dest_of_scp(&words[1..])),
+            "sftp" => Some(dest_of_scp(&words[1..])),
+            "rsync" => Some(dest_of_rsync(&words[1..])),
+            _ => None,
+        })
+        .flatten()
+        else {
+            continue;
+        };
+        if !found.contains(&dest) {
+            found.push(dest);
+        }
+    }
+    found
+}
+
+/// Options of the ssh-family that CONSUME the next word, so their value is
+/// never mistaken for the destination. Deliberately generous: skipping one
+/// option too many at worst delays the prompt by a word, while skipping one
+/// too few can misname the host the user is approving. Flags (`-4`, `-A`,
+/// `-t`, …) stay OUT of the set on purpose — `ssh -t host` must still find
+/// `host`.
+const SSH_VALUE_OPTS: &[&str] = &[
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
+    "-p", "-P", "-Q", "-R", "-S", "-w", "-W",
+];
+/// `scp` consumes: `-P` port, `-c` cipher, `-F` config, `-i` identity, `-o`
+/// option, `-l` limit, `-S` program. `sftp` adds `-b` batchfile and `-D`
+/// server. NOT here: `-B` is a scp FLAG (batch) and sftp's buffer size —
+/// consuming it would swallow a real `host:file` after `scp -B host:file .`.
+const SCP_VALUE_OPTS: &[&str] = &[
+    "-P", "-c", "-F", "-i", "-o", "-l", "-S", "-b", "-D",
+];
+
+/// The destination word of an `ssh`/`mosh`/`sftp`-style invocation: the first
+/// argument that is neither an option nor an option's value. `sftp` also
+/// accepts `sftp://user@host/path` URLs.
+fn dest_of_ssh_like(args: &[&str]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(w) = iter.next() {
+        if let Some(rest) = w.strip_prefix("--") {
+            // `--opt=value` is one word; a bare `--opt` that takes a value is
+            // rare on OpenSSH — treat the next word as consumable only when
+            // the option is known to need one.
+            if !rest.contains('=') && rest == "rsh" {
+                iter.next();
+            }
+            continue;
+        }
+        if w.starts_with('-') && w.len() > 1 {
+            if SSH_VALUE_OPTS.contains(w) {
+                iter.next();
+            }
+            continue;
+        }
+        let url = w.strip_prefix("sftp://").or_else(|| w.strip_prefix("ssh://"));
+        if let Some(rest) = url {
+            let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+            if !authority.is_empty() {
+                return Some(authority.to_string());
+            }
+            continue;
+        }
+        return Some(w.to_string());
+    }
+    None
+}
+
+/// The FIRST remote spec of an `scp` invocation — either endpoint may be the
+/// remote (`scp local remote:`, `scp remote:file local`).
+fn dest_of_scp(args: &[&str]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(w) = iter.next() {
+        if w.starts_with('-') && w.len() > 1 {
+            if SCP_VALUE_OPTS.contains(w) {
+                iter.next();
+            }
+            continue;
+        }
+        if let Some(d) = remote_spec(w) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// The FIRST remote spec of an `rsync` invocation (`[[user@]host:]path` or
+/// `rsync://host/…`). Options are skipped WITHOUT consuming a following word:
+/// rsync's short flags are a different alphabet from ssh's (`-P` is
+/// `--partial --progress` here, a port elsewhere), so consuming values could
+/// swallow the real destination (`rsync -P host:path .`) and MISS the prompt —
+/// while a value misread as a destination merely prompts with a wrong name,
+/// which is the safe direction.
+fn dest_of_rsync(args: &[&str]) -> Option<String> {
+    for w in args {
+        if w.starts_with('-') && w.len() > 1 {
+            continue;
+        }
+        if let Some(d) = remote_spec(w) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// `[[user@]host:]path` / `rsync://host/…` → `user@host` (or `host`), else
+/// `None` for a plain local path. The destination is what the user approves,
+/// so it keeps the `user@` part but drops the path.
+fn remote_spec(word: &str) -> Option<String> {
+    if let Some(rest) = word.strip_prefix("rsync://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        if !authority.is_empty() {
+            return Some(authority.to_string());
+        }
+        return None;
+    }
+    let slash = word.find('/').unwrap_or(word.len());
+    let head = &word[..slash];
+    let Some(colon) = head.rfind(':') else {
+        return None;
+    };
+    let host = &head[..colon];
+    // `C:/Users/x` is a drive letter, not a host; an empty head (`:path`,
+    // rsync's "relative to home" spelling) names no host either.
+    if host.is_empty() || (host.len() == 1 && host.chars().all(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 /// The folder a grant must cover before a call may touch a path OUTSIDE every
@@ -2053,12 +2404,28 @@ fn outside_target(
     args: &Value,
     root: &str,
     permit: Option<&Value>,
+    caps: &ToolCaps,
 ) -> Option<std::path::PathBuf> {
-    let rels = if name == "run_terminal" {
+    let mut rels = if name == "run_terminal" {
         shell_targets(args["command"].as_str().unwrap_or_default())
     } else {
         crate::tools::lookup_paths(name, args)
     };
+    // A WRITER asks before it runs too — but only when the mode may write at
+    // all: in a read-only mode the call is refused by caps anyway and the popup
+    // would change nothing. The tool's own `resolve_safe` refusal then never
+    // fires first, so the round is spent on the answer instead of on
+    // discovering the refusal.
+    if caps.write_files && matches!(name, "write_file" | "edit_file") {
+        rels.extend(crate::tools::writer_gate_paths(name, args));
+    }
+    // A bundle script IS a command (see `plugin_mode_refusal`): it follows the
+    // terminal capability, so an explicit working folder outside the free set
+    // (the bundle's own folder, ~/.codifa, temp) asks exactly like a shell line
+    // naming that folder would.
+    if caps.run_terminal && name == "plugin" {
+        rels.extend(crate::tools::writer_gate_paths(name, args));
+    }
     for rel in rels {
         if let crate::tools::PathAccess::NeedsPermission(folder) =
             crate::tools::path_access(root, &rel, permit)
@@ -2299,6 +2666,12 @@ pub enum AgentEvent {
     /// Emitted when a tool call STARTS — the frontend mints a running card.
     /// `id` is the provider tool_call id so the frontend can dedup/re-pair.
     ToolStart { id: String, name: String, args: Value },
+    /// Live output tail of a RUNNING `run_terminal` call, streamed every
+    /// ~500 ms from the tool's reader loop (`tools::TailSink`). UI-only: the
+    /// renderer folds it into the still-running card (progress bar + live
+    /// output) and the FINAL output still arrives on the `Tool` event — a
+    /// dropped or replayed ToolOutput loses nothing. Not written to the trace.
+    ToolOutput { id: String, tail: String },
     /// Emitted when the tool FINISHES — resolves the running card.
     ///
     /// `result` is what the MODEL sees (for `web_search` that is the distilled
@@ -2535,6 +2908,9 @@ impl AgentEvent {
             AgentEvent::ToolStart { id, name, args } => json!({
                 "kind": "tool", "id": id, "name": name, "tool": name, "args": args,
             }),
+            AgentEvent::ToolOutput { id, tail } => json!({
+                "kind": "tool_output", "id": id, "tail": tail,
+            }),
             AgentEvent::Tool { id, name, args, result, ok, results, engine } => json!({
                 "kind": "tool_result", "id": id, "name": name, "tool": name, "args": args,
                 "result": result, "ok": ok, "results": results, "engine": engine,
@@ -2721,10 +3097,10 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             // The schema is where the model learns the DIVISION OF LABOUR: the
             // backend refuses a shell read/search (MEASURED: the model reached
             // for `cat`/`sed -n` whenever the tool list did not say so).
-            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused. For a LONG-RUNNING process (dev server, watcher) set background=true: it starts detached, output goes to a log file the result names, and the tool returns AT ONCE instead of blocking the turn until the timeout.",
+            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`, and such a call is refused. For a LONG-RUNNING process (dev server, watcher) set background=true: it starts detached, output goes to a log file the result names, and the tool returns AT ONCE instead of blocking the turn until the timeout. An SSH connection (ssh/scp/sftp/rsync/mosh) triggers the host permission popup the first time — wait for its answer, never pre-ask with confirm_action.",
             json!({
                 "command": {"type": "string"},
-                "timeout": {"type": "integer", "description": "max seconds to wait (default 120, hard ceiling 600 — for anything longer use background=true)"},
+                "timeout": {"type": "integer", "description": "max seconds to wait (default 120, hard ceiling 1800 — for anything longer use background=true)"},
                 "background": {"type": "boolean"}
             }),
         ),
@@ -2925,7 +3301,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                     "items": {"type": "string"},
                     "description": "run: script arguments"
                 },
-                "timeout": {"type": "integer", "description": "run: kill after N seconds (default 60)"},
+                "timeout": {"type": "integer", "description": "run: max seconds to wait (omit for no limit — a plugin script is never cut off)"},
                 "cwd": {"type": "string", "description": "run: working folder (default: the plugin folder)"}
             }),
         ),
@@ -3191,7 +3567,7 @@ fn research_schemas() -> Vec<Value> {
         ),
         (
             "grep",
-            "Regex content search. ALWAYS pass path (a directory or single file) and include (glob filter); keep patterns narrow (max 3 alternatives) and max_results small. Output shows 1 context line per hit by default — pass `context` (0-5) only when the surrounding lines matter, and ignore_case=true only when the exact casing is unknown (matching is case-SENSITIVE by default; a looser pattern means more output).",
+            "Regex content search. ALWAYS pass path (dir or single file) and include (glob filter); keep patterns narrow (max 3 alternatives) and max_results small. Over budget: definition lines (struct/fn/impl/…) come FIRST, the rest spreads fairly across files, and every unseen matching file is listed with its hit count — read a named file instead of re-grepping. A miss auto-tries spelling variants (snake/camel/Pascal), labeled. Context: 1 line per hit (pass `context` 0-5 only when surroundings matter); matching is case-SENSITIVE unless ignore_case=true.",
             json!({
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
@@ -3541,6 +3917,20 @@ pub async fn run_turn(
     } else {
         req.system_prompt.clone()
     };
+    // The schedule contract, in the prompt as well as in the loop: a headless
+    // run has NOBODY to answer a question or approve an action. Stating it up
+    // front keeps the run from spending a round discovering it (the ask/confirm
+    // tools are withheld below and auto-answered if still called).
+    if req.headless && req.mode != "subagent" {
+        system.push_str(
+            "\n\nSCHEDULED HEADLESS RUN: there is NO user here. Never try to ask a question or \
+request approval — those tools are unavailable and return without an answer. Decide each \
+fork yourself with the most reasonable default and state the assumption in your final \
+output. Paths outside the workspace, the OS temp folder and ~/.codifa are REFUSED (never \
+asked about): keep all reads and writes inside those roots or inside a folder the user has \
+already approved with \"Always allow\".",
+        );
+    }
     // Skills: the system prompt carries a catalog of the installed skills and
     // the model loads the ones it needs via `load_skill` (the Codex/Claude
     // pattern). Only the skills the user attached are inlined whole.
@@ -3881,6 +4271,18 @@ pub async fn run_turn(
     // Gate the native set BEFORE the MCP merge below: a connector must not be
     // able to re-introduce a tool the mode forbids (`write_file` through MCP).
     retain_allowed_tools(&mut schemas, &caps, &req.mode);
+    // The schedule contract at the SCHEMA level: a headless run has nobody to
+    // answer a question or approve an action, so the ask/confirm tools are not
+    // even advertised. The in-loop backstop below still auto-answers a stale
+    // transcript that calls them anyway — the belt for the suspenders.
+    if req.headless {
+        schemas.retain(|s| {
+            !matches!(
+                s["function"]["name"].as_str().unwrap_or(""),
+                "ask_user" | "confirm_action" | "request_permission"
+            )
+        });
+    }
     // A read-only mode never sees the authoring enum: `allow_create` is sticky
     // from the conversation history, so an Ask turn can carry it while the mode
     // forbids saving a bundle — with the full enum the model then names
@@ -5015,6 +5417,10 @@ the Vision model's description instead.\n"
         // instead of a tool error, so the model neither retries the path nor
         // spends a round discovering it cannot.
         let mut denied: Vec<(String, String, Value, String)> = Vec::new();
+        // SSH destinations the user approved for the rest of THIS turn ("Allow
+        // once"). "Always allow" persists through trusted-hosts.json instead,
+        // which the gate re-reads on every call.
+        let mut ssh_approved: Vec<String> = Vec::new();
         for (id, name, raw_args) in &tool_calls {
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
             // A call that reaches OUTSIDE every allowed root is asked about
@@ -5028,8 +5434,8 @@ the Vision model's description instead.\n"
             // grant, so the common case costs nothing. A sub-agent never
             // prompts: it reports back and the parent turn owns the question.
             if req.mode != "subagent" && !name.starts_with(crate::mcp::TOOL_PREFIX) {
-                if let Some(folder) = outside_target(name, &args, &root, permit.as_ref()) {
-                    if ask_outside_access(emit, &req.chat_id, cancel, name, &folder).await {
+                if let Some(folder) = outside_target(name, &args, &root, permit.as_ref(), &caps) {
+                    if ask_outside_access(emit, &req.chat_id, cancel, name, &folder, req.headless).await {
                         grant_folder(&mut permit, &folder);
                     } else {
                         // The card must appear even when the call is refused:
@@ -5040,6 +5446,38 @@ the Vision model's description instead.\n"
                             args: args.clone(),
                         });
                         denied.push((id.clone(), name.clone(), args, denied_outside(&folder)));
+                        continue;
+                    }
+                }
+                // An SSH connection is an outward-facing act the user owns:
+                // every destination the command would reach is asked about
+                // BEFORE anything runs — the whole line is held even when only
+                // one of several servers in it is new, so a chain can never
+                // connect somewhere unapproved halfway through. Approved hosts
+                // (this turn's answers, plus persisted "Always allow") pass
+                // silently; a denial answers the call without running it.
+                if name == "run_terminal" {
+                    let mut refused: Option<String> = None;
+                    for dest in ssh_destinations(args["command"].as_str().unwrap_or_default()) {
+                        if ssh_approved.iter().any(|h| h == &dest)
+                            || trusted_hosts(&skill_root).iter().any(|h| h == &dest)
+                        {
+                            continue;
+                        }
+                        if ask_ssh_access(emit, &req.chat_id, cancel, &dest, req.headless).await {
+                            ssh_approved.push(dest);
+                        } else {
+                            refused = Some(dest);
+                            break;
+                        }
+                    }
+                    if let Some(dest) = refused {
+                        emit(&AgentEvent::ToolStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args: args.clone(),
+                        });
+                        denied.push((id.clone(), name.clone(), args, denied_ssh(&dest)));
                         continue;
                     }
                 }
@@ -5110,28 +5548,55 @@ the Vision model's description instead.\n"
             // resolve `load_skill`/`create_skill` there, or every load answers
             // "Available: (none)" while the catalog above lists the skill.
             let skill_root_c = skill_root.clone();
+            // A scheduled turn may block for minutes on a paid script, so the
+            // batch hands each call to the blocking pool.
+            //
+            // Live output: every blocking task shares ONE tail channel; a task
+            // whose tool streams (only `run_terminal` does) forwards its
+            // command's output tail tagged with ITS call id. The pump below
+            // drains the channel until EVERY sender is gone — the senders live
+            // inside the blocking tasks, so a closed channel means every
+            // dispatch has returned — which keeps the emit single-threaded and
+            // preserves the ordered finish loop below unchanged.
+            let (tail_tx, mut tail_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
             let handles: Vec<_> = batch
                 .iter()
-                .map(|(_, name, args)| {
+                .map(|(id, name, args)| {
                     let root = root_c.clone();
                     let skill_root = skill_root_c.clone();
                     let permit = permit_c.clone();
                     let name = name.clone();
                     let args = args.clone();
+                    let id_tail = id.clone();
+                    let tail_tx = tail_tx.clone();
+                    let sink: tools::TailSink = Arc::new(move |tail: &str| {
+                        let _ = tail_tx.send((id_tail.clone(), tail.to_string()));
+                    });
                     tokio::task::spawn_blocking(move || {
-                        match tools::dispatch_with_data_root(
+                        let out = tools::dispatch_bounded_with(
                             &root,
                             &name,
                             &args,
                             permit.as_ref(),
                             Some(&skill_root),
-                        ) {
+                            Some(&sink),
+                        );
+                        drop(sink);
+                        match out {
                             Ok(r) => (r, true),
                             Err(e) => (e, false),
                         }
                     })
                 })
                 .collect();
+            // The map closure above moved a sender per task; drop OUR last
+            // reference so the channel actually closes when the tasks do.
+            drop(tail_tx);
+            // Forward every tail until all tasks are done (channel closes).
+            // 500 ms of gating happens inside the tool, not here.
+            while let Some((id, tail)) = tail_rx.recv().await {
+                emit(&AgentEvent::ToolOutput { id, tail });
+            }
             for ((id, name, args), handle) in batch.into_iter().zip(handles) {
                 let (result, ok) = handle
                     .await
@@ -5548,15 +6013,15 @@ user to ask for it. Available this turn: `list` and `run`."
                     (refusal, false)
                 } else {
                     // Sequential dispatch must NOT park the async worker: these
-                    // handlers block (terminal, plugin scripts — up to the 600s
-                    // ceiling). Same pattern as the read-only batch loop above.
+                    // handlers block (terminal, plugin scripts — up to the tool
+                    // budget). Same pattern as the read-only batch loop above.
                     let root_sb = root.clone();
                     let name_sb = name.to_string();
                     let args_sb = args.clone();
                     let permit_sb = permit.clone();
                     let skill_root_sb = skill_root.clone();
                     match tokio::task::spawn_blocking(move || {
-                        tools::dispatch_with_data_root(
+                        tools::dispatch_bounded(
                             &root_sb,
                             &name_sb,
                             &args_sb,
@@ -5794,6 +6259,20 @@ user to ask for it. Available this turn: `list` and `run`."
                     true,
                 )
             } else if name == "ask_user" {
+                // A scheduled run has NO renderer and NO user: the Ask event is
+                // dropped and `await_answer` (deliberately deadline-free) parks
+                // the run FOREVER. Answer at once instead, so the run keeps
+                // going and the model learns to decide on its own.
+                if req.headless {
+                    eprintln!("[tool] ask_user: auto-answered (scheduled run has no user)");
+                    (
+                        "ask_user returned immediately: this is a SCHEDULED run and NOBODY can \
+answer. Do not retry it. Decide with the most reasonable default for the task, state the \
+assumption in your final output, and continue."
+                            .to_string(),
+                        true,
+                    )
+                } else {
                 // Blocking question: emit the popup request, then WAIT (no
                 // deadline — the user may take as long as they need).
                 let gate = next_gate_id();
@@ -5815,7 +6294,22 @@ user to ask for it. Available this turn: `list` and `run`."
                         false,
                     ),
                 }
+                }
             } else if name == "confirm_action" || name == "request_permission" {
+                // Same schedule contract: nobody can approve a headless run, so
+                // DENY at once instead of parking the run on an open gate.
+                if req.headless {
+                    eprintln!(
+                        "[tool] {name}: auto-denied (scheduled run has no user to approve)"
+                    );
+                    (
+                        "NOT approved: this is a SCHEDULED run and nobody can approve anything. \
+Do NOT perform the action. Keep the work inside the workspace, the OS temp folder and \
+~/.codifa, or skip the step and note it in your final output."
+                            .to_string(),
+                        false,
+                    )
+                } else {
                 // Blocking permission gate: the action is NOT performed until
                 // the user approves it in the popup.
                 let gate = next_gate_id();
@@ -5868,6 +6362,7 @@ user to ask for it. Available this turn: `list` and `run`."
                         "The user did not answer (the turn was stopped).".to_string(),
                         false,
                     ),
+                }
                 }
             } else if name == "web_search" {
                 // Native web search: the engine chain is the user's Settings →
@@ -6105,21 +6600,41 @@ call fetch_url again with offset={next} for the rest]",
                 // Same worker protection as the plugin arm above: generic
                 // sequential handlers (terminal-capable skills, connectors)
                 // block too, so they run on the blocking pool.
+                //
+                // Live output: the blocking task streams its command's tail
+                // through a channel while it runs (only `run_terminal` sends);
+                // the pump forwards every tail to the UI and ends exactly when
+                // the task drops the sender — so the emit stays single-threaded
+                // and the await below sees the final result as before.
+                let (tail_tx, mut tail_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+                let id_tail = id.clone();
+                let tail_tx_sink = tail_tx.clone();
+                let sink: tools::TailSink = Arc::new(move |tail: &str| {
+                    let _ = tail_tx_sink.send((id_tail.clone(), tail.to_string()));
+                });
                 let root_sb = root.clone();
                 let name_sb = name.to_string();
                 let args_sb = args.clone();
                 let skill_root_sb = skill_root.clone();
-                match tokio::task::spawn_blocking(move || {
-                    tools::dispatch_with_data_root(
+                let handle = tokio::task::spawn_blocking(move || {
+                    let out = tools::dispatch_bounded_with(
                         &root_sb,
                         &name_sb,
                         &args_sb,
                         None,
                         Some(&skill_root_sb),
-                    )
-                })
-                .await
-                .unwrap_or(Err("tool task failed".into()))
+                        Some(&sink),
+                    );
+                    drop(sink);
+                    out
+                });
+                drop(tail_tx);
+                while let Some((cid, tail)) = tail_rx.recv().await {
+                    emit(&AgentEvent::ToolOutput { id: cid, tail });
+                }
+                match handle
+                    .await
+                    .unwrap_or(Err("tool task failed".into()))
                 {
                     Ok(r) => {
                         if let Some((target, pin_name, pin_path)) = was_update {
@@ -8274,8 +8789,15 @@ fn single_call_hint(
     // hint could not fire on any of them. `find_symbol` and `lsp_symbols` joined
     // the MAIN set for the same reason they belong here: both answer "where does
     // this live" WITHOUT a follow-up read, so a lone one is exactly a round that
-    // could have carried the window reads it points at.
-    if matches!(name, "read" | "fetch_url" | "load_skill" | "find_symbol" | "lsp_symbols") {
+    // could have carried the window reads it points at. `grep` and `glob` joined
+    // on the Oct 30 corpus: 41 lone `grep` rounds sat outside the whitelist even
+    // though grep runs in the concurrent batch phase (READONLY_NATIVE_TOOLS) —
+    // 3rd-largest lone-call group behind read and run_terminal, all of it
+    // batchable the moment the second lookup is foreseeable.
+    if matches!(
+        name,
+        "read" | "grep" | "glob" | "fetch_url" | "load_skill" | "find_symbol" | "lsp_symbols"
+    ) {
         return Some(Cow::Borrowed(
             "[hint] That step had ONE call. Every step re-sends the whole conversation: these read-only calls run CONCURRENTLY, so fetch everything you already know you need IN THE SAME STEP.",
         ));
@@ -9572,6 +10094,13 @@ carrying the question plus the paths you already found. It searches in its own \
 SHORT context and never pays your history; you act on its report. Fire SEVERAL \
 `explore` calls IN THE SAME STEP when the task spans independent areas — they run \
 concurrently on one round-trip; one broad explore is the slowest, shallowest option.\n\
+- BATCH EVERYTHING ALREADY DETERMINED: every step re-sends the whole conversation, \
+so a step that carries ONE call is a wasted round-trip whenever the next call does \
+not depend on its result. Read-only lookups (read, grep, glob, find_symbol, lsp_*) \
+issued together run CONCURRENTLY in that step; file edits issued together run IN \
+ORDER in that step. When several lookups or edits are already determined, fire them \
+ALL in the SAME reply — only a call whose ARGUMENTS come from the previous result \
+(the next probe, the next edit target) justifies a step of its own.\n\
 - After EVERY successful `edit_file`: the result carries the language server's \
 diagnostics for that file whenever a server is warm (it runs NO build). Read them \
 and fix what they name — only run your own build/typecheck when they are absent, \
@@ -9594,6 +10123,18 @@ first whether that dev process is already running (ps/lsof + its port): if it \
 is, REUSE it and never start a second one — duplicate dev servers fight over \
 the same port and produce conflicting logs. Only start it once when nothing \
 is running, and never verify against a release build. \
+REMOTE SERVERS (SSH): work on a server the user names through the ssh client in \
+`run_terminal` (`ssh user@host '…'`, `scp`, `rsync`). The FIRST command reaching a \
+server triggers the user's permission popup for that host — never pre-ask with \
+`confirm_action`, just wait for the popup and continue on approval; the grant is \
+remembered per host. A connection must be NON-INTERACTIVE: no password prompt is \
+ever answered, so probe reachability with `ssh -o BatchMode=yes user@host true` \
+and, if it fails, tell the user to set up key auth instead of retrying. Use \
+`-o StrictHostKeyChecking=accept-new` on an approved host, never `no`. Long remote \
+work runs detached on the SERVER (`nohup … >/tmp/x.log 2>&1 &` or tmux) and you \
+poll the log with follow-up ssh calls, or rides a local background=true terminal. \
+`read`/`edit_file`/`write_file` cannot reach the server: edit remote files through \
+ssh heredoc/`sed -i` or copy them with scp/rsync. \
 Use the tools this mode binds to make changes, and never claim a change you \
 did not make. \
 Only run `git commit` when the user EXPLICITLY asks for it — never commit \
@@ -10482,6 +11023,70 @@ mod tests {
     }
 
     #[test]
+    fn ssh_destinations_finds_the_servers_a_command_would_reach() {
+        // The direct shapes, with the option noise skipped.
+        assert_eq!(
+            ssh_destinations("ssh deploy@203.0.113.7 'df -h'"),
+            vec!["deploy@203.0.113.7"]
+        );
+        assert_eq!(
+            ssh_destinations("ssh -p 2222 -i ~/.keys/id_ed25519 -o BatchMode=yes prod.db"),
+            vec!["prod.db"]
+        );
+        assert_eq!(
+            ssh_destinations("/usr/bin/ssh root@10.0.0.2 systemctl status nginx"),
+            vec!["root@10.0.0.2"]
+        );
+        // scp: either endpoint may be the remote.
+        assert_eq!(ssh_destinations("scp out.tar.gz deploy@srv:/tmp/"), vec!["deploy@srv"]);
+        assert_eq!(ssh_destinations("scp -P 2200 deploy@srv:/var/x.log ./"), vec!["deploy@srv"]);
+        // rsync, sshpass wrapper, sh -c payload.
+        assert_eq!(ssh_destinations("rsync -avz ./dist/ admin@web:/srv/app/"), vec!["admin@web"]);
+        assert_eq!(ssh_destinations("sshpass -p PW ssh ops@bastion uptime"), vec!["ops@bastion"]);
+        assert_eq!(ssh_destinations("sh -c 'ssh git@github.com true'"), vec!["git@github.com"]);
+        // Several servers on one line: EVERY new destination must prompt.
+        assert_eq!(
+            ssh_destinations("ssh a@h1 x; ssh b@h2 y"),
+            vec!["a@h1", "b@h2"]
+        );
+        // The same host twice asks once.
+        assert_eq!(ssh_destinations("ssh h1 a && ssh h1 b"), vec!["h1"]);
+    }
+
+    #[test]
+    fn ssh_destinations_stays_silent_without_a_connection() {
+        // Local-only work must never open the popup.
+        for cmd in [
+            "cargo test 2>&1 | tail -3",
+            "git status && git diff --stat",
+            "rsync -a src/ dst/ && echo done",
+            "cp build/out.tar.gz C:/temp/out.tar.gz",
+            "du -sh . ; df -h",
+            "echo 'run ssh later'",
+        ] {
+            assert!(
+                ssh_destinations(cmd).is_empty(),
+                "{cmd:?} opens no SSH session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_ssh_host_never_prompts_again() {
+        let dir = std::env::temp_dir().join(format!("codifa-ssh-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.to_str().unwrap();
+        assert!(trusted_hosts(root).is_empty());
+        let stored = add_trusted_host(root, "deploy@203.0.113.7").unwrap();
+        assert_eq!(stored, "deploy@203.0.113.7");
+        // A duplicate stays a single entry; the file survives a re-read.
+        add_trusted_host(root, "deploy@203.0.113.7").unwrap();
+        assert_eq!(trusted_hosts(root), vec!["deploy@203.0.113.7".to_string()]);
+        assert!(add_trusted_host(root, "  ").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_prefixed_search_cannot_sneak_past_the_gate() {
         let root = env!("CARGO_MANIFEST_DIR");
         // MEASURED on the live build: 63% of `run_terminal` calls arrive as
@@ -10735,6 +11340,143 @@ mod tests {
                     crate::tools::PathAccess::Free
                 ),
                 "{rel:?} runs in any terminal without a prompt"
+            );
+        }
+    }
+
+    /// The traced two-round dance this closes: an out-of-tree `edit_file` died
+    /// on "path escapes project root" (mvpalezr t1595), the model re-attempted
+    /// the change through a shell one-liner, and THAT asked the popup the write
+    /// should have asked. The writer must pre-flight like a read does.
+    #[test]
+    fn a_writer_outside_every_root_asks_before_it_runs() {
+        // The "outside" folder must sit outside EVERY free root, so temp is
+        // out (it is always open) — this repo itself is the stand-in.
+        let outside =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests-gate-outside");
+        let root = std::env::temp_dir().join("codifa-writer-gate-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut caps = caps_for_mode("build");
+        let args = json!({
+            "path": outside.join("stt-server.py").to_string_lossy(),
+            "old_string": "a", "new_string": "b",
+        });
+        let folder = outside_target("edit_file", &args, root.to_str().unwrap(), None, &caps)
+            .expect("an out-of-tree write must pre-flight");
+        assert!(
+            outside.starts_with(&folder),
+            "the grant must cover the write's own folder: {folder:?}"
+        );
+        // A read-only mode refuses the call by caps anyway: no popup.
+        caps.write_files = false;
+        assert!(
+            outside_target("edit_file", &args, root.to_str().unwrap(), None, &caps).is_none(),
+            "a read-only mode must not show a popup a refusal follows anyway"
+        );
+        // Inside the workspace no writer asks.
+        caps.write_files = true;
+        let inside = json!({ "path": "src/a.rs", "old_string": "a", "new_string": "b" });
+        assert!(
+            outside_target("edit_file", &inside, root.to_str().unwrap(), None, &caps).is_none(),
+            "a workspace write never asks"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A plugin script run with an explicit working folder outside the free
+    /// set (the bundle folder, ~/.codifa, temp) pre-flights like any other
+    /// call; the DEFAULT working folder (the bundle's own) never does.
+    #[test]
+    fn a_plugin_script_with_an_explicit_outside_cwd_asks() {
+        let outside =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests-gate-outside");
+        let root = std::env::temp_dir().join("codifa-plugin-cwd-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let caps = caps_for_mode("build");
+        let explicit = json!({ "slug": "t", "name": "s", "action": "run",
+            "cwd": outside.to_string_lossy() });
+        assert!(
+            outside_target("plugin", &explicit, root.to_str().unwrap(), None, &caps).is_some(),
+            "an explicit outside working folder must ask"
+        );
+        let default_cwd = json!({ "slug": "t", "name": "s", "action": "run" });
+        assert!(
+            outside_target("plugin", &default_cwd, root.to_str().unwrap(), None, &caps).is_none(),
+            "the default (bundle folder) cwd never asks"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// "Always allow" must outlive the session: the folder is persisted in the
+    /// data root and merged into every later turn's permit — including a
+    /// headless one, which then never prompts on it.
+    #[test]
+    fn an_always_allow_folder_survives_into_later_turns() {
+        let data = std::env::temp_dir().join(format!("codifa-trust-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let folder = std::env::temp_dir().join("codifa-trust-folder");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let mut req = base_req();
+        req.data_root = data.to_string_lossy().to_string();
+        // No session grant and nothing persisted: no permit, old refusals stay.
+        assert!(outside_permit(&req).is_none());
+        // Approve for keeps… (the stored path is canonical: /var -> /private/var
+        // on macOS, so compare against the canonicalized temp root).
+        let stored = add_trusted_folder(&req.data_root, folder.to_str().unwrap()).unwrap();
+        let temp_canon = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(std::path::Path::new(&stored).starts_with(&temp_canon));
+        // …and the NEXT turn (fresh request, no renderer grant) already has it.
+        let permit = outside_permit(&req).expect("a persisted grant must open a permit");
+        let folders = permit["folders"].as_array().cloned().unwrap_or_default();
+        assert!(
+            folders.iter().any(|f| f.as_str() == Some(stored.as_str())),
+            "the permit must carry the trusted folder: {folders:?}"
+        );
+        // And the sandbox actually accepts a path inside it, with no other grant.
+        let root = std::env::temp_dir().join("codifa-trust-empty-root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = folder.join("file.txt");
+        assert!(
+            crate::tools::resolve_safe(
+                root.to_str().unwrap(),
+                &target.to_string_lossy(),
+                true,
+                Some(&permit),
+            )
+            .is_ok(),
+            "a trusted folder must open its subtree in resolve_safe"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A headless run must never advertise the ask/confirm tools: there is no
+    /// renderer, and a call would park on a gate nobody can resolve.
+    #[test]
+    fn a_headless_run_is_not_advertised_the_ask_tools() {
+        let mut schemas = tool_schemas(false, false);
+        assert!(
+            schemas.iter().any(|s| s["function"]["name"].as_str() == Some("ask_user")),
+            "an interactive build turn keeps ask_user"
+        );
+        // The same retain the headless branch in run_turn applies.
+        schemas.retain(|s| {
+            !matches!(
+                s["function"]["name"].as_str().unwrap_or(""),
+                "ask_user" | "confirm_action" | "request_permission"
+            )
+        });
+        for gone in ["ask_user", "confirm_action", "request_permission"] {
+            assert!(
+                schemas
+                    .iter()
+                    .all(|s| s["function"]["name"].as_str() != Some(gone)),
+                "{gone} must not be advertised to a scheduled run"
             );
         }
     }
@@ -11364,7 +12106,13 @@ mod tests {
             );
         }
         // Read-only natives are the one group that DOES batch concurrently.
-        for name in ["read", "fetch_url", "load_skill", "find_symbol", "lsp_symbols"] {
+        // `grep` joined on the Oct 30 corpus (41 lone rounds, streaks of 4+
+        // same-tool searches — all of it batchable the moment the second search
+        // was foreseeable); `glob` joins for the same execution semantics (it
+        // runs in the concurrent batch phase, so the wording stays truthful).
+        for name in [
+            "read", "grep", "glob", "fetch_url", "load_skill", "find_symbol", "lsp_symbols",
+        ] {
             let hint = single_call_hint("agent", &one(name), 1)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
             assert!(hint.contains("CONCURRENTLY"), "{name}: {hint}");
@@ -11378,8 +12126,6 @@ mod tests {
                 "{name} must stay silent"
             );
         }
-        // A tool the hint has nothing useful to say about must stay silent.
-        assert!(single_call_hint("agent", &one("glob"), 1).is_none());
     }
 
     #[test]

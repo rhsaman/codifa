@@ -100,6 +100,7 @@ repoAddress|tests/repoAddress.test.ts|-
 cmdContext|tests/cmdContext.test.ts|-
 transcribe|tests/transcribe.test.ts|--packages=external --external:electron
 voice|tests/voice.test.ts|-
+liveVoiceLease|tests/liveVoiceLease.test.ts|
 webResults|tests/webResults.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 engineBadge|tests/engineBadge.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 retryBanner|tests/retryBanner.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron

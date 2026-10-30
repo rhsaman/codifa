@@ -147,9 +147,8 @@ pub async fn transcribe(mp: Multipart) -> Response<Body> {
         }
     };
     let lang = form_str(&form, "lang").trim().to_lowercase();
-    // The user's glossary is BIASING CONTEXT for the model, never a sentence
-    // instructing it (see buildSttPrompt): an instruction came back as the
-    // transcript instead of the audio.
+    // `prompt` is OpenAI-surface passthrough only: the app sends none (measured
+    // worse — WER 24.5% -> 26.9%), but an external client may still set it.
     let prompt = form_str(&form, "prompt").trim().to_string();
     // Decoding temperature, forwarded only when it is a real 0..=1 number: the
     // renderer pins greedy decoding so the same clip cannot transcribe to a

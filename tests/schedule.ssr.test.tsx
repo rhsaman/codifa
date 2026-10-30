@@ -37,9 +37,15 @@ const { formatNextRunFa, runStatusFa, cronToPresetValue } = await import(
   "../src/components/SchedulePanel"
 )
 const { unseenRunCount, unseenRunCountForTask, pickInboxTask } = await import("../src/components/ScheduleInbox")
-const { scheduleRunTokenTotal, taskTokenTotals, findFinishedScheduleRuns, liveRunningMap } = await import(
-  "../src/lib/schedule-notify"
-)
+const {
+  scheduleRunTokenTotal,
+  taskTokenTotals,
+  findFinishedScheduleRuns,
+  liveRunningMap,
+  finishedRunIds,
+  unseenRunCount: unseenRunCountLib,
+} = await import("../src/lib/schedule-notify")
+const { readFileSync } = await import("node:fs")
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -185,6 +191,37 @@ console.log("۱۱) liveRunningMap — اسپینر از داده بکاند مش
   check("ران بدون schedule_id نادیده", !("" in map), map)
   check("فقط s1 رأی در حال اجرا دارد", Object.keys(map).length === 1, map)
   check("لیست خالی → map خالی", Object.keys(liveRunningMap([])).length === 0)
+}
+
+console.log("12) a RUNNING run never counts toward the badge and is never marked seen:")
+{
+  const runs = [
+    { id: "a", schedule_id: "s1", status: "done", started_at: 1 },
+    { id: "b", schedule_id: "s1", status: "running", started_at: 2 },
+    { id: "c", schedule_id: "s2", status: "error", started_at: 3 },
+  ] as any
+  check("badge counts only finished runs (done + error)", unseenRunCount(runs, []) === 2, unseenRunCount(runs, []))
+  check("per-task badge ignores the running run", unseenRunCountForTask(runs, [], "s1") === 1)
+  check("a task with only a running run has no badge", unseenRunCountForTask([runs[1]], [], "s1") === 0)
+  check("the dock helper and the inbox re-export agree", unseenRunCountLib(runs, ["a"]) === unseenRunCount(runs, ["a"]))
+  check("only finished ids may be recorded as seen", finishedRunIds(runs).join(",") === "a,c", finishedRunIds(runs))
+  // The run settles later: it was never marked seen, so its result DOES badge.
+  const settled = runs.map((r: any) => (r.id === "b" ? { ...r, status: "done" } : r))
+  check("once it settles, the unseen result counts", unseenRunCount(settled, finishedRunIds(runs)) === 1)
+}
+
+console.log("13) the badge's plumbing is actually mounted (regression: the badge button was dead code):")
+{
+  const appSrc = readFileSync("src/App.tsx", "utf8")
+  const barSrc = readFileSync("src/components/ViewerTabBar.tsx", "utf8")
+  const inboxSrc = readFileSync("src/components/ScheduleInbox.tsx", "utf8")
+  check("App mounts the run watcher", /<ScheduleRunsWatcher\s*\/>/.test(appSrc))
+  check("the dock's Inbox entry carries the unseen count", /kind: "inbox"[^\n]*badge: inboxUnseen/.test(barSrc))
+  check("the dock renders the badge element", barSrc.includes("viewer-dock-badge"))
+  check("the inbox never marks a running run seen", !/markSeen\([a-z]+\.map\(/.test(inboxSrc) && inboxSrc.includes("markSeen(finishedRunIds("))
+  check("no second poller: the old titlebar button is gone", !inboxSrc.includes("ScheduleInboxButton"))
+  const css = readFileSync("src/styles/global.css", "utf8")
+  check("the dock badge is positioned over its button", /\.viewer-dock-btn\s*\{[^}]*position:\s*relative/.test(css) && /\.viewer-dock-badge\s*\{[^}]*position:\s*absolute/.test(css))
 }
 
 if (failed > 0) {

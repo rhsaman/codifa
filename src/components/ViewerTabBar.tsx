@@ -16,6 +16,8 @@ import { CompressIcon, ExpandIcon } from "./ViewerFullscreenButton";
 import { TabListButton, type TabListSection } from "./TabListMenu";
 import { FileIcon } from "./FileIcon";
 import { fmtAgo } from "../lib/time";
+import { unseenRunCount } from "../lib/schedule-notify";
+import { useScheduleRunsLive } from "../lib/scheduleRunsLive";
 
 /** Width (px) of the tab-list dropdown, mirrored from `.tab-list-menu`. */
 const TAB_LIST_MENU_WIDTH = 410;
@@ -589,13 +591,18 @@ export function ViewerDockBar() {
   // that is actually painted right now.
   const shownTab = allTabs.find((t) => t.id === shownViewerTabId(allTabs, activeId, scope));
   const vt = () => useViewerTabs.getState();
-  const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; onPress: () => void }> = [
+  // Finished-but-unread schedule runs: the Inbox icon carries the count. A run
+  // still in flight never counts (see unseenRunCount), so "running" is silent.
+  const liveRuns = useScheduleRunsLive((s) => s.runs);
+  const runsSeen = useStore((s) => s.scheduleRunsSeen);
+  const inboxUnseen = unseenRunCount(liveRuns, runsSeen);
+  const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; badge?: number; onPress: () => void }> = [
     { kind: "files", title: "Files", icon: <FilesIcon />, onPress: () => vt().openFiles() },
     { kind: "todos", title: "Todos", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
     { kind: "review", title: "Git diff", icon: <ReviewIcon />, onPress: () => vt().openGitDiff(scope.chatId) },
     { kind: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onPress: () => vt().openArtifacts() },
     { kind: "schedule", title: "Schedule", icon: <ScheduleIcon />, onPress: () => vt().openSchedule() },
-    { kind: "inbox", title: "Inbox", icon: <InboxIcon />, onPress: () => vt().openInbox() },
+    { kind: "inbox", title: "Inbox", icon: <InboxIcon />, badge: inboxUnseen, onPress: () => vt().openInbox() },
     { kind: "terminal", title: "Terminal", icon: <TerminalIcon />, onPress: openTerminalTab },
   ];
   return (
@@ -607,8 +614,8 @@ export function ViewerDockBar() {
             key={d.kind}
             type="button"
             className={`viewer-dock-btn${active ? " active" : ""}`}
-            title={d.title}
-            aria-label={d.title}
+            title={d.badge ? `${d.title} · ${d.badge} new` : d.title}
+            aria-label={d.badge ? `${d.title} (${d.badge} new)` : d.title}
             aria-pressed={active}
             onClick={() => {
               // Toggle: the page is on screen → close it (the pane falls back
@@ -621,6 +628,11 @@ export function ViewerDockBar() {
             }}
           >
             {d.icon}
+            {d.badge ? (
+              <span className="viewer-dock-badge" aria-hidden="true">
+                {d.badge > 99 ? "99+" : d.badge}
+              </span>
+            ) : null}
           </button>
         );
       })}

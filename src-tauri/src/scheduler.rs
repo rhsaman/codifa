@@ -15,14 +15,21 @@ use std::path::{Path, PathBuf};
 const POLL_SECS: u64 = 30;
 /// A stored next_run at most this far in the past still counts as due.
 const DUE_GRACE_SECS: f64 = 90.0;
-/// A "running" run younger than this blocks a second concurrent run.
-const RUNNING_WINDOW_SECS: f64 = 15.0 * 60.0;
+/// A scheduled run has NO wall-clock deadline.
+///
+/// It used to have one (15 min, then 30): the deadline killed the whole turn
+/// while a plugin script inside it was still working, and because that script
+/// had already paid for its article/image, the retry paid again. A plugin run is
+/// now unbounded, so a run cap would silently re-introduce the same kill — the
+/// turn is bounded only by the user pressing stop.
+///
+/// Liveness is tracked separately, below: a "running" row with no process
+/// behind it is closed as an orphan, so removing the deadline cannot leave a
+/// row stuck forever.
+const RUNNING_WINDOW_SECS: f64 = 6.0 * 60.0 * 60.0;
 /// Running runs older than this are orphans from a dead process → error.
-const ORPHAN_AFTER_SECS: f64 = 60.0 * 60.0;
-/// Hard wall-clock cap of ONE model rung of a scheduled run. A run whose tool
-/// call never returns would otherwise sit "running" until the orphan sweep.
-/// Kept equal to RUNNING_WINDOW_SECS so a live run never overlaps a second copy.
-const RUN_TIMEOUT_SECS: u64 = 15 * 60;
+/// Kept ABOVE the live window so a genuine long run is never swept as one.
+const ORPHAN_AFTER_SECS: f64 = RUNNING_WINDOW_SECS + 5.0 * 60.0;
 /// How long a run gets to wind down on its own after a stop was requested before
 /// its turn is dropped (a tool blocked on a child process never reads the flag).
 const STOP_GRACE_SECS: u64 = 5;
@@ -219,12 +226,23 @@ fn string_map(settings: &Value, key: &str) -> std::collections::HashMap<String, 
         .unwrap_or_default()
 }
 
-/// Read a `{ key: ["a", "b"] }` map of ORDERED string lists out of the settings
+/// Read a `{ key: […] }` map of ORDERED fallback entries out of the settings
 /// document (the per-tool fallback lists from Settings → Tools).
 ///
-/// The order is the try order, so it is preserved exactly; non-string rows and
-/// empty lists are dropped, and a hand-edited settings.json must never make a
-/// scheduled run panic.
+/// The order is the try order, so it is preserved exactly; rows that cannot
+/// address an endpoint and empty lists are dropped, and a hand-edited
+/// settings.json must never make a scheduled run panic.
+///
+/// A headless run reads this file DIRECTLY — it never passes through the
+/// renderer's `toolFallbackEntries` — so rows arrive in BOTH shapes the app
+/// has persisted: the plain `"providerId/model"` string the interactive turn
+/// sends on the wire, and the `{ "providerId": …, "model": … }` object the
+/// Tools row itself stores. The object shape is converted here with exactly
+/// that function's rules, so the schedule's chain can never disagree with the
+/// chat's: both halves empty becomes the `"main model"` sentinel
+/// `resolve_slot_target` resolves to the request's own model, a HALF-filled
+/// row (a provider without a model or the reverse) is unroutable and dropped,
+/// and any other object row becomes `"providerId/model"`.
 fn string_list_map(settings: &Value, key: &str) -> std::collections::HashMap<String, Vec<String>> {
     settings
         .get(key)
@@ -232,14 +250,8 @@ fn string_list_map(settings: &Value, key: &str) -> std::collections::HashMap<Str
         .map(|m| {
             m.iter()
                 .filter_map(|(k, v)| {
-                    let list: Vec<String> = v
-                        .as_array()?
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect();
+                    let list: Vec<String> =
+                        v.as_array()?.iter().filter_map(fallback_entry).collect();
                     if list.is_empty() {
                         None
                     } else {
@@ -249,6 +261,39 @@ fn string_list_map(settings: &Value, key: &str) -> std::collections::HashMap<Str
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// One stored fallback row → the wire entry the slot resolver speaks, or `None`
+/// when the row cannot route anywhere.
+fn fallback_entry(row: &Value) -> Option<String> {
+    // Legacy / hand-edited string row: kept verbatim, minus empty strings.
+    if let Some(s) = row.as_str() {
+        let s = s.trim();
+        if s.is_empty() || s.starts_with('/') || s.ends_with('/') {
+            return None;
+        }
+        return Some(s.to_string());
+    }
+    // The shape the Tools row persists: `{ providerId, model }`.
+    let obj = row.as_object()?;
+    let pid = obj
+        .get("providerId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let model = obj.get("model").and_then(Value::as_str).unwrap_or("").trim();
+    if pid.is_empty() && model.is_empty() {
+        // The composer's own model, travelling by NAME: the sentinel is a real
+        // rung in the user's try order and `resolve_slot_target` resolves it to
+        // the request's own model.
+        return Some("main model".to_string());
+    }
+    if pid.is_empty() || model.is_empty() {
+        // Unroutable: a provider without a model (or the reverse) cannot
+        // address an endpoint, and sending it would 404 the rung.
+        return None;
+    }
+    Some(format!("{pid}/{model}"))
 }
 
 /// Read a `["a", "b"]` list of names out of a task document (missing/non-array
@@ -974,7 +1019,6 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // so reading it back always produced an empty output.
         let mut text = String::new();
         let mut turn_errors: Vec<String> = Vec::new();
-        let mut timed_out = false;
         let res = {
             let mut emit = |ev: &crate::agent::AgentEvent| match ev {
                 crate::agent::AgentEvent::Text { content } => text.push_str(content),
@@ -989,12 +1033,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
             tokio::select! {
                 r = crate::agent::run_turn(&rung, &mut emit, &cancel) => r,
                 // Stop pressed: the turn gets a short grace to end by itself,
-                // then it is dropped so a hung tool cannot pin the run.
+                // then it is dropped so a hung tool cannot pin the run. This is
+                // the ONLY way a run is cut short — there is no deadline, so a
+                // paid tool call is never killed mid-flight.
                 _ = stop_requested(&cancel) => Err("stopped by user".to_string()),
-                _ = tokio::time::sleep(std::time::Duration::from_secs(RUN_TIMEOUT_SECS)) => {
-                    timed_out = true;
-                    Err(format!("run timed out after {} min", RUN_TIMEOUT_SECS / 60))
-                }
             }
         };
         match res {
@@ -1025,7 +1067,7 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
                 if text.chars().count() > partial_text.chars().count() {
                     partial_text = text;
                 }
-                if !next || timed_out {
+                if !next {
                     break;
                 }
             }
@@ -1362,5 +1404,51 @@ mod tests {
         let n = compute_next_run(&t, now).unwrap();
         let expected = ((now as i64) / 60 + 1) * 60;
         assert_eq!(n, expected as f64);
+    }
+
+    #[test]
+    fn tool_fallback_map_accepts_both_persisted_shapes() {
+        // The Tools row persists OBJECTS (`{providerId, model}`); the
+        // interactive turn sends STRINGS. A headless run reads the file
+        // directly, so the map must speak both — otherwise every object row
+        // was silently dropped and the schedule's chain ran its own model
+        // with NO fallbacks.
+        let settings = json!({
+            "toolFallbacks": {
+                "schedule": [
+                    {"providerId": "custom-mvchoxmp", "model": "oc/deepseek-v4.1-flash-free"},
+                    {"providerId": "", "model": ""},
+                    {"providerId": "", "model": "orphan-model"},
+                    {"providerId": "google", "model": ""},
+                    "",
+                    "legacy/bare-model"
+                ],
+                "vision": [
+                    {"providerId": "nvidia", "model": "minimaxai/minimax-m3.1-flash"}
+                ]
+            }
+        });
+        let map = string_list_map(&settings, "toolFallbacks");
+        assert_eq!(
+            map.get("schedule").map(Vec::as_slice),
+            Some(
+                &[
+                    // A fully-named row → the wire string the resolver splits.
+                    "custom-mvchoxmp/oc/deepseek-v4.1-flash-free".to_string(),
+                    // A row naming nothing → the composer's own model, by NAME.
+                    "main model".to_string(),
+                    // A legacy string row passes through verbatim.
+                    "legacy/bare-model".to_string(),
+                ][..]
+            )
+        );
+        // Half-filled rows (a provider without a model or the reverse) and
+        // empty strings are unroutable → dropped, in the middle of the list.
+        assert_eq!(
+            map.get("vision").map(Vec::as_slice),
+            Some(&["nvidia/minimaxai/minimax-m3.1-flash".to_string()][..])
+        );
+        // An absent key contributes nothing at all.
+        assert!(!map.contains_key("explore"));
     }
 }

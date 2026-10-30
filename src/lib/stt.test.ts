@@ -1,5 +1,5 @@
 // Tests for the speech-to-text helpers in src/lib/stt.ts.
-// Covers language/prompt resolution, the PCM/WAV encoder that makes chunked
+// Covers language resolution, the PCM/WAV encoder that makes chunked
 // live transcription possible, and the transcript merge used to stitch chunks.
 // Run: npx esbuild src/lib/stt.test.ts --bundle --platform=node --format=esm
 //        --packages=external --external:electron --outfile=tests/.tmp-stt.mjs
@@ -20,7 +20,6 @@ const {
   STT_SAMPLE_RATE,
   STT_LANGUAGES,
   resolveSttLanguage,
-  buildSttPrompt,
   concatFloat32,
   downsampleFloat32,
   encodeWavPcm16,
@@ -46,33 +45,18 @@ console.log('1) language resolution:')
   check('Persian is offered in the settings list', STT_LANGUAGES.some((l) => l.code === 'fa'))
 }
 
-console.log('2) the prompt never fabricates speech for the model to continue:')
+console.log('2) no prompt is ever sent to the provider:')
 {
-  // Regression: a built-in sentence per language ("سلام، این یک پیام صوتی
-  // فارسی است. متن را … بنویس.") was sent as the prompt. Whisper treats the
-  // prompt as preceding text and CONTINUES it, so «سلام چطوری» came back as the
-  // instruction sentence itself. An absent prompt is always safer.
-  check('no prompt is sent when nothing is configured', buildSttPrompt('fa') === '')
-  check('unknown language also sends nothing', buildSttPrompt('xx') === '')
-  check(
-    'the old instruction sentence is gone for every language',
-    ['fa', 'en', 'ar', 'de', 'fr', 'ru'].every((l) => buildSttPrompt(l) === ''),
-  )
-
-  const own = buildSttPrompt('fa', 'واژه‌های من')
-  check('user glossary is sent verbatim', own === 'واژه‌های من', { own })
-  check('no fabricated sentence is mixed in', !own.includes('پیام صوتی فارسی'), { own })
-
-  const withTail = buildSttPrompt('fa', 'واژه‌های من', 'متن قبلی')
-  check('an explicit real context tail still appends', withTail === 'واژه‌های من متن قبلی', { withTail })
-
-  const tailOnly = buildSttPrompt('fa', '', 'متن قبلی')
-  check('a tail alone is sent when there is no glossary', tailOnly === 'متن قبلی', { tailOnly })
-
-  const longCustom = Array.from({ length: 200 }, (_, i) => `w${i}`).join(' ')
-  const capped = buildSttPrompt('fa', longCustom)
-  check('long prompts are capped for the provider token limit', capped.length <= 400, { len: capped.length })
-  check('capped prompt keeps the newest words', capped.endsWith('w199'), { tail: capped.slice(-20) })
+  // Regression: the prompt was first a fabricated per-language sentence and
+  // then a word list. Whisper treats a prompt as preceding text and CONTINUES
+  // it, so the sentence came back as speech; the word list measurably raised
+  // the error rate (24.5% -> 26.9% on the Persian bench, one clip dropped
+  // entirely). The whole mechanism is gone, so no path can reintroduce it
+  // without adding the API back.
+  const api = Object.keys(await import('./stt'))
+  check('buildSttPrompt is gone', !api.includes('buildSttPrompt'), { api })
+  check('extractSttVocab is gone', !api.includes('extractSttVocab'))
+  check('stripSttPromptEcho is gone', !api.includes('stripSttPromptEcho'))
 }
 
 console.log('3) PCM helpers:')

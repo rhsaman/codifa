@@ -560,6 +560,40 @@ export function toolCallBody(activity: ToolActivity): string {
 }
 
 /**
+ * Fold a `tool_output` event into the activity list: the live output tail of
+ * a still-RUNNING `run_terminal` call (the backend streams one every ~500 ms).
+ * The tail lands on the card matched by the provider-native call id, recursing
+ * into explore children so a future sub-agent terminal call nests correctly.
+ * An event for a card that is already resolved (or unknown) is dropped — the
+ * final output always arrives on the tool_result event anyway.
+ */
+export function applyToolOutputEvent(
+  activities: ToolActivity[],
+  id: string,
+  tail: string,
+): ToolActivity[] {
+  let changed = false;
+  const fold = (list: ToolActivity[]): ToolActivity[] => {
+    const next = list.map((a) => {
+      if (a.callId === id && a.status === "running") {
+        changed = true;
+        return { ...a, liveTail: tail };
+      }
+      if (a.children && a.children.length > 0) {
+        const children = fold(a.children);
+        if (children.some((c, i) => c !== a.children![i])) {
+          return { ...a, children };
+        }
+      }
+      return a;
+    });
+    return next;
+  };
+  const out = fold(activities);
+  return changed ? out : activities;
+}
+
+/**
  * Force all "running" cards (including nested children) to "done" with an
  * elapsed time. Used by `resolveStuckCards` in Chat.tsx when a stream ends
  * without a `tool_result` for every started card (backend crash, stop,

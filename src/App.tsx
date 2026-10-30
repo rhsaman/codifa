@@ -38,6 +38,7 @@ import { invalidateSidecarCache } from './lib/api'
 import { fetchAndPersist } from './lib/provider-fetch'
 import { WindowStripCluster } from './components/WindowStripCluster'
 import { WorkspaceMenuButton } from './components/WorkspaceMenuButton'
+import { ScheduleRunsWatcher } from './components/ScheduleRunsWatcher'
 // xterm.js (term rendering) is only needed once the panel is actually opened,
 // so it is split out of the startup chunk: the panel is a plain component with
 // no imperative handle, and it renders `null` until the first open anyway.
@@ -885,6 +886,10 @@ export default function App() {
       <Suspense fallback={null}>
         <TerminalPanel />
       </Suspense>
+
+      {/* Headless: polls scheduled-task runs so the dock's Inbox badge and the
+          finished-run notification work while the inbox page is closed. */}
+      <ScheduleRunsWatcher />
 
       {settingsOpen && <SettingsModal onClose={() => useStore.getState().setSettingsOpen(false)} />}
       {searchOpen && <SearchOverlay onClose={() => setSearchOpen(false)} />}

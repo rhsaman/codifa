@@ -70,11 +70,16 @@ pub const DEFAULT_SCRIPT_LANGUAGE: &str = "rust";
 pub const SCRIPT_LANGUAGES: [&str; 4] = ["rust", "python", "node", "bash"];
 /// Cap on the scripts one bundle may hold.
 pub(crate) const MAX_SCRIPTS: usize = 20;
-/// How long one script run may take when the call does not say.
-const SCRIPT_TIMEOUT_SECS: u64 = 60;
-/// Hard ceiling for a script run, so one call cannot pin a worker forever.
-const SCRIPT_TIMEOUT_MAX: u64 = 600;
-/// A `rustc` build is slower than a run but still bounded.
+/// A plugin script has NO time budget: not a default, not a cap. The wait is
+/// whatever the script needs, and only the caller's own `timeout` (when it
+/// names one) can bound it.
+///
+/// Why: a paid script (article + image) was killed at 60 s, then at 600 s, then
+/// at an hour — every kill landed AFTER the money was spent, and the retry paid
+/// again. A ceiling smaller than the work it bounds is not a guard, it is a
+/// billing bug.
+///
+/// A `rustc` BUILD is the compiler, not the script, so it keeps its own bound.
 const SCRIPT_BUILD_TIMEOUT_SECS: u64 = 180;
 
 /// The Persian trigger phrases each KNOWN capability maps to.
@@ -677,6 +682,69 @@ fn read_script_source(root: &Path, slug: &str, name: &str, meta: &Value) -> Opti
     fs::read_to_string(script_dir(root, slug, name).join(script_source_file(language))).ok()
 }
 
+/// Absolute `$HOME` paths a bundle's scripts hard-code OUTSIDE their own folder.
+///
+/// A bundle is a self-contained folder: it must reach its config, history and
+/// state through paths relative to itself (the runner starts a script with the
+/// bundle as its working directory). A literal like
+/// `/Users/<someone>/.codifa/plugins/<slug>/...` stops being true as soon as the
+/// bundle is installed anywhere else, and anything else under `$HOME` is outside
+/// every root a scheduled run may touch without asking — which is exactly how a
+/// scheduled run reached a permission gate with nobody to answer it and stalled
+/// forever. Reported at WRITE time so the bug never ships.
+pub fn script_outside_paths(root: &Path, slug: &str) -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let home = home.to_string_lossy().to_string();
+    let own = plugin_dir(root, slug).to_string_lossy().to_string();
+    let mut hits: Vec<String> = Vec::new();
+    for row in list_scripts(root, slug) {
+        let Some(name) = row["name"].as_str() else {
+            continue;
+        };
+        let Some(meta) = read_script(root, slug, name) else {
+            continue;
+        };
+        let Some(source) = read_script_source(root, slug, name, &meta) else {
+            continue;
+        };
+        for literal in quoted_absolutes(&source) {
+            // Only the home tree is interesting: `/tmp`, `/usr`, `/opt` and the
+            // like are legitimate tool paths, not a misplaced bundle file.
+            if !literal.starts_with(&home) || literal.starts_with(&own) {
+                continue;
+            }
+            if !hits.iter().any(|h| h == &literal) {
+                hits.push(literal);
+            }
+        }
+    }
+    hits
+}
+
+/// Absolute-path string literals in a source file (`"..."` and `'...'`).
+///
+/// Deliberately lexical: there is no parser per language here, and every one of
+/// them spells a string the same way. A `~` form is expanded first, because
+/// `"~/.x"` is the same mistake as `"/Users/me/.x"`.
+fn quoted_absolutes(source: &str) -> Vec<String> {
+    let home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
+    let mut out: Vec<String> = Vec::new();
+    for (i, quote) in source.char_indices().filter(|(_, c)| *c == '"' || *c == '\'') {
+        let rest = &source[i + 1..];
+        let Some(len) = rest.find(quote) else { continue };
+        let mut lit = rest[..len].trim().to_string();
+        if lit.starts_with("~/") {
+            lit = format!("{}{}", home, &lit[1..]);
+        }
+        if lit.starts_with('/') && !out.iter().any(|o| o == &lit) {
+            out.push(lit);
+        }
+    }
+    out
+}
+
 /// A runnable starting point, so a script can be created without the caller
 /// having to invent boilerplate — and so the DEFAULT language is visible as
 /// working Rust code rather than an empty file.
@@ -881,6 +949,18 @@ pub(crate) fn load_plugin_env(dir: &Path) -> Vec<(String, String)> {
     vars
 }
 
+/// How long one script run may block: its own `timeout` when the call names
+/// one, else `0` = no deadline at all.
+///
+/// A plugin script has NO ceiling of its own, and no ceiling is imposed on it
+/// from outside either. It used to have two (600 s, then an hour) and both were
+/// smaller than the work they bounded: the script was killed AFTER a paid
+/// article call, and the retry paid for it again. See
+/// [`crate::tools::run_terminal_bounded`] for what `0` means there.
+fn script_timeout(body: &Value) -> u64 {
+    body["timeout"].as_u64().unwrap_or(0)
+}
+
 /// Run one of a bundle's scripts. Rust is compiled with `rustc` on first use
 /// and re-used until the source or the binary changes, so a repeat run costs
 /// nothing; the other languages go straight to their interpreter.
@@ -942,11 +1022,10 @@ rust, python, node, bash"
     if args.first().map(|a| a.trim()) == Some(name.as_str()) {
         args.remove(0);
     }
-    let timeout = body["timeout"]
-        .as_u64()
-        .filter(|t| *t > 0)
-        .unwrap_or(SCRIPT_TIMEOUT_SECS)
-        .min(SCRIPT_TIMEOUT_MAX);
+    // The script's OWN window: `timeout` from the call, else none at all.
+    // No plugin default and no caller ceiling: a paid script must never be
+    // killed after the money was spent.
+    let timeout = script_timeout(body);
     // Default to the plugin folder: a script that ships data beside itself
     // resolves relative paths without the caller having to explain where it is.
     let cwd = body["cwd"]
@@ -1018,7 +1097,11 @@ rust, python, node, bash"
         command.push(' ');
         command.push_str(&sh_quote(a));
     }
-    let output = crate::tools::run_terminal(&cwd, &command, timeout)?;
+    // The script's own window may exceed the terminal default (a paid article
+    // call takes minutes), so the bound is passed explicitly instead of
+    // inheriting the global one — and `ceiling = 0` means the plugin layer
+    // imposes none: the script is never clipped.
+    let output = crate::tools::run_terminal_bounded(&cwd, &command, timeout, 0)?;
     Ok(json!({
         "plugin": plugin,
         "script": name,
@@ -2587,11 +2670,60 @@ pub fn mcp_of(root: &Path, slugs: &[String]) -> serde_json::Map<String, Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn script_timeout_uses_the_calls_own_value_and_has_no_default_cap() {
+        // No timeout named: NO deadline — the script runs to completion.
+        assert_eq!(script_timeout(&json!({})), 0);
+        assert_eq!(script_timeout(&json!({"timeout": 0})), 0);
+        // A named value is used as given, however large.
+        assert_eq!(script_timeout(&json!({"timeout": 540})), 540);
+        assert_eq!(script_timeout(&json!({"timeout": 5400})), 5400);
+    }
+
     fn temp_root(tag: &str) -> PathBuf {
         let tmp = std::env::temp_dir().join(format!("codifa-plugin-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         tmp
+    }
+
+    #[test]
+    fn a_bundle_script_that_hard_codes_a_home_path_is_reported() {
+        // The reported bug: a script kept its dedup memory in
+        // `$HOME/.healer_generated_topics.json`. That is outside every root a
+        // scheduled run may touch, so the run hit a permission gate nobody could
+        // answer and stalled forever. The bundle must resolve its own files
+        // relative to itself, and the write path must SAY when it does not.
+        let root = temp_root("script-detached");
+        fs::create_dir_all(root.join("plugins/mylib/scripts/keep")).unwrap();
+        fs::write(
+            root.join("plugins/mylib/plugin.json"),
+            json!({"name": "mylib"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("plugins/mylib/scripts/keep/script.json"),
+            json!({"name": "keep", "language": "rust"}).to_string(),
+        )
+        .unwrap();
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        let stray = format!("{home}/.mylib_state.json");
+        fs::write(
+            root.join("plugins/mylib/scripts/keep/main.rs"),
+            format!("fn main() {{ let p = \"{stray}\"; let _ = p; }}"),
+        )
+        .unwrap();
+
+        assert_eq!(script_outside_paths(&root, "mylib"), vec![stray]);
+
+        // A path INSIDE the bundle is exactly what the rule asks for.
+        fs::write(
+            root.join("plugins/mylib/scripts/keep/main.rs"),
+            "fn main() { let p = \"state.json\"; let _ = p; }",
+        )
+        .unwrap();
+        assert!(script_outside_paths(&root, "mylib").is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

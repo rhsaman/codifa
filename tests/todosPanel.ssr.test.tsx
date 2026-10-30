@@ -403,9 +403,11 @@ console.log("۲۴) بخش Terminals — ترمینال‌های بک‌گران�
     { usageIdx, terminalsIdx, todosIdx },
   )
   // helperهای خالص جدا تست می‌شوند (tests/agentTerminals.test.ts)؛ اینجا فقط
-  // مطمئن می‌شویم رندر فقط ردیف‌های زنده را نشان می‌دهد
-  const { runningAgentTerminals, formatRunningFor } = await import("../src/lib/agentTerminals")
-  check("فیلتر ردیف‌های زنده از helper خالص می‌آید", src.includes("runningAgentTerminals(terminals)"))
+  // مطمئن می‌شویم رندر از فیلتر خالص می‌خواند: زنده‌ها + خروج‌یافته‌های grace
+  const { visibleAgentTerminals, runningAgentTerminals, formatRunningFor } =
+    await import("../src/lib/agentTerminals")
+  check("فیلتر نمایش از helper خالص می‌آید", src.includes("visibleAgentTerminals(terminals"))
+  check("ردیف خروج‌یافته برچسب exit دارد", src.includes("terminalExitLabel(t)"))
   const rows = [
     { id: "a", running: true, started_at_ms: 0 },
     { id: "b", running: false },

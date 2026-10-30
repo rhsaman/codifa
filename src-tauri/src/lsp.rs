@@ -1496,8 +1496,19 @@ pub fn find_symbol_position(text: &str, symbol: &str, hint_line: Option<i64>) ->
 
 /// Resolve `symbol=` (what the model actually knows) to a (line, character)
 /// position inside `file_path` for definition/references/hover.
-pub fn locate_symbol(root: &str, file_path: &str, symbol: &str, hint_line: Option<i64>) -> Result<(i64, i64), String> {
-    let abs = resolve_safe(root, file_path, true, None)?;
+///
+/// `permit` is the turn's own out-of-workspace grant. Dropping it made every
+/// LSP call refuse a folder the user had JUST approved while `read`/`grep` on
+/// the same path passed — the gate said Free, the tool said "path escapes
+/// project root" (traced: mvutl9rf t753/t795).
+pub fn locate_symbol(
+    root: &str,
+    file_path: &str,
+    symbol: &str,
+    hint_line: Option<i64>,
+    permit: Option<&Value>,
+) -> Result<(i64, i64), String> {
+    let abs = resolve_safe(root, file_path, true, permit)?;
     let text = std::fs::read_to_string(&abs).map_err(|e| format!("cannot read {file_path}: {e}"))?;
     find_symbol_position(&text, symbol, hint_line).ok_or_else(|| {
         format!("symbol {symbol:?} not found in {file_path} — check the spelling, or grep for it first")
@@ -1505,8 +1516,14 @@ pub fn locate_symbol(root: &str, file_path: &str, symbol: &str, hint_line: Optio
 }
 
 /// lsp_definition: `path:line:character` hits; inline body for <= 3 hits.
-pub fn definition(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
-    let abs = resolve_safe(root, file_path, true, None)?;
+pub fn definition(
+    root: &str,
+    file_path: &str,
+    line: i64,
+    character: i64,
+    permit: Option<&Value>,
+) -> Result<String, String> {
+    let abs = resolve_safe(root, file_path, true, permit)?;
     let abs = PathBuf::from(abs);
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
@@ -1543,8 +1560,14 @@ pub fn definition(root: &str, file_path: &str, line: i64, character: i64) -> Res
 }
 
 /// lsp_references: grouped by file, capped at 40 with inline source lines.
-pub fn references(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
-    let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
+pub fn references(
+    root: &str,
+    file_path: &str,
+    line: i64,
+    character: i64,
+    permit: Option<&Value>,
+) -> Result<String, String> {
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, permit)?);
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;
@@ -1585,8 +1608,14 @@ pub fn references(root: &str, file_path: &str, line: i64, character: i64) -> Res
 }
 
 /// lsp_hover: raw hover text.
-pub fn hover(root: &str, file_path: &str, line: i64, character: i64) -> Result<String, String> {
-    let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
+pub fn hover(
+    root: &str,
+    file_path: &str,
+    line: i64,
+    character: i64,
+    permit: Option<&Value>,
+) -> Result<String, String> {
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, permit)?);
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;
@@ -1611,8 +1640,8 @@ pub fn hover(root: &str, file_path: &str, line: i64, character: i64) -> Result<S
 }
 
 /// lsp_symbols: document symbols sorted by line, optional substring filter.
-pub fn symbols(root: &str, file_path: &str, query: &str) -> Result<String, String> {
-    let abs = match PathBuf::from(resolve_safe(root, file_path, true, None)?) {
+pub fn symbols(root: &str, file_path: &str, query: &str, permit: Option<&Value>) -> Result<String, String> {
+    let abs = match PathBuf::from(resolve_safe(root, file_path, true, permit)?) {
         p if p.exists() => p,
         _ => {
             // A hallucinated/guessed filename died as a bare ENOENT and the
@@ -1704,8 +1733,8 @@ fn symbol_kind_name(kind: u64) -> String {
 }
 
 /// lsp_diagnostics: publishDiagnostics for the target file.
-pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
-    diagnostics_within(root, file_path, DIAGNOSTICS_WINDOW)
+pub fn diagnostics(root: &str, file_path: &str, permit: Option<&Value>) -> Result<String, String> {
+    diagnostics_within(root, file_path, DIAGNOSTICS_WINDOW, permit)
 }
 
 /// Automatic post-edit diagnostics: ONLY when a server for that language is
@@ -1722,19 +1751,20 @@ pub fn diagnostics(root: &str, file_path: &str) -> Result<String, String> {
 /// Crucially it NEVER starts a server: a cold start (rust-analyzer reached
 /// 1921 MB and takes minutes to index) would turn a cheap edit into a stall, so
 /// a cold language returns `None` and the model keeps its own build command.
-pub fn diagnostics_if_warm(root: &str, file_path: &str) -> Option<String> {
-    let abs = PathBuf::from(resolve_safe(root, file_path, true, None).ok()?);
+pub fn diagnostics_if_warm(root: &str, file_path: &str, permit: Option<&Value>) -> Option<String> {
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, permit).ok()?);
     let language = detect_language(&abs).ok()?;
     registry().warm_server(&PathBuf::from(root), language)?;
-    diagnostics_within(root, file_path, POST_EDIT_DIAGNOSTICS_WINDOW).ok()
+    diagnostics_within(root, file_path, POST_EDIT_DIAGNOSTICS_WINDOW, permit).ok()
 }
 
 fn diagnostics_within(
     root: &str,
     file_path: &str,
     budget: Duration,
+    permit: Option<&Value>,
 ) -> Result<String, String> {
-    let abs = PathBuf::from(resolve_safe(root, file_path, true, None)?);
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, permit)?);
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
     let srv = registry().server_for(&root_path, language)?;
@@ -2037,7 +2067,7 @@ mod tests {
     fn definition_rejects_paths_outside_root() {
         let tmp = std::env::temp_dir().join(format!("codifa-lsp-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let err = definition(tmp.to_str().unwrap(), "../../etc/passwd", 1, 0);
+        let err = definition(tmp.to_str().unwrap(), "../../etc/passwd", 1, 0, None);
         assert!(err.is_err());
         std::fs::remove_dir_all(&tmp).ok();
     }

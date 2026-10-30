@@ -35,6 +35,13 @@ pub struct AgentTerminalInfo {
     pub started_at_ms: u64,
     pub running: bool,
     pub exit_code: Option<i32>,
+    /// When the exit was OBSERVED (epoch millis). The panel keeps a row
+    /// visible for a short grace window after this, so a quick command that
+    /// lives and dies between two 2-second polls is still seen — without it
+    /// the only filter available is `running` itself and short jobs would
+    /// never appear. Missing on rows written by older builds (serde treats
+    /// the absent field as None); those stay hidden once dead, as before.
+    pub exited_at_ms: Option<u64>,
     /// Where the combined output goes. Outside the workspace (the data root),
     /// so `read` may open it and `run_terminal tail` may show it without a
     /// sandbox refusal.
@@ -196,6 +203,7 @@ pub fn spawn(root: &str, chat_id: &str, command: &str) -> Result<AgentTerminalIn
         started_at_ms: crate::state::now_ms() as u64,
         running: true,
         exit_code: None,
+        exited_at_ms: None,
         log_path: log_path.to_string_lossy().into_owned(),
         pid,
     };
@@ -224,6 +232,7 @@ pub fn spawn(root: &str, chat_id: &str, command: &str) -> Result<AgentTerminalIn
                 Ok(Some(status)) => {
                     row.info.running = false;
                     row.info.exit_code = status.code();
+                    row.info.exited_at_ms = Some(crate::state::now_ms() as u64);
                     // The child is reaped; drop the handle.
                     row.child = None;
                     Some(row.info.clone())
@@ -232,6 +241,7 @@ pub fn spawn(root: &str, chat_id: &str, command: &str) -> Result<AgentTerminalIn
                 Err(_) => {
                     row.info.running = false;
                     row.info.exit_code = Some(-1);
+                    row.info.exited_at_ms = Some(crate::state::now_ms() as u64);
                     row.child = None;
                     Some(row.info.clone())
                 }
@@ -320,6 +330,7 @@ fn stop_foreign(id: &str) -> bool {
             if !pid_alive(escalate.pid) {
                 let mut done = escalate.clone();
                 done.running = false;
+                done.exited_at_ms = Some(crate::state::now_ms() as u64);
                 write_row_file(&done);
                 return;
             }
@@ -391,6 +402,7 @@ pub fn list(chat_id: &str) -> Vec<AgentTerminalInfo> {
         if info.running && !pid_alive(info.pid) {
             info.running = false;
             info.exit_code = info.exit_code.or(Some(-1));
+            info.exited_at_ms = info.exited_at_ms.or(Some(crate::state::now_ms() as u64));
             write_row_file(&info);
         }
         rows.push(info);
@@ -494,7 +506,12 @@ mod tests {
         let done = wait_until(5000, || {
             list("chat-test")
                 .iter()
-                .any(|i| i.id == info.id && !i.running && i.exit_code == Some(0))
+                .any(|i| {
+                    i.id == info.id
+                        && !i.running
+                        && i.exit_code == Some(0)
+                        && i.exited_at_ms.is_some()
+                })
         });
         assert!(done, "terminal never reported exit: {:?}", list("chat-test"));
         assert!(read_log(&info.id, 1024).contains("bg-hello"));
@@ -572,6 +589,7 @@ mod tests {
             started_at_ms: 0,
             running: true,
             exit_code: None,
+            exited_at_ms: None,
             log_path: "/logs/bg-abcd1234.log".into(),
             pid: 4242,
         };
@@ -609,6 +627,7 @@ mod tests {
             started_at_ms: 1,
             running: true,
             exit_code: None,
+            exited_at_ms: None,
             log_path: "/dev/null".into(),
             pid: u32::MAX - 1, // reserved pid: never alive, never ours
         };
@@ -619,6 +638,9 @@ mod tests {
             .expect("foreign row must merge in");
         assert!(!row.running, "a dead pid must be healed to not-running");
         assert_eq!(row.exit_code, Some(-1));
+        // The heal also stamps the exit time, so the panel's grace window
+        // starts from the poll that noticed the death…
+        assert!(row.exited_at_ms.is_some(), "healed row must get exited_at_ms");
         // The healed file is written back so the next list is stable…
         let healed: AgentTerminalInfo = serde_json::from_slice(
             &std::fs::read(
@@ -656,6 +678,7 @@ mod tests {
             started_at_ms: 1,
             running: true,
             exit_code: None,
+            exited_at_ms: None,
             log_path: "/dev/null".into(),
             pid: u32::MAX - 2, // reserved pid: never ours; liveness is irrelevant here
         };

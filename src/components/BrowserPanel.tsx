@@ -551,8 +551,11 @@ export function BrowserPanel({
       sizeRef.current = { w: width, h: height };
       setViewport({ w: width, h: height });
       syncDrafts(width, height);
-      await refreshStatus();
-      await refreshShot();
+      // The frame is what the user is waiting on after a resize: fetch it
+      // immediately and let the status sync ride along in parallel instead of
+      // adding a full round trip in front of the shot (the fit toggle and the
+      // ruler both felt a beat late because of it).
+      await Promise.all([refreshShot(), refreshStatus()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -1173,13 +1176,16 @@ function SvgIcon({ children, size = 16 }: { children: React.ReactNode; size?: nu
   );
 }
 
+/** Fit-to-panel: a page frame with a double-headed width arrow — reads as
+ *  "the page's width follows the pane", unlike the old fullscreen-style
+ *  corners which looked like a maximize button. */
 function FitIcon() {
   return (
     <SvgIcon>
-      <path d="M4 9V4h5" />
-      <path d="M20 15v5h-5" />
-      <path d="M15 4h5v5" />
-      <path d="M9 20H4v-5" />
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="M7.5 12h9" />
+      <path d="M10 9.5 7.5 12l2.5 2.5" />
+      <path d="M14 9.5 16.5 12 14 14.5" />
     </SvgIcon>
   );
 }

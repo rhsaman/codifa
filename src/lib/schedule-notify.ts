@@ -50,6 +50,36 @@ export function liveRunningMap(runs: ScheduleRun[]): Record<string, boolean> {
   return out;
 }
 
+/** Unseen runs that are FINISHED (done/error): the inbox badge count. A run
+ *  still in flight (`running`) never counts — the badge says "there is a result
+ *  to read", and a live run has none yet. It starts counting the moment it
+ *  settles, because `finishedRunIds` (what gets recorded as seen) never
+ *  includes a running run either. Pure for tests. */
+export function unseenRunCount(runs: ScheduleRun[], seen: string[]): number {
+  const seenSet = new Set(seen);
+  return runs.filter((r) => r.status !== "running" && !seenSet.has(r.id)).length;
+}
+
+/** `unseenRunCount` scoped to one task (the badge beside each task in the
+ *  inbox list). */
+export function unseenRunCountForTask(
+  runs: ScheduleRun[],
+  seen: string[],
+  scheduleId: string,
+): number {
+  const seenSet = new Set(seen);
+  return runs.filter(
+    (r) => r.schedule_id === scheduleId && r.status !== "running" && !seenSet.has(r.id),
+  ).length;
+}
+
+/** Run ids that may be recorded as "seen": finished runs only. Marking a live
+ *  run seen would make its result arrive already-read — no badge when it
+ *  settles. Pure for tests. */
+export function finishedRunIds(runs: ScheduleRun[]): string[] {
+  return runs.filter((r) => r.status !== "running").map((r) => r.id);
+}
+
 /** اجازه اعلان سیستم‌عامل را در صورت نیاز می‌گیرد؛ false یعنی اعلان ممکن نیست. */
 export async function ensureScheduleNotificationPermission(): Promise<boolean> {
   try {

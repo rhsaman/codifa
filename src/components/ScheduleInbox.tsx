@@ -3,17 +3,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore } from "../lib/store";
 import { clearOrphanScheduleRuns, clearScheduleRuns, listAllScheduleRuns, listScheduleRuns, listSchedules } from "../lib/api";
-import {
-  ensureScheduleNotificationPermission,
-  findFinishedScheduleRuns,
-  notifyScheduleRun,
-  notifyScheduleRunBatch,
-} from "../lib/schedule-notify";
-import { playAlarm } from "../lib/alarm";
+import { finishedRunIds, unseenRunCount, unseenRunCountForTask } from "../lib/schedule-notify";
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { mdComponents } from "./ChatMessage";
-import { shownViewerTabId, useViewerScope, useViewerTabs } from "../lib/viewerTabs";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
 
@@ -26,21 +19,9 @@ export function scheduleRunTokens(run: ScheduleRun): number {
   return total;
 }
 
-/** تعداد اجراهای دیده‌نشده (برای بج نوتیفیکیشن Inbox). */
-export function unseenRunCount(runs: ScheduleRun[], seen: string[]): number {
-  const seenSet = new Set(seen);
-  return runs.filter((r) => !seenSet.has(r.id)).length;
-}
-
-/** تعداد اجراهای دیده‌نشده‌ی یک تسک خاص (برای بج کنار هر تسک در لیست Inbox). */
-export function unseenRunCountForTask(
-  runs: ScheduleRun[],
-  seen: string[],
-  scheduleId: string,
-): number {
-  const seenSet = new Set(seen);
-  return runs.filter((r) => r.schedule_id === scheduleId && !seenSet.has(r.id)).length;
-}
+// The unseen-run counters live in lib/schedule-notify (pure, light) so the dock's
+// Inbox badge can use them without loading this chunk; re-exported here.
+export { unseenRunCount, unseenRunCountForTask };
 
 /** انتخاب تسک نمایشی Inbox: انتخاب ذخیره‌شده اگر هنوز وجود دارد، وگرنه تسکی که
  *  تازه‌ترین ران را دارد (نه لزوماً اولین تسک لیست)، وگرنه اولین تسک. */
@@ -267,14 +248,14 @@ export function ScheduleInbox() {
       const out = await listScheduleRuns(selectedTask.id, 20);
       if (!("error" in out)) {
         setTaskRuns(out);
-        markSeen(out.map((r) => r.id));
+        markSeen(finishedRunIds(out));
       }
     })();
   }, [open, selectedTask, markSeen]);
 
   // باز شدن Inbox همه اجراهای فعلی را «دیده» می‌کند تا بج صفر شود.
   useEffect(() => {
-    if (open && runs.length > 0) markSeen(runs.map((r) => r.id));
+    if (open && runs.length > 0) markSeen(finishedRunIds(runs));
   }, [open, runs, markSeen]);
 
   // ران‌های نمایشی تسک انتخاب‌شده: اجتماع پاسخ مستقیم تسک و کش سراسری runs
@@ -295,7 +276,11 @@ export function ScheduleInbox() {
   const newestUnseenTaskId = useMemo(() => {
     const seenSet = new Set(seen);
     for (const r of runs) {
-      if (!seenSet.has(r.id) && schedules.some((t) => t.id === r.schedule_id)) {
+      if (
+        r.status !== "running" &&
+        !seenSet.has(r.id) &&
+        schedules.some((t) => t.id === r.schedule_id)
+      ) {
         return r.schedule_id;
       }
     }
@@ -738,103 +723,6 @@ export function ScheduleInbox() {
         </div>
       </div>
     </div>
-  );
-}
-
-/** دکمه Inbox در تایتل‌بار با بج اجرای دیده‌نشده (نوتیفیکیشن کرون).
- * ران‌هایی که به وضعیت پایانی رسیده‌اند (از running به done/error، یا ران‌هایی
- * که بین دو پولینگ تمام شده‌اند) اعلان سیستم‌عامل و آلارم صوتی می‌دهند تا حتی
- * وقتی Inbox باز نیست، کاربر خبردار شود؛ رانِ در حال اجرا هرگز اعلان نمی‌دهد. */
-export function ScheduleInboxButton() {
-  const seen = useStore((s) => s.scheduleRunsSeen);
-  const [runs, setRuns] = useState<ScheduleRun[]>([]);
-  const prevStatusesRef = useRef<Map<string, ScheduleRun["status"]> | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      const out = await listAllScheduleRuns(50);
-      if (cancelled || "error" in out) return;
-      setRuns(out);
-      // اعلان OS + آلارم فقط برای ران‌هایی که از پولینگ قبلی به وضعیت پایانی
-      // رسیده‌اند (بدون تکرار): اولین پولینگ فقط baseline می‌سازد و رانِ
-      // running هرگز اعلان نمی‌دهد — فقط پایان کار اعلان دارد.
-      const prev = prevStatusesRef.current;
-      if (prev !== null) {
-        const finished = findFinishedScheduleRuns(prev, out);
-        for (const r of finished) {
-          playAlarm(r.status === "error" ? "error" : "alert");
-        }
-        if (finished.length > 0) {
-          const openInbox = () => {
-            void import("../lib/viewerTabs").then(({ useViewerTabs }) => {
-              useViewerTabs.getState().openInbox();
-            });
-            useStore.getState().setScheduleInboxOpen(true);
-          };
-          if (await ensureScheduleNotificationPermission()) {
-            if (finished.length === 1) {
-              const r = finished[0];
-              const name = useStore
-                .getState()
-                .schedules.find((t) => t.id === r.schedule_id)?.name;
-              notifyScheduleRun(r, name, openInbox);
-            } else {
-              notifyScheduleRunBatch(finished.length, openInbox);
-            }
-          }
-        }
-      }
-      prevStatusesRef.current = new Map(out.map((r) => [r.id, r.status]));
-    };
-    void tick();
-    const t = setInterval(() => void tick(), 30000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, []);
-
-  const unseen = unseenRunCount(runs, seen);
-  // Same toggle contract as the rail's inbox icon: pressed means the pane is
-  // SHOWING the inbox, so an inbox that is open behind another tab re-focuses
-  // on the first press instead of being closed by it.
-  const tabs = useViewerTabs((s) => s.tabs);
-  const activeId = useViewerTabs((s) => s.activeId);
-  const shown = shownViewerTabId(tabs, activeId, useViewerScope()) === 'inbox';
-  return (
-    <button
-      className="titlebar-icon-btn schedule-inbox-btn"
-      title={unseen > 0 ? `${unseen} new schedule runs` : "Schedule inbox"}
-      aria-label="Schedule inbox"
-      aria-pressed={shown}
-      onClick={() => {
-        const vt = useViewerTabs.getState();
-        if (shown) {
-          vt.closeViewer('inbox');
-          useStore.getState().setScheduleInboxOpen(false);
-        } else {
-          vt.openInbox();
-          useStore.getState().setScheduleInboxOpen(true);
-        }
-      }}
-    >
-      <svg
-        width="17"
-        height="17"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        aria-hidden="true"
-      >
-        <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-        <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-      </svg>
-      {unseen > 0 && <span className="schedule-inbox-badge">{unseen}</span>}
-    </button>
   );
 }
 

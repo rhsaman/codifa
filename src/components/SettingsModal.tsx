@@ -1484,8 +1484,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setSttFallbacks = useStore((s) => s.setSttFallbacks)
   const sttLanguage = useStore((s) => s.sttLanguage)
   const setSttLanguage = useStore((s) => s.setSttLanguage)
-  const sttPrompt = useStore((s) => s.sttPrompt)
-  const setSttPrompt = useStore((s) => s.setSttPrompt)
   const liveProviderId = useStore((s) => s.liveProviderId)
   const setLiveProviderId = useStore((s) => s.setLiveProviderId)
   const liveModel = useStore((s) => s.liveModel)
@@ -3585,18 +3583,6 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </select>
                     <div className="hint">
                       بدون زبان صریح، Whisper روی کلیپ‌های کوتاه زبان را اشتباه تشخیص می‌دهد و کلمات فارسی خراب می‌شوند.
-                    </div>
-                    </div>
-                    <div className="voice-field">
-                      <label className="field-label">STT prompt (optional)</label>
-                    <textarea
-                      value={sttPrompt ?? ''}
-                      onChange={(e) => setSttPrompt(e.target.value)}
-                      rows={2}
-                      placeholder="مثال: کوئرا، رفیوژ، نیم‌فاصله، اسم‌های خاص"
-                    />
-                    <div className="hint">
-                      فقط <b>فهرست واژه‌ها</b> بنویس، نه جملهٔ دستوری. Whisper متن prompt را «حرف قبلی» فرض می‌کند و آن را ادامه می‌دهد؛ پس یک جملهٔ کامل مثل «متن را با املای درست بنویس» به‌جای صدای شما تایپ می‌شود.
                     </div>
                     </div>
                   </div>

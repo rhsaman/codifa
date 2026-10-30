@@ -118,9 +118,11 @@ function ScheduleRow(props: {
     }
     onChanged();
     // The backend writes status=running on disk and flips it to done/error at
-    // the end: poll the run history until OUR run (started just now) settles,
-    // with a hard cap (~15 min) so a stuck run never pins the button forever.
-    for (let i = 0; i < 450; i++) {
+    // the end: poll the run history until OUR run (started just now) settles.
+    // A scheduled run has NO deadline of its own, so this poll only exists to
+    // stop the spinner from pinning the button forever on a dead backend — it
+    // is deliberately far longer than any real run (6 h, every 2 s).
+    for (let i = 0; i < 10800; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       const runs = await listScheduleRuns(task.id, 5);
       if ("error" in runs) break;

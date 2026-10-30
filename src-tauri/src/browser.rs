@@ -1704,20 +1704,61 @@ pub fn screenshot(chat_id: &str) -> Value {
     let (w, h) = tab.viewport;
     let tab_for_call = tab.clone();
     let fut = async move {
-        wait_page_settled(&tab_for_call, Duration::from_secs(6)).await;
-        // One paint beat after readyState flips: the first composited frame
-        // usually lands right behind the DOM reporting ready — capturing on
-        // the readyState tick alone still races it every few pages.
-        tokio::time::sleep(Duration::from_millis(180)).await;
-        let res = cdp_calls(
-            &tab_for_call,
-            vec![(
-                "Page.captureScreenshot",
-                json!({"format": "jpeg", "quality": SCREENSHOT_QUALITY}),
-            )],
+        // ONE connection for the whole capture. The old flow spent a first
+        // WebSocket just to read readyState and a second one for the capture,
+        // and paid a fixed 180ms paint beat even when the page had been
+        // settled for ages — latency on every poll and every fit-to-pane
+        // resize, which is why the ruler and the fit button felt laggy.
+        let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
+        let mut cdp = Cdp::connect(port).await?;
+        cdp.attach(&tab_for_call.target_id).await?;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut waited = false;
+        loop {
+            let ready = cdp
+                .send(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "document.readyState",
+                        "returnByValue": true,
+                    }),
+                )
+                .await;
+            let settled = ready
+                .ok()
+                .and_then(|res| res["result"]["result"]["value"].as_str().map(str::to_string))
+                .map(|v| v == "interactive" || v == "complete")
+                .unwrap_or(false);
+            if settled || Instant::now() >= deadline {
+                break;
+            }
+            waited = true;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        if waited {
+            // One paint beat after readyState flips: the first composited
+            // frame usually lands right behind the DOM reporting ready —
+            // capturing on the readyState tick alone still races it every few
+            // pages. A page that was ALREADY settled needs no beat; skipping
+            // it here never covered a resize (the override below re-lays-out
+            // synchronously before the capture).
+            tokio::time::sleep(Duration::from_millis(180)).await;
+        }
+        // The override MUST ride in this same batch: it is scoped to the CDP
+        // session, and the one an earlier /browser/viewport call set died with
+        // that connection.
+        cdp.send(
+            "Emulation.setDeviceMetricsOverride",
+            viewport_override(w, h),
         )
         .await?;
-        Ok(res.into_iter().next().unwrap_or(Value::Null)["data"].clone())
+        let res = cdp
+            .send(
+                "Page.captureScreenshot",
+                json!({"format": "jpeg", "quality": SCREENSHOT_QUALITY}),
+            )
+            .await?;
+        Ok(res["data"].clone())
     };
     match block_on(fut) {
         Ok(data) => match data.as_str() {

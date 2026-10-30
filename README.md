@@ -134,7 +134,9 @@ codifa serve --foreground   # attach to the terminal instead (Ctrl-C to stop)
 
 From a checkout of this repo, `npm run serve` builds the frontend first and
 then starts the server the same way (`serve:fg` / `serve:stop` are the
-foreground / stop variants).
+foreground / stop variants). To BUILD the web edition without starting it —
+the same binary the release zips contain — run `npm run dist:web`, then
+`codifa serve` whenever you want it up.
 
 Open the printed URL — `http://127.0.0.1:8787/?token=…` — and the full app
 loads in the browser: chats, agent, files, git, the in-app terminal,
@@ -316,7 +318,9 @@ codifa serve --foreground   # چسبیده به ترمینال (خاموشی ب�
 ```
 
 در ریشه‌ی پروژه، `npm run serve` اول فرانت را می‌سازد و بعد سرور را همین‌طور
-روشن می‌کند (`serve:fg` و `serve:stop` هم حالت پیش‌رو و خاموش‌کننده‌اند).
+روشن می‌کند (`serve:fg` و `serve:stop` هم حالت پیش‌رو و خاموش‌کننده‌اند). برای
+«بیلدِ» نسخه‌ی وب بدون روشن‌کردن آن — همان باینری‌ای که زیپ‌های ریلیز دارند —
+`npm run dist:web` را بزنید و هر وقت خواستید بالا بیاید `codifa serve`.
 
 آدرس چاپ‌شده — `http://127.0.0.1:8787/?token=…` — را در مرورگر باز کنید؛ کل
 برنامه (گفتگوها، عامل، فایل‌ها، گیت، ترمینال داخلی و زمان‌بندها) بالا می‌آید.

@@ -45,6 +45,7 @@
     "dist:mac": "npm run tauri build -- --target aarch64-apple-darwin",
     "dist:win": "npm run tauri build -- --target x86_64-pc-windows-msvc",
     "dist:linux": "npm run tauri build",
+    "dist:web": "npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri"
   },
   "dependencies": {

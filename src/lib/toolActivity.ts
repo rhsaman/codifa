@@ -318,6 +318,9 @@ export function resolveToolResult(
               : "done",
         summary: event.summary,
         engine: event.engine,
+        // The card resolved: the live tail is stale now — the FINAL output
+        // rides in on this very event and renders in the Output section.
+        liveTail: undefined,
         items:
           // Args-derived items FIRST: the native (Rust) result rows carry only
           // bare filenames, while the tool's own args hold the real (absolute)

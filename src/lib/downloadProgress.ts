@@ -38,13 +38,15 @@ function looksLikeSize(token: string): boolean {
 }
 
 /** Scan the tail and parse the NEWEST recognizable progress line (the tail is
- *  chronological, so the last match is the freshest refresh). */
+ *  chronological, so the last match is the freshest refresh). NOTE: curl's
+ *  meter line carries NO "%" character (only the header row does), so the
+ *  match is by shape — column count + h:m:s times — never by "%". */
 export function parseDownloadProgress(tail: string): DownloadProgress | null {
   if (!tail) return null;
   const lines = tail.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
-    if (!line || !line.includes("%")) continue;
+    if (!line) continue;
     const parsed = parseCurlMeter(line) ?? parseCurlBar(line) ?? parseWgetBar(line);
     if (parsed) return parsed;
   }

@@ -17,6 +17,7 @@ import {
   MEMORY_TOOLS,
   terminalOutputText,
 } from "../lib/toolActivity";
+import { parseDownloadProgress } from "../lib/downloadProgress";
 import { reviewPathOf } from "../lib/reviewTurn";
 import { parseDiffRows, parseSideBySide } from "../lib/reviewDiff";
 import { countOccurrences } from "../lib/diffSearch";
@@ -2774,6 +2775,50 @@ function ToolPathSpan({ path }: { path: string }) {
   );
 }
 
+/** Live output tail of a RUNNING terminal command (tool_output events).
+ *  Auto-scrolls to the newest line on every tail update — the user watches a
+ *  download/build stream in without scrolling. */
+const LiveTerminalTail = function LiveTerminalTail({ tail }: { tail: string }) {
+  const ref = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [tail]);
+  return (
+    <pre
+      ref={ref}
+      className="trace-expand-val trace-expand-pre trace-terminal-output tool-live-output"
+      dir="auto"
+    >
+      {tail}
+    </pre>
+  );
+};
+
+/** Determinate progress bar for a running download parsed out of the live
+ *  tail (curl meter / curl bar / wget). Quiet by design — one bar, one meta
+ *  line, no animation beyond the fill width. */
+function DownloadProgressBar({ progress }: { progress: NonNullable<ReturnType<typeof parseDownloadProgress>> }) {
+  const pct = Math.max(0, Math.min(100, progress.percent));
+  const meta: string[] = [];
+  if (progress.received && progress.total) meta.push(`${progress.received} / ${progress.total}`);
+  else if (progress.received) meta.push(progress.received);
+  else if (progress.total) meta.push(progress.total);
+  if (progress.speed) meta.push(progress.speed);
+  if (progress.eta) meta.push(`eta ${progress.eta}`);
+  return (
+    <div className="tool-download-progress" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>
+      <div className="tool-download-progress-track">
+        <div className="tool-download-progress-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="tool-download-progress-meta" dir="ltr">
+        <span className="tool-download-progress-pct">{pct % 1 === 0 ? pct : pct.toFixed(1)}%</span>
+        {meta.length > 0 && <span className="tool-download-progress-detail">{meta.join(" · ")}</span>}
+      </div>
+    </div>
+  );
+}
+
 export const ToolCallView = memo(function ToolCallView({
   activity,
   chatId,
@@ -2830,6 +2875,18 @@ export const ToolCallView = memo(function ToolCallView({
       : [];
 
   const fetchSummary = activity.tool === "fetch_url" ? activity.summary : "";
+  // Live download progress for a RUNNING terminal card: parsed from the
+  // streamed output tail (tool_output events) — the newest curl/wget progress
+  // line in the tail becomes a real bar; no line matches, no bar.
+  const liveProgress = useMemo(
+    () =>
+      activity.status === "running" &&
+      activity.tool === "run_terminal" &&
+      activity.liveTail
+        ? parseDownloadProgress(activity.liveTail)
+        : null,
+    [activity.status, activity.tool, activity.liveTail],
+  );
   /** The skill a `load_skill` call loaded. The label only says "Load Skill", and
    *  the raw `name` arg chip is stripped as redundant (REDUNDANT_ARG_KEYS), so
    *  without this the head never states WHICH skill the turn pulled in. */
@@ -3022,6 +3079,13 @@ export const ToolCallView = memo(function ToolCallView({
             auto margin — without this the row only reached the right edge
             when the timer happened to render (write cards have no timer). */}
         <span className="tool-card-head-end">
+          {/* Progress chip keeps a collapsed card honest while its download
+              runs — percent visible without expanding the card. */}
+          {liveProgress && (
+            <span className="tool-progress-chip" dir="ltr">
+              ⇣ {liveProgress.percent % 1 === 0 ? liveProgress.percent : liveProgress.percent.toFixed(1)}%
+            </span>
+          )}
           {ms ? <span className="tool-ms">{fmtTime(ms)}</span> : null}
           {isWrite &&
             activity.diff &&
@@ -3130,6 +3194,15 @@ export const ToolCallView = memo(function ToolCallView({
               {activity.resultText}
             </pre>
           )}
+          {activity.tool === "run_terminal" &&
+            activity.status === "running" &&
+            activity.liveTail && (
+              <>
+                {liveProgress && <DownloadProgressBar progress={liveProgress} />}
+                <span className="trace-expand-key">Live output</span>
+                <LiveTerminalTail tail={activity.liveTail} />
+              </>
+            )}
           {activity.tool === "run_terminal" &&
             (((activity.items ?? activity.results)?.length ?? 0) > 0 ||
               Boolean(activity.resultText)) && (

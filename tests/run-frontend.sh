@@ -132,6 +132,7 @@ fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 toolNesting|tests/toolNesting.test.ts|
+downloadProgress|tests/downloadProgress.test.ts|--packages=external --external:electron
 codeBlock|tests/codeBlock.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 lineCaption|tests/lineCaption.test.ts|--external:electron
 watchdog|tests/watchdog.test.ts|-

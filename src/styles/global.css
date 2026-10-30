@@ -28928,3 +28928,69 @@ input[type='range']::-moz-range-thumb {
 .settings-modal .settings-row:last-of-type {
   border-bottom: none;
 }
+
+/* ---------- Live terminal output + download progress (running tool card) ---- */
+
+/* The live tail streams into a still-RUNNING run_terminal card (tool_output
+   events). Same clamped block as the final output, plus a subtle "alive" left
+   rail so the user can tell streaming output from finished output. */
+.tool-live-output {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.tool-download-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.tool-download-progress-track {
+  height: 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  overflow: hidden;
+}
+
+.tool-download-progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  transition: width 0.4s ease;
+}
+
+.tool-download-progress-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+
+.tool-download-progress-pct {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.tool-download-progress-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapsed-card chip: the running percent stays visible without expanding. */
+.tool-progress-chip {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}

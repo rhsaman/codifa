@@ -52,6 +52,7 @@ import {
 import { didYouMean, rankMatches } from "../lib/fuzzy";
 import {
   applyToolEvent,
+  applyToolOutputEvent,
   diffStatsFromUnified,
   makeToolActivity,
   resolveStuckActivities,
@@ -5237,6 +5238,17 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
             ? event.path
             : `${chat.root || useStore.getState().root}/${event.path.replace(/^\/+/, "")}`;
           store.bumpDocRev(abs);
+        }
+      } else if (event.kind === "tool_output") {
+        // Live output tail of a running run_terminal call (downloads, builds).
+        // Folded into the running card by its call id; a resolved or unknown
+        // card leaves the list unchanged. UI-only — not part of the transcript.
+        clearTransientRetry();
+        const id = typeof event.id === "string" ? event.id : "";
+        const tail = typeof event.tail === "string" ? event.tail : "";
+        if (id && tail) {
+          const next = applyToolOutputEvent(findMsg()?.toolActivity ?? [], id, tail);
+          store.updateMessage(assistantMsg.id, { toolActivity: next });
         }
       } else if (event.kind === "compact_start") {
         // Backend is auto-compacting (summarizer running) — show the loading

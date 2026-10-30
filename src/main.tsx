@@ -2,6 +2,7 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { injectThemeStyles } from './lib/themes'
 import { installTauriBridge, recordDroppedPaths } from './lib/tauriBridge'
+import { installWebBridge } from './lib/webBridge'
 import { installInputSuppression } from './lib/inputSuppress'
 import './styles/global.css'
 
@@ -27,6 +28,11 @@ if (!container) throw new Error('root element missing')
 // In web mode (vite dev without Tauri) installTauriBridge is a no-op and the
 // page relies on the harness stub.
 const tauri = installTauriBridge()
+
+// Served by `codifa serve` in a plain browser: no Tauri runtime and no harness
+// stub. Install the web bridge BEFORE the app imports run — src/lib/store.ts
+// touches window.coder at module load.
+if (!tauri && !('coder' in window)) installWebBridge()
 
 // Tauri drag-drop carries absolute file paths (Electron used webUtils in the
 // preload); record them so api.getPathForFile(file) stays synchronous.

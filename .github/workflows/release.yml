@@ -31,18 +31,22 @@ jobs:
           - name: macOS (Apple Silicon)
             os: macos-latest
             args: --target aarch64-apple-darwin
+            triple: aarch64-apple-darwin
           - name: macOS (Intel)
             # macos-13 (the last default Intel image) was retired on 2025-12-04
             # and its jobs queue forever; macos-15-intel is GitHub's
             # x86_64 image until Aug 2027 (actions/runner-images#13045).
             os: macos-15-intel
             args: --target x86_64-apple-darwin
+            triple: x86_64-apple-darwin
           - name: Windows
             os: windows-latest
             args: ""
+            triple: x86_64-pc-windows-msvc
           - name: Linux
             os: ubuntu-latest
             args: ""
+            triple: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -189,3 +193,43 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      # The WEB/SERVER edition: `codifa serve` is built into the SAME binary
+      # the desktop bundles ship, so a release also publishes it ALONE for
+      # servers (no installer to unpack). Runs after tauri-action, which has
+      # created the release and warmed the cargo cache, so this rebuild is
+      # incremental.
+      - name: Build and upload the server binary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TRIPLE: ${{ matrix.triple }}
+        run: |
+          cargo build --release --target "$TARGET_TRIPLE" --manifest-path src-tauri/Cargo.toml
+          bin="src-tauri/target/$TARGET_TRIPLE/release/codifa"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          if [ ! -f "$bin" ]; then echo "server binary missing: $bin" >&2; exit 1; fi
+
+          cat > SERVER.md <<'EOF'
+          # Codifa server (web edition)
+
+          The desktop app, headless — drive it from any browser:
+
+              ./codifa serve --host 0.0.0.0 --port 8787
+
+          Open the printed `?token=...` URL (the token is also saved to
+          `~/.codifa/web-token`).
+
+              ./codifa serve --daemon   # run in the background (log: ~/.codifa/serve.log)
+              ./codifa stop             # stop the background server
+
+          A packaged frontend is embedded, so no dist folder is needed. Put a
+          public deployment behind TLS and keep the token private — the server
+          runs commands on its machine. Full docs:
+          https://github.com/rhsaman/codifa#-server-mode-use-it-from-a-browser
+          EOF
+
+          asset="codifa-server-$TARGET_TRIPLE.zip"
+          python3 -m zipfile -c "$asset" "$bin" SERVER.md
+          gh release upload "v${{ steps.ver.outputs.version }}" "$asset" --clobber
+          echo "uploaded $asset"

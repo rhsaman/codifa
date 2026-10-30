@@ -48,3 +48,5 @@ pub mod skill_router;
 pub mod state;
 pub mod store;
 pub mod tools;
+pub mod webapi;
+pub mod webmode;

@@ -45,6 +45,8 @@ mod skill_router;
 mod state;
 mod store;
 mod tools;
+mod webapi;
+mod webmode;
 
 use std::time::Duration;
 
@@ -64,10 +66,11 @@ struct Quitting(std::sync::atomic::AtomicBool);
 /// second call then finds nothing to reap.
 fn shutdown_children(app: &tauri::AppHandle) {
     pty::kill_all_terminal_sessions(app);
-    // Background terminals the AGENT started (dev servers, watchers) die with
-    // the app too: they are children of this process and would otherwise be
-    // reparented to launchd and keep their ports busy for days.
-    agent_terminals::kill_all();
+    // Agent background terminals (dev servers, watchers) deliberately SURVIVE
+    // the app: they are detached group leaders whose rows are mirrored to the
+    // data root, so after a relaunch `agent_terminals::list` merges them back
+    // (liveness probed by pid) and the panel lists — and can stop — them. The
+    // user's dev server must not die because the client restarted.
     // Chromium sessions are per-chat and outlive the panel, so they must be
     // reaped here or every visited chat leaves a browser process behind.
     browser::kill_all_sessions();
@@ -143,8 +146,27 @@ fn redirect_logs_to_file() {
 }
 
 fn main() {
+    // Serve/web mode MUST be decided first: it decides whether logs go to the
+    // terminal (the printed access URL is how the user connects) and whether
+    // setup shows a window at all.
+    if let Some(config) = webmode::from_env_and_args() {
+        webmode::init(config);
+    }
+    // `codifa stop` — signal the daemonized server and leave. Runs before any
+    // builder work: it is a pure std operation, no Tauri involved.
+    if webmode::stop_daemon() {
+        return;
+    }
+    // `codifa serve --daemon` — re-spawn detached; this parent process exits.
+    if webmode::daemonize_if_requested() {
+        return;
+    }
     #[cfg(unix)]
-    redirect_logs_to_file();
+    if webmode::active().is_none() {
+        redirect_logs_to_file();
+    }
+    // Serve mode keeps stdout/stderr attached: the printed `?token=` URL is
+    // how the user connects, and a systemd/journald setup captures it anyway.
     // The release profile uses panic=abort and is stripped, so a panic used to
     // kill the app with no message. Record file:line + message before the abort.
     std::panic::set_hook(Box::new(|info| {
@@ -360,6 +382,33 @@ fn main() {
                     eprintln!("[router] failed to start: {e}");
                 }
             });
+            // Serve mode: the router must find the app handle (the web command
+            // dispatcher calls the same fns the Tauri commands wrap) and the
+            // browser needs a token. Then go headless: destroy the config-
+            // created window — there is no renderer to flush, and the run
+            // loop below refuses the exit this would otherwise request.
+            if webmode::active().is_some() {
+                webmode::set_app(app.handle().clone());
+                let root = state::get_data_root(app.handle());
+                let token = webmode::ensure_token(&root);
+                let cfg = webmode::active().unwrap();
+                eprintln!(
+                    "[web] Codifa server ready: http://{}:{}?token={}",
+                    if cfg.host == "0.0.0.0" { "localhost".to_string() } else { cfg.host.clone() },
+                    cfg.port,
+                    token
+                );
+                eprintln!("[web] token also saved to {}", root.join("web-token").display());
+                if webmode::dist_dir().is_none() {
+                    eprintln!(
+                        "[web] note: no frontend found (no --dist and no ./dist) — the API is \
+                         up, but the UI needs `npm run build` first or a --dist flag"
+                    );
+                }
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.destroy();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -412,14 +461,56 @@ fn main() {
             // suddenly and my new chats were gone". Flushing here closes that gap
             // for every exit route, not just the titlebar close button.
             match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    // Startup fires this once (setup destroys the window);
+                    // quiet by default — it is noise unless exit misbehaves.
+                    if crate::webmode::verbose() {
+                        eprintln!(
+                            "[web] exit requested (code={code:?}, serve={})",
+                            webmode::active().is_some()
+                        );
+                    }
+                    // Serve mode without a code: the last window closed (setup
+                    // destroyed it). The SERVER is the product now — keep the
+                    // process alive. An explicit `code` is app.exit() from
+                    // restart_app: allow it and run the normal teardown.
+                    if code.is_none() && webmode::active().is_some() {
+                        api.prevent_exit();
+                        return;
+                    }
+                    // A restart passes RESTART_EXIT_CODE: allow the process to
+                    // end after the normal teardown (the new process spawns
+                    // first). Any OTHER coded exit in serve mode is treated
+                    // like a desktop exit for child reaping, but the park
+                    // after run() still keeps the server up.
+                    if code == Some(tauri::RESTART_EXIT_CODE) {
+                        webmode::allow_exit();
+                    }
                     store::flush_pending(app);
                     // Cmd-Q and `app.exit()` also bypass CloseRequested, so the
                     // children must be reaped here too. Idempotent: on a normal
                     // quit the CloseRequested path already ran this.
                     shutdown_children(app);
                 }
+                tauri::RunEvent::Exit => {
+                    store::flush_pending(app);
+                    shutdown_children(app);
+                }
                 _ => {}
             }
         });
+
+    // Serve mode: the event loop has exit paths that bypass ExitRequested —
+    // observed twice as a clean exit-0 minutes after the last interaction,
+    // with no exit request logged (tao/NSApp quirk with zero windows). The
+    // server must outlive every one of them: the router runs on its own
+    // thread, so parking the main thread keeps the process — and the
+    // service — up. Only an explicit restart (restart_app) or a signal
+    // (SIGTERM/SIGHUP teardown) ends the process from here.
+    if webmode::active().is_some() && !webmode::exit_allowed() {
+        eprintln!("[web] event loop ended; keeping the server alive (main thread parked)");
+        loop {
+            std::thread::park();
+        }
+    }
 }

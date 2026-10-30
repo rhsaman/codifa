@@ -13,6 +13,34 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+/// Every pty byte that leaves the reader thread, mirrored off the Tauri event
+/// bus so a subscriber WITHOUT an `AppHandle` (the web terminal WebSocket, on
+/// the router's own tokio runtime) can stream the same sessions.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum TerminalBusEvent {
+    Data { id: String, data: String },
+    Exit { id: String, code: u32 },
+}
+
+/// The broadcast bus. 1024 buffered events: a slow web client lags (its
+/// receiver reports `Lagged` and it keeps going) instead of ever stalling the
+/// reader thread — a pty that blocks on a browser would corrupt the session.
+fn bus() -> &'static tokio::sync::broadcast::Sender<TerminalBusEvent> {
+    static BUS: OnceLock<tokio::sync::broadcast::Sender<TerminalBusEvent>> = OnceLock::new();
+    BUS.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
+}
+
+/// Subscribe to live pty output/exit events (web terminal WebSocket).
+pub fn subscribe_bus() -> tokio::sync::broadcast::Receiver<TerminalBusEvent> {
+    bus().subscribe()
+}
+
+fn bus_send(event: TerminalBusEvent) {
+    // No receivers (desktop-only use) is the normal case for `send`'s Err.
+    let _ = bus().send(event);
+}
+
 #[derive(Clone, Serialize)]
 pub struct TerminalSessionInfo {
     pub id: String,
@@ -403,7 +431,11 @@ pub fn terminal_create(
                         let cleaned = sanitize_colon_sgr(&strip_decrqm(&pending[..safe]));
                         pending.drain(..safe);
                         let data = String::from_utf8_lossy(&cleaned).into_owned();
-                        let _ = reader_app.emit("terminal:data", (reader_id.clone(), data));
+                        let _ = reader_app.emit("terminal:data", (reader_id.clone(), data.clone()));
+                        bus_send(TerminalBusEvent::Data {
+                            id: reader_id.clone(),
+                            data,
+                        });
                     }
                 }
             }
@@ -431,7 +463,8 @@ pub fn terminal_create(
         }
         // Removing the session here means an explicit kill (which already
         // removed it) does not double-emit the exit event.
-        let _ = reader_app.emit("terminal:exit", (reader_id, code));
+        let _ = reader_app.emit("terminal:exit", (reader_id.clone(), code));
+        bus_send(TerminalBusEvent::Exit { id: reader_id, code });
     });
 
     Ok(info)

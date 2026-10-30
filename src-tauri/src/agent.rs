@@ -4936,18 +4936,18 @@ the Vision model's description instead.\n"
                 }
             }
             // A turn that ends HERE ends because the model answered with no tool
-            // call. Say so in the log, with what the model last said: a turn that
-            // stops mid-work with no error is otherwise indistinguishable from a
-            // finished one, and this line is the only evidence of which it was.
-            if req.mode != "subagent" {
-                let tail: String = text.trim().chars().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect();
+            // call. Quiet by default: the reply (and any chat content) must
+            // never reach the logs, and a one-line-per-turn entry is exactly
+            // the noise a server log should not have — the chat's trace
+            // already records the full turn. CODIFA_VERBOSE=1 restores a
+            // STRUCTURAL line (chat/step/finish_reason — still no content).
+            if req.mode != "subagent" && crate::webmode::verbose() {
                 eprintln!(
-                    "[turn-end] chat={} step={} finish_reason={:?} reasoning_chars={} reply_tail={:?}",
+                    "[turn-end] chat={} step={} finish_reason={:?} reasoning_chars={}",
                     req.chat_id,
                     step + 1,
                     acc.finish_reason,
                     acc.reasoning_len,
-                    tail
                 );
             }
             emit(&AgentEvent::Done { aborted: false });

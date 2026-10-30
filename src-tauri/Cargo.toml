@@ -39,7 +39,8 @@ libc = "0.2"
 # codifa-backup-*.zip on every platform the app ships for.
 zip = "9.0.5"
 # Phase 2: native HTTP router (light endpoints) + proxy to the Python sidecar
-axum = { version = "0.7", features = ["http1", "multipart"] }
+# "ws": the web-mode terminal WebSocket (/ws/terminal), see webapi.rs.
+axum = { version = "0.7", features = ["http1", "multipart", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "time", "sync"] }
 # Phase 3-2: native agent tools (read/grep/glob/write/edit/terminal)
 regex = "1"

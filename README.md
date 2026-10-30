@@ -119,6 +119,66 @@ and relaunch the app after an update.
 > by default in `~/.codifa` on every OS. The path is changeable from
 > **Settings → Memory**, and moving it keeps a backup of the old folder.
 
+### 🌐 Server mode (use it from a browser)
+
+The same binary runs headless on a server, and you drive it from any browser.
+
+**`codifa serve` runs in the background by default** — it detaches, prints the
+access URL with its token, and gives the terminal back:
+
+```bash
+codifa serve         # background; prints: [web] Codifa server ready: http://…?token=…
+codifa stop          # stop the background server
+codifa serve --foreground   # attach to the terminal instead (Ctrl-C to stop)
+```
+
+From a checkout of this repo, `npm run serve` builds the frontend first and
+then starts the server the same way (`serve:fg` / `serve:stop` are the
+foreground / stop variants).
+
+Open the printed URL — `http://127.0.0.1:8787/?token=…` — and the full app
+loads in the browser: chats, agent, files, git, the in-app terminal,
+schedules. The token is persisted in `~/.codifa/web-token`, the first
+`?token=` visit plants a session cookie, and a daemonized server logs to
+`~/.codifa/serve.log`.
+
+**From a packaged app** (the frontend is embedded, no flags needed):
+
+```bash
+# macOS
+./Codifa.app/Contents/MacOS/codifa serve
+# Windows / Linux (release zips named codifa-server-<platform>.zip)
+codifa serve
+```
+
+**Useful flags & env** (all optional): `--host` (default `127.0.0.1`;
+`0.0.0.0` for LAN), `--port` (default `8787`), `--foreground` to keep the
+server attached to the terminal, `--dist <dir>` for a dev/cargo run when
+`./dist` isn't next to the working directory. Env: `CODIFA_SERVE_HOST` /
+`CODIFA_SERVE_PORT` / `CODIFA_SERVE_DIST` / `CODIFA_WEB_TOKEN`.
+
+**Keep it running for good** — a supervisor must use `--foreground`, e.g.
+systemd (Linux) or launchd (macOS):
+
+```ini
+[Unit]
+Description=Codifa web server
+[Service]
+ExecStart=/usr/local/bin/codifa serve --foreground --host 0.0.0.0 --port 8787
+Restart=always
+User=youruser
+[Install]
+WantedBy=multi-user.target
+```
+
+**Security:** the web surface is token-gated (cookie, `Authorization: Bearer`
+or `?token=`), but the server can run commands and read/write files on its
+machine — put it behind TLS (a reverse proxy) or a VPN, and do not expose it
+to an untrusted network. Desktop-only capabilities degrade gracefully in the
+browser: opening a workspace asks for an absolute server path, files open in
+the in-app viewer, and screen capture is disabled. Google sign-in needs the
+desktop app; use API keys on a server.
+
 ### ⌨️ Keyboard shortcuts
 
 | Shortcut              | Action                                             |
@@ -240,6 +300,65 @@ curl -fsSL https://raw.githubusercontent.com/rhsaman/codifa/main/scripts/install
 > نگه داشته می‌شود — به‌صورت پیش‌فرض در `~/.codifa` روی هر سیستم‌عاملی. این مسیر
 > از **تنظیمات ← حافظه** قابل تغییر است و هنگام جابه‌جایی، از پوشهٔ قبلی پشتیبان
 > گرفته می‌شود.
+
+### 🌐 حالت سرور (استفاده از مرورگر)
+
+همان باینری به‌صورت headless اجرا می‌شود و از هر مرورگری می‌توانید با آن کار
+کنید.
+
+**`codifa serve` به‌صورت پیش‌فرض در بک‌گراند اجرا می‌شود** — پروسه جدا می‌شود،
+آدرس دسترسی با توکن را چاپ می‌کند و ترمینال را آزاد می‌گذارد:
+
+```bash
+codifa serve         # بک‌گراند؛ چاپ می‌کند: [web] Codifa server ready: http://…?token=…
+codifa stop          # خاموش کردن سرور بک‌گراند
+codifa serve --foreground   # چسبیده به ترمینال (خاموشی با Ctrl-C)
+```
+
+در ریشه‌ی پروژه، `npm run serve` اول فرانت را می‌سازد و بعد سرور را همین‌طور
+روشن می‌کند (`serve:fg` و `serve:stop` هم حالت پیش‌رو و خاموش‌کننده‌اند).
+
+آدرس چاپ‌شده — `http://127.0.0.1:8787/?token=…` — را در مرورگر باز کنید؛ کل
+برنامه (گفتگوها، عامل، فایل‌ها، گیت، ترمینال داخلی و زمان‌بندها) بالا می‌آید.
+توکن در `~/.codifa/web-token` ذخیره می‌شود، اولین بازدیدِ `?token=` یک کوکی
+نشست نصب می‌کند و لاگ سرور بک‌گراند در `~/.codifa/serve.log` است.
+
+**از بسته‌ی نصبی** (فرانت داخل باینری embed شده، بدون هیچ فلگی):
+
+```bash
+# مک
+./Codifa.app/Contents/MacOS/codifa serve
+# ویندوز / لینوکس (زیپ‌های codifa-server-<platform>.zip در ریلیزها)
+codifa serve
+```
+
+**فلگ‌ها و متغیرها** (همه اختیاری‌اند): `--host` (پیش‌فرض `127.0.0.1`؛ برای
+شبکه‌ی محلی `0.0.0.0`)، `--port` (پیش‌فرض `8787`)، `--foreground` برای چسبیدن
+به ترمینال، و `--dist <مسیر>` برای اجرای dev وقتی `./dist` کنار مسیر جاری
+نیست. متغیرهای محیطی: `CODIFA_SERVE_HOST` / `CODIFA_SERVE_PORT` /
+`CODIFA_SERVE_DIST` / `CODIFA_WEB_TOKEN`.
+
+**اجرای دائمی** — سرویس‌کننده باید `--foreground` بگیرد، مثلاً یونیت systemd
+(لینوکس) یا launchd (مک):
+
+```ini
+[Unit]
+Description=Codifa web server
+[Service]
+ExecStart=/usr/local/bin/codifa serve --foreground --host 0.0.0.0 --port 8787
+Restart=always
+User=youruser
+[Install]
+WantedBy=multi-user.target
+```
+
+**امنیت:** سطح وب با توکن محافظت می‌شود (کوکی، `Authorization: Bearer` یا
+`?token=`)، اما سرور می‌تواند روی ماشین خودش دستور اجرا کند و فایل بخواند/بنویسد —
+پشت TLS (reverse proxy) یا VPN بگذارید و روی شبکه‌ی نامطمئن باز نکنید.
+قابلیت‌های فقط-دسکتاپ در مرورگر با ملایمت غیرفعال می‌شوند: انتخاب پوشه‌ی پروژه
+مسیر مطلق سمت سرور را می‌پرسد، فایل‌ها در نمایشگر داخلی باز می‌شوند و ضبط صفحه
+از دسترس خارج است. ورود گوگل به اپ دسکتاپ نیاز دارد؛ روی سرور از کلید API
+استفاده کنید.
 
 ### ⌨️ میان‌برهای صفحه‌کلید
 

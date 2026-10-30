@@ -426,23 +426,6 @@ fn prune_exited() {
     }
 }
 
-/// Kill every live terminal — called once on app quit so no dev server is
-/// left behind (they are children of THIS process and would otherwise be
-/// reparented to launchd). Hard kill: nothing here can be graceful at quit.
-pub fn kill_all() {
-    let rows: Vec<AgentTerminalRow> = registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain()
-        .map(|(_, r)| r)
-        .collect();
-    for mut row in rows {
-        if row.info.running {
-            kill_row(&mut row, SIG_KILL);
-        }
-    }
-}
-
 /// The text the MODEL sees as the tool result — everything it needs to check
 /// progress and stop the command without another tool.
 pub fn model_text(info: &AgentTerminalInfo) -> String {

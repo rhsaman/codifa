@@ -313,6 +313,16 @@ textarea {
   box-shadow: none;
 }
 
+/* Live drag-resize (sidebar handle / right-pane split / bottom terminal):
+   the open/close size transitions on these three containers would ease every
+   per-move width/height step, so the edge lags behind the cursor. A drag must
+   track 1:1 — the handlers set this class on <body> for the gesture only. */
+body.coder-resizing .sidebar,
+body.coder-resizing .viewer-group,
+body.coder-resizing .terminal-panel {
+  transition: none;
+}
+
 /* The shell's aside IS the sidebar; the content it mounts fills it. */
 .sidebar-inner {
   flex: 1 1 auto;
@@ -1601,10 +1611,10 @@ textarea {
   list-style: none;
   margin: 0;
   /* پدینگ افقی روی آیتم‌هاست تا اسکرول‌بار به لبهٔ کادر بچسبد. */
-  padding: 0 0 4px;
+  padding: 2px 0 6px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
   overflow-y: auto;
 }
 
@@ -1632,15 +1642,18 @@ textarea {
   /* داخل کانتینر flex لیست: له نشوند تا واقعاً سرریز کنند و اسکرول‌بار
      ظاهر شود (flex-shrink پیش‌فرض آیتم‌ها را در ارتفاع ثابت جا می‌کرد). */
   flex: 0 0 auto;
-  gap: 8px;
+  gap: 9px;
   align-items: flex-start;
   margin: 0 8px;
-  padding: 6px 9px;
-  border-radius: 9px;
-  font-size: 11px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 11.5px;
   color: var(--text-dim);
-  line-height: 1.5;
-  border: 1px solid transparent;
+  line-height: 1.55;
+  /* Every step is its own quiet inset row: the checklist reads as a stack of
+     cards instead of a wall of text, and the running step still pops above it. */
+  border: 1px solid color-mix(in srgb, var(--text) 5%, transparent);
+  background: color-mix(in srgb, var(--text) 2.5%, transparent);
   transition:
     color 0.14s,
     background 0.14s,
@@ -1648,7 +1661,8 @@ textarea {
 }
 
 .sidebar-todo-item:hover {
-  background: color-mix(in srgb, var(--text) 5%, transparent);
+  background: color-mix(in srgb, var(--text) 5.5%, transparent);
+  border-color: color-mix(in srgb, var(--text) 12%, transparent);
 }
 
 .sidebar-todo-item.done {
@@ -1690,12 +1704,12 @@ textarea {
 
 .sidebar-todo-mark {
   flex: 0 0 auto;
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
+  font-size: 10.5px;
   line-height: 1;
   margin-top: 1px;
   border-radius: 50%;
@@ -19640,24 +19654,43 @@ mark.diff-hit-active {
 .terminals-list {
   list-style: none;
   margin: 0;
-  padding: 8px 12px 10px;
+  padding: 9px 11px 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .terminals-item {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
+  /* Each live terminal sits in its own soft inset card so a row reads as one
+     running process, not as loose text under the header. */
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
 }
 
 .terminals-icon {
   flex: 0 0 auto;
   display: inline-flex;
   margin-top: 1px;
-  color: var(--text-dim);
+  /* The icon is the liveness indicator: accent-tinted and breathing while the
+     process runs (the row only mounts for running terminals). */
+  color: var(--accent);
+  animation: terminals-live 1.6s ease-in-out infinite;
+}
+
+@keyframes terminals-live {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
 }
 
 .terminals-body {
@@ -19671,7 +19704,8 @@ mark.diff-hit-active {
 /* خودِ دستور — توضیح ردیف است؛ دستور بلند در یک خط با سه‌نقطه تمام می‌شود و
    کل متن (دستور + cwd + مسیر لاگ) در tooltip هست. */
 .terminals-command {
-  font-size: 12.5px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--text);
   white-space: nowrap;
@@ -19710,12 +19744,18 @@ mark.diff-hit-active {
   font-size: 11.5px;
   font-weight: 700;
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 
+/* Hover reveals the destructive affordance: the stop is quiet until pointed
+   at, then reads as "this kills the process". */
 .terminals-stop:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  border-color: color-mix(in srgb, var(--text) 22%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+  color: var(--danger);
 }
 
 .terminals-stop:disabled {
@@ -19811,12 +19851,26 @@ mark.diff-hit-active {
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--text-dim);
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+
+.turn-usage-chip:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-color: color-mix(in srgb, var(--text) 20%, transparent);
 }
 
 .turn-usage-chip.used {
   color: var(--text);
   border-color: color-mix(in srgb, var(--accent) 34%, transparent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.turn-usage-chip.used:hover {
+  background: color-mix(in srgb, var(--accent) 17%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
 }
 
 .turn-usage-dot {
@@ -19852,15 +19906,6 @@ mark.diff-hit-active {
   font-family: var(--font-sans);
   font-size: 9.5px;
   opacity: 0.8;
-}
-
-.turn-usage-empty {
-  margin: 0;
-  font-size: 11.5px;
-  line-height: 1.6;
-  color: var(--text-dim);
-  max-width: 42ch;
-  overflow-wrap: anywhere;
 }
 
 /* A used chip leads with a filled accent dot and a brighter border: the eye
@@ -20821,7 +20866,7 @@ mark.diff-hit-active {
 /* نوار پیشرفت تودوها — تک‌رنگ accent تم تا با همهٔ تم‌ها هماهنگ باشد. */
 .sidebar-todos-progress {
   height: 4px;
-  margin: 10px 12px 2px;
+  margin: 11px 12px 3px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--text) 10%, transparent);
   overflow: hidden;
@@ -20830,8 +20875,13 @@ mark.diff-hit-active {
 .sidebar-todos-progress-fill {
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
-  transition: width 0.3s ease;
+  /* Gradient across the accent family with a soft glow: the bar reads as a
+     live meter, not a flat rule, and the eased width keeps check-offs smooth. */
+  background: linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 65%, var(--thinking)),
+      var(--accent));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 30%, transparent);
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 /* ---- Trace panel (لاگ چت جاری مثل لنگ‌اسمیت): ردیف‌های تاشو + بلوک پرامپت تمیز ---- */
@@ -23058,29 +23108,33 @@ mark.trace-hit-active {
   margin: 0 auto;
 }
 
-/* No todos yet: the page keeps the card shell so the pane reads as "empty",
-   not as a rendering failure. */
-.sidebar-panel.todos-empty .sidebar-panel-head {
-  cursor: default;
-  border-bottom: 1px solid var(--hairline);
+/* The todos page's resting hint: every card renders NOTHING while empty, so
+   this line is the container's only child exactly then — `:only-child` is the
+   whole gate. Any real card on screen pushes it out of that state and hides
+   it, with no extra state anywhere. */
+.todos-page-empty {
+  display: none;
+  min-height: 34vh;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px 20px;
 }
 
-.sidebar-todos-empty {
+.todos-page-empty:only-child {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 16px 14px 18px;
-  text-align: start;
 }
 
-.sidebar-todos-empty-title {
+.todos-page-empty-title {
   margin: 0;
   font-size: 12.5px;
   font-weight: 700;
   color: var(--text);
 }
 
-.sidebar-todos-empty-text {
+.todos-page-empty-text {
   margin: 0;
   font-size: 11.5px;
   line-height: 1.6;

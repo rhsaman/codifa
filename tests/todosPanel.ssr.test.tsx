@@ -336,7 +336,7 @@ console.log("۲۳) دکمهٔ نمایش پلن در هدر Todos:")
   // the section.
   check("کلیک/کیبورد head را قطع می‌کند", src.includes("e.stopPropagation()"))
   // Placement: between the title and the count, so the counter stays right.
-  const titleIdx = src.indexOf('className="sidebar-panel-title">Todos')
+  const titleIdx = src.indexOf('className="sidebar-panel-title">Agent plan')
   const btnIdx = src.indexOf('className="sidebar-panel-plan-btn"', titleIdx)
   const countIdx = src.indexOf('className="sidebar-panel-count"', titleIdx)
   check(
@@ -382,9 +382,9 @@ console.log("۲۴) بخش Terminals — ترمینال‌های بک‌گران�
 {
   const { readFileSync } = await import("node:fs")
   const src = readFileSync("src/components/TodosPanel.tsx", "utf8")
-  // هدر به سبک zcode: عنوان + شمارندهٔ «N in background»
-  check("عنوان بخش Terminals هست", src.includes(">Terminals</span>"))
-  check("شمارندهٔ in background هست", src.includes("in background"))
+  // هدر به سبک zcode: عنوان + شمارندهٔ «N running»
+  check("عنوان بخش Background terminals هست", src.includes(">Background terminals</span>"))
+  check("شمارندهٔ N running هست", src.includes("{running.length} running"))
   // تایمر «Running for …» از helper خالص می‌آید (تست‌پذیر) و هر ثانیه تیک می‌خورد
   check("تایمر از formatRunningFor می‌خواند", src.includes("formatRunningFor(now - t.started_at_ms)"))
   check("تیک ثانیه‌ای فقط با ردیف زنده", src.includes("hasRunning"))

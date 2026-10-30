@@ -202,11 +202,16 @@ export function cycleTerminalTabs(dir: 1 | -1): void {
   if (!useViewerTabs.getState().paneOpen) useViewerTabs.setState({ paneOpen: true })
 }
 
-/** Id of the tab the pane body is showing RIGHT NOW, or `null` when the pane
- *  has no visible tab at all — the body then falls back to the todos page.
+/** Id of the tab the pane body is showing RIGHT NOW, or `null` when nothing
+ *  is explicitly open — the body then falls back to the todos page.
  *
- *  Mirrors the body rule in ViewerContent/ViewerWindows exactly. Pure, for
- *  tests. */
+ *  Fallbacks may only land on STRIP surfaces (file/trace/browser/…): dock
+ *  pages (git/todos/terminal/schedule/…) own their dock button and appear
+ *  only when explicitly opened. A leftover one-per-workspace tab (the Git
+ *  diff) used to win `visible[0]` in every tab-less chat — the strip drew no
+ *  row for it, so the pane read "no tab open" while painting Git.
+ *
+ *  Mirrors the body rule in ViewerContent exactly. Pure, for tests. */
 export function shownViewerTabId(
   tabs: ViewerTab[],
   activeId: string | null,
@@ -217,8 +222,7 @@ export function shownViewerTabId(
   // lands on Schedule while the chat still has a trace/browser open.
   const active =
     visible.find((t) => t.id === activeId) ??
-    visible.find((t) => t.chatId === scope.chatId) ??
-    visible[0] ??
+    visible.find((t) => t.chatId === scope.chatId && TAB_STRIP_KINDS.has(t.kind)) ??
     null
   return active?.id ?? null
 }
@@ -640,7 +644,13 @@ function loadPersisted(): {
     }
     // Enforce the tab cap on load so a bloated store never fills RAM/localStorage.
     const capped = capTabs(tabs)
-    const activeId = typeof parsed.activeId === 'string' && capped.some((t) => t.id === parsed.activeId) ? parsed.activeId : (capped[0]?.id ?? null)
+    // An unknown/stale activeId restores as NULL, never as "first tab": the
+    // first tab is usually the leftover one-per-workspace Git diff, and
+    // activating it on launch painted Git over the todos resting page.
+    const activeId =
+      typeof parsed.activeId === 'string' && capped.some((t) => t.id === parsed.activeId)
+        ? parsed.activeId
+        : null
     const closed = Array.isArray(parsed.closed)
       ? parsed.closed
           .filter((c) => c && typeof c.closedAt === 'number' && c.tab && typeof c.tab.id === 'string' && VALID_KINDS.has(c.tab.kind))
@@ -667,7 +677,11 @@ function persist(tabs: ViewerTab[], activeId: string | null, closed: ClosedViewe
       STORAGE_KEY,
       JSON.stringify({
         tabs: slim,
-        activeId: tabs.some((t) => t.id === activeId && keep(t)) ? activeId : (slim[0]?.id ?? null),
+        // No "first tab" rescue: when the active id is gone (closed tab,
+        // ephemeral terminal, or the no-tab todos resting state) it persists
+        // as null so a restart restores the todos page, not a leftover
+        // workspace tab like the Git diff.
+        activeId: tabs.some((t) => t.id === activeId && keep(t)) ? activeId : null,
         closed: closed.filter((c) => keep(c.tab)).map((c) => ({ tab: slimTab(c.tab), closedAt: c.closedAt })),
       }),
     )
@@ -1364,7 +1378,14 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const tabs = s.tabs.filter((t) => t.id !== id)
       let activeId = s.activeId
       if (s.activeId === id) {
-        activeId = tabs[Math.min(idx, tabs.length - 1)]?.id ?? null
+        // The replacement tab must be something the pane may show WITHOUT an
+        // explicit invite: a strip surface (file/trace/browser/…) visible in
+        // the focused scope. Activating a dock page here (the leftover
+        // one-per-workspace Git diff) is how closing a tab made Git pop up
+        // uninvited; nothing eligible → null, and the body rests on todos.
+        const scope = viewerScopeForChat(useStore.getState().activeChatId || undefined)
+        const surfaces = visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind))
+        activeId = surfaces[Math.min(idx, surfaces.length - 1)]?.id ?? null
       }
       const closedTabs = [
         { tab: removed, closedAt: Date.now() },
@@ -1402,7 +1423,12 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       const closeIds = new Set(toClose.map((t) => t.id))
       for (const t of toClose) notifyTabClosed(t.id)
       const tabs = s.tabs.filter((t) => !closeIds.has(t.id))
-      const activeId = s.activeId && closeIds.has(s.activeId) ? (tabs[0]?.id ?? null) : s.activeId
+      // Same rule as closeViewer: only a strip surface still visible in this
+      // scope may take over, otherwise the pane rests on the todos page.
+      const scope = viewerScopeForChat(useStore.getState().activeChatId || undefined)
+      const surfaces = visibleTabs(tabs, scope).filter((t) => TAB_STRIP_KINDS.has(t.kind))
+      const activeId =
+        s.activeId && closeIds.has(s.activeId) ? (surfaces[surfaces.length - 1]?.id ?? null) : s.activeId
       const closedTabs = [
         ...toClose.map((tab) => ({ tab, closedAt: Date.now() })),
         ...s.closedTabs.filter((c) => !closeIds.has(c.tab.id)),

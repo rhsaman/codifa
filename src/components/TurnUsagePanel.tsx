@@ -24,13 +24,14 @@ function bareTool(tool: string): string {
 /** Skills/MCP/plugins of the CURRENT turn — the same per-chat window the Todos
  *  card uses (newest user message → end of the transcript). Attached skills and
  *  enabled connectors come from that message; a `load_skill` call anywhere
- *  after it marks the skill as actually used. */
+ *  after it marks the skill as actually used.
+ *
+ *  Always LTR: skill/connector names are English identifiers, so the card must
+ *  not mirror inside an RTL locale (the plan card below keeps the app dir). */
 export function TurnUsageSection({
   messages,
-  dir,
 }: {
   messages: ChatMessage[];
-  dir: "rtl" | "ltr";
 }) {
   const [catalog, setCatalog] = useState<SkillRow[]>(getSkillsList);
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
@@ -131,10 +132,15 @@ export function TurnUsageSection({
     });
   }
 
+  // Nothing attached and nothing used → NO card. The old "runs without
+  // skills…" paragraph was a whole empty card for a fact nobody asked for; the
+  // page-level hint speaks only when every card on the page is empty.
+  if (total === 0) return null;
+
   return (
     <div
       className={`sidebar-panel usage-docked${collapsed ? " collapsed" : ""}`}
-      dir={dir}
+      dir="ltr"
     >
       <div
         className="sidebar-panel-head"
@@ -150,7 +156,7 @@ export function TurnUsageSection({
         }}
       >
         <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
-        <span className="sidebar-panel-title">This turn</span>
+        <span className="sidebar-panel-title">This turn's tools</span>
         <span className="sidebar-panel-count">{total}</span>
       </div>
       {!collapsed && (
@@ -216,7 +222,7 @@ export function TurnUsageSection({
                 className="turn-usage-label"
                 title="Enabled for this turn but never called"
               >
-                MCP
+                Connectors
                 <span className="turn-usage-count">
                   {unusedConnectors.length}
                 </span>
@@ -248,26 +254,20 @@ export function TurnUsageSection({
               </ul>
             </section>
           )}
-          {total === 0 && (
-            <p className="turn-usage-empty">
-              This turn runs without skills, MCP connectors or plugins.
-            </p>
-          )}
         </div>
       )}
     </div>
   );
 }
 
-/** Docked "This turn" card — the right panel's variant. It reads the ACTIVE
- *  chat and dir from the store exactly like TodosSection does, so the panel
- *  never pipes messages through and switching chats switches both cards at
- *  once. */
+/** Docked "This turn's tools" card — the right panel's variant. It reads the
+ *  ACTIVE chat and dir from the store exactly like TodosSection does, so the
+ *  panel never pipes messages through and switching chats switches both cards
+ *  at once. */
 export function TurnUsagePanel() {
   const chat = useStore(
     (s) => s.chats.find((c) => c.id === s.activeChatId) ?? null,
   );
-  const dir = useStore((s) => s.dir);
   // The index row carries no `messages` — TodosSection hydrates the active
   // chat, but this card can mount first (panel reopened, chat just switched)
   // and would then report an empty turn while the transcript is full. Ask for
@@ -277,10 +277,5 @@ export function TurnUsagePanel() {
   useEffect(() => {
     if (chatId && needsBody) void ensureChatHydrated(chatId);
   }, [chatId, needsBody]);
-  return (
-    <TurnUsageSection
-      messages={needsBody ? [] : (chat?.messages ?? [])}
-      dir={dir}
-    />
-  );
+  return <TurnUsageSection messages={needsBody ? [] : (chat?.messages ?? [])} />;
 }

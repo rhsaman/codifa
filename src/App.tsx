@@ -155,6 +155,9 @@ export default function App() {
   const startSplitResize = (e: React.MouseEvent) => {
     e.preventDefault()
     splitDrag.current = { startX: e.clientX, startW: splitW }
+    // 1:1 tracking: the pane's open/close width transition must not ease the
+    // per-move steps (the class is stripped again in onUp).
+    document.body.classList.add('coder-resizing')
     const onMove = (ev: MouseEvent) => {
       if (!splitDrag.current) return
       const w = clampSplitWidth(splitDrag.current.startW - (ev.clientX - splitDrag.current.startX))
@@ -163,6 +166,7 @@ export default function App() {
     }
     const onUp = () => {
       splitDrag.current = null
+      document.body.classList.remove('coder-resizing')
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }

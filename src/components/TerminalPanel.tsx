@@ -510,6 +510,9 @@ export function TerminalPanel() {
     if (useStore.getState().terminalFullscreen) return
     e.preventDefault()
     dragRef.current = { startY: e.clientY, startH: height }
+    // 1:1 tracking: the open/close height transition must not ease the
+    // per-move steps (the class is stripped again in onUp).
+    document.body.classList.add('coder-resizing')
     const onMove = (ev: MouseEvent) => {
       if (!dragRef.current) return
       const max = window.innerHeight * 0.7
@@ -519,6 +522,7 @@ export function TerminalPanel() {
     }
     const onUp = () => {
       dragRef.current = null
+      document.body.classList.remove('coder-resizing')
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }

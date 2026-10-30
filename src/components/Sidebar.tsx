@@ -6,10 +6,7 @@ import type { Chat, Workspace } from "../types";
 import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
-import { shouldFocusSearch, physicalKey } from "../lib/shortcuts";
-import { stepChatId } from "../lib/sidebarStep";
-import { isVimRegionActive } from "../lib/panePointer";
-import { isPrefixArmed, watchPrefixFlag } from "../lib/prefixState";
+import { shouldFocusSearch } from "../lib/shortcuts";
 import { WindowStripCluster } from "./WindowStripCluster";
 
 type ChatSummary = {
@@ -207,6 +204,10 @@ export function Sidebar() {
   const startSidebarResize = (e: React.MouseEvent) => {
     e.preventDefault();
     sidebarDrag.current = { startX: e.clientX, startW: sidebarWidth };
+    // 1:1 tracking: the open/close width transition must not ease the
+    // per-move steps (the class is stripped again in onUp, which also runs
+    // from the unmount cleanup below).
+    document.body.classList.add("coder-resizing");
     const onMove = (ev: MouseEvent) => {
       if (!sidebarDrag.current) return;
       const w = Math.max(
@@ -222,6 +223,7 @@ export function Sidebar() {
     };
     const onUp = () => {
       sidebarDrag.current = null;
+      document.body.classList.remove("coder-resizing");
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       sidebarDragCleanup.current = null;
@@ -408,67 +410,6 @@ function SidebarContent({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Bare j/k walk the chat list when the caret is in the sidebar — the same
-  // stroke the file explorer and the chat windows use. Only the sidebar may
-  // claim it: a composer, the find boxes and any dialog keep their letters,
-  // and a modifier is a different chord entirely.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
-      // Ctrl+X waits for its second key: those j/k strokes belong to the pane
-      // chord (App.tsx), not to the chat list. This is a CAPTURE listener, so
-      // without the guard it would step the list and swallow the chord.
-      if (isPrefixArmed()) return;
-      // The viewer/git-diff panes own the letters while the user's last
-      // interaction was there (panePointer tracks it — focus alone lies in
-      // WebKit). Inside the sidebar the caret decides, as before.
-      if (isVimRegionActive()) return;
-      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-      const t = e.target as HTMLElement | null;
-      // The sidebar takes these letters ONLY while the caret is inside it.
-      // Claiming them when nothing is focused used to make `j` in a diff pane
-      // switch chats — the pane on screen must win, and `<body>` is not the
-      // sidebar. `Ctrl+X h` (or a click) is what puts the caret here.
-      if (!t?.closest?.(".sidebar")) return;
-      if (
-        t?.closest?.(
-          'textarea, select, [contenteditable=""], [contenteditable="true"], [role="dialog"], .settings-modal',
-        )
-      ) {
-        return;
-      }
-      // The search box is the sidebar's default focus target, so it must not
-      // swallow the list stroke outright: an EMPTY box navigates the list (the
-      // letters would otherwise be typed into nothing), while a query in
-      // progress keeps them for editing. The QUERY is the React state, not the
-      // DOM value — the input is controlled, so reading `.value` would always
-      // see the last rendered text.
-      const searchBox = t?.closest?.("input");
-      if (searchBox && searchBox !== searchInputRef.current) return;
-      if (searchBox === searchInputRef.current && searchRef.current) return;
-      const key = physicalKey(e);
-      if (key !== "j" && key !== "k") return;
-      const ids = visibleGroupsRef.current.flatMap((g) => g.chats.map((c) => c.id));
-      const next = stepChatId(ids, activeChatIdRef.current, key === "j" ? 1 : -1);
-      if (!next) return;
-      e.preventDefault();
-      e.stopPropagation();
-      // Keep the caret in the sidebar so the NEXT j/k lands here too. The box is
-      // the sidebar's focus target (see focusSidebar in lib/paneFocus.ts).
-      const box = searchInputRef.current;
-      if (box && !box.hidden && document.activeElement !== box) {
-        box.focus({ preventScroll: true });
-      }
-      useStore.getState().openChat(next);
-    };
-    window.addEventListener("keydown", onKey, true);
-    const unwatchPrefix = watchPrefixFlag();
-    return () => {
-      window.removeEventListener("keydown", onKey, true);
-      unwatchPrefix();
-    };
-  }, []);
-
   const dir = useStore((s) => s.dir);
 
   // Persist the panel/group UI state whenever it changes, so collapse toggles
@@ -551,15 +492,6 @@ function SidebarContent({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [groups, searching, debouncedSearch],
   );
-  // The bare j/k listener below is bound once (no re-subscribe per render), so
-  // it reads the live list and selection through refs instead of closing over
-  // them.
-  const visibleGroupsRef = useRef(visibleGroups);
-  visibleGroupsRef.current = visibleGroups;
-  const activeChatIdRef = useRef(activeChatId);
-  activeChatIdRef.current = activeChatId;
-  const searchRef = useRef(search);
-  searchRef.current = search;
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();

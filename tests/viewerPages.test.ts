@@ -220,9 +220,16 @@ console.log('6) the schedule page and the todos page are separate:')
     !todosSrc.includes('<ScheduleSection'),
     todosSrc.includes('<ScheduleSection'),
   )
+  // Empty cards are NOISE: an empty todos card (and an empty usage card)
+  // renders nothing at all. The page stays self-explanatory through the
+  // :only-child hint that shows only when EVERY card is empty.
   check(
-    'an empty todo list renders an empty state instead of nothing',
-    /if \(todos\.length === 0\) \{/.test(todosSrc) && todosSrc.includes('sidebar-todos-empty'),
+    'an empty todo list renders no card at all',
+    todosSrc.includes('if (todos.length === 0)') && !todosSrc.includes('sidebar-todos-empty'),
+  )
+  check(
+    'a fully-empty page falls back to the one quiet hint',
+    todosBody.includes('<TodosPageEmptyHint />'),
   )
 }
 
@@ -254,9 +261,22 @@ console.log('7) a rail icon marks the page ON SCREEN, not merely an open tab:')
     shownViewerTabId(tabs, 'files:c1', scopeC1) === 'files:c1',
   )
   check('an empty pane shows no page', shownViewerTabId([], null, scopeC1) === null)
+  // The bug this locks: a stale activeId (restart / closed tab) used to fall
+  // through to `visible[0]` and paint a leftover dock page (the one-per-
+  // workspace Git diff) in a chat that never opened it — while the strip drew
+  // no row for it, so the pane read "no tab open". Dock pages (files/inbox
+  // here) must never win a fallback: the pane rests on the todos page.
   check(
-    'a stale activeId falls back to the first visible tab',
-    shownViewerTabId(tabs, 'gone', scopeC1) === 'files:c1',
+    'a stale activeId never promotes a dock page',
+    shownViewerTabId(tabs, 'gone', scopeC1) === null,
+  )
+  check(
+    "the chat's own strip surface still wins a fallback",
+    shownViewerTabId(
+      [...tabs, tab(`file:${WS}:a.ts`, 'file', { chatId: 'c1', wsKey: WS })],
+      'gone',
+      scopeC1,
+    ) === `file:${WS}:a.ts`,
   )
   check(
     "another chat's tab is not the shown one",

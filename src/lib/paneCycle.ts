@@ -9,9 +9,8 @@
  *   h / l  move horizontally  sidebar ↔ chat ↔ viewer
  *   k / j  move vertically    any pane → terminal → back to the chat
  *
- * The sidebar lays its list out as rows, so `j`/`k` there walk that list (see
- * src/lib/sidebarStep.ts) and only reach the pane ring when the list is empty:
- * this ring owns the *pane* hop, the caller decides when the list gets the key.
+ * This ring owns the *pane* hop only; the caller decides when a key means
+ * something inside a pane instead of a hop between panes.
  *
  * A pane that is CLOSED is still a valid target — the caller opens it first
  * (src/lib/paneFocus.ts), which is what makes `Ctrl+X j` reach the terminal

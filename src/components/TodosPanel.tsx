@@ -159,24 +159,10 @@ export function TodosSection() {
   }, [collapsed]);
 
   if (todos.length === 0) {
-    // A page, not a floating card: returning null left the whole pane blank
-    // with no hint about what belongs here or how to get it. The empty state
-    // names the actor (the agent) and the trigger (a plan), so the pane reads
-    // as "nothing yet", not "broken".
-    return (
-      <div className="sidebar-panel todos-docked todos-empty" dir={dir}>
-        <div className="sidebar-panel-head">
-          <span className="sidebar-panel-title">Todos</span>
-        </div>
-        <div className="sidebar-todos-empty">
-          <p className="sidebar-todos-empty-title">No todos yet</p>
-          <p className="sidebar-todos-empty-text">
-            The agent fills this list while it works — each step of its plan
-            appears here and checks off as it lands.
-          </p>
-        </div>
-      </div>
-    );
+    // No plan yet → NO card. An empty shell with "No todos yet" was just noise
+    // on top of the resting page; the page-level hint (TodosPageEmptyHint, the
+    // :only-child trick in global.css) speaks only when EVERY card is empty.
+    return null;
   }
 
   const done = todos.filter((t) => t.status === "completed").length;
@@ -201,7 +187,7 @@ export function TodosSection() {
         }}
       >
         <span className="sidebar-panel-chevron">{collapsed ? "▸" : "▾"}</span>
-        <span className="sidebar-panel-title">Todos</span>
+        <span className="sidebar-panel-title">Agent plan</span>
         {/* Opens the saved plan document (Plan viewer tab). stopPropagation on
             click AND keydown keeps the parent head's collapse toggle from
             firing — the head itself is a role="button" with Enter/Space. */}
@@ -242,7 +228,7 @@ export function TodosSection() {
             aria-valuenow={pct}
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-label={`${done} of ${todos.length} todos done`}
+            aria-label={`${done} of ${todos.length} steps done`}
           >
             <div className="sidebar-todos-progress-fill" style={{ width: `${pct}%` }} />
           </div>
@@ -282,14 +268,13 @@ export function TodosPanel() {
 }
 
 /** بخش Terminals — ترمینال‌های بک‌گراندِ ایجنت (run_terminal با background=true،
- *  مثل «Start vite dev server» در zcode): عنوان + شمارندهٔ «N in background»،
+ *  مثل «Start vite dev server» در zcode): عنوان + شمارندهٔ «N running»،
  *  یک ردیف به‌ازای هر ترمینال زندهٔ همین چت با تایمر «Running for …» و دکمهٔ
  *  Stop. فهرست هر ۲ ثانیه از بک‌اند پول می‌شود (registry سمت Rust است و بعد از
  *  تمام‌شدن ترن هم زنده می‌ماند)؛ تایمر خودش هر ثانیه تیک می‌خورد. چیزی برای
  *  نشان‌دادن نیست، بخش اصلاً رندر نمی‌شود تا پنل بی‌دلیل شلوغ نشود. */
 export function TerminalsSection() {
   const activeChatId = useStore((s) => s.activeChatId);
-  const dir = useStore((s) => s.dir);
   const [terminals, setTerminals] = useState<AgentTerminalInfo[]>([]);
   // دکمه‌هایی که کلیک شده‌اند تا پول بعدی تایید کند — بدون این، دابل‌کلیک دو
   // بار POST می‌زد و دکمه تا تایید بک‌اند فعال می‌ماند.
@@ -338,11 +323,13 @@ export function TerminalsSection() {
   };
 
   return (
-    <div className="sidebar-panel terminals-docked" dir={dir}>
+    // Always LTR: the rows are shell commands (mono, English) — an RTL locale
+    // must not mirror them. The plan card below keeps the app's direction.
+    <div className="sidebar-panel terminals-docked" dir="ltr">
       <div className="sidebar-panel-head">
-        <span className="sidebar-panel-title">Terminals</span>
+        <span className="sidebar-panel-title">Background terminals</span>
         <span className="terminals-bg-count">
-          {running.length} in background
+          {running.length} running
         </span>
       </div>
       <ul className="terminals-list">
@@ -389,6 +376,23 @@ export function TerminalsSection() {
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** تنها چیزی که وقتی هر سه کارت صفحه Todos خالی‌اند دیده می‌شود. کارت‌ها
+ *  وقتی خالی‌اند اصلاً رندر نمی‌شوند، پس این خط آن‌وقت تنها فرزند container
+ *  است — و همان لحظه قانون `:only-child` در global.css آن را نمایان می‌کند.
+ *  با آمدن هر کارت واقعی، hint خودبه‌خود محو می‌شود (بدون state اضافه). */
+export function TodosPageEmptyHint() {
+  const dir = useStore((s) => s.dir);
+  return (
+    <div className="todos-page-empty" dir={dir}>
+      <p className="todos-page-empty-title">Nothing here yet</p>
+      <p className="todos-page-empty-text">
+        The agent&apos;s plan, tools and background terminals will appear here
+        as it works.
+      </p>
     </div>
   );
 }
@@ -504,6 +508,8 @@ function RightPanelContent() {
             ردیفش با خروج پروسه محو می‌شود؛ وقتی چیزی نیست اصلاً رندر نمی‌شود. */}
         <TerminalsSection />
         <TodosSection />
+        {/* هر سه کارت خالی‌اند → همین خط؛ هیچ کارتی خالی نمایش داده نمی‌شود. */}
+        <TodosPageEmptyHint />
       </div>
     </aside>
   );

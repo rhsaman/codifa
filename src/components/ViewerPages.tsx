@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { ScheduleSection } from "./SchedulePanel";
-import { TodosSection } from "./TodosPanel";
+import { TerminalsSection, TodosPageEmptyHint, TodosSection } from "./TodosPanel";
 import { TurnUsagePanel } from "./TurnUsagePanel";
 
 /** Scroll shell shared by every full pane page (todos, schedule). One place
@@ -32,16 +32,18 @@ export function ViewerPage({ children }: { children: ReactNode }) {
 }
 
 /** Todos page: what the turn ran with (skills / MCP connectors / plugins)
- *  first, then the plan checklist. The usage card answers "is the right tool
- *  set loaded?" — it changes turn to turn, and it is the reason the page is
- *  opened — so it must not sit under a long checklist the user has to scroll
- *  past. Both cards read the ACTIVE chat themselves, so switching chats
- *  switches both. Schedules own their page. */
+ *  first, then the agent's live background terminals (each with its
+ *  "Running for …" timer and Stop button), then the plan checklist. Every card
+ *  renders NOTHING while it is empty, and the quiet page hint below is the
+ *  `:only-child` fallback that shows only when all three are empty at once.
+ *  Schedules own their page. */
 export function TodosPage() {
   return (
     <ViewerPage>
       <TurnUsagePanel />
+      <TerminalsSection />
       <TodosSection />
+      <TodosPageEmptyHint />
     </ViewerPage>
   );
 }

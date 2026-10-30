@@ -224,7 +224,6 @@ panePointer|tests/panePointer.test.ts|
 chatFind|src/lib/chatFind.test.ts|
 terminalKeys|tests/terminalKeys.test.ts|
 scrollKeys|tests/scrollKeys.test.ts|
-sidebarStep|tests/sidebarStep.test.ts|
 pluginDetail|tests/pluginDetail.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
 browserPanelMemory|src/lib/browserPanelMemory.test.ts|
 editTarget|tests/editTarget.test.ts|--packages=external --external:electron

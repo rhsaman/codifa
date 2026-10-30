@@ -1,5 +1,5 @@
 import { Suspense, lazy } from "react";
-import { useViewerTabs, useViewerScope, visibleTabs } from "../lib/viewerTabs";
+import { TAB_STRIP_KINDS, useViewerTabs, useViewerScope, visibleTabs } from "../lib/viewerTabs";
 import { useStore } from "../lib/store";
 import { SchedulePage, TodosPage } from "./ViewerPages";
 
@@ -64,11 +64,13 @@ function ViewerContentInner() {
   const scope = useViewerScope();
   const visible = visibleTabs(tabs, scope);
   // Same rule as `shownViewerTabId`: the chat's own tab beats a shared page tab
-  // (schedule/inbox/…), so an open file never loses the pane to Schedule.
+  // (schedule/inbox/…), so an open file never loses the pane to Schedule — and
+  // only strip surfaces may win a fallback, so a dock page (git/todos/…) that
+  // nobody opened in this scope never hijacks the pane (the strip draws no row
+  // for it, which read as "no tab open" while Git was painted).
   const active =
     visible.find((t) => t.id === activeId) ??
-    visible.find((t) => t.chatId === activeChatId) ??
-    visible[0] ??
+    visible.find((t) => t.chatId === activeChatId && TAB_STRIP_KINDS.has(t.kind)) ??
     null;
 
   // Empty pane (no tab of this chat): the todos checklist, no chooser.

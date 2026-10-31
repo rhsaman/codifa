@@ -226,6 +226,16 @@ button:disabled {
   outline-offset: 2px;
 }
 
+/* Text-entry fields never take the global focus outline — it reads as a
+   border on every input (text inputs match :focus-visible even on click).
+   The caret and the tonal field well are the focus affordance. Native
+   toggle-style controls keep the ring for keyboard navigation. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
+
 input,
 select,
 textarea {
@@ -30304,4 +30314,34 @@ textarea::placeholder {
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-weight: 700;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BORDERLESS FIELDS — absolute final layer (appended last, wins the
+   cascade). No visible border, outline, focus ring or glow on ANY field
+   anywhere in the app, composer included. The tonal field well + caret
+   are the only affordances. Native toggle-style controls (checkbox,
+   radio, range, color, file) keep their own chrome and keyboard ring.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]),
+textarea,
+select {
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):hover,
+textarea:hover,
+select:hover,
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):focus,
+textarea:focus,
+select:focus,
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  border-color: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
 }

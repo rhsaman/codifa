@@ -486,6 +486,20 @@ export function ReviewPanel(props?: {
   const [gitError, setGitError] = useState<string | null>(null);
   // Bumped after a branch switch/create so the file list refetches at once.
   const [gitTick, setGitTick] = useState(0);
+  // Ticks on a 5s beat while the Uncommitted tab is open (and on window
+  // focus): a commit can happen outside this panel — the git bar's Commit
+  // button, a terminal, another window — and the list must follow within
+  // seconds instead of freezing until the next tab switch.
+  useEffect(() => {
+    if (source !== "uncommitted") return;
+    const bump = () => setGitTick((t) => t + 1);
+    const timer = setInterval(bump, 5000);
+    window.addEventListener("focus", bump);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", bump);
+    };
+  }, [source]);
   const [commits, setCommits] = useState<GitCommitInfo[]>([]);
   const [rev, setRev] = useState(props?.initialRev ?? "HEAD");
   useEffect(() => {

@@ -2135,7 +2135,10 @@ export async function gitDiscard(
     const res = await fetch(`${url}/git/discard`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root }),
+      // The backend reuses CommitBody here, whose serde struct REQUIRES the
+      // `message` field (the handler ignores it) — without it the whole call
+      // fails deserialization and discard silently never happened.
+      body: JSON.stringify({ root, message: "" }),
     })
     if (!res.ok) {
       return { error: await readApiError(res, `discard failed (${res.status})`) }

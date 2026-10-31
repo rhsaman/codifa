@@ -106,3 +106,5 @@ void import('./App').then(({ default: App }) => {
 // HMR touch #3: force full-reload (broken CSS HMR session).
 // HMR touch #4: force full-reload (broken CSS HMR session).
 // HMR touch #5: force full-reload (broken HMR session).
+// HMR touch #6: force full-reload (broken HMR session).
+// HMR touch #7: force full-reload (broken HMR session).

@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { onGitChange } from "../lib/liveEvents";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -260,6 +261,20 @@ export function FileViewerPanel({
     : `${(root || "").replace(/\/+$/, "")}/${cleanFilePath}`;
   const ext = extOf(filePath);
   const isImage = IMAGE_EXTS.has(ext);
+  // Live: the backend pushes changed repo-relative paths over /ws/events;
+  // when THIS file is among them, bump docRev — the loader below already
+  // refetches on docRev with stale-while-revalidate (no blank/flash).
+  useEffect(() => {
+    if (!root || !absPath) return;
+    return onGitChange(root, (_r, files) => {
+      for (const f of files) {
+        if (`${(root || "").replace(/\/+$/, "")}/${f}` === absPath) {
+          useStore.getState().bumpDocRev(absPath);
+          break;
+        }
+      }
+    });
+  }, [root, absPath]);
   // Markdown files render by default (same rendering as the chat text viewer);
   // the header toggle switches to the line-numbered raw view. A file opened at
   // a specific line (jump, search hit) starts raw so the target row is visible.

@@ -12,6 +12,7 @@ import { diffStatsFromUnified } from "../lib/toolActivity";
 import { providerApiKeys, useStore } from "../lib/store";
 import { useReviewPanel, type ReviewSource } from "../lib/reviewPanel";
 import { useViewerTabs } from "../lib/viewerTabs";
+import { onGitChange } from "../lib/liveEvents";
 import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { ComposerDiffBar } from "./ComposerDiffBar";
 import {
@@ -484,22 +485,11 @@ export function ReviewPanel(props?: {
   const [gitFiles, setGitFiles] = useState<GitFile[]>([]);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  // Latest silent loader — the /ws/events subscription lives in its own
+  // effect (keyed on root only) and pulls the trigger through this ref.
+  const gitLoadRef = useRef<((silent: boolean) => void) | null>(null);
   // Bumped after a branch switch/create so the file list refetches at once.
   const [gitTick, setGitTick] = useState(0);
-  // Ticks on a 5s beat while the Uncommitted tab is open (and on window
-  // focus): a commit can happen outside this panel — the git bar's Commit
-  // button, a terminal, another window — and the list must follow within
-  // seconds instead of freezing until the next tab switch.
-  useEffect(() => {
-    if (source !== "uncommitted") return;
-    const bump = () => setGitTick((t) => t + 1);
-    const timer = setInterval(bump, 5000);
-    window.addEventListener("focus", bump);
-    return () => {
-      clearInterval(timer);
-      window.removeEventListener("focus", bump);
-    };
-  }, [source]);
   const [commits, setCommits] = useState<GitCommitInfo[]>([]);
   const [rev, setRev] = useState(props?.initialRev ?? "HEAD");
   useEffect(() => {
@@ -509,12 +499,25 @@ export function ReviewPanel(props?: {
 
   // بارگذاری دیف uncommitted: ترکیب staged و unstaged تا فایل‌های استیج‌شده
   // هم آمار واقعی داشته باشند (نه +0 -0)، بعد تفکیک per-file.
+  // LIVES: a 5s background beat (and window focus) refreshes the list SILENTLY
+  // — no loading flag, no error flash, and the list object only changes when
+  // something actually changed, so the DOM never flickers. Visible loading is
+  // reserved for tab switches and explicit refreshes (gitTick).
   useEffect(() => {
     if (source !== "uncommitted" || !root) return;
     let cancelled = false;
-    void (async () => {
-      setGitLoading(true);
-      setGitError(null);
+    const sameGitFiles = (
+      a: GitFile[],
+      b: GitFile[],
+    ) =>
+      a.length === b.length &&
+      a.every((f, i) => f.path === b[i].path && f.adds === b[i].adds && f.dels === b[i].dels);
+    const load = async (silent: boolean) => {
+      gitLoadRef.current = (s) => void load(s);
+      if (!silent) {
+        setGitLoading(true);
+        setGitError(null);
+      }
       try {
         const [st, unstaged, staged] = await Promise.all([
           gitStatus(root),
@@ -523,25 +526,46 @@ export function ReviewPanel(props?: {
         ]);
         if (cancelled) return;
         if ("error" in unstaged) {
-          setGitFiles([]);
-          setGitError(unstaged.error ?? "git diff failed");
+          // Background ticks keep the last good list; visible loads report it.
+          if (!silent) {
+            setGitFiles([]);
+            setGitError(unstaged.error ?? "git diff failed");
+          }
           return;
         }
         // فایل‌های untracked در diff نیستند — `buildUncommittedFiles` آن‌ها را
         // از status اضافه می‌کند و staged/unstaged را per-file ادغام می‌کند.
         const statusPaths = "error" in st ? [] : st.entries.map((e) => e.path);
         const stagedDiff = "error" in staged ? "" : staged.diff;
-        setGitFiles(
-          buildUncommittedFiles(statusPaths, unstaged.diff, stagedDiff),
+        const next = buildUncommittedFiles(statusPaths, unstaged.diff, stagedDiff);
+        setGitFiles((prev) =>
+          silent && sameGitFiles(prev, next) ? prev : next,
         );
+      } catch {
+        // Silent tick transport errors keep the last good list.
       } finally {
-        if (!cancelled) setGitLoading(false);
+        if (!cancelled && !silent) setGitLoading(false);
       }
-    })();
+    };
+    void load(false);
+    // Live push via /ws/events + a slow silent poll as a dead-socket fallback.
+    const timer = setInterval(() => void load(true), 30000);
+    const onFocus = () => void load(true);
+    window.addEventListener("focus", onFocus);
     return () => {
       cancelled = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+      gitLoadRef.current = null;
     };
   }, [source, root, gitTick]);
+
+  // Live: the backend pushes a change event whenever the workspace git state
+  // moves — refresh silently (no loading flag, no flicker).
+  useEffect(() => {
+    if (!root) return;
+    return onGitChange(root, () => gitLoadRef.current?.(true));
+  }, [root]);
 
   // تاریخچه‌ی کامیت‌ها برای فیلتر committed.
   useEffect(() => {

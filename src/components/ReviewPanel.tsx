@@ -667,12 +667,11 @@ export function ReviewPanel(props?: {
           dels: files.reduce((n, f) => n + f.dels, 0),
         };
 
-  // انتخاب پیش‌فرض: اگر فایل درخواستی (کلیک Review روی ادیت چت یا تب باز)
-  // داخل لیست جدید هست همان باز می‌ماند؛ فقط وقتی انتخاب فعلی در لیست نیست
-  // (تعویض منبع، استریم جدید) به اولین فایل برمی‌گردد. بستن دستی همهٔ
-  // فایل‌ها (`selectedPath` خالی) تا وقتی منبع عوض نشده حفظ می‌شود.
-  // این منطق مشکل «گیت‌دیف باز است و کلیک Review فایل همان ادیت را باز نمی‌کند»
-  // را حل می‌کند: قبلاً با هر تعویض منبع بی‌قیدوشرط به فایل اول می‌پرید.
+  // انتخاب آکاردئون: همهٔ فایل‌ها به‌صورت پیش‌فرض بسته‌اند. فقط دو حالت باز
+  // می‌کند: (۱) درخواست صریح — کلیک Review روی ادیت چت / تب بازِ داک‌شده،
+  // (۲) فایلی که خود کاربر قبلاً باز کرده و هنوز در لیست هست. انتخابِ
+  // باقی‌مانده از منبع قبلی (تعویض منبع، استریم جدید) به‌جای پرش به اولین
+  // فایل، بسته می‌شود.
   const dockedWant = docked ? (props?.initialPath ?? "") : "";
   useEffect(() => {
     if (files.length === 0) return;
@@ -681,7 +680,7 @@ export function ReviewPanel(props?: {
       return;
     }
     const has = files.some((f) => f.path === selectedPath);
-    if (!selectedPath || !has) selectPath(files[0]?.path ?? "");
+    if (selectedPath && !has) selectPath("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source, turn?.files, gitFiles, dockedWant]);
 

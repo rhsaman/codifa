@@ -239,6 +239,29 @@ const LIVE_TTS_OWNER = 9007199;
 const PLAN_APPROVE_TOKEN = "__plan_approve__";
 const PLAN_DISMISS_TOKEN = "__plan_dismiss__";
 
+// ---- Per-chat auto-retry runtime, shared by EVERY mounted ChatPanel ----
+// These used to live in per-instance refs. The panel REMOUNTS on every chat
+// switch (and every window mounts its own panel), so the error-retry ladder
+// armed by the previous instance kept a live timer nothing could reach:
+// Stop in the freshly-mounted panel stopped a brand-new scheduler while the
+// orphaned timer fired anyway, and the turn the user had just stopped
+// restarted on its own ("pressed Stop, it still auto-retries"). Module scope
+// gives ONE scheduler / stop flag / attempt count per chat id, so Stop from
+// any panel — even a remount — drops ladders armed by any other instance.
+const CHAT_ERROR_MAX_RETRIES = 10;
+const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
+const chatStopped = new Map<string, boolean>();
+const chatAutoRetry = new Map<string, AutoRetryScheduler>();
+const chatAutoRetryCount = new Map<string, number>();
+const autoRetryFor = (chatId: string): AutoRetryScheduler => {
+  let sched = chatAutoRetry.get(chatId);
+  if (!sched) {
+    sched = new AutoRetryScheduler();
+    chatAutoRetry.set(chatId, sched);
+  }
+  return sched;
+};
+
 // THINKING_OPTIONS / THINKING_LABELS / THINKING_DESCS live in the shared
 // src/lib/thinking-options.ts module so Settings → Tools rows can render the
 // exact same picker (imported below next to the other lib imports).
@@ -1147,7 +1170,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Explicit Stop (persistent flag or in-memory race flag) blocks the loop.
     let wasStopped = false;
     try {
-      wasStopped = Boolean(stoppedMapRef.current?.get(ch.id));
+      wasStopped = Boolean(chatStopped.get(ch.id));
     } catch {
       wasStopped = false;
     }
@@ -2165,37 +2188,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   // race. Keyed by chatId.
   const abortMapRef = useRef<Map<string, AbortController>>(new Map());
   const abortRef = useRef<AbortController | null>(null);
-  /** Per-chat stop flags: prevents trailing retry events from re-activating
-   *  another chat's banner after the user stopped THIS chat. */
-  const stoppedMapRef = useRef<Map<string, boolean>>(new Map());
+  // Stop flags, auto-retry schedulers and error-retry counts live at MODULE
+  // scope (`chatStopped` / `chatAutoRetry` / `chatAutoRetryCount`): per-chat
+  // state shared by every panel instance. As refs here they died with the
+  // panel on a chat switch, and an armed retry ladder outlived its owner with
+  // no handle left to cancel it — Stop in the remounted panel could not
+  // reach it, so the turn restarted after the user stopped it.
   const stoppedRef = useRef(false);
-  // Per-chat auto-retry schedulers (epoch-guarded): every automatic resend
-  // (watchdog stall retry, post-turn drain) is armed through these, so an
-  // explicit Stop bumps the epoch and a timer firing afterwards is dropped
-  // instead of restarting the turn and bringing the retry banner back.
-  // Auto-retry ladder for a turn that failed OUTRIGHT: the backend reported an
-  // error event, so the turn really died. Same cadence as the transport
-  // reconnect in api.ts — every 10s, at most 10 attempts. Model ERROR is
-  // retried; model SILENCE never is (a slow model must not be cut off, and the
-  // backend's only time-based cap is 24h precisely so it never fires).
-  const CHAT_ERROR_MAX_RETRIES = 10;
-  const CHAT_ERROR_RETRY_DELAY_MS = 10_000;
-  const autoRetryMapRef = useRef<Map<string, AutoRetryScheduler>>(new Map());
-  // Auto error-retries THIS chat has already spent. Kept in a per-chat ref and
-  // NOT on the message: the resend goes through `send()`, which clears `retry`
-  // on the continuation bubble, and the static banner written just before the
-  // read reports `attempt: 1` anyway — so the message-level count re-derived to
-  // 1 on every cycle and the ladder re-armed at "2/10" forever while the turn
-  // restarted every 10s and never reached its cap.
-  const autoRetryCountRef = useRef<Map<string, number>>(new Map());
-  const autoRetryFor = (chatId: string): AutoRetryScheduler => {
-    let sched = autoRetryMapRef.current.get(chatId);
-    if (!sched) {
-      sched = new AutoRetryScheduler();
-      autoRetryMapRef.current.set(chatId, sched);
-    }
-    return sched;
-  };
   // Release per-chat bookkeeping once a chat is gone.
   //
   // Every map above is keyed by chat id and nothing ever removed an entry: each
@@ -2212,13 +2211,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     };
     // A deleted chat can never retry: clear the pending timer before dropping
     // the scheduler, or it would still fire against a chat that no longer exists.
-    for (const [k, sched] of Array.from(autoRetryMapRef.current.entries())) {
+    for (const [k, sched] of Array.from(chatAutoRetry.entries())) {
       if (!live.has(k)) sched.stop();
     }
     prune(abortMapRef.current);
-    prune(stoppedMapRef.current);
-    prune(autoRetryMapRef.current);
-    prune(autoRetryCountRef.current);
+    prune(chatStopped);
+    prune(chatAutoRetry);
+    prune(chatAutoRetryCount);
     prune(goalAutoRef.current);
     prune(lastSeenFpRef.current);
     for (const k of Array.from(goalInitRef.current)) if (!live.has(k)) goalInitRef.current.delete(k);
@@ -4228,15 +4227,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       }
     }
     const sendImgs = cleanImagesForSend(imgs);
-    stoppedMapRef.current.set(chatId, false);
+    chatStopped.set(chatId, false);
     // Fresh turn: invalidate any retry armed by the previous turn and allow
     // auto-retry again (an explicit Stop bumps the epoch via stop() below).
     autoRetryFor(chatId).beginTurn();
     // A genuine new turn — not a continuation of a failed one — starts the
     // automatic error-retry ladder over from its first attempt.
-    if (!continueAssistantId) autoRetryCountRef.current.set(chatId, 0);
+    if (!continueAssistantId) chatAutoRetryCount.set(chatId, 0);
     // Per-turn local state (was shared refs — now locals so concurrent chats
-    // don't race). stop() coordinates via stoppedMapRef + chatAborts store.
+    // don't race). stop() coordinates via chatStopped + chatAborts store.
     let mcpChanged = false;
     // Messages that ask to create/install skills or MCP connectors also grant
     // the create_skill/create_mcp tools — in EVERY mode (ask, plan, build).
@@ -4868,7 +4867,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
       // Skipped after an explicit Stop: trailing events from the aborted stream
       // must not resurrect the button the user just dismissed.
       if (
-        stoppedMapRef.current.get(chat.id) !== true &&
+        chatStopped.get(chat.id) !== true &&
         !useStore.getState().chatBusy[chat.id]
       ) {
         setBusyFor(chat.id, true);
@@ -5077,7 +5076,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // If the user already clicked Stop, ignore any trailing retry events
         // that the backend may still be emitting during its asyncio.sleep delay.
         // Per-chat: only THIS origin chat's stop flag matters, not another chat's.
-        if (stoppedMapRef.current.get(chat.id) === true) return;
+        if (chatStopped.get(chat.id) === true) return;
         const info = {
           attempt: event.attempt ?? 1,
           maxAttempts: event.max_attempts ?? 3,
@@ -5126,7 +5125,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           });
         }
       } else if (event.kind === "retry_giveup") {
-        if (stoppedMapRef.current.get(chat.id) === true) return;
+        if (chatStopped.get(chat.id) === true) return;
         store.updateMessage(assistantMsg.id, {
           retry: {
             attempt: event.attempt ?? 1,
@@ -5482,7 +5481,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         ringTurnAlarm("alert");
       } else if (event.kind === "error") {        // A late backend error arriving after an explicit Stop must not re-arm
         // the retry banner — the user already cancelled this turn.
-        if (shouldIgnoreLateRetryEvent(stoppedMapRef.current.get(chat.id) === true)) return;
+        if (shouldIgnoreLateRetryEvent(chatStopped.get(chat.id) === true)) return;
         // A backend error while the summarizer was supposedly running means the
         // compact can't complete either — never leave the "Compacting context"
         // banner stuck next to the error. Clear it defensively (the backend's
@@ -5530,9 +5529,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // written just above reports `attempt: 1`, so a message-derived count
         // always re-read 1 and the ladder re-armed at "2/10" on every cycle —
         // the turn restarted every 10s forever and never reached its cap.
-        const spent = autoRetryCountRef.current.get(chat.id) ?? 1;
+        const spent = chatAutoRetryCount.get(chat.id) ?? 1;
         if (lastUserMsg && spent < CHAT_ERROR_MAX_RETRIES) {
-          autoRetryCountRef.current.set(chat.id, spent + 1);
+          chatAutoRetryCount.set(chat.id, spent + 1);
           useStore.getState().updateMessage(assistantMsg.id, {
             retry: {
               attempt: spent + 1,
@@ -9969,7 +9968,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     // Per-chat stop: only THIS viewed chat is affected. Aborting another chat's
     // controller here was the cross-chat kill (Stop in B ended A's stream).
     const originId = chatIdRef.current;
-    stoppedMapRef.current.set(originId, true);
+    chatStopped.set(originId, true);
     // Codex-style: an explicit Stop also halts this chat's goal loop. The goal
     // stays attached (paused=false) for manual sends, but auto-continue stays
     // idle until the user presses Resume in the goal bar.
@@ -10155,7 +10154,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         const onGoalResume = () => {
           goalAutoRef.current.delete(goalChatId);
                     try {
-                      stoppedMapRef.current?.delete(goalChatId);
+                      chatStopped.delete(goalChatId);
                     } catch {
                       /* ignore */
                     }

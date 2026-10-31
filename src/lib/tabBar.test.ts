@@ -133,6 +133,31 @@ console.log("7) tabForPoint — geometric drop target (gaps are not dead zones):
   check("empty bar -> null", tabForPoint([], 50) === null);
 }
 
+console.log("8) tabForPoint vertical — sidebar folder rows:");
+{
+  const rows = [
+    { id: "a", top: 0, bottom: 40 },
+    { id: "b", top: 44, bottom: 84 },
+    { id: "c", top: 88, bottom: 128 },
+  ];
+  check(
+    "over a's top half -> a/before",
+    JSON.stringify(tabForPoint(rows, 10, 1, "y")) === '{"id":"a","after":false}',
+  );
+  check("over a's bottom half -> a/after", tabForPoint(rows, 30, 1, "y")?.after === true);
+  const gap = tabForPoint(rows, 41, 1, "y");
+  check("gap nearest a's edge -> a/after", gap?.id === "a" && gap.after === true);
+  check(
+    "past the end -> last row/after",
+    tabForPoint(rows, 200, 1, "y")?.id === "c" && tabForPoint(rows, 200, 1, "y")?.after === true,
+  );
+  check(
+    "before the start -> first row/before",
+    tabForPoint(rows, -10, 1, "y")?.id === "a" && tabForPoint(rows, -10, 1, "y")?.after === false,
+  );
+  check("empty list -> null", tabForPoint([], 5, 1, "y") === null);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`);
   process.exit(1);

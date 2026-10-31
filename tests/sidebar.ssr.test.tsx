@@ -40,7 +40,7 @@
 
 export {}
 
-const { buildGroups, toggleGroupSelection } = await import("../src/components/Sidebar")
+const { buildGroups, toggleGroupSelection, matchesFolder } = await import("../src/components/Sidebar")
 
 const workspaces = [{ key: "/demo", label: "Demo", root: "/demo", color: "#4f8" }]
 const chats = [
@@ -91,6 +91,16 @@ console.log("۳) انتخاب/لغو همه چت‌های یک ورک‌اسپی
     "انتخاب جزئی به انتخاب کامل می‌رسد و گروه دیگر دست نمی‌خورد",
     partial.has("c1") && partial.has("c2") && partial.has("other"),
   )
+}
+
+console.log("۴) جست‌وجوی پوشه‌ها در فهرست پروژه‌ها (matchesFolder):")
+{
+  const folder = { label: "Demo", root: "/code/demo" }
+  check("برچسب شامل عبارت است", matchesFolder(folder, "dem") === true)
+  check("مسیر هم مچ می‌شود", matchesFolder(folder, "/code") === true)
+  check("عدم تطبیق", matchesFolder(folder, "zzz") === false)
+  check("رشتهٔ خالی همه را می‌پذیرد", matchesFolder(folder, "") === true)
+  check("بی‌Root (No project) فقط با برچسب مچ می‌شود", matchesFolder({ label: "No project", root: null }, "no pro") === true)
 }
 
 if (failed > 0) {

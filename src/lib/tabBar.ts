@@ -97,36 +97,59 @@ export function slideWidth(dragged: HTMLElement, bar: HTMLElement): number {
   return w + gap;
 }
 
-export interface TabExtent {
-  id: string;
-  left: number;
-  right: number;
+/** Slide distance for one slot in a VERTICAL list: the dragged row's outer
+ *  height plus the list's row gap — the hole a dragged sidebar folder leaves. */
+export function slideHeight(dragged: HTMLElement, list: HTMLElement): number {
+  const h = dragged.getBoundingClientRect().height;
+  let gap = 0;
+  try {
+    const cs = getComputedStyle(list);
+    gap = parseFloat(cs.rowGap || cs.gap || "") || 0;
+  } catch {
+    /* keep 0 */
+  }
+  return h + gap;
 }
 
-/** Which tab a drop lands on, from the pointer x and the tabs' PHYSICAL
+export interface TabExtent {
+  id: string;
+  /** Horizontal bar extents (axis "x"). */
+  left?: number;
+  right?: number;
+  /** Vertical list extents (axis "y") — the sidebar folder rows. */
+  top?: number;
+  bottom?: number;
+}
+
+/** Which tab a drop lands on, from the pointer position and the tabs' PHYSICAL
  *  extents: the tab under the pointer (side = which half), else — over a gap
  *  or the empty space past the ends — the nearest tab by center. `sign` is
  *  the bar's flow direction, so "after" stays array-order-correct in rtl bars
  *  (a drop on a tab's right half is AFTER it in ltr, BEFORE it in rtl).
- *  This replaces the old "only the space past the tail drops at the end"
- *  rule, which left every inter-tab gap a dead drop zone. */
+ *  `axis` selects the measured pair: left/right for horizontal bars, top/bottom
+ *  for vertical lists (a sidebar's folder rows, where array order always flows
+ *  top→bottom, so sign stays 1). This replaces the old "only the space past the
+ *  tail drops at the end" rule, which left every inter-tab gap a dead drop zone. */
 export function tabForPoint(
   tabs: TabExtent[],
   x: number,
   sign: 1 | -1 = 1,
+  axis: TabAxis = "x",
 ): { id: string; after: boolean } | null {
   if (tabs.length === 0) return null;
+  const startOf = (t: TabExtent) => (axis === "y" ? t.top : t.left) ?? 0;
+  const endOf = (t: TabExtent) => (axis === "y" ? t.bottom : t.right) ?? 0;
   const sideOf = (t: TabExtent) => {
-    const after = x > (t.left + t.right) / 2;
+    const after = x > (startOf(t) + endOf(t)) / 2;
     return sign === 1 ? after : !after;
   };
   for (const t of tabs) {
-    if (x >= t.left && x <= t.right) return { id: t.id, after: sideOf(t) };
+    if (x >= startOf(t) && x <= endOf(t)) return { id: t.id, after: sideOf(t) };
   }
   let best = tabs[0];
   let bestDist = Infinity;
   for (const t of tabs) {
-    const d = Math.abs(x - (t.left + t.right) / 2);
+    const d = Math.abs(x - (startOf(t) + endOf(t)) / 2);
     if (d < bestDist) {
       bestDist = d;
       best = t;

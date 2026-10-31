@@ -7,6 +7,8 @@ import { api } from "../lib/fs";
 import { prepareContent } from "../lib/bidi";
 import { fmtAgo, fmtClockFull } from "../lib/time";
 import { shouldFocusSearch } from "../lib/shortcuts";
+import { edgeScroll, menuLeft, menuTop, slideHeight, tabForPoint, tabMove } from "../lib/tabBar";
+import { previewOrder, previewShifts } from "../lib/tabOrder";
 import { WindowStripCluster } from "./WindowStripCluster";
 
 type ChatSummary = {
@@ -44,12 +46,26 @@ interface Group<T = Chat | ChatSummary> {
   chats: T[];
 }
 
-/** Persisted sidebar UI state (localStorage `coder:sidebarUi`): collapse
- *  toggles for workspace groups, so the layout the user left comes back
- *  exactly as it was after a restart. (Todos moved to the floating
+/** The group shape the sidebar actually renders: buildGroups output over the
+ *  lightweight chat summaries (Chat has no streaming/pending flags). */
+type SummaryGroup = Group<ChatSummary>;
+
+/** Persisted sidebar UI state (localStorage `coder:sidebarUi`): WHICH workspace
+ *  the sidebar is drilled into, so the layout the user left comes back exactly
+ *  as it was after a restart. The list itself is projects-only — chats live one
+ *  click deeper, inside the opened folder. (Todos moved to the floating
  *  TodosPanel — its state lives in `coder:todoPanel`.) */
 interface SidebarUiState {
-  collapsedGroups?: string[];
+  openWorkspace?: string | null;
+}
+
+function readOpenWorkspace(): string | null {
+  try {
+    const raw = localStorage.getItem("coder:sidebarUi");
+    return raw ? ((JSON.parse(raw) as SidebarUiState).openWorkspace ?? null) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -158,6 +174,20 @@ export function toggleGroupSelection(prev: Set<string>, groupIds: string[]): Set
   return next;
 }
 
+/** Root-level search matches the FOLDER row (label or root path), not chats —
+ *  chats are searched inside their opened folder. Case-insensitive substring. */
+export function matchesFolder(
+  group: Pick<Group, "label" | "root">,
+  query: string,
+): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return (
+    group.label.toLowerCase().includes(q) ||
+    (group.root ?? "").toLowerCase().includes(q)
+  );
+}
+
 export function Sidebar() {
   // Lightweight shell: subscribes ONLY to the open flag so Cmd/Ctrl+B flips
   // instantly without touching chats/workspaces. The aside itself stays
@@ -180,6 +210,37 @@ export function Sidebar() {
     const t = window.setTimeout(() => setContentMounted(false), 300);
     return () => window.clearTimeout(t);
   }, [open]);
+  // Which workspace the sidebar is drilled into (null = the projects list).
+  // Lives in the SHELL, not the content: the shell never unmounts, so the
+  // persistence listeners below survive sidebar close/open and the drill-in
+  // survives a quick toggle without racing the debounce.
+  const [openWsKey, setOpenWsKey] = useState<string | null>(readOpenWorkspace);
+  // Persist the drill-in whenever it changes, so the layout survives restarts.
+  // Debounced: the write lands 250ms after the change settles; the flush
+  // listeners guarantee the final value on quit (the main process dispatches
+  // `coder:flush-ui` before every store flush, including quit).
+  useEffect(() => {
+    const write = () => {
+      try {
+        localStorage.setItem(
+          "coder:sidebarUi",
+          JSON.stringify({ openWorkspace: openWsKey } satisfies SidebarUiState),
+        );
+      } catch {
+        /* quota / serialization errors — the layout just won't persist */
+      }
+    };
+    const t = window.setTimeout(write, 250);
+    window.addEventListener("coder:flush-ui", write);
+    window.addEventListener("beforeunload", write);
+    window.addEventListener("pagehide", write);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("coder:flush-ui", write);
+      window.removeEventListener("beforeunload", write);
+      window.removeEventListener("pagehide", write);
+    };
+  }, [openWsKey]);
   // Sidebar width lives HERE (the shell owns the aside); the content only
   // receives the drag handler. Previously the width sat below the shell,
   // which produced a nested .sidebar whose fixed var() width clipped the
@@ -244,16 +305,28 @@ export function Sidebar() {
         } as React.CSSProperties
       }
     >
-      {contentMounted ? <SidebarContent onResizeStart={startSidebarResize} /> : null}
+      {contentMounted ? (
+        <SidebarContent
+          onResizeStart={startSidebarResize}
+          openWsKey={openWsKey}
+          setOpenWsKey={setOpenWsKey}
+        />
+      ) : null}
     </aside>
   );
 }
 
 function SidebarContent({
   onResizeStart,
+  openWsKey,
+  setOpenWsKey,
 }: {
   /** Drag-resize handler owned by the shell (which owns the animated aside). */
   onResizeStart: (e: React.MouseEvent) => void;
+  /** The workspace the sidebar is drilled into (null = projects list).
+   *  Owned by the shell so it persists across sidebar close/open. */
+  openWsKey: string | null;
+  setOpenWsKey: (key: string | null) => void;
 }) {
   // Subscribe to a lightweight chat SUMMARY (id/title/root/timestamps + flags),
   // not the full chat objects: message/stream/draft edits rebuild the chat
@@ -303,24 +376,9 @@ function SidebarContent({
     const id = setInterval(() => setNowTick(Date.now()), 30000);
     return () => clearInterval(id);
   }, []);
-  // Persisted sidebar UI state (collapse toggles + panel heights) — read once
-  // per mount, same localStorage pattern as coder:sidebarWidth below.
-  const [savedUi] = useState<SidebarUiState>(() => {
-    try {
-      const raw = localStorage.getItem("coder:sidebarUi");
-      return raw ? (JSON.parse(raw) as SidebarUiState) : {};
-    } catch {
-      return {};
-    }
-  });
-  const [collapsed, setCollapsed] = useState<Set<string>>(
-    () => new Set(savedUi.collapsedGroups ?? []),
-  );
   const [colorOpen, setColorOpen] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const [dragKey, setDragKey] = useState<string | null>(null);
-  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
 
@@ -336,29 +394,29 @@ function SidebarContent({
   };
   const clearSelected = () => setSelectedChats(new Set());
 
-  // Click-based kebab menu: opens on click, stays open while hovering the
-  // popup (no hover-gap race), and closes on outside click or re-click.
-  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  // Right-click chat menu: opens at the cursor, closes on outside mousedown
+  // or after an action. The row's left-click (open chat) never fires for
+  // right buttons, so no extra guarding is needed.
+  const [chatMenuId, setChatMenuId] = useState<string | null>(null);
+  const [chatMenuPos, setChatMenuPos] = useState<{ top: number; left: number } | null>(null);
   useEffect(() => {
-    if (!menuOpenId) return;
+    if (!chatMenuId) return;
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as Node | null;
-      if (
-        !(t instanceof Element) ||
-        (!t.closest(".chat-item-kebab-wrap") && !t.closest(".chat-item-menu"))
-      ) {
-        setMenuOpenId(null);
+      if (!(t instanceof Element) || !t.closest(".chat-menu")) {
+        setChatMenuId(null);
       }
     };
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
-  }, [menuOpenId]);
+  }, [chatMenuId]);
 
-  // Workspace 3-dot menu, delete-confirm popup, and chat-selection mode.
+  // Workspace 3-dot / context menu and chat-selection mode. The old two-step
+  // delete popup is gone: chat deletion happens via checkbox selection inside
+  // the folder, and Delete workspace lives on the projects list's right-click
+  // menu.
   const [wsMenuOpenKey, setWsMenuOpenKey] = useState<string | null>(null);
   const [wsMenuPos, setWsMenuPos] = useState<{ top: number; left: number } | null>(null);
-  const [deleteMenuKey, setDeleteMenuKey] = useState<string | null>(null);
-  const [deleteMenuPos, setDeleteMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [selectingWsKey, setSelectingWsKey] = useState<string | null>(null);
   const [renamingWsKey, setRenamingWsKey] = useState<string | null>(null);
   const [wsRenameValue, setWsRenameValue] = useState("");
@@ -371,23 +429,16 @@ function SidebarContent({
     setWsRenameValue("");
   };
   useEffect(() => {
-    if (!wsMenuOpenKey && !deleteMenuKey) return;
+    if (!wsMenuOpenKey) return;
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as Node | null;
-      if (
-        !(t instanceof Element) ||
-        (!t.closest(".ws-menu-wrap") &&
-          !t.closest(".ws-delete-menu-wrap") &&
-          !t.closest(".ws-menu") &&
-          !t.closest(".ws-delete-menu"))
-      ) {
+      if (!(t instanceof Element) || !t.closest(".ws-menu")) {
         setWsMenuOpenKey(null);
-        setDeleteMenuKey(null);
       }
     };
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
-  }, [wsMenuOpenKey, deleteMenuKey]);
+  }, [wsMenuOpenKey]);
 
   // ⌘K / Ctrl+K focuses the chat search — the natural "find my chat" shortcut.
   useEffect(() => {
@@ -412,49 +463,6 @@ function SidebarContent({
 
   const dir = useStore((s) => s.dir);
 
-  // Persist the panel/group UI state whenever it changes, so collapse toggles
-  // survive restarts. Debounced: the write lands 250ms after the change
-  // settles, and the app-close flush below guarantees the final value.
-  useEffect(() => {
-    const t = setTimeout(() => {
-      try {
-        localStorage.setItem(
-          "coder:sidebarUi",
-          JSON.stringify({ collapsedGroups: [...collapsed] }),
-        );
-      } catch {
-        /* quota / serialization errors — the layout just won't persist */
-      }
-    }, 250);
-    return () => clearTimeout(t);
-  }, [collapsed]);
-
-  // Flush the latest sidebar UI state synchronously on app close, so a toggle
-  // made right before quitting is never lost to the debounce above.
-  // Also flushes on the store's `coder:flush-ui` event (dispatched before every
-  // store flush, including the main process's `flush-persist` on quit) so the
-  // layout survives even when the renderer's beforeunload runs late.
-  useEffect(() => {
-    const flush = () => {
-      try {
-        localStorage.setItem(
-          "coder:sidebarUi",
-          JSON.stringify({ collapsedGroups: [...collapsed] }),
-        );
-      } catch {
-        /* quota / serialization errors — the layout just won't persist */
-      }
-    };
-    window.addEventListener("coder:flush-ui", flush);
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
-    return () => {
-      window.removeEventListener("coder:flush-ui", flush);
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
-    };
-  }, [collapsed]);
-
   // `buildGroups` walks every chat + sorts; memoize it so it only re-runs when
   // the underlying data actually changes (not on every unrelated re-render such
   // as hover/scroll state). `chats` is rebuilt by the store on each streamed
@@ -464,9 +472,29 @@ function SidebarContent({
     [chats, workspaces, pinnedWorkspaces, pinnedChats],
   );
 
+  // The drilled-into workspace. The find-guard doubles as deletion handling:
+  // once the workspace is gone the sidebar falls back to the projects list
+  // (the stale persisted key stays harmless until the user navigates).
+  const openGroup = useMemo(
+    () => (openWsKey ? groups.find((g) => g.key === openWsKey) ?? null : null),
+    [groups, openWsKey],
+  );
+
+  // Drill in / back. Both clear the search: a query typed for folder filtering
+  // must not silently become a chat filter inside the opened folder.
+  const openWorkspace = (key: string) => {
+    setOpenWsKey(key);
+    setSearch("");
+  };
+  const closeWorkspace = () => {
+    setOpenWsKey(null);
+    setSearch("");
+  };
+
   // Sidebar search: debounced, title-only (never scans message bodies — that
-  // walks every token of every chat on each keystroke). While searching, groups
-  // keep their workspace context but only matching chats are shown.
+  // walks every token of every chat on each keystroke). Contextual: on the
+  // projects list it filters FOLDER rows; inside an opened folder it filters
+  // that workspace's chats.
   const [debouncedSearch, setDebouncedSearch] = useState(search);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 200);
@@ -479,26 +507,59 @@ function SidebarContent({
     if ((chat.title || "").toLowerCase().includes(query)) return true;
     return chat.firstUser.toLowerCase().includes(query);
   };
-  const visibleGroups = useMemo(
-    () =>
-      searching
-        ? groups
-          .map((g) => ({
-            ...g,
-            chats: g.chats.filter((c) => matchesQuery(c, debouncedSearch)),
-          }))
-          .filter((g) => g.chats.length > 0)
-        : groups,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [groups, searching, debouncedSearch],
+  const visibleFolders = useMemo(
+    () => (searching && !openGroup ? groups.filter((g) => matchesFolder(g, debouncedSearch)) : groups),
+    [groups, searching, openGroup, debouncedSearch],
   );
+  const openChats = useMemo(() => {
+    if (!openGroup) return [];
+    return searching
+      ? openGroup.chats.filter((c) => matchesQuery(c, debouncedSearch))
+      : openGroup.chats;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openGroup, searching, debouncedSearch]);
 
   const newWorkspace = async () => {
     const dir = await api.selectFolder();
     if (dir) useStore.getState().createWorkspace(dir);
   };
 
-  const onDragStart = (e: React.DragEvent, key: string) => {
+  // ---------------------------------------------------------------------------
+  // Folder drag & drop — the same slide-preview mechanics as the chat tab bar:
+  // the dragged row stays as a muted landing slot and its neighbours glide one
+  // slot toward the freed hole via animated transforms (no mid-drag reflow).
+  // ---------------------------------------------------------------------------
+  const listRef = useRef<HTMLDivElement>(null);
+  const [dragKey, setDragKey] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
+  // Slide geometry measured once at drag start: how far "one slot" is (the
+  // dragged row's height + the list's row gap). Vertical lists flow top→bottom
+  // in both ltr and rtl, so no flow-sign mirroring is needed.
+  const [dragGeom, setDragGeom] = useState<{ slot: number } | null>(null);
+
+  const clearDrag = () => {
+    setDragKey(null);
+    setDropTarget(null);
+    setDragGeom(null);
+  };
+
+  const folderKeys = visibleFolders.map((g) => g.key);
+  const shifts = dragKey && dropTarget
+    ? previewShifts(folderKeys, dragKey, dropTarget.id, dropTarget.after)
+    : null;
+  const slot = dragGeom?.slot ?? 0;
+
+  /** Physical extents of the rendered folder rows, for geometric drop checks. */
+  const rowExtents = () =>
+    Array.from(listRef.current?.querySelectorAll<HTMLElement>("[data-ws-id]") ?? []).map(
+      (el) => ({
+        id: el.dataset.wsId ?? "",
+        top: el.getBoundingClientRect().top,
+        bottom: el.getBoundingClientRect().bottom,
+      }),
+    );
+
+  const onFolderDragStart = (e: React.DragEvent, key: string) => {
     setDragKey(key);
     e.dataTransfer.effectAllowed = "move";
     try {
@@ -506,42 +567,41 @@ function SidebarContent({
     } catch {
       /* ignore dataTransfer restrictions (rare) */
     }
+    const list = listRef.current;
+    const el = list?.querySelector<HTMLElement>(`[data-ws-id="${CSS.escape(key)}"]`);
+    setDragGeom(el && list ? { slot: slideHeight(el, list) } : null);
   };
 
-  const onDragOver = (e: React.DragEvent, key: string) => {
+  const onListDragOver = (e: React.DragEvent) => {
+    if (!dragKey) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    setDragOverKey(key);
+    const list = listRef.current;
+    if (!list) return;
+    // Dragging near a list edge scrolls it, so off-screen rows stay reachable.
+    const delta = edgeScroll(e.clientY, list.getBoundingClientRect(), "y");
+    if (delta) list.scrollTop += delta;
+    const at = tabForPoint(rowExtents(), e.clientY, 1, "y");
+    if (!at) return;
+    setDropTarget((prev) =>
+      prev && prev.id === at.id && prev.after === at.after ? prev : at,
+    );
   };
 
-  const onDrop = (e: React.DragEvent, targetKey: string) => {
+  const onListDragLeave = (e: React.DragEvent) => {
+    if (e.target !== e.currentTarget) return;
+    setDropTarget(null);
+  };
+
+  const onListDrop = (e: React.DragEvent) => {
+    if (!dragKey) return;
     e.preventDefault();
-    const from =
-      dragKey || (e.dataTransfer.getData("text/plain") as string) || "";
-    setDragKey(null);
-    setDragOverKey(null);
-    if (!from || from === targetKey) return;
-    const keys = groups.map((g) => g.key);
-    const i = keys.indexOf(from);
-    const j = keys.indexOf(targetKey);
-    if (i === -1) return;
-    keys.splice(i, 1);
-    keys.splice(j, 0, from);
-    useStore.getState().setWorkspaceOrder(keys);
-  };
-
-  const onDragEnd = () => {
-    setDragKey(null);
-    setDragOverKey(null);
-  };
-
-  const toggleGroup = (key: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    const at = tabForPoint(rowExtents(), e.clientY, 1, "y");
+    if (at && at.id !== dragKey) {
+      const next = previewOrder(folderKeys, dragKey, at.id, at.after);
+      useStore.getState().setWorkspaceOrder(next);
+    }
+    clearDrag();
   };
 
   const startRename = (chat: Chat | ChatSummary) => {
@@ -555,6 +615,548 @@ function SidebarContent({
         .getState()
         .renameChat(renamingId, renameValue.trim() || "New chat");
     setRenamingId(null);
+  };
+
+  // Activity badges aggregated for a folder row / workspace header: live
+  // streaming, pending permission/ask, unread count. With chats hidden one
+  // level down, these keep a busy project visible from the projects list.
+  const renderBadges = (g: SummaryGroup) => {
+    const streaming = g.chats.filter((c) => c.hasStreaming).length;
+    const unread = g.chats.filter(
+      (c) => !c.hasStreaming && c.id !== activeChatId && unreadChats.includes(c.id),
+    ).length;
+    const pendingPerm = g.chats.find((c) => c.pendingPermission)?.pendingPermission ?? null;
+    const pendingAsk = g.chats.find((c) => c.pendingAsk)?.pendingAsk ?? null;
+    if (streaming === 0 && unread === 0 && !pendingPerm && !pendingAsk) return null;
+    return (
+      <span className="sidebar-folder-badges">
+        {streaming > 0 && (
+          <span
+            className="chat-item-streaming"
+            title={`Agent is working in ${streaming === 1 ? "1 chat" : `${streaming} chats`}`}
+          />
+        )}
+        {pendingPerm && (
+          <span
+            className="chat-item-pending permission"
+            title={`Needs permission: ${pendingPerm.action}${pendingPerm.path ? ` · ${pendingPerm.path}` : ""}`}
+          >
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            </svg>
+          </span>
+        )}
+        {pendingAsk && (
+          <span
+            className="chat-item-pending ask"
+            title={`Asks you: ${pendingAsk.question}`}
+          >
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
+              <path d="M12 17h.01" />
+            </svg>
+          </span>
+        )}
+        {unread > 0 && (
+          <span
+            className="ws-unread-badge"
+            title={`${unread} unread chat${unread === 1 ? "" : "s"}`}
+          >
+            {unread}
+          </span>
+        )}
+      </span>
+    );
+  };
+
+  // [+ new chat] — the only control on a folder row; the workspace menu lives
+  // inside the opened folder (its header), keeping the projects list lean.
+  const renderNewChatBtn = (g: SummaryGroup, hidden?: boolean) => (
+    <button
+      className="sidebar-group-btn"
+      title="New chat in this workspace"
+      aria-label="New chat in this workspace"
+      style={hidden ? { display: "none" } : undefined}
+      onClick={(e) => {
+        e.stopPropagation();
+        useStore.getState().newChatInRoot(g.root ?? g.key);
+      }}
+    >
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+      >
+        <path d="M12 5v14M5 12h14" />
+      </svg>
+    </button>
+  );
+
+  // The workspace popup menu, in two variants:
+  //  - "row"    → right-click on a projects-list folder row: Pin/Unpin,
+  //               Rename, Color, Change folder…, Delete workspace. Workspace-
+  //               level management belongs OUT here, on the list of projects.
+  //  - "header" → the opened folder's kebab: Rename, Color, Change folder…,
+  //               Select chats. No pin/delete — those live on the list.
+  const renderWsMenu = (
+    g: SummaryGroup,
+    variant: "row" | "header",
+    pos: { top: number; left: number },
+  ) => {
+    const isPinned = pinnedWorkspaces.includes(g.key);
+    return (
+      <div
+        className="ws-menu"
+        role="menu"
+        style={{
+          position: "fixed",
+          top: pos.top,
+          left: pos.left,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {variant === "row" && (
+          <button
+            className={`ws-menu-btn${isPinned ? " active" : ""}`}
+            role="menuitem"
+            onClick={() => {
+              useStore.getState().togglePinWorkspace(g.key);
+              setWsMenuOpenKey(null);
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+            </svg>
+            {isPinned ? "Unpin" : "Pin to top"}
+          </button>
+        )}
+        <button
+          className="ws-menu-btn"
+          role="menuitem"
+          onClick={() => {
+            setRenamingWsKey(g.key);
+            setWsRenameValue(g.label);
+            setWsMenuOpenKey(null);
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+          </svg>
+          Rename
+        </button>
+        <button
+          className="ws-menu-btn"
+          role="menuitem"
+          onClick={() => {
+            setColorOpen(colorOpen === g.key ? null : g.key);
+            setWsMenuOpenKey(null);
+          }}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" />
+            <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" />
+            <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" />
+            <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" />
+            <path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.7 1.7-1.7H17a3 3 0 0 0 3-3c0-4.4-4-8-8-8z" />
+          </svg>
+          Color
+        </button>
+        <button
+          className="ws-menu-btn"
+          role="menuitem"
+          title={g.root || "No folder set"}
+          onClick={() => {
+            setWsMenuOpenKey(null);
+            void api.selectFolder().then((dir) => {
+              if (dir) useStore.getState().moveWorkspace(g.key, dir);
+            });
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+            <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
+          </svg>
+          Change folder…
+        </button>
+        {variant === "row" ? (
+          <button
+            className="ws-menu-btn danger"
+            role="menuitem"
+            title={`Deletes the workspace and its ${g.chats.length} chat${g.chats.length === 1 ? "" : "s"}`}
+            onClick={() => {
+              useStore.getState().deleteWorkspace(g.key);
+              setWsMenuOpenKey(null);
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+            </svg>
+            Delete workspace
+            <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
+              ({g.chats.length})
+            </span>
+          </button>
+        ) : (
+          <button
+            className="ws-menu-btn"
+            role="menuitem"
+            title="Pick chats with checkboxes, then delete them in bulk"
+            onClick={() => {
+              setSelectingWsKey(g.key);
+              setWsMenuOpenKey(null);
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
+            Select chats
+            <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
+              ({g.chats.length})
+            </span>
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderColorPopover = (g: SummaryGroup) => (
+    <div className="color-popover" onClick={(e) => e.stopPropagation()}>
+      {themeById(theme).workspaceColors.map((c2) => (
+        <button
+          key={c2}
+          className="color-swatch"
+          style={{ background: c2 }}
+          onClick={() => {
+            useStore.getState().setWorkspaceColor(g.key, c2);
+            setColorOpen(null);
+          }}
+        />
+      ))}
+      <button
+        className="color-none"
+        title="Remove color"
+        onClick={() => {
+          useStore.getState().setWorkspaceColor(g.key, "");
+          setColorOpen(null);
+        }}
+      >
+        ✕
+      </button>
+    </div>
+  );
+
+  // Bulk-select bar for the opened folder's header (checkbox mode): select
+  // all / delete selected / cancel.
+  const renderBulkBar = (g: SummaryGroup) => {
+    const selectedInGroup = g.chats.filter((c) => selectedChats.has(c.id)).length;
+    return (
+      <div className="group-bulk-actions">
+        <button
+          className="group-select-all"
+          title={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all" : "Select all"}
+          aria-label={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all chats" : "Select all chats"}
+          aria-pressed={g.chats.length > 0 && selectedInGroup === g.chats.length}
+          onClick={() => {
+            setSelectedChats((prev) =>
+              toggleGroupSelection(
+                prev,
+                g.chats.map((c) => c.id),
+              ),
+            );
+          }}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            {g.chats.length > 0 && selectedInGroup === g.chats.length ? (
+              <path d="M9 11l3 3L22 4" />
+            ) : null}
+            <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+          </svg>
+        </button>
+        <button
+          className="group-delete-selected"
+          title={`Delete ${selectedInGroup} selected conversation(s)`}
+          onClick={() => {
+            const ids = g.chats
+              .map((c) => c.id)
+              .filter((id) => selectedChats.has(id));
+            if (ids.length === 0) return;
+            ids.forEach((id) =>
+              useStore.getState().deleteChat(id),
+            );
+            setSelectedChats((prev) => {
+              const next = new Set(prev);
+              ids.forEach((id) => next.delete(id));
+              return next;
+            });
+            setSelectingWsKey(null);
+          }}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+          </svg>
+          {selectedInGroup}
+        </button>
+        <button
+          className="group-cancel-select"
+          title="Cancel selection"
+          aria-label="Cancel selection"
+          onClick={() => {
+            setSelectingWsKey(null);
+            clearSelected();
+          }}
+        >
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+          >
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
+    );
+  };
+
+  // Right-click menu for a chat row (the ⋯ kebab is gone): pin, rename,
+  // delete — the actions the kebab used to hold, now at the cursor.
+  const renderChatMenu = (c: ChatSummary, pos: { top: number; left: number }) => {
+    const isPinnedChat = pinnedChats.includes(c.id);
+    return (
+      <div
+        className="ws-menu chat-menu"
+        role="menu"
+        style={{ position: "fixed", top: pos.top, left: pos.left }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <button
+          className={`ws-menu-btn${isPinnedChat ? " active" : ""}`}
+          role="menuitem"
+          onClick={() => {
+            useStore.getState().togglePinChat(c.id);
+            setChatMenuId(null);
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinnedChat ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+          </svg>
+          {isPinnedChat ? "Unpin" : "Pin to top"}
+        </button>
+        <button
+          className="ws-menu-btn"
+          role="menuitem"
+          onClick={() => {
+            startRename(c);
+            setChatMenuId(null);
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+          </svg>
+          Rename
+        </button>
+        <button
+          className="ws-menu-btn danger"
+          role="menuitem"
+          onClick={() => {
+            useStore.getState().deleteChat(c.id);
+            setChatMenuId(null);
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+          </svg>
+          Delete
+        </button>
+      </div>
+    );
+  };
+
+  // One chat row — identical in look and behavior to before, now rendered
+  // inside the opened workspace's list instead of an inline group expansion.
+  const renderChatRow = (c: ChatSummary, gKey: string) => {
+    const isPinnedChat = pinnedChats.includes(c.id);
+    // "Live" (agent working) comes precomputed from the summary
+    // subscription — no message scan per row per render.
+    const hasStreaming = c.hasStreaming;
+    const hasUnread =
+      !hasStreaming &&
+      c.id !== activeChatId &&
+      unreadChats.includes(c.id);
+    return (
+      <div
+        key={c.id}
+        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === gKey ? " selecting" : ""}`}
+        draggable
+        onDragStart={(e) => {
+          try {
+            e.dataTransfer.setData("application/x-coder-chat-id", c.id);
+          } catch {
+            /* drag unsupported */
+          }
+          try {
+            e.dataTransfer.setData("text/plain", c.id);
+          } catch {
+            /* drag unsupported */
+          }
+          e.dataTransfer.effectAllowed = "move";
+        }}
+        onClick={() => useStore.getState().openChat(c.id)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setChatMenuId(c.id);
+          setChatMenuPos({
+            top: menuTop(e.clientY, 120, window.innerHeight),
+            left: menuLeft(e.clientX, 150, window.innerWidth),
+          });
+        }}
+        title={prepareContent(titleOf(c), dir)}
+      >
+        {selectingWsKey === gKey && (
+          <div className="chat-item-select-wrap">
+            <input
+              type="checkbox"
+              className="chat-select-checkbox"
+              checked={selectedChats.has(c.id)}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => toggleChatSelected(c.id)}
+              title="Select this chat"
+            />
+          </div>
+        )}
+        {renamingId === c.id ? (
+          <input
+            className="chat-rename-input"
+            dir={dir}
+            autoFocus
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onBlur={commitRename}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRename();
+              else if (e.key === "Escape") setRenamingId(null);
+            }}
+            onClick={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <span className="chat-item-title-row" dir={dir}>
+            <span
+              className="chat-item-title"
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                startRename(c);
+              }}
+            >
+              {prepareContent(titleOf(c), dir)}
+            </span>
+            {hasStreaming && (
+              <span
+                className="chat-item-streaming"
+                title="Agent is working in this chat"
+              />
+            )}
+            {hasUnread && (
+              <span
+                className="chat-item-unread"
+                title="New message from the agent — click to view"
+              />
+            )}
+            {c.pendingPermission && (
+              <span
+                className="chat-item-pending permission"
+                title={`Needs permission: ${c.pendingPermission.action}${c.pendingPermission.path ? ` · ${c.pendingPermission.path}` : ""}`}
+              >
+                <svg
+                  width="10"
+                  height="10"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                </svg>
+              </span>
+            )}
+            {c.pendingAsk && (
+              <span
+                className="chat-item-pending ask"
+                title={`Asks you: ${c.pendingAsk.question}`}
+              >
+                <svg
+                  width="10"
+                  height="10"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
+                  <path d="M12 17h.01" />
+                </svg>
+              </span>
+            )}
+            <span
+              className="chat-item-time"
+              title={fmtClockFull(c.updatedAt)}
+            >
+              <span dir="ltr">{fmtAgo(c.updatedAt, nowTick)}</span>
+            </span>
+          </span>
+        )}
+        {chatMenuId === c.id && chatMenuPos && renderChatMenu(c, chatMenuPos)}
+      </div>
+    );
   };
 
   return (
@@ -591,7 +1193,7 @@ function SidebarContent({
             ref={searchInputRef}
             className="sidebar-search-input"
             type="text"
-            placeholder="Search chats…"
+            placeholder={openGroup ? "Search chats…" : "Search projects…"}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             onKeyDown={(e) => {
@@ -641,639 +1243,254 @@ function SidebarContent({
         </div>
       </div>
 
-      <div className="sidebar-list">
-        {colorOpen !== null && (
-          <div className="color-backdrop" onClick={() => setColorOpen(null)} />
-        )}
-        {chats.length === 0 && (
-          <div className="sidebar-empty">No conversations yet</div>
-        )}
-        {searching && chats.length > 0 && visibleGroups.length === 0 && (
-          <div className="sidebar-empty">No chats match “{search.trim()}”</div>
-        )}
-        {searching && visibleGroups.length > 0 && (
-          <div className="sidebar-result-count">
-            {visibleGroups.reduce((n, g) => n + g.chats.length, 0)} chats found
-          </div>
-        )}
-        {visibleGroups.map((g) => {
-          const isCollapsed = collapsed.has(g.key) && !searching;
-          const color = workspaceColors[g.key] || "var(--accent)";
-          const isPinned = pinnedWorkspaces.includes(g.key);
-          const selectedInGroup = g.chats.filter((c) =>
-            selectedChats.has(c.id),
-          ).length;
-          return (
+      {openGroup ? (
+        /* ---------------------------------------------------------------
+         * Opened workspace: back header + that workspace's chat list.
+         * --------------------------------------------------------------- */
+        <div className="sidebar-list">
+          {colorOpen !== null && (
+            <div className="color-backdrop" onClick={() => setColorOpen(null)} />
+          )}
+          <div
+            className="sidebar-group sidebar-ws-open ws-colored"
+            style={{ "--ws": workspaceColors[openGroup.key] || "var(--accent)" } as React.CSSProperties}
+          >
             <div
-              key={g.key}
-              className={`sidebar-group${isPinned ? " pinned" : ""} ws-colored${dragKey === g.key ? " dragging" : ""}${dragOverKey === g.key && dragKey && dragKey !== g.key ? " drop-target" : ""}`}
-              style={{ "--ws": color } as React.CSSProperties}
-              draggable
-              onDragStart={(e) => onDragStart(e, g.key)}
-              onDragOver={(e) => onDragOver(e, g.key)}
-              onDrop={(e) => onDrop(e, g.key)}
-              onDragEnd={onDragEnd}
+              className="sidebar-group-head sidebar-ws-head"
+              onContextMenu={(e) => {
+                // The kebab is gone — right-clicking the folder header opens
+                // its menu (Rename / Color / Change folder… / Select chats).
+                e.preventDefault();
+                setWsMenuOpenKey(openGroup.key);
+                setWsMenuPos({
+                  top: menuTop(e.clientY, 150, window.innerHeight),
+                  left: menuLeft(e.clientX, 168, window.innerWidth),
+                });
+              }}
             >
-              <div className="sidebar-group-head">
-                <button
-                  className="sidebar-group-toggle"
-                  onClick={() => toggleGroup(g.key)}
-                  title={g.root || g.label}
+              <button
+                className="sidebar-ws-back"
+                title="Back to projects"
+                aria-label="Back to projects"
+                onClick={closeWorkspace}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
                 >
-                  <svg
-                    className={`sidebar-group-icon${isCollapsed ? " collapsed" : ""}`}
-                    style={{ color }}
-                    width="17"
-                    height="17"
-                    viewBox="0 0 24 24"
-                    fill={isCollapsed ? "currentColor" : "none"}
-                    stroke="currentColor"
-                    strokeWidth={isCollapsed ? 0 : 1.9}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    {isCollapsed ? (
-                      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
-                    ) : (
-                      <>
-                        <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
-                        <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
-                      </>
-                    )}
-                  </svg>
-                  {renamingWsKey === g.key ? (
-                    <input
-                      className="ws-rename-input"
-                      autoFocus
-                      value={wsRenameValue}
-                      onChange={(e) => setWsRenameValue(e.target.value)}
-                      onBlur={commitWsRename}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") commitWsRename();
-                        else if (e.key === "Escape") {
-                          setRenamingWsKey(null);
-                          setWsRenameValue("");
-                        }
-                      }}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  ) : (
-                    <span className="sidebar-group-label">{g.label}</span>
-                  )}
-                </button>
-                <div className="sidebar-group-actions">
-                  <button
-                    className="sidebar-group-btn"
-                    title="New chat in this workspace"
-                    aria-label="New chat in this workspace"
-                    style={selectingWsKey === g.key ? { display: "none" } : undefined}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      useStore.getState().newChatInRoot(g.root ?? g.key);
+                  <path d="M15 18l-6-6 6-6" />
+                </svg>
+              </button>
+              <button
+                className="sidebar-group-toggle"
+                onClick={closeWorkspace}
+                title={openGroup.root || openGroup.label}
+              >
+                <svg
+                  className="sidebar-group-icon"
+                  style={{ color: workspaceColors[openGroup.key] || "var(--accent)" }}
+                  width="17"
+                  height="17"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  stroke="none"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                </svg>
+                {renamingWsKey === openGroup.key ? (
+                  <input
+                    className="ws-rename-input"
+                    autoFocus
+                    value={wsRenameValue}
+                    onChange={(e) => setWsRenameValue(e.target.value)}
+                    onBlur={commitWsRename}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitWsRename();
+                      else if (e.key === "Escape") {
+                        setRenamingWsKey(null);
+                        setWsRenameValue("");
+                      }
                     }}
-                  >
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                    >
-                      <path d="M12 5v14M5 12h14" />
-                    </svg>
-                  </button>
-                  <div className="ws-menu-wrap" style={selectingWsKey === g.key ? { display: "none" } : undefined}>
-                    <button
-                      className="sidebar-group-btn"
-                      title="Workspace options"
-                      aria-label="Workspace options"
-                      aria-expanded={wsMenuOpenKey === g.key}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const next = wsMenuOpenKey === g.key ? null : g.key;
-                        setWsMenuOpenKey(next);
-                        if (next) {
-                          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                          setWsMenuPos({ top: r.bottom + 6, left: r.right - 168 });
-                        } else {
-                          setWsMenuPos(null);
-                        }
-                      }}
-                    >
-                      <svg
-                        width="16"
-                        height="16"
-                        viewBox="0 0 24 24"
-                        fill="currentColor"
-                      >
-                        <circle cx="12" cy="5" r="1.6" />
-                        <circle cx="12" cy="12" r="1.6" />
-                        <circle cx="12" cy="19" r="1.6" />
-                      </svg>
-                    </button>
-                    {wsMenuOpenKey === g.key && wsMenuPos && (
-                      <div
-                        className="ws-menu"
-                        role="menu"
-                        style={{
-                          position: "fixed",
-                          top: wsMenuPos.top,
-                          left: wsMenuPos.left,
-                        }}
-                        onMouseDown={(e) => e.stopPropagation()}
-                      >
-                        <button
-                          className={`ws-menu-btn${isPinned ? " active" : ""}`}
-                          role="menuitem"
-                          onClick={() => {
-                            useStore.getState().togglePinWorkspace(g.key);
-                            setWsMenuOpenKey(null);
-                          }}
-                        >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
-                          </svg>
-                          {isPinned ? "Unpin" : "Pin to top"}
-                        </button>
-                        <button
-                          className="ws-menu-btn"
-                          role="menuitem"
-                          onClick={() => {
-                            setRenamingWsKey(g.key);
-                            setWsRenameValue(g.label);
-                            setWsMenuOpenKey(null);
-                          }}
-                        >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                          </svg>
-                          Rename
-                        </button>
-                        <button
-                          className="ws-menu-btn"
-                          role="menuitem"
-                          onClick={() => {
-                            setColorOpen(colorOpen === g.key ? null : g.key);
-                            setWsMenuOpenKey(null);
-                          }}
-                        >
-                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                            <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" />
-                            <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" />
-                            <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" />
-                            <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" />
-                            <path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.2 0-1 .8-1.7 1.7-1.7H17a3 3 0 0 0 3-3c0-4.4-4-8-8-8z" />
-                          </svg>
-                          Color
-                        </button>
-                        <button
-                          className="ws-menu-btn"
-                          role="menuitem"
-                          title={g.root || "No folder set"}
-                          onClick={() => {
-                            setWsMenuOpenKey(null);
-                            void api.selectFolder().then((dir) => {
-                              if (dir) useStore.getState().moveWorkspace(g.key, dir);
-                            });
-                          }}
-                        >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
-                            <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
-                          </svg>
-                          Change folder…
-                        </button>
-                        <button
-                          className="ws-menu-btn danger"
-                          role="menuitem"
-                          onClick={(e) => {
-                            const btn = (e.currentTarget as HTMLElement)
-                              .closest(".ws-menu-wrap")
-                              ?.querySelector(".sidebar-group-btn") as HTMLElement | null;
-                            const r = (btn ?? e.currentTarget).getBoundingClientRect();
-                            setDeleteMenuPos({ top: r.bottom + 6, left: r.right - 180 });
-                            setDeleteMenuKey(g.key);
-                            setWsMenuOpenKey(null);
-                          }}
-                        >
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
-                          </svg>
-                          Delete
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {colorOpen === g.key && (
-                  <div
-                    className="color-popover"
                     onClick={(e) => e.stopPropagation()}
-                  >
-                    {themeById(theme).workspaceColors.map((c2) => (
-                      <button
-                        key={c2}
-                        className="color-swatch"
-                        style={{ background: c2 }}
-                        onClick={() => {
-                          useStore.getState().setWorkspaceColor(g.key, c2);
-                          setColorOpen(null);
-                        }}
-                      />
-                    ))}
-                    <button
-                      className="color-none"
-                      title="Remove color"
-                      onClick={() => {
-                        useStore.getState().setWorkspaceColor(g.key, "");
-                        setColorOpen(null);
-                      }}
-                    >
-                      ✕
-                    </button>
-                  </div>
+                  />
+                ) : (
+                  <span className="sidebar-group-label">{openGroup.label}</span>
                 )}
-                {deleteMenuKey === g.key && deleteMenuPos && (
-                  <div
-                    className="ws-delete-menu-wrap"
-                    style={{
-                      position: "fixed",
-                      top: deleteMenuPos.top,
-                      left: deleteMenuPos.left,
-                    }}
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <div
-                      className="ws-delete-menu"
-                      role="menu"
-                      onMouseDown={(e) => e.stopPropagation()}
-                    >
-                      <div className="ws-delete-menu-title">Delete…</div>
-                      <button
-                        className="ws-delete-menu-btn danger"
-                        role="menuitem"
-                        onClick={() => {
-                          useStore.getState().deleteWorkspace(g.key);
-                          setDeleteMenuKey(null);
-                        }}
-                      >
-                        Delete workspace
-                        <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
-                          ({g.chats.length})
-                        </span>
-                      </button>
-                      <button
-                        className="ws-delete-menu-btn"
-                        role="menuitem"
-                        onClick={() => {
-                          setSelectingWsKey(g.key);
-                          setDeleteMenuKey(null);
-                        }}
-                      >
-                        Delete chats
-                        <span style={{ opacity: 0.7, marginInlineStart: "auto", fontSize: 11 }}>
-                          ({g.chats.length})
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {selectingWsKey === g.key && (
-                  <div className="group-bulk-actions">
-                    <button
-                      className="group-select-all"
-                      title={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all" : "Select all"}
-                      aria-label={selectedInGroup === g.chats.length && g.chats.length > 0 ? "Deselect all chats" : "Select all chats"}
-                      aria-pressed={g.chats.length > 0 && selectedInGroup === g.chats.length}
-                      onClick={() => {
-                        setSelectedChats((prev) =>
-                          toggleGroupSelection(
-                            prev,
-                            g.chats.map((c) => c.id),
-                          ),
-                        );
-                      }}
-                    >
-                      <svg
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        {g.chats.length > 0 && selectedInGroup === g.chats.length ? (
-                          <path d="M9 11l3 3L22 4" />
-                        ) : null}
-                        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-                      </svg>
-                    </button>
-                    <button
-                      className="group-delete-selected"
-                      title={`Delete ${selectedInGroup} selected conversation(s)`}
-                      onClick={() => {
-                        const ids = g.chats
-                          .map((c) => c.id)
-                          .filter((id) => selectedChats.has(id));
-                        if (ids.length === 0) return;
-                        ids.forEach((id) =>
-                          useStore.getState().deleteChat(id),
-                        );
-                        setSelectedChats((prev) => {
-                          const next = new Set(prev);
-                          ids.forEach((id) => next.delete(id));
-                          return next;
-                        });
-                        setSelectingWsKey(null);
-                      }}
-                    >
-                      <svg
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-                      </svg>
-                      {selectedInGroup}
-                    </button>
-                    <button
-                      className="group-cancel-select"
-                      title="Cancel selection"
-                      aria-label="Cancel selection"
-                      onClick={() => {
-                        setSelectingWsKey(null);
-                        clearSelected();
-                      }}
-                    >
-                      <svg
-                        width="12"
-                        height="12"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.4"
-                        strokeLinecap="round"
-                      >
-                        <path d="M6 6l12 12M18 6L6 18" />
-                      </svg>
-                    </button>
-                  </div>
-                )}
+                {renderBadges(openGroup)}
+              </button>
+              <div className="sidebar-group-actions">
+                {renderNewChatBtn(openGroup, selectingWsKey === openGroup.key)}
               </div>
-              {!isCollapsed && (
-                <div
-                  className="sidebar-group-chats"
-                  style={
-                    color
-                      ? ({ "--ws": color } as React.CSSProperties)
-                      : undefined
-                  }
-                >
-                  {g.chats.map((c) => {
-                    const isPinnedChat = pinnedChats.includes(c.id);
-                    // "Live" (agent working) comes precomputed from the summary
-                    // subscription — no message scan per row per render.
-                    const hasStreaming = c.hasStreaming;
-                    const hasUnread =
-                      !hasStreaming &&
-                      c.id !== activeChatId &&
-                      unreadChats.includes(c.id);
-                    return (
-                      <div
-                        key={c.id}
-                        className={`chat-item ${c.id === activeChatId ? "active" : ""}${isPinnedChat ? " pinned" : ""}${hasUnread ? " unread" : ""}${selectedChats.has(c.id) ? " selected" : ""}${selectingWsKey === g.key ? " selecting" : ""}`}
-                        draggable
-                        onDragStart={(e) => {
-                          try {
-                            e.dataTransfer.setData("application/x-coder-chat-id", c.id);
-                          } catch {
-                            /* drag unsupported */
-                          }
-                          try {
-                            e.dataTransfer.setData("text/plain", c.id);
-                          } catch {
-                            /* drag unsupported */
-                          }
-                          e.dataTransfer.effectAllowed = "move";
-                        }}
-                        onClick={() => useStore.getState().openChat(c.id)}
-                        title={prepareContent(titleOf(c), dir)}
-                      >
-                        {selectingWsKey === g.key ? (
-                          <div className="chat-item-select-wrap">
-                            <input
-                              type="checkbox"
-                              className="chat-select-checkbox"
-                              checked={selectedChats.has(c.id)}
-                              onClick={(e) => e.stopPropagation()}
-                              onChange={() => toggleChatSelected(c.id)}
-                              title="Select this chat"
-                            />
-                          </div>
-                        ) : (
-                          <div
-                            className={`chat-item-kebab-wrap${menuOpenId === c.id ? " open" : ""}`}
-                          >
-                          <button
-                            className="chat-item-kebab"
-                            title="Chat actions"
-                            aria-label="Chat actions"
-                            aria-expanded={menuOpenId === c.id}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setMenuOpenId(menuOpenId === c.id ? null : c.id);
-                            }}
-                          >
-                            <svg
-                              width="14"
-                              height="14"
-                              viewBox="0 0 24 24"
-                              fill="currentColor"
-                            >
-                              <circle cx="12" cy="5" r="1.6" />
-                              <circle cx="12" cy="12" r="1.6" />
-                              <circle cx="12" cy="19" r="1.6" />
-                            </svg>
-                          </button>
-                          <div
-                            className={`chat-item-menu${menuOpenId === c.id ? " open" : ""}`}
-                            role="menu"
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <button
-                              className={`chat-item-menu-btn${isPinnedChat ? " active" : ""}`}
-                              role="menuitem"
-                              onClick={() => {
-                                useStore.getState().togglePinChat(c.id);
-                                setMenuOpenId(null);
-                              }}
-                            >
-                              <svg
-                                width="13"
-                                height="13"
-                                viewBox="0 0 24 24"
-                                fill={isPinnedChat ? "currentColor" : "none"}
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
-                              </svg>
-                              {isPinnedChat ? "Unpin" : "Pin to top"}
-                            </button>
-                            <button
-                              className="chat-item-menu-btn"
-                              role="menuitem"
-                              onClick={() => {
-                                startRename(c);
-                                setMenuOpenId(null);
-                              }}
-                            >
-                              <svg
-                                width="13"
-                                height="13"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                              </svg>
-                              Rename
-                            </button>
-                            <button
-                              className="chat-item-menu-btn danger"
-                              role="menuitem"
-                              onClick={() => {
-                                useStore.getState().deleteChat(c.id);
-                                setMenuOpenId(null);
-                              }}
-                            >
-                              <svg
-                                width="13"
-                                height="13"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2.2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                              >
-                                <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
-                              </svg>
-                              Delete
-                            </button>
-                          </div>
-                        </div>
-                        )}
-                        {renamingId === c.id ? (
-                          <input
-                            className="chat-rename-input"
-                            dir={dir}
-                            autoFocus
-                            value={renameValue}
-                            onChange={(e) => setRenameValue(e.target.value)}
-                            onBlur={commitRename}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") commitRename();
-                              else if (e.key === "Escape") setRenamingId(null);
-                            }}
-                            onClick={(e) => e.stopPropagation()}
-                          />
-                        ) : (
-                          <span className="chat-item-title-row" dir={dir}>
-                            <span
-                              className="chat-item-title"
-                              onDoubleClick={(e) => {
-                                e.stopPropagation();
-                                startRename(c);
-                              }}
-                            >
-                              {prepareContent(titleOf(c), dir)}
-                            </span>
-                            {hasStreaming && (
-                              <span
-                                className="chat-item-streaming"
-                                title="Agent is working in this chat"
-                              />
-                            )}
-                            {hasUnread && (
-                              <span
-                                className="chat-item-unread"
-                                title="New message from the agent — click to view"
-                              />
-                            )}
-                            {c.pendingPermission && (
-                              <span
-                                className="chat-item-pending permission"
-                                title={`Needs permission: ${c.pendingPermission.action}${c.pendingPermission.path ? ` · ${c.pendingPermission.path}` : ""}`}
-                              >
-                                <svg
-                                  width="10"
-                                  height="10"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2.4"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                >
-                                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                                </svg>
-                              </span>
-                            )}
-                            {c.pendingAsk && (
-                              <span
-                                className="chat-item-pending ask"
-                                title={`Asks you: ${c.pendingAsk.question}`}
-                              >
-                                <svg
-                                  width="10"
-                                  height="10"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2.6"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                >
-                                  <circle cx="12" cy="12" r="10" />
-                                  <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
-                                  <path d="M12 17h.01" />
-                                </svg>
-                              </span>
-                            )}
-                            <span
-                              className="chat-item-time"
-                              title={fmtClockFull(c.updatedAt)}
-                            >
-                              <span dir="ltr">{fmtAgo(c.updatedAt, nowTick)}</span>
-                            </span>
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
+              {selectingWsKey === openGroup.key && renderBulkBar(openGroup)}
+              {wsMenuOpenKey === openGroup.key && wsMenuPos && renderWsMenu(openGroup, "header", wsMenuPos)}
+              {colorOpen === openGroup.key && renderColorPopover(openGroup)}
+            </div>
+            <div
+              className="sidebar-group-chats"
+              style={
+                workspaceColors[openGroup.key]
+                  ? ({ "--ws": workspaceColors[openGroup.key] } as React.CSSProperties)
+                  : undefined
+              }
+            >
+              {openChats.map((c) => renderChatRow(c, openGroup.key))}
+              {openChats.length === 0 && (
+                <div className="sidebar-empty">
+                  {searching
+                    ? `No chats match “${search.trim()}”`
+                    : "No chats in this project yet"}
                 </div>
               )}
             </div>
-          );
-        })}
-      </div>
+          </div>
+          {searching && openChats.length > 0 && (
+            <div className="sidebar-result-count">
+              {openChats.length} chats found
+            </div>
+          )}
+        </div>
+      ) : (
+        /* ---------------------------------------------------------------
+         * Projects list: ONE flat list of folder rows, no collapse. Click
+         * a row to drill into its chats; drag rows to reorder (slide
+         * preview, exactly like the chat tab bar).
+         * --------------------------------------------------------------- */
+        <div
+          ref={listRef}
+          className="sidebar-list"
+          onDragOver={onListDragOver}
+          onDrop={onListDrop}
+          onDragLeave={onListDragLeave}
+        >
+          {colorOpen !== null && (
+            <div className="color-backdrop" onClick={() => setColorOpen(null)} />
+          )}
+          {visibleFolders.length === 0 && (
+            <div className="sidebar-empty">
+              {searching
+                ? `No projects match “${search.trim()}”`
+                : "No projects yet"}
+            </div>
+          )}
+          {visibleFolders.map((g) => {
+            const color = workspaceColors[g.key] || "var(--accent)";
+            const isPinned = pinnedWorkspaces.includes(g.key);
+            const shift = shifts?.get(g.key) ?? 0;
+            return (
+              <div
+                key={g.key}
+                data-ws-id={g.key}
+                className={`sidebar-group sidebar-folder${dragKey === g.key ? " dragging" : ""}`}
+                style={
+                  {
+                    "--ws": color,
+                    transform:
+                      shift !== 0 && slot > 0
+                        ? `translateY(${shift * slot}px)`
+                        : undefined,
+                  } as React.CSSProperties
+                }
+                draggable
+                onDragStart={(e) => onFolderDragStart(e, g.key)}
+                onDragEnd={clearDrag}
+                onKeyDown={(e) => {
+                  // Alt+Arrow moves the focused folder without dragging.
+                  const target = tabMove(folderKeys, g.key, e.key, e.altKey, "y");
+                  if (!target) return;
+                  e.preventDefault();
+                  useStore
+                    .getState()
+                    .setWorkspaceOrder(
+                      previewOrder(folderKeys, g.key, target.toId, target.after),
+                    );
+                }}
+                onContextMenu={(e) => {
+                  // Row actions live here (right-click), not on the row:
+                  // Delete workspace belongs on the projects list, while the
+                  // row itself stays a plain click-into-the-folder target.
+                  e.preventDefault();
+                  setWsMenuOpenKey(g.key);
+                  setWsMenuPos({
+                    top: menuTop(e.clientY, 226, window.innerHeight),
+                    left: menuLeft(e.clientX, 168, window.innerWidth),
+                  });
+                }}
+              >
+                <div className="sidebar-group-head">
+                  <button
+                    className="sidebar-group-toggle"
+                    onClick={() => openWorkspace(g.key)}
+                    title={g.root || g.label}
+                  >
+                    <svg
+                      className="sidebar-group-icon"
+                      style={{ color }}
+                      width="17"
+                      height="17"
+                      viewBox="0 0 24 24"
+                      fill="currentColor"
+                      stroke="none"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                    </svg>
+                    {renamingWsKey === g.key ? (
+                      <input
+                        className="ws-rename-input"
+                        autoFocus
+                        value={wsRenameValue}
+                        onChange={(e) => setWsRenameValue(e.target.value)}
+                        onBlur={commitWsRename}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitWsRename();
+                          else if (e.key === "Escape") {
+                            setRenamingWsKey(null);
+                            setWsRenameValue("");
+                          }
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    ) : (
+                      <span className="sidebar-group-label">{g.label}</span>
+                    )}
+                    {isPinned && (
+                      <svg
+                        className="sidebar-folder-pin"
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-label="Pinned"
+                      >
+                        <path d="M12 17v5M5 7h14M7 7l1-4h8l1 4M8 7v4l-2 3h12l-2-3V7" />
+                      </svg>
+                    )}
+                    {renderBadges(g)}
+                  </button>
+                  <div className="sidebar-group-actions">
+                    {renderNewChatBtn(g)}
+                  </div>
+                  {wsMenuOpenKey === g.key && wsMenuPos && renderWsMenu(g, "row", wsMenuPos)}
+                  {colorOpen === g.key && renderColorPopover(g)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
     </div>
   );

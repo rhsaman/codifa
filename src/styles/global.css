@@ -21396,6 +21396,17 @@ mark.diff-hit-active {
   flex-direction: column;
   gap: 12px;
   background: var(--bg-alt);
+  /* نوار اسکرول همیشه سمت راست بماند (مثل بقیهٔ پنل‌ها) حتی وقتی اینباکس
+     راست‌به‌چپ است: اسکرولر LTR می‌شود — چیدمان ستونی عوض نمی‌شود، فقط سمت
+     نوار عوض می‌شود. در حالت RTL محتوا با قاعدهٔ بعدی دوباره RTL می‌شود. */
+  direction: ltr;
+}
+
+/* بازگرداندن جهت محتوا فقط در اینباکس راست‌به‌چپ — در حالت LTR فرزندان، ltr
+   ارث می‌برند (رفتار قبلی). */
+.schedule-inbox-overlay[dir="rtl"] .schedule-inbox-chat > *,
+.schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-chat > * {
+  direction: rtl;
 }
 
 .schedule-inbox-chat-head {
@@ -24123,6 +24134,14 @@ mark.trace-hit-active {
   .viewer-inbox-wrap .schedule-inbox-body {
     flex-direction: column;
     overflow-y: auto;
+    /* در حالت ستونی، اسکرولر کل صفحه همین‌جاست — نوارش هم سمت راست بماند
+       (چیدمان column با direction عوض نمی‌شود). */
+    direction: ltr;
+  }
+
+  .viewer-inbox-wrap .schedule-inbox-overlay[dir="rtl"] .schedule-inbox-body > *,
+  .viewer-inbox-wrap .schedule-inbox-overlay[data-dir="rtl"] .schedule-inbox-body > * {
+    direction: rtl;
   }
 
   .viewer-inbox-wrap .schedule-inbox-list {

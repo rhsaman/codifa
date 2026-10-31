@@ -60,6 +60,21 @@ function InboxMarkdown({ text }: { text: string }) {
   );
 }
 
+/** اتصال کلیدهای vim به اینباکس — کامپوننت جدا تا هوک دقیقاً همزمان با mount
+ *  شدن محتوا نصب شود: useVimScroll با deps خالی فقط یک بار refها را می‌خواند و
+ *  اگر اینباکس با open=false mount شود (بازیابی تب هنگام بوت)، refها null
+ *  می‌مانند و هوک برای همیشه از کار می‌افتد. */
+function InboxVimScroll({
+  inboxRef,
+  chatRef,
+}: {
+  inboxRef: React.RefObject<HTMLDivElement | null>;
+  chatRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  useVimScroll(chatRef, inboxRef);
+  return null;
+}
+
 /** کارت یک اجرا در Inbox — چت‌مانند: هدر خنثی + بدنه مارکداون با فونت چت. */
 function InboxRunCard({ run }: { run: ScheduleRun }) {
   const tokens = scheduleRunTokens(run);
@@ -118,10 +133,10 @@ export function ScheduleInbox() {
   const [promptOpen, setPromptOpen] = useState(false);
 
   // j/k/h/l مثل بقیهٔ پنل‌ها: ناحیهٔ ownership کل دیالوگ اینباکس است ولی
-  // اسکرولر هدف ستون پیام‌هاست — پیام‌ها مهم‌تر از لیست تسک‌اند.
+  // اسکرولر هدف ستون پیام‌هاست — پیام‌ها مهم‌تر از لیست تسک‌اند. اتصال داخل
+  // InboxVimScroll انجام می‌شود (بالا) تا با mount واقعی محتوا همگام باشد.
   const inboxRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
-  useVimScroll(chatScrollRef, inboxRef);
 
   // باز شدن اینباکس کلیدها را همین‌جا می‌گیرد (مثل پاپ‌آپ گیت‌دیف): فوکوس روی
   // ریشه + علامت‌گذاری ناحیهٔ vim، تا j/k بدون کلیک داخل پنل کار کند. بستن،
@@ -322,6 +337,7 @@ export function ScheduleInbox() {
 
   return (
     <div className="schedule-inbox-overlay" dir={dir}>
+      <InboxVimScroll inboxRef={inboxRef} chatRef={chatScrollRef} />
       <div className="schedule-inbox-backdrop" onClick={() => setOpen(false)} />
       <div
         ref={inboxRef}

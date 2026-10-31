@@ -2854,7 +2854,10 @@ export const useStore = create<State>((set, get) => ({
     const id = `custom-${Date.now().toString(36)}`
     const provider: ProviderConfig = {
       id,
-      name: 'New provider',
+      // Nameless on purpose: the Settings form's Name input must open EMPTY.
+      // UI labels fall back via providerDisplayName() until the user names it;
+      // a Save (or the next load's normalizeProvider) backfills the kind name.
+      name: '',
       kind: 'custom',
       apiKeys: [],
       baseUrl: '',

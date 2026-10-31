@@ -26,7 +26,7 @@ import { fetchAndPersist } from '../lib/provider-fetch'
 import { invalidateAvailableSkills, invalidateSkillsList, forgetPluginCommands } from '../lib/skills'
 import { api } from '../lib/fs'
 import { allModes } from '../lib/modes'
-import { PROVIDER_META, accountScopedBaseUrl, isAccountScoped, providerMeta } from '../lib/provider-meta'
+import { PROVIDER_META, accountScopedBaseUrl, isAccountScoped, providerDisplayName, providerMeta } from '../lib/provider-meta'
 import { ModeIcon } from './ModeIcon'
 import { THEMES } from '../lib/themes'
 import {
@@ -1499,9 +1499,7 @@ function MediaProviderSelect({
         .filter((p) => p.kind !== 'ollama')
         .map((p) => (
           <option key={p.id} value={p.id}>
-            {p.name
-              ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})`
-              : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+            {`${providerDisplayName(p)} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})`}
           </option>
         ))}
     </select>
@@ -2561,7 +2559,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
     const p = providers.find((x) => x.id === id)
     if (!p) return
     if (providers.length <= 1) return
-    if (window.confirm(`Remove provider “${p.name}”? Its models will be deleted too.`)) {
+    if (window.confirm(`Remove provider “${providerDisplayName(p)}”? Its models will be deleted too.`)) {
       removeProvider(id)
       if (editId === id) {
         const rest = providers.filter((x) => x.id !== id)
@@ -2779,7 +2777,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   className={`provider-tab-dot ${isProviderConfigured(p) ? 'ok' : 'off'}`}
                   title={isProviderConfigured(p) ? 'Configured' : 'Not configured'}
                 />
-                <span className="provider-tab-name">{p.name}</span>
+                <span className="provider-tab-name">{providerDisplayName(p)}</span>
                 {!BUILTIN_KINDS.includes(p.kind) && providers.length > 1 && (
                   <button
                     className="provider-tab-remove"

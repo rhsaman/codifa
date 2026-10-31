@@ -602,6 +602,31 @@ pub fn normalize_base(provider: &str, base_url: &str) -> String {
     base
 }
 
+/// Gemini's native root: the configured base with a trailing `/openai` (the
+/// OpenAI-compat suffix the old Google default carried) or `/v1beta` removed,
+/// so `{root}/v1beta/models/…` is the same URL whichever way the base was
+/// written. A path prefix in front of those suffixes (`https://proxy/gemini/v1beta`)
+/// survives, which is what lets the same code drive a Gemini-compatible gateway.
+pub fn gemini_native_root(base: &str) -> String {
+    let mut root = base.trim().trim_end_matches('/').to_string();
+    // `/openai` first: the legacy default ends in `/v1beta/openai`.
+    for suffix in ["/openai", "/v1beta"] {
+        if let Some(head) = root.strip_suffix(suffix) {
+            root = head.trim_end_matches('/').to_string();
+        }
+    }
+    root
+}
+
+/// Gemini's native API prefix — `{gemini_native_root}/v1beta` — which every
+/// native call (`:generateContent`, `:predictLongRunning`, operations) hangs
+/// off. Chat and the media tools must agree on it, so the saved base URL can
+/// stay the OpenAI-compat one (`…/v1beta/openai`) while both wire shapes still
+/// resolve to `…/v1beta/models/…`.
+pub fn gemini_native_api(base: &str) -> String {
+    format!("{}/v1beta", gemini_native_root(base))
+}
+
 /// Resolve the chat-completions endpoint + auth header style for a kind.
 /// Returns (url, header_name, header_value_prefix).
 fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, String) {

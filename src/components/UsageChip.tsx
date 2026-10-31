@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { providerDisplayName } from "../lib/provider-meta";
 import { useStore } from "../lib/store";
 import {
   formatTokens,
@@ -142,9 +143,10 @@ export function buildUsageView(
       }
       return acc;
     };
+    const prow = allProviders.find((p) => p.id === pid);
     return {
       providerId: pid,
-      name: allProviders.find((p) => p.id === pid)?.name ?? pid,
+      name: prow ? providerDisplayName(prow) : pid,
       entries,
       tokens,
       cached,

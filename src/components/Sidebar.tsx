@@ -396,19 +396,26 @@ function SidebarContent({
 
   // Right-click chat menu: opens at the cursor, closes on outside mousedown
   // or after an action. The row's left-click (open chat) never fires for
-  // right buttons, so no extra guarding is needed.
+  // right buttons, so no extra guarding is needed. `chatMenuMove` swaps the
+  // menu's content for the "Move to group" workspace list.
   const [chatMenuId, setChatMenuId] = useState<string | null>(null);
   const [chatMenuPos, setChatMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [chatMenuMove, setChatMenuMove] = useState(false);
+  const closeChatMenu = () => {
+    setChatMenuId(null);
+    setChatMenuMove(false);
+  };
   useEffect(() => {
     if (!chatMenuId) return;
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as Node | null;
       if (!(t instanceof Element) || !t.closest(".chat-menu")) {
-        setChatMenuId(null);
+        closeChatMenu();
       }
     };
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatMenuId]);
 
   // Workspace 3-dot / context menu and chat-selection mode. The old two-step
@@ -963,10 +970,46 @@ function SidebarContent({
     );
   };
 
-  // Right-click menu for a chat row (the ⋯ kebab is gone): pin, rename,
-  // delete — the actions the kebab used to hold, now at the cursor.
+  // Right-click menu for a chat row (the ⋯ kebab is gone): pin, rename, move
+  // to another workspace, delete — the actions the kebab used to hold, now at
+  // the cursor. "Move to group" swaps the menu's content for the workspace
+  // list instead of nesting a submenu.
   const renderChatMenu = (c: ChatSummary, pos: { top: number; left: number }) => {
     const isPinnedChat = pinnedChats.includes(c.id);
+    if (chatMenuMove) {
+      const currentKey = workspaceKey(c.root ?? "");
+      const targets = groups.filter((g) => g.key !== currentKey);
+      return (
+        <div
+          className="ws-menu chat-menu"
+          role="menu"
+          style={{ position: "fixed", top: pos.top, left: pos.left }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="ws-menu-title">Move to group</div>
+          {targets.length === 0 && (
+            <div className="ws-menu-title">No other projects</div>
+          )}
+          {targets.map((g) => (
+            <button
+              key={g.key}
+              className="ws-menu-btn"
+              role="menuitem"
+              onClick={() => {
+                useStore.getState().setChatRoot(c.id, g.root ?? "");
+                closeChatMenu();
+              }}
+            >
+              <span
+                className="ws-menu-dot"
+                style={{ background: workspaceColors[g.key] || "var(--accent)" }}
+              />
+              {g.label}
+            </button>
+          ))}
+        </div>
+      );
+    }
     return (
       <div
         className="ws-menu chat-menu"
@@ -979,7 +1022,7 @@ function SidebarContent({
           role="menuitem"
           onClick={() => {
             useStore.getState().togglePinChat(c.id);
-            setChatMenuId(null);
+            closeChatMenu();
           }}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill={isPinnedChat ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -992,7 +1035,7 @@ function SidebarContent({
           role="menuitem"
           onClick={() => {
             startRename(c);
-            setChatMenuId(null);
+            closeChatMenu();
           }}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1001,11 +1044,21 @@ function SidebarContent({
           Rename
         </button>
         <button
+          className="ws-menu-btn"
+          role="menuitem"
+          onClick={() => setChatMenuMove(true)}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+          </svg>
+          Move to group
+        </button>
+        <button
           className="ws-menu-btn danger"
           role="menuitem"
           onClick={() => {
             useStore.getState().deleteChat(c.id);
-            setChatMenuId(null);
+            closeChatMenu();
           }}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -1049,9 +1102,13 @@ function SidebarContent({
         onClick={() => useStore.getState().openChat(c.id)}
         onContextMenu={(e) => {
           e.preventDefault();
+          // WebKit grabs the word under the pointer on right-mousedown; clear
+          // it so the label never shows a stale selection behind the menu.
+          document.getSelection()?.removeAllRanges();
+          setChatMenuMove(false);
           setChatMenuId(c.id);
           setChatMenuPos({
-            top: menuTop(e.clientY, 120, window.innerHeight),
+            top: menuTop(e.clientY, 150, window.innerHeight),
             left: menuLeft(e.clientX, 150, window.innerWidth),
           });
         }}
@@ -1261,6 +1318,9 @@ function SidebarContent({
                 // The kebab is gone — right-clicking the folder header opens
                 // its menu (Rename / Color / Change folder… / Select chats).
                 e.preventDefault();
+                // WebKit grabs the word under the pointer on right-mousedown;
+                // clear it so the label never shows a stale selection.
+                document.getSelection()?.removeAllRanges();
                 setWsMenuOpenKey(openGroup.key);
                 setWsMenuPos({
                   top: menuTop(e.clientY, 150, window.innerHeight),
@@ -1292,22 +1352,27 @@ function SidebarContent({
                 onClick={closeWorkspace}
                 title={openGroup.root || openGroup.label}
               >
+                {/* Open-folder icon: this workspace is "entered", so the icon
+                    reads open — folder rows in the projects list stay closed. */}
                 <svg
                   className="sidebar-group-icon"
                   style={{ color: workspaceColors[openGroup.key] || "var(--accent)" }}
                   width="17"
                   height="17"
                   viewBox="0 0 24 24"
-                  fill="currentColor"
-                  stroke="none"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.9}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 >
                   <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.5l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" />
+                  <path d="M2 9a2 2 0 0 1 2-2h7.5l2 2H21a2 2 0 0 1 2 2v1H2Z" />
                 </svg>
                 {renamingWsKey === openGroup.key ? (
                   <input
                     className="ws-rename-input"
+                    dir={dir}
                     autoFocus
                     value={wsRenameValue}
                     onChange={(e) => setWsRenameValue(e.target.value)}
@@ -1322,7 +1387,7 @@ function SidebarContent({
                     onClick={(e) => e.stopPropagation()}
                   />
                 ) : (
-                  <span className="sidebar-group-label">{openGroup.label}</span>
+                  <span className="sidebar-group-label" dir={dir}>{openGroup.label}</span>
                 )}
                 {renderBadges(openGroup)}
               </button>
@@ -1333,14 +1398,7 @@ function SidebarContent({
               {wsMenuOpenKey === openGroup.key && wsMenuPos && renderWsMenu(openGroup, "header", wsMenuPos)}
               {colorOpen === openGroup.key && renderColorPopover(openGroup)}
             </div>
-            <div
-              className="sidebar-group-chats"
-              style={
-                workspaceColors[openGroup.key]
-                  ? ({ "--ws": workspaceColors[openGroup.key] } as React.CSSProperties)
-                  : undefined
-              }
-            >
+            <div className="sidebar-group-chats">
               {openChats.map((c) => renderChatRow(c, openGroup.key))}
               {openChats.length === 0 && (
                 <div className="sidebar-empty">
@@ -1417,6 +1475,9 @@ function SidebarContent({
                   // Delete workspace belongs on the projects list, while the
                   // row itself stays a plain click-into-the-folder target.
                   e.preventDefault();
+                  // WebKit grabs the word under the pointer on right-mousedown;
+                  // clear it so the label never shows a stale selection.
+                  document.getSelection()?.removeAllRanges();
                   setWsMenuOpenKey(g.key);
                   setWsMenuPos({
                     top: menuTop(e.clientY, 226, window.innerHeight),
@@ -1446,6 +1507,7 @@ function SidebarContent({
                     {renamingWsKey === g.key ? (
                       <input
                         className="ws-rename-input"
+                        dir={dir}
                         autoFocus
                         value={wsRenameValue}
                         onChange={(e) => setWsRenameValue(e.target.value)}
@@ -1460,7 +1522,7 @@ function SidebarContent({
                         onClick={(e) => e.stopPropagation()}
                       />
                     ) : (
-                      <span className="sidebar-group-label">{g.label}</span>
+                      <span className="sidebar-group-label" dir={dir}>{g.label}</span>
                     )}
                     {isPinned && (
                       <svg

@@ -31,6 +31,7 @@ import { resolveLocalMedia } from "../lib/mediaUrl";
 import { fallbackReason, humanizeError } from "../lib/errorText";
 import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
 import type { SpeakProviderOpts } from "../lib/api";
+import { providerDisplayName } from "../lib/provider-meta";
 import { lspStatusLabel, useStore } from "../lib/store";
 import { getMode } from "../lib/modes";
 import { splitSections } from "../lib/sections";
@@ -1269,7 +1270,8 @@ export function RetryBanner({
   // kind — several rows can share one kind and one model id.
   const providerName = useStore((s) => {
     if (!providerId) return "";
-    return s.settings.providers.find((p) => p.id === providerId)?.name || providerId;
+    const row = s.settings.providers.find((p) => p.id === providerId);
+    return row ? providerDisplayName(row) : providerId;
   });
   // Provider + the model id IN FULL (never shortened): `provider/model`.
   const fullModel = model ? `${providerName ? `${providerName}/` : ""}${model}` : "";

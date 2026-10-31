@@ -65,7 +65,7 @@ import {
   shouldRecoverContentStall,
   shouldShowWaitingForModel,
 } from "../lib/watchdog";
-import { PROVIDER_META } from "../lib/provider-meta";
+import { PROVIDER_META, providerDisplayName } from "../lib/provider-meta";
 import { bareModelId } from "../lib/provider-fetch";
 import { normalizeUsageModel } from "../lib/usage";
 import { otherSlotLevel, otherSlotModel, toolFallbackEntries } from "../lib/toolSlots";
@@ -572,7 +572,8 @@ function CompactBanner({ progress }: { progress: ChatCompactProgress | null }) {
   const providerName = useStore((s) => {
     const pid = progress?.providerId;
     if (!pid) return "";
-    return s.settings.providers.find((p) => p.id === pid)?.name || pid;
+    const row = s.settings.providers.find((p) => p.id === pid);
+    return row ? providerDisplayName(row) : pid;
   });
 
   if (!progress) {
@@ -10099,9 +10100,9 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
     <BalanceChip
       providerName={
         shownBal
-          ? shownBal.provider.name || shownBal.provider.id
+          ? providerDisplayName(shownBal.provider)
           : provider
-            ? provider.name || provider.id
+            ? providerDisplayName(provider)
             : null
       }
       amount={shownBal ? shownBal.amount : null}

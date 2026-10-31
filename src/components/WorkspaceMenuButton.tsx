@@ -1,17 +1,28 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { api } from "../lib/fs";
+import { useStore } from "../lib/store";
 import { useViewerTabs } from "../lib/viewerTabs";
+import { workspaceDisplayFor } from "../lib/chatWindowMeta";
 import { FinderIcon, FolderIcon, TerminalIcon, isMacOS } from "./MacAppIcons";
 
-/** Single titlebar control for the two workspace shortcuts: the collapsed
- *  pill shows the Finder badge (folder glyph off macOS) plus a chevron and
- *  opens a small menu with "reveal in file manager" and "open terminal".
- *  Replaces the previous pair of separate icon buttons. */
+/** The workspace pill in the app bar: folder icon + the CURRENT PROJECT NAME
+ *  + chevron, opening a small menu (change folder / reveal in file manager /
+ *  open terminal). Lives in the chat-column titlebar — never in the sidebar's
+ *  strip, whose fixed width used to squeeze the name away. The label lays out
+ *  at its own content width (capped, ellipsized) so the project name is always
+ *  readable, in both RTL and LTR. */
 export function WorkspaceMenuButton({ root }: { root?: string }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const mac = isMacOS();
+  const activeChatRoot = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
+  );
+  const workspaces = useStore((s) => s.workspaces);
+  const workspaceColors = useStore((s) => s.workspaceColors);
+  const ws = workspaceDisplayFor(activeChatRoot ?? root, workspaces, workspaceColors);
 
   useEffect(() => {
     if (!open) return;
@@ -37,7 +48,7 @@ export function WorkspaceMenuButton({ root }: { root?: string }) {
       return;
     }
     const r = wrapRef.current?.getBoundingClientRect();
-    if (r) setPos({ top: r.bottom + 6, left: r.right - 168 });
+    if (r) setPos({ top: r.bottom + 6, left: r.right - 190 });
     setOpen(true);
   };
 
@@ -47,17 +58,17 @@ export function WorkspaceMenuButton({ root }: { root?: string }) {
   };
 
   const reveal = () =>
-    root &&
-    void api.openWorkspaceFolder(root).then((res) => {
+    ws.root &&
+    void api.openWorkspaceFolder(ws.root).then((res) => {
       if (!res.ok) console.warn("[workspace] reveal failed:", res.error);
     });
   // In-app only: the terminal never leaves the app, so this opens a fresh
   // terminal tab in the right pane sitting at the workspace root.
   const terminal = () => {
-    if (!root) return;
+    if (!ws.root) return;
     const v = useViewerTabs.getState();
     v.setPaneOpen(true);
-    v.openTerminal({ cwd: root, fresh: true });
+    v.openTerminal({ cwd: ws.root, fresh: true });
   };
 
   return (
@@ -65,18 +76,15 @@ export function WorkspaceMenuButton({ root }: { root?: string }) {
       <button
         type="button"
         className="titlebar-icon-btn workspace-menu-btn"
-        aria-label="Workspace actions — reveal in file manager or open terminal"
-        title={
-          root
-            ? `${root} — reveal in ${mac ? "Finder" : "file manager"} / open terminal`
-            : "No workspace open — pick a folder first"
-        }
+        style={{ "--ws": ws.color } as CSSProperties}
+        aria-label="Workspace — change folder, reveal in file manager or open terminal"
+        title={ws.root ? `${ws.label} — ${ws.root}` : "No workspace open — pick a folder for this chat"}
         aria-haspopup="menu"
         aria-expanded={open}
-        disabled={!root}
         onClick={toggle}
       >
         {mac ? <FinderIcon /> : <FolderIcon />}
+        <span className="workspace-btn-label">{ws.root ? ws.label : "Open workspace"}</span>
         <svg
           width="10"
           height="10"
@@ -98,11 +106,23 @@ export function WorkspaceMenuButton({ root }: { root?: string }) {
           style={{ position: "fixed", top: pos.top, left: pos.left }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <button type="button" className="ws-menu-btn" role="menuitem" onClick={() => run(reveal)}>
+          <button
+            type="button"
+            className="ws-menu-btn"
+            role="menuitem"
+            disabled={!ws.root}
+            onClick={() => run(reveal)}
+          >
             {mac ? <FinderIcon /> : <FolderIcon />}
             {mac ? "Finder" : "File manager"}
           </button>
-          <button type="button" className="ws-menu-btn" role="menuitem" onClick={() => run(terminal)}>
+          <button
+            type="button"
+            className="ws-menu-btn"
+            role="menuitem"
+            disabled={!ws.root}
+            onClick={() => run(terminal)}
+          >
             <TerminalIcon />
             Terminal
           </button>

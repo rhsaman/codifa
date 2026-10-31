@@ -126,6 +126,18 @@ export function providerMeta(kind: ProviderKind | undefined | null): ProviderKin
   return PROVIDER_META[kind ?? 'custom'] ?? PROVIDER_META.custom
 }
 
+/** Display name for a provider row: the user's saved name, or the kind's
+ *  default label while the row is still unnamed. Freshly-added custom rows
+ *  start nameless (the Settings form's Name input must open EMPTY), so every
+ *  display site goes through this — nothing may render a blank label. */
+export function providerDisplayName(
+  p: { name?: string | null; kind?: ProviderKind | null } | undefined | null,
+): string {
+  const saved = typeof p?.name === 'string' ? p.name.trim() : ''
+  if (saved) return saved
+  return providerMeta(p?.kind).name || 'Custom API'
+}
+
 /** True when the kind's endpoint is account-scoped (Cloudflare): the row needs an
  *  account id before it has a usable base URL at all. */
 export function isAccountScoped(kind: ProviderKind | undefined | null): boolean {

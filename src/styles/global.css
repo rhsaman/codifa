@@ -519,6 +519,22 @@ body.coder-resizing .terminal-panel {
   user-select: text;
 }
 
+.sidebar-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 2px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Scrollbar on the outer (left) edge, away from the chat content: the bar
+     side follows the container direction, so rtl parks it left. Children are
+     reset to ltr below so rows lay out exactly as before — inner text keeps
+     its own dir attributes. scrollbar-gutter avoids a width jump when the
+     bar appears. */
+  direction: rtl;
+  scrollbar-gutter: stable;
+}
+
 .sidebar-list > * {
   direction: ltr;
 }
@@ -626,7 +642,7 @@ body.coder-resizing .terminal-panel {
   flex-direction: row;
   align-items: center;
   gap: 6px;
-  padding: 7px 8px 7px 13px;
+  padding: 7px 8px 7px 10px;
   border-radius: 12px;
   cursor: pointer;
   color: var(--text-dim);
@@ -643,30 +659,11 @@ body.coder-resizing .terminal-panel {
 }
 
 .chat-item.active {
-  /* Tinted with the theme's main accent color (--accent) so the current chat
-     reads as one cohesive highlighted card in the active theme — independent
-     of the workspace color, which stays on the group header dot. */
-  background: linear-gradient(to bottom,
-      color-mix(in srgb, var(--accent) 20%, var(--bg-alt)) 0%,
-      color-mix(in srgb, var(--accent) 9%, var(--bg-alt)) 100%);
+  /* Calm current-chat marker: just a soft accent tint. No gradient, no ring,
+     no glow, no left bar — the tint alone reads at a glance. */
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
   color: var(--text);
-  font-weight: 500;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 25%, transparent),
-    inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 3px 14px -6px color-mix(in srgb, var(--accent) 55%, transparent);
-}
-
-.chat-item.active::before {
-  content: "";
-  position: absolute;
-  left: 3px;
-  top: 18%;
-  bottom: 18%;
-  width: 3px;
-  border-radius: 3px;
-  background: var(--accent);
-  box-shadow: 0 0 8px 1px color-mix(in srgb, var(--accent) 50%, transparent);
+  font-weight: 600;
 }
 
 .chat-item-icon {
@@ -680,23 +677,24 @@ body.coder-resizing .terminal-panel {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-align: right;
-  direction: rtl;
-  font-size: 11px;
+  /* Direction follows the app bar's ltr/rtl toggle (dir on
+     .chat-item-title-row), NOT auto-detection: RTL mode aligns titles to the
+     right, LTR mode to the left. */
+  text-align: start;
+  font-size: 12px;
   font-weight: 500;
 }
 
 /* Row that keeps the streaming dot inline with the chat title instead of a
    full-width flex child below it (.chat-item is a column layout). The gap on
-   .chat-item keeps long titles from running under the ⋯ kebab button. */
+   .chat-item keeps long titles from colliding with the trailing badges.
+   dir comes from the store's direction toggle via the JSX dir attribute. */
 .chat-item-title-row {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
-  direction: rtl;
-  text-align: right;
   order: 1;
 }
 
@@ -948,6 +946,26 @@ body.coder-resizing .terminal-panel {
   animation: chat-menu-pop 0.12s ease-out;
 }
 
+/* Non-interactive header of a popup menu (e.g. the chat "Move to group"
+   list) — small, dim, never hover-highlighted. */
+.ws-menu-title {
+  padding: 3px 9px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-align: start;
+  cursor: default;
+}
+
+/* Colored workspace dot inside a menu item (the "Move to group" list) —
+   quick scannability by each project's color. */
+.ws-menu-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
 .ws-menu-btn {
   display: flex;
   align-items: center;
@@ -1012,9 +1030,6 @@ body.coder-resizing .terminal-panel {
   flex: 1 1 auto;
   min-width: 0;
   padding: 3px 7px 3px 7px;
-  /* Keep the typed text clear of the absolutely-positioned ⋯ kebab button
-     (same right padding as .chat-item-title-row), so it never runs under it. */
-  padding-right: 28px;
   border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
   border-radius: 8px;
   background: color-mix(in srgb, var(--accent) 9%, var(--bg-panel));
@@ -1067,29 +1082,18 @@ body.coder-resizing .terminal-panel {
   display: flex;
   align-items: center;
   width: 100%;
+  /* Keep breathing room between the row content (title, badges — e.g. the
+     streaming dot) and the trailing action buttons. */
+  gap: 8px;
   padding: 6px 6px 6px 10px;
   border-radius: 10px;
   background: transparent;
   transition: background 0.12s, color 0.12s;
 }
 
-/* نوار اکسنت رنگی در سمت چپ — هویت بصری ورک‌اسپیس بدون زمینهٔ سنگین */
-.sidebar-group.ws-colored .sidebar-group-head {
-  padding-left: 8px;
-}
-
-.sidebar-group.ws-colored .sidebar-group-head::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 3px;
-  height: 60%;
-  border-radius: 3px;
-  background: var(--ws);
-  box-shadow: 0 0 8px 0 color-mix(in srgb, var(--ws) 55%, transparent);
-}
+/* NOTE: no accent rail (::before bar) on workspace headers or the active
+   chat — the colored icon + label carry the identity; the bar read as a
+   stray white line behind the rows. */
 
 .sidebar-group-head:hover {
   background: color-mix(in srgb, var(--text) 6%, transparent);
@@ -1235,6 +1239,11 @@ body.coder-resizing .terminal-panel {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Direction follows the app bar's ltr/rtl toggle (dir attr on the span). */
+  text-align: start;
+  /* Physical padding (rows are ltr): in RTL mode the title right-aligns and
+     would otherwise touch the trailing badges / + button. */
+  padding-right: 12px;
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1;
@@ -1308,10 +1317,6 @@ body.coder-resizing .terminal-panel {
 
 /* In the opened workspace the chat list IS the body — drop the deep tree
    indent the inline expansion used, keep the colored rail for continuity. */
-.sidebar-ws-open .sidebar-group-chats {
-  margin: 4px 0 2px 8px;
-}
-
 .ws-rename-input {
   flex: 1 1 auto;
   min-width: 0;
@@ -1401,13 +1406,12 @@ body.coder-resizing .terminal-panel {
   color: var(--text);
 }
 
+/* The chat list sits FLUSH under the workspace header: no tree indent line,
+   no extra left padding — the rows line up with the header above them. */
 .sidebar-group-chats {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-left: 10px;
-  margin: 2px 0 2px 16px;
-  border-left: 2px solid color-mix(in srgb, var(--ws, var(--accent)) 22%, transparent);
 }
 
 .sidebar-footer {
@@ -2579,45 +2583,17 @@ body.coder-resizing .terminal-panel {
 }
 
 .workspace-btn-label {
+  /* The workspace pill's project name — lays out at its own content width
+     (capped at 150px, ellipsized beyond), never a flex-shrink victim, so the
+     name stays readable in the free-width titlebar in both RTL and LTR.
+     Color inherits from the pill (dim at rest, text on hover). */
+  flex: 0 0 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.workspace-btn {
-  display: inline-flex;
-  margin-left: 0;
-  align-items: center;
-  gap: 7px;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  height: 30px;
-  padding: 0 9px 0 7px;
-  border-radius: 999px;
-  border: none;
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-dim);
+  max-width: 150px;
   font-size: 12px;
   font-weight: 500;
-  cursor: pointer;
-  flex: 0 1 auto;
-  min-width: 0;
-  transition:
-    background 0.12s,
-    color 0.12s,
-    border-color 0.12s,
-    transform 0.12s;
-}
-
-.workspace-btn svg {
-  width: 17px;
-  height: 17px;
-  flex: 0 0 auto;
-  color: var(--ws, var(--accent));
-  opacity: 0.9;
 }
 
 /* Cluster's icon-only buttons (sidebar toggle, settings): uniform 17px
@@ -2626,16 +2602,6 @@ body.coder-resizing .terminal-panel {
 .window-strip-cluster .titlebar-icon-btn svg {
   width: 17px;
   height: 17px;
-}
-
-.workspace-btn:hover {
-  background: transparent;
-  border-color: transparent;
-  color: var(--text);
-}
-
-.workspace-btn:active {
-  transform: scale(0.96);
 }
 
 /* خوشه‌ی آیکون‌های هدر — دکمه‌ی پنل با جداکننده در گوشه‌ی انتهایی. */
@@ -12398,20 +12364,17 @@ body.coder-dragging .chat-split-child {
     0 6px 16px -8px rgba(0, 0, 0, 0.35);
 }
 
-/* Reply-quote card ("Replying to …"): shares the paste-card frame but gets an
-   accent tint, because the plain panel fill was indistinguishable from the chat
-   bubble behind it. Everything derives from the theme accent (never a literal
-   colour) so it stays legible on all palettes, dark and light. */
+/* Reply-quote card ("Replying to …"): shares the paste-card frame but gets a
+   light accent tint, because the plain panel fill was indistinguishable from the
+   chat bubble behind it. The tint stays at the codebase's standard card level
+   (≈14%, like tool cards) rather than a heavy wash: themes whose accent is
+   near-white (Onyx) turned a strong wash into a flat grey slab. Everything
+   derives from theme vars, so each palette tints the card with its own accent. */
 .paste-card.reply-card {
-  /* Mixed into --bg-panel (not --bg): on light themes the chat surface and the
-     accent are both pale, so a --bg base washed the card out. 42% accent keeps
-     it a distinct, theme-coloured card on every palette (worst-case contrast
-     against the chat surface ≈1.9:1; the old panel fill was ≈1.3:1, i.e. it
-     looked like part of the background). */
-  background: color-mix(in srgb, var(--accent) 42%, var(--bg-panel));
-  border: 1px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent) 30%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--accent) 18%, transparent),
     0 1px 2px rgba(0, 0, 0, 0.12),
     0 6px 16px -8px rgba(0, 0, 0, 0.35);
 }
@@ -12424,10 +12387,10 @@ body.coder-dragging .chat-split-child {
 }
 
 .paste-card.reply-card .paste-card-badge {
-  /* Chip flips to the theme BACKGROUND colour so it reads as an inset label on
-     the accent card instead of accent-on-accent mush. */
+  /* One step stronger than the default badge chip (text 7%): the card body is
+     now accent-tinted, so the label needs a touch more lift to read as a chip. */
   color: var(--text);
-  background: color-mix(in srgb, var(--bg) 62%, transparent);
+  background: color-mix(in srgb, var(--text) 14%, transparent);
 }
 
 .paste-card.reply-card .paste-card-x {
@@ -18019,7 +17982,6 @@ body.coder-dragging .chat-split-child {
 .sidebar-new-btn,
 .color-popover,
 .sidebar-panel,
-.workspace-btn,
 .scroll-jump,
 .tool-sub-list,
 .empty-mode,
@@ -18220,17 +18182,6 @@ body.coder-dragging .chat-split-child {
     inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
     0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent),
     0 3px 10px rgba(0, 0, 0, 0.1);
-}
-
-.workspace-btn {
-  background: transparent;
-  box-shadow: none;
-}
-
-.workspace-btn:hover {
-  background: transparent;
-  color: var(--text);
-  box-shadow: none;
 }
 
 .copy-btn,
@@ -21530,12 +21481,6 @@ mark.diff-hit-active {
   background: var(--accent);
   color: var(--on-accent, #fff);
   box-shadow: 0 0 0 2px var(--bg-alt);
-}
-
-@media (max-width: 980px) {
-  .workspace-btn {
-    max-width: 150px;
-  }
 }
 
 /* نوار پیشرفت تودوها — تک‌رنگ accent تم تا با همهٔ تم‌ها هماهنگ باشد. */

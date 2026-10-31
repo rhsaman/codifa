@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ProviderConfig } from "../types";
+import { providerDisplayName } from "../lib/provider-meta";
 import { MAX_PINNED_RECENT_MODELS, sortRecentModels, useStore } from "../lib/store";
 import { resolveSlotEntry } from "../lib/toolSlots";
 import { ModelTestButton, PinIcon, RemoveIcon, TestBoltIcon } from "./ModelTestButton";
@@ -16,10 +17,11 @@ function bareModel(p: ProviderConfig, m: string): string {
 }
 
 /** Display label for a model, e.g. "openrouter/gpt-5". Uses the provider's
- *  NAME (not its id) so custom rows show a human label like "justwoker/"
- *  instead of a random "custom-mtwl9t08/" slug. */
+ *  display NAME (not its id) so custom rows show a human label like
+ *  "justwoker/" instead of a random "custom-mtwl9t08/" slug. Unnamed rows
+ *  (freshly added, Name input still empty) fall back to the kind label. */
 function modelLabel(p: ProviderConfig, m: string): string {
-  return `${p.name}/${m}`;
+  return `${providerDisplayName(p)}/${m}`;
 }
 
 /** The provider's OWN catalog is authoritative: `p.models` is what its
@@ -282,7 +284,7 @@ export function ProviderModelSelect(props?: {
     return providers
       .map((p) => {
         const models = allModels(p).filter((m) => {
-          const hay = `${p.name} ${p.id} ${m}`.toLowerCase();
+          const hay = `${providerDisplayName(p)} ${p.id} ${m}`.toLowerCase();
           return terms.every((t) => hay.includes(t));
         });
         return { p, models };
@@ -432,7 +434,7 @@ export function ProviderModelSelect(props?: {
           className={`mode-menu-item pm-model ${isCurrent ? "active" : ""}`}
           onClick={() => pick(p, m)}
         >
-          {prefixed && <span className="pm-model-provider">{p.name}/</span>}
+          {prefixed && <span className="pm-model-provider">{providerDisplayName(p)}/</span>}
           <span className="pm-model-name">{m}</span>
         </button>
         {dismissible && (
@@ -458,7 +460,7 @@ export function ProviderModelSelect(props?: {
   /** سربرگ گروه (نام پروایدر) در تب‌های Checked و نتایج جستجو. */
   const groupHeader = (p: ProviderConfig, count: number) => (
     <div className="pm-mpane-group">
-      <span className="pm-mpane-group-name">{p.name}</span>
+      <span className="pm-mpane-group-name">{providerDisplayName(p)}</span>
       <span className="pm-mpane-group-count">{count}</span>
     </div>
   );
@@ -484,10 +486,10 @@ export function ProviderModelSelect(props?: {
     ? noneText
     : shownModel
       ? modelLabel(shownProvider, shownModel)
-      : shownProvider.name;
+      : providerDisplayName(shownProvider);
   const buttonTitle = inherited
     ? `${noneText} — follows whatever the composer is using`
-    : `${shownProvider.name} — ${shownModel || "no model"}`;
+    : `${providerDisplayName(shownProvider)} — ${shownModel || "no model"}`;
 
   const paneProvider =
     effectiveTab === "__recent" || effectiveTab === "__checked"
@@ -506,7 +508,7 @@ export function ProviderModelSelect(props?: {
         <span className="pm-select-label">
           {props?.compact && !inherited && shownModel ? (
             <>
-              <span className="pm-select-provider">{shownProvider.name}/</span>
+              <span className="pm-select-provider">{providerDisplayName(shownProvider)}/</span>
               <span className="pm-select-model">{shownModel}</span>
             </>
           ) : (
@@ -586,7 +588,7 @@ export function ProviderModelSelect(props?: {
                     <button
                       key={p.id}
                       type="button"
-                      title={p.name}
+                      title={providerDisplayName(p)}
                       className={`pm-mrail-item${effectiveTab === p.id ? " active" : ""}`}
                       onClick={() => {
                         setQuery("");
@@ -594,9 +596,9 @@ export function ProviderModelSelect(props?: {
                       }}
                     >
                       <span className="pm-mrail-avatar">
-                        {p.name.trim().charAt(0).toUpperCase() || "?"}
+                        {providerDisplayName(p).trim().charAt(0).toUpperCase() || "?"}
                       </span>
-                      <span className="pm-mrail-label">{p.name}</span>
+                      <span className="pm-mrail-label">{providerDisplayName(p)}</span>
                       <span className="pm-mrail-count">{allModels(p).length}</span>
                     </button>
                   ))}
@@ -770,7 +772,7 @@ export function ProviderModelSelect(props?: {
                     paneProvider && (
                       <>
                         <div className="pm-mpane-head">
-                          <span className="pm-mpane-title">{paneProvider.name}</span>
+                          <span className="pm-mpane-title">{providerDisplayName(paneProvider)}</span>
                           <span className="pm-mpane-sub">
                             {paneModels.length}{" "}
                             {paneModels.length === 1 ? "model" : "models"}

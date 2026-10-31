@@ -296,6 +296,23 @@ fn fallback_entry(row: &Value) -> Option<String> {
     Some(format!("{pid}/{model}"))
 }
 
+/// "Results per search" (Settings → Web Providers) for a scheduled run.
+///
+/// ONE number drives both halves of a `web_search` here exactly like an
+/// interactive turn: how many results come back AND how many of those get
+/// their real page fetched. The value is stored top-level in settings.json
+/// (the interactive turn sends the same number on the wire), and `0` is
+/// MEANINGFUL — "snippets only", no page fetches — so it passes through;
+/// only a MISSING key (an older settings.json) falls back to the default
+/// the UI starts at.
+fn web_search_auto_fetch_of(settings: &Value) -> usize {
+    settings
+        .get("webSearchAutoFetch")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT)
+}
+
 /// Read a `["a", "b"]` list of names out of a task document (missing/non-array
 /// fields become an empty list, so an older task still runs).
 fn string_list(task: &Value, key: &str) -> Vec<String> {
@@ -941,6 +958,39 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        // Media slots read straight from the settings doc, exactly like the
+        // chat path sends them — a scheduled run can generate media too, and
+        // there is no renderer to answer "not configured" for.
+        image_provider_id: settings
+            .get("imageProviderId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        image_model: settings
+            .get("imageModel")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        image_fallbacks: settings
+            .get("imageFallbacks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        video_provider_id: settings
+            .get("videoProviderId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        video_model: settings
+            .get("videoModel")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        video_fallbacks: settings
+            .get("videoFallbacks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         // Headless runs have no UI to compact against, so they keep the
         // default threshold and no summarizer override; mid-turn compaction
         // still protects them from a "context length exceeded" hard failure.
@@ -960,9 +1010,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // retried down that tool's list, for that call only.
         tool_fallbacks,
         images: Vec::new(),
-        // A headless run has no UI, so it reads no Storage setting: it uses the
-        // same default auto-fetch count the UI starts at.
-        web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
+        // The user's "Results per search" (Settings → Web Providers) governs a
+        // scheduled run exactly like an interactive one; a hardcoded default
+        // here made every headless web_search ignore the setting.
+        web_search_auto_fetch: web_search_auto_fetch_of(&settings),
         // No renderer to send a table: `run_turn` derives it from the task's
         // mode, so a scheduled Ask run is read-only like an interactive one.
         cap: None,
@@ -1261,6 +1312,20 @@ pub fn start_loop(data_root: std::path::PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_auto_fetch_reads_the_settings_number() {
+        // A missing key (an older settings.json) falls back to the default
+        // the UI starts at.
+        assert_eq!(
+            web_search_auto_fetch_of(&json!({})),
+            crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT
+        );
+        // The user's number is honoured verbatim…
+        assert_eq!(web_search_auto_fetch_of(&json!({"webSearchAutoFetch": 8})), 8);
+        // …and 0 is MEANINGFUL ("snippets only"), never replaced by the default.
+        assert_eq!(web_search_auto_fetch_of(&json!({"webSearchAutoFetch": 0})), 0);
+    }
 
     #[test]
     fn orphan_sweep_min_age_zero_closes_fresh_running_rows() {

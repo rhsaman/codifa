@@ -33,18 +33,22 @@ const SKIP_DIRS: [&str; 7] = [
     "__pycache__",
 ];
 /// Files at a skill's own level that belong to the REPO, not to the skill.
-const SKIP_FILES: [&str; 8] = [
+const SKIP_FILES: [&str; 9] = [
     "readme.md",
     "license",
     "license.md",
+    "license.txt",
     "changelog.md",
     "package.json",
     "plugin.json",
     "mcp.json",
     ".mcp.json",
 ];
-/// Cap on the files that travel with one skill: `extra_files` is prompt-sized.
-const MAX_EXTRA_FILES: usize = 20;
+/// Cap on the files that travel with one skill: the prompt carries only their
+/// NAMES (a body is read on demand through `load_skill`), so the cap bounds
+/// bundle bloat, not prompt size. An office skill library — the ZCode document
+/// packs ship 40+ files of scripts and references — needs the room.
+const MAX_EXTRA_FILES: usize = 100;
 
 /// One repo, already resolved: the ref the files were read from and the paths
 /// below the sub-folder the caller pointed at.
@@ -482,7 +486,9 @@ fn parent(path: &str) -> &str {
 /// Claude's layout hides the manifest in `.claude-plugin/` while the skills and
 /// `.mcp.json` sit at the repo root, so the root is one level UP from the
 /// manifest in that case; a bundle that keeps `plugin.json` beside its skills
-/// (`skills/plugin.json`) roots at the manifest's own folder.
+/// (`skills/plugin.json`) roots at the manifest's own folder. ZCode plugins
+/// hide theirs the same way, in `.zcode-plugin/`, and root one level up
+/// identically — same shape, different dot-folder name.
 fn locate(repo: &Repo) -> Result<(String, Option<String>), String> {
     let mut manifests: Vec<&String> = repo.files().iter().filter(|p| is_manifest(p)).collect();
     manifests.sort_by_key(|p| p.matches('/').count());
@@ -505,9 +511,15 @@ fn locate(repo: &Repo) -> Result<(String, Option<String>), String> {
         ));
     }
     let dir = parent(&path).to_string();
+    // A manifest parked in a dot-folder is metadata, not the bundle: the skills
+    // and connectors live one level ABOVE it. Claude and ZCode differ only in
+    // the folder's name.
+    let hidden_manifest = |folder: &str| {
+        folder.eq_ignore_ascii_case(".claude-plugin") || folder.eq_ignore_ascii_case(".zcode-plugin")
+    };
     let root = match dir.rsplit_once('/') {
-        Some((up, last)) if last.eq_ignore_ascii_case(".claude-plugin") => up.to_string(),
-        _ if dir.eq_ignore_ascii_case(".claude-plugin") => String::new(),
+        Some((up, last)) if hidden_manifest(last) => up.to_string(),
+        _ if hidden_manifest(&dir) => String::new(),
         _ => dir,
     };
     Ok((root, Some(path)))
@@ -1242,6 +1254,48 @@ mod tests {
         assert_eq!(got["name"], "Ponytail");
         assert_eq!(got["skills"].as_array().unwrap().len(), 1);
         assert_eq!(got["manifest"], "skills/plugin.json");
+    }
+
+    #[test]
+    fn zcode_layout_roots_at_the_repo_not_the_hidden_manifest() {
+        // The ZCode plugin cache (`~/.zcode/cli/plugins/cache/<market>/<name>/<version>/`)
+        // parks its manifest in `.zcode-plugin/`. Reading that root as the bundle
+        // itself found no skills under it and refused every install; the root is
+        // the version folder, exactly like Claude's `.claude-plugin/`. The shape
+        // below mirrors a real cached plugin: `package.json` and `agents/` sit
+        // beside `skills/`, and neither may leak in as a bundle part.
+        let dir = fixture("zcode");
+        put(
+            &dir,
+            ".zcode-plugin/plugin.json",
+            r#"{"name":"documents","version":"0.2.1","description":"DOCX document production skills"}"#,
+        );
+        put(&dir, "package.json", r#"{"name":"documents"}"#);
+        put(
+            &dir,
+            "skills/docx/SKILL.md",
+            "---\nname: docx\ndescription: DOCX production.\n---\n\n# docx\n\nMake it.",
+        );
+        put(&dir, "skills/docx/scripts/make.py", "print('hi')");
+        put(
+            &dir,
+            "skills/docx-viewer/SKILL.md",
+            "---\nname: docx-viewer\n---\nViewer body.",
+        );
+        put(&dir, "agents/visual-judge.md", "judge");
+        let got = read_plugin(dir.to_str().unwrap(), "", "").unwrap();
+        assert_eq!(got["name"], "documents");
+        assert_eq!(got["version"], "0.2.1");
+        let skills = got["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        let docx = skills
+            .iter()
+            .find(|s| s["name"] == "docx")
+            .expect("docx skill");
+        assert_eq!(docx["extra_files"]["scripts__make.py"], "print('hi')");
+        // The ZCode-host MCP server lives inside the manifest's `mcpServers`, not
+        // in a `.mcp.json` file, so nothing connector-shaped installs from it.
+        assert!(got["mcp"].as_object().is_none_or(|m| m.is_empty()));
     }
 
     #[test]

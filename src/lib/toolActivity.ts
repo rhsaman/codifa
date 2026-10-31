@@ -483,6 +483,15 @@ export function filesFromNativeResult(
     isBrowserTool(tool)
   )
     return null;
+  // Media tools answer with a summary whose TEXT mentions model ids and
+  // error strings ("ag/gemini-3.1") that scan as path-like tokens — and a
+  // broken-image row for a model name is worse than no row. Only REAL media
+  // files qualify for those tools.
+  const isMediaTool =
+    tool === "generate_image" ||
+    tool === "edit_image" ||
+    tool === "generate_video" ||
+    tool === "edit_video";
   const re = /((?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,10})(?::(\d+))?/g;
   const seen = new Set<string>();
   const out: Array<Record<string, unknown>> = [];
@@ -499,6 +508,13 @@ export function filesFromNativeResult(
       !/\.(ts|tsx|js|jsx|mjs|cjs|py|rs|json|toml|md|css|scss|html|yaml|yml|txt|sh|go|java|rb|php|c|cpp|h|hpp|sql|lock|svg|png|jpg)$/i.test(file)
     )
       continue;
+    // Media tools: only an actual media file becomes a result row.
+    if (isMediaTool && !/\.(png|jpe?g|webp|gif|bmp|mp4|webm|mov|m4v)$/i.test(file)) continue;
+    // The AUTHORITY part of a URL (`codifa-media://media/…`, `https://cdn/x.png`)
+    // is preceded by "//" and scans as a path with a leading slash — a SECOND
+    // row for the file whose markdown alt/label already produced one, and a
+    // made-up absolute path ("/media/…" exists nowhere). Skip it.
+    if (result.slice(Math.max(0, m.index - 2), m.index) === "//") continue;
     // Absolute paths must keep their leading slash: the regex above strips
     // it, so "/Users/x/y.ts" became "Users/x/y.ts" which the viewer then
     // resolved against the workspace root and failed with "No file exists".

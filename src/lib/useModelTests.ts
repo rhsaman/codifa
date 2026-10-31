@@ -70,6 +70,32 @@ export function clearModelTests(): void {
   for (const l of listeners) l();
 }
 
+/** حذف نتیجهٔ تست «یک» مدل: نتیجهٔ ✓ سبز به idle برمی‌گردد — مدل از تب
+ *  Checked پیکر می‌رود و دکمهٔ ⚡ آن دوباره رعد خالی نشان می‌دهد. فقط روی
+ *  نتیجهٔ ok اثر دارد (نتیجهٔ fail دست‌نخورده می‌ماند). */
+export function dismissModelTest(cfg: ProviderConfig, model: string): void {
+  const k = key(cfg, model);
+  if (snapshot.get(k)?.status === "ok") setEntry(k, { status: "idle", msg: "" });
+}
+
+/** پاک‌کردن کلی نتایج موفق: همهٔ ✓ها به idle برمی‌گردند (تب Checked خالی
+ *  می‌شود) ولی نتایج fail حفظ می‌شوند — همان کاری که دکمهٔ ✕ سربرگ تب
+ *  Checked انجام می‌دهد. */
+export function clearCheckedTests(): void {
+  let changed = false;
+  const next = new Map(snapshot);
+  for (const [k, e] of snapshot) {
+    if (e.status === "ok") {
+      next.set(k, { status: "idle", msg: "" });
+      changed = true;
+    }
+  }
+  if (changed) {
+    snapshot = next;
+    for (const l of listeners) l();
+  }
+}
+
 /** تست یک مدل: نتیجه در استور مشترک ثبت می‌شود تا دکمهٔ تکی و جمع‌بندی
  *  پروایدر هر دو از یک منبع بخوانند. اگر همان مدل از قبل در حال تست باشد
  *  دوباره فایر نمی‌شود. */
@@ -291,5 +317,11 @@ export function useModelTests() {
   const runMixed = useCallback((entries: MixedTestEntry[], runKey = "recent"): void => {
     void runMixedTests(entries, 10, runKey);
   }, []);
-  return { getStatus, getSummary, getMixedSummary, run, runAll, runMixed };
+  const dismiss = useCallback((cfg: ProviderConfig, model: string): void => {
+    dismissModelTest(cfg, model);
+  }, []);
+  const clearChecked = useCallback((): void => {
+    clearCheckedTests();
+  }, []);
+  return { getStatus, getSummary, getMixedSummary, run, runAll, runMixed, dismiss, clearChecked };
 }

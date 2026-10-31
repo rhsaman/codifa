@@ -1335,6 +1335,23 @@ pub struct AgentRequest {
     /// turn, so the user's list order IS the fallback chain.
     #[serde(default)]
     pub search_plugins: Vec<Value>,
+    /// Image-generation slot (Settings → Media Providers): provider id into
+    /// `providers` + default model + ordered fallbacks. Empty id = the
+    /// `generate_image` / `edit_image` tools answer "not configured".
+    #[serde(default)]
+    pub image_provider_id: String,
+    #[serde(default)]
+    pub image_model: String,
+    #[serde(default)]
+    pub image_fallbacks: Vec<Value>,
+    /// Video-generation slot, same shape as the image slot. Empty id =
+    /// `generate_video` answers "not configured" (local ffmpeg edits still run).
+    #[serde(default)]
+    pub video_provider_id: String,
+    #[serde(default)]
+    pub video_model: String,
+    #[serde(default)]
+    pub video_fallbacks: Vec<Value>,
     /// Auto-compaction threshold as a percentage of the RAW context window —
     /// the renderer has always sent this (the Python graph consumed it), and
     /// the native loop now honours it MID-TURN: once a turn's wire history
@@ -1515,6 +1532,14 @@ fn edit_target_of(
 fn denied_by_caps(caps: &ToolCaps, name: &str) -> Option<String> {
     let (allowed, action) = match name {
         "write_file" | "edit_file" => (caps.write_files, "write or edit files"),
+        // Media tools create NEW files only (the result paths are minted
+        // unique under media/ — an existing file is never overwritten), so
+        // they stay available in the read-only Ask/Plan modes exactly like
+        // web_search does: a user who asks "make me a picture" in Ask mode
+        // expects the picture, not a lecture. The read-only protection for
+        // these is the dispatch arm IGNOREing the `output` argument when
+        // `write_files` is off, so no call can aim a write at a project file.
+        "generate_image" | "edit_image" | "generate_video" | "edit_video" => (true, ""),
         "run_terminal" => (caps.run_terminal, "run commands"),
         // The memory tools are a read of the project's own notes (and the
         // matching write to the same store), so they ride the read capability
@@ -1707,6 +1732,14 @@ impl AgentRequest {
             allow_outside: self.allow_outside,
             allow_outside_folders: self.allow_outside_folders.clone(),
             search_plugins: self.search_plugins.clone(),
+            // Media slots ride along: an explore that generates a preview image
+            // uses the same configured provider the parent would have.
+            image_provider_id: self.image_provider_id.clone(),
+            image_model: self.image_model.clone(),
+            image_fallbacks: self.image_fallbacks.clone(),
+            video_provider_id: self.video_provider_id.clone(),
+            video_model: self.video_model.clone(),
+            video_fallbacks: self.video_fallbacks.clone(),
             // Sub-agents never auto-compact mid-turn (they have their own
             // budget), but the snapshot stays a faithful copy of the turn.
             compact_at_percent: self.compact_at_percent,
@@ -3453,6 +3486,119 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
     out
 }
 
+/// The four media-generation tools, bound ONLY on the main agent's turn (see
+/// the call site: a sub-agent must not spend the user's provider credit). The
+/// descriptions name the user's configured DEFAULT models — the model knows
+/// what it will hit before the call costs anything — and teach the display
+/// contract: every result carries a `codifa-media://` markdown reference the
+/// renderer turns into an inline picture or player, and the model includes it
+/// VERBATIM so the user actually sees the file.
+fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
+    let img = if image_default.trim().is_empty() {
+        "(no default — the tool errors until one is set in Settings)"
+    } else {
+        image_default.trim()
+    };
+    let vid = if video_default.trim().is_empty() {
+        "(no default — the tool errors until one is set in Settings)"
+    } else {
+        video_default.trim()
+    };
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "generate_image",
+                "description": format!(
+                    "Generate ONE image from a text prompt with the user's configured image provider (default model: {img}). \
+                     The file is saved into THIS CHAT's media folder under the app data root (~/.codifa/media — NOT the workspace) and the result carries a \
+                     `codifa-media://` markdown reference — include that line VERBATIM in your reply so the user sees the image. \
+                     Costs the user's provider credit: one call per image, never batch speculative sizes. \
+                     If the user asked for an EDIT of an existing picture, use edit_image instead."
+                ),
+                "parameters": {"type": "object", "properties": json!({
+                    "prompt": {"type": "string", "description": "What the image shows — be concrete (subject, style, lighting)"},
+                    "size": {"type": "string", "description": "Optional WxH like 1024x1024; omit to let the provider default"},
+                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
+                    "output": {"type": "string", "description": "Optional workspace-relative save path; default media/<stamp>.png"}
+                })},
+            },
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "edit_image",
+                "description": format!(
+                    "Edit an EXISTING image in the workspace with the configured image provider (default model: {img}): \
+                     restyle, add/remove elements, or re-generate a rectangular region. `path` is a workspace-relative \
+                     image; `mask_region` (x/y/w/h in source pixels) limits the change to that rectangle and keeps the \
+                     rest identical where the provider supports masking. The EDITED copy is saved as a NEW file — the \
+                     original is never overwritten — and the result's `codifa-media://` line goes into your reply VERBATIM. \
+                     For a brand-new picture use generate_image."
+                ),
+                "parameters": {"type": "object", "properties": json!({
+                    "path": {"type": "string", "description": "Workspace-relative image to edit (e.g. media/image-20261031-120000-ab12.png)"},
+                    "prompt": {"type": "string", "description": "What to change"},
+                    "mask_region": {"type": "object", "description": "Optional {x,y,w,h} rectangle in source pixels to restrict the edit"},
+                    "size": {"type": "string", "description": "Optional WxH output size"},
+                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
+                    "output": {"type": "string", "description": "Optional save path; default media/image-edit-<stamp>.png"}
+                })},
+            },
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "generate_video",
+                "description": format!(
+                    "Generate ONE short video clip from a text prompt (or animate an image: pass `image` — that \
+                     picture becomes the clip's FIRST frame) with the configured video provider (default model: {vid}). \
+                     This is SLOW (often 1-5 minutes) and expensive — fire it only when the user asked for video, and \
+                     tell the user it is running. Clips are SHORT (providers cap them at ~4-12s) and clips WITH audio \
+                     cost more than silent ones. For a LONGER story, chain clips: generate clip 1, extract its LAST \
+                     frame (edit_video action=frames at the end timestamp), pass that frame as `image` to clip 2, then \
+                     stitch everything with edit_video action=merge. Local assembly (slideshow from images, trim, \
+                     merge) is edit_video's job, not this tool's. The result's `codifa-media://` markdown line goes \
+                     into your reply VERBATIM so the inline player appears."
+                ),
+                "parameters": {"type": "object", "properties": json!({
+                    "prompt": {"type": "string", "description": "What the clip shows (camera movement, scene, mood)"},
+                    "image": {"type": "string", "description": "Optional workspace-relative image to animate (image-to-video)"},
+                    "seconds": {"type": "integer", "description": "Clip length in seconds (providers cap it, often 4-12)"},
+                    "size": {"type": "string", "description": "Optional WxH or aspect like 1280x720"},
+                    "model": {"type": "string", "description": "Override the default model for THIS call only"},
+                    "output": {"type": "string", "description": "Optional save path; default media/clip-<stamp>.mp4"}
+                })},
+            },
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "edit_video",
+                "description": "Local ffmpeg editing of EXISTING media files — fast and free, no provider involved. \
+                     Actions: `probe` (duration/size/fps of one file — run it BEFORE trimming to pick bounds), \
+                     `trim` (path+start+end seconds, frame-accurate re-encode), `merge` (paths[] in list order; every \
+                     clip is normalized to the first clip's size/fps, so different sources still concatenate cleanly), \
+                     `slideshow` (paths[] of IMAGES + seconds each → one mp4 — the free way to make a short video), \
+                     `frames` (path+at[] → stills in media/frames/, feed one to edit_image), `convert` (path+format: \
+                     mp4|webm|mov|gif|mp3|wav). Outputs are NEW files in media/; results carry `codifa-media://` \
+                     markdown lines for your reply.",
+                "parameters": {"type": "object", "properties": json!({
+                    "action": {"type": "string", "description": "probe | trim | merge | slideshow | frames | convert"},
+                    "path": {"type": "string", "description": "Workspace-relative media file (probe/trim/frames/convert)"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "List of files, IN ORDER (merge, slideshow)"},
+                    "start": {"type": "number", "description": "trim: start seconds"},
+                    "end": {"type": "number", "description": "trim: end seconds"},
+                    "seconds": {"type": "number", "description": "slideshow: seconds per image (default 3)"},
+                    "at": {"type": "array", "items": {"type": "number"}, "description": "frames: timestamps in seconds"},
+                    "format": {"type": "string", "description": "convert: mp4 | webm | mov | gif | mp3 | wav"},
+                    "output": {"type": "string", "description": "Optional save path; default media/<kind>-<stamp>.<ext>"}
+                })},
+            },
+        }),
+    ]
+}
+
 /// Swap the `plugin` tool's full schema for the compact one: a plain turn keeps
 /// the door to a bundle's scripts (`list`/`run`) but NOT the authoring prose.
 /// The full schema is ~2.9K chars and is re-sent on every round-trip, so the
@@ -4260,7 +4406,14 @@ already approved with \"Always allow\".",
     let mut schemas = if req.mode == "subagent" {
         research_schemas()
     } else {
-        tool_schemas(req.allow_create, req.allow_browser)
+        let mut schemas = tool_schemas(req.allow_create, req.allow_browser);
+        // Media generation rides ONLY on the main agent's turn: these tools
+        // spend the user's provider credit and their results (an inline
+        // markdown reference) are meant for the user's chat, not for a
+        // sub-agent's research fold. The descriptions embed the slot's
+        // DEFAULT model so the model knows what it will hit before calling.
+        schemas.extend(media_tool_schemas(&req.image_model, &req.video_model));
+        schemas
     };
     // What the tools may do this turn. A renderer that sends `cap` wins; without
     // it the mode's row is used, so a headless scheduled Ask run is read-only too.
@@ -6499,6 +6652,316 @@ call fetch_url again with offset={next} for the rest]",
                         (format!("{body}{note}"), true)
                     }
                     Err(e) => (format!("ERROR fetching {url}: {e}"), false),
+                }
+            } else if name == "generate_image" || name == "edit_image" || name == "generate_video" {
+                // Media GENERATION through the user's configured provider slot
+                // (Settings → Media Providers). Async provider HTTP, so this is
+                // an in-loop arm like web_search; the fallback ladder is the
+                // slot's own ordered fallbacks, walked per call.
+                let prompt = args["prompt"].as_str().unwrap_or_default().trim().to_string();
+                if prompt.is_empty() && name != "generate_video" {
+                    (format!("{name} needs a `prompt`"), false)
+                } else if name == "generate_video" && prompt.is_empty() {
+                    ("generate_video needs a `prompt`".to_string(), false)
+                } else {
+                    let (slot_provider, slot_model, slot_fallbacks, slot_word) = if name == "generate_video" {
+                        (
+                            req.video_provider_id.as_str(),
+                            req.video_model.as_str(),
+                            req.video_fallbacks.clone(),
+                            "video",
+                        )
+                    } else {
+                        (
+                            req.image_provider_id.as_str(),
+                            req.image_model.as_str(),
+                            req.image_fallbacks.clone(),
+                            "image",
+                        )
+                    };
+                    // A per-call `model` overrides the slot default on the
+                    // PRIMARY rung only — fallbacks keep their own models.
+                    let effective_model = args["model"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(slot_model);
+                    let ladder = crate::media_gen::media_ladder(
+                        slot_provider,
+                        effective_model,
+                        &slot_fallbacks,
+                        &req.providers,
+                    );
+                    if ladder.is_empty() {
+                        (
+                            crate::media_gen::not_configured_error(&format!("{slot_word} generation")),
+                            false,
+                        )
+                    } else {
+                        let size = args["size"].as_str();
+                        // Read-only modes (Ask/Plan) may generate media but may
+                        // not AIM the write: `output` is ignored there, so the
+                        // file always lands on the minted unique chat-media
+                        // name and can never overwrite anything by name.
+                        let output = if caps.write_files { args["output"].as_str() } else { None };
+                        // Generated media lives under the DATA ROOT, scoped to
+                        // THIS chat (`~/.codifa/media/<chat>/…`) — never in the
+                        // workspace. The workspace root stays available as a
+                        // SOURCE for edit inputs (the user's own pictures).
+                        let data_root = if req.data_root.trim().is_empty() {
+                            native_data_root()
+                        } else {
+                            req.data_root.trim().to_string()
+                        };
+                        let chat_id = req.chat_id.trim().to_string();
+                        let mut last_err = String::new();
+                        let mut done: Option<crate::media_gen::GeneratedMedia> = None;
+                        for rung in &ladder {
+                            let attempt = if name == "generate_image" {
+                                crate::media_gen::generate_image(
+                                    &data_root,
+                                    &chat_id,
+                                    rung,
+                                    &prompt,
+                                    size,
+                                    output,
+                                )
+                                .await
+                            } else if name == "edit_image" {
+                                let path = args["path"].as_str().unwrap_or_default().trim();
+                                if path.is_empty() {
+                                    Err("edit_image needs the `path` of the image to edit".to_string())
+                                } else {
+                                    let mask = crate::media_gen::MaskRegion::from_args(&args["mask_region"]);
+                                    crate::media_gen::edit_image(
+                                        req.root.trim(),
+                                        &data_root,
+                                        &chat_id,
+                                        rung,
+                                        path,
+                                        &prompt,
+                                        mask,
+                                        size,
+                                        output,
+                                    )
+                                    .await
+                                }
+                            } else {
+                                let seconds = args["seconds"].as_u64();
+                                let image = args["image"].as_str();
+                                crate::media_gen::generate_video(
+                                    req.root.trim(),
+                                    &data_root,
+                                    &chat_id,
+                                    rung,
+                                    &prompt,
+                                    seconds,
+                                    size,
+                                    image,
+                                    output,
+                                )
+                                .await
+                            };
+                            match attempt {
+                                Ok(m) => {
+                                    done = Some(m);
+                                    break;
+                                }
+                                Err(e) => {
+                                    last_err = format!(
+                                        "{slot_word} generation failed on {} (model {}): {e}",
+                                        rung.kind, rung.model
+                                    );
+                                }
+                            }
+                        }
+                        match done {
+                            Some(m) => {
+                                // A ROW ARRAY, like every other tool card's
+                                // `results` (web_search rows, file links) —
+                                // the renderer's resultRows only maps arrays.
+                                ui_results = Some(json!([crate::media_gen::media_file_row(
+                                    &m.rel_path,
+                                    m.bytes,
+                                    &m.mime,
+                                )]));
+                                (
+                                    crate::media_gen::generated_summary(slot_word, &m, &ladder[0].kind),
+                                    true,
+                                )
+                            }
+                            None => (last_err, false),
+                        }
+                    }
+                }
+            } else if name == "edit_video" {
+                // LOCAL ffmpeg editing — no provider, no credit, just the
+                // provisioned binary. Blocking children, so spawn_blocking;
+                // the first call may download ffmpeg (~80MB, once).
+                let action = args["action"].as_str().unwrap_or_default().trim().to_string();
+                // Sources may be workspace files; OUTPUTS land in the chat's
+                // media folder under the data root (never the workspace).
+                let media_ctx = crate::media_edit::MediaCtx {
+                    workspace_root: req.root.trim().to_string(),
+                    data_root: if req.data_root.trim().is_empty() {
+                        native_data_root()
+                    } else {
+                        req.data_root.trim().to_string()
+                    },
+                    chat_id: req.chat_id.trim().to_string(),
+                };
+                // Owned copy for the blocking closure — `args` itself must stay
+                // put (the loop re-initializes it every step).
+                let edit_args = args.clone();
+                // Read-only modes may run local edits but may not aim the
+                // write at a named path (same rule as the provider arm above).
+                let write_ok = caps.write_files;
+                let result = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String), String> {
+                    let bin = crate::media_edit::ensure_ffmpeg(&media_ctx.data_root)?;
+                    let args = &edit_args;
+                    let output_arg = if write_ok { args["output"].as_str() } else { None };
+                    let mut files: Vec<String> = Vec::new();
+                    let line = match action.as_str() {
+                        "probe" => {
+                            let path = args["path"].as_str().unwrap_or_default().trim().to_string();
+                            if path.is_empty() {
+                                return Err("edit_video probe needs `path`".into());
+                            }
+                            let (line, _info) = crate::media_edit::probe(&media_ctx, &bin, &path)?;
+                            line
+                        }
+                        "trim" => {
+                            let path = args["path"].as_str().unwrap_or_default().trim().to_string();
+                            let (Some(start), Some(end)) = (
+                                args["start"].as_f64(),
+                                args["end"].as_f64(),
+                            ) else {
+                                return Err("edit_video trim needs `start` and `end` (seconds)".into());
+                            };
+                            let rel = crate::media_edit::trim(
+                                &media_ctx,
+                                &bin,
+                                &path,
+                                start,
+                                end,
+                                output_arg,
+                            )?;
+                            files.push(rel.clone());
+                            format!("Trimmed {path} [{start:.2}s–{end:.2}s] → {rel}")
+                        }
+                        "merge" => {
+                            let paths: Vec<String> = args["paths"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let rel = crate::media_edit::merge(
+                                &media_ctx,
+                                &bin,
+                                &paths,
+                                output_arg,
+                            )?;
+                            files.push(rel.clone());
+                            format!(
+                                "Merged {} clips ({}) → {rel}",
+                                paths.len(),
+                                paths.join(", ")
+                            )
+                        }
+                        "slideshow" => {
+                            let paths: Vec<String> = args["paths"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let seconds = args["seconds"].as_f64().unwrap_or(3.0);
+                            let rel = crate::media_edit::slideshow(
+                                &media_ctx,
+                                &bin,
+                                &paths,
+                                seconds,
+                                output_arg,
+                            )?;
+                            files.push(rel.clone());
+                            format!(
+                                "Slideshow from {} images ({seconds:.2}s each) → {rel}",
+                                paths.len()
+                            )
+                        }
+                        "frames" => {
+                            let path = args["path"].as_str().unwrap_or_default().trim().to_string();
+                            let at: Vec<f64> = args["at"]
+                                .as_array()
+                                .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                                .unwrap_or_default();
+                            let rels = crate::media_edit::extract_frames(&media_ctx, &bin, &path, &at)?;
+                            files.extend(rels.iter().cloned());
+                            format!(
+                                "Extracted {} frame(s) from {path}: {}\n\
+                                 Feed one of these paths to edit_image to re-generate a moment.",
+                                rels.len(),
+                                rels.join(", ")
+                            )
+                        }
+                        "convert" => {
+                            let path = args["path"].as_str().unwrap_or_default().trim().to_string();
+                            let format = args["format"].as_str().unwrap_or_default().trim().to_string();
+                            let rel = crate::media_edit::convert(
+                                &media_ctx,
+                                &bin,
+                                &path,
+                                &format,
+                                output_arg,
+                            )?;
+                            files.push(rel.clone());
+                            format!("Converted {path} → {format}: {rel}")
+                        }
+                        other => {
+                            return Err(format!(
+                                "edit_video: unknown action `{other}` (probe | trim | merge | slideshow | frames | convert)"
+                            ))
+                        }
+                    };
+                    Ok((files, line))
+                })
+                .await
+                .map_err(|e| format!("edit_video join failed: {e}"));
+                match result {
+                    Ok(Ok((files, line))) => {
+                        if !files.is_empty() {
+                            // Row array, same contract as the provider arm above.
+                            ui_results = Some(json!(files.iter().map(|f| {
+                                crate::media_gen::media_file_row(f, 0, crate::media_gen::mime_for_path(f))
+                            }).collect::<Vec<_>>() ));
+                        }
+                        // The display contract rides on EVERY success: the
+                        // model must copy the reference into its reply.
+                        let markdown = files
+                            .iter()
+                            .map(|f| format!("![{f}]({})", crate::media_gen::codifa_media_ref(f)))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let line = if markdown.is_empty() {
+                            line
+                        } else {
+                            format!("{line}\n{markdown}")
+                        };
+                        (line, true)
+                    }
+                    Ok(Err(e)) => (e, false),
+                    Err(e) => (e, false),
                 }
             } else if name == "artifact" {
                 // Artifacts must emit an event so the transcript grows a card
@@ -9399,6 +9862,14 @@ async fn run_subagent(
         // Web search IS research, so the sub-agent inherits the same engine
         // chain the user configured for the parent turn.
         search_plugins: parent.search_plugins.clone(),
+        // Media slots ride along like the search chain above: a delegated turn
+        // that generates a preview image uses the configured provider.
+        image_provider_id: parent.image_provider_id.clone(),
+        image_model: parent.image_model.clone(),
+        image_fallbacks: parent.image_fallbacks.clone(),
+        video_provider_id: parent.video_provider_id.clone(),
+        video_model: parent.video_model.clone(),
+        video_fallbacks: parent.video_fallbacks.clone(),
         // A sub-agent never folds its own history mid-turn — it has a separate,
         // much smaller budget (compact_subagent_messages, before its loop).
         compact_at_percent: parent.compact_at_percent,
@@ -9415,7 +9886,14 @@ async fn run_subagent(
             sub_level
         },
         model_reasoning: sub_model_reasoning,
-        subagent_thinking: std::collections::HashMap::new(),
+        // The slot LEVELS flow through too: the web distiller this sub-agent's
+        // `web_search`/`fetch_url` calls run through reads the "web" level from
+        // THIS map, so an empty one silently dropped the Other row's effort to
+        // "none" inside every exploration. The sub-agent's own effort is applied
+        // via `thinking_level` above, and the mid-turn compact that also reads
+        // this map never runs here (the `mode != "subagent"` gate), so no other
+        // key changes behaviour.
+        subagent_thinking: parent.subagent_thinking.clone(),
         // The explore sub-agent carries its OWN fallback ladder (a fresh copy:
         // the slot list is re-read per call from the parent request).
         tool_fallbacks: parent.tool_fallbacks.clone(),
@@ -13552,6 +14030,12 @@ mod tests {
             allow_outside: false,
             allow_outside_folders: Vec::new(),
             search_plugins: Vec::new(),
+            image_provider_id: String::new(),
+            image_model: String::new(),
+            image_fallbacks: Vec::new(),
+            video_provider_id: String::new(),
+            video_model: String::new(),
+            video_fallbacks: Vec::new(),
             compact_at_percent: 80,
             fallback_provider: String::new(),
             fallback_model: String::new(),
@@ -14091,6 +14575,184 @@ mod tests {
             sent.iter().any(|b| b["model"] == MOCK_MODEL),
             "the explore sub-request must use the slot model; sent models: {:?}",
             sent.iter().map(|b| b["model"].clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Mock upstream for the explore → fetch_url → distiller chain. Streamed
+    /// calls (SSE) are counted: 0 = the parent issues `explore`, 1 = the
+    /// sub-agent issues `fetch_url`, anything later answers "done". A GET (no
+    /// JSON body) is the page fetch and gets a long HTML page; a non-streaming
+    /// POST is the distiller's completion.
+    async fn spawn_explore_web_distill_mock_upstream(
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        // Prose big enough that the fetched page clears FETCH_DISTILL_MIN_CHARS,
+        // so the distiller really fires.
+        let page_body: String = (0..400)
+            .map(|i| {
+                format!(
+                    "<p>Paragraph {i} of the mock page body, long enough to exceed the \
+                     six-thousand-character distillation threshold.</p>"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = format!("<html><head><title>Mock Page</title></head><body>{page_body}</body></html>");
+        let fetch_url: String = format!("http://{addr}/page");
+        // ONE counter across ALL connections: a per-connection counter made
+        // every streamed call look like the first, so the parent and the
+        // sub-agent were both answered with the `explore` tool_call forever.
+        let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let tx = tx.clone();
+                let page = page.clone();
+                let fetch_url = fetch_url.clone();
+                let stream_calls = std::sync::Arc::clone(&stream_calls);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .split("\r\n")
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body = serde_json::from_slice(&buf[head_end + 4..]).unwrap_or(Value::Null);
+                    let _ = tx.send(body.clone());
+                    let frame = |payload: String| format!("data: {payload}\n\n");
+                    let resp: String = if body.is_null() {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            page.len(),
+                            page
+                        )
+                    } else if body["stream"] == json!(true) {
+                        let idx = stream_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut sse = String::new();
+                        if idx == 0 {
+                            sse.push_str(&frame(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"explore","arguments":"{\"description\":\"look\",\"prompt\":\"what does the page say\"}"}}]}}]}).to_string()));
+                            sse.push_str(&frame(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"input_tokens":5,"output_tokens":3}}).to_string()));
+                        } else if idx == 1 {
+                            let args = json!({ "url": fetch_url }).to_string();
+                            sse.push_str(&frame(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"fetch_url","arguments":args}}]}}]}).to_string()));
+                            sse.push_str(&frame(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"input_tokens":7,"output_tokens":4}}).to_string()));
+                        } else {
+                            sse.push_str(&frame(json!({"choices":[{"delta":{"content":"done"}}]}).to_string()));
+                            sse.push_str(&frame(json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"input_tokens":11,"output_tokens":2}}).to_string()));
+                        }
+                        sse.push_str("data: [DONE]\n\n");
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        )
+                    } else {
+                        let payload =
+                            json!({"choices":[{"message":{"content":"distilled page summary"}}]})
+                                .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// The distiller INSIDE an exploration must run at the Other slot's own
+    /// level: the sub request inherits the parent's `subagent_thinking`, so a
+    /// `fetch_url` the explore performs may not silently drop the web slot's
+    /// reasoning effort to "none".
+    #[tokio::test]
+    async fn explore_distiller_runs_at_the_web_slot_level() {
+        let (mock_base, rx) = spawn_explore_web_distill_mock_upstream().await;
+        let bodies = drain_bodies(rx);
+        let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = json!({
+            "provider": "custom",
+            "provider_id": "chat-provider",
+            "model": "main/parent-model",
+            "base_url": format!("{mock_base}/v1"),
+            "api_key": "sk",
+            "api_keys": ["sk"],
+            "root": "/tmp/codifa-live-explore",
+            "mode": "build",
+            "prompt": "go explore",
+            "history": [],
+            "subagent_models": {
+                "explore": format!("slot-prov/{MOCK_MODEL}"),
+                "web": format!("slot-prov/{MOCK_MODEL}"),
+            },
+            "subagent_thinking": { "explore": "high", "web": "max" },
+            "thinking_level": "high",
+            "model_reasoning": true,
+            "providers": {
+                "slot-prov": {
+                    "kind": "custom",
+                    "baseUrl": format!("{mock_base}/v1"),
+                    "apiKeys": ["sk-slot"],
+                    // The capability flags a custom provider needs before any
+                    // reasoning parameter is sent (see the distiller test).
+                    "manualReasoningMap": { MOCK_MODEL: true },
+                    "thinkingLevelsMap": { MOCK_MODEL: ["none", "low", "medium", "high", "xhigh"] },
+                }
+            },
+            "data_root": "/tmp/codifa-live-explore-data"
+        });
+        let req: AgentRequest = serde_json::from_value(req).unwrap();
+        let mut emit = |_: &AgentEvent| {};
+        let _ = run_turn(&req, &mut emit, &cancel).await;
+
+        // The distiller's completion is the only non-streaming call the chain
+        // makes; everything else streams.
+        let sent = bodies.lock().unwrap().clone();
+        let distill_calls: Vec<&Value> =
+            sent.iter().filter(|b| b["stream"] == json!(false)).collect();
+        assert_eq!(
+            distill_calls.len(),
+            1,
+            "exactly one distiller call expected; bodies: {sent:?}"
+        );
+        let d = distill_calls[0];
+        assert_eq!(
+            d["model"], MOCK_MODEL,
+            "the distiller must use the web slot model: {d}"
+        );
+        assert_eq!(
+            d["reasoning_effort"], "xhigh",
+            "the web slot's level from the PARENT map must reach the distiller inside the explore: {d}"
+        );
+        let user_text = d["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            user_text.contains("PAGE:") && user_text.contains("Mock Page"),
+            "the fetched page must be the distiller's input: {user_text}"
         );
     }
 

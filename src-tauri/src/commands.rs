@@ -1881,6 +1881,46 @@ pub async fn select_file(app: AppHandle, start_dir: Option<String>) -> Option<Ve
     rx.recv().ok().flatten()
 }
 
+/// Save ONE generated media file to a user-chosen location. The path is the
+/// VIRTUAL media path (`media/<chat-slug>/<file>`) the UI carries; it is
+/// resolved against the data root with the same containment rule the serving
+/// route uses, so the dialog can never copy anything outside the media tree.
+#[tauri::command]
+pub async fn save_media_as(
+    app: AppHandle,
+    path: String,
+    default_name: Option<String>,
+) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let data_root = crate::state::current_data_root()?;
+    let abs = crate::media_gen::resolve_media_virtual(&data_root.to_string_lossy(), &path).ok()?;
+    if !abs.is_file() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    let mut builder = app.dialog().file().set_title("Save media as");
+    let fallback_name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = default_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(fallback_name.as_str());
+    if !name.is_empty() {
+        builder = builder.set_file_name(name);
+    }
+    builder.save_file(move |dest| {
+        let _ = tx.send(dest.map(|d| d.to_string()));
+    });
+    let dest = rx.recv().ok().flatten()?;
+    match std::fs::copy(&abs, &dest) {
+        Ok(_) => Some(dest),
+        Err(_) => None,
+    }
+}
+
 // --- quit flush handshake ---------------------------------------------------
 
 #[tauri::command]

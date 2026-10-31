@@ -40,6 +40,11 @@ const ArtifactPanel = lazy(() =>
 const TerminalTabPanel = lazy(() =>
   import("./TerminalTabPanel").then((m) => ({ default: m.TerminalTabPanel })),
 );
+// The media editor carries canvas/video interactions but no heavy deps; still
+// lazy so a chat-only session never parses it.
+const MediaEditorPanel = lazy(() =>
+  import("./MediaEditorPanel").then((m) => ({ default: m.MediaEditorPanel })),
+);
 
 /** Active viewer content for the right editor group (docked, no overlay). */
 export function ViewerContent() {
@@ -111,6 +116,18 @@ function ViewerContentInner() {
         key={active.id}
         filePath={active.filePath ?? ""}
         fileLine={active.fileLine}
+        fileRoot={active.fileRoot}
+        chatId={active.chatId ?? activeChatId}
+      />
+    );
+  }
+
+  if (active.kind === "media") {
+    // Generated/edited image or clip: the selection editor + agent handoff.
+    return (
+      <MediaEditorPanel
+        key={active.id}
+        filePath={active.filePath ?? ""}
         fileRoot={active.fileRoot}
         chatId={active.chatId ?? activeChatId}
       />

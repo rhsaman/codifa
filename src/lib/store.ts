@@ -23,6 +23,7 @@ import type {
   McpServerConfig,
   MarketplaceSource,
   MessageSegment,
+  CheckedModel,
   ProviderConfig,
   ProviderKind,
   QueuedMessage,
@@ -33,6 +34,7 @@ import type {
   Settings,
   SttFallback,
   TtsFallback,
+  MediaFallback,
   ToolFallback,
   ThinkingLevel,
   TokenUsage,
@@ -342,10 +344,27 @@ export const COMMUNITY_MARKETPLACE: MarketplaceSource = {
   kind: 'mcp',
 }
 
+/** The best-known community plugin marketplace (Jesse Vincent's superpowers
+ *  and friends) — a `.claude-plugin/marketplace.json` at the repo root. */
+export const SUPERPOWERS_MARKETPLACE: MarketplaceSource = {
+  repo: 'obra/superpowers-marketplace',
+  label: 'Superpowers',
+  kind: 'plugins',
+}
+
+/** The most-subscribed agent/skill collection on GitHub (94 plugin rows). */
+export const AGENTS_MARKETPLACE: MarketplaceSource = {
+  repo: 'wshobson/agents',
+  label: 'Claude agents',
+  kind: 'skills',
+}
+
 /** Every shipped default, in tab order. */
 export const DEFAULT_MARKETPLACES: MarketplaceSource[] = [
   ANTROPIC_SKILLS_MARKETPLACE,
   COMMUNITY_MARKETPLACE,
+  SUPERPOWERS_MARKETPLACE,
+  AGENTS_MARKETPLACE,
 ]
 
 /** Which generation of the shipped defaults a settings file last saw.
@@ -355,8 +374,10 @@ export const DEFAULT_MARKETPLACES: MarketplaceSource[] = [
  *  name yet, once.
  *
  *  4 retired the Anthropic plugin directory: files that still carry it lose it
- *  (see `mergeShippedMarketplaces`), which is the one edit a current file gets. */
-export const MARKETPLACE_DEFAULTS_VERSION = 4
+ *  (see `mergeShippedMarketplaces`), which is the one edit a current file gets.
+ *  5 adds the two well-known community marketplaces (Superpowers and the
+ *  claude-code-workflows agent collection) to every file that predates it. */
+export const MARKETPLACE_DEFAULTS_VERSION = 5
 
 // Cap on persisted base64 image payloads so one pasted screenshot (often
 // 1-5MB as data:image/...;base64) doesn't bloat every chats snapshot +
@@ -573,6 +594,22 @@ function normalizeTtsFallbacks(raw: unknown): TtsFallback[] {
     const model = typeof rec.model === 'string' ? rec.model.trim() : ''
     const voice = typeof rec.voice === 'string' ? rec.voice.trim() : ''
     out.push({ providerId, model, voice })
+  }
+  return out
+}
+
+/** Normalize a persisted image/video fallback list: keep rows with a provider
+ *  id, trim model. Shared by both media slots (same row shape). */
+function normalizeMediaFallbacks(raw: unknown): MediaFallback[] {
+  if (!Array.isArray(raw)) return []
+  const out: MediaFallback[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const rec = r as Record<string, unknown>
+    const providerId = typeof rec.providerId === 'string' ? rec.providerId.trim() : ''
+    if (!providerId) continue
+    const model = typeof rec.model === 'string' ? rec.model.trim() : ''
+    out.push({ providerId, model })
   }
   return out
 }
@@ -923,8 +960,8 @@ function writeSettingsNow(s: ReturnType<typeof useStore.getState>): Promise<unkn
   if (!s.settingsHydrated || persistSuspended) return Promise.resolve()
   const seq = ++persistSeq
   return (async () => {
-    const { settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
-    const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+    const { settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+    const payload = await encryptSettings({ ...settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
     if (seq !== persistSeq) return
     await api.storeSet('settings', payload)
   })()
@@ -1021,7 +1058,7 @@ export function setPersistSuspended(v: boolean): void {
 
 function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown> {
   if (persistSuspended) return Promise.resolve()
-  const { settings, chats, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
+  const { settings, chats, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } = s
   const seq = ++persistSeq
   const writes: Promise<unknown>[] = [
     (async () => {
@@ -1037,7 +1074,7 @@ function writeStateNow(s: ReturnType<typeof useStore.getState>): Promise<unknown
     // Encrypt API keys / OAuth secrets before they reach settings.json on disk.
     writes.unshift(
       (async () => {
-        const payload = await encryptSettings({ ...settings, root, dir, recentModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
+        const payload = await encryptSettings({ ...settings, root, dir, recentModels, checkedModels, sidebarOpen, rightPanelOpen, fontSize, viewerFontSize, terminalFontSize, dataPath, backupPath, sttProviderId, sttModel, sttFallbacks, sttLanguage, ttsProviderId, ttsModel, ttsVoice, ttsFallbacks, imageProviderId, imageModel, imageFallbacks, videoProviderId, videoModel, videoFallbacks, liveProviderId, liveModel, liveVoice, subagentModels, subagentThinking, toolFallbacks, cacheTtlMinutes, historyLimit, webSearchAutoFetch, skillCatalogMaxChars, workspaceColors, pinnedWorkspaces, workspaces, searchPlugins, marketplaces, searchConsole, pinnedChats, scheduleRunsSeen, computerUse, browserUse, marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION } as Settings)
         if (seq !== persistSeq) return
         await api.storeSet('settings', payload)
       })(),
@@ -1212,7 +1249,7 @@ function normalizeProvider(p: ProviderConfig): ProviderConfig {
 
 
 /** سقف مدل‌های پین‌شده در لیست اخیر — پین‌شده‌ها همیشه بالای لیست‌اند و از حذف خودکار مصون‌اند. */
-export const MAX_PINNED_RECENT_MODELS = 3
+export const MAX_PINNED_RECENT_MODELS = 5
 
 /** مرتب‌سازی لیست اخیر: پین‌شده‌ها اول (تازه‌ترین اول)، بعد بقیه (تازه‌ترین اول). */
 export function sortRecentModels(list: RecentModel[]): RecentModel[] {
@@ -1240,7 +1277,7 @@ function normalizeRecentModels(raw: unknown): RecentModel[] {
       if (model) out.push({ providerId: pid === 'ollama' ? 'local' : pid, model, lastUsed, ...(pinned ? { pinned: true as const } : {}) })
     }
   }
-  // پین‌شده‌ها اول؛ سقف پین روی داده قدیمی هم اعمال می‌شود (۳ تای تازه‌تر می‌مانند).
+  // پین‌شده‌ها اول؛ سقف پین روی داده قدیمی هم اعمال می‌شود (۵ تای تازه‌تر می‌مانند).
   const ordered = sortRecentModels(out)
   const pinned = ordered.filter((r) => r.pinned).slice(0, MAX_PINNED_RECENT_MODELS)
   const pinnedKeys = new Set(pinned.map((r) => `${r.providerId}/${r.model}`))
@@ -1249,6 +1286,23 @@ function normalizeRecentModels(raw: unknown): RecentModel[] {
   }
   // Sort by lastUsed descending (most recent first) and limit to 20
   return [...pinned, ...ordered.filter((r) => !r.pinned)].slice(0, 20)
+}
+
+/** پذیرش لیست checked ذخیره‌شده — فقط جفت‌های معتبر providerId/model؛
+ *  ورودی‌های خراب بی‌سروصدا دور ریخته می‌شوند. */
+function normalizeCheckedModels(raw: unknown): CheckedModel[] {
+  if (!Array.isArray(raw)) return []
+  const out: CheckedModel[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const e = entry as { providerId?: unknown; model?: unknown; lastOkAt?: unknown }
+    const model = typeof e.model === 'string' ? e.model.trim() : ''
+    const providerId = typeof e.providerId === 'string' ? e.providerId.trim() : ''
+    if (!model || !providerId) continue
+    const lastOkAt = typeof e.lastOkAt === 'number' ? e.lastOkAt : undefined
+    out.push({ providerId, model, ...(lastOkAt ? { lastOkAt } : {}) })
+  }
+  return out
 }
 
 interface State {
@@ -1265,6 +1319,8 @@ interface State {
   theme: string
   dir: 'rtl' | 'ltr'
   recentModels: RecentModel[]
+  /** مدل‌های تیک‌دار (تست موفق) — ماندگار، منبع تب Checked پیکر مدل. */
+  checkedModels: CheckedModel[]
   sidebarOpen: boolean
   /** Docked right panel (todos + future sections) — persisted like sidebarOpen. */
   rightPanelOpen: boolean
@@ -1381,10 +1437,13 @@ interface State {
   /** Remove a mode (and its custom system prompt); used to purge legacy custom modes. */
   removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: RecentModel[]) => void
+  /** جایگزینی کل لیست checked — پیکر مدل ادغام نتایج زنده را خودش انجام
+   *  می‌دهد و فقط لیست نهایی را اینجا می‌نویسد. */
+  setCheckedModels: (checkedModels: CheckedModel[]) => void
   addRecentModel: (model: string, providerId?: string) => void
   /** حذف دستی یک مدل از لیست اخیر (حتی پین‌شده) — پین‌شده‌ها فقط از حذف خودکار مصون‌اند. */
   removeRecentModel: (model: string, providerId?: string) => void
-  /** پین/آنپین یک مدل اخیر؛ سقف ۳ پین. وقتی سقف پر است پین جدید انجام نمی‌شود و false برمی‌گردد. */
+  /** پین/آنپین یک مدل اخیر؛ سقف ۵ پین. وقتی سقف پر است پین جدید انجام نمی‌شود و false برمی‌گردد. */
   togglePinRecentModel: (model: string, providerId?: string) => boolean
   setRoot: (root: string) => void
   setSidebarOpen: (open: boolean) => void
@@ -1443,6 +1502,20 @@ interface State {
   ttsVoice: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks: TtsFallback[]
+  /** Image-generation source: a settings.providers id. Empty = media image
+   *  tools answer "not configured". */
+  imageProviderId: string
+  /** Default image model id (e.g. gpt-image-1); a tool call may override it. */
+  imageModel: string
+  /** Ordered image fallback targets, tried after the primary source fails. */
+  imageFallbacks: MediaFallback[]
+  /** Video-generation source: a settings.providers id. Empty = generate_video
+   *  answers "not configured". */
+  videoProviderId: string
+  /** Default video model id (e.g. sora-2); a tool call may override it. */
+  videoModel: string
+  /** Ordered video fallback targets, tried after the primary source fails. */
+  videoFallbacks: MediaFallback[]
   /** Realtime (speech-to-speech) provider id. Empty = live voice runs the
    *  chunked STT + TTS pipeline instead of a realtime session. */
   liveProviderId: string
@@ -1478,6 +1551,12 @@ interface State {
   setTtsModel: (m: string) => void
   setTtsVoice: (v: string) => void
   setTtsFallbacks: (f: TtsFallback[]) => void
+  setImageProviderId: (id: string) => void
+  setImageModel: (m: string) => void
+  setImageFallbacks: (f: MediaFallback[]) => void
+  setVideoProviderId: (id: string) => void
+  setVideoModel: (m: string) => void
+  setVideoFallbacks: (f: MediaFallback[]) => void
   /** Per-subagent model overrides: explore / vision / compact. */
   subagentModels: Record<string, string>
   setSubagentModel: (agent: string, model: string) => void
@@ -2076,12 +2155,19 @@ export const useStore = create<State>((set, get) => ({
   ttsModel: 'tts-1',
   ttsVoice: 'alloy',
   ttsFallbacks: [],
+  imageProviderId: '',
+  imageModel: 'gpt-image-1',
+  imageFallbacks: [],
+  videoProviderId: '',
+  videoModel: 'sora-2',
+  videoFallbacks: [],
   liveProviderId: '',
   liveModel: '',
   liveVoice: '',
   liveVoiceChatId: null,
   liveVoiceState: 'idle',
   recentModels: [],
+  checkedModels: [],
   subagentModels: {},
   subagentThinking: {},
   toolFallbacks: {},
@@ -2559,6 +2645,21 @@ export const useStore = create<State>((set, get) => ({
       ttsModel: typeof raw.ttsModel === 'string' ? raw.ttsModel.trim() : 'tts-1',
       ttsVoice: typeof raw.ttsVoice === 'string' ? raw.ttsVoice.trim() : 'alloy',
       ttsFallbacks: normalizeTtsFallbacks((raw as Record<string, unknown>).ttsFallbacks),
+      // Media generation slots (image / video). Empty id = not configured; the
+      // agent tools then answer "configure an Image provider in Settings" like
+      // STT/TTS do, instead of guessing a provider.
+      imageProviderId:
+        typeof raw.imageProviderId === 'string' && raw.imageProviderId.trim() !== 'local'
+          ? raw.imageProviderId.trim()
+          : '',
+      imageModel: typeof raw.imageModel === 'string' ? raw.imageModel.trim() : 'gpt-image-1',
+      imageFallbacks: normalizeMediaFallbacks((raw as Record<string, unknown>).imageFallbacks),
+      videoProviderId:
+        typeof raw.videoProviderId === 'string' && raw.videoProviderId.trim() !== 'local'
+          ? raw.videoProviderId.trim()
+          : '',
+      videoModel: typeof raw.videoModel === 'string' ? raw.videoModel.trim() : 'sora-2',
+      videoFallbacks: normalizeMediaFallbacks((raw as Record<string, unknown>).videoFallbacks),
       // Realtime speech-to-speech. All three empty means "not configured",
       // which makes live voice use the chunked STT + TTS pipeline instead.
       liveProviderId: typeof raw.liveProviderId === 'string' ? raw.liveProviderId.trim() : '',
@@ -2653,6 +2754,7 @@ export const useStore = create<State>((set, get) => ({
       marketplaceDefaultsVersion: MARKETPLACE_DEFAULTS_VERSION,
       searchConsole: migratedSc,
       recentModels: Array.isArray(raw.recentModels) ? normalizeRecentModels(raw.recentModels) : [],
+      checkedModels: normalizeCheckedModels((raw as { checkedModels?: unknown }).checkedModels),
       sidebarOpen: raw.sidebarOpen !== false,
       rightPanelOpen: raw.rightPanelOpen === true,
       workspaceColors: raw.workspaceColors ?? {},
@@ -3017,6 +3119,9 @@ export const useStore = create<State>((set, get) => ({
       recentModels: s.recentModels.filter(
         (r) => r.providerId !== providerId || valid.has(bare(r.model)),
       ),
+      checkedModels: s.checkedModels.filter(
+        (c) => c.providerId !== providerId || valid.has(bare(c.model)),
+      ),
     }))
     get().persist()
   },
@@ -3212,6 +3317,31 @@ export const useStore = create<State>((set, get) => ({
     set({ ttsFallbacks: normalizeTtsFallbacks(f) })
     get().persist()
   },
+  setImageProviderId: (id) => {
+    set({ imageProviderId: (id ?? '').trim() })
+    get().persist()
+  },
+  setImageModel: (m) => {
+    // Empty allowed — a provider that needs no model id (or the tool passes one).
+    set({ imageModel: (m ?? '').trim() })
+    get().persist()
+  },
+  setImageFallbacks: (f) => {
+    set({ imageFallbacks: normalizeMediaFallbacks(f) })
+    get().persist()
+  },
+  setVideoProviderId: (id) => {
+    set({ videoProviderId: (id ?? '').trim() })
+    get().persist()
+  },
+  setVideoModel: (m) => {
+    set({ videoModel: (m ?? '').trim() })
+    get().persist()
+  },
+  setVideoFallbacks: (f) => {
+    set({ videoFallbacks: normalizeMediaFallbacks(f) })
+    get().persist()
+  },
   setWebSearchAutoFetch: (n) => {
     // 0 is a valid, deliberate value (disable auto-fetch) — unlike the TTL
     // setters above, we can't fall back with `|| default` since that would
@@ -3332,6 +3462,11 @@ export const useStore = create<State>((set, get) => ({
 
   setRecentModels: (recentModels) => {
     set({ recentModels })
+    get().persist()
+  },
+
+  setCheckedModels: (checkedModels) => {
+    set({ checkedModels })
     get().persist()
   },
 

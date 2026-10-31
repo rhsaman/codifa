@@ -83,10 +83,24 @@ export function RemoveIcon({ size = 11 }: { size?: number }) {
 /** دکمهٔ تست کنار هر مدل — کنترل‌شده از استور مشترک useModelTests تا
  *  «تست همهٔ مدل‌های پروایدر» بتواند همین دکمه را هم پیش ببرد.
  *  idle (رعد) → testing (…) → ok (✓ سبز) / fail (✕ قرمز + tooltip خطا).
- *  فقط با کلیک کاربر فایر می‌شود — پاپ‌آپ هنگام باز شدن هیچ درخواستی نمی‌زند. */
-export function ModelTestButton({ cfg, model }: { cfg: ProviderConfig; model: string }) {
+ *  `persistentOk`: مدل در لیست checked ذخیره‌شده است ولی در این نشست هنوز
+ *  تست نشده — به‌جای رعد، ✓ سبزِ «ذخیره‌شده» نشان داده می‌شود؛ کلیک دوباره
+ *  تستش می‌کند. فقط با کلیک کاربر فایر می‌شود — پاپ‌آپ هنگام باز شدن هیچ
+ *  درخواستی نمی‌زند. */
+export function ModelTestButton({
+  cfg,
+  model,
+  persistentOk = false,
+}: {
+  cfg: ProviderConfig;
+  model: string;
+  persistentOk?: boolean;
+}) {
   const { getStatus, run } = useModelTests();
   const st = getStatus(cfg, model);
+  // بعد از ری‌استارت وضعیت زنده idle است ولی لیست ذخیره‌شده این مدل را ✓
+  // می‌داند — نمایش ✓ سبز با tooltip متمایز، و کلیک = تست مجدد.
+  const shown = st.status === "idle" && persistentOk ? "ok" : st.status;
   const onClick = (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
@@ -96,12 +110,16 @@ export function ModelTestButton({ cfg, model }: { cfg: ProviderConfig; model: st
   return (
     <button
       type="button"
-      className={`pm-model-test ${st.status}`}
+      className={`pm-model-test ${shown}`}
       onClick={onClick}
-      title={st.msg || `Test ${model}`}
+      title={
+        shown === "ok" && st.status === "idle"
+          ? `Saved ✓ — ${model} passed an earlier test. Click to re-test.`
+          : st.msg || `Test ${model}`
+      }
       aria-label={`Test ${model}`}
     >
-      {st.status === "testing" ? "…" : st.status === "ok" ? "✓" : st.status === "fail" ? "✕" : <TestBoltIcon />}
+      {shown === "testing" ? "…" : shown === "ok" ? "✓" : shown === "fail" ? "✕" : <TestBoltIcon />}
     </button>
   );
 }

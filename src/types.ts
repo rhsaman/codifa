@@ -9,8 +9,18 @@ export interface RecentModel {
   model: string
   /** Epoch ms when this model was last used — used to sort recents by usage time. */
   lastUsed?: number
-  /** مدل پین‌شده همیشه بالای لیست اخیر می‌ماند و از حذف خودکار مصون است (سقف ۳). */
+  /** مدل پین‌شده همیشه بالای لیست اخیر می‌ماند و از حذف خودکار مصون است (سقف ۵). */
   pinned?: boolean
+}
+
+/** مدلی که تستش سبز (✓) بوده — لیست ماندگار تب «Checked» پیکر مدل. در
+ *  settings ذخیره می‌شود تا بعد از ری‌استارت هم تب همان مدل‌ها را نشان دهد؛
+ *  با تست مجدد ناموفق یا حذف دستی (✕) از لیست خارج می‌شود. */
+export interface CheckedModel {
+  providerId: string
+  model: string
+  /** Epoch ms of the last passing test. */
+  lastOkAt?: number
 }
 
 /** Per-mode tool access. Sent to the backend so tool gating is data-driven
@@ -161,6 +171,15 @@ export interface ToolFallback {
   model: string
 }
 
+/** One image/video-generation fallback target: a settings.providers id plus the
+ *  model id that target serves. Same shape as a tool fallback, kept as its own
+ *  type because the media slots resolve keys per provider kind (OpenAI-compatible
+ *  vs Google), not per reasoning level. */
+export interface MediaFallback {
+  providerId: string
+  model: string
+}
+
 /** Live voice session state for the realtime speech-to-speech UI. */
 export type LiveVoiceState = 'idle' | 'connecting' | 'live' | 'speaking' | 'closed' | 'error'
 
@@ -238,6 +257,22 @@ export interface Settings {
   ttsVoice?: string
   /** Ordered TTS fallback targets, tried after the primary TTS source fails. */
   ttsFallbacks?: TtsFallback[]
+  /** Image-generation source: a settings.providers id (OpenAI-compatible
+   *  /images/generations or Google Gemini :generateContent). Empty = the
+   *  generate_image / edit_image tools answer "not configured". */
+  imageProviderId?: string
+  /** Default image model id (e.g. gpt-image-1); a tool call may override it. */
+  imageModel?: string
+  /** Ordered image fallback targets, tried after the primary source fails. */
+  imageFallbacks?: MediaFallback[]
+  /** Video-generation source: a settings.providers id (OpenAI-compatible /videos
+   *  i.e. Sora, or Google Veo predictLongRunning). Empty = generate_video
+   *  answers "not configured". */
+  videoProviderId?: string
+  /** Default video model id (e.g. sora-2); a tool call may override it. */
+  videoModel?: string
+  /** Ordered video fallback targets, tried after the primary source fails. */
+  videoFallbacks?: MediaFallback[]
   /** Realtime (speech-to-speech) provider id. Empty = live voice runs the
    *  chunked STT + TTS pipeline instead of a realtime session. */
   liveProviderId?: string

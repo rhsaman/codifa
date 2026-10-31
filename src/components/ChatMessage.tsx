@@ -26,7 +26,8 @@ import { dedupDocPaths, extractInlinePathParts, filePathFromHref, isDocPath, loo
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
-import { cancelSteer } from "../lib/api";
+import { cancelSteer, ensureSidecar, peekSidecarUrl } from "../lib/api";
+import { resolveLocalMedia } from "../lib/mediaUrl";
 import { fallbackReason, humanizeError } from "../lib/errorText";
 import { friendlyTtsError, speakableMessageText, useTtsPlayback } from "../lib/tts";
 import type { SpeakProviderOpts } from "../lib/api";
@@ -630,6 +631,19 @@ function extractVideoEmbed(href: string): VideoEmbed | null {
 
 // ── Markdown image with error handling ──────────────────────────────────────
 // Shows a fallback placeholder when the image URL is broken or unreachable.
+// `codifa-media://` sources (and bare `media/...` paths the model writes by
+// hand) resolve to the local /media/file route; a VIDEO extension renders an
+// inline player instead of a broken <img>. Local media is CENTERED and carries
+// an edit affordance: clicking the media (or the pencil) opens the Media
+// editor in the right-hand viewer.
+
+/** Pencil-in-square glyph for the edit affordance — a stroke icon matching the
+ *  app's other chrome icons, deliberately NOT an emoji. */
+const EDIT_ICON = (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+  </svg>
+);
 
 function MarkdownImage({
   src,
@@ -637,8 +651,63 @@ function MarkdownImage({
   ...props
 }: React.ImgHTMLAttributes<HTMLImageElement>) {
   const [errored, setErrored] = useState(false);
+  // The sidecar URL resolves ASYNCHRONOUSLY (and is unknown right after an app
+  // restart, when persisted history renders before any request ran). A media
+  // source that failed for that reason must RETRY once the backend is known —
+  // a memo over a non-reactive peek would otherwise stick on the broken
+  // fallback forever.
+  const [retryTick, setRetryTick] = useState(0);
+  const retriesLeft = useRef(3);
+  const resolved = useMemo(
+    () => resolveLocalMedia(src, peekSidecarUrl()),
+    // retryTick forces the re-resolve after ensureSidecar() succeeds.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the tick IS the signal
+    [src, retryTick],
+  );
+  const retryOrError = () => {
+    const isLocalMedia = Boolean(resolveLocalMedia(src, "http://retry-probe.invalid"));
+    if (isLocalMedia && retriesLeft.current > 0) {
+      retriesLeft.current -= 1;
+      void ensureSidecar().then((url) => {
+        if (url) setRetryTick((t) => t + 1);
+        else setErrored(true);
+      });
+      return;
+    }
+    setErrored(true);
+  };
 
-  if (!src || errored) {
+  if (resolved?.video) {
+    if (errored) {
+      return (
+        <span className="md-image-wrap md-image-errored">
+          <span className="md-image-fallback">🎬 {alt || "Video unavailable"}</span>
+        </span>
+      );
+    }
+    return (
+      <span className="md-image-wrap md-media-wrap">
+        <video
+          className="md-video-inline"
+          src={resolved.url}
+          controls
+          preload="metadata"
+          onError={retryOrError}
+        />
+        <button
+          type="button"
+          className="md-media-edit"
+          title="Open in the Media editor"
+          onClick={() => useViewerTabs.getState().openMedia(resolved.path)}
+        >
+          {EDIT_ICON}
+        </button>
+      </span>
+    );
+  }
+
+  const effectiveSrc = resolved?.url ?? src;
+  if (!effectiveSrc || errored) {
     return (
       <span className="md-image-wrap md-image-errored">
         <span className="md-image-fallback">
@@ -649,15 +718,34 @@ function MarkdownImage({
   }
 
   return (
-    <span className="md-image-wrap">
+    <span className={`md-image-wrap${resolved ? " md-media-wrap" : ""}`}>
       {/* eslint-disable-next-line @next/next/no-img-element -- markdown inline image */}
       <img
-        src={src}
+        src={effectiveSrc}
         alt={alt ?? ""}
         loading="lazy"
-        onError={() => setErrored(true)}
+        onClick={
+          resolved
+            ? () => useViewerTabs.getState().openMedia(resolved.path)
+            : undefined
+        }
+        style={resolved ? { cursor: "pointer" } : undefined}
+        onError={retryOrError}
         {...props}
       />
+      {resolved && (
+        <button
+          type="button"
+          className="md-media-edit"
+          title="Open in the Media editor"
+          onClick={(e) => {
+            e.stopPropagation();
+            useViewerTabs.getState().openMedia(resolved.path);
+          }}
+        >
+          {EDIT_ICON}
+        </button>
+      )}
       {alt ? <span className="md-image-caption">{alt}</span> : null}
     </span>
   );
@@ -883,9 +971,11 @@ const PROSE_REHYPE_PLUGINS = [rehypeArrows];
 
 /** react-markdown blanks the href of every scheme it does not know, which
  *  killed `file://` citations before the `a` override could turn them into
- *  file chips. Keep `file:` intact; every other scheme stays sanitized. */
+ *  file chips. Keep `file:` AND `codifa-media://` (generated images/videos —
+ *  MarkdownImage resolves them to local /media/file URLs) intact; every other
+ *  scheme stays sanitized. */
 function keepFileUrls(url: string): string {
-  return /^file:/i.test(url) ? url : defaultUrlTransform(url);
+  return /^(file|codifa-media):/i.test(url) ? url : defaultUrlTransform(url);
 }
 
 /** One markdown prose block. Besides rendering, it fixes the direction of

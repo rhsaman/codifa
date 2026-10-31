@@ -163,7 +163,7 @@ export function focusAppPane(pane: AppPane, opts?: { ring?: boolean }): void {
       // The arrival also hands the bare vim keys to the pane the user just
       // opened — without a click there is no pointer intent to read.
       const paneRoot = document.querySelector<HTMLElement>(
-        '.file-viewer, .review-docked-wrap, .review-overlay, .text-viewer',
+        '.file-viewer, .review-docked-wrap, .review-overlay, .text-viewer, .schedule-inbox',
       )
       if (paneRoot) markVimRegion(paneRoot)
       if (ring) flashPaneFocus(document.querySelector<HTMLElement>('.viewer-group') || root)

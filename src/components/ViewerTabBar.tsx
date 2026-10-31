@@ -152,6 +152,8 @@ const KIND_ICON: Record<ViewerKind, () => React.JSX.Element> = {
   // File tabs render their own per-path icon (see the map below); this
   // placeholder only satisfies the Record type.
   file: () => <ReviewIcon />,
+  // Media tabs render a per-path image/video glyph too — placeholder only.
+  media: () => <ReviewIcon />,
   text: PlanIcon,
   explore: ExploreIcon,
   files: FilesIcon,

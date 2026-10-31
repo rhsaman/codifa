@@ -80,9 +80,14 @@ export function finishedRunIds(runs: ScheduleRun[]): string[] {
   return runs.filter((r) => r.status !== "running").map((r) => r.id);
 }
 
-/** اجازه اعلان سیستم‌عامل را در صورت نیاز می‌گیرد؛ false یعنی اعلان ممکن نیست. */
+/** اجازه اعلان سیستم‌عامل را در صورت نیاز می‌گیرد؛ false یعنی اعلان ممکن نیست.
+ *  پوستهٔ دسکتاپ (Tauri) از پلاگین نیتیو استفاده می‌کند — Web Notification API
+ *  داخل WKWebView بی‌صدا هیچ‌چیز نشان نمی‌دهد — و مرورگر (حالت serve) همان
+ *  وب API را دارد؛ فقط آن‌جا ممکن است پرامپت اجازه لازم شود. */
 export async function ensureScheduleNotificationPermission(): Promise<boolean> {
   try {
+    const coder = typeof window === "undefined" ? undefined : window.coder;
+    if (coder?.notifyOs) return true; // دسکتاپ: پلاگین نیتیو، بدون پرامپت
     if (typeof Notification === "undefined") return false;
     if (Notification.permission === "granted") return true;
     if (Notification.permission !== "denied") {
@@ -95,20 +100,27 @@ export async function ensureScheduleNotificationPermission(): Promise<boolean> {
   }
 }
 
-/** یک اعلان سیستم‌عامل برای ران جدید نشان می‌دهد (best-effort، بدون throw).
- * کلیک روی اعلان (در صورت پشتیبانی) `onOpen` را صدا می‌زند تا Inbox باز شود. */
+/** یک اعلان سیستم‌عامل برای ران پایانیافته نشان می‌دهد (best-effort، بدون
+ * throw). دسکتاپ از طریق `window.coder.notifyOs` (پلاگین نیتیو تارِی) می‌رود؛
+ * در مرورگر Web Notification API — آن‌جا کلیک روی اعلان (در صورت پشتیبانی)
+ * `onOpen` را صدا می‌زند تا Inbox باز شود. */
 export function notifyScheduleRun(
   run: ScheduleRun,
   taskName: string | null | undefined,
   onOpen?: () => void,
 ): void {
   try {
-    if (typeof Notification === "undefined") return;
-    if (Notification.permission !== "granted") return;
     const name = (taskName ?? "").trim() || "Scheduled task";
     const status = run.status === "error" ? "Failed" : run.status === "running" ? "Running" : "Done";
     const tokens = scheduleRunTokenTotal(run);
     const body = tokens > 0 ? `${status} · ${tokens} tokens` : status;
+    const coder = typeof window === "undefined" ? undefined : window.coder;
+    if (coder?.notifyOs) {
+      void coder.notifyOs(name, body);
+      return;
+    }
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
     const n = new Notification(name, { body });
     if (onOpen) n.onclick = () => onOpen();
   } catch {
@@ -119,6 +131,11 @@ export function notifyScheduleRun(
 /** اعلان تجمیعی وقتی چند ران تازه هم‌زمان دیده شدند (جلوگیری از اسپم اعلان). */
 export function notifyScheduleRunBatch(count: number, onOpen?: () => void): void {
   try {
+    const coder = typeof window === "undefined" ? undefined : window.coder;
+    if (coder?.notifyOs) {
+      void coder.notifyOs("Scheduled tasks", `${count} new schedule runs`);
+      return;
+    }
     if (typeof Notification === "undefined") return;
     if (Notification.permission !== "granted") return;
     const n = new Notification("Scheduled tasks", {

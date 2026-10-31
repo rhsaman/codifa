@@ -51,6 +51,8 @@ const bridge: CoderApi = {
       scope: scope ?? null,
     }),
   selectFolder: () => invoke<string | null>('select_folder'),
+  saveMediaAs: (path: string, defaultName?: string) =>
+    invoke<string | null>('save_media_as', { path, defaultName }),
   selectFile: (startDir?: string) =>
     invoke<string[] | null>('select_file', { startDir: startDir ?? null }),
   importFile: (absPath) => invoke<string | null>('import_file', { absPath }),
@@ -157,6 +159,13 @@ const bridge: CoderApi = {
   startUpdate: () => invoke<OpResult>('start_update'),
   onUpdateProgress: (cb) =>
     eventSubscribe<UpdateProgress>('updater:progress', (p) => cb(p)),
+  // Native notification plugin (desktop: permission is always granted, no
+  // prompt exists). Swallow failures — an OS notification is best-effort, the
+  // in-app inbox badge is the source of truth.
+  notifyOs: (title, body) =>
+    invoke<void>('plugin:notification|notify', { options: { title, body } })
+      .then(() => true)
+      .catch(() => false),
 }
 
 /** Latest absolute path seen per dropped file name (see getPathForFile). */

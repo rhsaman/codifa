@@ -7,7 +7,7 @@ import { registerChatDeleteHook, useStore, workspaceKey } from './store'
 import type { ChatDropPos, ChatTreeNode } from './chatTree'
 import { appendChat as appendViewerLeaf, buildFromList as buildViewerTree, collectChatIds as collectViewerTabIds, containsChat as viewerTreeContains, dropOnto as dropViewerOnto, leafCount as viewerLeafCount, normalizeTree as normalizeViewerTreeRaw, removeChat as removeViewerLeaf, replaceChat as replaceViewerLeafTab, resizePair as resizeViewerPairRaw, setNodeSize as setViewerNodeSizeRaw } from './chatTree'
 
-export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'terminal'
+export type ViewerKind = 'review' | 'trace' | 'inbox' | 'schedule' | 'todos' | 'plan' | 'browser' | 'file' | 'text' | 'explore' | 'files' | 'artifact' | 'artifacts' | 'media' | 'terminal'
 
 /** Kinds that belong to ONE chat: their rail icon follows the focused chat.
  *  Trace/Browser are session surfaces of one run; Plan (the saved plan.md of
@@ -24,7 +24,7 @@ const CHAT_SCOPED_KINDS = new Set<ViewerKind>(['trace', 'browser', 'plan'])
 // focused chat. A per-chat explorer gave every chat its own `files:<chatId>`
 // tab, so the rail showed one icon per chat AND activating it pushed the open
 // file tab out of the rail.
-const WORKSPACE_SCOPED_KINDS = new Set<ViewerKind>(['review', 'plan', 'todos', 'text', 'explore', 'file', 'terminal'])
+const WORKSPACE_SCOPED_KINDS = new Set<ViewerKind>(['review', 'plan', 'todos', 'text', 'explore', 'file', 'media', 'terminal'])
 
 /** Kinds that are NEVER written to localStorage. A terminal tab is a live pty:
  *  restoring one after a restart would spawn a shell (or an editor) the user
@@ -36,12 +36,12 @@ const EPHEMERAL_KINDS = new Set<ViewerKind>(['terminal'])
 let shellCounter = 0
 
 export function viewerTabId(kind: ViewerKind, scopeKey: string, path?: string): string {
-  if (kind === 'file') {
+  if (kind === 'file' || kind === 'media') {
     const clean = (path ?? '').trim()
     // Workspace-scoped file id `file:<wsKey>:<path>` (one tab per file per
     // workspace). Without a path keep the `file:<wsKey>` prefix so existing
     // callers keep working.
-    return clean ? `file:${scopeKey}:${clean}` : `file:${scopeKey}`
+    return clean ? `${kind}:${scopeKey}:${clean}` : `${kind}:${scopeKey}`
   }
   if (kind === 'terminal') {
     // `target` is the run target (a bare shell, or the argv of an editor
@@ -107,6 +107,7 @@ const VALID_KINDS: ReadonlySet<string> = new Set<ViewerKind>([
   'files',
   'artifact',
   'artifacts',
+  'media',
   'terminal',
 ])
 
@@ -122,6 +123,8 @@ const VIEWER_KIND_LABEL: Record<ViewerKind, string> = {
   browser: 'Browser',
   // Unused: file tabs keep their per-path title (the file name).
   file: 'File',
+  // Unused: media tabs keep their per-path title (the file name).
+  media: 'Media',
   text: 'Text',
   // Unused: explore tabs keep their own title ("Explore · <description>").
   explore: 'Explore',
@@ -396,6 +399,10 @@ interface ViewerTabsState {
    *  same path in the same chat focuses the tab and updates the target line.
    *  `chatId` defaults to the active chat; empty means a legacy global tab. */
   openFile: (path: string, line?: number, root?: string, chatId?: string) => void
+  /** Open a generated/edited image or video in the Media editor (one tab per
+   *  path per workspace). The editor reads the bytes live from the workspace
+   *  and offers selection → "ask the agent" context, crop/trim/merge. */
+  openMedia: (path: string, root?: string, chatId?: string) => void
   /** Open a collapsed chat text in its own viewer tab (one tab per chat).
    *  Reopening updates the tab in place. `format` sets the default render
    *  mode: "md" renders the body as markdown (default), "text" keeps it
@@ -803,7 +810,7 @@ const initialViewerTree = (() => {
   return id ? buildViewerTree([id], 'row') : null
 })()
 
-export const useViewerTabs = create<ViewerTabsState>((set) => ({
+export const useViewerTabs = create<ViewerTabsState>((set, get) => ({
   tabs: initial.tabs,
   activeId: initial.activeId,
   viewerTree: initialViewerTree,
@@ -1140,6 +1147,11 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       return next
     }),
   openFile: (path, line, root, chatId) => {
+    // Generated/edited media routes to its OWN editor tab (timeline, region
+    // select), not the code viewer: an mp4 in FileViewerPanel is a dead end.
+    if (/\.(png|jpe?g|webp|gif|bmp|mp4|webm|mov|m4v)$/i.test(path.trim())) {
+      return get().openMedia(path, root, chatId)
+    }
     // An explicit `chatId` means a chat's OWN surface opened the file (its file
     // explorer / files panel). The tab is workspace-scoped, so the pane shows it
     // from any chat of the workspace — but the OWNER chat is still focused so
@@ -1183,6 +1195,48 @@ export const useViewerTabs = create<ViewerTabsState>((set) => ({
       // The panes paint ONLY tree leaves: without this the new tab stayed
       // invisible whenever a resumed/split tree existed, so the pane kept the
       // previous page (e.g. Schedule) on screen while the rail marked this tab.
+      const revealed = revealViewerTab(s.viewerTree, id, s.focusedViewerId, new Set(tabs.map((t) => t.id)))
+      if (revealed?.tree && revealed.tree !== s.viewerTree) persistViewerTree(revealed.tree)
+      persist(next.tabs, next.activeId)
+      return {
+        ...next,
+        viewerTree: revealed?.tree ?? s.viewerTree,
+        focusedViewerId: revealed?.focusedId ?? s.focusedViewerId,
+      }
+    })
+  },
+  openMedia: (path, root, chatId) => {
+    const owner = (chatId ?? '').trim()
+    if (owner) {
+      const st = useStore.getState()
+      if (
+        owner !== st.activeChatId &&
+        (st.openChatIds.includes(owner) || st.visibleChatIds.includes(owner))
+      ) {
+        st.focusWindow(owner)
+      }
+    }
+    return set((s) => {
+      const clean = path.trim()
+      if (!clean) return {}
+      const cid = (chatId ?? currentChatId()).trim()
+      const wsKey = workspaceKeyForChat(cid || undefined)
+      const id = cid ? viewerTabId('media', wsKey, clean) : `media:${clean}`
+      const entry: ViewerTab = {
+        id,
+        kind: 'media',
+        ...(cid ? { chatId: cid, wsKey } : {}),
+        title: clean.split(/[\\/]/).pop() || clean,
+        filePath: clean,
+        fileRoot: root,
+        createdAt: Date.now(),
+      }
+      const raw = s.tabs.some((t) => t.id === id)
+        ? s.tabs.map((t) => (t.id === id ? { ...t, fileRoot: root ?? t.fileRoot, ...(cid ? { chatId: cid, wsKey } : {}) } : t))
+        : [...s.tabs, entry]
+      const tabs = capTabs(raw)
+      const lastActiveByChat = cid ? { ...s.lastActiveByChat, [cid]: id } : s.lastActiveByChat
+      const next = { tabs, activeId: id, paneOpen: true, lastActiveByChat }
       const revealed = revealViewerTab(s.viewerTree, id, s.focusedViewerId, new Set(tabs.map((t) => t.id)))
       if (revealed?.tree && revealed.tree !== s.viewerTree) persistViewerTree(revealed.tree)
       persist(next.tabs, next.activeId)

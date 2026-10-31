@@ -21,6 +21,8 @@ export const api = {
   ): Promise<{ refreshToken: string; accessToken: string; expiresIn: number }> =>
     window.coder.googleSignIn(clientId, clientSecret, scope),
   selectFolder: () => window.coder.selectFolder(),
+  saveMediaAs: (path: string, defaultName?: string) =>
+    window.coder.saveMediaAs?.(path, defaultName) ?? null,
   selectFile: (startDir?: string) => window.coder.selectFile(startDir),
   importFile: (absPath: string): Promise<string | null> => window.coder.importFile(absPath),
   fsList: (root: string, rel: string): Promise<FileEntry[]> => window.coder.fsList(root, rel),

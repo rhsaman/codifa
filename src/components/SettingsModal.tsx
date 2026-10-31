@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { MarketplaceKind, McpServerConfig, McpTransport, ProviderConfig, ProviderKind, SearchConsoleConfig, SearchPluginConfig, SearchPluginKind, ThinkingLevel, ToolFallback } from '../types'
 import type { MarketplaceSource, PluginInfo } from '../types'
@@ -7,10 +7,13 @@ import { getSkillFile, listMcp, listSkills, syncSkill } from '../lib/api'
 import {
   deletePlugin,
   installPlugin,
+  isRowInstalling,
   listMarketplace,
   listPluginConnectors,
   listPlugins,
   listPluginSkills,
+  marketKey,
+  subscribeInstallChanges,
   togglePlugin,
   updatePlugin,
 } from '../lib/plugins'
@@ -338,17 +341,15 @@ const SEARCH_ENGINE_KINDS: Array<{ kind: SearchPluginKind; label: string; needsK
  *  1.5MB index stay cheap; the rest arrives as the user scrolls. */
 const CARD_BATCH = 24
 
-/** A marketplace's stable id — its install address, not its display label. */
-function marketKey(repo: string, path?: string, gitRef?: string): string {
-  return `${repo}|${path ?? ''}|${gitRef ?? ''}`
-}
-
 /** Settings → Marketplaces: the plugin catalogues the user subscribes to.
  *
  *  An index is a plain JSON file in a git repo (Claude's `marketplace.json`),
  *  so "adding a marketplace" is just naming a repo. Browsing one writes nothing
  *  — a row installs through the SAME `installPlugin` the `/plugin install`
  *  command uses, which is why a listed plugin and a typed repo cannot diverge.
+ *  The install ADDRESS a row carries is the id everywhere here (`marketKey`,
+ *  from `lib/plugins`): the same key the install registry and the installed
+ *  list match on.
  */
 function MarketplaceEditor() {
   const marketplaces = useStore((s) => s.marketplaces ?? [])
@@ -371,7 +372,16 @@ function MarketplaceEditor() {
   const [installed, setInstalled] = useState<PluginInfo[]>([])
   const [error, setError] = useState('')
   const [note, setNote] = useState('')
-  const [busy, setBusy] = useState('')
+
+  /** Rows mid-install RIGHT NOW, read from the module-level registry in
+   *  `lib/plugins`. This editor unmounts on every tab switch, so component
+   *  state cannot hold an install in flight: the button fell back to a plain
+   *  "Install" on return (the reported "my download was cancelled") and a
+   *  single busy STRING let a second install blank the first's indicator.
+   *  The registry is per-address and survives the unmount; this subscription
+   *  only re-renders the grid when it changes. */
+  const [, bumpInstalls] = useReducer((n: number) => n + 1, 0)
+  useEffect(() => subscribeInstallChanges(bumpInstalls), [bumpInstalls])
 
   /** Which rows are already here, so a browsed plugin can say so and the button
    *  reads "Update". Matched by the ADDRESS it was installed from, not by name:
@@ -380,6 +390,13 @@ function MarketplaceEditor() {
     const out = await listPlugins()
     if (Array.isArray(out)) setInstalled(out)
   }, [])
+
+  // Returning to this tab must show the truth: the installed list was only
+  // ever read AFTER an install, so a revisit showed every row as not-installed
+  // and every finished bundle read "Install" again.
+  useEffect(() => {
+    void refreshInstalled()
+  }, [refreshInstalled])
 
   /** Load one marketplace's index into the merged map (each read is cached
    *  server-side, so a kind tab fills from every catalogue without waiting
@@ -480,7 +497,9 @@ function MarketplaceEditor() {
    *  not appear as `/`-commands until a reload. */
   const install = async (entry: MarketplaceEntry) => {
     const key = marketKey(entry.repo, entry.repo_path, entry.repo_ref)
-    setBusy(key)
+    // The registry (not the button) is the one guard: a double click, a
+    // re-click after a tab switch, and the chat path all meet here.
+    if (isRowInstalling(key)) return
     setError('')
     const out = await installPlugin({
       repo: entry.repo,
@@ -496,7 +515,6 @@ function MarketplaceEditor() {
       ...(entry.category ? { category: entry.category } : {}),
       ...(entry.description ? { description: entry.description } : {}),
     })
-    setBusy('')
     if ('error' in out) {
       setError(`${entry.name}: ${out.error}`)
       return
@@ -744,16 +762,17 @@ function MarketplaceEditor() {
                 {shown.map((entry) => {
                   const key = marketKey(entry.repo, entry.repo_path, entry.repo_ref)
                   const have = installedKeys.has(key)
+                  const installing = isRowInstalling(key)
                   return (
                     <div key={key} className="market-card">
                       <div className="market-card-head">
                         <span className="market-card-name" dir="ltr">{entry.name}</span>
                         <button
                           className={`btn tiny ${have ? 'secondary' : ''}`}
-                          disabled={busy === key}
+                          disabled={installing}
                           onClick={() => void install(entry)}
                         >
-                          {busy === key ? 'Installing…' : have ? 'Update' : 'Install'}
+                          {installing ? 'Installing…' : have ? 'Update' : 'Install'}
                         </button>
                       </div>
                       {entry.description ? (
@@ -1455,6 +1474,129 @@ function sameRows(a: ToolFallback[], b: ToolFallback[]): boolean {
     a.every((r, i) => r.providerId === b[i].providerId && r.model === b[i].model)
   )
 }
+
+/** The provider dropdown every Media Providers control shares. Lists the
+ *  non-local providers with their display name, kind and base URL, so two
+ *  same-named rows stay distinguishable. */
+function MediaProviderSelect({
+  value,
+  onChange,
+  emptyLabel,
+}: {
+  value: string
+  onChange: (id: string) => void
+  /** When set, a first option with this label is rendered. On a primary slot
+   *  the empty value means "feature off"; on a fallback row it only ever shows
+   *  for a stored row that names no provider (the backend skips such rows) —
+   *  a live row is cleared with Remove, not by re-picking the empty option. */
+  emptyLabel?: string
+}) {
+  const providers = useStore((s) => s.settings.providers)
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} dir="ltr">
+      {emptyLabel !== undefined && <option value="">{emptyLabel}</option>}
+      {providers
+        .filter((p) => p.kind !== 'ollama')
+        .map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name
+              ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})`
+              : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
+          </option>
+        ))}
+    </select>
+  )
+}
+
+/** The Settings → Media Providers fallback ladder: an ordered list of
+ *  provider+model targets tried when the slot's primary fails. One row per
+ *  rung; TTS rows add a voice column. Shared by STT/TTS/Image/Video so the
+ *  four lists behave and read the same. */
+function MediaFallbackList<R extends { providerId: string; model: string; voice?: string }>({
+  label,
+  addLabel,
+  rows,
+  onChange,
+  withVoice = false,
+  modelPlaceholder,
+  voicePlaceholder = 'alloy',
+}: {
+  label: string
+  /** Text after "+ Add" on the trailing button ("STT fallback"), singular. */
+  addLabel: string
+  rows: R[]
+  onChange: (rows: R[]) => void
+  withVoice?: boolean
+  modelPlaceholder: string
+  voicePlaceholder?: string
+}) {
+  const providers = useStore((s) => s.settings.providers)
+  // Same non-local filter the dropdown shows: a new rung starts on a provider
+  // it can actually route through.
+  const firstRoutable = providers.find((p) => p.kind !== 'ollama')?.id ?? ''
+  const patch = (i: number, partial: Partial<{ providerId: string; model: string; voice: string }>) =>
+    onChange(rows.map((r, j) => (j === i ? ({ ...r, ...partial } as R) : r)))
+  const add = () => {
+    const row = { providerId: firstRoutable, model: '', ...(withVoice ? { voice: '' } : {}) }
+    onChange([...rows, row as R])
+  }
+  return (
+    <div className="voice-fallbacks">
+      <label className="field-label">{label}</label>
+      <div className="hint">Tried in order when the primary fails — top first.</div>
+      <div className="voice-fallback-head" aria-hidden="true">
+        <span className="voice-col-provider">Provider</span>
+        <span className="voice-col-model">Model</span>
+        {withVoice && <span className="voice-col-voice">Voice</span>}
+        <span className="voice-head-remove" />
+      </div>
+      {rows.map((fb, i) => (
+        <div key={i} className="voice-fallback-card">
+          <div className="voice-col-provider">
+            <MediaProviderSelect
+              value={fb.providerId}
+              onChange={(id) => patch(i, { providerId: id })}
+              emptyLabel={fb.providerId ? undefined : 'Not selected'}
+            />
+          </div>
+          <div className="voice-col-model">
+            <input
+              value={fb.model}
+              onChange={(e) => patch(i, { model: e.target.value })}
+              dir="ltr"
+              placeholder={modelPlaceholder}
+              aria-label={`${label} row ${i + 1} model`}
+            />
+          </div>
+          {withVoice && (
+            <div className="voice-col-voice">
+              <input
+                value={fb.voice ?? ''}
+                onChange={(e) => patch(i, { voice: e.target.value })}
+                dir="ltr"
+                placeholder={voicePlaceholder}
+                aria-label={`${label} row ${i + 1} voice`}
+              />
+            </div>
+          )}
+          <button
+            type="button"
+            className="btn tiny secondary voice-remove-btn"
+            title="Remove this fallback"
+            aria-label={`Remove ${label} row ${i + 1}`}
+            onClick={() => onChange(rows.filter((_, j) => j !== i))}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+      <button type="button" className="btn tiny secondary voice-add-btn" onClick={add}>
+        + Add {addLabel}
+      </button>
+    </div>
+  )
+}
+
 export function SettingsModal({ onClose, initialTab }: { onClose: () => void; initialTab?: string }) {
   const settings = useStore((s) => s.settings)
   const updateProvider = useStore((s) => s.updateProvider)
@@ -1498,6 +1640,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
   const setTtsVoice = useStore((s) => s.setTtsVoice)
   const ttsFallbacks = useStore((s) => s.ttsFallbacks)
   const setTtsFallbacks = useStore((s) => s.setTtsFallbacks)
+  const imageProviderId = useStore((s) => s.imageProviderId)
+  const imageModel = useStore((s) => s.imageModel)
+  const imageFallbacks = useStore((s) => s.imageFallbacks)
+  const setImageProviderId = useStore((s) => s.setImageProviderId)
+  const setImageModel = useStore((s) => s.setImageModel)
+  const setImageFallbacks = useStore((s) => s.setImageFallbacks)
+  const videoProviderId = useStore((s) => s.videoProviderId)
+  const videoModel = useStore((s) => s.videoModel)
+  const videoFallbacks = useStore((s) => s.videoFallbacks)
+  const setVideoProviderId = useStore((s) => s.setVideoProviderId)
+  const setVideoModel = useStore((s) => s.setVideoModel)
+  const setVideoFallbacks = useStore((s) => s.setVideoFallbacks)
   const subagentModels = useStore((s) => s.subagentModels)
   const setSubagentModel = useStore((s) => s.setSubagentModel)
   const subagentThinking = useStore((s) => s.subagentThinking)
@@ -3542,31 +3696,26 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
         <>
             <div className="field models-tab">
               <div className="slot-intro">
-                <b>Media Providers</b> — speech runs on your own providers,
-                nothing on-device. STT posts audio to{' '}
-                {'<base_url>/audio/transcriptions'} and TTS to{' '}
-                {'<base_url>/audio/speech'}.
+                <b>Media Providers</b> — the providers behind the app's media
+                features: voice input (STT), spoken replies (TTS), image and
+                video generation, and live voice. Everything runs on your own
+                providers — nothing on-device. Speech calls hit{' '}
+                <code>{'<base_url>'}/audio/transcriptions</code> (STT) and{' '}
+                <code>{'<base_url>'}/audio/speech</code> (TTS).
               </div>
 
               <div className="model-card model-card-voice">
                 <div className="model-card-head">
                   <div className="model-card-titles">
                     <span className="model-card-title">Speech to Text (STT)</span>
-                    <span className="model-card-desc">Voice input transcription</span>
+                    <span className="model-card-desc">Voice input — mic dictation and audio transcription</span>
                   </div>
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
                     <div className="voice-field">
                       <label className="field-label">STT provider</label>
-                    <select value={sttProviderId} onChange={(e) => setSttProviderId(e.target.value)} dir="ltr">
-                      <option value="">Not selected</option>
-                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                        </option>
-                      ))}
-                    </select>
+                    <MediaProviderSelect value={sttProviderId} onChange={setSttProviderId} emptyLabel="Not selected" />
                     </div>
                     <div className="voice-field">
                       <label className="field-label">STT model</label>
@@ -3582,36 +3731,18 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                       ))}
                     </select>
                     <div className="hint">
-                      بدون زبان صریح، Whisper روی کلیپ‌های کوتاه زبان را اشتباه تشخیص می‌دهد و کلمات فارسی خراب می‌شوند.
+                      Without an explicit language, Whisper mis-detects the language on short
+                      clips and Persian words come out garbled.
                     </div>
                     </div>
                   </div>
-                  <div className="voice-fallbacks">
-                  <label className="field-label">STT fallbacks</label>
-                  <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
-                  {sttFallbacks.map((fb, i) => (
-                    <div key={i} className="voice-fallback-card">
-                      <select value={fb.providerId} onChange={(e) => {
-                        const next = [...sttFallbacks]
-                        next[i] = { ...next[i], providerId: e.target.value }
-                        setSttFallbacks(next)
-                      }} dir="ltr">
-                        {providers.filter((p) => p.kind !== 'ollama').map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                          </option>
-                        ))}
-                      </select>
-                      <input value={fb.model} onChange={(e) => {
-                        const next = [...sttFallbacks]
-                        next[i] = { ...next[i], model: e.target.value }
-                        setSttFallbacks(next)
-                      }} dir="ltr" placeholder="whisper-1" />
-                      <button type="button" className="btn tiny secondary voice-remove-btn" onClick={() => setSttFallbacks(sttFallbacks.filter((_, j) => j !== i))}>Remove</button>
-                    </div>
-                  ))}
-                  <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setSttFallbacks([...sttFallbacks, { providerId: providers[0]?.id ?? '', model: '' }])}>+ Add STT fallback</button>
-                  </div>
+                  <MediaFallbackList
+                    label="STT fallbacks"
+                    addLabel="STT fallback"
+                    rows={sttFallbacks}
+                    onChange={setSttFallbacks}
+                    modelPlaceholder="whisper-1"
+                  />
                 </div>
               </div>
 
@@ -3619,21 +3750,14 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                 <div className="model-card-head">
                   <div className="model-card-titles">
                     <span className="model-card-title">Text to Speech (TTS)</span>
-                    <span className="model-card-desc">Voice output synthesis</span>
+                    <span className="model-card-desc">Voice output — reads the assistant's replies aloud</span>
                   </div>
                 </div>
                 <div className="model-card-body">
                   <div className="voice-section">
                     <div className="voice-field">
                       <label className="field-label">TTS provider</label>
-                    <select value={ttsProviderId} onChange={(e) => setTtsProviderId(e.target.value)} dir="ltr">
-                      <option value="">Not selected</option>
-                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                        </option>
-                      ))}
-                    </select>
+                    <MediaProviderSelect value={ttsProviderId} onChange={setTtsProviderId} emptyLabel="Not selected" />
                     </div>
                     <div className="voice-field">
                       <label className="field-label">TTS model</label>
@@ -3645,38 +3769,89 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                     </div>
                   </div>
 
-                  <div className="voice-fallbacks">
-                  <label className="field-label">TTS fallbacks</label>
-                  <div className="hint">به ترتیب از بالا تلاش می‌شوند.</div>
-                  {ttsFallbacks.map((fb, i) => (
-                    <div key={i} className="voice-fallback-card">
-                      <select value={fb.providerId} onChange={(e) => {
-                        const next = [...ttsFallbacks]
-                        next[i] = { ...next[i], providerId: e.target.value }
-                        setTtsFallbacks(next)
-                      }} dir="ltr">
-                        <option value="">Not selected</option>
-                        {providers.filter((p) => p.kind !== 'ollama').map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                          </option>
-                        ))}
-                      </select>
-                      <input value={fb.model} onChange={(e) => {
-                        const next = [...ttsFallbacks]
-                        next[i] = { ...next[i], model: e.target.value }
-                        setTtsFallbacks(next)
-                      }} dir="ltr" placeholder="tts-1" />
-                      <input value={fb.voice} onChange={(e) => {
-                        const next = [...ttsFallbacks]
-                        next[i] = { ...next[i], voice: e.target.value }
-                        setTtsFallbacks(next)
-                      }} dir="ltr" placeholder="alloy" />
-                      <button type="button" className="btn tiny secondary voice-remove-btn" onClick={() => setTtsFallbacks(ttsFallbacks.filter((_, j) => j !== i))}>Remove</button>
-                    </div>
-                  ))}
-                  <button type="button" className="btn tiny secondary voice-add-btn" onClick={() => setTtsFallbacks([...ttsFallbacks, { providerId: providers[0]?.id ?? '', model: '', voice: '' }])}>+ Add TTS fallback</button>
+                  <MediaFallbackList
+                    label="TTS fallbacks"
+                    addLabel="TTS fallback"
+                    rows={ttsFallbacks}
+                    onChange={setTtsFallbacks}
+                    withVoice
+                    modelPlaceholder="tts-1"
+                  />
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Image Generation</span>
+                    <span className="model-card-desc">Used by the agent's generate_image / edit_image tools</span>
                   </div>
+                </div>
+                <div className="model-card-body">
+                  <div className="voice-section">
+                    <div className="voice-field">
+                      <label className="field-label">Image provider</label>
+                    <MediaProviderSelect value={imageProviderId} onChange={setImageProviderId} emptyLabel="Not selected" />
+                    <div className="hint">
+                      OpenAI-compatible endpoints (<code>/images/generations</code>,{' '}
+                      <code>/images/edits</code>), Google Gemini and OpenRouter are supported.
+                      Generated files are saved under <code>~/.codifa/media</code> in the chat's
+                      own folder and deleted with the chat.
+                    </div>
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">Image model</label>
+                    <input value={imageModel} onChange={(e) => setImageModel(e.target.value)} dir="ltr" placeholder="gpt-image-1" />
+                    <div className="hint">
+                      The default — the agent may request a different model in the same request.
+                    </div>
+                    </div>
+                  </div>
+
+                  <MediaFallbackList
+                    label="Image fallbacks"
+                    addLabel="image fallback"
+                    rows={imageFallbacks}
+                    onChange={setImageFallbacks}
+                    modelPlaceholder="gpt-image-1"
+                  />
+                </div>
+              </div>
+
+              <div className="model-card model-card-voice">
+                <div className="model-card-head">
+                  <div className="model-card-titles">
+                    <span className="model-card-title">Video Generation</span>
+                    <span className="model-card-desc">Used by the agent's generate_video / edit_video tools</span>
+                  </div>
+                </div>
+                <div className="model-card-body">
+                  <div className="voice-section">
+                    <div className="voice-field">
+                      <label className="field-label">Video provider</label>
+                    <MediaProviderSelect value={videoProviderId} onChange={setVideoProviderId} emptyLabel="Not selected" />
+                    <div className="hint">
+                      OpenAI-compatible Sora format (<code>/videos</code>), Google Veo (
+                      <code>predictLongRunning</code>) and OpenRouter are supported. Local
+                      trim/merge runs through ffmpeg (downloaded automatically on first use).
+                    </div>
+                    </div>
+                    <div className="voice-field">
+                      <label className="field-label">Video model</label>
+                    <input value={videoModel} onChange={(e) => setVideoModel(e.target.value)} dir="ltr" placeholder="sora-2" />
+                    <div className="hint">
+                      The default — the agent may request a different model in the same request.
+                    </div>
+                    </div>
+                  </div>
+
+                  <MediaFallbackList
+                    label="Video fallbacks"
+                    addLabel="video fallback"
+                    rows={videoFallbacks}
+                    onChange={setVideoFallbacks}
+                    modelPlaceholder="sora-2"
+                  />
                 </div>
               </div>
 
@@ -3691,16 +3866,15 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
                   <div className="voice-section">
                     <div className="voice-field">
                       <label className="field-label">Realtime provider (optional)</label>
-                    <select value={liveProviderId} onChange={(e) => setLiveProviderId(e.target.value)} dir="ltr">
-                      <option value="">Not selected — chunked STT + TTS</option>
-                      {providers.filter((p) => p.kind !== 'ollama').map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name ? `${p.name} (${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''})` : `${p.kind}${p.baseUrl ? ` — ${p.baseUrl}` : ''}`}
-                        </option>
-                      ))}
-                    </select>
+                    <MediaProviderSelect
+                      value={liveProviderId}
+                      onChange={setLiveProviderId}
+                      emptyLabel="Not selected — chunked STT + TTS"
+                    />
                     <div className="hint">
-                      با انتخاب پروایدر، حالت live voice تمام‌دوطرفه (realtime) روی همان پروایدر اجرا می‌شود — هر endpoint سازگار با OpenAI realtime، نه فقط OpenAI. خالی بماند، حالت چانکی با هر پروایدر STT/TTS کار می‌کند.
+                      With a provider selected, live voice runs as full-duplex realtime on that
+                      provider — any OpenAI-realtime-compatible endpoint, not just OpenAI. Leave
+                      empty for the chunked mode, which works with any STT/TTS provider.
                     </div>
                     </div>
                     <div className="voice-field">

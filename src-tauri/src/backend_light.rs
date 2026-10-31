@@ -777,6 +777,181 @@ async fn artifact_list(
     }
 }
 
+// ---------- media serving + manual editing (generated images / videos) ------
+
+#[derive(serde::Deserialize)]
+struct MediaFileQuery {
+    /// Legacy param from the workspace-storage era; accepted and ignored so a
+    /// stale renderer URL still serves instead of 400ing.
+    #[serde(default)]
+    #[allow(dead_code)]
+    root: String,
+    path: String,
+}
+
+/// GET /media/file?path= — stream one generated media file to the renderer.
+/// This is what the chat's `codifa-media://` markdown references resolve to:
+/// the agent only ever names a VIRTUAL path (`media/<chat-slug>/<file>`)
+/// relative to the DATA root, the webview cannot read the disk, so the
+/// renderer rewrites the scheme to this route. Resolution goes through
+/// `media_gen::resolve_media_virtual` — containment inside
+/// `<data_root>/media/` — so the route can never be walked out of it.
+async fn media_file(State(st): State<AppState>, Query(q): Query<MediaFileQuery>) -> Response<Body> {
+    let abs = match crate::media_gen::resolve_media_virtual(&st.root().to_string_lossy(), &q.path) {
+        Ok(abs) => abs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "detail": e })),
+            )
+                .into_response()
+        }
+    };
+    let bytes = match std::fs::read(&abs) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "detail": format!("cannot read {}: {e}", q.path) })),
+            )
+                .into_response()
+        }
+    };
+    let mime = crate::media_gen::mime_for_path(&q.path);
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(mime),
+            ),
+            // Never cache: a regenerated file with the same name must show up.
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct MediaEditBody {
+    /// The workspace root — sources the user picked from the workspace.
+    root: String,
+    /// The chat that OWNS the media folder these operations write into.
+    #[serde(default)]
+    chat_id: String,
+    /// crop | trim | merge | slideshow | probe
+    action: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    x: u32,
+    #[serde(default)]
+    y: u32,
+    #[serde(default)]
+    w: u32,
+    #[serde(default)]
+    h: u32,
+    #[serde(default)]
+    start: f64,
+    #[serde(default)]
+    end: f64,
+    #[serde(default)]
+    seconds: f64,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// POST /media/edit — the MANUAL editor's local operations (Media Viewer
+/// panel). Same ffmpeg helpers the `edit_video` tool uses, so the tool and the
+/// panel can never drift apart on how a cut or a merge is performed.
+async fn media_edit(Json(b): Json<MediaEditBody>) -> Response<Body> {
+    let data_root = crate::state::current_data_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+    // The editor only touches THIS chat's media folder.
+    let ctx = crate::media_edit::MediaCtx {
+        workspace_root: b.root.clone(),
+        data_root: data_root.clone(),
+        chat_id: b.chat_id.clone(),
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, String), String> {
+        let bin = crate::media_edit::ensure_ffmpeg(&data_root)?;
+        let mut files: Vec<String> = Vec::new();
+        let line = match b.action.as_str() {
+            "crop" => {
+                let rel = crate::media_edit::crop_image(
+                    &ctx,
+                    &bin,
+                    &b.path,
+                    b.x,
+                    b.y,
+                    b.w,
+                    b.h,
+                    b.output.as_deref(),
+                )?;
+                files.push(rel.clone());
+                format!("Cropped {rel}")
+            }
+            "trim" => {
+                let rel = crate::media_edit::trim(
+                    &ctx,
+                    &bin,
+                    &b.path,
+                    b.start,
+                    b.end,
+                    b.output.as_deref(),
+                )?;
+                files.push(rel.clone());
+                format!("Trimmed {rel}")
+            }
+            "merge" => {
+                let rel = crate::media_edit::merge(
+                    &ctx,
+                    &bin,
+                    &b.paths,
+                    b.output.as_deref(),
+                )?;
+                files.push(rel.clone());
+                format!("Merged {} clips → {rel}", b.paths.len())
+            }
+            "slideshow" => {
+                let rel = crate::media_edit::slideshow(
+                    &ctx,
+                    &bin,
+                    &b.paths,
+                    if b.seconds > 0.0 { b.seconds } else { 3.0 },
+                    b.output.as_deref(),
+                )?;
+                files.push(rel.clone());
+                format!("Slideshow → {rel}")
+            }
+            "probe" => {
+                let (line, _) = crate::media_edit::probe(&ctx, &bin, &b.path)?;
+                line
+            }
+            other => return Err(format!("unknown media edit action: {other}")),
+        };
+        Ok((files, line))
+    })
+    .await
+    .map_err(|e| format!("media edit join failed: {e}"));
+    match result {
+        Ok(Ok((files, line))) => Json(json!({ "ok": true, "files": files, "message": line }))
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "detail": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": e })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------- native /chat/compact (phase 3-1) ----------
 
 #[derive(serde::Deserialize)]
@@ -2338,6 +2513,12 @@ pub fn router(state: AppState) -> Router {
         .route("/artifacts/assets", get(artifact_assets))
         .route("/artifacts/list", get(artifact_list))
         .route("/artifacts", delete(artifact_delete))
+        // Generated media: the chat's `codifa-media://` markdown resolves to
+        // /media/file, and the manual Media Editor's local operations (crop,
+        // trim, merge, slideshow) run through /media/edit — the SAME helpers
+        // the `edit_video` tool uses.
+        .route("/media/file", get(media_file))
+        .route("/media/edit", post(media_edit))
         .route("/chat/compact", post(chat_compact))
         .route("/chat/stream", post(chat_stream_entry))
         // Mid-turn steer: inject a message into the RUNNING turn of a chat.

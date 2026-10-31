@@ -103,6 +103,10 @@ const CATEGORY_KEYWORDS: &[(&str, &str)] = &[
     ("learning", "یادگیری، آموزش"),
     ("math", "ریاضی، محاسبات"),
     ("location", "موقعیت مکانی، نقشه"),
+    ("document", "سند، ورد، word، docx"),
+    ("spreadsheet", "اکسل، صفحه‌گسترده، excel، xlsx، csv"),
+    ("presentation", "پاورپوینت، ارائه، powerpoint، pptx"),
+    ("pdf", "پی‌دی‌اف، pdf"),
 ];
 
 /// Concrete technologies an index row may NAME, and the capability each means.
@@ -216,6 +220,20 @@ const DOMAIN_ANCHORS: &[(&str, &str)] = &[
     ("maps", "location"),
     ("map", "location"),
     ("geo", "location"),
+    ("word", "document"),
+    ("docx", "document"),
+    ("document", "document"),
+    ("documents", "document"),
+    ("excel", "spreadsheet"),
+    ("xlsx", "spreadsheet"),
+    ("spreadsheet", "spreadsheet"),
+    ("spreadsheets", "spreadsheet"),
+    ("csv", "spreadsheet"),
+    ("powerpoint", "presentation"),
+    ("pptx", "presentation"),
+    ("slide", "presentation"),
+    ("slides", "presentation"),
+    ("pdf", "pdf"),
 ];
 
 /// The phrase lists an EARLIER mapper wrote into the bundles it seeded.
@@ -3072,6 +3090,20 @@ mod tests {
         let _ = fs::remove_dir_all(&up_root);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn office_skill_names_seed_their_persian_triggers() {
+        // The ZCode office packs install with skill folders named docx, xlsx,
+        // pptx and pdf and carry no Persian keywords of their own. Those nouns
+        // name a real capability, so the NAME seeds the trigger — and a name
+        // that only CONTAINS one ("password" is not "word") must stay empty.
+        for name in ["docx", "docx-viewer", "documents", "xlsx", "spreadsheets", "pptx", "pdf"] {
+            let seeded = category_keywords(name);
+            assert!(!seeded.is_empty(), "{name} must seed keywords, got none");
+        }
+        assert_eq!(category_keywords("password manager"), Vec::<String>::new());
+        assert_eq!(category_keywords("Mystery Bundle"), Vec::<String>::new());
     }
 
     #[test]

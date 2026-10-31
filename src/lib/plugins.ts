@@ -78,8 +78,11 @@ export async function translateKeywords(params: {
         items: params.items,
       }),
       // One batched call for the whole list, so the budget only has to cover a
-      // slow model, not one round trip per skill.
-      signal: AbortSignal.timeout(120_000),
+      // slow model, not one round trip per skill. The backend walks a whole
+      // candidate chain before giving up (the "Other" slot model, its
+      // fallbacks, then the active model — each bounded at 45s), so the
+      // client's own cap has to outlast the chain, not the first rung.
+      signal: AbortSignal.timeout(240_000),
     })
     const data = (await res.json().catch(() => ({}))) as {
       keywords?: Record<string, string[]>
@@ -284,7 +287,11 @@ async function browseIndex(body: {
  *  The backend reads the repo (`plugin.json` / `.claude-plugin/plugin.json`,
  *  its skills and its `.mcp.json`) and writes it through the same path a
  *  hand-authored plugin takes, so a reinstall updates in place.
- */
+ *
+ *  While the request runs, the row is registered in the module-level install
+ *  registry below: an install is a BACKEND job that outlives the component that
+ *  started it, and the UI has to keep telling the truth about it across tab
+ *  switches and Settings reopenings. */
 export async function installPlugin(body: {
   repo: string
   repo_path?: string
@@ -302,17 +309,140 @@ export async function installPlugin(body: {
 }): Promise<PluginInstallResult | { error: string }> {
   const url = await ensureSidecar()
   if (!url) return { error: 'the local backend is not ready' }
+  const key = marketKey(body.repo, body.repo_path, body.repo_ref)
+  installingRows.set(key, body.name ?? body.repo)
+  notifyInstalls()
   try {
-    const res = await fetch(`${url}/plugins/install`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
+    let res: Response
+    try {
+      res = await fetch(`${url}/plugins/install`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      // A network-level failure — most often the webview cutting a request that
+      // heard no bytes for ~60s (WebKit's no-data timer). The backend's
+      // blocking install keeps running either way, so "connection dropped" is
+      // NOT "install failed": watch the plugin list for the bundle landing
+      // before reporting anything.
+      return await waitForLateInstall(body, err)
+    }
     const data = (await res.json().catch(() => ({}))) as PluginInstallResult & { detail?: string }
     if (!res.ok) return { error: data.detail || `install failed (${res.status})` }
     return data
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) }
+  } finally {
+    installingRows.delete(key)
+    notifyInstalls()
+  }
+}
+
+/** Install addresses of the rows that are MID-INSTALL right now, module-level.
+ *
+ *  Keyed by install address (`marketKey`), valued by the row name for
+ *  debugging. Component state cannot hold this: the Marketplaces editor
+ *  unmounts on every tab switch inside Settings, and losing the flight made a
+ *  running install invisible — the card fell back to a plain Install button,
+ *  which read as "my download was cancelled" and invited a second, concurrent
+ *  install of the same row. It also cannot be ONE busy string: two rows
+ *  installing side by side must both keep their spinner, not blank each other. */
+const installingRows = new Map<string, string>()
+/** Bumped on every registry change; a re-render trigger for subscribers, which
+ *  then read the rows through `isRowInstalling`. */
+let installVersion = 0
+const installListeners = new Set<() => void>()
+
+function notifyInstalls(): void {
+  installVersion += 1
+  for (const listener of installListeners) listener()
+}
+
+/** Subscribe to install-flight changes; pairs with `isRowInstalling`. */
+export function subscribeInstallChanges(listener: () => void): () => void {
+  installListeners.add(listener)
+  return () => {
+    installListeners.delete(listener)
+  }
+}
+
+/** Monotonic version of the install registry, for subscribers that want a
+ *  `useSyncExternalStore` snapshot value instead of a callback. */
+export function installStateVersion(): number {
+  return installVersion
+}
+
+/** Whether the row at this install address is mid-install right now. */
+export function isRowInstalling(key: string): boolean {
+  return installingRows.has(key)
+}
+
+/** The stable id of one install address — repo, sub-folder and ref. */
+export function marketKey(repo: string, path?: string, gitRef?: string): string {
+  return `${repo}|${path ?? ''}|${gitRef ?? ''}`
+}
+
+/** How long a dropped install connection is watched before the failure is
+ *  reported as real. The backend task runs to completion either way; the poll
+ *  only decides what the UI SAYS about it. */
+let LATE_INSTALL_WATCH_MS = 60_000
+let LATE_INSTALL_POLL_MS = 2_000
+
+/** Test hook: the late-install watch runs on real timers, so a test shrinks
+ *  the window to keep the suite fast. Not for app code. */
+export function _setLateInstallTimingForTests(pollMs: number, watchMs: number): void {
+  LATE_INSTALL_POLL_MS = pollMs
+  LATE_INSTALL_WATCH_MS = watchMs
+}
+
+/** A dropped connection is not a failed install: poll the plugin list until the
+ *  bundle lands (matched by the address it was installed from — the same three
+ *  fields the "Update" badge matches on), then report success like a finished
+ *  response would. Never lands → report the drop, with the hint that the
+ *  backend may still be working. */
+async function waitForLateInstall(
+  body: { repo: string; repo_path?: string; repo_ref?: string },
+  cause: unknown,
+): Promise<PluginInstallResult | { error: string }> {
+  const deadline = Date.now() + LATE_INSTALL_WATCH_MS
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, LATE_INSTALL_POLL_MS))
+    let listed: PluginInfo[] | { error: string }
+    try {
+      listed = await listPlugins()
+    } catch {
+      continue
+    }
+    if (!Array.isArray(listed)) continue
+    const landed = listed.find(
+      (p) =>
+        (p.source_repo ?? '') === body.repo &&
+        (p.source_path ?? '') === (body.repo_path ?? '') &&
+        (p.source_ref ?? '') === (body.repo_ref ?? ''),
+    )
+    if (!landed) continue
+    // The success note reads the skill/connector counts off the result, so
+    // fill them from the same stores a finished response would have carried.
+    const [skills, connectors] = await Promise.all([
+      listPluginSkills()
+        .then((rows) => (Array.isArray(rows) ? rows : ([] as PluginSkillRow[])))
+        .catch(() => [] as PluginSkillRow[]),
+      listPluginConnectors()
+        .then((rows) => (Array.isArray(rows) ? rows : ([] as PluginConnectorRow[])))
+        .catch(() => [] as PluginConnectorRow[]),
+    ])
+    return {
+      installed: 'created',
+      slug: landed.slug,
+      skills: skills.filter((s) => s.plugin_slug === landed.slug).map((s) => s.name),
+      mcp: connectors.filter((c) => c.plugin_slug === landed.slug).map((c) => c.name),
+      plugin: landed,
+    }
+  }
+  const why = cause instanceof Error ? cause.message : String(cause)
+  return {
+    error:
+      `${why} — the connection to the backend dropped mid-install, but the install ` +
+      `may still finish there; check the Plugins tab before retrying`,
   }
 }
 

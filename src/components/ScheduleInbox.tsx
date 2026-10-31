@@ -6,6 +6,9 @@ import { clearOrphanScheduleRuns, clearScheduleRuns, listAllScheduleRuns, listSc
 import { finishedRunIds, unseenRunCount, unseenRunCountForTask } from "../lib/schedule-notify";
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
+import { useVimScroll } from "../lib/useVimScroll";
+import { markVimRegion } from "../lib/panePointer";
+import { focusChatInput } from "../lib/chatFocus";
 import { mdComponents } from "./ChatMessage";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
 import type { ScheduleRun, ScheduledTask } from "../types";
@@ -111,6 +114,32 @@ export function ScheduleInbox() {
   const [clearingOrphans, setClearingOrphans] = useState(false);
   const [confirmClearOrphans, setConfirmClearOrphans] = useState(false);
   const [orphanError, setOrphanError] = useState<string | null>(null);
+  // پرامپت تسک به‌صورت پیش‌فرض جمع است — پیام‌های اجرا مهم‌ترند؛ کلیک بازش می‌کند.
+  const [promptOpen, setPromptOpen] = useState(false);
+
+  // j/k/h/l مثل بقیهٔ پنل‌ها: ناحیهٔ ownership کل دیالوگ اینباکس است ولی
+  // اسکرولر هدف ستون پیام‌هاست — پیام‌ها مهم‌تر از لیست تسک‌اند.
+  const inboxRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  useVimScroll(chatScrollRef, inboxRef);
+
+  // باز شدن اینباکس کلیدها را همین‌جا می‌گیرد (مثل پاپ‌آپ گیت‌دیف): فوکوس روی
+  // ریشه + علامت‌گذاری ناحیهٔ vim، تا j/k بدون کلیک داخل پنل کار کند. بستن،
+  // فوکوس را به کامپوزر چت برمی‌گرداند.
+  useEffect(() => {
+    if (!open) return;
+    const el = inboxRef.current;
+    if (!el) return;
+    if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+    el.focus({ preventScroll: true });
+    markVimRegion(el);
+    return () => {
+      const a = document.activeElement;
+      if (a && a !== document.body) return; // کاربر خودش فوکوس را برده جای دیگر
+      const id = useStore.getState().activeChatId;
+      if (id) requestAnimationFrame(() => focusChatInput(id));
+    };
+  }, [open]);
 
   // عرض پنل — با درگ لبهٔ چپ (مثل پنل گیت‌دیف) + ذخیرهٔ محلی.
   const [width, setWidth] = useState(() => {
@@ -243,6 +272,7 @@ export function ScheduleInbox() {
     // تسک عوض شد → تأییدیه Clear تسک قبلی را دور بریز.
     setConfirmClear(false);
     setClearError(null);
+    setPromptOpen(false);
     setTaskRuns(null);
     void (async () => {
       const out = await listScheduleRuns(selectedTask.id, 20);
@@ -294,6 +324,7 @@ export function ScheduleInbox() {
     <div className="schedule-inbox-overlay" dir={dir}>
       <div className="schedule-inbox-backdrop" onClick={() => setOpen(false)} />
       <div
+        ref={inboxRef}
         className="schedule-inbox"
         role="dialog"
         aria-label="Schedule inbox"
@@ -365,7 +396,7 @@ export function ScheduleInbox() {
               </div>
             )}
           </div>
-          <div className="schedule-inbox-chat">
+          <div ref={chatScrollRef} className="schedule-inbox-chat">
             {!selectedTask ? (
               orphanRuns.length > 0 ? (
                 <div className="schedule-inbox-runs">
@@ -512,9 +543,36 @@ export function ScheduleInbox() {
                   )}
                 </div>
                 {clearError && <div className="schedule-error">{clearError}</div>}
-                <div className="schedule-inbox-prompt">
-                  <div className="schedule-inbox-prompt-label">Task</div>
-                  <InboxMarkdown text={selectedTask.prompt} />
+                <div className={`schedule-inbox-prompt${promptOpen ? " open" : ""}`}>
+                  <button
+                    type="button"
+                    className="schedule-inbox-prompt-head"
+                    aria-expanded={promptOpen}
+                    title={promptOpen ? "Collapse task" : "Show task"}
+                    onClick={() => setPromptOpen((v) => !v)}
+                  >
+                    <span className="schedule-inbox-prompt-label">Task</span>
+                    {!promptOpen && (
+                      <span className="schedule-inbox-prompt-preview">
+                        {selectedTask.prompt.replace(/\s+/g, " ").trim()}
+                      </span>
+                    )}
+                    <svg
+                      className="schedule-inbox-prompt-chevron"
+                      width="12"
+                      height="12"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <polyline points="6 9 12 15 18 9" />
+                    </svg>
+                  </button>
+                  {promptOpen && <InboxMarkdown text={selectedTask.prompt} />}
                 </div>
                 {loading && <div className="schedule-runs-empty">Loading…</div>}
                 {!displayedRuns ? (

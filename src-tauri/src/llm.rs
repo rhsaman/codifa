@@ -9,8 +9,10 @@
 
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Resolved per-call LLM configuration (mirrors llm.py's build_chat_model args).
@@ -671,6 +673,92 @@ fn is_key_error(status: u16, body: &str) -> bool {
         || body.to_ascii_lowercase().contains("quota")
 }
 
+// ---------- per-key cooldowns ----------
+//
+// Free-tier keys recover on their own: the quota resets (a minute, an hour, a
+// day later) and the SAME key works again. The key ladder itself has no
+// memory, so while one key sits exhausted every request still pays a doomed
+// attempt on it before reaching the next one. Marking a rejected key cold for
+// a while removes that tax, and the key rejoins the ladder once the window
+// passes — the "test the dead key again later" behavior a rotating pool of
+// free keys needs.
+
+/// Process-global registry: key string → the Instant its cooldown expires.
+/// In memory only (the key already lives in the config structs); never
+/// persisted, never logged.
+static KEY_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
+    KEY_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock the map, recovering from a poisoned lock: a panic in one thread must
+/// not take key rotation down with it.
+fn cooldown_lock() -> MutexGuard<'static, HashMap<String, Instant>> {
+    cooldowns().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How long a rejected key sits out. The default is HOURS because the common
+/// death on a rotating pool of free-tier keys is a daily cap: re-probing every
+/// few minutes only buys each dead key a doomed attempt per probe, while a
+/// multi-hour bench makes it nearly free until its quota day rolls over. The
+/// price is that a merely RATE-LIMITED key (a 429 that a minute of waiting
+/// would fix) also sits out the window — acceptable while other keys carry
+/// the load, and moot when every key is cooling (they all run anyway).
+/// `CODIFA_KEY_COOLDOWN_SECS` overrides it (a tiny value ≈ the old
+/// always-retry-first behavior).
+fn key_cooldown() -> Duration {
+    const DEFAULT_SECS: u64 = 4 * 60 * 60;
+    let secs = std::env::var("CODIFA_KEY_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs.max(1))
+}
+
+/// A key the provider just refused on a key error: off the ladder until the
+/// cooldown expires. A second refusal while still cold RE-ARMS the window
+/// (it failed again, so its clock restarts).
+fn mark_key_dead(key: &str) {
+    cooldown_lock().insert(key.to_string(), Instant::now() + key_cooldown());
+}
+
+/// A key that just served a successful call: drop any cooldown it earned
+/// earlier, so a key whose quota came back early is used again at once.
+fn mark_key_ok(key: &str) {
+    cooldown_lock().remove(key);
+}
+
+fn key_is_cooling(key: &str, now: Instant) -> bool {
+    cooldown_lock()
+        .get(key)
+        .map_or(false, |until| *until > now)
+}
+
+/// The ladder order for one request: keys NOT on cooldown first (the user's
+/// own order preserved), then the cooling ones as a last resort — a request
+/// must not die with "all keys rejected" while one of the cold keys may have
+/// recovered early. When EVERY key is cooling the original order runs
+/// unchanged, so an all-cold request attempts the same keys it always did.
+fn key_attempt_order(keys: &[String]) -> Vec<String> {
+    let now = Instant::now();
+    let mut live = Vec::new();
+    let mut cold = Vec::new();
+    for key in keys {
+        if key_is_cooling(key, now) {
+            cold.push(key.clone());
+        } else {
+            live.push(key.clone());
+        }
+    }
+    if live.is_empty() {
+        keys.to_vec()
+    } else {
+        live.extend(cold);
+        live
+    }
+}
+
 /// Whether a rejected request is complaining about the optional
 /// `stream_options` field specifically.
 ///
@@ -855,10 +943,14 @@ pub async fn complete_with_images(
     // is megabytes of base64 that used to be re-serialized for every attempt.
     let body = one_shot_body(cfg, system, user, images);
     let mut last_err = String::new();
-    for key in &cfg.api_keys {
-        match complete_with_key(client, cfg, key, &body).await {
-            Ok(res) => return Ok(res),
+    for key in key_attempt_order(&cfg.api_keys) {
+        match complete_with_key(client, cfg, &key, &body).await {
+            Ok(res) => {
+                mark_key_ok(&key);
+                return Ok(res);
+            }
             Err((status, body)) if is_key_error(status, &body) => {
+                mark_key_dead(&key);
                 last_err = format!("key rejected ({status}): {body}");
                 continue;
             }
@@ -1384,12 +1476,16 @@ pub async fn stream_chat(
     // API-key attempt.
     let body = build_request_body(cfg, messages, tools);
     let mut last_err = String::new();
-    for key in &cfg.api_keys {
-        match stream_with_key(client, cfg, key, &body, on_event, cancel, steer_interrupt)
+    for key in key_attempt_order(&cfg.api_keys) {
+        match stream_with_key(client, cfg, &key, &body, on_event, cancel, steer_interrupt)
             .await
         {
-            Ok(acc) => return Ok(acc),
+            Ok(acc) => {
+                mark_key_ok(&key);
+                return Ok(acc);
+            }
             Err((status, body)) if is_key_error(status, &body) => {
+                mark_key_dead(&key);
                 last_err = format!("key rejected ({status}): {body}");
                 continue;
             }
@@ -2538,6 +2634,52 @@ mod tests {
         // A genuine rate limit still tries the next key: another key has its own
         // quota.
         assert!(is_key_error(429, "429 Too Many Requests"));
+    }
+
+    /// A key the provider refused sits out the cooldown: it moves to the BACK
+    /// of the ladder so live keys are tried first, and a success clears the
+    /// mark at once (the quota may come back before the window ends). The
+    /// registry is process-global and the suite runs in parallel, so every
+    /// test uses its own key strings.
+    #[test]
+    fn a_rejected_key_sits_out_the_cooldown_then_rejoins() {
+        let hot = "cooldown-test-hot-key".to_string();
+        let spare = "cooldown-test-spare-key".to_string();
+        let keys = vec![hot.clone(), spare.clone()];
+
+        mark_key_dead(&hot);
+        // The cold key is still attempted — as the last rung, not the first.
+        assert_eq!(key_attempt_order(&keys), vec![spare.clone(), hot.clone()]);
+
+        mark_key_ok(&hot);
+        assert_eq!(key_attempt_order(&keys), keys.clone());
+    }
+
+    /// An EXPIRED cooldown must look exactly like a never-marked key: the
+    /// window is a plain Instant comparison, so a deadline in the past drops
+    /// out of the ordering without any explicit sweep.
+    #[test]
+    fn an_expired_cooldown_returns_the_key_to_the_front() {
+        let hot = "cooldown-test-expired-key".to_string();
+        let spare = "cooldown-test-expired-spare".to_string();
+        let keys = vec![hot.clone(), spare.clone()];
+
+        cooldown_lock().insert(hot.clone(), Instant::now() - Duration::from_secs(1));
+        assert_eq!(key_attempt_order(&keys), keys.clone());
+    }
+
+    /// When EVERY key is cooling the request must not get a shorter ladder
+    /// than before: all keys run in the original order, so a momentary 429 on
+    /// the first key cannot turn into "no key tried at all".
+    #[test]
+    fn when_every_key_is_cooling_the_original_order_runs() {
+        let a = "cooldown-test-all-a".to_string();
+        let b = "cooldown-test-all-b".to_string();
+        let keys = vec![a.clone(), b.clone()];
+
+        mark_key_dead(&a);
+        mark_key_dead(&b);
+        assert_eq!(key_attempt_order(&keys), keys.clone());
     }
 
     /// The fallback rule: ONLY a model that cannot serve us may be replaced.

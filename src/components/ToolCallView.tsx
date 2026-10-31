@@ -36,6 +36,8 @@ import { fixZwsp, prepareContent } from "../lib/bidi";
 import { fileBasename } from "../lib/fileTypes";
 import { handleLinkClick } from "../lib/link";
 import { useDragScroll } from "../lib/useDragScroll";
+import { resolveLocalMedia, codifaMediaPath } from "../lib/mediaUrl";
+import { ensureSidecar, peekSidecarUrl } from "../lib/api";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { createPortal } from "react-dom";
 import { commentFileSelection } from "../lib/fileComments";
@@ -824,8 +826,92 @@ function resultRows(activity: ToolActivity): Array<Record<string, unknown>> {
     : [];
 }
 
-export const FileResultLinks = memo(function FileResultLinks({
-  tool,
+/** The media-generation tools whose `results` rows carry generated files
+ *  ({path, url: codifa-media://…, bytes, mime}) instead of web/file rows. */
+export const MEDIA_TOOLS: ReadonlySet<string> = new Set([
+  "generate_image",
+  "edit_image",
+  "generate_video",
+  "edit_video",
+]);
+
+/** Inline preview strip for a media tool's result: real thumbnails for images
+ *  and playable <video> elements for clips, straight off the /media/file
+ *  route. Clicking opens the file in the Media viewer tab. */
+export const MediaResultLinks = memo(function MediaResultLinks({
+  items,
+}: {
+  items: Array<Record<string, unknown>>;
+}) {
+  // The sidecar URL resolves asynchronously (unknown right after a restart,
+  // when replayed transcripts render first): resolve NOW and re-render when
+  // it lands, so a fresh card never shows permanently broken thumbnails.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    if (!peekSidecarUrl()) {
+      void ensureSidecar().then((url) => {
+        if (url && alive) forceTick((t) => t + 1);
+      });
+    }
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const rows: string[] = [];
+  const seen = new Set<string>();
+  for (const it of items) {
+    // Rows arrive in two shapes (structured {path,url} from the backend and
+    // text-scanned {file} from the transcript replay) — the SAME file can
+    // appear through both, so dedupe on the path itself or the card shows the
+    // generated file twice.
+    const raw = String(it.path ?? it.file ?? codifaMediaPath(String(it.url ?? "")) ?? "").trim();
+    // Only real media files render here — error text can scan into a row
+    // (model ids like "ag/gemini-3.1" look path-like), and a broken-image
+    // tile for a model name is worse than no tile.
+    if (!/\.(png|jpe?g|webp|gif|bmp|mp4|webm|mov|m4v)$/i.test(raw)) continue;
+    // Scan rows and structured rows can spell the same file with/without a
+    // leading slash — normalize before deduping or the card shows it twice.
+    const path = raw.replace(/^\/+/, "");
+    if (seen.has(path)) continue;
+    seen.add(path);
+    rows.push(path);
+  }
+  if (rows.length === 0) return null;
+  const base = peekSidecarUrl();
+  return (
+    <div className="media-results">
+      {rows.map((path, i) => {
+        const resolved = resolveLocalMedia(`codifa-media://${path}`, base);
+        if (!resolved) return null;
+        return resolved.video ? (
+          <video
+            key={path}
+            className="media-result-video"
+            src={resolved.url}
+            controls
+            preload="metadata"
+            onClick={() => useViewerTabs.getState().openMedia(path)}
+          />
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element -- generated media thumbnail
+          <img
+            key={path}
+            className="media-result-thumb"
+            src={resolved.url}
+            alt={path}
+            title={`${path} — click to open in the Media editor`}
+            loading="lazy"
+            onClick={() => useViewerTabs.getState().openMedia(path)}
+          />
+        );
+      })}
+    </div>
+  );
+});
+
+export const FileResultLinks = memo(function FileResultLinks({  tool,
   items,
 }: {
   tool: string;
@@ -2377,6 +2463,10 @@ const TraceRow = memo(function TraceRow({
                   items={activity.items ?? activity.results}
                   fallbackText={activity.resultText}
                 />
+              ) : MEDIA_TOOLS.has(activity.tool) ? (
+                // Generated media renders as REAL thumbnails/playables here —
+                // FileResultLinks' icon+name rows hid the picture entirely.
+                <MediaResultLinks items={resultRows(activity)} />
               ) : (
                 <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
               )}
@@ -2424,7 +2514,9 @@ const ToolTimelineRow = memo(function ToolTimelineRow({
       <StatusIcon status={activity.status} />
       <span className="tool-ms">{fmtTime(ms)}</span>
       {resultRows(activity).length > 0 &&
-        (activity.tool === "web_search" || activity.tool === "fetch_url" ? (
+        (MEDIA_TOOLS.has(activity.tool) ? (
+          <MediaResultLinks items={resultRows(activity)} />
+        ) : activity.tool === "web_search" || activity.tool === "fetch_url" ? (
           <WebResultLinks items={activity.items ?? activity.results!} />
         ) : (
           <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
@@ -2724,6 +2816,10 @@ export const ToolSingleRow = memo(function ToolSingleRow({
                   items={activity.items ?? activity.results}
                   fallbackText={activity.resultText}
                 />
+              ) : MEDIA_TOOLS.has(activity.tool) ? (
+                // Generated media renders as REAL thumbnails/playables here —
+                // FileResultLinks' icon+name rows hid the picture entirely.
+                <MediaResultLinks items={resultRows(activity)} />
               ) : (
                 <FileResultLinks tool={activity.tool} items={resultRows(activity)} />
               )}
@@ -3186,6 +3282,9 @@ export const ToolCallView = memo(function ToolCallView({
             (activity.items ?? activity.results)!.length > 0 && (
               <WebResultLinks items={(activity.items ?? activity.results)!} />
             )}
+          {MEDIA_TOOLS.has(activity.tool) && resultRows(activity).length > 0 && (
+            <MediaResultLinks items={resultRows(activity)} />
+          )}
           {MEMORY_TOOLS.has(activity.tool) && activity.resultText && (
             <pre
               className="trace-expand-val trace-expand-pre trace-terminal-output"

@@ -17,6 +17,7 @@ const SIDECAR_RESOLVE_TIMEOUT_MS = 10_000
 
 api.onSidecarChanged(() => {
   sidecarUrl = null
+  noteSidecarUrl(null)
   sidecarInFlight = null
 })
 
@@ -25,6 +26,7 @@ api.onSidecarChanged(() => {
 // waiting for the next health probe to fail with "Failed to fetch".
 api.onSidecarDead(() => {
   sidecarUrl = null
+  noteSidecarUrl(null)
   sidecarInFlight = null
 })
 
@@ -42,6 +44,22 @@ async function isSidecarAlive(url: string): Promise<boolean> {
   }
 }
 
+/** Last successfully probed sidecar URL, for SYNC consumers that cannot await
+ *  the IPC round trip — the chat markdown renderer rewrites `codifa-media://`
+ *  references to `/media/file` URLs while streaming, deep inside a render pass.
+ *  `null` until the first ensureSidecar() succeeds (the send path always
+ *  resolves it before any reply can render, so a null means "nothing to
+ *  resolve yet", never "lost"). */
+let lastSidecarUrl: string | null = null
+
+export function peekSidecarUrl(): string | null {
+  return lastSidecarUrl
+}
+
+function noteSidecarUrl(url: string | null): void {
+  lastSidecarUrl = url
+}
+
 export async function ensureSidecar(): Promise<string | null> {
   // Dedup: if a previous call is still resolving (probing /health or
   // awaiting the getSidecarUrl IPC), every concurrent caller awaits the
@@ -56,7 +74,10 @@ export async function ensureSidecar(): Promise<string | null> {
       // a crash between calls is detected immediately: the previous resolution
       // success doesn't mean the sidecar is still alive, and skipping the
       // probe would leave the user hitting a dead port until the next call.
-      if (await isSidecarAlive(sidecarUrl)) return sidecarUrl
+      if (await isSidecarAlive(sidecarUrl)) {
+        noteSidecarUrl(sidecarUrl)
+        return sidecarUrl
+      }
       sidecarUrl = null
     }
     // Bound the IPC: if the sidecar never comes up, every caller must still
@@ -79,6 +100,7 @@ export async function ensureSidecar(): Promise<string | null> {
         }),
       ])
       if (url) sidecarUrl = url
+      noteSidecarUrl(sidecarUrl)
       return sidecarUrl
     } finally {
       // Never leave the timer behind: it would keep a test/CLI process alive.
@@ -825,6 +847,17 @@ export interface StreamParams {
   /** Cumulative goal turns so far (client counter). The server enforces the
    *  max authoritatively; this lets it continue counting across requests. */
   goalTurns?: number
+  /** Image-generation slot (Settings → Media Providers): provider id + default
+   *  model + ordered fallbacks. The backend resolves base URL/keys from the
+   *  `providers` map it already receives. */
+  imageProviderId?: string
+  imageModel?: string
+  imageFallbacks?: Array<{ providerId: string; model: string }>
+  /** Video-generation slot (Settings → Media Providers), same shape as the
+   *  image slot. Empty provider id = the media tools answer "not configured". */
+  videoProviderId?: string
+  videoModel?: string
+  videoFallbacks?: Array<{ providerId: string; model: string }>
   signal?: AbortSignal
 }
 
@@ -1003,6 +1036,12 @@ export async function streamChat(
           restart: params.restart ?? false,
           goal: params.goal ?? null,
           goal_turns: params.goalTurns ?? 0,
+          image_provider_id: params.imageProviderId ?? '',
+          image_model: params.imageModel ?? '',
+          image_fallbacks: params.imageFallbacks ?? [],
+          video_provider_id: params.videoProviderId ?? '',
+          video_model: params.videoModel ?? '',
+          video_fallbacks: params.videoFallbacks ?? [],
           context_window: modelContextWindow(params.provider, params.provider.model),
         }),
       })

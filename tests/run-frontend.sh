@@ -96,6 +96,7 @@ ensureSidecar|tests/ensureSidecar.test.ts|--packages=external --external:electro
 marketplaceBrowse|tests/marketplaceBrowse.test.ts|--packages=external --external:electron
 marketplaceDefaults|tests/marketplaceDefaults.test.ts|-
 keywordFill|tests/keywordFill.test.ts|--packages=external --external:electron
+installTracker|tests/installTracker.test.ts|--packages=external --external:electron
 repoAddress|tests/repoAddress.test.ts|-
 cmdContext|tests/cmdContext.test.ts|-
 transcribe|tests/transcribe.test.ts|--packages=external --external:electron
@@ -131,6 +132,7 @@ shortcutsKeys|src/lib/shortcuts.test.ts|
 fsWrappers|src/lib/fs.test.ts|--packages=external --external:electron
 diffContrast|tests/diffContrast.test.ts|-
 settingsStorage|tests/settingsStorage.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
+mediaProviders|tests/mediaProviders.ssr.test.tsx|--jsx=automatic --packages=external --external:electron
 toolNesting|tests/toolNesting.test.ts|
 downloadProgress|tests/downloadProgress.test.ts|--packages=external --external:electron
 codeBlock|tests/codeBlock.ssr.test.tsx|--jsx=automatic --packages=external --alias:highlight.js/styles/github-dark.min.css=./tests/css-stub.js --external:electron
@@ -216,6 +218,7 @@ artifactsPage|tests/artifactsPage.test.tsx|--jsx=automatic --packages=external -
 tabOrder|tests/tabOrder.test.ts|-
 stt|src/lib/stt.test.ts|
 localLive|src/lib/localLive.test.ts|
+mediaUrl|tests/mediaUrl.test.ts|
 liveSession|src/lib/liveSession.test.ts|
 livePrompt|src/lib/livePrompt.test.ts|
 paging|tests/paging.test.ts|-

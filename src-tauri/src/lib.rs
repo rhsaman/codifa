@@ -32,6 +32,8 @@ pub mod websearch;
 pub mod git;
 pub mod llm;
 pub mod media;
+pub mod media_gen;
+pub mod media_edit;
 pub mod models;
 pub mod oauth;
 pub mod plans;

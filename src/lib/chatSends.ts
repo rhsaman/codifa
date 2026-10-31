@@ -97,3 +97,35 @@ export function sendPendingSteerNext(chatId: string): boolean {
   )
   return true
 }
+
+/** Send a message from a NON-composer surface (the Media editor) RIGHT NOW,
+ *  with inline images. A chat that is already streaming must not start a
+ *  second turn (the send closure single-flights and would drop it), so the
+ *  message is QUEUED instead and the existing post-turn drain delivers it.
+ *  Returns what happened so the caller can say so honestly. */
+export function sendOrQueue(
+  chatId: string,
+  text: string,
+  images?: Array<{ path: string; name: string; dataUrl?: string }>,
+): "sent" | "queued" | "unavailable" {
+  const store = useStore.getState()
+  const chat = store.chats.find((c) => c.id === chatId)
+  if (!chat) return "unavailable"
+  // The chat's OWN send closure single-flights: a second call while a turn is
+  // live is silently dropped, so a live turn means QUEUE, never direct send.
+  const liveTurn = chat.messages.some((m) => m.streaming)
+  if (!liveTurn) {
+    const fn = registry.get(chatId)
+    if (fn) {
+      fn(text, [], images ?? [])
+      return "sent"
+    }
+  }
+  store.queueMessage(chatId, {
+    id: uid2(),
+    text,
+    images,
+    kind: "queue",
+  })
+  return "queued"
+}

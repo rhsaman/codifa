@@ -29,6 +29,8 @@ mod websearch;
 mod git;
 mod llm;
 mod media;
+mod media_gen;
+mod media_edit;
 mod models;
 mod oauth;
 mod plans;
@@ -182,6 +184,7 @@ fn main() {
     }));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         // Persist window size/position/fullscreen across restarts (parity with
         // the Electron build's saveWindowState).
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -197,6 +200,7 @@ fn main() {
             store::chat_get,
             // dialogs
             commands::select_folder,
+            commands::save_media_as,
             commands::select_file,
             // files
             commands::fs_list,

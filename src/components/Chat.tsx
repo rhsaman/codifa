@@ -5857,6 +5857,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           // Settings → Web Providers: how many results a web_search returns and
           // how many of them get their real page content fetched (0 = snippets only).
           webSearchAutoFetch: s.webSearchAutoFetch,
+          // Settings → Media Providers: the image/video generation slots the
+          // agent's generate_image / generate_video tools resolve server-side.
+          imageProviderId: s.imageProviderId,
+          imageModel: s.imageModel,
+          imageFallbacks: s.imageFallbacks,
+          videoProviderId: s.videoProviderId,
+          videoModel: s.videoModel,
+          videoFallbacks: s.videoFallbacks,
           skills: effectiveSkills,
           allowCreate,
           cap: getMode(s.settings, chat.editTarget ? "build" : chat.mode).capabilities,

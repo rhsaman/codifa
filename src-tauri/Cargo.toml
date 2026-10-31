@@ -20,6 +20,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-window-state = "2"
+# OS notifications for finished schedule runs: the Web Notification API is a
+# no-op inside WKWebView (permission looks granted, nothing ever posts), so the
+# desktop shell posts through this plugin while the browser (serve mode) keeps
+# the web API.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
@@ -50,6 +55,11 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Scheduler loop: cron math needs civil-time date fields (local time).
 chrono = "0.4"
+# Media editing (trim/merge/slideshow/probe via the `edit_video` tool and the
+# manual editor): provisions an ffmpeg+ffprobe binary into the data root on
+# first use (system PATH wins when one exists), so no install step is asked of
+# the user. Only the download helpers are used; commands spawn through tokio.
+ffmpeg-sidecar = "2"
 
 # Cross-platform parsers/protocols used on EVERY target (document readers,
 # web search, secret encryption). They used to sit in the macOS section below

@@ -101,3 +101,8 @@ void import('./App').then(({ default: App }) => {
     </React.StrictMode>,
   )
 })
+// HMR touch: force full-reload after a broken CSS HMR session.
+// HMR touch #2: force full-reload (broken CSS HMR session).
+// HMR touch #3: force full-reload (broken CSS HMR session).
+// HMR touch #4: force full-reload (broken CSS HMR session).
+// HMR touch #5: force full-reload (broken HMR session).

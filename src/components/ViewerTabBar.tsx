@@ -18,6 +18,9 @@ import { FileIcon } from "./FileIcon";
 import { fmtAgo } from "../lib/time";
 import { unseenRunCount } from "../lib/schedule-notify";
 import { useScheduleRunsLive } from "../lib/scheduleRunsLive";
+import { gitDiff, gitStatus } from "../lib/api";
+import { buildUncommittedFiles } from "../lib/uncommitted";
+import { splitWorkspaceFiles } from "../lib/fileTree";
 
 /** Width (px) of the tab-list dropdown, mirrored from `.tab-list-menu`. */
 const TAB_LIST_MENU_WIDTH = 410;
@@ -579,6 +582,47 @@ export function ViewerAddButton() {
   );
 }
 
+/** Changed-files count for the ACTIVE chat's workspace, polled lightly
+ *  (5s + window focus) with the same counting rule as the review panel —
+ *  feeds the badge on the dock's git icon. Returns 0 outside a repo. */
+function useUncommittedCount(root: string | null): number {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (!root) {
+      setCount(0);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const [st, unstaged, staged] = await Promise.all([
+          gitStatus(root),
+          gitDiff(root),
+          gitDiff(root, "", true),
+        ]);
+        if (cancelled) return;
+        const paths = "error" in st ? [] : st.entries.map((e) => e.path);
+        const unstagedDiff = "error" in unstaged ? "" : unstaged.diff;
+        const stagedDiff = "error" in staged ? "" : staged.diff;
+        const list = buildUncommittedFiles(paths, unstagedDiff, stagedDiff);
+        setCount(splitWorkspaceFiles(list, root).inside.length);
+      } catch {
+        /* Git errors keep the badge empty — non-critical. */
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 5000);
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [root]);
+  return count;
+}
+
 /** Fixed launcher dock along the pane's BOTTOM edge — a slim, always-present
  *  icon row (one button per page, T3-Code style). COMPLETELY SEPARATE from the
  *  top tab strip: these pages never become tab rows up there. A click opens
@@ -598,10 +642,15 @@ export function ViewerDockBar() {
   const liveRuns = useScheduleRunsLive((s) => s.runs);
   const runsSeen = useStore((s) => s.scheduleRunsSeen);
   const inboxUnseen = unseenRunCount(liveRuns, runsSeen);
+  // The git dock icon carries the changed-files count for this workspace.
+  const dockRoot = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.root ?? s.root,
+  );
+  const changedCount = useUncommittedCount(dockRoot);
   const dock: Array<{ kind: ViewerKind; title: string; icon: React.ReactNode; badge?: number; onPress: () => void }> = [
     { kind: "files", title: "Files", icon: <FilesIcon />, onPress: () => vt().openFiles() },
     { kind: "todos", title: "Todos", icon: <TodosIcon />, onPress: () => vt().openTodos(scope.chatId) },
-    { kind: "review", title: "Git diff", icon: <ReviewIcon />, onPress: () => vt().openGitDiff(scope.chatId) },
+    { kind: "review", title: "Git diff", icon: <ReviewIcon />, badge: changedCount, onPress: () => vt().openGitDiff(scope.chatId) },
     { kind: "artifacts", title: "Artifacts", icon: <ArtifactsIcon />, onPress: () => vt().openArtifacts() },
     { kind: "schedule", title: "Schedule", icon: <ScheduleIcon />, onPress: () => vt().openSchedule() },
     { kind: "inbox", title: "Inbox", icon: <InboxIcon />, badge: inboxUnseen, onPress: () => vt().openInbox() },

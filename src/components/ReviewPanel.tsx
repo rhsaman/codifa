@@ -9,11 +9,27 @@ import { countDiffHits, filterFilesByQuery, locateHit, stepHitIndex } from "../l
 import { parseDiffRows } from "../lib/reviewDiff";
 import { splitUnifiedDiffByFile } from "../lib/reviewDiff";
 import { diffStatsFromUnified } from "../lib/toolActivity";
-import { useStore } from "../lib/store";
+import { providerApiKeys, useStore } from "../lib/store";
 import { useReviewPanel, type ReviewSource } from "../lib/reviewPanel";
 import { useViewerTabs } from "../lib/viewerTabs";
 import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
-import { gitDiff, gitLog, gitShow, gitStatus, type GitCommitInfo } from "../lib/api";
+import { ComposerDiffBar } from "./ComposerDiffBar";
+import {
+  gitAutoCommit,
+  gitDiff,
+  gitDiscard,
+  gitLog,
+  gitPush,
+  gitShow,
+  gitStatus,
+  type CompactUsage,
+  type GitCommitInfo,
+} from "../lib/api";
+import { normalizeUsageModel } from "../lib/usage";
+import { otherSlotLevel, otherSlotModel } from "../lib/toolSlots";
+import { supportsReasoning } from "../lib/thinking";
+import { modelReasoning, modelThinkingLevels } from "../lib/context";
+import { levelFromSource } from "../lib/thinking-options";
 import { DiffView } from "./ToolCallView";
 import { FileIcon } from "./FileIcon";
 import { splitWorkspaceFiles, toWorkspacePath } from "../lib/fileTree";
@@ -33,6 +49,12 @@ export const REVIEW_SIDE_BY_SIDE_THRESHOLD = 900;
 
 /** "Source preview" — open the original file, complete, in its own viewer
  *  tab (FileViewerPanel), jumping to the first changed line of the diff. */
+const REVIEW_SOURCES: [ReviewSource, string][] = [
+  ["turn", "Last Turn"],
+  ["uncommitted", "Uncommitted"],
+  ["committed", "Committed"],
+];
+
 function openSourcePreview(path: string, diff: string, root?: string) {
   const hm = /^@@ -\d+(?:,\d+)? \+(\d+)/m.exec(diff);
   const line = hm ? parseInt(hm[1], 10) : undefined;
@@ -293,9 +315,177 @@ export function ReviewPanel(props?: {
   const root = useStore(
     (s) => s.chats.find((c) => c.id === (ownerChatId ?? s.activeChatId))?.root ?? s.root,
   );
+
+  // ---- Git bar actions (the bar moved here from the composer/app bar) ----
+  // Chat context is derived from the store so the bar works in every panel
+  // variant (docked, floating, message-attached) with no prop plumbing.
+  const [isCommitting, setIsCommitting] = useState(false);
+  const [isUndoing, setIsUndoing] = useState(false);
+  const [isPushing, setIsPushing] = useState(false);
+  const gitChat = useStore((s) => s.chats.find((c) => c.id === (ownerChatId ?? s.activeChatId)));
+  const gitProvider = useStore((s) => {
+    const overrideId = s.chats.find((c) => c.id === (ownerChatId ?? s.activeChatId))?.providerId;
+    return (
+      s.settings.providers.find(
+        (x) => x.id === (overrideId ?? s.settings.activeProviderId),
+      ) ?? s.settings.providers[0]
+    );
+  });
+  // Busy = the owning chat is mid-turn — git writes while the agent works can
+  // interleave with its edits.
+  const gitBusy = useStore((s) => {
+    const c = s.chats.find((x) => x.id === (ownerChatId ?? s.activeChatId));
+    return (
+      !!c &&
+      (s.chatBusy[c.id] === true ||
+        c.messages.some((m) => m.streaming) ||
+        c.messages.some((m) => m.retry?.reconnecting === true))
+    );
+  });
+  const handleGitCommit = () => {
+    if (!root || gitBusy || !gitChat || isCommitting) return;
+    void (async () => {
+      setIsCommitting(true);
+      try {
+        // Commit messages run on the Tools → "Other" model group
+        // (Settings → Tools → Other): a one-line message needs a small fast
+        // model, not the main chat model. `otherSlotModel` resolves the same
+        // value the settings row displays; empty = follow the chat's model.
+        const st = useStore.getState();
+        const otherEntry = otherSlotModel(st.subagentModels);
+        let commitProvider = gitProvider;
+        let commitModel = gitChat.model ?? gitProvider?.model;
+        if (otherEntry && commitProvider) {
+          const slash = otherEntry.indexOf("/");
+          const prefix = slash > 0 ? otherEntry.slice(0, slash) : "";
+          const modelName = slash > 0 ? otherEntry.slice(slash + 1) : otherEntry;
+          const explicitProvider = prefix
+            ? st.settings.providers.find(
+                (p) => p.id === prefix || p.kind === prefix,
+              )
+            : undefined;
+          if (explicitProvider) {
+            commitProvider = explicitProvider;
+            commitModel = modelName;
+          } else if (!prefix && modelName) {
+            commitModel = modelName;
+          }
+        }
+        if (!commitProvider) return;
+        const res = await gitAutoCommit(
+          root,
+          {
+            kind: commitProvider.kind,
+            model: commitModel,
+            baseUrl: commitProvider.baseUrl,
+            apiKeys: providerApiKeys(commitProvider),
+            id: commitProvider.id,
+            // Reasoning effort follows the "Other" group's own slider when the
+            // message runs on that group's model; with no slot set the call is
+            // a main-model call and uses the chat's level.
+            thinkingLevel: levelFromSource(
+              modelThinkingLevels(commitProvider, commitModel),
+              supportsReasoning(
+                commitModel,
+                commitProvider.kind,
+                modelReasoning(commitProvider, commitModel),
+              )
+                ? otherEntry
+                  ? otherSlotLevel(st.subagentThinking)
+                  : gitChat.thinkingLevel ?? "xhigh"
+                : "",
+            ),
+            modelReasoning:
+              modelReasoning(commitProvider, commitModel) ??
+              supportsReasoning(
+                commitModel,
+                commitProvider.kind,
+                modelReasoning(commitProvider, commitModel),
+              ),
+          },
+          Object.fromEntries(st.settings.providers.map((p) => [p.id, p])),
+        );
+        if ("error" in res) {
+          useStore.getState().setChatCmdError(ownerChatId ?? st.activeChatId, res.error);
+        } else if (res.usage) {
+          // Bill the commit-message call into the chat's cumulative usage,
+          // grouped under the provider that ACTUALLY ran it — mirroring the
+          // compact path. No usage on the heuristic fallback (no model call).
+          const cu: CompactUsage = res.usage;
+          const pid = cu.provider_id || cu.provider || commitProvider.id;
+          useStore.getState().accrueChatUsage(
+            ownerChatId ?? st.activeChatId,
+            pid,
+            normalizeUsageModel(pid, cu.model || commitModel),
+            {
+              input: cu.input_tokens ?? 0,
+              output: cu.output_tokens ?? 0,
+              cacheRead: cu.cache_read_tokens ?? 0,
+              cacheWrite: cu.cache_write_tokens ?? 0,
+            },
+          );
+        }
+      } finally {
+        setIsCommitting(false);
+      }
+    })();
+  };
+  const handleGitUndo = () => {
+    // The bar arms the undo (two-click confirm) — window.confirm is
+    // unreliable in Tauri's WKWebView, so no dialog here.
+    if (!root || gitBusy || isUndoing) return;
+    void (async () => {
+      setIsUndoing(true);
+      try {
+        const res = await gitDiscard(root);
+        if ("error" in res) {
+          useStore.getState().setChatCmdError(ownerChatId ?? useStore.getState().activeChatId, res.error);
+        }
+      } finally {
+        setIsUndoing(false);
+      }
+    })();
+  };
+  const handleGitPush = () => {
+    if (!root || gitBusy || isPushing) return;
+    void (async () => {
+      setIsPushing(true);
+      try {
+        const res = await gitPush(root);
+        if ("error" in res) {
+          useStore.getState().setChatCmdError(ownerChatId ?? useStore.getState().activeChatId, res.error);
+        }
+      } finally {
+        setIsPushing(false);
+      }
+    })();
+  };
+  // ---- Source selector as ONE dropdown (was three separate tab buttons) ----
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
+  const sourceMenuRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!sourceMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (sourceMenuRef.current && !sourceMenuRef.current.contains(e.target as Node)) {
+        setSourceMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSourceMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [sourceMenuOpen]);
+
   const [gitFiles, setGitFiles] = useState<GitFile[]>([]);
   const [gitLoading, setGitLoading] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  // Bumped after a branch switch/create so the file list refetches at once.
+  const [gitTick, setGitTick] = useState(0);
   const [commits, setCommits] = useState<GitCommitInfo[]>([]);
   const [rev, setRev] = useState(props?.initialRev ?? "HEAD");
   useEffect(() => {
@@ -337,7 +527,7 @@ export function ReviewPanel(props?: {
     return () => {
       cancelled = true;
     };
-  }, [source, root]);
+  }, [source, root, gitTick]);
 
   // تاریخچه‌ی کامیت‌ها برای فیلتر committed.
   useEffect(() => {
@@ -539,24 +729,65 @@ export function ReviewPanel(props?: {
       )}
       <aside className={docked ? "review-panel review-docked-panel" : "review-panel review-floating-panel"} dir="ltr">
       <div className="review-header">
-        <span className="review-source" role="tablist" aria-label="Diff source">
-          {(
-            [
-              ["turn", "Last Turn"],
-              ["uncommitted", "Uncommitted"],
-              ["committed", "Committed"],
-            ] as [ReviewSource, string][]
-          ).map(([key, label]) => (
-            <button
-              key={key}
-              role="tab"
-              aria-selected={source === key}
-              className={`review-source-btn${source === key ? " active" : ""}`}
-              onClick={() => switchSource(key)}
+        <span className="review-source" ref={sourceMenuRef}>
+          <button
+            type="button"
+            className="review-source-btn current"
+            aria-haspopup="listbox"
+            aria-expanded={sourceMenuOpen}
+            title="Diff source"
+            onClick={() => setSourceMenuOpen((o) => !o)}
+          >
+            {REVIEW_SOURCES.find(([key]) => key === source)?.[1]}
+            <svg
+              className="review-source-caret"
+              width="9"
+              height="9"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
             >
-              {label}
-            </button>
-          ))}
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+          {sourceMenuOpen && (
+            <div className="review-source-menu" role="listbox" aria-label="Diff source">
+              {REVIEW_SOURCES.map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  role="option"
+                  aria-selected={source === key}
+                  className={`review-source-item${source === key ? " active" : ""}`}
+                  onClick={() => {
+                    setSourceMenuOpen(false);
+                    switchSource(key);
+                  }}
+                >
+                  <span>{label}</span>
+                  {source === key && (
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.4"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="m5 13 4 4L19 7" />
+                    </svg>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
         </span>
         {totals && (
           <span className="review-counts">
@@ -565,6 +796,18 @@ export function ReviewPanel(props?: {
           </span>
         )}
         <span className="review-header-actions">
+          <ComposerDiffBar
+            root={root}
+            disabled={gitBusy}
+            isCommitting={isCommitting}
+            isUndoing={isUndoing}
+            isPushing={isPushing}
+            onCommit={handleGitCommit}
+            onUndo={handleGitUndo}
+            onPush={handleGitPush}
+            onError={setGitError}
+            onBranchChanged={() => setGitTick((t) => t + 1)}
+          />
           {!docked && <ViewerFullscreenButton docked={docked} fullscreen={fullscreen} onToggleFullscreen={() => setFullscreen((v) => !v)} />}
           {!docked && (
             <button

@@ -1,17 +1,21 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { gitBranches, gitCheckout, gitDiff, gitStatus } from "../lib/api";
 import { buildUncommittedFiles, sumDiffStats } from "../lib/uncommitted";
 import { splitWorkspaceFiles } from "../lib/fileTree";
 import { useViewerTabs } from "../lib/viewerTabs";
 
-/** Uncommitted-changes bar above the composer input, Codex style: "N files changed +A -D".
- *  Clicking the summary opens the git-diff panel for all uncommitted changes.
- *  Renders nothing when there are no changes. */
+/** Uncommitted-changes bar, Codex style: [git-icon + files badge] [branch] [+A -D]
+ *  with Undo / Commit / Push. It lives in the Review panel header (moved out
+ *  of the composer and the app bar). Clicking the counts opens the git-diff
+ *  panel for all uncommitted changes. Renders nothing when there are no
+ *  changes and no branch info. */
 export function ComposerDiffBar({
   root,
   onCommit,
   onUndo,
   onPush,
+  onError,
+  onBranchChanged,
   disabled,
   isCommitting,
   isUndoing,
@@ -21,6 +25,11 @@ export function ComposerDiffBar({
   onCommit?: () => void;
   onUndo?: () => void;
   onPush?: () => void;
+  /** Checkout failures are NOT silent: git refuses to switch with a dirty
+   *  tree, and the panel surfaces the message. */
+  onError?: (message: string) => void;
+  /** Fired after a successful switch/create so the panel refetches its list. */
+  onBranchChanged?: () => void;
   disabled?: boolean;
   isCommitting?: boolean;
   isUndoing?: boolean;
@@ -33,6 +42,13 @@ export function ComposerDiffBar({
   const [branches, setBranches] = useState<string[]>([]);
   const [current, setCurrent] = useState("");
   const [switching, setSwitching] = useState(false);
+  // window.prompt / window.confirm return null in Tauri's WKWebView, so the
+  // old "+ New branch…" prompt silently did nothing. New branches get an
+  // inline input instead, and Undo arms on the first click.
+  const [newBranchOpen, setNewBranchOpen] = useState(false);
+  const [newBranchName, setNewBranchName] = useState("");
+  const [undoArmed, setUndoArmed] = useState(false);
+  const newBranchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!root) {
@@ -60,7 +76,7 @@ export function ComposerDiffBar({
           stagedDiff,
         );
         // فقط فایل‌های داخل ورک‌اسپیس شمرده می‌شوند — همان فیلتری که پنل Review
-        // روی لیست می‌زند، وگرنه نشانِ «تعداد فایل تغییرکرده» با لیست یکی نمی‌شد.
+        // روی لیست می‌زند، وگرنه badge با لیست یکی نمی‌شد.
         const inWorkspace = splitWorkspaceFiles(list, root).inside;
         const totals = sumDiffStats(inWorkspace);
         setFiles(inWorkspace.length);
@@ -112,61 +128,113 @@ export function ComposerDiffBar({
   }, [root]);
 
   const handleBranchChange = async (name: string) => {
-    if (!root || !name || name === current || switching || disabled) return;
+    if (!root || !name || name === current || switching) return;
     if (name === "__new__") {
-      const next = window.prompt("New branch name:");
-      if (!next || !next.trim()) return;
-      setSwitching(true);
-      try {
-        const res = await gitCheckout(root, next.trim(), true);
-        if (!( "error" in res)) {
-          setCurrent(res.current);
-          setBranches((b) => (b.includes(res.current) ? b : [...b, res.current]));
-        }
-      } finally {
-        setSwitching(false);
-      }
+      // Tauri's WKWebView has no window.prompt — open the inline input.
+      setNewBranchOpen(true);
+      setNewBranchName("");
+      requestAnimationFrame(() => newBranchInputRef.current?.focus());
       return;
     }
     setSwitching(true);
     try {
       const res = await gitCheckout(root, name);
-      if (!("error" in res)) setCurrent(res.current);
+      if ("error" in res) {
+        onError?.(res.error);
+      } else {
+        setCurrent(res.current);
+        onBranchChanged?.();
+      }
     } finally {
       setSwitching(false);
     }
+  };
+
+  const createBranch = async () => {
+    const next = newBranchName.trim();
+    if (!root || !next || switching) return;
+    setSwitching(true);
+    try {
+      const res = await gitCheckout(root, next, true);
+      if ("error" in res) {
+        onError?.(res.error);
+      } else {
+        setCurrent(res.current);
+        setBranches((b) => (b.includes(res.current) ? b : [...b, res.current]));
+        onBranchChanged?.();
+      }
+      if (!("error" in res)) {
+        setNewBranchOpen(false);
+        setNewBranchName("");
+      }
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const handleUndoClick = () => {
+    // Two-click confirm replaces window.confirm (unsupported in Tauri).
+    if (!undoArmed) {
+      setUndoArmed(true);
+      window.setTimeout(() => setUndoArmed(false), 4000);
+      return;
+    }
+    setUndoArmed(false);
+    onUndo?.();
   };
 
   if (!root) return null;
   if (files === 0 && branches.length === 0) return null;
   return (
     <div className="composer-diff-bar" dir="ltr">
+      {newBranchOpen && (
+        <span className="composer-diff-newbranch">
+          <input
+            ref={newBranchInputRef}
+            value={newBranchName}
+            placeholder="New branch name"
+            disabled={switching}
+            onChange={(e) => setNewBranchName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void createBranch();
+              if (e.key === "Escape") setNewBranchOpen(false);
+            }}
+          />
+          <button
+            type="button"
+            className="composer-diff-btn commit"
+            title="Create branch"
+            aria-label="Create branch"
+            disabled={switching || !newBranchName.trim()}
+            onClick={() => void createBranch()}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m5 13 4 4L19 7" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className="composer-diff-btn undo"
+            title="Cancel"
+            aria-label="Cancel"
+            onClick={() => setNewBranchOpen(false)}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </span>
+      )}
       {branches.length > 0 && (
         <span
           className="composer-diff-branch-wrap"
           onClick={(e) => e.stopPropagation()}
         >
-          <svg
-            className="composer-diff-git-icon"
-            width="12"
-            height="12"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <line x1="6" y1="3" x2="6" y2="15" />
-            <circle cx="18" cy="6" r="3" />
-            <circle cx="6" cy="18" r="3" />
-            <path d="M18 9a9 9 0 0 1-9 9" />
-          </svg>
           <select
             className="composer-diff-branch"
             value={branches.includes(current) ? current : ""}
-            disabled={disabled || switching}
+            disabled={switching}
             title={current ? `Branch: ${current} — click to switch` : "Current branch — click to switch"}
             onClick={(e) => e.stopPropagation()}
             onChange={(e) => {
@@ -190,9 +258,6 @@ export function ComposerDiffBar({
         title="Show all uncommitted changes"
         onClick={() => openGitDiff()}
       >
-        <span className="composer-diff-text">
-          {files} file{files > 1 ? "s" : ""} changed
-        </span>
         <span className="composer-diff-counts">
           <span className="review-count-add">+{adds}</span>
           <span className="review-count-del">-{dels}</span>
@@ -204,13 +269,13 @@ export function ComposerDiffBar({
           {onUndo && (
             <button
               type="button"
-              className="composer-diff-btn undo"
+              className={"composer-diff-btn undo" + (undoArmed ? " armed" : "")}
               disabled={disabled || isUndoing}
-              data-tip="Undo"
-              aria-label={isUndoing ? "Undoing" : "Undo"}
+              data-tip={undoArmed ? "Click again to discard" : "Undo"}
+              aria-label={isUndoing ? "Undoing" : undoArmed ? "Confirm undo" : "Undo"}
               onClick={(e) => {
                 e.stopPropagation();
-                onUndo();
+                handleUndoClick();
               }}
             >
               {isUndoing ? (
@@ -240,20 +305,25 @@ export function ComposerDiffBar({
                   </g>
                 </svg>
               ) : (
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M3 7v6h6" />
-                  <path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
-                </svg>
+                <>
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 7v6h6" />
+                    <path d="M21 17a9 9 0 0 0-15-6.7L3 13" />
+                  </svg>
+                  {undoArmed && (
+                    <span className="composer-diff-btn-armed">Sure?</span>
+                  )}
+                </>
               )}
             </button>
           )}

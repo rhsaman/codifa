@@ -111,8 +111,6 @@ import {
   triggerCompact,
   gitAutoCommit,
   retrySubagentNow,
-  gitDiscard,
-  gitPush,
   syncSkill,
   type CompactResult,
   type CompactUsage,
@@ -221,7 +219,6 @@ import { ProviderModelSelect } from "./ProviderModelSelect";
 import { ToolCallView } from "./ToolCallView";
 import { BalanceChip } from "./BalanceChip";
 import { ChatFindBar } from "./ChatFindBar";
-import { ComposerDiffBar } from "./ComposerDiffBar";
 import { visibleChatMessages } from "../lib/compactDedupe";
 import { isFileDrag } from "../lib/fileDrag";
 import { useViewerTabs } from "../lib/viewerTabs";
@@ -11396,156 +11393,6 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
               </div>
             );
           })()}
-        <ComposerDiffBar
-          root={wroot}
-          disabled={busy}
-          onCommit={() => {
-            if (!wroot || busy || !chat || isCommitting) return;
-            const chatId = chat.id;
-            void (async () => {
-              setIsCommitting(true);
-              try {
-                // Commit messages run on the Tools → "Other" model group
-                // (Settings → Tools → Other): a one-line message needs a small
-                // fast model, not the main chat model. The group's slots
-                // (compact / web / title) share ONE row in the UI, so the pick
-                // may be stored under any of them — reading only
-                // `subagentModels.compact` is exactly why this button kept
-                // running on the main chat model while Settings showed the
-                // picked one. `otherSlotModel` resolves the same value the row
-                // displays; empty = follow the chat's model.
-                const st = useStore.getState();
-                const otherEntry = otherSlotModel(st.subagentModels);
-                let commitProvider = provider;
-                let commitModel = activeModel;
-                if (otherEntry) {
-                  const slash = otherEntry.indexOf("/");
-                  const prefix = slash > 0 ? otherEntry.slice(0, slash) : "";
-                  const modelName =
-                    slash > 0 ? otherEntry.slice(slash + 1) : otherEntry;
-                  const explicitProvider = prefix
-                    ? st.settings.providers.find(
-                        (p) => p.id === prefix || p.kind === prefix,
-                      )
-                    : undefined;
-                  if (explicitProvider) {
-                    commitProvider = explicitProvider;
-                    commitModel = modelName;
-                  } else if (!prefix && modelName) {
-                    commitModel = modelName;
-                  }
-                }
-                console.info(
-                  "[commit] message model:",
-                  commitModel,
-                  "via",
-                  commitProvider.id,
-                  "| other slot:",
-                  otherEntry || "main model",
-                );
-                const res = await gitAutoCommit(wroot, {
-                  kind: commitProvider.kind,
-                  model: commitModel,
-                  baseUrl: commitProvider.baseUrl,
-                  apiKeys: providerApiKeys(commitProvider),
-                  id: commitProvider.id,
-                  // Reasoning effort follows the "Other" group's own slider
-                  // when the message runs on that group's model; with no slot
-                  // set the call is a main-model call and uses the chat's level.
-                  // Same rule as a chat turn: only a level a source enumerated
-                  // for this model may leave the process.
-                  thinkingLevel: levelFromSource(
-                    modelThinkingLevels(commitProvider, commitModel),
-                    supportsReasoning(
-                      commitModel,
-                      commitProvider.kind,
-                      modelReasoning(commitProvider, commitModel),
-                    )
-                      ? otherEntry
-                        ? otherSlotLevel(st.subagentThinking)
-                        : chat.thinkingLevel ?? thinkingLevel
-                      : "",
-                  ),
-                  modelReasoning:
-                    modelReasoning(commitProvider, commitModel) ??
-                    supportsReasoning(
-                      commitModel,
-                      commitProvider.kind,
-                      modelReasoning(commitProvider, commitModel),
-                    ),
-                }, Object.fromEntries(st.settings.providers.map((p) => [p.id, p])));
-                if ("error" in res) {
-                  useStore.getState().setChatCmdError(chatId, res.error);
-                } else if (res.usage) {
-                  // Accrue the commit-message call into the chat's cumulative
-                  // usage so the sidebar's Model usage panel bills it —
-                  // grouped under the provider that ACTUALLY ran it
-                  // (provider_id > kind > commit provider), mirroring the
-                  // compact path. No usage on the heuristic fallback path
-                  // (there was no model call to bill).
-                  const cu: CompactUsage = res.usage;
-                  const pid =
-                    cu.provider_id ||
-                    cu.provider ||
-                    commitProvider.id ||
-                    provider.id;
-                  useStore.getState().accrueChatUsage(
-                    chatId,
-                    pid,
-                    normalizeUsageModel(pid, cu.model || commitModel),
-                    {
-                      input: cu.input_tokens ?? 0,
-                      output: cu.output_tokens ?? 0,
-                      cacheRead: cu.cache_read_tokens ?? 0,
-                      cacheWrite: cu.cache_write_tokens ?? 0,
-                    },
-                  );
-                }
-              } finally {
-                setIsCommitting(false);
-              }
-            })();
-          }}
-          isCommitting={isCommitting}
-          isUndoing={isUndoing}
-          isPushing={isPushing}
-          onUndo={() => {
-            if (!wroot || busy || isUndoing) return;
-            if (
-              !window.confirm(
-                "Discard all uncommitted changes? This cannot be undone.",
-              )
-            )
-              return;
-            const chatId = chat?.id;
-            void (async () => {
-              setIsUndoing(true);
-              try {
-                const res = await gitDiscard(wroot);
-                if ("error" in res && chatId) {
-                  useStore.getState().setChatCmdError(chatId, res.error);
-                }
-              } finally {
-                setIsUndoing(false);
-              }
-            })();
-          }}
-          onPush={() => {
-            if (!wroot || busy || isPushing) return;
-            const chatId = chat?.id;
-            void (async () => {
-              setIsPushing(true);
-              try {
-                const res = await gitPush(wroot);
-                if ("error" in res && chatId) {
-                  useStore.getState().setChatCmdError(chatId, res.error);
-                }
-              } finally {
-                setIsPushing(false);
-              }
-            })();
-          }}
-        />
         <div className="composer-inner">
           <div className="composer-input-wrap">
             {historyOpen && (
@@ -12667,22 +12514,13 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           onMouseDown={(e) => e.preventDefault()}
           onClick={applyQuoteSel}
           style={{
+            // Positioning only — the visuals (surface, accent border/text,
+            // radius) live in .chat-quote-reply so themes restyle the chip.
             position: "fixed",
             left: quoteSel.x,
             top: quoteSel.y,
             transform: "translate(-50%, -100%)",
             zIndex: 60,
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            padding: "6px 10px",
-            borderRadius: 10,
-            border: "1px solid var(--border, #2a2a35)",
-            background: "var(--bg-panel, #313244)",
-            color: "var(--text, #cdd6f4)",
-            boxShadow: "var(--shadow, 0 4px 20px rgba(0,0,0,0.35))",
-            cursor: "pointer",
-            fontSize: 12,
           }}
         >
           <svg

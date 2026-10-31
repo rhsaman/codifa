@@ -5142,9 +5142,20 @@ body.coder-dragging .chat-split-child {
      container below; only the inner card and the anchored ask/perm cards
      capture pointer events. */
   pointer-events: none;
-  /* Top edge fades into the chat; bottom stays solid so the input area is
-     fully opaque. Must use --bg-alt to match .chat-panel background. */
-  background: linear-gradient(to bottom, transparent 0%, var(--bg-alt) 100px);
+  /* The shade reads bottom-up: fully transparent at the composer's top
+     edge, then quickly — but smoothly — opaque on the way down, solid for
+     the whole lower half so the card sides and footer hide the transcript
+     completely. Three stops keep it from reading as a rectangle while still
+     getting dark fast. The stops are PERCENTAGES on purpose: the composer
+     shrank well below 100px once the git bar moved out, and a px stop
+     taller than the box left the entire surface translucent. Percentages
+     always complete inside the real box height. */
+  background: linear-gradient(
+    to bottom,
+    transparent 0%,
+    color-mix(in srgb, var(--bg-alt) 72%, transparent) 34%,
+    var(--bg-alt) 58%
+  );
   transition: box-shadow 0.15s;
 }
 
@@ -19406,8 +19417,8 @@ body.coder-dragging .chat-split-child {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 6px 12px 10px;
+  border-bottom: none;
   font-size: 12px;
 }
 
@@ -20123,7 +20134,7 @@ mark.diff-hit-active {
 
 /* باکس جست‌وجو در هدر پنل Review */
 .review-search-row {
-  padding: 6px 12px 0;
+  padding: 6px 12px 8px;
 }
 .review-search {
   flex: 1 1 auto;
@@ -22863,7 +22874,7 @@ mark.trace-hit-active {
 /* The page reuses the Review search box verbatim (one search UI for every
    panel); only the padding follows this page's own 8px list gutter. */
 .artifacts-panel > .review-search-row {
-  padding: 8px 8px 0;
+  padding: 8px 8px 8px;
 }
 
 /* Row action: a trash icon that turns into its own inline confirm, so deleting
@@ -24071,7 +24082,9 @@ mark.trace-hit-active {
   display: none !important;
 }
 
-/* Narrow headers: tabs wrap to show all, actions stay fixed on their own row. */
+/* Narrow headers: rows wrap when the pane is narrow, inline when it fits —
+   the source selector no longer claims a full row of its own (that rule
+   predates the dropdown and stacked the whole header even at wide widths). */
 .review-header {
   flex-wrap: wrap;
   row-gap: 6px;
@@ -24079,11 +24092,9 @@ mark.trace-hit-active {
 }
 
 .review-header .review-source {
-  flex: 1 1 100%;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
-  flex-wrap: wrap;
-  row-gap: 4px;
   overflow: visible;
 }
 
@@ -29719,4 +29730,578 @@ input[type='range']::-moz-range-thumb {
   border-radius: 999px;
   padding: 2px 8px;
   white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MODERN UI POLISH — final override layer
+   Appended last so it wins the cascade without touching rules above.
+   1. Borderless fields everywhere (the chat composer subtree is excluded
+      and untouched). border-COLOR only → zero layout shift.
+   2. Fields whose border was their affordance get the house "well"
+      (tonal surface + inset highlight) + one unified accent focus glow.
+   3. Soft glass on dialogs and the command palette.
+   4. Composer responsive behavior via container queries.
+   5. Chat scrollbar: slim at rest, fat on hover.
+   6. Git pill integrated into the app bar (#titlebar-git).
+   Everything derives from theme vars via color-mix — every theme wins.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── 1a. No visible border on any field, anywhere ────────────────────────
+   The composer subtree (:not(.composer *)) is excluded on purpose — its
+   styling is frozen by design. Toggles/sliders/pickers keep their own
+   custom-drawn chrome. */
+input:not(.composer *):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]),
+select:not(.composer *),
+textarea:not(.composer *) {
+  border-color: transparent !important;
+}
+
+/* ── 1b. Fields whose border WAS the affordance → house "well" ───────────
+   Tonal surface + inset highlight, so the field still reads as editable
+   once the outline is gone. */
+.chat-find-input,
+.pm-modal-search,
+.settings-row-control input[type="number"],
+.manual-model-ctx-input,
+.files-filter-input,
+.fv-sheet-input,
+.fv-search-input,
+.fv-comment-input,
+.media-editor-ask-input,
+.review-search {
+  background: var(--bg-input);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Inline rename fields sit in tight rows — surface only, they keep their
+   own ring shadow as the editing affordance. */
+.chat-rename-input,
+.ws-rename-input,
+.chat-window-title-input,
+.editor-tab-rename-input,
+.files-rename-input {
+  background: var(--bg-input);
+}
+
+/* ── 1c. One unified focus glow for every field that lost its border ───── */
+.chat-find-input:focus,
+.pm-modal-search:focus,
+.settings-row-control input[type="number"]:focus,
+.manual-model-ctx-input:focus,
+.files-filter-input:focus,
+.fv-sheet-input:focus,
+.fv-search-input:focus,
+.fv-comment-input:focus,
+.media-editor-ask-input:focus,
+.review-search:focus-within {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* ── 1d. Settings + plugin detail: every remaining field gets the well ───
+   Catches the unclassed OAuth fields, fallback selects and manual-model
+   inputs that still rendered with browser-default chrome. Toggles,
+   sliders and the intentionally transparent api-key field are excluded. */
+.settings-modal input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(.api-key-input),
+.settings-modal select,
+.settings-modal textarea,
+.pd-panel input,
+.pd-panel select,
+.pd-panel textarea,
+.voice-fallback-card input,
+.voice-fallback-card select {
+  background: var(--bg-input);
+  border-radius: 8px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.settings-modal input:focus,
+.settings-modal select:focus,
+.settings-modal textarea:focus,
+.pd-panel input:focus,
+.pd-panel select:focus,
+.pd-panel textarea:focus,
+.voice-fallback-card input:focus,
+.voice-fallback-card select:focus {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 6px 18px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* Select-like pill buttons outside the composer lose their outline too. */
+.settings-modal .pm-select-btn {
+  border-color: transparent;
+}
+
+/* Smooth interactions + shared caret/placeholder for the fields above. */
+.chat-find-input,
+.pm-modal-search,
+.manual-model-ctx-input,
+.files-filter-input,
+.fv-sheet-input,
+.fv-search-input,
+.fv-comment-input,
+.media-editor-ask-input,
+.settings-modal input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(.api-key-input),
+.settings-modal select,
+.settings-modal textarea,
+.pd-panel input,
+.pd-panel select,
+.pd-panel textarea {
+  caret-color: var(--accent);
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.2s ease,
+    border-color 0.16s ease;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+/* ── 2. Soft glass on dialogs + the command palette ────────────────────── */
+.modal,
+.search-pop {
+  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  backdrop-filter: blur(28px) saturate(1.25);
+  -webkit-backdrop-filter: blur(28px) saturate(1.25);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* Buttons: a soft accent bloom on hover + a visible keyboard ring. */
+.btn:not(:disabled):hover {
+  box-shadow: 0 6px 18px -8px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.btn:focus-visible,
+.icon-btn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ── 3. Composer responsive behavior ─────────────────────────────────────
+   The chat PANEL is the size container, so a narrow window and a narrow
+   split pane collapse the composer chrome identically. The composer's
+   visual design is frozen — only wrapping, caps and paddings adapt. */
+.chat-panel {
+  container: chatpanel / inline-size;
+}
+
+@container chatpanel (max-width: 620px) {
+  .composer {
+    padding-inline: 10px;
+  }
+
+  .composer-footer {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    padding-inline: 2px;
+  }
+
+  .composer-footer .pm-select-btn {
+    max-width: 170px;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .composer-footer .ctx-ring-wrap,
+  .composer-footer .live-btn-wrap {
+    flex: 0 0 auto;
+  }
+
+  .composer-inner > .attachment-chips {
+    flex-wrap: wrap;
+  }
+}
+
+@container chatpanel (max-width: 440px) {
+  .composer {
+    padding-inline: 6px;
+  }
+
+  .composer-footer {
+    gap: 4px;
+  }
+
+  .composer-footer .pm-select-btn {
+    max-width: 132px;
+  }
+
+  .composer-input {
+    padding-inline: 12px;
+  }
+
+  .composer-bottom-row {
+    padding-inline: 9px;
+  }
+}
+
+/* ── 4. Chat scrollbar: slim at rest, fat on hover ───────────────────────
+   The visible thumb widens via a transparent-border trick (the classic
+   WebKit technique — Tauri renders through WKWebView): the track keeps its
+   10px lane (zero layout shift) while the thumb grows from 6px to the full
+   10px under the cursor. Hover is scoped to the scrollbar's OWN track and
+   thumb — NOT the container, or the thumb would be wide whenever the mouse
+   is anywhere over the transcript. */
+.chat-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+  border-width: 0;
+  background: color-mix(in srgb, var(--text) 24%, var(--border));
+}
+
+/* ── 5. Git bar in the Review panel header ───────────────────────────────
+   The uncommitted-changes bar (branch + counts + Undo/Commit/Push) moved
+   here from the composer and then from the app bar: the review panel already
+   shows this workspace's diffs, so its git controls belong in its header.
+   Compacted to header scale and the counts are hidden — the panel's own
+   .review-counts line right beside it shows the same numbers. */
+.review-header .composer-diff-bar {
+  position: relative;
+  flex: 0 0 auto;
+  margin: 0;
+  max-width: 380px;
+  min-height: 36px;
+  padding: 3px 5px;
+  gap: 6px;
+  /* No outline around the bar — the pill surface is enough. */
+  border-color: transparent;
+}
+
+.review-header .composer-diff-btn {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 7px;
+}
+
+.review-header .composer-diff-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.review-header .composer-diff-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.review-header-actions .composer-diff-counts {
+  display: none;
+}
+
+/* Branch name as its own quiet chip (the select is the switcher): tonal
+   surface, no UA chrome. WebKit paints an accent-colored native focus ring
+   around selects — replaced with the house ring, mouse clicks stay quiet. */
+.review-header .composer-diff-branch {
+  /* ONE background — an ellipse at the same 30px scale as the buttons. */
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: none;
+  border-radius: 999px;
+  height: 30px;
+  padding: 0 14px;
+  color: var(--text);
+  /* Native selects do NOT inherit font-size — without this the branch name
+     renders in the UA default size and dwarfs the bar's mono. */
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  max-width: 160px;
+  cursor: pointer;
+}
+
+.review-header .composer-diff-git-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.review-header .composer-diff-git-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.review-header .composer-diff-branch-wrap {
+  gap: 7px;
+  /* Passive container: NEVER paints its own pill — the wrap's accent hover
+     background/border was the mystery "second background" around the chip. */
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.review-header .composer-diff-branch-wrap:hover {
+  background: none;
+  border-color: transparent;
+}
+
+.review-header .composer-diff-branch:focus,
+.review-header .composer-diff-branch:focus-visible {
+  outline: none;
+  /* WebKit matches :focus-visible on select even for mouse clicks — the old
+     accent ring here was my own focus-visible shadow, so NO ring at all;
+     the background brightening below is the focus affordance. */
+  box-shadow: none;
+}
+
+.review-header .composer-diff-branch:focus {
+  color: var(--accent);
+}
+
+/* Input WRAPPERS (label/div around a field) — the element safety net above
+   only reaches the field itself. Same rule here: tonal surface, NO outline. */
+.review-search,
+.browser-omnibox-wrap,
+.tab-list-search {
+  border-color: transparent;
+}
+
+/* Search fields: kill any residual native search-field chrome. */
+.review-search-input,
+.tab-list-search input {
+  -webkit-appearance: none;
+  appearance: none;
+  outline: none;
+}
+
+/* ── 5b. Diff-source selector: one dropdown (was three tab buttons) ────── */
+.review-source {
+  position: relative;
+}
+
+.review-source-btn.current {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-panel);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.review-source-caret {
+  color: var(--text-dim);
+}
+
+.review-source-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 70;
+  min-width: 190px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
+  backdrop-filter: blur(24px) saturate(1.2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-pop);
+  animation: review-source-menu-in 0.14s ease-out;
+}
+
+@keyframes review-source-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.review-source-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.review-source-item:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.review-source-item.active {
+  color: var(--accent);
+}
+
+.review-source-item svg {
+  margin-left: auto;
+  color: var(--text-dim);
+}
+
+/* ── 7. Transcript controls that were invisible ──────────────────────────
+   The scroll-to-bottom pill and the selection "Reply" chip were dark-on-dark.
+   Both now speak the theme language: accent fill for the scroll pill (the
+   strongest affordance in the transcript), panel surface + accent border for
+   the Reply chip. */
+.scroll-jump {
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-panel));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  /* Barely-there depth only — the accent ring does the lifting. */
+  box-shadow: 0 1px 6px -2px rgba(0, 0, 0, 0.3);
+}
+
+.scroll-jump:hover {
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-panel));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.chat-quote-reply {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-panel));
+  color: var(--accent);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-pop);
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease;
+}
+
+.chat-quote-reply:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 26%, var(--bg-panel));
+}
+
+/* ── 8. Git bar tooltips flip DOWN in the review header ──────────────────
+   .composer-diff-btn tooltips open ABOVE the button (composer heritage).
+   In the review header the buttons sit at the panel's top edge, so the
+   tooltip escaped the pane and got clipped — drop it below instead. */
+.review-header .composer-diff-btn[data-tip]:hover::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+
+/* ── 9. Focus WITHOUT a ring on wrapper wells ────────────────────────────
+   The user reads every outline as a border. On focus the wrapper wells
+   brighten instead: base :focus-within painted an accent border and the
+   polish layer added a 3px accent ring on top — both are suppressed here
+   (this block is last, so it wins the tie). */
+.review-search:focus-within {
+  border-color: transparent !important;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent);
+  background: color-mix(in srgb, var(--bg-input) 93%, var(--text) 7%);
+}
+
+/* ── 10. The wrapper well NEVER draws an outline — any state ─────────────
+   The base :hover / :focus-within rules painted an accent border on the
+   search pill (hover beat the flat borderless override on specificity, so
+   the ring kept reappearing under the cursor). One rule, all states, !important:
+   the wrapper is a tonal well, period — brightness is its only affordance. */
+.review-search,
+.review-search:hover,
+.review-search:focus-within,
+.review-search:focus-visible {
+  border-color: transparent !important;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+
+/* ── 11. Nuclear: no ring on the review search field, any state ────────── */
+.review-search-input:focus,
+.review-search-input:focus-visible,
+.review-search:focus,
+.review-search:focus-within,
+.review-search:focus-visible,
+.review-search:hover {
+  outline: none !important;
+  border-color: transparent !important;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent) !important;
+}
+
+
+/* ── 12. Inline new-branch input + two-click undo ────────────────────────
+   window.prompt / window.confirm return null in Tauri's WKWebView, so the
+   branch popover is a real inline input and Undo arms on the first click. */
+.composer-diff-newbranch {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 80;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: color-mix(in srgb, var(--bg-panel, var(--bg)) 94%, transparent);
+  backdrop-filter: blur(24px) saturate(1.2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pop);
+  animation: composer-diff-pop 0.14s ease-out;
+}
+
+@keyframes composer-diff-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.composer-diff-newbranch input {
+  width: 190px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+
+.composer-diff-btn.undo.armed {
+  width: auto;
+  padding: 0 9px;
+  color: var(--danger);
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.composer-diff-btn-armed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
 }

@@ -7,7 +7,10 @@ import { finishedRunIds, unseenRunCount, unseenRunCountForTask } from "../lib/sc
 import { prepareContent } from "../lib/bidi";
 import { formatTokens } from "../lib/context";
 import { useVimScroll } from "../lib/useVimScroll";
-import { markVimRegion } from "../lib/panePointer";
+import { applyScroll, scrollDelta } from "../lib/scrollKeys";
+import { physicalKey } from "../lib/shortcuts";
+import { isPrefixArmed } from "../lib/prefixState";
+import { isEditableTarget, markVimRegion, snapshotIntent } from "../lib/panePointer";
 import { focusChatInput } from "../lib/chatFocus";
 import { mdComponents } from "./ChatMessage";
 import { formatNextRunFa, runStatusFa } from "./SchedulePanel";
@@ -72,6 +75,35 @@ function InboxVimScroll({
   chatRef: React.RefObject<HTMLDivElement | null>;
 }) {
   useVimScroll(chatRef, inboxRef);
+
+  // Override مخصوص اینباکس برای caret کهنهٔ WebKit: کرسر بعد از کلیک روی
+  // محتوای غیرقابل‌تایپ، در کامپوزر چت پارک می‌ماند؛ هوک مشترک چنین keydownی
+  // را «تایپ» می‌داند و j/k را رها می‌کند. اینباکس هیچ فیلد متنی خودش ندارد،
+  // پس وقتی جدیدترین تعامل کاربر کلیک داخل اینباکس بوده (نه رفتن به یک input)،
+  // j/k با اطمینان مالِ اسکرول‌اند — حتی با کرسر پارک‌شده بیرون. قاعده فقط
+  // وقتی اعمال می‌شود که هوک مشترک کلید را نگرفته باشد (defaultPrevented) و
+  // intent تایپ از intent پنل جدیدتر نباشد؛ وگرنه تایپ واقعی اولویت دارد.
+  useEffect(() => {
+    const dlg = inboxRef.current;
+    const chat = chatRef.current;
+    if (!dlg || !chat) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isPrefixArmed()) return;
+      const delta = scrollDelta(physicalKey(e), e.shiftKey);
+      if (!delta) return;
+      const target = e.target as Node | null;
+      if (isEditableTarget(target) && dlg.contains(target)) return;
+      const st = snapshotIntent();
+      if (st.region !== dlg || st.regionAt < st.typingAt) return;
+      e.preventDefault();
+      e.stopPropagation();
+      applyScroll(chat, delta, !e.repeat);
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, []);
+
   return null;
 }
 

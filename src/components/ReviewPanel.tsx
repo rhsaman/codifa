@@ -332,19 +332,12 @@ export function ReviewPanel(props?: {
       ) ?? s.settings.providers[0]
     );
   });
-  // Busy = the owning chat is mid-turn — git writes while the agent works can
-  // interleave with its edits.
-  const gitBusy = useStore((s) => {
-    const c = s.chats.find((x) => x.id === (ownerChatId ?? s.activeChatId));
-    return (
-      !!c &&
-      (s.chatBusy[c.id] === true ||
-        c.messages.some((m) => m.streaming) ||
-        c.messages.some((m) => m.retry?.reconnecting === true))
-    );
-  });
+  // Git actions stay available while the chat is streaming: the agent only
+  // edits files inside tool calls, and a commit snapshots whatever is on disk
+  // at that moment. Concurrent clicks of the same action are guarded by the
+  // per-action flags (isCommitting / isUndoing / isPushing) below.
   const handleGitCommit = () => {
-    if (!root || gitBusy || !gitChat || isCommitting) return;
+    if (!root || !gitChat || isCommitting) return;
     void (async () => {
       setIsCommitting(true);
       try {
@@ -434,7 +427,7 @@ export function ReviewPanel(props?: {
   const handleGitUndo = () => {
     // The bar arms the undo (two-click confirm) — window.confirm is
     // unreliable in Tauri's WKWebView, so no dialog here.
-    if (!root || gitBusy || isUndoing) return;
+    if (!root || isUndoing) return;
     void (async () => {
       setIsUndoing(true);
       try {
@@ -448,7 +441,7 @@ export function ReviewPanel(props?: {
     })();
   };
   const handleGitPush = () => {
-    if (!root || gitBusy || isPushing) return;
+    if (!root || isPushing) return;
     void (async () => {
       setIsPushing(true);
       try {
@@ -835,7 +828,6 @@ export function ReviewPanel(props?: {
         <span className="review-header-actions">
           <ComposerDiffBar
             root={root}
-            disabled={gitBusy}
             isCommitting={isCommitting}
             isUndoing={isUndoing}
             isPushing={isPushing}

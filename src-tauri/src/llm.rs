@@ -645,8 +645,16 @@ fn endpoint_and_auth(cfg: &LlmConfig, key: &str) -> (String, &'static str, Strin
             "x-api-key",
             key,
         ),
+        // Native shape: the saved base may carry the OpenAI-compat suffix
+        // (`…/v1beta/openai`), and appending `/v1beta` to THAT produced
+        // `…/v1beta/openai/v1beta/models/…` — a 404 for every Google chat call.
+        // The root is normalized so both spellings of the base resolve here.
         "google" => (
-            format!("{base}/v1beta/models/{model}:generateContent", model = cfg.model),
+            format!(
+                "{}/models/{model}:generateContent",
+                gemini_native_api(&cfg.base_url),
+                model = cfg.model
+            ),
             "x-goog-api-key",
             key,
         ),
@@ -1537,7 +1545,11 @@ async fn stream_with_key(
     let (url, header_name, header_value) = match cfg.provider.as_str() {
         "anthropic" => (format!("{base}/v1/messages"), "x-api-key", key.to_string()),
         "google" => (
-            format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse", model = cfg.model),
+            format!(
+                "{}/models/{model}:streamGenerateContent?alt=sse",
+                gemini_native_api(&cfg.base_url),
+                model = cfg.model
+            ),
             "x-goog-api-key",
             key.to_string(),
         ),

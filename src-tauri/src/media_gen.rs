@@ -773,6 +773,21 @@ fn is_google(kind: &str) -> bool {
     kind.eq_ignore_ascii_case("google") || kind.eq_ignore_ascii_case("gemini")
 }
 
+/// One Google media URL — `:generateContent`, `:predictLongRunning` or an
+/// operation poll — hung off the SAME native API prefix chat uses.
+///
+/// The saved base is the OpenAI-compat one (`…/v1beta/openai`), so appending
+/// `/models/…` to it produced `…/v1beta/openai/models/…`: a 404 for every
+/// Google image/video call. `gemini_native_api` strips the compat suffix first,
+/// which is what keeps one provider row serving chat AND media.
+fn gemini_media_url(base_url: &str, tail: &str) -> String {
+    format!(
+        "{}/{}",
+        crate::llm::gemini_native_api(base_url),
+        tail.trim_start_matches('/')
+    )
+}
+
 fn auth_headers(
     req: reqwest::RequestBuilder,
     keys: &[String],
@@ -1013,7 +1028,10 @@ pub async fn generate_image(
     let timeout = Duration::from_secs(IMAGE_TIMEOUT_SECS);
     let google = is_google(&target.kind);
     let payload = if google {
-        let url = format!("{}/models/{}:generateContent", target.base_url, target.model);
+        let url = gemini_media_url(
+            &target.base_url,
+            &format!("models/{}:generateContent", target.model),
+        );
         let body = gemini_image_body(prompt, None);
         let resp = post_json(&url, &target.keys, &body, true, timeout).await?;
         gemini_image_parse(&resp)?
@@ -1216,7 +1234,10 @@ pub async fn edit_image(
     let result_bytes: Vec<u8>;
     let mut result_mime: &'static str;
     if google {
-        let url = format!("{}/models/{}:generateContent", target.base_url, target.model);
+        let url = gemini_media_url(
+            &target.base_url,
+            &format!("models/{}:generateContent", target.model),
+        );
         let reference = match &composite {
             Some((_, crop, _, _)) => Some((crop.as_raw().as_slice(), "image/png")),
             None => Some((&input[..], mime_for_path(input_rel))),
@@ -1392,9 +1413,9 @@ pub async fn generate_video(
     };
 
     let (video_bytes, mime) = if is_google(&target.kind) {
-        let url = format!(
-            "{}/models/{}:predictLongRunning",
-            target.base_url, target.model
+        let url = gemini_media_url(
+            &target.base_url,
+            &format!("models/{}:predictLongRunning", target.model),
         );
         let body = {
             let reference_ref = reference.as_ref().map(|(b, m)| (b.as_slice(), *m));
@@ -1408,7 +1429,7 @@ pub async fn generate_video(
             .trim()
             .trim_start_matches('/')
             .to_string();
-        let poll_url = format!("{}/{op_name}", target.base_url);
+        let poll_url = gemini_media_url(&target.base_url, &op_name);
         let done = poll_until(&poll_url, &target.keys, true, |b| {
             // Err = the operation itself failed; Ok(false) = still running.
             match veo_operation_video_uri(b) {
@@ -1559,6 +1580,34 @@ mod tests {
 
         // No base URL at all: not a rung.
         assert!(target_from_cfg(&json!({ "kind": "openai" }), "m").is_none());
+    }
+
+    /// A Google provider row carries the OpenAI-compat base
+    /// (`…/v1beta/openai`) so chat keeps working; every media URL must still
+    /// land on `…/v1beta/models/…`. Appending straight to the saved base sent
+    /// image/video calls to `…/v1beta/openai/models/…` — a 404 each time.
+    #[test]
+    fn google_media_urls_use_the_native_prefix() {
+        let compat = "https://generativelanguage.googleapis.com/v1beta/openai";
+        assert_eq!(
+            gemini_media_url(compat, "models/gemini-2.5-flash-image:generateContent"),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent"
+        );
+        // The bare native base and a trailing slash must resolve identically.
+        for base in [
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/",
+        ] {
+            assert_eq!(
+                gemini_media_url(base, "/models/veo-3:predictLongRunning"),
+                "https://generativelanguage.googleapis.com/v1beta/models/veo-3:predictLongRunning"
+            );
+        }
+        // A gateway that keeps a path prefix in front of the suffix survives.
+        assert_eq!(
+            gemini_media_url("https://proxy/gemini/v1beta/openai", "models/m:generateContent"),
+            "https://proxy/gemini/v1beta/models/m:generateContent"
+        );
     }
 
     #[test]

@@ -462,6 +462,41 @@ fn is_skill_file(path: &str) -> bool {
     leaf(path).eq_ignore_ascii_case("skill.md")
 }
 
+/// Whether `path` is a Claude Code command: `<anything>/commands/<name>.md`.
+fn is_command_file(path: &str) -> bool {
+    markdown_under(path, "commands")
+}
+
+/// Whether `path` is a Codex prompt: `<anything>/prompts/<name>.md`.
+///
+/// Codex keeps the exact same prompt-template file under `prompts/`; the two
+/// readers are one code path with a different folder name.
+fn is_prompt_file(path: &str) -> bool {
+    markdown_under(path, "prompts")
+}
+
+/// Whether `path` is a plugin sub-agent: `<anything>/agents/<name>.md`.
+fn is_agent_file(path: &str) -> bool {
+    markdown_under(path, crate::subagents::AGENTS)
+}
+
+/// Whether `path` is a hook declaration: `<anything>/hooks/hooks.json`.
+fn is_hooks_file(path: &str) -> bool {
+    leaf(path).eq_ignore_ascii_case(crate::hooks::HOOKS_FILE)
+        && parent(path)
+            .rsplit('/')
+            .next()
+            .is_some_and(|folder| folder.eq_ignore_ascii_case(crate::hooks::HOOKS))
+}
+
+fn markdown_under(path: &str, folder: &str) -> bool {
+    leaf(path).to_ascii_lowercase().ends_with(".md")
+        && parent(path)
+            .rsplit('/')
+            .next()
+            .is_some_and(|f| f.eq_ignore_ascii_case(folder))
+}
+
 /// Whether `path` is a plugin script's manifest: `<anything>/scripts/<name>/script.json`.
 fn is_script_manifest(path: &str) -> bool {
     if !leaf(path).eq_ignore_ascii_case(crate::plugins::SCRIPT_MANIFEST) {
@@ -481,6 +516,54 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 
+/// Dot-folders that hold a HOST's copy of the manifest rather than the bundle.
+///
+/// `.claude-plugin/` is the shape this reader was written for, and `.zcode-plugin/`
+/// copies it. Codex, Cursor and Grok publish the SAME bundle under their own
+/// dot-folder, so a repo that distributes to several hosts carries one manifest
+/// per host at the SAME depth — that is one plugin, not several. Ordered by
+/// preference: when a bundle ships several, the Claude manifest wins, because it
+/// is the shape that carries every part (commands, hooks, agents, `.mcp.json`).
+const HOST_DIRS: [&str; 5] = [
+    ".claude-plugin",
+    ".zcode-plugin",
+    ".codex-plugin",
+    ".cursor-plugin",
+    ".grok-plugin",
+];
+
+/// Last path segment — the folder name a manifest sits in.
+fn last_segment(dir: &str) -> &str {
+    dir.rsplit('/').next().unwrap_or(dir)
+}
+
+fn is_host_dir(segment: &str) -> bool {
+    HOST_DIRS.iter().any(|d| segment.eq_ignore_ascii_case(d))
+}
+
+/// The bundle folder a manifest belongs to: its own folder, or one level UP when
+/// that folder is a host's dot-folder — the skills, connectors and `.mcp.json`
+/// sit beside the dot-folder, not inside it.
+fn root_of(manifest_path: &str) -> String {
+    let dir = parent(manifest_path);
+    if is_host_dir(last_segment(dir)) {
+        parent(dir).to_string()
+    } else {
+        dir.to_string()
+    }
+}
+
+/// Preference among manifests that root to the same folder. A manifest outside
+/// every host folder sorts last, so a single bundle still roots at its own
+/// `skills/plugin.json` when that is all it has.
+fn host_rank(manifest_path: &str) -> usize {
+    let dir = parent(manifest_path);
+    HOST_DIRS
+        .iter()
+        .position(|d| last_segment(dir).eq_ignore_ascii_case(d))
+        .unwrap_or(HOST_DIRS.len())
+}
+
 /// The bundle root plus the manifest that declared it.
 ///
 /// Claude's layout hides the manifest in `.claude-plugin/` while the skills and
@@ -489,40 +572,49 @@ fn parent(path: &str) -> &str {
 /// (`skills/plugin.json`) roots at the manifest's own folder. ZCode plugins
 /// hide theirs the same way, in `.zcode-plugin/`, and root one level up
 /// identically — same shape, different dot-folder name.
+///
+/// Several manifests at the top depth are only several PLUGINS when they root at
+/// DIFFERENT folders. A repo that ships one bundle to Claude, Codex, Cursor and
+/// Grok puts a manifest in each host's dot-folder at one depth, and all of them
+/// root to the repo — that is one install, so it must not be refused as
+/// ambiguous.
 fn locate(repo: &Repo) -> Result<(String, Option<String>), String> {
     let mut manifests: Vec<&String> = repo.files().iter().filter(|p| is_manifest(p)).collect();
     manifests.sort_by_key(|p| p.matches('/').count());
-    let Some(path) = manifests.first().map(|p| (*p).clone()) else {
+    let Some(first) = manifests.first().map(|p| (*p).clone()) else {
         return Ok((String::new(), None));
     };
-    let depth = path.matches('/').count();
-    let ties: Vec<&&String> = manifests
+    let depth = first.matches('/').count();
+    let ties: Vec<String> = manifests
         .iter()
         .filter(|p| p.matches('/').count() == depth)
+        .map(|p| (*p).clone())
         .collect();
-    if ties.len() > 1 {
-        let list = ties
+    let mut roots: Vec<String> = Vec::new();
+    for path in &ties {
+        let root = root_of(path);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if roots.len() > 1 {
+        // Listed as FOLDERS, because that is what `repo_path` takes: naming the
+        // manifests would hand the caller a file where it must pass a directory.
+        let list = roots
             .iter()
-            .map(|p| format!("  {p}"))
+            .map(|r| format!("  {}", if r.is_empty() { "." } else { r }))
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!(
             "this repo holds more than one plugin — pass `repo_path` to pick one:\n{list}"
         ));
     }
-    let dir = parent(&path).to_string();
-    // A manifest parked in a dot-folder is metadata, not the bundle: the skills
-    // and connectors live one level ABOVE it. Claude and ZCode differ only in
-    // the folder's name.
-    let hidden_manifest = |folder: &str| {
-        folder.eq_ignore_ascii_case(".claude-plugin") || folder.eq_ignore_ascii_case(".zcode-plugin")
-    };
-    let root = match dir.rsplit_once('/') {
-        Some((up, last)) if hidden_manifest(last) => up.to_string(),
-        _ if hidden_manifest(&dir) => String::new(),
-        _ => dir,
-    };
-    Ok((root, Some(path)))
+    let path = ties
+        .iter()
+        .min_by_key(|p| host_rank(p))
+        .cloned()
+        .unwrap_or(first);
+    Ok((root_of(&path), Some(path)))
 }
 
 /// Read a whole plugin bundle: manifest, skills and connectors, in the exact
@@ -593,14 +685,88 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
         }));
     }
     // A bundle is a CONTAINER, so it only has to carry SOMETHING: skills,
-    // connectors or scripts. Refusing a skills-less repo made a marketplace row
-    // that publishes only an `mcp.json` (a connector, no prompt) uninstallable,
-    // which is not a property of the row but of this guard.
+    // connectors, scripts, commands, hooks or sub-agents. Refusing a
+    // skills-less repo made a marketplace row that publishes only an `mcp.json`
+    // (a connector, no prompt) uninstallable, which is not a property of the row
+    // but of this guard — and the same refusal turned every Claude Code bundle
+    // made of `commands/`, `hooks/` and `agents/` into "nothing to install".
     let mcp = read_connectors(&repo, &root);
-    if skills.is_empty() && scripts.is_empty() && mcp.as_object().is_none_or(|m| m.is_empty()) {
+    // Commands (Claude) and prompts (Codex) are prompt templates, so they land
+    // in the bundle's SKILL store flagged as `kind: command`: one container for
+    // everything the renderer and the router already read.
+    let mut commands: Vec<Value> = Vec::new();
+    for path in repo.files().iter().filter(|p| {
+        p.starts_with(prefix.as_str()) && (is_command_file(p) || is_prompt_file(p))
+    }) {
+        if commands.len() >= crate::plugins::MAX_COMMANDS {
+            break;
+        }
+        commands.push(read_command_at(&repo, path)?);
+    }
+    // Sub-agent profiles travel verbatim: their frontmatter is the contract, so
+    // the file is stored as read and parsed by `subagents` on every listing.
+    let mut agents: Vec<Value> = Vec::new();
+    for path in repo
+        .files()
+        .iter()
+        .filter(|p| p.starts_with(prefix.as_str()) && is_agent_file(p))
+    {
+        if agents.len() >= crate::subagents::MAX_AGENTS {
+            break;
+        }
+        let Ok(raw) = repo.read(path) else { continue };
+        let stem = leaf(path).trim_end_matches(".md").trim_end_matches(".MD");
+        let mut profile = crate::subagents::parse_profile(&raw, stem);
+        if !profile["prompt"].as_str().is_some_and(|p| !p.trim().is_empty()) {
+            continue;
+        }
+        profile["content"] = json!(raw);
+        profile["file"] = json!(leaf(path));
+        agents.push(profile);
+    }
+    // Hook declarations are VALIDATED here, not executed: a command that leaves
+    // the bundle folder, or an event Codifa does not dispatch, is dropped before
+    // it can reach disk. Execution is a separate, explicitly-approved decision.
+    let mut hooks: Vec<Value> = Vec::new();
+    // The HANDLER SCRIPTS a declaration points at. A real Claude Code bundle
+    // keeps them beside the manifest (`hooks-handlers/session-start.sh`) and
+    // spells the command `${CLAUDE_PLUGIN_ROOT}/…`; carrying only the JSON left
+    // every such hook pointing at a file the install never wrote.
+    let mut hook_files: Vec<Value> = Vec::new();
+    if let Some(path) = repo
+        .files()
+        .iter()
+        .find(|p| p.starts_with(prefix.as_str()) && is_hooks_file(p))
+    {
+        if let Ok(raw) = repo.read(path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&raw) {
+                for hook in crate::hooks::hooks_of(&doc) {
+                    if let Some(rel) = crate::hooks::handler_path(&hook.command) {
+                        let full = format!("{prefix}{rel}");
+                        if !hook_files.iter().any(|f| f["path"] == json!(rel)) {
+                            if let Ok(body) = repo.read(&full) {
+                                hook_files.push(json!({ "path": rel, "content": body }));
+                            }
+                        }
+                    }
+                    hooks.push(json!({
+                        "event": hook.event,
+                        "matcher": hook.matcher,
+                        "command": hook.command,
+                    }));
+                }
+            }
+        }
+    }
+    if skills.is_empty()
+        && scripts.is_empty()
+        && commands.is_empty()
+        && agents.is_empty()
+        && hooks.is_empty()
+        && mcp.as_object().is_none_or(|m| m.is_empty())
+    {
         return Err(format!(
-            "nothing to install from {}{} — the folder holds no SKILL.md, no `mcp.json` \
-             (or `.mcp.json`) and no `scripts/`. Point `repo_path` at the folder that does",
+            "nothing to install from {}{} — the folder holds no `skills/*/SKILL.md`, no `commands/*.md` (or Codex `prompts/*.md`), no `agents/*.md`, no `hooks/hooks.json`, no `scripts/` and no `mcp.json` (or `.mcp.json`). Point `repo_path` at the folder that does",
             repo.describe(),
             match &manifest_path {
                 Some(p) => format!(" (plugin.json is {p})"),
@@ -635,6 +801,10 @@ pub fn read_plugin(spec: &str, sub: &str, git_ref: &str) -> Result<Value, String
         "manifest": manifest_path,
         "skills": skills,
         "scripts": scripts,
+        "commands": commands,
+        "agents": agents,
+        "hooks": hooks,
+        "hook_files": hook_files,
         "mcp": read_connectors(&repo, &root),
     }))
 }
@@ -935,6 +1105,39 @@ pub fn read_skill(spec: &str, sub: &str, git_ref: &str, hint: &str) -> Result<Va
     read_skill_at(&repo, path)
 }
 
+fn read_command_at(repo: &Repo, path: &str) -> Result<Value, String> {
+    let raw = repo.read(path)?;
+    let stem = leaf(path)
+        .trim_end_matches(".md")
+        .trim_end_matches(".MD");
+    // The FILE STEM names the command, never the body: `commands/model-check.md`
+    // is `/model-check` — the word the palette shows and the user types. Only an
+    // explicit `name:` in a frontmatter header may override it. (`parse_frontmatter`
+    // falls back to the first body line, which on a real bundle's plain-prose
+    // command turned its opening sentence into the command's name.)
+    let declared = crate::skills::frontmatter_name_pub(&raw);
+    let name = if declared.trim().is_empty() {
+        stem.to_string()
+    } else {
+        declared
+    };
+    let (_, _, description, _) = crate::skills::parse_frontmatter_pub(&raw);
+    Ok(json!({
+        // `kind` is what turns a stored skill row into a SLASH COMMAND: the
+        // command palette and the router read the same store, and this field is
+        // the one fact that keeps a command from showing up as an attachable
+        // skill.
+        "name": name,
+        "description": if description.trim().is_empty() {
+            format!("Run the /{stem} command")
+        } else {
+            description
+        },
+        "kind": "command",
+        "content": raw,
+    }))
+}
+
 fn read_skill_at(repo: &Repo, path: &str) -> Result<Value, String> {
     let raw = repo.read(path)?;
     let (mut name, _slug, description, fa_keywords) =
@@ -1038,6 +1241,51 @@ mod tests {
         let path = dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    /// The exact layout of a real published bundle
+    /// (`Jaace/claude-model-advisor`): a manifest in `.claude-plugin/`, ONE
+    /// command with no frontmatter, a `hooks/hooks.json` whose handler lives in
+    /// `hooks-handlers/` and is spelled `${CLAUDE_PLUGIN_ROOT}/…`, and no
+    /// `SKILL.md` and no `mcp.json` anywhere. This is the bundle that used to
+    /// fail with "nothing to install".
+    #[test]
+    fn a_commands_and_hooks_only_bundle_installs_whole() {
+        let dir = fixture("claude-model-advisor");
+        put(
+            &dir,
+            ".claude-plugin/plugin.json",
+            r#"{"name":"model-advisor","version":"1.0.1","description":"Recommends the right model"}"#,
+        );
+        put(
+            &dir,
+            "commands/model-check.md",
+            "Reassess the current session.\n\nArguments: $ARGUMENTS\n",
+        );
+        put(
+            &dir,
+            "hooks/hooks.json",
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.sh","timeout":5}]}]}}"#,
+        );
+        put(&dir, "hooks-handlers/session-start.sh", "#!/bin/sh\necho ready\n");
+
+        let got = read_plugin(dir.to_str().unwrap(), "", "").unwrap();
+        // The ROOT is the repo, not the hidden manifest folder: both parts sit
+        // beside `.claude-plugin/`, so reading the manifest's folder found none.
+        assert_eq!(got["name"], "model-advisor");
+        let commands = got["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["name"], "model-check");
+        assert!(commands[0]["content"].as_str().unwrap().contains("$ARGUMENTS"));
+        // The hook is declared AND its handler script travels with it: a
+        // declaration pointing at a file the install never wrote could only
+        // ever fail to start.
+        let hooks = got["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["event"], "SessionStart");
+        let files = got["hook_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "hooks-handlers/session-start.sh");
     }
 
     #[test]
@@ -1257,6 +1505,72 @@ mod tests {
     }
 
     #[test]
+    fn one_bundle_published_to_four_hosts_is_one_plugin() {
+        // The real `Upload-Post/upload-post-plugin` layout: ONE bundle shipped to
+        // Claude, Codex, Cursor and Grok, so each host's dot-folder carries its
+        // own manifest at the SAME depth. All four root to the repo, so this is
+        // one install — it used to be refused as "more than one plugin" and the
+        // user was told to pass a `repo_path` that does not exist.
+        let dir = fixture("multi-host");
+        put(
+            &dir,
+            ".claude-plugin/plugin.json",
+            r#"{"name":"upload-post","version":"0.4.0","description":"social media scheduler"}"#,
+        );
+        put(&dir, ".codex-plugin/plugin.json", r#"{"name":"up-post"}"#);
+        put(&dir, ".cursor-plugin/plugin.json", r#"{"name":"up-post"}"#);
+        put(&dir, ".grok-plugin/plugin.json", r#"{"name":"up-post"}"#);
+        put(&dir, ".mcp.json", r#"{"mcpServers":{"up":{"url":"https://x.test/mcp"}}}"#);
+        put(
+            &dir,
+            "skills/publish/SKILL.md",
+            "---\nname: publish\ndescription: Post a video.\n---\n\n# publish\n\nGo.",
+        );
+        put(
+            &dir,
+            "agents/post-debugger.md",
+            "---\nname: post-debugger\ndescription: Debugs a failed post.\ntools: read, grep\n---\nFind the reason.",
+        );
+        let got = read_plugin(dir.to_str().unwrap(), "", "").unwrap();
+        // The repo roots at itself, and the Claude manifest is the one recorded:
+        // it is the shape that carries every part.
+        assert_eq!(got["manifest"], ".claude-plugin/plugin.json");
+        assert_eq!(got["name"], "upload-post");
+        assert_eq!(got["version"], "0.4.0");
+        assert_eq!(got["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(got["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(got["mcp"]["up"]["url"], "https://x.test/mcp");
+    }
+
+    #[test]
+    fn two_plugins_in_two_folders_are_still_refused() {
+        // The check still has to fire when the manifests root at DIFFERENT
+        // folders: otherwise folding the host dot-folders would have silently
+        // made every multi-plugin repo install the wrong one.
+        let dir = fixture("two-plugins");
+        put(&dir, "alpha/.claude-plugin/plugin.json", r#"{"name":"alpha"}"#);
+        put(
+            &dir,
+            "alpha/skills/a/SKILL.md",
+            "---\nname: a\n---\nBody.",
+        );
+        put(&dir, "beta/.claude-plugin/plugin.json", r#"{"name":"beta"}"#);
+        put(
+            &dir,
+            "beta/skills/b/SKILL.md",
+            "---\nname: b\n---\nBody.",
+        );
+        let err = read_plugin(dir.to_str().unwrap(), "", "").unwrap_err();
+        assert!(err.contains("more than one plugin"), "{err}");
+        // Listed as FOLDERS, because that is what `repo_path` takes.
+        assert!(err.contains("  alpha"), "{err}");
+        assert!(err.contains("  beta"), "{err}");
+        // And each one alone installs.
+        let alpha = read_plugin(dir.to_str().unwrap(), "alpha", "").unwrap();
+        assert_eq!(alpha["name"], "alpha");
+    }
+
+    #[test]
     fn zcode_layout_roots_at_the_repo_not_the_hidden_manifest() {
         // The ZCode plugin cache (`~/.zcode/cli/plugins/cache/<market>/<name>/<version>/`)
         // parks its manifest in `.zcode-plugin/`. Reading that root as the bundle
@@ -1322,6 +1636,9 @@ mod tests {
         let dir = fixture("empty");
         put(&dir, "README.md", "nothing here");
         let err = read_plugin(dir.to_str().unwrap(), "", "").unwrap_err();
-        assert!(err.contains("no SKILL.md"), "{err}");
+        // The message names every installable shape, so a bundle that carries
+        // none of them says which one it looked for.
+        assert!(err.contains("nothing to install from"), "{err}");
+        assert!(err.contains("skills/*/SKILL.md"), "{err}");
     }
 }

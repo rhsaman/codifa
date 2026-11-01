@@ -593,10 +593,18 @@ async fn degrade_images_to_text(
     changed
 }
 
-/// Maximum tool-loop iterations per turn (mirrors graph.py MAX_STEPS).
-const MAX_STEPS: usize = 60;
-/// Main-agent wrap-up: how many steps before [`MAX_STEPS`] the wrap-up nudge
-/// lands (once). Traced Oct 29: three of twenty runs ran into the cap and were
+/// The explore sub-agent's round budget is `SUBAGENT_MAX_STEPS`; the MAIN agent
+/// has no round cap at all.
+///
+/// A capped main turn was cut mid-work with `finish_reason: tool_calls` on every
+/// round — no final answer and no "what is done / what remains" — so the user's
+/// follow-up message paid another full-context round-trip just to continue the
+/// same task, and the work was left half-finished. The main loop is bounded by
+/// the model itself (it stops calling tools), by the Stop button, and by the
+/// history fold/compaction that keeps the prompt inside the context window —
+/// never by an arbitrary round count.
+/// Main-agent wrap-up: how many steps before a step cap the wrap-up nudge
+/// lands (once). Traced Oct 29: three of twenty runs ran into a cap and were
 /// cut with `finish_reason: tool_calls` on every round — no final answer, no
 /// "what is done / what remains", and the user's follow-up message paid another
 /// full-context round-trip just to continue. The explore sub-agent already
@@ -927,9 +935,10 @@ fn fold_pays_off(calls_left: usize) -> bool {
     calls_left >= FOLD_MIN_REMAINING_CALLS
 }
 
-/// The main agent's wrap-up nudge, delivered once a few steps before
-/// [`MAX_STEPS`].
+/// The main agent's wrap-up nudge, delivered once a few steps before a cap.
 ///
+/// The main agent normally runs WITHOUT a cap (`max_steps == usize::MAX`), so
+/// this is silent there; it stays for any caller that does bound the loop.///
 /// Traced Oct 29: three of twenty runs ran into the 60-step cap and were cut
 /// with `finish_reason: tool_calls` on every round — no final answer, no
 /// done/remaining report, and the user's follow-up message paid another
@@ -944,7 +953,13 @@ fn main_wrapup_message(
     delivered: bool,
     mode: &str,
 ) -> Option<&'static str> {
-    if mode == "subagent" || delivered || step + MAIN_WRAPUP_STEPS_LEFT != max_steps {
+    // A cap that does not exist cannot be "nearly exhausted": the main agent
+    // runs to completion instead of being cut short (`max_steps` is
+    // `usize::MAX` there).
+    if mode == "subagent" || delivered || max_steps == usize::MAX {
+        return None;
+    }
+    if step + MAIN_WRAPUP_STEPS_LEFT != max_steps {
         return None;
     }
     Some(
@@ -1012,7 +1027,7 @@ fn record_fold(
 /// recap's 8 KB budget could apply, and its tail (later CODE blocks, ALSO
 /// RELEVANT) was lost between turns.
 fn ui_echo_cap(tool: &str) -> usize {
-    if tool == "explore" {
+    if is_delegation(tool) {
         RECAP_EXPLORE_CHARS
     } else {
         TOOL_RESULT_CAP
@@ -1400,6 +1415,13 @@ pub struct AgentRequest {
     /// as history.
     #[serde(default, deserialize_with = "deserialize_images")]
     pub images: Vec<String>,
+    /// Tools a plugin sub-agent PROFILE declared in its `agents/*.md` frontmatter.
+    /// Empty = the built-in research set (`research_schemas`), which is what the
+    /// built-in `explore` uses. A profile narrows what its sub-agent can call; it
+    /// can never widen it beyond the research set, because the filter only ever
+    /// REMOVES entries.
+    #[serde(default)]
+    pub subagent_tools: Vec<String>,
     /// The user's "Results per search" number (Settings → Web Providers). It is
     /// ONE setting with two effects: how many results `web_search` returns, and
     /// how many of those top results get their REAL page content fetched (not
@@ -1613,6 +1635,23 @@ user to switch to Build mode to edit the plugin."
     }
 }
 
+/// Narrow a sub-agent's tool set to the profile's declared tools.
+///
+/// `declared` is empty when the profile said nothing → the full research set,
+/// which is what the builtin `explore` runs with. The filter only ever REMOVES:
+/// a profile naming `write_file` gains nothing, because the research table never
+/// held it in the first place.
+fn retain_subagent_tools(schemas: &mut Vec<Value>, declared: &[String]) {
+    if declared.is_empty() {
+        return;
+    }
+    schemas.retain(|s| {
+        s["function"]["name"]
+            .as_str()
+            .is_some_and(|n| declared.iter().any(|d| d.eq_ignore_ascii_case(n)))
+    });
+}
+
 /// Mode gating, part one: drop every tool this turn may not use. The model
 /// cannot pick a tool it cannot see, so withholding the schema is the primary
 /// gate; `denied_by_caps` in the loop is the backstop for a stale transcript or
@@ -1757,6 +1796,9 @@ impl AgentRequest {
             tool_fallbacks: self.tool_fallbacks.clone(),
             // A research sub-agent is text-only: images stay with the parent.
             images: Vec::new(),
+            // A sub-agent's own tool narrowing is decided by the profile it runs
+            // under, never inherited from the parent turn.
+            subagent_tools: Vec::new(),
             // A research sub-agent searches the web the same way the parent does.
             web_search_auto_fetch: self.web_search_auto_fetch,
             // A research sub-agent has no mutating tool at all, so it runs with
@@ -3116,13 +3158,25 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "edit_file",
-            "Replace an exact string in an existing file.",
+            "Replace exact strings in existing files. Put EVERY replacement you know in ONE call via `edits`, and an entry may name its own `path` — a batch across files still costs ONE call, run IN ORDER.",
             json!({
                 "path": {"type": "string"},
                 "old_string": {"type": "string"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean"},
-                "edits": {"type": "array", "items": {"type": "object"}}
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                            "replace_all": {"type": "boolean"}
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                }
             }),
         ),
         (
@@ -3130,7 +3184,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
             // The schema is where the model learns the DIVISION OF LABOUR: the
             // backend refuses a shell read/search (MEASURED: the model reached
             // for `cat`/`sed -n` whenever the tool list did not say so).
-            "Run a shell command in the workspace with a timeout. For work only the terminal can do: listing/measuring (ls, du, df, ps, lsof), builds, tests, git, and any path OUTSIDE the workspace — there a shell grep/find is fine, the folder is requested first. It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol` (refused here). For a LONG-RUNNING process (dev server, watcher) set background=true: detached, output goes to a log file, the tool returns AT ONCE. Output streams LIVE while a command runs — never mute curl/wget (`-s`/`-q` hides a download's progress bar). An SSH connection (ssh/scp/sftp/rsync/mosh) triggers the host permission popup the first time — wait for its answer, never pre-ask with confirm_action.",
+            "Run a shell command in the workspace with a timeout. For terminal-only work: listing/measuring (du, df, ps, lsof), builds, tests, git, and paths outside the workspace (shell grep/find is fine there). It does NOT read workspace files and does NOT locate files — those are `read` and `grep`/`glob`/`find_symbol`. For a long-running process (dev server, watcher) set background=true: detached, output to a log, returns at once — never mute curl/wget (-s/-q hides progress).",
             json!({
                 "command": {"type": "string"},
                 "timeout": {"type": "integer", "description": "max seconds to wait (default 120, hard ceiling 1800 — for anything longer use background=true)"},
@@ -3148,7 +3202,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // explore rounds. Read/search here is for what the step already NAMED.
         (
             "read",
-            "Read files this step already KNOWS (never for discovery — that is `explore`). One call covers all of them: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400}] reads one window PER ENTRY — several files and several windows of ONE file cost one call, never one per window; overlapping windows merge. An entry without `path` reuses the top-level filePath.",
+            "Read files this step KNOWS (discovery is `explore`). One call covers all: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400}] reads one window PER ENTRY (several files or windows cost one call; overlaps merge). An entry without `path` reuses filePath. Headers give the file's TOTAL lines, and a large file's FIRST window carries its definition outline — jump to the line you need, don't walk window by window.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
@@ -3163,7 +3217,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "pattern": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}},
                 "path": {"type": "string"},
-                "include": {"type": "string"},
+                "include": {"type": "string", "description": "Glob filter(s): `*.rs`, or a comma list `*.ts,*.tsx` — split into one glob per entry"},
                 "max_results": {"type": "integer"},
                 "context": {"type": "integer"},
                 "ignore_case": {"type": "boolean"}
@@ -3189,7 +3243,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "lsp_symbols",
-            "Outline ONE file — functions/structs/classes with their line ranges, `query` filters by name. Use it instead of reading a large file just to find where something lives, then read only that window.",
+            "Outline ONE file — functions/structs/classes with line ranges, `query` filters by name. Native and INSTANT (no server to boot), so use it instead of reading a large file to find where something lives, then read only that window.",
             json!({"filePath": {"type": "string"}, "query": {"type": "string"}}),
         ),
         (
@@ -3278,7 +3332,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         // short: create/update/toggle/delete/list instead of four tools.
         (
             "plugin",
-            "Create/edit a plugin — a folder bundling skills, MCP connectors and runnable scripts behind one switch. `install` READS a bundle from a git repo or local folder; `create` MAKES one (use it when the user names a bundle rather than a repo); update patches only the fields sent; toggle flips `enabled`; delete removes it; run executes a script. Pass its Persian `fa_keywords`. Scripts are Rust — the house language — unless the user asked for another. When a bundle ships scripts, `list` names them and `run` executes one; also write the running command into the SKILL body that owns it, so the route is discoverable from the skill alone.",
+            "Create, edit, install or run a plugin: one switchable folder bundling skills, MCP connectors, commands, sub-agents, hooks and scripts. `create` MAKES one, `install` READS one from a repo or folder, `update` patches only what is sent, `toggle` flips `enabled`, `run` executes a script. Pass its Persian `fa_keywords`. Scripts are Rust unless the user asked otherwise.",
             json!({
                 "action": {"type": "string", "enum": ["list", "install", "create", "update", "toggle", "delete", "run"]},
                 "repo": {"type": "string", "description": "install: `owner/repo`, GitHub URL, or local path"},
@@ -3288,11 +3342,7 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                 "slug": {"type": "string", "description": "Folder slug; defaults to the lowercased name"},
                 "description": {"type": "string"},
                 "version": {"type": "string", "description": "Defaults to 1.0.0"},
-                "fa_keywords": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "PERSIAN phrases the whole bundle answers to. Skills with no fa_keywords of their own inherit these (capped)."
-                },
+                "fa_keywords": {"type": "array", "items": {"type": "string"}, "description": "PERSIAN phrases the whole bundle answers to; a skill with none of its own inherits them."},
                 "enabled": {"type": "boolean", "description": "toggle: the value to set; omit to flip"},
                 "skills": {
                     "type": "array",
@@ -3311,11 +3361,15 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
                     }
                 },
                 "deleted_skills": {"type": "array", "items": {"type": "string"}},
-                "mcp": {"type": "object", "description": "Connectors: {name: {command,args}|{url}}"},
-                "deleted_mcp": {"type": "array", "items": {"type": "string"}},
+                "commands": {"type": "array", "description": "Slash commands: name (typed after `/`), description, content (body; `$ARGUMENTS`, `$1`..`$9`).", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "content": {"type": "string"}}, "required": ["name"]}},
+                "deleted_commands": {"type": "array", "items": {"type": "string"}},
+                "agents": {"type": "array", "description": "Sub-agent profiles: each is a delegation tool that ALWAYS runs on the Explore model row.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string", "description": "WHEN to delegate"}, "tools": {"type": "array", "items": {"type": "string"}, "description": "Omit for all; can only NARROW"}, "prompt": {"type": "string", "description": "Its system prompt"}}, "required": ["name", "prompt"]}},
+                "deleted_agents": {"type": "array", "items": {"type": "string"}},
+                "hooks": {"type": "object", "description": "Shell guards: {Event: [{matcher, hooks: [{command}]}]}. Exit 2 vetoes. OFF until hooks_enabled."},
+                "hooks_enabled": {"type": "boolean", "description": "The user's approval to RUN the hooks — never set it for them."},
                 "scripts": {
                     "type": "array",
-                    "description": "Runnable scripts. Scripts are RUST unless the user explicitly asked for another language: leave `language` OUT and write Rust. Never pick a language on your own.",
+                    "description": "Runnable scripts. RUST unless the user explicitly named another language: leave `language` OUT.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -3599,6 +3653,58 @@ fn media_tool_schemas(image_default: &str, video_default: &str) -> Vec<Value> {
     ]
 }
 
+/// Advertise every ENABLED bundle's sub-agent profiles as delegation tools.
+///
+/// One mechanism for every sub-agent: the builtin `explore` is advertised in the
+/// static table, and every installed profile joins it HERE, under
+/// [`DELEGATION_PREFIX`] so a bundle's `reviewer` cannot shadow a native `read`.
+/// Each description carries the profile's own text (that is how the model learns
+/// WHEN to delegate to it), and the parameter shape is `explore`'s — a profile
+/// never asks for different arguments.
+fn delegation_schemas(root: &std::path::Path) -> Vec<Value> {
+    crate::plugins::enabled_plugin_agents(root)
+        .iter()
+        .filter_map(|row| {
+            let name = row["name"].as_str()?.trim();
+            let prompt = row["prompt"].as_str().unwrap_or_default().trim();
+            if name.is_empty() || prompt.is_empty() {
+                return None;
+            }
+            let description = row["description"].as_str().unwrap_or_default().trim();
+            let bundle = row["plugin"].as_str().unwrap_or_default().trim();
+            let head = if description.is_empty() {
+                format!("Delegate to the `{name}` sub-agent")
+            } else {
+                format!("Delegate to the `{name}` sub-agent: {description}")
+            };
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": delegation_tool_name(name),
+                    "description": format!(
+                        "{head}{} Args: description (SHORT label for the UI) and prompt \
+                         (the full task for that sub-agent). Every sub-agent runs on the \
+                         Explore model row of Settings → Tools.",
+                        if bundle.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (from the `{bundle}` plugin)")
+                        }
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "description": "SHORT label for the UI (under 80 chars)"},
+                            "prompt": {"type": "string", "description": "The full task for the sub-agent"}
+                        },
+                        "required": ["description", "prompt"]
+                    }
+                }
+            }))
+        })
+        .collect()
+}
+
 /// Swap the `plugin` tool's full schema for the compact one: a plain turn keeps
 /// the door to a bundle's scripts (`list`/`run`) but NOT the authoring prose.
 /// The full schema is ~2.9K chars and is re-sent on every round-trip, so the
@@ -3655,7 +3761,7 @@ fn lsp_position_schemas() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
             "lsp_definition",
-            "Jump to the DEFINITION of a symbol and show its body (LSP) — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. No need to know line/character.",
+            "Jump to the DEFINITION of a symbol and show its body — more precise and cheaper than grep for \"where is X defined\". Pass filePath + symbol (the identifier as written in that file); line is an optional hint for repeated names. Never waits for an index.",
             json!({
                 "filePath": {"type": "string", "description": "File that contains the symbol (a usage or the declaration)"},
                 "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
@@ -3665,7 +3771,7 @@ fn lsp_position_schemas() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "lsp_references",
-            "Find ALL references/usages of a symbol across the workspace (LSP). Pass filePath + symbol (same as lsp_definition).",
+            "Find ALL references/usages of a symbol across the workspace. Pass filePath + symbol (same as lsp_definition). Never waits for an index.",
             json!({
                 "filePath": {"type": "string", "description": "File that contains the symbol"},
                 "symbol": {"type": "string", "description": "Identifier to look up, exactly as written in the file"},
@@ -3703,7 +3809,7 @@ fn research_schemas() -> Vec<Value> {
     let schemas: &[(&str, &str, Value)] = &[
         (
             "read",
-            "Read files you already KNOW. ONE call covers several: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400},{\"path\":\"b.ts\"},…] reads one window per entry (several files and several windows alike), and an entry without `path` reuses the top-level filePath. Several windows of ONE file belong in the SAME call — never one call per window. Overlapping or adjacent windows of one file arrive merged. Default window is 400 lines.",
+            "Read files you already KNOW. ONE call covers several: ranges=[{\"path\":\"a.rs\",\"offset\":1,\"limit\":80},{\"path\":\"a.rs\",\"offset\":400},{\"path\":\"b.ts\"},…] reads one window per entry (several files and several windows alike); an entry without `path` reuses filePath. Overlapping or adjacent windows of one file arrive merged. Default window 400 lines; each header states the file's TOTAL lines — jump to the window you need instead of walking the file.",
             json!({
                 "filePath": {"type": "string"},
                 "offset": {"type": "integer"},
@@ -3864,6 +3970,26 @@ fn shot_summary(shots: &[crate::computer::Shot]) -> String {
     out
 }
 
+/// Run the bundle `Stop` handlers and report their output as a trailing note.
+///
+/// Runs at EVERY terminal exit of a turn. It cannot change the answer — the
+/// turn is already finished — so its only effect is what a bundle prints, and a
+/// handler that fails must never turn a finished turn into an error.
+fn run_stop_hooks(
+    hooks: &[crate::hooks::Active],
+    emit: &mut (dyn FnMut(&AgentEvent) + Send),
+) {
+    if hooks.is_empty() {
+        return;
+    }
+    let done = crate::hooks::run_active(hooks, "Stop", "");
+    if !done.output.is_empty() {
+        emit(&AgentEvent::Text {
+            content: format!("\n\n> hook: {}", done.output.replace('\n', "\n> ")),
+        });
+    }
+}
+
 /// Cap the UI echo, record the trace row, emit the Tool event and push the
 /// tool message — shared by the parallel (read-only batch) and sequential
 /// tool paths so both produce identical cards/traces/model messages.
@@ -3899,7 +4025,7 @@ fn finish_tool(
     // below can drop the tail that carries the marker.
     let levers = crate::tools::levers_fired(name, &result);
     let mut for_model = result;
-    let is_report = name == "explore";
+    let is_report = is_delegation(name);
     let cap = if is_report { EXPLORE_REPORT_CAP } else { MODEL_RESULT_CAP };
     if for_model.len() > cap {
         if is_report {
@@ -4110,6 +4236,18 @@ already approved with \"Always allow\".",
         }
         skill_section.missing
     };
+    // Plugin hooks: the SAME resolved list is used at all four lifecycle points
+    // below, read ONCE from the bundles that are enabled AND approved. A
+    // sub-agent never runs them: hooks belong to the turn the user started, and
+    // a nested explore firing the user's shell guards would run them once per
+    // delegation. Empty unless the user explicitly approved hooks for a bundle.
+    let hooks = if req.mode == "subagent" {
+        Vec::new()
+    } else {
+        crate::hooks::active_in(&crate::plugins::active_hook_bundles(std::path::Path::new(
+            &skill_root,
+        )))
+    };
     // Read the saved plan + live checklist BACK FROM DISK. The native loop only
     // ever wrote them (plans.rs), so after an app restart (or on the next turn)
     // the agent had forgotten the plan it was executing and re-planned from
@@ -4307,7 +4445,33 @@ already approved with \"Always allow\".",
     // describe them once — the description then replaces the blocks as text.
     // When the maps are silent the blocks are sent and the main loop retries
     // with the Vision slot if the provider rejects them.
+    // A leading `/name` that names an ENABLED bundle's command is that command:
+    // its body replaces the typed line, with `$ARGUMENTS`/`$1..$9` substituted
+    // from the words after it. Resolved BEFORE the vision pass and the message
+    // assembly, so the model receives the command's INSTRUCTIONS as the user
+    // turn — the shape Claude Code and Codex use. An unknown `/word` stays
+    // literal: the composer's built-ins never reach the backend, so a stray
+    // slash here is text the user typed.
     let mut final_prompt = req.prompt.clone();
+    if req.mode != "subagent" {
+        if let Some((expanded, name)) =
+            crate::skill_router::expand_slash_command(&req.prompt, &skill_root)
+        {
+            trace.record(crate::trace::TraceEntry {
+                kind: "command".into(),
+                summary: format!(
+                    "/{name}{}",
+                    if expanded.len() > req.prompt.len() {
+                        " (expanded)"
+                    } else {
+                        ""
+                    }
+                ),
+                ..Default::default()
+            });
+            final_prompt = expanded;
+        }
+    }
     let mut inline_images: Vec<String> = req.images.clone();
     if !main_can_vision {
         match run_vision_slot(
@@ -4344,6 +4508,66 @@ already approved with \"Always allow\".",
         }
     }
 
+    // Plugin `UserPromptSubmit`: the last place to see the prompt BEFORE the
+    // model does. A handler may rewrite it by printing the replacement text on
+    // stdout, and may veto it outright (exit 2). Both are reported on the turn's
+    // trace, so a turn whose prompt was rewritten can be explained afterwards.
+    //
+    // `SessionStart` runs FIRST, and only on a chat's opening turn (empty
+    // history is the only signal a fresh conversation gives us). A bundle uses it
+    // to inject standing guidance for the whole session — the real
+    // `claude-model-advisor` bundle does exactly this and nothing else. Its
+    // output rides as a trailing context message (the user's own text must stay
+    // untouched), and it can never veto: there is nothing yet to veto.
+    let mut session_note = String::new();
+    if !hooks.is_empty() {
+        if req.mode != "subagent" && req.history.is_empty() {
+            let start = crate::hooks::run_active(&hooks, "SessionStart", &final_prompt);
+            if start.ran > 0 {
+                trace.record(crate::trace::TraceEntry {
+                    kind: "hook".into(),
+                    summary: if start.output.is_empty() {
+                        format!("SessionStart ran {} handler(s)", start.ran)
+                    } else {
+                        format!("SessionStart → {}", start.output)
+                    },
+                    ..Default::default()
+                });
+                if !start.output.is_empty() && !start.output.trim_start().starts_with('{') {
+                    session_note = start.output;
+                }
+            }
+        }
+        let submit = crate::hooks::run_active(&hooks, "UserPromptSubmit", &final_prompt);
+        if submit.ran > 0 {
+            let veto = submit.blocked;
+            trace.record(crate::trace::TraceEntry {
+                kind: "hook".into(),
+                summary: if veto {
+                    format!("UserPromptSubmit vetoed the turn: {}", submit.reason)
+                } else if submit.output.is_empty() {
+                    format!("UserPromptSubmit ran {} handler(s)", submit.ran)
+                } else {
+                    format!("UserPromptSubmit → {}", submit.output)
+                },
+                ..Default::default()
+            });
+            if veto {
+                emit(&AgentEvent::Error {
+                    content: format!("a plugin hook refused this prompt: {}", submit.reason),
+                });
+                drop_steers(&req.chat_id, emit);
+                emit(&AgentEvent::Done { aborted: false });
+                return Ok(());
+            }
+            // Non-empty stdout is the hook's REPLACEMENT prompt. Only the
+            // output of a `{"decision":…}`/exit-2 style document is skipped:
+            // that is a verdict, not instructions.
+            if !submit.output.is_empty() && !submit.output.trim_start().starts_with('{') {
+                final_prompt = submit.output;
+            }
+        }
+    }
     if !final_prompt.is_empty() || !inline_images.is_empty() {
         // Images ride WITH the user text as neutral content blocks; llm.rs
         // translates each one to the provider's own shape (OpenAI image_url /
@@ -4368,6 +4592,9 @@ already approved with \"Always allow\".",
     // from `messages[0]` as possible, and re-sending it unchanged on the next
     // round-trip does not move anything in front of it.
     if let Some(m) = plan_context_message(&main_plan_section) {
+        messages.push(m);
+    }
+    if let Some(m) = plugin_context_message(&session_note) {
         messages.push(m);
     }
     // The last message gets a weak model's attention, so the duty to load a
@@ -4404,7 +4631,12 @@ already approved with \"Always allow\".",
     // The explore sub-agent gets the full read/search set; the main agent
     // deliberately has NO search tools and must delegate via `explore`.
     let mut schemas = if req.mode == "subagent" {
-        research_schemas()
+        let mut research = research_schemas();
+        // A plugin profile may run a NARROWER sub-agent (a reviewer that only
+        // reads, a locator that only greps). The narrowing is applied here so
+        // the sub-turn never even sees the schema of a tool it may not call.
+        retain_subagent_tools(&mut research, &req.subagent_tools);
+        research
     } else {
         let mut schemas = tool_schemas(req.allow_create, req.allow_browser);
         // Media generation rides ONLY on the main agent's turn: these tools
@@ -4413,6 +4645,10 @@ already approved with \"Always allow\".",
         // sub-agent's research fold. The descriptions embed the slot's
         // DEFAULT model so the model knows what it will hit before calling.
         schemas.extend(media_tool_schemas(&req.image_model, &req.video_model));
+        // Every installed sub-agent PROFILE joins the same delegation list as
+        // `explore`: one mechanism, so a bundle cannot invent a second kind of
+        // sub-agent that misses the depth limit, the model slot or the caps.
+        schemas.extend(delegation_schemas(std::path::Path::new(&skill_root)));
         schemas
     };
     // What the tools may do this turn. A renderer that sends `cap` wins; without
@@ -4608,13 +4844,21 @@ already approved with \"Always allow\".",
     let max_steps = if req.mode == "subagent" {
         SUBAGENT_MAX_STEPS
     } else {
-        MAX_STEPS
+        // No cap on the main agent: it must be able to finish the job it
+        // started. `usize::MAX` disables every budget nudge that keys off
+        // `max_steps` (see `main_wrapup_message`), which is exactly right —
+        // there is no budget to warn about.
+        usize::MAX
     };
     // Lookups already executed in THIS turn. A repeat of the same read window
     // or grep is pure waste — the payload is already in the context above —
     // and the explore prompt forbids it, yet a traced run re-read three files
     // in round 3 that round 1 had returned and repeated a refused grep.
     let mut seen_lookups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A new turn starts a NEW transcript: the definition map of a large file is
+    // worth re-sending once (nothing above carries it yet) but never twice in
+    // the same turn.
+    crate::tools::reset_outline_claims();
     // Files read or path-scoped-grepped EARLIER IN THIS STEP — the batch phase
     // always runs before the sequential writers, so a writer landing on one of
     // these has just invalidated the copy the model is quoting (traced: 4
@@ -5110,6 +5354,11 @@ already approved with \"Always allow\".",
                 emit(&AgentEvent::Thinking { active });
             }
         };
+        // A hint only matters for the NEXT step: every older copy rides the whole
+        // conversation on every later round trip for nothing (measured: 26
+        // hinted tool results in one chat, all re-billed every round). Elide the
+        // stale ones just before the request; the tool payloads stay intact.
+        strip_stale_hints(&mut messages);
         let acc = match stream_chat(
             &client,
             &cfg,
@@ -5198,6 +5447,7 @@ the Vision model's description instead.\n"
                 // must survive as the next turn, and the renderer marks those
                 // bubbles pending while processing `done`.
                 drop_steers(&req.chat_id, emit);
+                run_stop_hooks(&hooks, emit);
                 emit(&AgentEvent::Done { aborted: false });
                 return Ok(());
             }
@@ -5505,6 +5755,7 @@ the Vision model's description instead.\n"
                     acc.reasoning_len,
                 );
             }
+            run_stop_hooks(&hooks, emit);
             emit(&AgentEvent::Done { aborted: false });
             return Ok(());
         }
@@ -5642,6 +5893,43 @@ the Vision model's description instead.\n"
                     is_shell_read_only(args["command"].as_str().unwrap_or_default(), &root)
                 }
             };
+            // Plugin `PreToolUse`: the guard sees the tool NAME (its matcher) and
+            // may refuse the call outright. It runs BEFORE the batch/sequential
+            // split, so a vetoed read is not dispatched either. The denial goes
+            // through `finish_tool` like any other refusal: a card, a trace row
+            // and a message the model can act on.
+            if !hooks.is_empty() {
+                let guard = crate::hooks::run_active(&hooks, "PreToolUse", name);
+                if guard.ran > 0 {
+                    trace.record(crate::trace::TraceEntry {
+                        kind: "hook".into(),
+                        summary: if guard.blocked {
+                            format!("PreToolUse refused {name}: {}", guard.reason)
+                        } else {
+                            format!("PreToolUse ran {} handler(s) for {name}", guard.ran)
+                        },
+                        ..Default::default()
+                    });
+                }
+                if guard.blocked {
+                    // The card must appear even though nothing ran.
+                    emit(&AgentEvent::ToolStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    });
+                    denied.push((
+                        id.clone(),
+                        name.clone(),
+                        args,
+                        format!(
+                            "blocked by a plugin hook (`{}`): {}",
+                            name, guard.reason
+                        ),
+                    ));
+                    continue;
+                }
+            }
             // A background=true terminal is NEVER batch-dispatched: the batch
             // phase calls tools::dispatch directly and that has no background
             // branch — the call would run to its timeout in the foreground
@@ -5771,6 +6059,9 @@ the Vision model's description instead.\n"
                 // legitimate follow-up with a pointer to text it never saw.
                 if ok && name == "read" && !result_was_window_cut(&result) {
                     record_read_coverage(&mut seen_lookups, &tools::read_windows_of(&args));
+                    if result.contains("[read] extended ") {
+                        record_extended_coverage(&mut seen_lookups, &result);
+                    }
                 }
                 finish_tool(
                     &mut messages,
@@ -5826,11 +6117,13 @@ context; use what it showed, read a DIFFERENT window, or move on"
         let mut explore_batch: Vec<(String, String, Value, u64)> = Vec::new();
         let mut rest: Vec<(String, String, String)> = Vec::new();
         for call in sequential {
-            if call.1 == "explore" {
+            if is_delegation(&call.1) {
                 // Enforce MAX_SUBAGENT_DEPTH: a sub-agent must not fan out more
                 // sub-agents (mirrors graph.py). `research_schemas()` never
-                // advertises `explore`, so this only rejects a hallucinated call
-                // — without it the depth limit was a dead constant.
+                // advertises a delegation tool, so this only rejects a
+                // hallucinated call — without it the depth limit was a dead
+                // constant. Applies to `explore` and to every plugin profile
+                // alike, because both go through this one branch.
                 if req.mode == "subagent" {
                     let args: Value =
                         serde_json::from_str(&call.2).unwrap_or_else(|_| json!({}));
@@ -7186,6 +7479,29 @@ call fetch_url again with offset={next} for the rest]",
                 ui_results,
                 ui_engine,
             );
+            // Plugin `PostToolUse`: the call already happened, so this cannot veto
+            // it — a handler's stdout is shipped back as extra information about
+            // what just ran (a linter, a formatter, a policy note). Only a
+            // non-empty print is appended, so a quiet handler costs nothing.
+            if ok && !hooks.is_empty() {
+                let after = crate::hooks::run_active(&hooks, "PostToolUse", name);
+                if after.ran > 0 {
+                    trace.record(crate::trace::TraceEntry {
+                        kind: "hook".into(),
+                        summary: format!("PostToolUse ran {} handler(s) for {name}", after.ran),
+                        ..Default::default()
+                    });
+                }
+                if !after.output.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "=== POST-TOOL HOOK ({name}) ===\n{}",
+                            after.output
+                        ),
+                    }));
+                }
+            }
         }
 
         // A step with a single call is a wasted model round trip when more
@@ -7206,10 +7522,16 @@ call fetch_url again with offset={next} for the rest]",
         }
         // Deliver the escalating form on the first lone round and then every
         // third; on the rounds in between the streak hint still gets its turn.
-        // Past `LONE_CALL_HINT_MAX_PER_TURN` deliveries the note has been read
-        // and repeating it only re-bills it on every later round, so the lever
-        // goes silent and lets the streak hint keep the slot.
-        let lone_hint_budget_left = lone_call_hints < LONE_CALL_HINT_MAX_PER_TURN;
+        //
+        // The old code ALSO went permanently silent past
+        // `LONE_CALL_HINT_MAX_PER_TURN` deliveries, justified by "a delivered
+        // hint rides the rest of the turn and is re-billed every round". That
+        // premise is false: `strip_stale_hints` elides every hint but the newest
+        // before each request, so a delivery costs its own round only. MEASURED
+        // on trace `mvxsy14e`: the lever hit its cap at step 3 and the chat then
+        // ran 14 more single-call rounds in total silence (16 of 19 rounds were
+        // lone). So the cap is gone; the every-third rhythm below is what keeps
+        // it from becoming wallpaper.
         let hints_are_quiet = lone_mutating_rounds > 1 && lone_mutating_rounds % 3 != 0;
         // The streak hint yields the slot, but it must not silence the round:
         // traced, a chat sat 34 lone-serial rounds deep and the quiet rounds
@@ -7222,10 +7544,13 @@ call fetch_url again with offset={next} for the rest]",
             discovery_streak_hint(&req.mode, discovery_streak)
                 .map(Cow::Borrowed)
                 .or_else(|| single_call_hint(&req.mode, &tool_calls, lone_mutating_rounds))
-        } else if lone_hint_budget_left {
-            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds)
         } else {
-            discovery_streak_hint(&req.mode, discovery_streak).map(Cow::Borrowed)
+            // The escalating form keeps this slot for the WHOLE turn. It used to
+            // yield to `discovery_streak_hint` once its cap was spent — and that
+            // hint returns `None` unless the streak sits exactly on 3 or 7, so
+            // the round went silent in the one state the counter proves is
+            // wasteful: a long run of lone shell rounds.
+            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds)
         };
         // Which lever spoke, counted apart: `hints_delivered` sums both, so it
         // rose on rounds where the model had in fact batched (traced:
@@ -7240,17 +7565,14 @@ call fetch_url again with offset={next} for the rest]",
                         last["content"] = json!(format!("{c}\n\n{hint}"));
                         nudges += 1;
                         // Both generators carry the lone-call wording: the
-                        // budgeted lever (`single_call_hint`) AND the quiet-round
+                        // escalating lever (`single_call_hint`) AND the quiet-round
                         // fallback (`single_call_hint_text`, reached when the
-                        // streak lever is silent). Counting on the text alone let
-                        // the fallback path bypass `lone_hint_budget_left` and the
-                        // counter climbed to 6 against a cap of 3 (traced on a
-                        // live build). The budget gates BOTH paths, so a delivery
-                        // is counted only while it is still inside the cap.
-                        if lone_hint_budget_left
-                            && lone_hint_str
-                                .as_deref()
-                                .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
+                        // streak lever is silent). Counting on the text alone keeps
+                        // ONE counter for both paths, since the cap that used to
+                        // gate it is gone.
+                        if lone_hint_str
+                            .as_deref()
+                            .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
                         {
                             lone_call_hints += 1;
                         }
@@ -7343,11 +7665,13 @@ call fetch_url again with offset={next} for the rest]",
             }
         }
         emit(&AgentEvent::Text { content: report });
+        run_stop_hooks(&hooks, emit);
         emit(&AgentEvent::Done { aborted: false });
         return Ok(());
     }
+    // Plugin `Stop` runs from `run_stop_hooks` at every terminal exit below.
     emit(&AgentEvent::Warn {
-        content: format!("turn stopped after {MAX_STEPS} steps"),
+        content: format!("turn stopped after {max_steps} steps"),
     });
     // The budget ran out with steers possibly still queued: report them so the
     // renderer can start them as the next turn (this exit has no model call
@@ -8845,6 +9169,35 @@ fn is_readonly_native(name: &str) -> bool {
     READONLY_NATIVE_TOOLS.contains(&name)
 }
 
+/// Tool-name prefix under which a plugin sub-agent PROFILE is advertised.
+///
+/// The prefix keeps a bundle's `reviewer` from shadowing a native `read`, and it
+/// is what `is_delegation` keys on — every delegation (builtin `explore` and
+/// every installed profile) takes the same code path, so a second mechanism can
+/// never drift from the first.
+pub(crate) const DELEGATION_PREFIX: &str = "agent__";
+
+/// The tool name a profile is advertised under (its frontmatter name, folded to
+/// the charset providers accept).
+fn delegation_tool_name(profile: &str) -> String {
+    let mut out = String::with_capacity(profile.len() + DELEGATION_PREFIX.len());
+    out.push_str(DELEGATION_PREFIX);
+    for c in profile.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c.to_ascii_lowercase());
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// True for any tool that runs a sub-agent: the builtin `explore`, or a plugin
+/// profile advertised under [`DELEGATION_PREFIX`].
+fn is_delegation(name: &str) -> bool {
+    name == "explore" || name.starts_with(DELEGATION_PREFIX)
+}
+
 /// True when this call can WRITE to the workspace — the only thing that makes a
 /// cached read body stale.
 ///
@@ -8953,8 +9306,28 @@ fn read_windows_covered(
         let (start, end) = read_window_span(*offset, *limit);
         served
             .iter()
-            .any(|(f, s, e)| f == file && *s <= start && end <= *e)
+            .any(|(f, s, e)| same_file(f, file) && *s <= start && end <= *e)
     })
+}
+
+/// True when two spellings of a path name the same file.
+///
+/// The model mixes spellings inside one turn (an absolute path from a tool
+/// result, a workspace-relative one from its own head), and a character-for-
+/// character comparison treated those as different files: traced, the same
+/// `browser.rs` was read twice for two spellings, and the coverage the first
+/// read had already granted was invisible to the second.
+fn same_file(a: &str, b: &str) -> bool {
+    let a = a.trim_start_matches("./").trim_end_matches('/');
+    let b = b.trim_start_matches("./").trim_end_matches('/');
+    if a == b {
+        return true;
+    }
+    // Same file under a longer prefix (workspace-relative vs absolute).
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    long.len() > short.len()
+        && long.ends_with(short)
+        && long[..long.len() - short.len()].ends_with('/')
 }
 
 /// Remember the spans a successful `read` served, so a later call for lines
@@ -8966,6 +9339,18 @@ fn record_read_coverage(
     for (file, offset, limit) in windows {
         let (start, end) = read_window_span(*offset, *limit);
         seen.insert(format!("{READ_COVERAGE_PREFIX}{file}|{start}|{end}"));
+    }
+}
+
+/// Record the span a `read` block ACTUALLY delivered when it was stretched to
+/// the end of the file (see `tools::file_window_upto`).
+///
+/// Without this the extension would be invisible to the repeat-guard: the model
+/// would be holding the tail and still get served it again, which is the very
+/// round trip the extension exists to remove.
+fn record_extended_coverage(seen: &mut std::collections::HashSet<String>, result: &str) {
+    for (file, last) in crate::tools::read_extended_spans(result) {
+        seen.insert(format!("{READ_COVERAGE_PREFIX}{file}|1|{}", last + 1));
     }
 }
 
@@ -9259,11 +9644,26 @@ fn single_call_hint(
     // batchable the moment the second lookup is foreseeable.
     if matches!(
         name,
-        "read" | "grep" | "glob" | "fetch_url" | "load_skill" | "find_symbol" | "lsp_symbols"
+        "read"
+            | "grep"
+            | "glob"
+            | "fetch_url"
+            | "load_skill"
+            | "find_symbol"
+            | "lsp_symbols"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+            | "lsp_diagnostics"
     ) {
-        return Some(Cow::Borrowed(
-            "[hint] That step had ONE call. Every step re-sends the whole conversation: these read-only calls run CONCURRENTLY, so fetch everything you already know you need IN THE SAME STEP.",
-        ));
+        if lone_rounds <= 1 {
+            return Some(Cow::Borrowed(
+                "[hint] That step had ONE call. Every step re-sends the whole conversation: these read-only calls run CONCURRENTLY, so fetch everything you already know you need IN THE SAME STEP — several `read` windows fit in ONE call via ranges:[{path,offset,limit}], and independent greps/finds go in the SAME step.",
+            ));
+        }
+        return Some(Cow::Owned(format!(
+            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each, and every round re-sends the whole conversation (tens of thousands of tokens per round on a long chat). Batch the lookups you already know you need into this next step: read-only calls run CONCURRENTLY, several `read` windows fit in ONE call as ranges:[{{path,offset,limit}}], and independent greps/finds go in the SAME step."
+        )));
     }
     // Native write/terminal/browser tools. Traced main-agent turns spent 76% of
     // their steps on a SINGLE call (210 of 277, measured from tool rows) — 61 of
@@ -9288,30 +9688,99 @@ fn single_call_hint(
     None
 }
 
-/// True when this round spent its whole round-trip on ONE call the hint can
-/// actually help with — a file write that had independent siblings to batch.
-/// Main agent only: the sub-agent has no batching freedom to spend and its own
-/// report already governs its rounds.
+/// True when this round spent its whole round-trip on ONE call whose siblings
+/// were already knowable. Main agent only: the sub-agent has its own wording.
 ///
-/// Deliberately NARROWER than [`is_serial_tool`]: a lone `run_terminal` is a
-/// probe chain, not a missed batch, so counting it would grow the streak while
-/// the hint stays silent — the field would then report waste that was never
-/// addressable. Traced, that is exactly how 50 firings landed on a run with
-/// nothing batchable in it.
+/// Two families count, because BOTH run in one batch and both are rounds the
+/// model could have merged:
+///   - a file write (`edit_file` / `write_file` / `artifact`) — independent
+///     siblings run IN ORDER in one step;
+///   - a read-only native lookup (`read`, `grep`, `glob`, `find_symbol`, the five
+///     `lsp_*` lookups, `fetch_url`, `load_skill`) — these run CONCURRENTLY, so a
+///     lone one is the most common wasted round (measured: 54 of 65 rounds in
+///     trace `mvy0ausq`, 91% of that turn's wire tokens).
+///
+/// Deliberately EXCLUDED: a lone `run_terminal` or browser act-then-observe
+/// call is a probe CHAIN whose arguments come from the previous result — there
+/// is nothing to batch, so counting it would grow the streak while the hint
+/// stays silent and the field would report waste that was never addressable.
 fn single_call_is_serial(mode: &str, calls: &[(String, String, String)]) -> bool {
     if mode == "subagent" || calls.len() != 1 {
         return false;
     }
-    matches!(calls[0].1.as_str(), "edit_file" | "write_file" | "artifact")
+    // The whole read-only family, because that is the set that really runs as one
+    // concurrent batch (`READONLY_NATIVE_TOOLS`). The four LSP lookups were
+    // missing: a lone `lsp_definition` could therefore spend a round on its own
+    // and keep the streak counter at 0, so neither this lever nor the escalating
+    // one fired — while the system prompt itself advertises the group as
+    // batchable ("read, grep, glob, find_symbol, lsp_*"). Kept in sync with
+    // that constant, not with a hand-written subset.
+    matches!(
+        calls[0].1.as_str(),
+        "edit_file"
+            | "write_file"
+            | "artifact"
+            | "read"
+            | "grep"
+            | "glob"
+            | "find_symbol"
+            | "lsp_symbols"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+            | "lsp_diagnostics"
+            | "fetch_url"
+            | "load_skill"
+    )
 }
 
-/// Cap on how many times ONE turn may deliver the escalating lone-call hint.
+/// Prefix every hint block is appended with (`format!("{c}\n\n{hint}")` at the
+/// delivery site), so a stale one can be cut back out exactly.
+const HINT_MARK: &str = "\n\n[hint] ";
+
+/// Cut every `[hint]` block out of the history except the one on the NEWEST
+/// tool result.
 ///
-/// Each delivery lives on in the re-sent history for the rest of the turn, so a
-/// deep streak compounds: the traced 59-round run carried 50 of them (~350 chars
-/// each) into every later request while the model batched on 2 of its rounds.
-/// Past this many refusals the note has been read — repeating it only re-bills
-/// it — so the lever falls silent and leaves the streak hint to do the talking.
+/// A hint rides on a tool result the model was already charged for, and from
+/// then on EVERY later round re-sends it, because the whole conversation goes
+/// on the wire each round trip. Measured on a live chat: 26 tool results carried
+/// a hint (~350 chars each) while the model had long since acted on it or
+/// refused it — every stale copy was pure re-billing. Only the freshest hint can
+/// still change the NEXT step, so the older ones are elided before each request.
+///
+/// The tool result itself is untouched: only the appended note goes, so nothing
+/// the model needs is lost.
+pub(crate) fn strip_stale_hints(messages: &mut [Value]) {
+    let newest = messages.iter().rposition(|m| {
+        m["role"].as_str() == Some("tool")
+            && m["content"].as_str().is_some_and(|c| c.contains(HINT_MARK))
+    });
+    let Some(newest) = newest else { return };
+    for (i, m) in messages.iter_mut().enumerate() {
+        if i == newest || m["role"].as_str() != Some("tool") {
+            continue;
+        }
+        let Some(content) = m["content"].as_str() else {
+            continue;
+        };
+        if !content.contains(HINT_MARK) {
+            continue;
+        }
+        let head = content.split(HINT_MARK).next().unwrap_or(content);
+        m["content"] = json!(head);
+    }
+}
+
+/// Kept as a named constant so the trace field `lone_call_hints` still means
+/// "deliveries of the escalating lone-call lever" — it is only a MEASUREMENT
+/// now, no longer a cap. The cap that used to silence the lever after three
+/// deliveries rested on a false premise: it assumed each delivery rides the
+/// rest of the turn and is re-billed every round, but `strip_stale_hints`
+/// elides every hint except the newest before each request. MEASURED on trace
+/// `mvxsy14e`: the lever hit that cap at step 3 and the turn then ran 14 more
+/// single-call rounds in silence. Do not reintroduce a hard cap here; the
+/// every-third rhythm in the loop is what keeps the text from becoming
+/// wallpaper.
 const LONE_CALL_HINT_MAX_PER_TURN: usize = 3;
 
 /// The batching hint for the main agent's lone serial call, escalated by how
@@ -9376,12 +9845,19 @@ const PLAN_CONTEXT_HEAD: &str =
 const SKILLS_CONTEXT_HEAD: &str =
     "=== REMINDER: load a matching skill first (NOT a new request) ===";
 
+/// Opening line of the trailing plugin-context message (a hook's SessionStart
+/// output: the guidance a bundle wants present for the whole conversation).
+const PLUGIN_CONTEXT_HEAD: &str =
+    "=== CONTEXT: from an installed plugin (NOT a new request) ===";
+
 /// True for a message that exists ONLY on the wire (the renderer never stores
 /// it): the trailing plan/checklist context and the skills reminder. Both are
 /// pushed after the user prompt to stay off the cached prefix, so the fold count
 /// must ignore both.
 fn is_wire_only_context(content: &str) -> bool {
-    content.starts_with(PLAN_CONTEXT_HEAD) || content.starts_with(SKILLS_CONTEXT_HEAD)
+    content.starts_with(PLAN_CONTEXT_HEAD)
+        || content.starts_with(SKILLS_CONTEXT_HEAD)
+        || content.starts_with(PLUGIN_CONTEXT_HEAD)
 }
 
 /// Number of messages in a compaction tail that the RENDERER can actually fold.
@@ -9398,6 +9874,10 @@ fn plan_context_keep(tail: &[Value]) -> usize {
 
 fn plan_context_message(section: &str) -> Option<Value> {
     trailing_context_message(PLAN_CONTEXT_HEAD, section)
+}
+
+fn plugin_context_message(section: &str) -> Option<Value> {
+    trailing_context_message(PLUGIN_CONTEXT_HEAD, section)
 }
 
 /// The per-turn skills reminder, pushed at the TAIL of the request.
@@ -9758,8 +10238,9 @@ async fn run_subagent(
     parent: &AgentRequest,
     args: &Value,
     branch: u64,
-    // The tool name that spawned this sub-agent ("explore"). Carried through to
-    // the retry events so the banner can name the tool, not just the agent.
+    // The tool name that spawned this sub-agent: `explore`, or the name of a
+    // plugin PROFILE (`plugins::find_plugin_agent`). Carried through to the
+    // retry events so the banner can name the tool, not just the agent.
     tool: &str,
     emit: &mut (dyn FnMut(&AgentEvent) + Send),
     cancel: &CancelFlag,
@@ -9767,8 +10248,21 @@ async fn run_subagent(
     let description = args["description"].as_str().unwrap_or_default().to_string();
     let prompt = args["prompt"].as_str().unwrap_or_default().to_string();
     if prompt.is_empty() {
-        return ("explore requires a non-empty prompt".into(), false);
+        return (format!("{tool} requires a non-empty prompt"), false);
     }
+    // A plugin sub-agent PROFILE supplies its own system prompt and narrows the
+    // tool set; a name `explore` keeps the builtin research prompt. The MODEL is
+    // deliberately NOT taken from the profile: every sub-agent — builtin or
+    // installed — runs on the `explore` slot of Settings → Tools, so one row
+    // controls what they all cost. A profile that names its own model is ignored.
+    let profile = if tool == "explore" {
+        None
+    } else {
+        crate::plugins::find_plugin_agent(
+            std::path::Path::new(&parent.data_root),
+            tool.strip_prefix(DELEGATION_PREFIX).unwrap_or(tool),
+        )
+    };
 
     // Every retry event of this ladder is stamped with ITS branch id. Parallel
     // explore calls share one stream, so without it the renderer cannot tell
@@ -9836,10 +10330,26 @@ async fn run_subagent(
         mode: "subagent".into(),
         prompt,
         history: Vec::new(),
-        system_prompt: explore_system_prompt(&parent.root),
+        system_prompt: match profile.as_ref().and_then(|p| p["prompt"].as_str()) {
+            Some(text) if !text.trim().is_empty() => text.to_string(),
+            _ => explore_system_prompt(&parent.root),
+        },
         // A sub-agent is read, not heard: never apply the live-voice rules.
         system_suffix: String::new(),
         skills: Vec::new(),
+        // The profile's declared tools, intersected with the research set inside
+        // the sub-turn (`retain_subagent_tools`): a profile can only NARROW what
+        // its own sub-agent may call, never widen it.
+        subagent_tools: profile
+            .as_ref()
+            .and_then(|p| p["tools"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         context_window: parent.context_window,
         chat_id: parent.chat_id.clone(),
         mcp_servers: Value::Null,
@@ -10701,6 +11211,101 @@ mod tests {
             &dir,
         )
         .is_none());
+    }
+
+    /// Every delegation tool goes through ONE branch: the builtin `explore` and
+    /// each installed profile. The prefix is what keeps a bundle's `reviewer`
+    /// from shadowing a native tool, so it must be recognised and stripped.
+    #[test]
+    fn a_plugin_profile_is_advertised_under_the_delegation_prefix() {
+        assert!(is_delegation("explore"));
+        assert!(is_delegation(&delegation_tool_name("Code Reviewer")));
+        assert_eq!(delegation_tool_name("Code Reviewer"), "agent__code_reviewer");
+        // A native tool is never mistaken for a sub-agent, however it is spelled.
+        assert!(!is_delegation("read"));
+        assert!(!is_delegation("reviewer"));
+    }
+
+    /// A profile can only NARROW: naming a tool the research set does not hold
+    /// must not add it, and an empty declaration keeps the full set.
+    #[test]
+    fn a_profile_narrows_the_research_tool_set_and_never_widens_it() {
+        let mut schemas = research_schemas();
+        let before = schemas.len();
+        retain_subagent_tools(
+            &mut schemas,
+            &["read".to_string(), "write_file".to_string()],
+        );
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["read"], "only the declared, existing tool survives");
+
+        // No declaration at all = the builtin explore set, untouched.
+        let mut schemas = research_schemas();
+        retain_subagent_tools(&mut schemas, &[]);
+        assert_eq!(schemas.len(), before);
+    }
+
+    /// The single model decision: EVERY sub-agent reads the `explore` slot, so
+    /// one Settings row controls what all of them cost.
+    #[test]
+    fn every_subagent_resolves_its_model_from_the_explore_slot() {
+        let mut req = base_req();
+        req.model = "main-model".into();
+        req.subagent_models = std::collections::HashMap::from([(
+            "explore".to_string(),
+            "second-model".to_string(),
+        )]);
+        let (model, _, _, _) = resolve_subagent_target(&req);
+        assert_eq!(model, "second-model", "the explore row must win");
+
+        // An empty slot falls back to the parent model rather than inventing one.
+        req.subagent_models.clear();
+        let (model, _, _, _) = resolve_subagent_target(&req);
+        assert_eq!(model, "main-model");
+    }
+
+    /// A plugin PROFILE cannot pick its own model: an installed sub-agent runs on
+    /// the `explore` row of Settings → Tools, exactly like the builtin `explore`,
+    /// and walks the SAME `tool_fallbacks["explore"]` list. Otherwise a bundle
+    /// would silently introduce a model the user never chose and cannot see.
+    #[test]
+    fn a_plugin_profile_runs_on_the_explore_slot_not_one_of_its_own() {
+        let mut req = base_req();
+        req.model = "main-model".into();
+        req.subagent_models = std::collections::HashMap::from([
+            ("explore".to_string(), "slot-model".to_string()),
+            // A bundle naming its own slot must be ignored: only `explore` is read.
+            ("reviewer".to_string(), "bundle-model".to_string()),
+        ]);
+        req.tool_fallbacks = std::collections::HashMap::from([(
+            "explore".to_string(),
+            vec!["fallback-a".to_string(), "fallback-b".to_string()],
+        )]);
+
+        // The chain one profile's ladder would walk: the slot model first, then
+        // the explore row's fallbacks in the user's order.
+        let chain = crate::backend_light::resolve_slot_chain(
+            "slot-model",
+            req.tool_fallbacks.get("explore").map(Vec::as_slice).unwrap_or(&[]),
+            &req.model,
+            &req.base_url,
+            &req.api_keys,
+            &req.provider_id,
+            &req.provider,
+            &req.providers,
+        );
+        let models: Vec<&str> = chain.iter().map(|rung| rung.0.as_str()).collect();
+        assert_eq!(models.first(), Some(&"slot-model"), "the Explore row comes first");
+        assert_eq!(
+            models,
+            vec!["slot-model", "fallback-a", "fallback-b"],
+            "a profile walks the explore fallback list, in order"
+        );
+        // And the bundle's own slot entry is NOT what the ladder resolved.
+        assert!(!models.contains(&"bundle-model"));
     }
 
     #[test]
@@ -11960,6 +12565,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_hints_are_elided_but_the_newest_survives() {
+        // Every round re-sends the whole conversation, so a hint left in the
+        // history is re-billed forever. Only the freshest can still steer the
+        // NEXT step; the payload it rode in on must survive untouched.
+        let mut msgs = vec![
+            json!({"role": "tool", "tool_call_id": "1", "content": "body one\n\n[hint] OLD"}),
+            json!({"role": "tool", "tool_call_id": "2", "content": "body two\n\n[hint] MID"}),
+            json!({"role": "tool", "tool_call_id": "3", "content": "body three"}),
+            json!({"role": "tool", "tool_call_id": "4", "content": "body four\n\n[hint] FRESH"}),
+        ];
+        strip_stale_hints(&mut msgs);
+        assert_eq!(msgs[0]["content"], json!("body one"));
+        assert_eq!(msgs[1]["content"], json!("body two"));
+        assert_eq!(msgs[2]["content"], json!("body three"));
+        assert_eq!(msgs[3]["content"], json!("body four\n\n[hint] FRESH"));
+        // Untouched history (no hint at all) is left exactly as it was.
+        let mut plain = vec![json!({"role": "tool", "tool_call_id": "1", "content": "x"})];
+        strip_stale_hints(&mut plain);
+        assert_eq!(plain[0]["content"], json!("x"));
+    }
+
+    #[test]
     fn the_terminal_schema_states_the_division_of_labour() {
         // MEASURED on the live build, before this text existed: the model ran
         // 10 rounds of shell reads (`ls`, `du`, `git status`, `cat`) in one chat
@@ -12233,8 +12860,14 @@ mod tests {
             // tool is now always present, which is the point — a capability
             // that belongs to the model's own judgement must not depend on a
             // regex — and the step is exactly that schema's chars.
-            ("main", tool_schemas(false, false), 15_100usize),
-            ("main+browser", tool_schemas(false, true), 20_900),
+            // Re-based again for the plugin bundle's new primitives: `commands`,
+            // `agents` and `hooks` joined the `plugin` schema (a Claude Code
+            // bundle ships them), so `create`/`update` can carry them. The step
+            // is those field declarations, and it lands on the PLAIN budgets too
+            // because `tool_schemas` always holds the full form — the compact
+            // swap happens at request assembly (`compact_plugin_schema`).
+            ("main", tool_schemas(false, false), 15_700usize),
+            ("main+browser", tool_schemas(false, true), 21_400),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -12245,8 +12878,8 @@ mod tests {
             // EAGER inlining of every connector's whole catalogue. That trade is
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
-            ("main+authoring", tool_schemas(true, false), 21_700),
-            ("main+authoring+browser", tool_schemas(true, true), 27_500),
+            ("main+authoring", tool_schemas(true, false), 22_900),
+            ("main+authoring+browser", tool_schemas(true, true), 28_700),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -12641,6 +13274,59 @@ mod tests {
         // A lone file write is the shape a batch CAN fix, so it still counts.
         let write = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
         assert!(single_call_is_serial("agent", &write));
+        // A lone read-only lookup is the OTHER batchable shape and the most
+        // common one: it must grow the streak, or the escalating text never
+        // escalates on the rounds that dominate the wire cost. The whole
+        // `lsp_*` family is included because it runs in the same concurrent
+        // batch and the system prompt advertises it as batchable — while the
+        // hint list named only `lsp_symbols`, so a lone `lsp_definition` spent
+        // its round in silence.
+        for name in [
+            "read",
+            "grep",
+            "glob",
+            "find_symbol",
+            "lsp_symbols",
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_diagnostics",
+            "fetch_url",
+            "load_skill",
+        ] {
+            let lookup = vec![("c1".to_string(), name.to_string(), "{}".to_string())];
+            assert!(
+                single_call_is_serial("agent", &lookup),
+                "a lone {name} must count as a batchable round"
+            );
+            // Same set on BOTH sides: a name the counter accepts but the hint
+            // refuses would grow the streak while the round stays silent.
+            assert!(
+                single_call_hint("agent", &lookup, 2).is_some(),
+                "a lone {name} must deliver the batching hint"
+            );
+        }
+        // The sub-agent's rounds are governed by its own report, not this lever.
+        assert!(!single_call_is_serial("subagent", &write));
+    }
+
+    #[test]
+    fn a_lone_lookup_streak_escalates_instead_of_repeating_its_first_wording() {
+        // Measured on trace `mvy0ausq`: 54 of 65 rounds carried a single
+        // read-only call and 91% of the turn's wire tokens, but the streak
+        // counter ignored them, so the hint said "That step had ONE call" on
+        // every one of them and never named the accumulated price.
+        let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
+        let first = single_call_hint("agent", &one, 1).unwrap();
+        assert!(first.contains("ONE call"), "{first}");
+        assert!(first.contains("ranges:"), "{first}");
+        let ninth = single_call_hint("agent", &one, 9).unwrap();
+        assert!(ninth.contains("9 rounds in a row"), "{ninth}");
+        assert!(ninth.contains("CONCURRENTLY"), "{ninth}");
+        assert_ne!(first, ninth, "the wording must change as the streak grows");
+        // A lookup must never be told edits run "IN ORDER" — that is the write
+        // path's wording, and the two families batch differently.
+        assert!(!ninth.contains("IN ORDER"), "{ninth}");
     }
 
     #[test]
@@ -12724,39 +13410,44 @@ mod tests {
     }
 
     #[test]
-    fn lone_call_hint_counter_never_exceeds_its_cap() {
-        // Traced on a live build: `lone_call_hints` reached 4, 5 and 6 against a
-        // cap of 3. The counter was incremented on the hint TEXT, and BOTH the
-        // budgeted lever and the quiet-round fallback carry "ONE call" — so the
-        // fallback, reached on every `lone_mutating_rounds > 1 && % 3 != 0`
-        // round, bypassed `lone_hint_budget_left` and kept counting after the
-        // lever had gone silent. This replays the loop guard over a long lone
-        // streak and pins the counter to the cap.
+    fn the_batching_lever_stays_audible_on_a_long_lone_streak() {
+        // MEASURED (trace `mvxsy14e`): the lever used to go PERMANENTLY silent
+        // past `LONE_CALL_HINT_MAX_PER_TURN` deliveries, on the premise that each
+        // delivery rides the rest of the turn and is re-billed every round. That
+        // premise is false — `strip_stale_hints` elides all but the newest hint
+        // before each request — so the cap only bought silence: the turn hit it
+        // at step 3 and then ran 14 more single-call rounds with nothing said.
+        // This replays the loop guard over a long lone streak and pins the two
+        // properties that matter: the counter keeps climbing past the old cap,
+        // and the lever still speaks on the escalating rounds.
         let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
         let mut lone_call_hints: usize = 0;
+        let mut escalating_after_cap = 0;
         for rounds in 1..=30 {
-            let lone_hint_budget_left = lone_call_hints < LONE_CALL_HINT_MAX_PER_TURN;
             let hints_are_quiet = rounds > 1 && rounds % 3 != 0;
             let hint = if hints_are_quiet {
                 discovery_streak_hint("agent", 0)
                     .map(std::borrow::Cow::Borrowed)
                     .or_else(|| single_call_hint("agent", &one, rounds))
-            } else if lone_hint_budget_left {
-                round_hint("agent", &one, 0, rounds)
             } else {
-                discovery_streak_hint("agent", 0).map(std::borrow::Cow::Borrowed)
+                round_hint("agent", &one, 0, rounds)
             };
-            if lone_hint_budget_left
-                && hint
-                    .as_deref()
-                    .is_some_and(|h| h.contains("ONE call") || h.contains("rounds in a row"))
-            {
-                lone_call_hints += 1;
+            if let Some(h) = hint.as_deref() {
+                if h.contains("ONE call") || h.contains("rounds in a row") {
+                    lone_call_hints += 1;
+                    if lone_call_hints > LONE_CALL_HINT_MAX_PER_TURN {
+                        escalating_after_cap += 1;
+                    }
+                }
             }
         }
-        assert_eq!(
-            lone_call_hints, LONE_CALL_HINT_MAX_PER_TURN,
-            "the counter must stop at the cap even though quiet rounds keep producing lone-call text"
+        assert!(
+            lone_call_hints > LONE_CALL_HINT_MAX_PER_TURN,
+            "the lever must keep delivering past the old cap, got {lone_call_hints}"
+        );
+        assert!(
+            escalating_after_cap > 0,
+            "the rounds after the old cap must still carry the batching text"
         );
     }
 
@@ -14047,6 +14738,7 @@ mod tests {
             subagent_thinking: std::collections::HashMap::new(),
             tool_fallbacks: std::collections::HashMap::new(),
             images: Vec::new(),
+            subagent_tools: Vec::new(),
             web_search_auto_fetch: crate::websearch::WEB_SEARCH_AUTO_FETCH_DEFAULT,
             // No renderer to send a table: derive it from the mode instead.
             cap: None,
@@ -16319,21 +17011,28 @@ mod tests {
     }
 
     #[test]
-    fn main_wrapup_nudge_fires_once_short_of_the_cap() {
-        // Traced Oct 29: three of twenty runs hit MAX_STEPS and were cut with
-        // `finish_reason: tool_calls` on every round — no final answer at all.
-        // The nudge must land MAIN_WRAPUP_STEPS_LEFT rounds before the cap,
-        // exactly once, and never inside a sub-agent (which owns its nudges).
-        let early = MAX_STEPS - MAIN_WRAPUP_STEPS_LEFT - 1;
-        assert!(main_wrapup_message(early, MAX_STEPS, false, "main").is_none());
-        let at = MAX_STEPS - MAIN_WRAPUP_STEPS_LEFT;
-        assert!(main_wrapup_message(at, MAX_STEPS, false, "main").is_some());
-        // After delivery (any later step) it stays silent: a repeated nudge
-        // would be re-billed on every remaining round for no new information.
-        assert!(main_wrapup_message(at + 1, MAX_STEPS, true, "main").is_none());
-        assert!(main_wrapup_message(MAX_STEPS - 1, MAX_STEPS, true, "main").is_none());
-        // Sub-agents never see it — their budget nudges already cover them.
-        assert!(main_wrapup_message(at, MAX_STEPS, false, "subagent").is_none());
+    fn main_wrapup_nudge_never_fires_without_a_cap() {
+        // The main agent has NO round cap (`max_steps == usize::MAX`), so it can
+        // always finish the job it started. A nudge saying "the budget is nearly
+        // exhausted" would be false there — and it would push the model to stop
+        // mid-work, the exact failure the cap removal fixes.
+        for step in [0, 1, 5, 55, 500, 100_000] {
+            assert!(
+                main_wrapup_message(step, usize::MAX, false, "main").is_none(),
+                "a turn with no cap must never be told its budget is nearly spent"
+            );
+        }
+        // A sub-agent keeps its own budget nudges and never sees this one.
+        assert!(main_wrapup_message(0, SUBAGENT_MAX_STEPS, false, "subagent").is_none());
+        // A bounded budget can still exist (tests, future callers): the nudge
+        // lands MAIN_WRAPUP_STEPS_LEFT rounds before it, exactly once.
+        let capped = 60;
+        let at = capped - MAIN_WRAPUP_STEPS_LEFT;
+        assert!(main_wrapup_message(at - 1, capped, false, "main").is_none());
+        assert!(main_wrapup_message(at, capped, false, "main").is_some());
+        // After delivery it stays silent: a repeated nudge would be re-billed on
+        // every remaining round for no new information.
+        assert!(main_wrapup_message(at + 1, capped, true, "main").is_none());
         // The margin leaves room to actually wrap up: at least one round to
         // read the nudge, one to answer. A margin of 1 would nudge on the very
         // last round, where nothing can come of it.

@@ -47,6 +47,8 @@ pub mod secrets;
 pub mod shell_env;
 pub mod skills;
 pub mod skill_router;
+pub mod subagents;
+pub mod hooks;
 pub mod state;
 pub mod store;
 pub mod tools;

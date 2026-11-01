@@ -1515,6 +1515,28 @@ pub fn locate_symbol(
     })
 }
 
+/// True only when a server for this file's language is ALREADY running.
+///
+/// MEASURED: a 234-round trace issued ZERO `lsp_*` calls while running 76
+/// greps and 127 reads — because `definition`/`references`/`hover` call
+/// `server_for`, and a cold rust-analyzer means 1.9 GB and minutes of indexing
+/// before the first answer. A model that has been burned by that once stops
+/// asking. This lets the dispatch answer INSTANTLY from the native engine
+/// whenever the server is cold, and use real LSP precision only when it is
+/// already warm — so the tool is never a stall and never a trap.
+pub fn is_warm(root: &str, file_path: &str, permit: Option<&Value>) -> bool {
+    let Ok(abs) = resolve_safe(root, file_path, true, permit) else {
+        return false;
+    };
+    let abs = PathBuf::from(abs);
+    let Ok(language) = detect_language(&abs) else {
+        return false;
+    };
+    registry()
+        .warm_server(&PathBuf::from(root), language)
+        .is_some()
+}
+
 /// lsp_definition: `path:line:character` hits; inline body for <= 3 hits.
 pub fn definition(
     root: &str,
@@ -1640,7 +1662,42 @@ pub fn hover(
 }
 
 /// lsp_symbols: document symbols sorted by line, optional substring filter.
-pub fn symbols(root: &str, file_path: &str, query: &str, permit: Option<&Value>) -> Result<String, String> {
+///
+/// `allow_cold` decides whether a COLD server may be started. `lsp_symbols` is
+/// the one LSP lookup that has a native equivalent (`tools::native_outline`),
+/// so the dispatch path asks for a WARM server only and falls back to that
+/// outline. Starting rust-analyzer cold costs minutes of indexing and ~1.9 GB
+/// for a list of function names the file itself already states — which is why
+/// the traced 91-round run issued ZERO `lsp_symbols` calls and hand-rolled the
+/// outline with grep instead, then walked the file window by window.
+pub fn symbols(
+    root: &str,
+    file_path: &str,
+    query: &str,
+    permit: Option<&Value>,
+) -> Result<String, String> {
+    symbols_with(root, file_path, query, permit, true)
+}
+
+/// `lsp_symbols` answered by an ALREADY-WARM server, or `None`.
+///
+/// Mirrors `diagnostics_if_warm`: a cold language returns `None` instead of
+/// stalling the turn, and the caller substitutes the native outline.
+pub fn symbols_if_warm(root: &str, file_path: &str, query: &str, permit: Option<&Value>) -> Option<String> {
+    let abs = PathBuf::from(resolve_safe(root, file_path, true, permit).ok()?);
+    let language = detect_language(&abs).ok()?;
+    registry().warm_server(&PathBuf::from(root), language)?;
+    symbols_with(root, file_path, query, permit, false).ok()
+}
+
+/// Shared body of `symbols` / `symbols_if_warm` (see `symbols` for `allow_cold`).
+pub fn symbols_with(
+    root: &str,
+    file_path: &str,
+    query: &str,
+    permit: Option<&Value>,
+    allow_cold: bool,
+) -> Result<String, String> {
     let abs = match PathBuf::from(resolve_safe(root, file_path, true, permit)?) {
         p if p.exists() => p,
         _ => {
@@ -1665,6 +1722,11 @@ pub fn symbols(root: &str, file_path: &str, query: &str, permit: Option<&Value>)
     };
     let language = detect_language(&abs)?;
     let root_path = PathBuf::from(root);
+    if !allow_cold && registry().warm_server(&root_path, language).is_none() {
+        return Err(format!(
+            "no warm {language} language server is running"
+        ));
+    }
     let srv = registry().server_for(&root_path, language)?;
     let mut srv = registry().lock_server(&root_path, language, &srv)?;
     srv.ensure_open(&abs)?;

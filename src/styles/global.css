@@ -27922,6 +27922,31 @@ tr[data-search-current] .fv-mark,
   border-color: var(--border);
 }
 
+/* A part row with nothing to edit (a command row, a hook row): the head is a
+   plain line, not a disclosure button, so it must not advertise "Edit". */
+.pd-part-head--static {
+  cursor: default;
+}
+
+/* The hooks approval banner: a shell-invoking part of a bundle the user has to
+   say yes to, so it is stated in place rather than buried in a tab. */
+.pd-hook-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pd-hook-state.on {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+
 .pd-head-meta {
   display: flex;
   gap: 16px;

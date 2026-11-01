@@ -481,6 +481,15 @@ fn bench_codifa(task: &Task, model: &str) -> Result<RunMetrics, String> {
         allow_outside: false,
         allow_outside_folders: vec![],
         search_plugins: vec![],
+        // Media slots and the sub-agent tool narrowing stay empty here: the bench
+        // never asks for an image/video and uses the built-in research set.
+        image_provider_id: String::new(),
+        image_model: String::new(),
+        image_fallbacks: vec![],
+        video_provider_id: String::new(),
+        video_model: String::new(),
+        video_fallbacks: vec![],
+        subagent_tools: vec![],
         compact_at_percent: 0,
         fallback_provider: String::new(),
         fallback_model: String::new(),

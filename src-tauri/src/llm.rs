@@ -408,6 +408,25 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], tools: Option<&[Value
             // did with it. A gateway that rejects the field instead of
             // ignoring it gets one retry without it (`stream_with_key`).
             body["stream_options"] = json!({ "include_usage": true });
+            // Ask the model to emit INDEPENDENT tool calls in ONE assistant
+            // message instead of serialising one call per round trip.
+            //
+            // MEASURED (trace `mvxsy14e`, 59 rows): 16 of 19 rounds carried a
+            // single call while the model demonstrably COULD have batched — the
+            // same turn opened with three 2-call rounds. Prompt guidance alone
+            // (the system prompt's "BATCH EVERYTHING ALREADY DETERMINED") did
+            // not hold, because the OpenAI-compatible protocol DEFAULT here is
+            // provider-defined and several gateways serialise unless told
+            // otherwise. Every extra round re-sends the whole conversation, so
+            // one call per round is the single largest wire-token cost. This
+            // flag is the protocol-level twin of that prompt rule.
+            //
+            // Sent only where the wire format defines it (the tool-carrying
+            // OpenAI-compatible arm); a server that rejects the field gets one
+            // retry without it, exactly like `stream_options`.
+            if tools.is_some_and(|t| !t.is_empty()) {
+                body["parallel_tool_calls"] = json!(true);
+            }
         }
     }
     apply_prompt_cache(cfg, &mut body);
@@ -801,6 +820,16 @@ fn key_attempt_order(keys: &[String]) -> Vec<String> {
 /// without it rather than failing the step.
 fn rejects_stream_options(status: u16, body: &str) -> bool {
     status == 400 && body.to_ascii_lowercase().contains("stream_options")
+}
+
+/// Whether a gateway refused `parallel_tool_calls` as an unknown field.
+///
+/// Same contract as [`rejects_stream_options`]: a strict OpenAI-compatible
+/// server can 400 on the field instead of ignoring it. Dropping it only costs
+/// the batching hint the model would have got — the answer is still served — so
+/// the request is retried once without it rather than failing the step.
+fn rejects_parallel_tool_calls(status: u16, body: &str) -> bool {
+    status == 400 && body.to_ascii_lowercase().contains("parallel_tool_calls")
 }
 
 /// Whether a failed model call means "THIS model cannot serve us", i.e. the only
@@ -1556,8 +1585,13 @@ async fn stream_with_key(
         _ => (format!("{base}/chat/completions"), "Authorization", format!("Bearer {key}")),
     };
 
-    // Set only after a gateway refused `stream_options`: see the retry below.
-    let mut without_stream_options: Option<Value> = None;
+    // Set only after a gateway refused a field, and each strip is applied to
+    // what was ACTUALLY sent last. Two independent `Option`s picked with `or`
+    // were wrong the moment a server rejected both: the more-stripped copy lost
+    // and the request looped back with the field it just rejected. Cumulative
+    // and capped, so a strict gateway always converges on a body it accepts.
+    let mut retry_body: Option<Value> = None;
+    let mut retries_left: u8 = 2;
     // Bound ONLY the wait for the response headers — never the answer. After a
     // sleep/wake or a NAT rebinding a dead connection can sit in TCP
     // retransmit for tens of minutes reporting NO error, which defeats the
@@ -1568,7 +1602,7 @@ async fn stream_with_key(
     // not answer either; the env override covers an exotic queued gateway.
     let header_wait = std::time::Duration::from_secs(header_wait_secs());
     let resp = loop {
-        let send_body = without_stream_options.as_ref().unwrap_or(body);
+        let send_body = retry_body.as_ref().unwrap_or(body);
         let mut req = client
             .post(&url)
             .header(header_name, header_value.as_str())
@@ -1595,17 +1629,29 @@ async fn stream_with_key(
             break resp;
         }
         let text = resp.text().await.unwrap_or_default();
-        // Losing `stream_options` costs only the token accounting, so a server
-        // that rejects the field still deserves the answer — but only one
-        // retry (a second rejection is a real error).
-        if without_stream_options.is_some() || !rejects_stream_options(status, &text) {
-            return Err((status, text));
+        // Both fields below are OPTIONAL niceties: dropping one still gets the
+        // answer. Strip whichever the gateway named, cumulatively, and retry —
+        // but only twice, because a third rejection is a real error.
+        let reject_stream = rejects_stream_options(status, &text);
+        let reject_parallel = rejects_parallel_tool_calls(status, &text);
+        if retries_left > 0 && (reject_stream || reject_parallel) {
+            let mut stripped = send_body.clone();
+            let mut changed = false;
+            if let Some(obj) = stripped.as_object_mut() {
+                if reject_stream && obj.remove("stream_options").is_some() {
+                    changed = true;
+                }
+                if reject_parallel && obj.remove("parallel_tool_calls").is_some() {
+                    changed = true;
+                }
+            }
+            if changed {
+                retries_left -= 1;
+                retry_body = Some(stripped);
+                continue;
+            }
         }
-        let mut stripped = body.clone();
-        if let Some(obj) = stripped.as_object_mut() {
-            obj.remove("stream_options");
-        }
-        without_stream_options = Some(stripped);
+        return Err((status, text));
     };
 
     let mut acc = StreamAcc::default();
@@ -1881,6 +1927,39 @@ mod tests {
         assert!(body["tools"][0].get("cache_control").is_none());
         assert_eq!(body["messages"][0]["content"], "SYS");
         assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn openai_compatible_body_opts_into_parallel_tool_calls() {
+        // MEASURED (trace `mvxsy14e`): 16 of 19 rounds carried ONE call while the
+        // model demonstrably could batch (the same turn opened with three 2-call
+        // rounds). The prompt rule alone did not hold; the protocol default on
+        // many OpenAI-compatible gateways serialises unless told otherwise, and
+        // every extra round re-sends the whole conversation.
+        let c = cfg("openrouter", "https://openrouter.ai/api/v1", &["k"]);
+        let tools = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_request_body(&c, &msgs, Some(&tools));
+        assert_eq!(body["parallel_tool_calls"], json!(true));
+
+        // Only when tools are actually offered: the flag is meaningless — and an
+        // unknown field to a strict gateway — on a call that carries none.
+        let no_tools = build_request_body(&c, &msgs, None);
+        assert!(no_tools.get("parallel_tool_calls").is_none());
+        let empty_tools = build_request_body(&c, &msgs, Some(&[]));
+        assert!(empty_tools.get("parallel_tool_calls").is_none());
+
+        // The Anthropic wire format names this differently and rejects unknown
+        // top-level fields, so the flag must never leak onto that arm.
+        let a = cfg("anthropic", "https://api.anthropic.com", &["k"]);
+        let abody = build_request_body(&a, &msgs, Some(&tools));
+        assert!(abody.get("parallel_tool_calls").is_none());
+
+        // And a gateway that refuses the field is recognized so the request is
+        // retried once without it instead of failing the step.
+        assert!(rejects_parallel_tool_calls(400, "unknown field parallel_tool_calls"));
+        assert!(!rejects_parallel_tool_calls(400, "context length exceeded"));
+        assert!(!rejects_parallel_tool_calls(500, "parallel_tool_calls"));
     }
 
     #[test]

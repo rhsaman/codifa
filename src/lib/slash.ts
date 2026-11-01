@@ -46,7 +46,7 @@ export const SUBCOMMANDS: Record<string, SubCommand[]> = {
     { name: 'list', hint: 'List installed bundles', arg: 'free' },
     { name: 'install', hint: 'Install a bundle from a repo', arg: 'repo', rest: 'free' },
     { name: 'create', hint: 'Create a bundle from a description', arg: 'free' },
-    { name: 'update', hint: 'Edit a bundle (skills, scripts, keywords)', arg: 'name' },
+    { name: 'update', hint: 'Edit a bundle (skills, commands, agents, hooks, scripts)', arg: 'name' },
     { name: 'on', hint: 'Switch a bundle on', arg: 'name' },
     { name: 'off', hint: 'Switch a bundle off', arg: 'name' },
     { name: 'remove', hint: 'Delete a bundle and its contents', arg: 'name' },

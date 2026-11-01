@@ -134,6 +134,74 @@ pub fn strip_frontmatter_pub(raw: &str) -> String {
     strip_frontmatter(raw)
 }
 
+/// The EXPLICIT `name:` of a frontmatter header, or empty when the file has none.
+///
+/// A command is named by its FILE STEM — `commands/model-check.md` is
+/// `/model-check`, which is the word the palette shows and the user types — so
+/// the body must never supply the name. A real published bundle's command is
+/// plain prose with no header at all, and `parse_frontmatter`'s first-line
+/// fallback turned that first sentence into the command's name.
+pub fn frontmatter_name_pub(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix("---") else {
+        return String::new();
+    };
+    let Some(end) = rest.find("\n---") else {
+        return String::new();
+    };
+    for line in fold_block_scalars(&rest[..end]).lines() {
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("name") {
+            return val.trim().trim_matches('"').trim_matches('\'').to_string();
+        }
+    }
+    String::new()
+}
+
+/// Substitute a slash command's argument placeholders.
+///
+/// The contract a Claude Code bundle is written against: `$ARGUMENTS` is the
+/// whole argument string and `$1`..`$9` are its whitespace-separated tokens. A
+/// body with no placeholder is returned untouched (a command that takes no
+/// arguments must not grow a trailing blank line), and a token past the end of
+/// what the user typed becomes empty rather than staying a literal `$3`. `$0` is
+/// NOT a token — a body legitimately contains prices like `$0.50`.
+pub fn expand_command_args(body: &str, args: &str) -> String {
+    if !body.contains('$') {
+        return body.to_string();
+    }
+    let trimmed = args.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut out = String::with_capacity(body.len() + trimmed.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body.as_bytes()[i] == b'$' {
+            let rest = &body[i + 1..];
+            if let Some(tail) = rest.strip_prefix("ARGUMENTS") {
+                out.push_str(trimmed);
+                i = body.len() - tail.len();
+                continue;
+            }
+            if let Some(d) = rest
+                .chars()
+                .next()
+                .filter(|c| c.is_ascii_digit() && *c != '0')
+            {
+                let n = d.to_digit(10).unwrap_or(1) as usize;
+                out.push_str(tokens.get(n - 1).copied().unwrap_or(""));
+                i += 1 + d.len_utf8();
+                continue;
+            }
+        }
+        // Copy one whole char: slicing by byte would split a Persian letter.
+        let ch = body[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Fold a Persian/Arabic phrase for COMPARISON only.
 ///
 /// Matching raw bytes failed on the spelling differences that are invisible to
@@ -229,7 +297,8 @@ fn fold_block_scalars(block: &str) -> String {
 }
 
 /// Parse `name`, `slug`, `description`, `fa_keywords` from skill.md frontmatter.
-fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {    let mut name = String::new();
+fn parse_frontmatter(raw: &str) -> (String, String, String, Vec<String>) {
+    let mut name = String::new();
     let mut slug = String::new();
     let mut description = String::new();
     let mut fa_keywords: Vec<String> = Vec::new();
@@ -1523,5 +1592,50 @@ mod tests {
             .contains("MODEL BODY"));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_command_body_takes_its_arguments() {
+        // The whole string, and the single words, in one body — the shape a
+        // Claude Code command is written against.
+        assert_eq!(
+            expand_command_args("Review $1 against $2. All: $ARGUMENTS", "a.rs b.rs extra"),
+            "Review a.rs against b.rs. All: a.rs b.rs extra"
+        );
+    }
+
+    #[test]
+    fn a_missing_argument_is_empty_and_zero_is_left_alone() {
+        // A word past what the user typed must not stay a literal `$3`, and a
+        // price in the body must survive.
+        assert_eq!(expand_command_args("$1/$3 costs $0.50", "x"), "x/ costs $0.50");
+        // Nothing to substitute: the body comes back byte-identical.
+        assert_eq!(expand_command_args("no args here", "ignored"), "no args here");
+    }
+
+    #[test]
+    fn a_command_without_frontmatter_is_named_by_its_file() {
+        // A real published bundle writes its command as plain prose with no
+        // header at all. Its NAME is the file stem (`/model-check`), so the first
+        // sentence of the body must never become the command word — nobody could
+        // type it.
+        assert_eq!(
+            frontmatter_name_pub("Reassess the current session.\n\nDo the thing.\n"),
+            ""
+        );
+        // An explicit header still wins, so a bundle can name a command its own
+        // way on purpose.
+        assert_eq!(
+            frontmatter_name_pub("---\nname: model-check\n---\nBody.\n"),
+            "model-check"
+        );
+    }
+
+    #[test]
+    fn persian_text_survives_the_substitution() {
+        // The scan walks chars, not bytes: slicing inside a Persian letter is the
+        // panic this guards.
+        let out = expand_command_args("فایل $1 را بررسی کن", "main.rs");
+        assert_eq!(out, "فایل main.rs را بررسی کن");
     }
 }

@@ -2462,16 +2462,65 @@ pub fn move_mouse(x: i64, y: i64, chat_id: &str) -> Value {
     }
 }
 
+/// Whether `text` is short enough to be typed key by key. Long runs and text
+/// with line breaks keep the single `Input.insertText` call: they are pastes in
+/// practice, and thousands of key events would only slow them down.
+pub(crate) fn is_short_plain_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().count() <= 80 && !text.contains(['\n', '\r', '\t'])
+}
+
+/// The keyDown/keyUp pair for one typed character.
+///
+/// `Input.insertText` changes the field but fires no `keydown`/`keyup`, which is
+/// exactly how a script tells a person from an automated client. Real events
+/// carry the key, its text and (for ASCII) the physical code and key code.
+pub(crate) fn char_key_events(ch: char) -> [Value; 2] {
+    let key = ch.to_string();
+    let mut base = json!({"key": key, "text": key, "unmodifiedText": key});
+    let (code, vk): (Option<String>, u32) = if ch.is_ascii_alphabetic() {
+        let up = ch.to_ascii_uppercase();
+        (Some(format!("Key{up}")), up as u32)
+    } else if ch.is_ascii_digit() {
+        (Some(format!("Digit{ch}")), ch as u32)
+    } else if ch == ' ' {
+        (Some("Space".to_string()), 32)
+    } else {
+        (None, 0)
+    };
+    if let Some(code) = code {
+        base["code"] = json!(code);
+        base["windowsVirtualKeyCode"] = json!(vk);
+        base["nativeVirtualKeyCode"] = json!(vk);
+    }
+    if ch.is_ascii_uppercase() {
+        base["modifiers"] = json!(8); // Shift
+    }
+    let mut down = base.clone();
+    down["type"] = json!("keyDown");
+    let mut up = base;
+    up["type"] = json!("keyUp");
+    if let Some(o) = up.as_object_mut() {
+        o.remove("text");
+        o.remove("unmodifiedText");
+    }
+    [down, up]
+}
+
 /// Type text into the focused element.
 pub fn type_text(text: &str, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
     let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    match cdp_calls(
-        &tab,
-        vec![("Input.insertText", json!({"text": text}))],
-    ) {
+    let calls: Vec<(&'static str, Value)> = if is_short_plain_text(text) {
+        text.chars()
+            .flat_map(char_key_events)
+            .map(|ev| ("Input.dispatchKeyEvent", ev))
+            .collect()
+    } else {
+        vec![("Input.insertText", json!({"text": text}))]
+    };
+    match cdp_calls(&tab, calls) {
         Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -2689,6 +2738,21 @@ pub fn close(chat_id: &str) -> Value {
 /// serve the agent's concurrently reading driver. Everything here is
 /// request/reply on that separate, per-driver socket.
 pub(crate) mod driver_hooks {
+    /// The identity the panel's session presents (Chrome User-Agent + client
+    /// hints, plus the consistency script), built from the running browser's own
+    /// version. The agent's driver is a SEPARATE CDP session on the same tab, so
+    /// it has to send the same override or the two sessions disagree about who
+    /// the browser is.
+    pub(crate) fn identity() -> Option<(serde_json::Value, &'static str)> {
+        let port = super::alive_port()?;
+        let info = super::http_get_json(port, "/json/version").ok()?;
+        let version = serde_json::json!({
+            "userAgent": info["User-Agent"],
+            "product": info["Browser"],
+        });
+        super::ua_override(&version).map(|ua| (ua, super::CONSISTENCY_JS))
+    }
+
     /// Normalized chat key.
     pub(crate) fn chat_key(chat: &str) -> String {
         super::normalize_chat(chat)

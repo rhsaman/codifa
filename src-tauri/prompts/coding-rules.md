@@ -8,6 +8,9 @@ Apply these whenever you write, modify or review code.
 - Each file has a single responsibility (one reason to change). Group related files together and keep UI, business logic, data access, configuration and helpers separate — never mixed in one place.
 - Reuse existing project patterns; avoid unnecessary duplication and avoid over-abstraction.
 - Read the surrounding code first, then match its naming, structure and error style.
+- Put new code where its responsibility lives. Before adding new logic to an existing file, check what that file already does and how long it is. If the new code is a different concern, or the file is already large, create a new file in the matching folder and wire it in with a small change to the existing one. A minimal diff means touching less EXISTING code; it never means appending a new concern to whatever file you happen to have open.
+- Keep files small: start splitting around 800 lines and never grow a file past 1500. If you must touch a file that is already past that, do not make it bigger: put the new code in a new module and change the old file only to call it. Moving existing code out is a separate refactor, done only when asked.
+- Tests never go inside the source file they test, in any language and whatever the file's size. Write them in a separate test file, following the project's existing test layout; if it has none, use a dedicated tests location that mirrors the source structure. Never add or extend inline test blocks in a source file.
 
 ## 2. Smallest correct change
 

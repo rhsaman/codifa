@@ -530,6 +530,63 @@ export async function listPluginScripts(): Promise<PluginScriptRow[] | { error: 
   }
 }
 
+/** One slash command of a plugin bundle. */
+export interface PluginCommandRow {
+  /** The word typed after `/` — the file stem, so it is what the palette shows. */
+  name: string
+  description: string
+  /** The body the model receives, with `$ARGUMENTS` placeholders still in it. */
+  content?: string
+  plugin?: string
+  plugin_slug?: string
+  plugin_enabled?: boolean
+}
+
+/** Every slash command inside every plugin, enabled or not. */
+export async function listPluginCommands(): Promise<PluginCommandRow[] | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: 'the local backend is not ready' }
+  try {
+    const res = await fetch(`${url}/plugins/commands`)
+    if (!res.ok) return { error: `list failed (${res.status})` }
+    const data = (await res.json()) as { commands?: PluginCommandRow[] }
+    return data.commands ?? []
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** One sub-agent profile of a plugin bundle. */
+export interface PluginAgentRow {
+  name: string
+  description: string
+  /** Tools it may call; empty = the full research set. It can only narrow. */
+  tools?: string[]
+  /** Its system prompt. */
+  prompt?: string
+  plugin?: string
+  plugin_slug?: string
+  plugin_enabled?: boolean
+}
+
+/** Every sub-agent profile inside every plugin, enabled or not.
+ *
+ *  All of them run on the Explore row of Settings → Tools — there is no
+ *  per-profile model, which is what the Settings note points at.
+ */
+export async function listPluginAgents(): Promise<PluginAgentRow[] | { error: string }> {
+  const url = await ensureSidecar()
+  if (!url) return { error: 'the local backend is not ready' }
+  try {
+    const res = await fetch(`${url}/plugins/agents`)
+    if (!res.ok) return { error: `list failed (${res.status})` }
+    const data = (await res.json()) as { agents?: PluginAgentRow[] }
+    return data.agents ?? []
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** Every connector inside every plugin, each row naming its owner. */
 export async function listPluginConnectors(): Promise<
   PluginConnectorRow[] | { error: string }

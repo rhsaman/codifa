@@ -665,6 +665,16 @@ async fn plugins_scripts(State(st): State<AppState>) -> Response<Body> {
     Json(json!({ "scripts": crate::plugins::all_plugin_scripts(&st.root()) })).into_response()
 }
 
+/// Every slash command of every plugin, tagged with its owning bundle.
+async fn plugins_commands(State(st): State<AppState>) -> Response<Body> {
+    Json(json!({ "commands": crate::plugins::all_plugin_commands(&st.root()) })).into_response()
+}
+
+/// Every sub-agent profile of every plugin, tagged with its owning bundle.
+async fn plugins_agents(State(st): State<AppState>) -> Response<Body> {
+    Json(json!({ "agents": crate::plugins::all_plugin_agents(&st.root()) })).into_response()
+}
+
 async fn plugins_mcp_save(State(st): State<AppState>, Json(body): Json<Value>) -> Response<Body> {
     match crate::plugins::save_bundle_connector(&st.root(), &body) {
         Ok(v) => Json(v).into_response(),
@@ -2637,6 +2647,8 @@ pub fn router(state: AppState) -> Router {
         // skills and connectors, enabled or not.
         .route("/plugins/skills", get(plugins_skills))
         .route("/plugins/scripts", get(plugins_scripts))
+        .route("/plugins/commands", get(plugins_commands))
+        .route("/plugins/agents", get(plugins_agents))
         .route("/plugins/mcp", get(plugins_mcp))
         .route("/plugins/mcp/save", post(plugins_mcp_save))
         .route("/plugins/mcp/delete", post(plugins_mcp_delete))

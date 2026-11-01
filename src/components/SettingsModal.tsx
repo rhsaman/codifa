@@ -3645,7 +3645,7 @@ export function SettingsModal({ onClose, initialTab }: { onClose: () => void; in
             <ToolSlotRow
               agent="explore"
               label="Explore"
-              desc="Research sub-agent that does ALL file reading, searching and LSP lookups for the main agent and reports the full findings. Falls back to the main model."
+              desc="Research sub-agent that does ALL file reading, searching and LSP lookups for the main agent and reports the full findings. Plugin sub-agents (agents/*.md inside a bundle) run on THIS row too — same model, same fallback list. Falls back to the main model."
               model={subagentModels.explore || ''}
               level={subagentThinking.explore || 'low'}
               onSelectModel={setSubagentModel}

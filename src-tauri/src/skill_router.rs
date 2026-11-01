@@ -359,6 +359,47 @@ fn read_skills_from_disk(root: &str) -> Vec<Value> {
     crate::plugins::enabled_plugin_skills(std::path::Path::new(root))
 }
 
+/// Resolve a typed `/name …` against the ENABLED bundles' slash commands.
+///
+/// Returns the command body with the argument placeholders already substituted
+/// (`$ARGUMENTS`, `$1`..`$9`) — ready to be sent as the turn's prompt — plus the
+/// command's own name for the trace and the UI banner. `None` when no enabled
+/// bundle ships that command, so a built-in `/compact` is never shadowed by an
+/// absent one.
+///
+/// The command name is the FILE STEM (see `plugins::list_commands`): that is what
+/// the palette offers and what the user typed, so looking it up by frontmatter
+/// `name` would miss every command whose display label differs from its word.
+pub fn expand_slash_command(prompt: &str, root: &str) -> Option<(String, String)> {
+    let raw = prompt.trim_start();
+    let rest = raw.strip_prefix('/')?;
+    // One token: the command word. Everything after it is its arguments. The
+    // TYPED word is kept for the split — `to_lowercase` can change a string's
+    // byte length on some scripts, and slicing a multi-byte word by the folded
+    // length would cut into the arguments (or panic).
+    let typed = rest.split_whitespace().next()?;
+    if typed.is_empty() {
+        return None;
+    }
+    let name = typed.to_lowercase();
+    let args = rest[typed.len()..].trim().to_string();
+    let row = crate::plugins::enabled_plugin_commands(std::path::Path::new(root))
+        .into_iter()
+        .find(|c| {
+            c["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+        })?;
+    let body = row["content"].as_str().unwrap_or_default();
+    // `trim_end` only: a command file is stored with a trailing newline, which
+    // would otherwise ride into the prompt as a dangling blank line. Leading
+    // whitespace is left alone so an indented body keeps its shape.
+    Some((
+        skills::expand_command_args(body, &args).trim_end().to_string(),
+        row["name"].as_str().unwrap_or(&name).to_string(),
+    ))
+}
+
 pub fn load_skills(root: &str) -> Vec<Value> {
     let signature = store_signature(root);
     if let Some(rows) = skills_cache()
@@ -950,6 +991,46 @@ mod tests {
         let gone = build_section("", root, &["Ghost Skill".into()]);
         assert_eq!(gone.missing, vec!["ghost skill".to_string()]);
         assert!(!gone.text.contains("ATTACHED SKILLS"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_typed_command_expands_with_its_arguments() {
+        // The whole chain a `/model-check something` goes through: a bundle on
+        // disk → an enabled command → its body with the placeholders replaced.
+        let dir = std::env::temp_dir().join(format!("codifa-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::plugins::create_plugin(
+            &dir,
+            &json!({
+                "name": "Advisor",
+                "slug": "advisor",
+                "commands": [{
+                    "name": "model-check",
+                    "description": "Check the model",
+                    "content": "Reassess $1 now. Full: $ARGUMENTS"
+                }]
+            }),
+        )
+        .expect("plugin");
+
+        let (body, name) = expand_slash_command("/model-check main.rs", dir.to_str().unwrap())
+            .expect("the command must resolve");
+        assert_eq!(name, "model-check");
+        assert_eq!(body, "Reassess main.rs now. Full: main.rs");
+
+        // Case-insensitive on the WORD, and the arguments still arrive whole.
+        let (body, _) = expand_slash_command("/Model-Check A B", dir.to_str().unwrap()).unwrap();
+        assert_eq!(body, "Reassess A now. Full: A B");
+
+        // A disabled bundle contributes nothing, and an unknown word is the
+        // user's own text rather than a dead click.
+        crate::plugins::toggle_plugin(&dir, &json!({"slug": "advisor", "enabled": false}))
+            .unwrap();
+        assert!(expand_slash_command("/model-check x", dir.to_str().unwrap()).is_none());
+        assert!(expand_slash_command("/nope x", dir.to_str().unwrap()).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

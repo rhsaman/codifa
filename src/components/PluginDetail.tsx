@@ -10,6 +10,8 @@ import { toolFallbackEntries } from '../lib/toolSlots'
 import {
   deletePluginConnector,
   deletePluginScript,
+  listPluginAgents,
+  listPluginCommands,
   listPluginConnectors,
   listPluginScripts,
   listPluginSkills,
@@ -19,10 +21,16 @@ import {
   fillMissingKeywords,
   updatePlugin,
 } from '../lib/plugins'
-import type { PluginConnectorRow, PluginScriptRow, PluginSkillRow } from '../lib/plugins'
+import type {
+  PluginAgentRow,
+  PluginCommandRow,
+  PluginConnectorRow,
+  PluginScriptRow,
+  PluginSkillRow,
+} from '../lib/plugins'
 
 /** Which part of the bundle the page is showing. */
-type Tab = 'skills' | 'mcp' | 'scripts' | 'bundle'
+type Tab = 'skills' | 'commands' | 'agents' | 'mcp' | 'scripts' | 'hooks' | 'bundle'
 
 function kvToText(kv: Record<string, string>): string {
   return Object.entries(kv)
@@ -322,6 +330,8 @@ export function PluginDetail({
   const [skills, setSkills] = useState<PluginSkillRow[]>([])
   const [conns, setConns] = useState<PluginConnectorRow[]>([])
   const [scripts, setScripts] = useState<PluginScriptRow[]>([])
+  const [cmds, setCmds] = useState<PluginCommandRow[]>([])
+  const [agents, setAgents] = useState<PluginAgentRow[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
@@ -358,14 +368,18 @@ export function PluginDetail({
   const providers = useStore((s) => s.settings.providers)
 
   const load = useCallback(async () => {
-    const [sk, cn, sc] = await Promise.all([
+    const [sk, cn, sc, cq, ag] = await Promise.all([
       listPluginSkills(),
       listPluginConnectors(),
       listPluginScripts(),
+      listPluginCommands(),
+      listPluginAgents(),
     ])
     setSkills(Array.isArray(sk) ? sk.filter((r) => r.plugin_slug === plugin.slug) : [])
     setConns(Array.isArray(cn) ? cn.filter((r) => r.plugin_slug === plugin.slug) : [])
     setScripts(Array.isArray(sc) ? sc.filter((r) => r.plugin_slug === plugin.slug) : [])
+    setCmds(Array.isArray(cq) ? cq.filter((r) => r.plugin_slug === plugin.slug) : [])
+    setAgents(Array.isArray(ag) ? ag.filter((r) => r.plugin_slug === plugin.slug) : [])
     setLoading(false)
   }, [plugin.slug])
 
@@ -496,17 +510,23 @@ export function PluginDetail({
 
   const counts: Record<Tab, number> = {
     skills: skills.length,
+    commands: cmds.length,
+    agents: agents.length,
     mcp: conns.length,
     scripts: scripts.length,
+    hooks: plugin.hooks?.length ?? 0,
     bundle: 0,
   }
   const tabLabels: Record<Tab, string> = {
     skills: 'Skills',
+    commands: 'Commands',
+    agents: 'Sub-agents',
     mcp: 'Connectors',
     scripts: 'Scripts',
+    hooks: 'Hooks',
     bundle: 'Bundle',
   }
-  const tabs: Tab[] = ['skills', 'mcp', 'scripts', 'bundle']
+  const tabs: Tab[] = ['skills', 'commands', 'agents', 'mcp', 'scripts', 'hooks', 'bundle']
 
   const body = (
     <div className="pd-overlay" onMouseDown={onClose}>
@@ -733,6 +753,112 @@ export function PluginDetail({
             )
           ) : null}
 
+          {tab === 'commands' ? (
+            cmds.length === 0 ? (
+              <div className="hint">
+                No commands in this bundle. A command is a markdown file under{' '}
+                <code>commands/</code> whose name is what you type after <code>/</code>; its body is
+                sent to the model, with <code>$ARGUMENTS</code> (everything after the command) and{' '}
+                <code>$1</code>..<code>$9</code> (single words) replaced.
+              </div>
+            ) : (
+              cmds.map((row) =>
+                row.description.trim() ? (
+                  <Part
+                    key={row.name}
+                    name={`/${row.name}`}
+                    open={open === `cmd:${row.name}`}
+                    onToggle={() => setOpen(open === `cmd:${row.name}` ? '' : `cmd:${row.name}`)}
+                  >
+                    <span className="hint">
+                      {row.description}
+                    </span>
+                    <span className="hint">
+                      Edit the body in <code>commands/{row.name}.md</code>.{' '}
+                      <code>$ARGUMENTS</code> is the whole argument string, <code>$1</code>..
+                      <code>$9</code> the single words.
+                    </span>
+                  </Part>
+                ) : (
+                  <div key={row.name} className="pd-part">
+                    <div className="pd-part-head pd-part-head--static">
+                      <span className="pd-part-line">
+                        <span className="pd-part-name">/{row.name}</span>
+                      </span>
+                    </div>
+                  </div>
+                ),
+              )
+            )
+          ) : null}
+
+          {tab === 'agents' ? (
+            agents.length === 0 ? (
+              <div className="hint">
+                No sub-agents in this bundle. A sub-agent is a markdown profile under{' '}
+                <code>agents/</code>: its frontmatter names the tools it may use and its body is its
+                system prompt. Every one of them runs on the <strong>Explore</strong> row of
+                Settings → Tools — same model, same fallback list.
+              </div>
+            ) : (
+              agents.map((row) => (
+                <Part
+                  key={row.name}
+                  name={row.name}
+                  badge={row.tools?.length ? `${row.tools.length} tool(s)` : 'all tools'}
+                  sub={row.description}
+                  open={open === `agent:${row.name}`}
+                  onToggle={() => setOpen(open === `agent:${row.name}` ? '' : `agent:${row.name}`)}
+                >
+                  {row.tools?.length ? (
+                    <span className="hint">
+                      Tools: <code>{row.tools.join(', ')}</code>
+                    </span>
+                  ) : null}
+                  <span className="hint">
+                    Runs on the Explore model row of Settings → Tools. Edit it in{' '}
+                    <code>agents/{row.name}.md</code>.
+                  </span>
+                </Part>
+              ))
+            )
+          ) : null}
+
+          {tab === 'hooks' ? (
+            !plugin.hooks?.length ? (
+              <div className="hint">
+                No hooks in this bundle. A hook is a shell command under{' '}
+                <code>hooks/hooks.json</code> that runs at a point of a turn (SessionStart,
+                UserPromptSubmit, PreToolUse, PostToolUse, Stop) and may refuse a tool call.
+                Hooks run CODE, so they stay off until you approve them in the Bundle tab.
+              </div>
+            ) : (
+              <>
+                <div className={`pd-hook-state${plugin.hooks_enabled ? ' on' : ''}`}>
+                  {plugin.hooks_enabled
+                    ? 'Hooks are ON for this bundle: every handler below runs during a turn.'
+                    : 'Hooks are OFF. Writing hooks.json is not approval to run it — turn them on in the Bundle tab when you trust this bundle.'}
+                </div>
+                {plugin.hooks.map((h) => (
+                  <div key={`${h.event}:${h.command}`} className="pd-part">
+                    <div className="pd-part-head pd-part-head--static">
+                      <span className="pd-part-line">
+                        <span className="pd-part-name">{h.event}</span>
+                        {h.matcher ? <span className="pd-badge">{h.matcher}</span> : null}
+                        {h.dispatched === false ? (
+                          <span className="pd-badge pd-badge--off">not dispatched</span>
+                        ) : null}
+                      </span>
+                      <span className="pd-part-sub">
+                        <code>{h.command}</code>
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </>
+            )
+          ) : null}
+
           {tab === 'scripts' ? (
             scripts.length === 0 ? (
               <div className="hint">
@@ -813,6 +939,36 @@ export function PluginDetail({
                 this bundle. A skill that carries none of its own falls back to them, so a library
                 of bare skills is still found.
               </span>
+              {plugin.hooks?.length ? (
+                <div className={`pd-hook-state${plugin.hooks_enabled ? ' on' : ''}`}>
+                  <span>
+                    This bundle ships {plugin.hooks.length} hook
+                    {plugin.hooks.length === 1 ? '' : 's'} — shell commands that run during a turn
+                    and may refuse a tool call.{' '}
+                    {plugin.hooks_enabled
+                      ? 'They are ON.'
+                      : 'They are OFF: installing a bundle is not permission to run its code.'}
+                  </span>
+                  <button
+                    className="btn tiny"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(
+                        () =>
+                          updatePlugin({
+                            slug: plugin.slug,
+                            hooks_enabled: !plugin.hooks_enabled,
+                          }).then((out) =>
+                            'error' in out ? { error: out.error } : { ok: true as const },
+                          ),
+                        plugin.hooks_enabled ? 'Hooks turned off.' : 'Hooks turned on.',
+                      )
+                    }
+                  >
+                    {plugin.hooks_enabled ? 'Turn hooks off' : 'Turn hooks on'}
+                  </button>
+                </div>
+              ) : null}
               <div className="pd-form-actions">
                 <button
                   className="btn tiny"

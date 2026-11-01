@@ -59,6 +59,14 @@ const MCP_META: &str = "connector_meta";
 const INHERIT_KEYWORDS_MAX: usize = 4;
 /// Folder inside a plugin holding its runnable scripts.
 pub(crate) const SCRIPTS: &str = "scripts";
+/// Folder inside a plugin holding its slash commands (`commands/<name>.md`).
+///
+/// Deliberately NOT the skill store: a command is typed as `/name`, never
+/// attached with `@`, and keeping it in its own folder means the skills catalog
+/// and the `@` picker cannot accidentally list it.
+pub(crate) const COMMANDS: &str = "commands";
+/// Cap on the commands one bundle may ship.
+pub(crate) const MAX_COMMANDS: usize = 64;
 /// Manifest inside one script folder: name, slug, language, description.
 pub(crate) const SCRIPT_MANIFEST: &str = "script.json";
 /// Language a script is written in when the call does not name one.
@@ -646,6 +654,188 @@ fn script_names(root: &Path, slug: &str) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// commands and sub-agents
+// ---------------------------------------------------------------------------
+
+/// Folder holding one plugin's slash commands.
+fn commands_dir(root: &Path, slug: &str) -> PathBuf {
+    plugin_dir(root, slug).join(COMMANDS)
+}
+
+/// Folder holding one plugin's sub-agent profiles.
+fn agents_dir(root: &Path, slug: &str) -> PathBuf {
+    plugin_dir(root, slug).join(crate::subagents::AGENTS)
+}
+
+/// Every slash command a plugin ships, sorted by name.
+///
+/// The file STEM is the command name — it is what the user types after `/`, so
+/// the frontmatter `name` is a display label only and a command listed under it
+/// would be one nobody can invoke. Read from disk on each call, like every other
+/// part of a bundle: the folder stays the only source of truth.
+pub fn list_commands(root: &Path, slug: &str) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(commands_dir(root, slug)) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let (_, _, description, _) = crate::skills::parse_frontmatter_pub(&raw);
+        rows.push(json!({
+            "name": stem,
+            "description": if description.trim().is_empty() {
+                format!("Run the /{stem} command")
+            } else {
+                description
+            },
+            // The body WITHOUT its frontmatter: this text becomes the prompt, so
+            // a `---` block left in would be read as instructions.
+            "content": crate::skills::strip_frontmatter_pub(&raw),
+        }));
+    }
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    rows
+}
+
+/// Command names only — what the manifest/view lists.
+fn command_names(root: &Path, slug: &str) -> Vec<String> {
+    list_commands(root, slug)
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The sub-agent profiles a plugin ships (the parsing lives in `subagents`).
+pub fn list_agents(root: &Path, slug: &str) -> Vec<Value> {
+    crate::subagents::read_agents(&plugin_dir(root, slug))
+}
+
+/// Sub-agent names only — what the manifest/view lists.
+fn agent_names(root: &Path, slug: &str) -> Vec<String> {
+    list_agents(root, slug)
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Slash commands of every ENABLED bundle, with their bodies, for the turn.
+///
+/// A disabled bundle contributes nothing: its switch is the on/off control, so a
+/// `/name` it ships must stop resolving the moment it is switched off.
+pub fn enabled_plugin_commands(root: &Path) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (slug, manifest) in all_plugins(root) {
+        if !manifest["enabled"].as_bool().unwrap_or(true) {
+            continue;
+        }
+        let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
+        for mut row in list_commands(root, &slug) {
+            row["plugin"] = json!(label);
+            row["plugin_slug"] = json!(slug);
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Sub-agent profiles of every ENABLED bundle, tagged with their owner.
+pub fn enabled_plugin_agents(root: &Path) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (slug, manifest) in all_plugins(root) {
+        if !manifest["enabled"].as_bool().unwrap_or(true) {
+            continue;
+        }
+        let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
+        for mut row in list_agents(root, &slug) {
+            row["plugin"] = json!(label);
+            row["plugin_slug"] = json!(slug);
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Every handler the agent may run this turn: enabled AND explicitly approved.
+///
+/// `hooks_enabled` is the user's approval of THIS bundle's code, so it is the
+/// gate — an enabled bundle with hooks off contributes none. The pair list is
+/// what `hooks::active_in` consumes.
+pub fn active_hook_bundles(root: &Path) -> Vec<(PathBuf, bool)> {
+    all_plugins(root)
+        .into_iter()
+        .filter(|(_, m)| m["enabled"].as_bool().unwrap_or(true))
+        .map(|(slug, manifest)| {
+            let approved = crate::hooks::trusted(&manifest);
+            (plugin_dir(root, &slug), approved)
+        })
+        .collect()
+}
+
+/// One ENABLED bundle's sub-agent profile by name.
+///
+/// The name is the delegation TOOL name the model was shown, so the lookup is
+/// case-insensitive and reads disk: a profile edited between two turns resolves
+/// to what is actually there now.
+pub fn find_plugin_agent(root: &Path, name: &str) -> Option<Value> {
+    let want = name.trim();
+    if want.is_empty() {
+        return None;
+    }
+    for (slug, manifest) in all_plugins(root) {
+        if !manifest["enabled"].as_bool().unwrap_or(true) {
+            continue;
+        }
+        if let Some(mut row) = crate::subagents::find_agent(&plugin_dir(root, &slug), want) {
+            row["plugin"] = json!(manifest["name"].as_str().unwrap_or(&slug));
+            row["plugin_slug"] = json!(slug);
+            return Some(row);
+        }
+    }
+    None
+}
+
+/// Every command of every plugin, enabled or not, tagged with its owning bundle.
+pub fn all_plugin_commands(root: &Path) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (slug, manifest) in all_plugins(root) {
+        let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
+        let enabled = manifest["enabled"].as_bool().unwrap_or(true);
+        for mut row in list_commands(root, &slug) {
+            row["plugin"] = json!(label);
+            row["plugin_slug"] = json!(slug);
+            row["plugin_enabled"] = json!(enabled);
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Every sub-agent of every plugin, enabled or not, tagged with its bundle.
+pub fn all_plugin_agents(root: &Path) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (slug, manifest) in all_plugins(root) {
+        let label = manifest["name"].as_str().unwrap_or(&slug).to_string();
+        let enabled = manifest["enabled"].as_bool().unwrap_or(true);
+        for mut row in list_agents(root, &slug) {
+            row["plugin"] = json!(label);
+            row["plugin_slug"] = json!(slug);
+            row["plugin_enabled"] = json!(enabled);
+            out.push(row);
+        }
+    }
+    out
+}
+
 /// Every script of a plugin WITH its own metadata, sorted by name.
 ///
 /// Read out of each script's manifest — the folder stays the only source of
@@ -1158,6 +1348,14 @@ fn plugin_view(root: &Path, slug: &str) -> Value {
     manifest["skills"] = json!(skill_names(root, slug));
     manifest["mcp"] = json!(connector_names(root, slug));
     manifest["scripts"] = json!(script_names(root, slug));
+    // The three parts a Claude Code bundle may be made of ENTIRELY. They are
+    // listed from disk like the rest, so a bundle with no skill still shows
+    // what it actually carries.
+    manifest[COMMANDS] = json!(command_names(root, slug));
+    manifest[crate::subagents::AGENTS] = json!(agent_names(root, slug));
+    manifest["hooks"] = crate::hooks::describe(&plugin_dir(root, slug))["hooks"].clone();
+    // Always a bool, so the renderer's switch needs no "absent means off" rule.
+    manifest[crate::hooks::ENABLED_KEY] = json!(crate::hooks::trusted(&manifest));
     // Always an array, even when the file holds a hand-written string: the
     // renderer edits it as a list and would otherwise show nothing.
     manifest[KEYWORDS] = json!(keywords_of(&manifest[KEYWORDS].clone()));
@@ -1242,6 +1440,12 @@ pub fn update_plugin(root: &Path, body: &Value) -> Result<Value, String> {
     }
     if let Some(v) = body["enabled"].as_bool() {
         manifest["enabled"] = json!(v);
+    }
+    // The hook approval switch. It lives in the manifest (one key for the whole
+    // bundle, not per handler) because it is the USER's decision about THIS
+    // plugin, and it must survive an update from source.
+    if let Some(v) = body[crate::hooks::ENABLED_KEY].as_bool() {
+        manifest[crate::hooks::ENABLED_KEY] = json!(v);
     }
     // An explicit empty list CLEARS the keywords; an absent field leaves them
     // alone, exactly like `description` above.
@@ -2029,6 +2233,9 @@ pub fn delete_bundle_connector(root: &Path, body: &Value) -> Result<Value, Strin
     };
     let only_part = connector_names(root, &slug).len() <= 1
         && skill_names(root, &slug).is_empty()
+        && command_names(root, &slug).is_empty()
+        && agent_names(root, &slug).is_empty()
+        && !crate::hooks::hooks_file(&plugin_dir(root, &slug)).is_file()
         && script_names(root, &slug).is_empty();
     if only_part {
         let removed = fs::remove_dir_all(plugin_dir(root, &slug)).is_ok();
@@ -2136,7 +2343,25 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
         "repo_ref": body["repo_ref"].clone(),
         "skills": read["skills"].clone(),
         "scripts": read["scripts"].clone(),
+        // The three parts a Claude Code bundle may be made of ENTIRELY. Without
+        // them a commands-only bundle (`commands/*.md`, no SKILL.md, no mcp.json)
+        // installed as an empty folder — the reported "nothing to install".
+        COMMANDS: read[COMMANDS].clone(),
+        "agents": read[crate::subagents::AGENTS].clone(),
     });
+    // A bundle that declares hooks lands with them DISABLED: writing the file is
+    // not approval to run it. The key is deliberately NOT set here — `plugin_view`
+    // reports `false` for an absent key — so a REINSTALL cannot flip a switch the
+    // user already turned on (the update path keeps the stored approval).
+    if read["hooks"].as_array().is_some_and(|a| !a.is_empty()) {
+        payload["hooks"] = read["hooks"].clone();
+        // The handler SCRIPTS the declarations point at. Without them a bundle
+        // installs with hooks.json naming a file that was never written, so the
+        // approved hook could only ever fail to start.
+        if read["hook_files"].as_array().is_some_and(|a| !a.is_empty()) {
+            payload["hook_files"] = read["hook_files"].clone();
+        }
+    }
     // A repo that ships no keywords leaves the key OUT, so reinstalling never
     // discards keywords the user edited by hand — `update_plugin` only touches
     // fields that are present.
@@ -2192,11 +2417,47 @@ pub fn install_plugin(root: &Path, body: &Value) -> Result<Value, String> {
         "installed": if existed { "updated" } else { "created" },
         "slug": slug,
         "source": read["source"].clone(),
+        // What actually landed, in words: a bundle carrying only commands used to
+        // answer with three empty arrays, which reads exactly like a failed
+        // install.
+        "summary": install_summary(&view),
         "skills": view["skills"].clone(),
         "mcp": view["mcp"].clone(),
         "scripts": view["scripts"].clone(),
+        COMMANDS: view[COMMANDS].clone(),
+        "agents": view[crate::subagents::AGENTS].clone(),
+        "hooks": view["hooks"].clone(),
         "plugin": view,
     }))
+}
+
+/// One line naming what an install landed, for the result message.
+fn install_summary(view: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (key, label) in [
+        ("skills", "skill"),
+        ("mcp", "connector"),
+        (COMMANDS, "command"),
+        (crate::subagents::AGENTS, "sub-agent"),
+        ("scripts", "script"),
+    ] {
+        let n = view[key].as_array().map_or(0, Vec::len);
+        if n > 0 {
+            parts.push(format!("{n} {label}{}", if n == 1 { "" } else { "s" }));
+        }
+    }
+    if parts.is_empty() {
+        return "the bundle carries no parts Codifa can run".to_string();
+    }
+    let mut out = parts.join(", ");
+    let hooks = view["hooks"].as_array().map_or(0, Vec::len);
+    if hooks > 0 {
+        out.push_str(&format!(
+            ", {hooks} hook{} (off until enabled)",
+            if hooks == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 /// Switch a plugin on/off. Without an explicit `enabled` the current value is
@@ -2321,7 +2582,251 @@ fn apply_parts(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
     // Last, so a bundle that ships code lands with it: `scripts/` is written
     // through the same branch a hand-authored one takes.
     apply_scripts(root, slug, body)?;
+    apply_commands(root, slug, body)?;
+    apply_agents(root, slug, body)?;
+    apply_hooks(root, slug, body)?;
     Ok(())
+}
+
+/// Write a bundle's slash commands.
+///
+/// PATCH by name like the other parts: a command named in the call is written,
+/// every other one on disk is left alone, and `deleted_commands` removes the
+/// ones the call drops. A command's file name IS its name (see [`list_commands`]).
+fn apply_commands(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
+    if let Some(list) = body[COMMANDS].as_array() {
+        if list.len() > MAX_COMMANDS {
+            return Err(format!(
+                "a plugin may hold at most {MAX_COMMANDS} commands (got {})",
+                list.len()
+            ));
+        }
+        let dir = commands_dir(root, slug);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for item in list {
+            let name = item["name"].as_str().unwrap_or("").trim();
+            if name.is_empty() {
+                return Err("every entry in `commands` needs a name".into());
+            }
+            // `safe_file` lowercases nothing and keeps dots, so the file stem is
+            // sanitized explicitly: a name with a separator must never escape
+            // the commands folder.
+            let stem = crate::skills::safe_file(name, "command");
+            let content = match item["content"].as_str().map(str::trim) {
+                Some(text) if !text.is_empty() => text.to_string(),
+                // A call that only names the command (install of a repo that
+                // carries no body, `/plugin create commands:[{name: "x"}]`) keeps
+                // whatever body it already has, so a description-only edit never
+                // wipes the prompt.
+                _ => fs::read_to_string(dir.join(format!("{stem}.md")))
+                    .map(|previous| previous.trim().to_string())
+                    .unwrap_or_else(|_| command_template(name)),
+            };
+            fs::write(dir.join(format!("{stem}.md")), content.trim_end().to_string() + "\n")
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(list) = body["deleted_commands"].as_array() {
+        let dir = commands_dir(root, slug);
+        for item in list {
+            let Some(name) = item.as_str() else { continue };
+            let path = dir.join(format!("{}.md", crate::skills::safe_file(name, "command")));
+            if path.is_file() {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a bundle's sub-agent profiles.
+///
+/// Stored verbatim (frontmatter and body as the repo shipped them) so the file
+/// stays a real Claude Code profile, readable by `subagents::read_agents` here
+/// and by Claude Code itself.
+fn apply_agents(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
+    if let Some(list) = body[crate::subagents::AGENTS].as_array() {
+        if list.len() > crate::subagents::MAX_AGENTS {
+            return Err(format!(
+                "a plugin may hold at most {} sub-agents (got {})",
+                crate::subagents::MAX_AGENTS,
+                list.len()
+            ));
+        }
+        let dir = agents_dir(root, slug);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for item in list {
+            let name = item["name"].as_str().unwrap_or("").trim();
+            if name.is_empty() {
+                return Err("every entry in `agents` needs a name".into());
+            }
+            let stem = crate::skills::safe_file(name, "agent");
+            // A repo install hands the file over AS IT WAS (`content`); a call
+            // from chat hands the fields over instead, so the frontmatter is
+            // assembled here rather than making the model write YAML.
+            let text = match item["content"].as_str().map(str::trim) {
+                Some(raw) if !raw.is_empty() => raw.to_string(),
+                _ => {
+                    let prompt = item["prompt"].as_str().unwrap_or("").trim();
+                    if prompt.is_empty() {
+                        return Err(format!(
+                            "sub-agent \"{name}\" needs a `prompt` (or the raw `content` of its file)"
+                        ));
+                    }
+                    let description = item["description"].as_str().unwrap_or("").trim();
+                    let tools = item["tools"]
+                        .as_array()
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    let mut head = format!("---\nname: {name}\n");
+                    if !description.is_empty() {
+                        head.push_str(&format!("description: {description}\n"));
+                    }
+                    if !tools.is_empty() {
+                        head.push_str(&format!("tools: {tools}\n"));
+                    }
+                    head.push_str("---\n\n");
+                    head.push_str(prompt);
+                    head
+                }
+            };
+            fs::write(dir.join(format!("{stem}.md")), text.trim_end().to_string() + "\n")
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(list) = body["deleted_agents"].as_array() {
+        let dir = agents_dir(root, slug);
+        for item in list {
+            let Some(name) = item.as_str() else { continue };
+            let path = dir.join(format!("{}.md", crate::skills::safe_file(name, "agent")));
+            if path.is_file() {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a bundle's hook declarations.
+///
+/// The file is written as given, then VALIDATED through the same reader the
+/// agent loop uses: what cannot run as written is rejected at write time instead
+/// of becoming a hook that silently never fires. Execution stays off until the
+/// user turns `hooks_enabled` on — writing the file never implies approval.
+///
+/// Three shapes are accepted: the canonical `{"hooks": {...}}` document a repo
+/// ships, the bare event map a chat call writes, and the FLAT row list
+/// (`[{event, matcher, command}]`) the repo reader produces — that last one is
+/// what an install carries, and reading it as an object dropped every hook.
+fn apply_hooks(root: &Path, slug: &str, body: &Value) -> Result<(), String> {
+    let document = match &body["hooks"] {
+        Value::Object(doc) if doc.contains_key("hooks") => Value::Object(doc.clone()),
+        Value::Object(doc) => json!({ "hooks": Value::Object(doc.clone()) }),
+        Value::Array(rows) => hooks_document_from_rows(rows),
+        _ => return Ok(()),
+    };
+    let dir = crate::hooks::hooks_dir(&plugin_dir(root, slug));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join(crate::hooks::HOOKS_FILE);
+    let declared = crate::hooks::hooks_of_in(&document, &plugin_dir(root, slug));
+    if declared.is_empty() {
+        return Err(
+            "`hooks` carried no usable handler — every command was empty, left the plugin \
+             folder, or named an event Codifa does not know"
+                .into(),
+        );
+    }
+    write_hook_files(root, slug, &body["hook_files"])?;
+    fs::write(
+        &file,
+        serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Rebuild a hooks document out of the flat `{event, matcher, command}` rows.
+fn hooks_document_from_rows(rows: &[Value]) -> Value {
+    let mut events: serde_json::Map<String, Value> = serde_json::Map::new();
+    for row in rows {
+        let Some(event) = row["event"].as_str().map(str::trim).filter(|e| !e.is_empty()) else {
+            continue;
+        };
+        let Some(command) = row["command"].as_str().map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let matcher = row["matcher"].as_str().unwrap_or("").trim();
+        let mut entry = json!({ "hooks": [{"type": "command", "command": command}] });
+        if !matcher.is_empty() {
+            entry["matcher"] = json!(matcher);
+        }
+        events
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .map(|list| list.push(entry));
+    }
+    json!({ "hooks": Value::Object(events) })
+}
+
+/// Write the handler scripts a bundle's declarations point at.
+///
+/// Each entry is `{path, content}` with `path` relative to the bundle folder
+/// (`hooks-handlers/session-start.sh`), which is exactly how the declaration
+/// spells it after the `${CLAUDE_PLUGIN_ROOT}/` prefix. Anything absolute or
+/// escaping the folder is refused: this writes files FROM A REMOTE REPO, so the
+/// path is untrusted input, not a convenience.
+fn write_hook_files(root: &Path, slug: &str, list: &Value) -> Result<(), String> {
+    let Some(files) = list.as_array() else {
+        return Ok(());
+    };
+    let base = plugin_dir(root, slug);
+    for item in files {
+        let Some(rel) = item["path"].as_str().map(str::trim).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let path = Path::new(rel);
+        let safe = !path.is_absolute()
+            && path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !safe {
+            return Err(format!(
+                "hook file {rel:?} must be a relative path inside the plugin folder"
+            ));
+        }
+        let dest = base.join(path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(&dest, item["content"].as_str().unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        // A handler that is not executable fails to start, and the one thing a
+        // hook must never do is fail silently at runtime. Unix only: elsewhere
+        // the shell runs it by extension.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+        }
+    }
+    Ok(())
+}
+
+/// Starting point for a command created from chat: the documented argument
+/// placeholders, so a command that forgets them is the exception.
+fn command_template(name: &str) -> String {
+    format!(
+        "Run the `{name}` command.\n\n\
+         Arguments: $ARGUMENTS\n"
+    )
 }
 
 /// Enabled plugin folders, sorted by slug.
@@ -2703,6 +3208,163 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         tmp
+    }
+
+    /// A bundle made ONLY of commands and a sub-agent — the shape the reporter's
+    /// `claude-model-advisor` has, and the one that used to fail with "nothing to
+    /// install": no SKILL.md, no mcp.json, no scripts/.
+    #[test]
+    fn a_bundle_of_commands_and_agents_is_a_real_install() {
+        let root = temp_root("commands-only");
+        let created = create_plugin(
+            &root,
+            &json!({
+                "name": "Advisor",
+                "slug": "advisor",
+                "commands": [{
+                    "name": "model-check",
+                    "description": "Check the model routing",
+                    "content": "Check $1 with $ARGUMENTS"
+                }],
+                "agents": [{
+                    "name": "judge",
+                    "description": "Reviews a diff",
+                    "tools": ["read"],
+                    "prompt": "You review diffs."
+                }]
+            }),
+        )
+        .expect("a command/agent-only bundle must install");
+
+        // The parts are ON DISK, not just in the manifest.
+        let dir = plugin_dir(&root, "advisor");
+        assert!(dir.join(COMMANDS).join("model-check.md").is_file());
+        assert!(dir.join(crate::subagents::AGENTS).join("judge.md").is_file());
+        assert_eq!(created["commands"], json!(["model-check"]));
+        assert_eq!(created[crate::subagents::AGENTS], json!(["judge"]));
+
+        // ...and the agent-facing readers find them.
+        let cmds = enabled_plugin_commands(&root);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["name"], "model-check");
+        assert!(cmds[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("$ARGUMENTS"));
+        let agents = enabled_plugin_agents(&root);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["tools"], json!(["read"]));
+        assert!(find_plugin_agent(&root, "judge").is_some());
+
+        // Switching the bundle OFF takes both away: the switch is the control.
+        toggle_plugin(&root, &json!({"slug": "advisor", "enabled": false})).unwrap();
+        assert!(enabled_plugin_commands(&root).is_empty());
+        assert!(enabled_plugin_agents(&root).is_empty());
+        assert!(find_plugin_agent(&root, "judge").is_none());
+        // Settings still lists them (it must show what a switched-off bundle has).
+        assert_eq!(all_plugin_commands(&root).len(), 1);
+        assert_eq!(all_plugin_agents(&root).len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An install carries hooks as the FLAT row list the repo reader produces
+    /// (`[{event, matcher, command}]`), not the nested document a hand-written
+    /// `hooks.json` has. Reading only the object dropped every installed hook —
+    /// and the handler SCRIPT a declaration points at has to travel too, since a
+    /// real bundle keeps it in `hooks-handlers/` and spells it
+    /// `${CLAUDE_PLUGIN_ROOT}/…`.
+    #[test]
+    fn an_install_carries_hook_rows_and_their_handler_files() {
+        // A bundle on disk with the layout `Jaace/claude-model-advisor` ships.
+        let source = temp_root("hook-source");
+        let bundle = source.join("bundle");
+        fs::create_dir_all(bundle.join("hooks")).unwrap();
+        fs::create_dir_all(bundle.join("hooks-handlers")).unwrap();
+        fs::create_dir_all(bundle.join("commands")).unwrap();
+        fs::write(
+            bundle.join(MANIFEST),
+            json!({"name": "Advisor", "version": "1.0.1"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join(COMMANDS).join("model-check.md"),
+            "Reassess the session.\n",
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("hooks/hooks.json"),
+            json!({"hooks": {"SessionStart": [{"hooks": [{
+                "type": "command",
+                "command": "${CLAUDE_PLUGIN_ROOT}/hooks-handlers/start.sh",
+            }]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("hooks-handlers/start.sh"),
+            "#!/bin/sh\necho ready\n",
+        )
+        .unwrap();
+
+        let root = temp_root("hook-store");
+        let out = install_plugin(
+            &root,
+            &json!({"repo": bundle.to_string_lossy()}),
+        )
+        .expect("a commands+hooks bundle must install");
+
+        // The declaration landed as a declared hook, still inert.
+        assert_eq!(out["hooks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(out["hooks"][0]["event"], "SessionStart");
+        assert_eq!(out["plugin"][crate::hooks::ENABLED_KEY], json!(false));
+        assert!(out["summary"].as_str().unwrap().contains("1 hook"));
+        // ...and so did the script it points at, EXECUTABLE: a handler that
+        // cannot start is the one failure a hook must not have.
+        let handler = plugin_dir(&root, "advisor").join("hooks-handlers/start.sh");
+        assert!(handler.is_file(), "the handler script must be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&handler).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "the handler must be executable");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn hooks_land_off_until_the_user_approves_them() {
+        let root = temp_root("hooks-off");
+        let view = create_plugin(
+            &root,
+            &json!({
+                "name": "Guarded",
+                "slug": "guarded",
+                "hooks": {"PreToolUse": [{
+                    "matcher": "write",
+                    "hooks": [{"command": "./guard.sh"}]
+                }]}
+            }),
+        )
+        .expect("create");
+        // Declared, listed... and NOT runnable.
+        assert_eq!(view["hooks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(view[crate::hooks::ENABLED_KEY], json!(false));
+        assert!(active_hook_bundles(&root)
+            .iter()
+            .all(|(_, approved)| !*approved));
+
+        // The user's explicit approval is what flips it — and it survives a
+        // patch that does not mention it.
+        update_plugin(&root, &json!({"slug": "guarded", "hooks_enabled": true})).unwrap();
+        update_plugin(&root, &json!({"slug": "guarded", "description": "still guarded"}))
+            .unwrap();
+        let manifest = read_manifest(&root, "guarded").expect("manifest");
+        assert_eq!(manifest[crate::hooks::ENABLED_KEY], json!(true));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -44,6 +44,8 @@ mod secrets;
 mod shell_env;
 mod skills;
 mod skill_router;
+mod subagents;
+mod hooks;
 mod state;
 mod store;
 mod tools;

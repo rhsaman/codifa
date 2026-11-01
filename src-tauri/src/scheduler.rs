@@ -945,6 +945,10 @@ pub async fn execute_schedule(data_root: &Path, task: Value) {
         // Nor do they author skills/connectors: a schedule has no user turn
         // asking for it, so the authoring tools stay unbound.
         allow_create: false,
+        // A scheduled run's sub-agents are never narrowed by a plugin profile:
+        // the profile is chosen by an explicit delegation tool name, which only
+        // an interactive turn's model emits.
+        subagent_tools: Vec::new(),
         // Headless: there is nobody to ask, so no out-of-workspace grant can be
         // given. The workspace, the OS temp roots and `~/.codifa` stay open.
         allow_outside: false,

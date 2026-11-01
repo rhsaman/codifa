@@ -1036,6 +1036,19 @@ export interface PluginInfo {
   /** Names of the runnable scripts the folder holds. The assistant runs one
    *  during a turn through its `plugin` tool (`action: "run"`). */
   scripts?: string[]
+  /** Slash commands the folder ships. Each one is typed in the composer as
+   *  `/name args`, and its body receives the arguments where it writes
+   *  `$ARGUMENTS` / `$1`..`$9`. */
+  commands?: string[]
+  /** Sub-agent profiles the folder ships. Each is offered to the model as a
+   *  delegation tool, and they ALL run on the Explore row of Settings → Tools. */
+  agents?: string[]
+  /** Shell guards declared in `hooks/hooks.json`, as `Event: command` rows. */
+  hooks?: Array<{ event: string; matcher?: string; command: string; dispatched?: boolean }>
+  /** The user's approval to RUN this bundle's hooks. Off until they turn it on
+   *  — writing `hooks.json` is never approval — so a bundle can land with hooks
+   *  and stay inert. */
+  hooks_enabled?: boolean
   /** Persian phrases the WHOLE bundle answers to. A skill with none of its own
    *  inherits these (capped), so a bundle of bare skills is still findable from
    *  a Persian request. */
@@ -1060,6 +1073,12 @@ export interface PluginInstallResult {
   skills?: string[]
   mcp?: string[]
   scripts?: string[]
+  commands?: string[]
+  agents?: string[]
+  hooks?: Array<{ event: string; matcher?: string; command: string; dispatched?: boolean }>
+  /** One line naming what actually landed — a bundle carrying only commands
+   *  used to answer with three empty arrays, which reads like a failed install. */
+  summary?: string
   plugin?: PluginInfo
 }
 

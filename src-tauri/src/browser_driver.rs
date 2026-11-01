@@ -476,6 +476,15 @@ impl CdpConn {
         ] {
             let _ = self.call(method, json!({}));
         }
+        // Present the same Chrome identity as the panel's session (see
+        // `driver_hooks::identity`). Best effort: a failure keeps the default.
+        if let Some((ua, js)) = crate::browser::driver_hooks::identity() {
+            let _ = self.call("Emulation.setUserAgentOverride", ua);
+            let _ = self.call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": js}),
+            );
+        }
     }
 }
 
@@ -1225,7 +1234,17 @@ fn type_into(d: &mut Driver, node: Option<&str>, text: &str, clear: bool) -> Res
         );
     }
     let conn = &d.conn;
-    conn.call("Input.insertText", json!({"text": text}))?;
+    if crate::browser::is_short_plain_text(text) {
+        // Real keydown/keyup per character: a bare insertText fires neither,
+        // which login forms and bot checks treat as an automated client.
+        for ch in text.chars() {
+            for ev in crate::browser::char_key_events(ch) {
+                conn.call("Input.dispatchKeyEvent", ev)?;
+            }
+        }
+    } else {
+        conn.call("Input.insertText", json!({"text": text}))?;
+    }
     Ok(())
 }
 

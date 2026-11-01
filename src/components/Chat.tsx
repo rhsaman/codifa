@@ -116,7 +116,8 @@ import {
   type CompactUsage,
   type StreamParams,
 } from "../lib/api";
-import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills } from "../lib/plugins";
+import { installPlugin, listPlugins, deletePlugin, togglePlugin, listPluginSkills, listPluginCommands } from "../lib/plugins";
+import type { PluginCommandRow } from "../lib/plugins";
 import { fillKeywordsAfterInstall, fillKeywordsFromToolResult } from "../lib/keywordFill";
 import type { PluginInfo } from "../types";
 import { looksLikeRepoAddress } from "../lib/repoAddress";
@@ -1075,6 +1076,11 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const [pluginCmds, setPluginCmds] = useState<PluginCommand[]>(() =>
     pluginCommands(getAvailableSkills()),
   );
+  // The bundles' own SLASH COMMANDS (`commands/*.md`), seeded empty and fetched
+  // with the bundle list. A command is a first-level `/name` of its own: unlike
+  // a bundle's skills it is not a sub-level, because the whole point of a
+  // command is that the user types it directly.
+  const [bundleCmds, setBundleCmds] = useState<PluginCommandRow[]>([]);
   // Prompt history popup (ArrowUp): previous prompts + up to 3 pinned
   // commands. History/pins persist in localStorage (see src/lib/slash).
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -1213,8 +1219,14 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         hint: p.skills.length === 1 ? '1 skill' : `${p.skills.length} skills`,
         plugin: p,
       })),
+      // A bundle's own commands come LAST: a bundle must never shadow a
+      // built-in, and the dispatcher checks the built-ins by name anyway.
+      ...bundleCmds.map((c) => ({
+        name: c.name,
+        hint: (c.description || '').trim() || 'plugin command',
+      })),
     ],
-    [pluginCmds],
+    [pluginCmds, bundleCmds],
   );
 
   /** One selectable row of the palette, whatever level it belongs to. */
@@ -6436,6 +6448,15 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
           `Plugin **${out.plugin?.name ?? out.slug}** ${out.installed}.\n` +
             `Skills: ${(out.skills ?? []).join(", ") || "none"}\n` +
             `Connectors: ${(out.mcp ?? []).join(", ") || "none"}\n` +
+            `Commands: ${(out.commands ?? []).join(", ") || "none"}\n` +
+            `Sub-agents: ${(out.agents ?? []).join(", ") || "none"}\n` +
+            // Hooks are the one part that lands INERT: saying so here is what
+            // stops a user from thinking a bundle's guards are already running.
+            `Hooks: ${
+              (out.hooks ?? []).length
+                ? `${(out.hooks ?? []).length} (OFF until you approve them in Settings → Plugins)`
+                : "none"
+            }\n` +
             `Scripts: ${(out.scripts ?? []).join(", ") || "none"}` +
             (fill.filled > 0
               ? `\nPersian keywords filled for ${fill.filled} skill(s).`
@@ -7082,13 +7103,24 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         break;
       }
       default: {
+        // A bundle's own COMMAND (`commands/*.md`). The body, with $ARGUMENTS
+        // already substituted, is what the backend sends as the turn's prompt —
+        // so the raw line is forwarded untouched and the transcript keeps the
+        // spelling the user typed (which is also what Retry re-sends).
+        const declared = bundleCmds.find((c) => `/${c.name}`.toLowerCase() === word);
+        if (declared) {
+          if (!ch) break;
+          const created = s.addMessage(ch.id, { role: "user", content: v, mode: ch.mode });
+          void send(v, [], [], false, created.id);
+          break;
+        }
         // Naming a plugin loads the BUNDLE. The user installs, switches and
         // deletes a plugin as one unit, so asking them to spell a second word
         // for one of its skills — and leaving the rest behind — defeated the
         // point of bundling it. Every skill it holds is attached, and its MCP
         // connectors come with their schemas. `/<plugin> <skill>` stays
         // supported as an explicit narrowing for a bundle that holds several.
-        const plug = pluginCmds.find((c) => `/${c.name}` === word);
+        const plug = pluginCmds.find((c) => `/${c.name}`.toLowerCase() === word);
         if (plug && ch) {
           // A plugin turn is a pipeline that WRITES (its scripts patch files and
           // its skills answer with edits), and the turn's capabilities come from
@@ -9490,6 +9522,8 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
   const refreshPluginCmds = useCallback(async () => {
     const rows = await refreshAvailableSkills();
     setPluginCmds(pluginCommands(rows));
+    const cmds = await listPluginCommands();
+    setBundleCmds(Array.isArray(cmds) ? cmds.filter((c) => c.plugin_enabled !== false) : []);
   }, []);
 
   useEffect(() => {

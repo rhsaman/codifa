@@ -8551,15 +8551,77 @@ fn looks_like_pattern(t: &str) -> bool {
         || body.chars().any(|c| matches!(c, '^' | '$' | '+' | '?' | '|' | '(' | ')'))
 }
 
+/// Split `cmd` on `delims` at TOP LEVEL only: a delimiter inside single or
+/// double quotes belongs to the argument, not to the command line.
+///
+/// MEASURED on a live turn: `awk 'NR>=1 { ... } END { print NR }'` was shredded
+/// on the `;` INSIDE its quoted program, one fragment became a bare `~` (awk's
+/// match operator), and the access gate read that as the home directory — so it
+/// asked the user for permission on `/Users/<user>`, the PARENT of the very
+/// workspace the agent was already working in.
+fn split_unquoted(cmd: &str, delims: &[char]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in cmd.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        // Inside single quotes a backslash is literal, matching shell rules.
+        if ch == '\\' && quote != Some('\'') {
+            cur.push(ch);
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(q) if ch == q => {
+                quote = None;
+                cur.push(ch);
+            }
+            Some(_) => cur.push(ch),
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    cur.push(ch);
+                } else if delims.contains(&ch) {
+                    out.push(std::mem::take(&mut cur));
+                } else {
+                    cur.push(ch);
+                }
+            }
+        }
+    }
+    out.push(cur);
+    out
+}
+
 fn shell_targets(cmd: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for st in cmd.split([';', '&', '|', '\n']) {
-        for w in st.split_whitespace() {
+    for st in split_unquoted(cmd, &[';', '&', '|', '\n']) {
+        for w in split_unquoted(&st, &[' ', '\t']) {
             if w.starts_with('-') {
                 continue;
             }
             let t = w.trim_matches(['"', '\'', '(', ')', '`']);
             if t.is_empty() || t.contains('=') {
+                continue;
+            }
+            // A word that still holds whitespace was a QUOTED argument. It is a
+            // path only when it spells an absolute or home path outright
+            // (`"/Users/me/my file.txt"`) — that must stay gated, since a
+            // quoted target is still a target. A program or a sed script
+            // (`awk '… ; …'`, `sed 's/a b/c/'`) is an instruction the command
+            // interprets, never a filename.
+            if t.chars().any(char::is_whitespace) && !(t.starts_with('/') || t.starts_with("~/")) {
+                continue;
+            }
+            // A bare `~` is never a home reference — home is written `~/…`.
+            // awk and sed use `~` as an operator, and reading it as $HOME sent
+            // the gate to the workspace's parent directory.
+            if t == "~" {
                 continue;
             }
             let pathy = t.starts_with('/') || t.starts_with('~') || t.contains('/');
@@ -8835,10 +8897,28 @@ fn is_shell_assignment(w: &str) -> bool {
         && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '=')
 }
 
+/// The user's home folder, for `~` expansion.
+///
+/// `$HOME` is a Unix convention: on Windows it is usually UNSET (the variable
+/// there is `USERPROFILE`), so reading it directly made every `~/…` expand to a
+/// leading-slash path that exists on no machine. `dirs::home_dir()` answers the
+/// same question portably, and `$HOME` stays the first choice because a shell
+/// command's `~` follows the variable it would actually see.
+fn home_dir_str() -> String {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Resolve a `cd` argument against the running base, `~`-aware.
 fn cd_base(base: &str, d: &str) -> String {
     let d = d.trim_matches(['"', '\'']);
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_str();
     if d.starts_with('/') {
         d.to_string()
     } else if d == "~" {
@@ -8862,7 +8942,7 @@ fn resolve_scope(base: &str, t: &str) -> String {
     if t.is_empty() || t.starts_with('$') || t.starts_with('{') || t.starts_with('%') {
         return String::new();
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_str();
     if t.starts_with('/') {
         t.to_string()
     } else if t == "~" {
@@ -9051,12 +9131,16 @@ fn always_allowed_target(abs: &str) -> bool {
             return true;
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default().to_lowercase();
+    let home = home_dir_str().to_lowercase();
     let a = if let Some(rest) = a.strip_prefix("~/") {
         format!("{home}/{rest}")
     } else {
         a
     };
+    // A bare `~` (no trailing separator) is the home folder itself.
+    if a == "~" && !home.is_empty() {
+        return true;
+    }
     if let Ok(tmp) = std::env::temp_dir().canonicalize() {
         let t = tmp.to_string_lossy().to_lowercase();
         if !t.is_empty() && (a == t || a.starts_with(&format!("{t}/"))) {
@@ -12086,15 +12170,16 @@ mod tests {
         // the old gate resolved it RELATIVELY into "<ws>/$B", a path that only
         // exists inside the gate, and billed 6+ false dump refusals while the
         // model retried the same probe.
+        let home = home_dir_str();
         for c in [
-            "B=/Users/saman/Documents/code/codifa/src-tauri/target/release/codifa; strings \"$B\" | grep -c \"sent no response headers\"",
-            "NEW=$(ls -t \"$HOME/Library/Application Support/com.codifa.app/terminal-logs/\"*.log | head -1); tail -c 600 \"$NEW\"",
+            format!("B={home}/Documents/code/codifa/src-tauri/target/release/codifa; strings \"$B\" | grep -c \"sent no response headers\""),
+            "NEW=$(ls -t \"$HOME/Library/Application Support/com.codifa.app/terminal-logs/\"*.log | head -1); tail -c 600 \"$NEW\"".to_string(),
             // `[1] strings(...)`: the app's own data root — same trusted class
             // as ~/.codifa — stays a terminal read, not a workspace dump.
-            "grep -rn \"schedule\" \"$HOME/Library/Application Support/com.codifa.app/\" 2>/dev/null | tail -20",
+            "grep -rn \"schedule\" \"$HOME/Library/Application Support/com.codifa.app/\" 2>/dev/null | tail -20".to_string(),
         ] {
             assert!(
-                !workspace_file_read(c, root),
+                !workspace_file_read(&c, root),
                 "{c:?} must stay a legal terminal read"
             );
         }
@@ -12215,7 +12300,10 @@ mod tests {
         // quote-blind split read both as scopes and refused a grep that lives
         // entirely outside the workspace (mvqksnvw run59, billed one round).
         assert!(!is_file_search_command(
-            "grep -n \"fn build_article_prompt\\|fn article_prompt\\|build_prompt\" -A 40 /Users/saman/.codifa/plugins/healer-article/scripts/generate-article/main.rs",
+            &format!(
+                "grep -n \"fn build_article_prompt\\|fn article_prompt\\|build_prompt\" -A 40 {}/.codifa/plugins/healer-article/scripts/generate-article/main.rs",
+                home_dir_str()
+            ),
             root
         ));
         // A redirect must not blind the gate either way: `rg foo src/ >
@@ -12282,7 +12370,10 @@ mod tests {
         // area — and billed run59 a whole round. A write redirect, by
         // contrast, is the mutation gate's business: `> f` is not a dump.
         assert!(!workspace_file_read(
-            "cat /Users/saman/.codifa/plugins/healer-article/models.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -60",
+            &format!(
+                "cat {}/.codifa/plugins/healer-article/models.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -60",
+                home_dir_str()
+            ),
             root
         ));
         assert!(!workspace_file_read(
@@ -12295,7 +12386,10 @@ mod tests {
         ));
         // A workspace dump right beside the shims is still refused.
         assert!(workspace_file_read(
-            "cat /Users/saman/.codifa/x 2>/dev/null; cat src/main.rs",
+            &format!(
+                "cat {}/.codifa/x 2>/dev/null; cat src/main.rs",
+                home_dir_str()
+            ),
             root
         ));
     }
@@ -12410,6 +12504,65 @@ mod tests {
                 "{real:?} is a real path and must stay in the target set"
             );
         }
+    }
+
+    #[test]
+    fn the_three_free_roots_never_ask_for_permission() {
+        // The user's rule: the workspace, the OS temp folder and ~/.codifa are
+        // already trusted — a call that stays inside them must run with no popup.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let tmp = std::env::temp_dir();
+        let probes: Vec<String> = vec![
+            "src/main.rs".to_string(),
+            "src".to_string(),
+            format!("{}/t.rs", tmp.display()),
+            "/tmp/codifa-live.log".to_string(),
+            // `~` expands via `absolute_target`, so this reaches the real store.
+            "~/.codifa/skills".to_string(),
+        ];
+        for p in probes {
+            assert!(
+                matches!(
+                    crate::tools::path_access(root, &p, None),
+                    crate::tools::PathAccess::Free
+                ),
+                "{p} is inside a free root and must never prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_targets_never_reads_a_quoted_program_as_a_path() {
+        // MEASURED on a live turn: this exact shape was refused with "The user
+        // DENIED access to /Users/<user>" — the workspace's PARENT, a folder the
+        // agent was already working inside. The `;` inside the quoted awk
+        // program split the command line, one fragment collapsed to a bare `~`
+        // (awk's match operator), and the access gate read that as $HOME.
+        let cmd = r#"cd /Users/me/proj/src && awk 'NR>=11163 { if (guard) {print start": "name}; start=NR; name=$0; guard=0 } END {print NR": END"}' src/agent.rs | sed 's/^ *//' | head -200"#;
+        let targets = shell_targets(cmd);
+        assert!(
+            !targets.iter().any(|t| t == "~"),
+            "a bare `~` is an operator, never home: {targets:?}"
+        );
+        // The real paths the same command names must survive.
+        assert!(
+            targets.iter().any(|t| t == "/Users/me/proj/src"),
+            "the `cd` target is a real path: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn shell_targets_keeps_a_quoted_path_that_is_really_a_path() {
+        // The cure must not un-gate a quoted target: a path with a space is
+        // still a path, and writing there still needs permission.
+        let targets = shell_targets(r#"cp a.txt "/Users/other/my file.txt""#);
+        assert!(
+            targets.iter().any(|t| t == "/Users/other/my file.txt"),
+            "a quoted absolute path stays in the target set: {targets:?}"
+        );
+        // Home-relative survives too, so the gate still sees `~/.zshrc`.
+        let home = shell_targets("cat ~/.zshrc");
+        assert!(home.iter().any(|t| t == "~/.zshrc"), "{home:?}");
     }
 
     #[test]

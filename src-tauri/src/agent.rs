@@ -984,14 +984,15 @@ fn main_wrapup_message(
 /// and can be joined against the `llm` rows before and after it.
 ///
 /// `calls_left` is the number of model calls remaining INCLUDING the one about
-/// to be made, which is exactly what decides the payoff.
+/// to be made, which is exactly what decides the payoff. `None` means the role
+/// has no step cap, so no payoff horizon exists to report.
 #[allow(clippy::too_many_arguments)]
 fn record_fold(
     trace: &crate::trace::TraceStore,
     role: &str,
     step: usize,
     call_no: usize,
-    calls_left: usize,
+    calls_left: Option<usize>,
     before_tokens: usize,
     removed_chars: usize,
     folded: usize,
@@ -1001,10 +1002,18 @@ fn record_fold(
     if folded == 0 {
         return;
     }
+    // `None` means the role has no step cap (the main agent runs to completion),
+    // so there is no "calls left" to report. Storing the raw `usize::MAX - step`
+    // sentinel printed `18446744073709551602 call(s) left` in the trace, which
+    // read like an underflow bug and hid the real fold numbers behind it.
     trace.record(crate::trace::TraceEntry {
         kind: "fold".into(),
         summary: format!(
-            "{role} fold: {folded} result(s), {removed_chars} chars out, {calls_left} call(s) left"
+            "{role} fold: {folded} result(s), {removed_chars} chars out, {} left",
+            match calls_left {
+                Some(n) => format!("{n} call(s)"),
+                None => "unbounded calls".to_string(),
+            }
         ),
         detail: Some(serde_json::json!({
             "role": role,
@@ -5034,7 +5043,7 @@ already approved with \"Always allow\".",
                     "main",
                     step,
                     step + 1,
-                    max_steps - step,
+                    (max_steps != usize::MAX).then(|| max_steps - step),
                     before,
                     removed,
                     folded,
@@ -5077,7 +5086,7 @@ already approved with \"Always allow\".",
             let probe_tokens = probe_chars.div_ceil(4);
             if folded > 0 && probe_tokens >= MAIN_FOLD_MIN_REMOVAL {
                 let (removed, folded) = fold_subagent_tool_results(&mut messages, &mut seen_lookups);
-                record_fold(&trace, "explore", step, step + 1, max_steps - step, before, removed, folded);
+                record_fold(&trace, "explore", step, step + 1, (max_steps != usize::MAX).then(|| max_steps - step), before, removed, folded);
             }
         }
 
@@ -11059,8 +11068,12 @@ on real traces, an early step re-sends the whole conversation for ~7.7K \
 uncached tokens, but by round 20 that same step costs ~79K, while ONE `explore` \
 delegation runs on its own SHORT context (~16K per round) and never pays your \
 history. So the longer the turn, the cheaper the delegation:\n\
-TOOL ORDER for finding anything (follow it TOP-DOWN — every step down costs \
-extra round-trips, so never start lower than the question forces):\n\
+TOOL ORDER for finding anything — the NUMBERS rank which tool is cheapest to \
+START with; they do NOT sequence your steps. One step may fan out across ALL of \
+them at once: a `where is X used` question is ONE step carrying glob (find the \
+files), grep (the raw token), find_symbol/lsp_references (the symbol) and read \
+(the windows you already know) TOGETHER — read-only lookups run CONCURRENTLY, so \
+the whole set costs ONE round-trip instead of four:\n\
   1. Files you can NAME (yours, the user's, a report, an earlier result): `read` \
 them — ranges=[{{\"path\":\"a.rs\",\"offset\":1,\"limit\":80}},{{\"path\":\"b.ts\"}},…] \
 reads every named file AND window in ONE call. Never delegate what one read answers.\n\

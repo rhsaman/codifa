@@ -3179,6 +3179,24 @@ into one union — those lines are all above; do NOT re-read them]"
                 let p = s("path");
                 if p.is_empty() { s("filePath") } else { p }
             };
+            // A batch may name its file ONLY per entry (`edits: [{path, …}]`, the
+            // shape the schema advertises). The top-level `path` is then absent,
+            // so resolving it landed on the workspace ROOT and the edit died with
+            // "cannot read <root> for editing: Is a directory (os error 21)" — a
+            // message that named no file at all. Correcting it therefore needed a
+            // reinterpretation of the request rather than a retry, and it cost a
+            // whole round.
+            let path = if path.is_empty() {
+                args["edits"]
+                    .as_array()
+                    .and_then(|edits| edits.first())
+                    .and_then(|first| first["path"].as_str())
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or(path)
+            } else {
+                path
+            };
             // A batch may name a DIFFERENT file per entry (`edits: [{path, …}]`,
             // the shape the schema advertises). The single-file body below
             // presumes one target, so a multi-file batch is applied here, one
@@ -5446,6 +5464,38 @@ token mid 3
         });
         let err = dispatch(root, "edit_file", &args, None).unwrap_err();
         assert!(err.contains("no edit applied"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A batch that names its file ONLY per entry must reach that file.
+    ///
+    /// The schema advertises `edits: [{path, old_string, new_string}]` with no
+    /// top-level `path`, so a batch of same-file entries resolved the EMPTY
+    /// path to the workspace ROOT and died with
+    /// `cannot read <root> for editing: Is a directory (os error 21)` — a
+    /// message naming no file, so recovering from it meant re-reading the whole
+    /// request rather than fixing one argument. Reproduced on the live corpus
+    /// (`agent/mod.rs`), where the model had obeyed the documented shape.
+    #[test]
+    fn a_batch_that_names_its_file_only_per_entry_reaches_that_file() {
+        let tmp = std::env::temp_dir().join("codifa-edit-per-entry-path");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("f.txt");
+        fs::write(&file, "alpha\nbeta\n").unwrap();
+        let root = tmp.to_str().unwrap();
+
+        // No top-level `path` at all: exactly the advertised batch shape.
+        let args = json!({
+            "edits": [
+                { "path": "f.txt", "old_string": "alpha", "new_string": "ALPHA" },
+                { "path": "f.txt", "old_string": "beta", "new_string": "BETA" }
+            ]
+        });
+        let msg = dispatch(root, "edit_file", &args, None).unwrap();
+        assert!(msg.contains("Successfully edited f.txt"), "{msg}");
+        let after = fs::read_to_string(&file).unwrap();
+        assert_eq!(after, "ALPHA\nBETA\n");
         fs::remove_dir_all(&tmp).ok();
     }
 

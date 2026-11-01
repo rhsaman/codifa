@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ensureSidecar } from "../lib/api";
+import { ensureSidecar, noteSidecarFailure } from "../lib/api";
 import { browserFitKey, clearBrowserFit, loadBrowserFit, saveBrowserFit } from "../lib/browserPanelMemory";
 import {
   DEFAULT_VIEWPORT_SIZE,
@@ -44,8 +44,11 @@ export function backendError(body: unknown): string | null {
  *  a DevTools-like Dimensions bar (Responsive dropdown, numeric W/H inputs
  *  plus a horizontal width slider), and a keyboard-focusable stage that
  *  forwards typing straight to the page — so the panel never shows a second
- *  input box. The virtual cursor is always live on hover, like a real
- *  Chrome window; the user's real mouse and keyboard are never touched. */
+ *  input box. Input is paced, not flooded: keystrokes go out as short text
+ *  runs, hover/wheel collapse to their latest value, and everything keyboard
+ *  or click shaped runs on one ordered chain. The virtual cursor is always
+ *  live on hover, like a real Chrome window; the user's real mouse and
+ *  keyboard are never touched. */
 export function BrowserPanel({
   chatId = "",
   initialUrl = "",
@@ -92,11 +95,28 @@ export function BrowserPanel({
   // Virtual cursor overlay position (percent of the rendered frame).
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const lastMoveAt = useRef(0);
-  const lastHoverShotAt = useRef(0);
   // Interval that follows a running automation-browser install (startInstall).
   const installTimer = useRef<number | null>(null);
-  // Debounced frame refresh after bursts of forwarded keystrokes.
-  const keyShotTimer = useRef<number | null>(null);
+  // ── Input pacing ──────────────────────────────────────────────────────────
+  // The panel used to fire one request per keystroke / hover move / wheel
+  // tick, each blocking its own backend round trip. Under load those queued
+  // up faster than they drained and EVERY interaction (typing, the virtual
+  // cursor, even the fit button) lagged seconds to minutes behind. Three
+  // cheap mechanisms keep the request rate bounded:
+  //   • one serialized chain for keyboard/click input (order is preserved,
+  //     at most one request in flight);
+  //   • keystroke runs coalesce: characters arriving while one type request
+  //     is in flight ride the next one instead of piling up;
+  //   • hover/wheel coalesce to the LATEST value while one is in flight.
+  // Frame feedback needs no pacing of its own: frames are PUSHED by the
+  // backend's screencast and rendered by the long-poll loop below.
+  const inputChain = useRef<Promise<void>>(Promise.resolve());
+  const typeBuf = useRef<string>("");
+  const typePumping = useRef(false);
+  const moveBusy = useRef(false);
+  const pendingMove = useRef<{ x: number; y: number } | null>(null);
+  const wheelBusy = useRef(false);
+  const wheelPending = useRef(0);
   // Manual Chrome-style dimensions: numeric width/height inputs plus a
   // graduated width ruler (no device names). draftW/draftH are the raw
   // input strings so typing never fights the applied size.
@@ -184,10 +204,18 @@ export function BrowserPanel({
         }
       }
     }
-    const res = await fetch(url, {
-      headers: { "Content-Type": "application/json" },
-      ...bodyInit,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...bodyInit,
+      });
+    } catch (err) {
+      // A NETWORK failure may mean the cached sidecar died: force the next
+      // ensureSidecar to re-probe /health instead of trusting its 2s TTL.
+      noteSidecarFailure();
+      throw err;
+    }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok) throw new Error(String(body.detail || `request failed (${res.status})`));
     const bizErr = strict ? backendError(body) : null;
@@ -237,37 +265,85 @@ export function BrowserPanel({
     }
   }
 
+  /** One FORCED capture, used only when the backend reports that screencast
+   *  push is unavailable for this tab (an older build): the panel then degrades
+   *  to ~1 capture/s instead of the pushed-frame loop. */
   async function refreshShot(): Promise<void> {
     try {
       const shot = await sidecarFetch("/browser/screenshot", undefined, false);
-      if (typeof shot.image === "string" && shot.image) {
-        // Only hand React a NEW string when the frame really changed. The poll
-        // runs every 1.2s and a fresh (identical) base64 string used to be set
-        // unconditionally, forcing a re-render, an `img.src` swap and a full
-        // re-decode/composite of a large JPEG on every tick — a permanent CPU
-        // tax in the WebView and WindowServer while the app sat idle.
-        if (shot.image !== imageRef.current) setImage(shot.image);
-        if (typeof shot.width === "number") {
-          const prev = sizeRef.current;
-          if (shot.width !== prev.w || shot.height !== prev.h) {
-            // Do NOT touch capWRef here: the cap is the user's MANUAL width.
-            // Overwriting it with the polled (possibly fit-shrunk) size made
-            // the pane unable to grow back — after one narrow fit the cap stuck
-            // at the small width, so widening the panel never re-fitted.
-            setViewport({ w: shot.width, h: shot.height });
-            if (shouldSyncViewportDrafts(prev.w, prev.h, shot.width, shot.height, isEditingDims())) {
-              syncDrafts(shot.width, shot.height);
-            }
-          }
-        }
-        setError("");
-      }
+      applyFrame(shot);
     } catch (err) {
       // Polling failures stay silent while a frame is already showing;
       // only surface them when there is nothing to display yet.
       if (!imageRef.current) setError(err instanceof Error ? err.message : String(err));
     }
   }
+
+  /** Apply one frame payload (pushed or captured): the image plus its size,
+   *  synced into the viewport state and the W/H drafts the same way a poll
+   *  used to. A repeat image is dropped before it can force a re-render and a
+   *  full re-decode of a large JPEG. */
+  function applyFrame(shot: Record<string, unknown>): void {
+    if (typeof shot.image === "string" && shot.image) {
+      if (shot.image !== imageRef.current) setImage(shot.image);
+      if (typeof shot.width === "number" && typeof shot.height === "number") {
+        const prev = sizeRef.current;
+        if (shot.width !== prev.w || shot.height !== prev.h) {
+          setViewport({ w: shot.width, h: shot.height });
+          if (shouldSyncViewportDrafts(prev.w, prev.h, shot.width, shot.height, isEditingDims())) {
+            syncDrafts(shot.width, shot.height);
+          }
+        }
+      }
+      setError("");
+    }
+  }
+
+  // Pushed-frame loop. The backend runs Page.startScreencast on the tab and
+  // caches the latest frame; /browser/frame long-polls and answers the moment
+  // the page repaints — so a keystroke, a click or a hover state shows up in
+  // roughly one compositor tick, with NO capture round trip in the path.
+  // Idle pages push nothing and the request just parks, so the cost is zero.
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    let seq = 0;
+    const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+    (async () => {
+      while (!cancelled) {
+        if (typeof document !== "undefined" && document.hidden) {
+          await sleep(600);
+          continue;
+        }
+        try {
+          const res = await sidecarFetch(`/browser/frame?after=${seq}`, undefined, false);
+          if (res.ok === false) {
+            // Session down (or no tab yet): pause; the status poll flips
+            // `active` and restarts this loop when it is back.
+            await sleep(700);
+            continue;
+          }
+          if (res.pushed === false) {
+            // This tab never pushed a frame (older backend): degrade to the
+            // capture poll instead of waiting on a push that never comes.
+            await refreshShot();
+            await sleep(1000);
+            continue;
+          }
+          if (typeof res.seq === "number" && res.seq > seq) {
+            seq = res.seq;
+            applyFrame(res);
+          }
+        } catch {
+          await sleep(800);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
 
   // Ensure the shared session exists on mount (idempotent: a running
   // session is left untouched), then poll frames roughly once a second.
@@ -301,36 +377,26 @@ export function BrowserPanel({
             // A dead session reports as inactive below on the next poll.
           });
         }
-        if (!cancelled) await refreshShot();
       }
       if (!cancelled) setLoading(false);
     })();
+    // Status poll only: the URL, viewport and session state. FRAMES arrive
+    // through the pushed-frame loop below — this interval never captures.
     timer.current = setInterval(() => {
-      // A hidden window (or a background tab whose pane is not showing) cannot
-      // display a frame, so capturing one is pure waste: it cost a CDP
-      // round-trip, a JPEG encode and a React render every 1.2s for as long as
-      // the app was open. Poll at the same rate, but do nothing at all while
-      // the document is hidden — the next visible tick resumes.
       if (typeof document !== "undefined" && document.hidden) return;
-      void refreshStatus().then((isActive) => {
-        if (isActive) void refreshShot();
-      });
+      void refreshStatus();
     }, 1200);
-    // Coming back to the window must not wait for the next tick to show the
-    // current page, and must never show a stale frame in the meantime.
+    // Coming back to the window must not wait for the next tick to sync the
+    // omnibox/session state; frames resume via their own loop.
     const onVisible = (): void => {
       if (document.hidden) return;
-      void refreshStatus().then((isActive) => {
-        if (isActive) void refreshShot();
-      });
+      void refreshStatus();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       if (timer.current) clearInterval(timer.current);
       timer.current = null;
       document.removeEventListener("visibilitychange", onVisible);
-      if (keyShotTimer.current) window.clearTimeout(keyShotTimer.current);
-      keyShotTimer.current = null;
       if (installTimer.current) window.clearInterval(installTimer.current);
       installTimer.current = null;
       if (rulerTimerRef.current) window.clearTimeout(rulerTimerRef.current);
@@ -389,7 +455,6 @@ export function BrowserPanel({
         if (typeof res.url === "string" && res.url) setAddress(res.url);
       }
       await refreshStatus();
-      await refreshShot();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Session died while the tab still said "active" — drop the flag so the
@@ -412,7 +477,6 @@ export function BrowserPanel({
         body: JSON.stringify({ action }),
       });
       await refreshStatus();
-      await refreshShot();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Session died while the tab stayed "active" — drop the flag so the
@@ -435,44 +499,95 @@ export function BrowserPanel({
   }
 
   // Map a click on the scaled image back to viewport pixels.
-  async function clickAt(e: React.MouseEvent<HTMLImageElement>): Promise<void> {
+  function clickAt(e: React.MouseEvent<HTMLImageElement>): void {
     if (!active) return;
     const rect = e.currentTarget.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     const x = Math.round(((e.clientX - rect.left) / rect.width) * viewport.w);
     const y = Math.round(((e.clientY - rect.top) / rect.height) * viewport.h);
     setCursor(hostPct(e.currentTarget, e.clientX, e.clientY));
-    try {
-      await sidecarFetch("/browser/click", {
-        method: "POST",
-        body: JSON.stringify({ x, y }),
-      });
-      window.setTimeout(() => void refreshShot(), 350);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    // Serialized behind earlier input: a click can never overtake (or be
+    // overtaken by) a pending keystroke run. Any characters still sitting in
+    // the type buffer flush FIRST — text typed just before the click belongs
+    // in the focused field, not in whatever the click focuses next.
+    enqueueInput(async () => {
+      try {
+        await drainType();
+        await sidecarFetch("/browser/click", {
+          method: "POST",
+          body: JSON.stringify({ x, y }),
+        });
+        // The click's effect shows up as a pushed frame the moment the page
+        // repaints — nothing to fetch here.
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    });
   }
 
   async function pressKey(key: string): Promise<void> {
     if (!active) return;
-    try {
-      await sidecarFetch("/browser/key", {
-        method: "POST",
-        body: JSON.stringify({ key }),
-      });
-      window.setTimeout(() => void refreshShot(), 350);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    await sidecarFetch("/browser/key", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    });
   }
 
-  // Debounced refresh: keystrokes arrive faster than frames should.
-  function scheduleKeyShot(): void {
-    if (keyShotTimer.current) return;
-    keyShotTimer.current = window.setTimeout(() => {
-      keyShotTimer.current = null;
-      void refreshShot();
-    }, 300);
+  /** Queue one input step so keyboard + click actions run strictly in order,
+   *  one request in flight at a time — a flood of events can no longer pile
+   *  up as parallel requests behind each other. */
+  function enqueueInput(step: () => Promise<void>): void {
+    inputChain.current = inputChain.current.then(step).catch(() => {
+      // One failed step must not poison the chain for the next keystroke.
+    });
+  }
+
+  /** Send whatever characters are buffered NOW, inside the current chain step
+   *  — named keys and clicks flush pending text ahead of themselves. */
+  function drainType(): Promise<void> {
+    const text = typeBuf.current;
+    typeBuf.current = "";
+    if (!text) return Promise.resolve();
+    return sidecarFetch("/browser/type", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    }).catch(() => {
+      // Keystroke forwarding is best-effort; transient failures are ignored.
+    });
+  }
+
+  /** Queue a printable character. The run goes out as ONE type request; while
+   *  that request is queued or in flight, further characters accumulate and
+   *  are carried by the next drain — so a fast typist batches automatically
+   *  and a slow one sees each character leave immediately. */
+  function queueChar(ch: string): void {
+    typeBuf.current += ch;
+    pumpType();
+  }
+
+  function pumpType(): void {
+    if (typePumping.current) return;
+    const text = typeBuf.current;
+    if (!text) return;
+    typeBuf.current = "";
+    typePumping.current = true;
+    enqueueInput(async () => {
+      try {
+        await sidecarFetch("/browser/type", {
+          method: "POST",
+          body: JSON.stringify({ text }),
+        });
+      } catch (err) {
+        // A failed type request used to vanish: the characters were lost and a
+        // typed password silently came out shorter. Say so in the status bar.
+        setError(
+          "Some typed characters were not delivered: " +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+      typePumping.current = false;
+      if (typeBuf.current) pumpType();
+    });
   }
 
   /** Forward typing to the virtual page while the stage has focus — this is
@@ -485,40 +600,99 @@ export function BrowserPanel({
       "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
       "Home", "End", "PageUp", "PageDown",
     ];
-    const plain = k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+    // Option (macOS) / AltGr (Windows = Ctrl+Alt) COMPOSE printable symbols such
+    // as @ # { } on many layouts: `e.key` already holds the composed character, so
+    // excluding `altKey` silently dropped it from typed passwords. Only real
+    // shortcuts (Cmd, or Ctrl without Alt) stay out.
+    const plain = k.length === 1 && !e.metaKey && (!e.ctrlKey || e.altKey);
     if (plain) {
       e.preventDefault();
-      void sidecarFetch("/browser/type", {
-        method: "POST",
-        body: JSON.stringify({ text: k }),
-      })
-        .then(scheduleKeyShot)
-        .catch(() => {
-          // Keystroke forwarding is best-effort; transient failures are ignored.
-        });
+      queueChar(k);
     } else if (named.includes(k)) {
       e.preventDefault();
-      void pressKey(k);
+      // Any pending characters go first, then the named key — order matters
+      // (Enter must see everything typed before it).
+      enqueueInput(async () => {
+        await drainType();
+        try {
+          await pressKey(k);
+        } catch {
+          // best-effort; transient failures are ignored
+        }
+      });
     }
   }
 
-  async function wheel(e: React.WheelEvent): Promise<void> {
+  /** Cmd/Ctrl+V on the stage: send the clipboard text to the page. Shortcuts are
+   *  not forwarded as keys, so a pasted password used to do nothing at all. */
+  function stagePaste(e: React.ClipboardEvent<HTMLDivElement>): void {
     if (!active) return;
-    try {
-      await sidecarFetch("/browser/scroll", {
-        method: "POST",
-        body: JSON.stringify({ dx: 0, dy: Math.round(e.deltaY) }),
-      });
-      window.setTimeout(() => void refreshShot(), 350);
-    } catch {
-      // Wheel scroll is best-effort; ignore transient failures.
-    }
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (!text) return;
+    e.preventDefault();
+    queueChar(text);
+  }
+
+  /** Forward one wheel tick, COALESCED: trackpads fire dozens of events per
+   *  second, and only the accumulated delta matters — at most one scroll
+   *  request is ever in flight, carrying everything that arrived meanwhile. */
+  function wheel(e: React.WheelEvent): void {
+    if (!active) return;
+    wheelPending.current += Math.round(e.deltaY);
+    if (wheelBusy.current) return;
+    wheelBusy.current = true;
+    void (async () => {
+      for (;;) {
+        const dy = wheelPending.current;
+        if (dy === 0) {
+          wheelBusy.current = false;
+          // An event may have landed between the last read and the flag
+          // flip — re-check so a tick is never dropped.
+          if (wheelPending.current === 0) return;
+          wheelBusy.current = true;
+          continue;
+        }
+        wheelPending.current = 0;
+        try {
+          await sidecarFetch("/browser/scroll", {
+            method: "POST",
+            body: JSON.stringify({ dx: 0, dy }),
+          });
+        } catch {
+          // Wheel scroll is best-effort; ignore transient failures.
+        }
+      }
+    })();
   }
 
   // Keep a live ref of the applied size for the fit-to-pane observer.
   useEffect(() => {
     sizeRef.current = viewport;
   }, [viewport]);
+
+  /** Send one virtual-cursor move, coalesced to the LATEST position: hover
+   *  fires far faster than the page (or the user's eye) needs, and only the
+   *  most recent point matters — at most one move request is in flight. */
+  function sendMove(p: { x: number; y: number }): void {
+    if (moveBusy.current) {
+      pendingMove.current = p;
+      return;
+    }
+    moveBusy.current = true;
+    void sidecarFetch("/browser/move", {
+      method: "POST",
+      body: JSON.stringify({ x: p.x, y: p.y }),
+    })
+      .catch(() => {
+        // Hover is best-effort; transient failures are ignored.
+      })
+      .finally(() => {
+        moveBusy.current = false;
+        const next = pendingMove.current;
+        pendingMove.current = null;
+        if (next) sendMove(next);
+      });
+  }
 
   // Resize the shared viewport to an explicit size (manual inputs / ruler).
   // Manual resizes become the new fit-to-pane cap; fit-to-pane follow calls
@@ -655,8 +829,9 @@ export function BrowserPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  // Forward hover as a virtual cursor move (throttled) and show the cursor
-  // overlay: the page reacts like a real pointer, the real mouse is untouched.
+  // Forward hover as a virtual cursor move (coalesced, ~60ms cadence) and
+  // show the cursor overlay: the page reacts like a real pointer, the real
+  // mouse is untouched. Hover STYLES land as pushed frames — no fetching.
   function hoverAt(e: React.MouseEvent<HTMLImageElement>): void {
     const rect = e.currentTarget.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
@@ -667,22 +842,12 @@ export function BrowserPanel({
     setCursor(hostPct(e.currentTarget, e.clientX, e.clientY));
     if (!active) return;
     const now = Date.now();
-    if (now - lastMoveAt.current < 120) return;
+    if (now - lastMoveAt.current < 60) return;
     lastMoveAt.current = now;
-    void sidecarFetch("/browser/move", {
-      method: "POST",
-      body: JSON.stringify({
-        x: Math.round((p.x / 100) * viewport.w),
-        y: Math.round((p.y / 100) * viewport.h),
-      }),
-    }).catch(() => {
-      // Hover is best-effort; transient failures are ignored.
+    sendMove({
+      x: Math.round((p.x / 100) * viewport.w),
+      y: Math.round((p.y / 100) * viewport.h),
     });
-    // Show hover states on the next frame, bounded to ~2 shots/s.
-    if (now - lastHoverShotAt.current > 500) {
-      lastHoverShotAt.current = now;
-      window.setTimeout(() => void refreshShot(), 250);
-    }
   }
 
   async function closeSession(): Promise<void> {
@@ -1050,6 +1215,7 @@ export function BrowserPanel({
         // typing in the page looked intentional. Screen readers keep the hint.
         aria-description="Click the page, then type — keystrokes go to the virtual browser"
         onKeyDown={stageKeyDown}
+        onPaste={stagePaste}
         onMouseDown={(e) => e.currentTarget.focus()}
       >
         {!available ? (
@@ -1094,7 +1260,7 @@ export function BrowserPanel({
               src={image}
               alt="Virtual browser"
               className="browser-stage-img"
-              onClick={(e) => void clickAt(e)}
+              onClick={(e) => clickAt(e)}
               onWheel={(e) => void wheel(e)}
               onMouseMove={(e) => hoverAt(e)}
               onMouseLeave={() => setCursor(null)}

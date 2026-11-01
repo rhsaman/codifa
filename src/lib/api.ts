@@ -14,6 +14,15 @@ let sidecarInFlight: Promise<string | null> | null = null
 
 /** How long `ensureSidecar` waits for the sidecar URL before giving up. */
 const SIDECAR_RESOLVE_TIMEOUT_MS = 10_000
+/**
+ * How long a successful `/health` probe stays trusted. Every call used to
+ * probe before returning, which doubled the request count of every hot path
+ * (each Browser-panel keystroke and hover move paid a /health round trip
+ * before its real request). A fresh probe result is now reused for this
+ * window; a failed request invalidates it immediately (noteSidecarFailure).
+ */
+const SIDECAR_PROBE_TTL_MS = 2_000
+let sidecarProbedAt = 0
 
 api.onSidecarChanged(() => {
   sidecarUrl = null
@@ -60,6 +69,13 @@ function noteSidecarUrl(url: string | null): void {
   lastSidecarUrl = url
 }
 
+/** Force the next `ensureSidecar` to re-probe `/health` instead of trusting
+ *  the TTL. Callers that hit a NETWORK failure against the cached URL use
+ *  this so a dead sidecar is still detected on the very next call. */
+export function noteSidecarFailure(): void {
+  sidecarProbedAt = 0
+}
+
 export async function ensureSidecar(): Promise<string | null> {
   // Dedup: if a previous call is still resolving (probing /health or
   // awaiting the getSidecarUrl IPC), every concurrent caller awaits the
@@ -68,13 +84,14 @@ export async function ensureSidecar(): Promise<string | null> {
   const p = (async () => {
     if (sidecarUrl) {
       // The cached URL may point at a dead process (e.g. the Python sidecar
-      // crashed while loading the Whisper model). Probe before trusting it so
-      // we don't keep hitting a dead port and surfacing "Failed to fetch".
-      // We DO probe on every call (no "fast path" that skips the probe) so
-      // a crash between calls is detected immediately: the previous resolution
-      // success doesn't mean the sidecar is still alive, and skipping the
-      // probe would leave the user hitting a dead port until the next call.
-      if (await isSidecarAlive(sidecarUrl)) {
+      // crashed while loading the Whisper model), so a probe must precede
+      // trusting it — but not on EVERY call: a fresh probe result is reused
+      // for SIDECAR_PROBE_TTL_MS, and any network failure against the URL
+      // invalidates it (noteSidecarFailure), so a crash is still detected on
+      // the next call instead of being paid as a round trip on every one.
+      const probeFresh = Date.now() - sidecarProbedAt < SIDECAR_PROBE_TTL_MS
+      if (probeFresh || (await isSidecarAlive(sidecarUrl))) {
+        sidecarProbedAt = Date.now()
         noteSidecarUrl(sidecarUrl)
         return sidecarUrl
       }

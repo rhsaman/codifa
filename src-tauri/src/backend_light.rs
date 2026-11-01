@@ -2407,9 +2407,27 @@ fn chat_id_of(body: &Value, query: &HashMap<String, String>) -> String {
         .to_string()
 }
 
+/// Run one blocking `browser::*` call off the router's async workers.
+///
+/// The router runtime has only TWO worker threads, and every browser call
+/// blocks (channel wait on the CDP driver, a helper thread + runtime, sleeps).
+/// Calling them inline parked both workers whenever two requests overlapped
+/// (status poll + a keystroke), freezing the whole local API — typing, hover
+/// and the fit button all lagged behind it. `spawn_blocking` keeps the async
+/// workers free.
+async fn off<F>(f: F) -> Response<Body>
+where
+    F: FnOnce() -> Value + Send + 'static,
+{
+    let v = tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| json!({"ok": false, "error": format!("browser task failed: {e}")}));
+    Json(v).into_response()
+}
+
 async fn browser_status(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
     let chat = q.get("chat_id").cloned().unwrap_or_default();
-    Json(crate::browser::status(&chat)).into_response()
+    off(move || crate::browser::status(&chat)).await
 }
 
 /// Start the one-click download of the app's own automation browser.
@@ -2430,19 +2448,33 @@ async fn browser_install_status() -> Response<Body> {
 
 async fn browser_launch(Json(body): Json<Value>) -> Response<Body> {    let url = body["url"].as_str().unwrap_or("about:blank");
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::launch(url, &chat)).into_response()
+    let url = url.to_string();
+    off(move || crate::browser::launch(&url, &chat)).await
 }
 
 /// Navigate an ALREADY running session (the panel's address bar).
 async fn browser_navigate(Json(body): Json<Value>) -> Response<Body> {
     let url = body["url"].as_str().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::navigate_to(url, &chat)).into_response()
+    let url = url.to_string();
+    off(move || crate::browser::navigate_to(&url, &chat)).await
 }
 
 async fn browser_screenshot(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
     let chat = q.get("chat_id").cloned().unwrap_or_default();
-    Json(crate::browser::screenshot(&chat)).into_response()
+    off(move || crate::browser::screenshot(&chat)).await
+}
+
+/// Long-poll the tab's latest pushed frame (`after` = last seq the panel has).
+/// Answers the moment the page repaints; times out quietly after ~4s with no
+/// new frame, and the panel simply asks again.
+async fn browser_frame(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
+    let chat = q.get("chat_id").cloned().unwrap_or_default();
+    let after = q
+        .get("after")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    Json(crate::browser::frame(&chat, after).await).into_response()
 }
 
 async fn browser_click(Json(body): Json<Value>) -> Response<Body> {
@@ -2451,11 +2483,12 @@ async fn browser_click(Json(body): Json<Value>) -> Response<Body> {
     // click: run it through the native driver, which resolves and scrolls the
     // element. Raw x/y stays on the arm's coordinate path.
     if body.get("ref").is_some() || body.get("selector").is_some() {
-        return Json(driver_json("click", &body, &chat)).into_response();
+        let b = body.clone();
+        return off(move || driver_json("click", &b, &chat)).await;
     }
     let x = body["x"].as_i64().unwrap_or_default();
     let y = body["y"].as_i64().unwrap_or_default();
-    Json(crate::browser::click(x, y, &chat)).into_response()
+    off(move || crate::browser::click(x, y, &chat)).await
 }
 
 /// Run one `browser_driver` action and render it as the `{ok, text}` /
@@ -2470,69 +2503,76 @@ fn driver_json(action: &str, body: &Value, chat: &str) -> Value {
 async fn browser_type(Json(body): Json<Value>) -> Response<Body> {
     let chat = chat_id_of(&body, &HashMap::new());
     if body.get("ref").is_some() || body.get("selector").is_some() {
-        return Json(driver_json("type", &body, &chat)).into_response();
+        let b = body.clone();
+        return off(move || driver_json("type", &b, &chat)).await;
     }
     let text = body["text"].as_str().unwrap_or_default();
-    Json(crate::browser::type_text(text, &chat)).into_response()
+    let text = text.to_string();
+    off(move || crate::browser::type_text(&text, &chat)).await
 }
 
 async fn browser_scroll(Json(body): Json<Value>) -> Response<Body> {
     let chat = chat_id_of(&body, &HashMap::new());
     if body.get("ref").is_some() || body.get("selector").is_some() {
-        return Json(driver_json("scroll", &body, &chat)).into_response();
+        let b = body.clone();
+        return off(move || driver_json("scroll", &b, &chat)).await;
     }
     let dx = body["dx"].as_i64().unwrap_or_default();
     let dy = body["dy"].as_i64().unwrap_or_default();
-    Json(crate::browser::scroll(dx, dy, &chat)).into_response()
+    off(move || crate::browser::scroll(dx, dy, &chat)).await
 }
 
 /// `browser_snapshot` for the panel: the same ref list the agent sees, so a
 /// user-driven click can be expressed as a ref instead of a pixel.
 async fn browser_snapshot(Json(body): Json<Value>) -> Response<Body> {
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(driver_json("snapshot", &body, &chat)).into_response()
+    let b = body.clone();
+    off(move || driver_json("snapshot", &b, &chat)).await
 }
 
 async fn browser_move(Json(body): Json<Value>) -> Response<Body> {
     let x = body["x"].as_i64().unwrap_or_default();
     let y = body["y"].as_i64().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::move_mouse(x, y, &chat)).into_response()
+    off(move || crate::browser::move_mouse(x, y, &chat)).await
 }
 
 async fn browser_key(Json(body): Json<Value>) -> Response<Body> {
     let key = body["key"].as_str().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::press_key(key, &chat)).into_response()
+    let key = key.to_string();
+    off(move || crate::browser::press_key(&key, &chat)).await
 }
 
 async fn browser_viewport(Json(body): Json<Value>) -> Response<Body> {
     let w = body["width"].as_u64().unwrap_or(1280) as u32;
     let h = body["height"].as_u64().unwrap_or(800) as u32;
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::set_viewport(w, h, &chat)).into_response()
+    off(move || crate::browser::set_viewport(w, h, &chat)).await
 }
 
 async fn browser_history(Json(body): Json<Value>) -> Response<Body> {
     let action = body["action"].as_str().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::history(action, &chat)).into_response()
+    let action = action.to_string();
+    off(move || crate::browser::history(&action, &chat)).await
 }
 
 async fn browser_search(Json(body): Json<Value>) -> Response<Body> {
     let query = body["query"].as_str().unwrap_or_default();
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::search(query, &chat)).into_response()
+    let query = query.to_string();
+    off(move || crate::browser::search(&query, &chat)).await
 }
 
 async fn browser_devtools_url(Query(q): Query<HashMap<String, String>>) -> Response<Body> {
     let chat = q.get("chat_id").cloned().unwrap_or_default();
-    Json(crate::browser::devtools_url(&chat)).into_response()
+    off(move || crate::browser::devtools_url(&chat)).await
 }
 
 async fn browser_close(Json(body): Json<Value>) -> Response<Body> {
     let chat = chat_id_of(&body, &HashMap::new());
-    Json(crate::browser::close(&chat)).into_response()
+    off(move || crate::browser::close(&chat)).await
 }
 
 /// Catch-all: no Python sidecar exists any more, so an unknown path is a real
@@ -2678,6 +2718,7 @@ pub fn router(state: AppState) -> Router {
         .route("/browser/launch", post(browser_launch))
         .route("/browser/navigate", post(browser_navigate))
         .route("/browser/screenshot", get(browser_screenshot))
+        .route("/browser/frame", get(browser_frame))
         .route("/browser/click", post(browser_click))
         .route("/browser/move", post(browser_move))
         .route("/browser/type", post(browser_type))

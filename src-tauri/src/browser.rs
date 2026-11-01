@@ -380,36 +380,37 @@ fn browser_ws_url(port: u16) -> Result<String, String> {
         .ok_or_else(|| "no browser websocket endpoint".to_string())
 }
 
-/// Open a new tab and return its target id.
-async fn create_target(cdp: &mut Cdp, url: &str) -> Result<String, String> {
-    let res = cdp.send("Target.createTarget", json!({"url": url})).await?;
-    res["targetId"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "Target.createTarget returned no targetId".to_string())
-}
-
-/// Close a tab, ignoring "already gone" (Chrome drops a target when its last
-/// session detaches, so a second close is a no-op rather than an error).
-async fn close_target(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
-    match cdp
-        .send("Target.closeTarget", json!({"targetId": target_id}))
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(e) if e.contains("No target") => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
 /// Browser-level CDP connection: one WebSocket, one `sessionId` per tab.
+///
+/// The socket is split into read/write halves so the driver can race incoming
+/// events (screencast frames) against new batches without borrow conflicts.
 struct Cdp {
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    tx: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    rx: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
     next_id: u64,
     /// Session id of the tab this connection is currently driving.
     session: Option<String>,
+    /// Screencast frames absorbed while a command was waiting for its reply:
+    /// `(flatten sessionId, base64 jpeg)`, latest per session. The driver moves
+    /// them into the frame cache after the batch (see `flush_frames`).
+    frames: Vec<(String, String)>,
+    /// Viewport override each session already holds. The override is scoped to
+    /// the CDP session and persists on a warm connection, so re-sending it with
+    /// every keystroke, hover and status poll only forced a relayout and a new
+    /// frame each time. It lives here so it is dropped with the connection.
+    applied_vp: std::collections::HashMap<String, (u32, u32)>,
+    /// `Emulation.setUserAgentOverride` params built from the browser's own
+    /// version (see `ua_override`), cached for the life of the connection.
+    ua: Option<Value>,
 }
 
 impl Cdp {
@@ -418,11 +419,48 @@ impl Cdp {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| format!("cdp connect failed: {e}"))?;
+        let (tx, rx) = ws.split();
         Ok(Self {
-            ws,
+            tx,
+            rx,
             next_id: 1,
             session: None,
+            frames: Vec::new(),
+            applied_vp: std::collections::HashMap::new(),
+            ua: None,
         })
+    }
+
+    /// Cache one pushed screencast frame and acknowledge it immediately.
+    ///
+    /// Two things stalled the panel's frames before:
+    ///   1. `send` skipped every event while waiting for its reply, so a frame
+    ///      that landed during a command (exactly when typing or clicking) was
+    ///      never stored or acknowledged;
+    ///   2. the acknowledgement carried the CDP flatten session id (a string)
+    ///      instead of the frame's own integer `params.sessionId`, which
+    ///      Chromium rejects — the frame stays unacknowledged and after a couple
+    ///      of them it stops pushing frames altogether.
+    async fn absorb_frame(&mut self, v: &Value) {
+        let Some(data) = v["params"]["data"].as_str() else {
+            return;
+        };
+        let Some(flat) = v["sessionId"].as_str() else {
+            return;
+        };
+        let ack_id = v["params"]["sessionId"].as_i64().unwrap_or(0);
+        self.frames.retain(|(s, _)| s != flat);
+        self.frames.push((flat.to_string(), data.to_string()));
+        let id = self.next_id;
+        self.next_id += 1;
+        // Fire and forget: the ack's own reply is ignored by id mismatch.
+        let ack = json!({
+            "id": id,
+            "method": "Page.screencastFrameAck",
+            "sessionId": flat,
+            "params": {"sessionId": ack_id},
+        });
+        let _ = self.tx.send(Message::Text(ack.to_string().into())).await;
     }
 
     /// Send one command and wait for its matching reply. Commands carry the
@@ -435,7 +473,7 @@ impl Cdp {
         if let Some(session) = &self.session {
             msg["sessionId"] = json!(session);
         }
-        self.ws
+        self.tx
             .send(Message::Text(msg.to_string().into()))
             .await
             .map_err(|e| format!("cdp send {method}: {e}"))?;
@@ -445,7 +483,7 @@ impl Cdp {
             if remaining.is_zero() {
                 return Err(format!("cdp {method} timed out"));
             }
-            let next = tokio::time::timeout(remaining, self.ws.next())
+            let next = tokio::time::timeout(remaining, self.rx.next())
                 .await
                 .map_err(|_| format!("cdp {method} timed out"))?;
             let Some(Ok(Message::Text(txt))) = next else {
@@ -455,6 +493,10 @@ impl Cdp {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            if v.get("method").and_then(Value::as_str) == Some("Page.screencastFrame") {
+                self.absorb_frame(&v).await;
+                continue;
+            }
             if v.get("id").and_then(Value::as_u64) != Some(id) {
                 continue; // an event or another command's reply
             }
@@ -464,51 +506,654 @@ impl Cdp {
             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
         }
     }
+}
 
-    /// Attach to one tab and make it the session every later command targets.
-    async fn attach(&mut self, target_id: &str) -> Result<(), String> {
-        let res = self
-            .send(
-                "Target.attachToTarget",
-                json!({"targetId": target_id, "flatten": true}),
-            )
-            .await?;
-        let session = res["sessionId"]
-            .as_str()
-            .ok_or_else(|| "attachToTarget returned no sessionId".to_string())?;
-        self.session = Some(session.to_string());
-        Ok(())
+// ---------------------------------------------------------------------------
+// Shared CDP connection: ONE warm WebSocket for the whole app
+// ---------------------------------------------------------------------------
+//
+// Every keystroke, hover move and frame used to open a fresh WebSocket
+// (`/json/version` probe + handshake + `Target.attachToTarget` + viewport
+// override) and spawn a fresh thread + tokio runtime for it. At the panel's
+// input rate that work queued up faster than it drained — typing and the
+// virtual cursor lagged seconds behind, and a size change sat minutes behind a
+// flood of stale hover moves. One long-lived connection, driven by one thread
+// that executes batches strictly in arrival order, turns every action into a
+// single warm-socket command and preserves input order for free.
+
+/// One batch of CDP commands, executed in order on the shared connection.
+struct CdpBatch {
+    /// Tab to drive, or `None` for browser-level commands
+    /// (Target.getTargets / createTarget / closeTarget / getTargetInfo).
+    target: Option<String>,
+    /// The tab's emulated viewport, applied when `with_viewport` is set.
+    viewport: (u32, u32),
+    /// Re-apply the emulated viewport before the commands: screenshots and
+    /// input need the tab's coordinate space, while navigation must not drag
+    /// it into the next page's first paint.
+    with_viewport: bool,
+    commands: Vec<(&'static str, Value)>,
+    reply: std::sync::mpsc::Sender<Result<Vec<Value>, String>>,
+}
+
+/// Handle on the driver thread: its request channel plus the browser port the
+/// connection was opened against.
+struct CdpPool {
+    port: u16,
+    tx: tokio::sync::mpsc::Sender<CdpBatch>,
+}
+
+/// The one driver serving every tab. `Option` (not a lazy cell) so the static
+/// stays `const`-constructible.
+static CDP_POOL: Mutex<Option<CdpPool>> = Mutex::new(None);
+
+/// Sender for the shared connection, (re)starting the driver thread when the
+/// browser is new or was restarted on a different port.
+fn cdp_pool() -> Result<tokio::sync::mpsc::Sender<CdpBatch>, String> {
+    let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
+    let mut guard = CDP_POOL.lock().map_err(|_| "cdp pool poisoned")?;
+    if let Some(pool) = guard.as_ref() {
+        if pool.port == port {
+            return Ok(pool.tx.clone());
+        }
+        // The browser restarted on another port — the old driver's socket is
+        // dead, so fall through and spawn a fresh one. The old thread winds
+        // down once its channel closes.
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<CdpBatch>(64);
+    std::thread::Builder::new()
+        .name("cdp-driver".to_string())
+        .spawn(move || cdp_driver_main(rx))
+        .map_err(|e| format!("cannot start the cdp driver: {e}"))?;
+    *guard = Some(CdpPool { port, tx: tx.clone() });
+    Ok(tx)
+}
+
+/// Drop the stored handle so the next call starts a fresh driver thread.
+/// Called wherever the browser process is killed or replaced: a same-port
+/// restart still self-heals via the transport-error retry, this just makes the
+/// common path immediate.
+fn invalidate_cdp_pool() {
+    if let Ok(mut guard) = CDP_POOL.lock() {
+        *guard = None;
     }
 }
 
-/// Run a sequence of CDP commands against `tab` over ONE connection.
-async fn cdp_calls(tab: &Tab, calls: Vec<(&'static str, Value)>) -> Result<Vec<Value>, String> {
-    cdp_calls_on(tab, calls, true).await
+/// True for errors that mean the CONNECTION or the cached session is gone
+/// (browser restart, cross-process navigation) rather than the command itself
+/// failing — those are retried once on a fresh connection. A timed-out command
+/// is deliberately NOT retried: its reply may still be in flight, and replaying
+/// a slow input event is worse than reporting the failure.
+fn is_transport_error(err: &str) -> bool {
+    let low = err.to_ascii_lowercase();
+    if low.contains("timed out") {
+        return false;
+    }
+    low.contains("websocket")
+        || low.contains("connect")
+        || low.contains("closed")
+        || low.contains("session")
+        || low.contains("no target")
+        || low.contains("target crashed")
+        || low.contains("detached")
+        || low.contains("io error")
+        || low.contains("protocol")
+        || low.contains("broken pipe")
+        || low.contains("reset")
 }
 
-/// `attach` controls the viewport override: the tab's emulated size is
-/// re-applied first for screenshots and input, but not for navigation (which
-/// must not drag the emulated size into the next page's first paint).
-async fn cdp_calls_on(
+/// The driver: pull batches in arrival order and run each one to completion
+/// before taking the next. Strict ordering is what keeps a typing burst (one
+/// batch per flush) from being reordered behind later requests. Between
+/// batches the loop reads the socket, so Chromium's PUSHED frames (screencast)
+/// land in the frame cache instead of piling up unacked.
+fn cdp_driver_main(mut rx: tokio::sync::mpsc::Receiver<CdpBatch>) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    rt.block_on(async move {
+        let mut conn: Option<Cdp> = None;
+        // target_id -> flatten sessionId. Sessions outlive batches, so a tab is
+        // attached ONCE and every later command rides the cached session.
+        let mut sessions: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Sessions with Page.startScreencast already running (frame push).
+        let mut screencast_on: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        loop {
+            if conn.is_none() {
+                // No connection: there is nothing to race the channel against.
+                match rx.recv().await {
+                    Some(batch) => {
+                        let res = run_batch(
+                            &mut conn,
+                            &mut sessions,
+                            &mut screencast_on,
+                            &batch,
+                        )
+                        .await;
+                        let _ = batch.reply.send(res);
+                    }
+                    None => break,
+                }
+                continue;
+            }
+            tokio::select! {
+                batch = rx.recv() => {
+                    match batch {
+                        Some(batch) => {
+                            let res = run_batch(
+                                &mut conn,
+                                &mut sessions,
+                                &mut screencast_on,
+                                &batch,
+                            )
+                            .await;
+                            let _ = batch.reply.send(res);
+                        }
+                        None => break,
+                    }
+                }
+                msg = conn.as_mut().expect("connection checked above").rx.next() => {
+                    on_socket_msg(&mut conn, &mut sessions, &mut screencast_on, msg).await;
+                }
+            }
+        }
+    });
+}
+
+/// Move the frames a connection absorbed into the shared per-tab cache, which
+/// wakes the panel's long-poll.
+fn flush_frames(cdp: &mut Cdp, sessions: &std::collections::HashMap<String, String>) {
+    for (flat, data) in std::mem::take(&mut cdp.frames) {
+        let target = sessions
+            .iter()
+            .find(|(_, s)| **s == flat)
+            .map(|(t, _)| t.clone());
+        if let Some(target) = target {
+            mark_pushed(&target);
+            store_frame(&target, &format!("data:image/jpeg;base64,{data}"));
+        }
+    }
+}
+
+/// Handle one socket message while no batch is running. Screencast frames are
+/// stored for the panel's long-poll and acked (an unacked frame stops the
+/// stream); everything else — stray events, late replies — is dropped.
+async fn on_socket_msg(
+    conn: &mut Option<Cdp>,
+    sessions: &mut std::collections::HashMap<String, String>,
+    screencast_on: &mut std::collections::HashSet<String>,
+    msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) {
+    let Some(Ok(Message::Text(txt))) = msg else {
+        // Socket closed or errored: drop everything session-scoped so the
+        // next batch reconnects and re-attaches from scratch.
+        *conn = None;
+        sessions.clear();
+        screencast_on.clear();
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return;
+    };
+    if v.get("method").and_then(Value::as_str) != Some("Page.screencastFrame") {
+        return;
+    }
+    if let Some(c) = conn.as_mut() {
+        c.absorb_frame(&v).await;
+        flush_frames(c, sessions);
+    }
+}
+
+/// Injected into every new document of a tab: the few places where a headless
+/// Chromium differs from the desktop Chrome the User-Agent now claims to be
+/// (`window.chrome` missing, `outerWidth/Height` of 0, a bare language list,
+/// `navigator.webdriver` set). Each line is guarded so one failure cannot stop
+/// the rest, and none of it changes what the page can do.
+const CONSISTENCY_JS: &str = r#"(() => {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch (e) {}
+  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+  try {
+    if (!window.outerWidth) {
+      Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+      Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
+    }
+  } catch (e) {}
+})();"#;
+
+/// `Emulation.setUserAgentOverride` params that make the headless browser
+/// present as the ordinary Chrome it is built from.
+///
+/// A headless Chromium announces itself as `HeadlessChrome` in the User-Agent
+/// header AND in the `Sec-CH-UA` client hints, which sites such as Instagram
+/// treat as an automated client — a correct login is then answered with the
+/// generic "login information is incorrect". Both are rewritten from the
+/// browser's own `Browser.getVersion` reply, so the version always matches the
+/// binary that is really running. Pure so it is unit-testable.
+fn ua_override(version: &Value) -> Option<Value> {
+    let ua = version["userAgent"].as_str()?;
+    // `product` is `HeadlessChrome/140.0.7339.82` (or `Chrome/...`).
+    let full = version["product"]
+        .as_str()
+        .and_then(|p| p.split('/').nth(1))
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let major = full.split('.').next().unwrap_or_default().to_string();
+    let mut params = json!({
+        "userAgent": ua.replace("HeadlessChrome", "Chrome"),
+        "acceptLanguage": "en-US,en",
+    });
+    // Client hints describe the OS, so they are only filled in for the platform
+    // this build actually runs on; elsewhere the plain UA rewrite is still safe.
+    if cfg!(target_os = "macos") {
+        params["platform"] = json!("MacIntel");
+        let brands = json!([
+            {"brand": "Chromium", "version": major},
+            {"brand": "Not=A?Brand", "version": "24"},
+            {"brand": "Google Chrome", "version": major},
+        ]);
+        let full_list = json!([
+            {"brand": "Chromium", "version": full},
+            {"brand": "Not=A?Brand", "version": "24.0.0.0"},
+            {"brand": "Google Chrome", "version": full},
+        ]);
+        params["userAgentMetadata"] = json!({
+            "brands": brands,
+            "fullVersionList": full_list,
+            "fullVersion": full,
+            "platform": "macOS",
+            "platformVersion": "14.5.0",
+            "architecture": if cfg!(target_arch = "aarch64") { "arm" } else { "x86" },
+            "bitness": "64",
+            "model": "",
+            "mobile": false,
+            "wow64": false,
+        });
+    }
+    Some(params)
+}
+
+/// Apply the browser-matched User-Agent to a freshly attached tab session.
+/// Best effort: a failure leaves the browser's own identity in place.
+async fn apply_user_agent(cdp: &mut Cdp, session: &str) {
+    if cdp.ua.is_none() {
+        // Browser-level call: no session.
+        cdp.session = None;
+        if let Ok(v) = cdp.send("Browser.getVersion", json!({})).await {
+            cdp.ua = ua_override(&v);
+        }
+    }
+    cdp.session = Some(session.to_string());
+    if let Some(params) = cdp.ua.clone() {
+        let _ = cdp.send("Emulation.setUserAgentOverride", params).await;
+    }
+    let _ = cdp
+        .send(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source": CONSISTENCY_JS}),
+        )
+        .await;
+}
+
+/// Run one batch on the shared connection. On a transport-level failure the
+/// connection (and the session cache) is dropped and the batch is replayed
+/// once — the same "fresh connection" recovery the per-call design had for
+/// free, without paying a reconnect on every success.
+async fn run_batch(
+    conn: &mut Option<Cdp>,
+    sessions: &mut std::collections::HashMap<String, String>,
+    screencast_on: &mut std::collections::HashSet<String>,
+    batch: &CdpBatch,
+) -> Result<Vec<Value>, String> {
+    for attempt in 0..2 {
+        if conn.is_none() {
+            let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
+            *conn = Some(Cdp::connect(port).await?);
+        }
+        let cdp = conn.as_mut().expect("connection just checked");
+        match &batch.target {
+            Some(target_id) => {
+                let session = match sessions.get(target_id) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let res = cdp
+                            .send(
+                                "Target.attachToTarget",
+                                json!({"targetId": target_id, "flatten": true}),
+                            )
+                            .await?;
+                        let s = res["sessionId"]
+                            .as_str()
+                            .ok_or_else(|| "attachToTarget returned no sessionId".to_string())?
+                            .to_string();
+                        sessions.insert(target_id.clone(), s.clone());
+                        apply_user_agent(cdp, &s).await;
+                        s
+                    }
+                };
+                cdp.session = Some(session.clone());
+                // Push frames for this tab once per session: the panel's
+                // long-poll then renders on every page repaint with no capture
+                // round trip at all.
+                if !screencast_on.contains(&session) {
+                    let _ = cdp
+                        .send(
+                            "Page.startScreencast",
+                            json!({
+                                "format": "jpeg",
+                                "quality": SCREENSHOT_QUALITY,
+                                "maxWidth": 4096,
+                                "maxHeight": 4096,
+                                "everyNthFrame": 1,
+                            }),
+                        )
+                        .await;
+                    screencast_on.insert(session);
+                }
+            }
+            None => cdp.session = None,
+        }
+        let mut calls: Vec<(&'static str, Value)> = Vec::new();
+        // Re-send the override only when this session does not hold it yet
+        // (first use, or the tab's size changed) — not on every input event.
+        let mut prepended = false;
+        if batch.with_viewport {
+            let held = cdp
+                .session
+                .as_ref()
+                .and_then(|s| cdp.applied_vp.get(s))
+                .copied();
+            if held != Some(batch.viewport) {
+                calls = with_viewport_override(batch.viewport.0, batch.viewport.1, calls);
+                prepended = true;
+            }
+        }
+        calls.extend(batch.commands.iter().cloned());
+        let mut out = Vec::with_capacity(calls.len());
+        let mut failure = None;
+        for (method, params) in calls {
+            match cdp.send(method, params).await {
+                Ok(v) => out.push(v),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => {
+                // The override's own reply is bookkeeping, not a result: strip
+                // it so callers reading `out[0]` see the FIRST COMMAND's reply
+                // (a missing strip made screenshot/current_url read the
+                // override's ack and report "empty screenshot" forever).
+                if prepended && !out.is_empty() {
+                    out.remove(0);
+                    if let Some(s) = cdp.session.clone() {
+                        cdp.applied_vp.insert(s, batch.viewport);
+                    }
+                }
+                // A batch that carries its own override (set_viewport) also
+                // updates what the session holds.
+                for (method, params) in &batch.commands {
+                    if *method == "Emulation.setDeviceMetricsOverride" {
+                        if let (Some(s), Some(w), Some(h)) = (
+                            cdp.session.clone(),
+                            params["width"].as_u64(),
+                            params["height"].as_u64(),
+                        ) {
+                            cdp.applied_vp.insert(s, (w as u32, h as u32));
+                        }
+                    }
+                }
+                flush_frames(cdp, sessions);
+                return Ok(out);
+            }
+            Some(e) if attempt == 0 && is_transport_error(&e) => {
+                *conn = None;
+                sessions.clear();
+                screencast_on.clear();
+                continue;
+            }
+            Some(e) => return Err(e),
+        }
+    }
+    Err("cdp retry exhausted".to_string())
+}
+
+/// Submit one batch to the shared connection and wait for the result.
+fn cdp_batch(
+    target: Option<&Tab>,
+    with_viewport: bool,
+    commands: Vec<(&'static str, Value)>,
+) -> Result<Vec<Value>, String> {
+    let tx = cdp_pool()?;
+    let (reply, rx) = std::sync::mpsc::channel();
+    let batch = CdpBatch {
+        target: target.map(|t| t.target_id.clone()),
+        viewport: target.map(|t| t.viewport).unwrap_or(DEFAULT_VIEWPORT),
+        with_viewport,
+        commands,
+        reply,
+    };
+    // `try_send` (not an await): every caller of this fn sits in sync code on
+    // an async runtime. A full queue means the driver is hopelessly behind —
+    // erroring one stale batch beats buffering minutes of them.
+    tx.try_send(batch)
+        .map_err(|_| "the cdp driver is not accepting work".to_string())?;
+    // Cdp::send already bounds every command at CDP_TIMEOUT; the headroom only
+    // covers queueing behind the batches ahead of this one.
+    match rx.recv_timeout(CDP_TIMEOUT + Duration::from_secs(5)) {
+        Ok(res) => res,
+        Err(_) => Err("the cdp driver did not answer in time".to_string()),
+    }
+}
+
+/// Run a sequence of CDP commands against `tab` with the tab's emulated
+/// viewport re-applied first (screenshots and input need the coordinate space).
+fn cdp_calls(tab: &Tab, calls: Vec<(&'static str, Value)>) -> Result<Vec<Value>, String> {
+    cdp_batch(Some(tab), true, calls)
+}
+
+/// Same batch with explicit control over the viewport override: navigation
+/// must not drag the emulated size into the next page's first paint, while
+/// `Emulation.setDeviceMetricsOverride` itself rides in its own batch.
+fn cdp_calls_on(
     tab: &Tab,
     calls: Vec<(&'static str, Value)>,
     with_viewport: bool,
 ) -> Result<Vec<Value>, String> {
-    let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
-    let mut cdp = Cdp::connect(port).await?;
-    cdp.attach(&tab.target_id).await?;
-    let mut calls = calls;
-    if with_viewport {
-        calls = with_viewport_override(tab.viewport.0, tab.viewport.1, calls);
+    cdp_batch(Some(tab), with_viewport, calls)
+}
+
+/// Browser-level commands (no tab session): target discovery, creation, close.
+fn cdp_browser_batch(commands: Vec<(&'static str, Value)>) -> Result<Vec<Value>, String> {
+    cdp_batch(None, false, commands)
+}
+
+// ---------------------------------------------------------------------------
+// Pushed frames (Page.startScreencast)
+// ---------------------------------------------------------------------------
+//
+// Polling Page.captureScreenshot cost a forced capture + JPEG encode on every
+// panel tick and serialized against input on the shared connection — the
+// click/keystroke feedback could never beat ~a capture time. Screencast flips
+// it around: Chromium pushes a frame on every page REPAINT (a keystroke, a
+// hover state, a navigation), the driver caches the latest one and acks it,
+// and /browser/frame long-polls until something newer exists. Idle pages push
+// nothing, so the idle cost is zero.
+
+/// Latest pushed frame of a tab: a monotonically increasing sequence (the
+/// panel sends back the seq it has seen) plus the JPEG data URI.
+struct LiveFrame {
+    seq: u64,
+    image: String,
+}
+
+/// Frames keyed by target id, each with a notify that wakes long-polls.
+/// `Option` (not a lazy cell) so the static stays `const`-constructible.
+static FRAMES: Mutex<
+    Option<std::collections::HashMap<String, (LiveFrame, std::sync::Arc<tokio::sync::Notify>)>>,
+> = Mutex::new(None);
+
+/// Cache one pushed frame and wake anything waiting for it.
+fn store_frame(target_id: &str, image: &str) {
+    let Ok(mut guard) = FRAMES.lock() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(Default::default);
+    let entry = map.entry(target_id.to_string()).or_insert_with(|| {
+        (
+            LiveFrame {
+                seq: 0,
+                image: String::new(),
+            },
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+    });
+    entry.0.seq += 1;
+    entry.0.image = image.to_string();
+    entry.1.notify_waiters();
+}
+
+/// `(seq, image)` of a tab's cached frame, when one exists.
+fn peek_frame(target_id: &str) -> Option<(u64, String)> {
+    let guard = FRAMES.lock().ok()?;
+    guard
+        .as_ref()?
+        .get(target_id)
+        .map(|f| (f.0.seq, f.0.image.clone()))
+}
+
+/// The notify a long-poll should wait on, or None when nothing is cached yet.
+fn frame_notify(target_id: &str) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let guard = FRAMES.lock().ok()?;
+    guard.as_ref()?.get(target_id).map(|f| f.1.clone())
+}
+
+/// Forget a tab's frame (tab closed or browser gone).
+fn drop_frame(target_id: &str) {
+    if let Ok(mut guard) = FRAMES.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.remove(target_id);
+        }
     }
-    let mut out = Vec::with_capacity(calls.len());
-    for (method, params) in calls {
-        out.push(cdp.send(method, params).await?);
+    drop_pushed(target_id);
+}
+
+/// Forget every cached frame.
+fn drop_all_frames() {
+    if let Ok(mut guard) = FRAMES.lock() {
+        *guard = None;
     }
-    if with_viewport && !out.is_empty() {
-        out.remove(0); // the override's own reply
+}
+
+/// Targets that have received at least one GENUINE pushed frame. A tab whose
+/// frames only ever come from the forced-capture fallback (a build without
+/// screencast support, say) reports `pushed: false` so the panel can fall back
+/// to capture polling instead of waiting on a push that never comes.
+static PUSHED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn mark_pushed(target_id: &str) {
+    if let Ok(mut guard) = PUSHED.lock() {
+        guard
+            .get_or_insert_with(Default::default)
+            .insert(target_id.to_string());
     }
-    Ok(out)
+}
+
+fn is_pushed(target_id: &str) -> bool {
+    PUSHED
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(target_id)))
+        .unwrap_or(false)
+}
+
+fn drop_pushed(target_id: &str) {
+    if let Ok(mut guard) = PUSHED.lock() {
+        if let Some(set) = guard.as_mut() {
+            set.remove(target_id);
+        }
+    }
+}
+
+/// Long-poll one frame for the panel: answers the moment Chromium pushes a
+/// frame newer than `after`, else falls back to one forced capture when the
+/// cache is empty, else times out quietly (the panel just asks again).
+pub async fn frame(chat_id: &str, after: u64) -> Value {
+    let chat = normalize_chat(chat_id);
+    let Some(tab) = existing_tab(&chat) else {
+        return json!({"ok": false, "error": "browser is not running"});
+    };
+    let target = tab.target_id.clone();
+    if peek_frame(&target).is_none() {
+        // Nothing cached yet — a fresh panel (or the first moment after
+        // attach, before the first push). One forced capture seeds the cache
+        // AND starts the screencast (the capture batch opens the session).
+        let chat_for_shot = chat.clone();
+        let shot = tokio::task::spawn_blocking(move || screenshot(&chat_for_shot))
+            .await
+            .unwrap_or(Value::Null);
+        if let Some(img) = shot.get("image").and_then(Value::as_str) {
+            store_frame(&target, img);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let pushed = is_pushed(&target);
+    loop {
+        if let Some((seq, image)) = peek_frame(&target) {
+            if seq > after {
+                return json!({
+                    "ok": true,
+                    "pushed": pushed,
+                    "seq": seq,
+                    "image": image,
+                    "width": tab.viewport.0,
+                    "height": tab.viewport.1,
+                });
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Nothing newer within the window: an empty frame tells the panel
+            // to simply ask again (the page has not repainted).
+            return json!({
+                "ok": true,
+                "pushed": pushed,
+                "seq": after,
+                "image": Value::Null,
+                "width": tab.viewport.0,
+                "height": tab.viewport.1,
+            });
+        }
+        // Register interest BEFORE re-peeking so a frame pushed between the
+        // peek and the wait cannot be missed, then wait bounded.
+        if let Some(notify) = frame_notify(&target) {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some((seq, image)) = peek_frame(&target) {
+                if seq > after {
+                    return json!({
+                        "ok": true,
+                        "pushed": pushed,
+                        "seq": seq,
+                        "image": image,
+                        "width": tab.viewport.0,
+                        "height": tab.viewport.1,
+                    });
+                }
+            }
+            let _ = tokio::time::timeout(remaining, notified).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }
 
 /// Device-metrics override params for an emulated viewport.
@@ -582,6 +1227,7 @@ fn alive_port() -> Option<u16> {
         if let Some(mut b) = guard.take() {
             let _ = b.child.kill();
             let _ = b.child.wait();
+            invalidate_cdp_pool();
             forget_all_tabs();
         }
     }
@@ -591,6 +1237,7 @@ fn alive_port() -> Option<u16> {
             if b.child.try_wait().ok().flatten().is_some() {
                 let mut dead = guard.take().expect("browser entry just checked");
                 let _ = dead.child.kill();
+                invalidate_cdp_pool();
                 forget_all_tabs();
                 return None;
             }
@@ -636,6 +1283,7 @@ fn restart_idle_clock_if_unused() {
 
 /// Drop every tab entry (called when the shared browser dies).
 fn forget_all_tabs() {
+    drop_all_frames();
     if let Ok(mut tabs) = TABS.lock() {
         tabs.clear();
     }
@@ -668,6 +1316,7 @@ fn kill_running_browser() {
     let taken = BROWSER.lock().ok().and_then(|mut guard| guard.take());
     if let Some(mut proc) = taken {
         kill_process_tree(&mut proc.child);
+        invalidate_cdp_pool();
         forget_all_tabs();
     }
 }
@@ -891,6 +1540,10 @@ fn spawn_browser() -> Result<u16, String> {
         let _ = old.child.kill();
         let _ = old.child.wait();
     }
+    // A brand-new Chromium: the pooled connection (if any) points at the dead
+    // process, so the next call starts a fresh driver.
+    invalidate_cdp_pool();
+    drop_all_frames();
     *guard = Some(BrowserProc {
         child,
         port,
@@ -910,22 +1563,28 @@ fn ensure_browser() -> Result<u16, String> {
 /// The chat's tab, opening it on `about:blank` when the chat has none yet.
 /// A tab whose target vanished (surfaced as a `No target` CDP error) is
 /// replaced rather than returned, so a stale entry never wedges a chat.
-async fn ensure_tab_async(chat: &str) -> Result<Tab, String> {
+fn ensure_tab(chat: &str) -> Result<Tab, String> {
     // Reading the tab refreshes its idle clock (`existing_tab` does that), which
     // is exactly right: the agent asking for the tab IS the tab being in use, so
     // the per-tab reaper must not close it between two tool calls.
-    let existing = existing_tab(chat);
-    if let Some(tab) = existing {
-        if tab_usable(tab.target_id.as_str()).await {
+    if let Some(tab) = existing_tab(chat) {
+        if tab_usable(&tab.target_id) {
             return Ok(tab);
         }
         TABS.lock()
             .ok()
             .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
     }
-    let port = ensure_browser()?;
-    let mut cdp = Cdp::connect(port).await?;
-    let target_id = create_target(&mut cdp, "about:blank").await?;
+    ensure_browser()?;
+    let out = cdp_browser_batch(vec![(
+        "Target.createTarget",
+        json!({"url": "about:blank"}),
+    )])?;
+    let target_id = out
+        .into_iter()
+        .next()
+        .and_then(|v| v["targetId"].as_str().map(str::to_string))
+        .ok_or_else(|| "Target.createTarget returned no targetId".to_string())?;
     let tab = Tab {
         target_id,
         viewport: DEFAULT_VIEWPORT,
@@ -939,26 +1598,21 @@ async fn ensure_tab_async(chat: &str) -> Result<Tab, String> {
 }
 
 /// True when a target still exists in the browser.
-async fn tab_usable(target_id: &str) -> bool {
-    let Some(port) = alive_port() else {
+fn tab_usable(target_id: &str) -> bool {
+    if alive_port().is_none() {
         return false;
-    };
-    let Ok(mut cdp) = Cdp::connect(port).await else {
-        return false;
-    };
-    match cdp
-        .send("Target.getTargetInfo", json!({"targetId": target_id}))
-        .await
-    {
-        Ok(res) => res["targetInfo"]["targetId"].as_str() == Some(target_id),
+    }
+    match cdp_browser_batch(vec![(
+        "Target.getTargetInfo",
+        json!({"targetId": target_id}),
+    )]) {
+        Ok(out) => out
+            .into_iter()
+            .next()
+            .map(|res| res["targetInfo"]["targetId"].as_str() == Some(target_id))
+            .unwrap_or(false),
         Err(_) => false,
     }
-}
-
-/// Synchronous wrapper around `ensure_tab_async`.
-fn ensure_tab(chat: &str) -> Result<Tab, String> {
-    let chat = chat.to_string();
-    block_on(async move { ensure_tab_async(&chat).await })
 }
 
 /// True when a target's URL is not a real page yet (nothing for the panel to
@@ -999,31 +1653,27 @@ fn same_page(a: &str, b: &str) -> bool {
 /// Every PAGE target in the shared browser as `(target_id, url)`.
 ///
 /// `Target.getTargets` is a browser-level call (no `sessionId` needed), so it
-/// runs on the same plain connection `tab_usable` uses. An error or a dead
-/// browser yields an empty list rather than failing the caller.
-async fn page_targets() -> Vec<(String, String)> {
-    let Some(port) = alive_port() else {
+/// rides the shared connection. An error or a dead browser yields an empty
+/// list rather than failing the caller.
+fn page_targets() -> Vec<(String, String)> {
+    let Ok(out) = cdp_browser_batch(vec![("Target.getTargets", json!({}))]) else {
         return Vec::new();
     };
-    let Ok(mut cdp) = Cdp::connect(port).await else {
-        return Vec::new();
-    };
-    let Ok(res) = cdp.send("Target.getTargets", json!({})).await else {
-        return Vec::new();
-    };
-    res["targetInfos"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|t| {
-                    if t["type"].as_str() != Some("page") {
-                        return None;
-                    }
-                    let id = t["targetId"].as_str()?.to_string();
-                    let url = t["url"].as_str().unwrap_or_default().to_string();
-                    Some((id, url))
-                })
-                .collect()
+    out.into_iter()
+        .next()
+        .and_then(|res| {
+            res["targetInfos"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        if t["type"].as_str() != Some("page") {
+                            return None;
+                        }
+                        let id = t["id"].as_str()?.to_string();
+                        let url = t["url"].as_str().unwrap_or_default().to_string();
+                        Some((id, url))
+                    })
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -1038,9 +1688,9 @@ async fn page_targets() -> Vec<(String, String)> {
 /// Adopting registers that page as the chat's tab, so every later
 /// screenshot/input follows the page the agent is actually driving instead of a
 /// blank one.
-async fn adopt_async(chat: &str) -> Option<Tab> {
+fn adopt(chat: &str) -> Option<Tab> {
     let registered = existing_tab(chat);
-    let targets = page_targets().await;
+    let targets = page_targets();
     if targets.is_empty() {
         // Browser down (or a unit-test registry): nothing to adopt.
         return registered;
@@ -1085,20 +1735,13 @@ async fn adopt_async(chat: &str) -> Option<Tab> {
     Some(tab)
 }
 
-/// Sync wrapper around [`adopt_async`] for the panel-facing entry points.
-///
-/// Deliberately used ONLY by `launch`/`status`/`screenshot`: those three run on
-/// the panel's polling path, so when one of them adopts a foreign page it is
-/// registered for the chat and every other `/browser/*` call follows it
+/// ADOPT a page another CDP client opened when the chat has nothing real to
+/// show. Deliberately used ONLY by `launch`/`status`/`screenshot`: those three
+/// run on the panel's polling path, so when one of them adopts a foreign page
+/// it is registered for the chat and every other `/browser/*` call follows it
 /// automatically — no other call site needs to know about adoption.
 fn active_tab(chat: &str) -> Option<Tab> {
-    let chat = chat.to_string();
-    // `block_on` is typed for the CDP helpers that return `Result`; adopting
-    // never fails (it falls back to the registered tab), so the `Ok` wrapper is
-    // just to reuse the same runtime-spawning helper.
-    block_on(async move { Ok(adopt_async(&chat).await) })
-        .ok()
-        .flatten()
+    adopt(chat)
 }
 
 /// The chat's registered tab without creating one.
@@ -1154,26 +1797,15 @@ fn reap_idle_tabs() {
     if stale.is_empty() {
         return;
     }
-    // `stale` is still needed after the await (to forget the cached drivers),
-    // so hand the async block only the target ids instead of moving the vector.
-    let targets: Vec<String> = stale.iter().map(|(_, t)| t.clone()).collect();
-    let _ = block_on(async move {
-        // No live browser (or a unit-test registry): the entries are already
-        // gone from the map, which is the part that matters here.
-        let Some(port) = alive_port() else {
-            return Ok(Value::Null);
-        };
-        let Ok(mut cdp) = Cdp::connect(port).await else {
-            return Ok(Value::Null);
-        };
-        for target in &targets {
-            let _ = close_target(&mut cdp, target).await;
-        }
-        Ok(Value::Null)
-    });
-    // The cached CDP driver points at a target that no longer exists. Dropping
-    // it releases the WebSocket and the page snapshots it was holding.
-    for (chat, _) in &stale {
+    // Close each stale target through the shared connection. One batch per
+    // target: a target that is ALREADY gone errors the batch, and a batch that
+    // stops at its first error must not skip the remaining targets.
+    for (chat, target) in &stale {
+        let _ = cdp_browser_batch(vec![(
+            "Target.closeTarget",
+            json!({"targetId": target}),
+        )]);
+        drop_frame(target);
         crate::browser_driver::forget(chat);
     }
     // If that was the last tab, start the browser's own timeout now so the
@@ -1200,12 +1832,13 @@ fn close_tab(chat: &str) -> bool {
         .ok()
         .map(|mut tabs| tabs.retain(|(k, _)| k != chat));
     restart_idle_clock_if_unused();
-    let _ = block_on(async move {
-        let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
-        let mut cdp = Cdp::connect(port).await?;
-        close_target(&mut cdp, &tab.target_id).await?;
-        Ok(Value::Null)
-    });
+    // "Already gone" arrives as a transport-shaped error and is ignored —
+    // closing a target that vanished is a no-op, not a failure.
+    let _ = cdp_browser_batch(vec![(
+        "Target.closeTarget",
+        json!({"targetId": tab.target_id}),
+    )]);
+    drop_frame(&tab.target_id);
     true
 }
 
@@ -1524,20 +2157,21 @@ fn make_executable(dir: &std::path::Path) {
 
 /// Current page URL of a tab, or "" when it cannot be read.
 fn current_url(tab: &Tab) -> String {
-    let tab = tab.clone();
-    let fut = async move {
-        let res = cdp_calls(
-            &tab,
-            vec![(
-                "Runtime.evaluate",
-                json!({"expression": "location.href", "returnByValue": true}),
-            )],
-        )
-        .await?;
-        Ok(res.into_iter().next().unwrap_or(Value::Null)["result"]["value"].clone())
-    };
-    match block_on(fut) {
-        Ok(v) => v.as_str().unwrap_or_default().to_string(),
+    let res = cdp_calls(
+        tab,
+        vec![(
+            "Runtime.evaluate",
+            json!({"expression": "location.href", "returnByValue": true}),
+        )],
+    );
+    match res {
+        Ok(out) => out
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Null)["result"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         Err(_) => String::new(),
     }
 }
@@ -1569,14 +2203,13 @@ pub fn status(chat_id: &str) -> Value {
 }
 
 /// Navigate a tab, idempotently (an existing tab is reused).
-async fn navigate(tab: &Tab, url: &str) -> Result<(), String> {
-    let tab = tab.clone();
-    let url = url.to_string();
-    let fut = async move {
-        cdp_calls_on(&tab, vec![("Page.navigate", json!({"url": url}))], false).await?;
-        Ok(Value::Null)
-    };
-    block_on(fut).map(|_| ())
+fn navigate(tab: &Tab, url: &str) -> Result<(), String> {
+    cdp_calls_on(
+        tab,
+        vec![("Page.navigate", json!({"url": url}))],
+        false,
+    )
+    .map(|_| ())
 }
 
 /// Navigate an already-open chat tab (the panel's address bar). Unlike `launch`
@@ -1602,15 +2235,15 @@ pub fn navigate_to(url: &str, chat_id: &str) -> Value {
     let tab_for_call = tab.clone();
     let tab_for_settle = tab.clone();
     let target_owned = target.to_string();
-    let fut = async move {
-        navigate(&tab_for_call, &target_owned).await?;
+    match block_on(async move {
+        navigate(&tab_for_call, &target_owned)?;
         Ok(Value::Null)
-    };
-    match block_on(fut) {
+    }) {
         Ok(_) => {
             // Wait for the navigation to commit AND settle so the returned url
             // is the new page rather than the one being left (a fixed sleep
-            // both raced slow pages and wasted time on fast ones).
+            // both raced slow pages and wasted time on fast ones). On a thrown
+            // thread, so the axum worker is never parked for up to 8s.
             let _ = block_on(async move {
                 wait_page_settled(&tab_for_settle, Duration::from_secs(8)).await;
                 Ok(Value::Null)
@@ -1637,13 +2270,7 @@ pub fn launch(url: &str, chat_id: &str) -> Value {
     if !target.is_empty() && target != "about:blank" {
         let current = current_url(&tab);
         if current != target {
-            let tab_for_call = tab.clone();
-            let target_owned = target.to_string();
-            let fut = async move {
-                navigate(&tab_for_call, &target_owned).await?;
-                Ok(Value::Null)
-            };
-            if let Err(e) = block_on(fut) {
+            if let Err(e) = navigate(&tab, target) {
                 return json!({"ok": false, "error": format!("navigation failed: {e}")});
             }
         }
@@ -1671,8 +2298,7 @@ async fn wait_page_settled(tab: &Tab, timeout: Duration) {
                 "returnByValue": true,
             }))],
             false,
-        )
-        .await;
+        );
         let settled = ready
             .ok()
             .and_then(|res| res.into_iter().next())
@@ -1692,10 +2318,10 @@ async fn wait_page_settled(tab: &Tab, timeout: Duration) {
 
 /// One JPEG frame as a data URI (the panel renders it directly).
 ///
-/// The device-metrics override is re-applied on THIS connection right before
-/// the capture: `Emulation.setDeviceMetricsOverride` is scoped to the CDP
-/// session, and every call here opens a fresh WebSocket, so an override set by
-/// an earlier /browser/viewport call would be gone by the time we capture.
+/// The device-metrics override rides in the capture batch (`cdp_calls`
+/// prepends it): `Emulation.setDeviceMetricsOverride` is scoped to the CDP
+/// session, and the session a screenshot drives must hold the tab's emulated
+/// size before the capture, whatever ran before it.
 pub fn screenshot(chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
     let Some(tab) = active_tab(&chat) else {
@@ -1704,29 +2330,29 @@ pub fn screenshot(chat_id: &str) -> Value {
     let (w, h) = tab.viewport;
     let tab_for_call = tab.clone();
     let fut = async move {
-        // ONE connection for the whole capture. The old flow spent a first
-        // WebSocket just to read readyState and a second one for the capture,
-        // and paid a fixed 180ms paint beat even when the page had been
-        // settled for ages — latency on every poll and every fit-to-pane
-        // resize, which is why the ruler and the fit button felt laggy.
-        let port = alive_port().ok_or_else(|| "browser is not running".to_string())?;
-        let mut cdp = Cdp::connect(port).await?;
-        cdp.attach(&tab_for_call.target_id).await?;
+        // A settled page captures cleanly; an unsettled one gets a readiness
+        // wait first. Each check is one warm-socket command now.
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut waited = false;
         loop {
-            let ready = cdp
-                .send(
+            let ready = cdp_calls(
+                &tab_for_call,
+                vec![(
                     "Runtime.evaluate",
                     json!({
                         "expression": "document.readyState",
                         "returnByValue": true,
                     }),
-                )
-                .await;
+                )],
+            );
             let settled = ready
                 .ok()
-                .and_then(|res| res["result"]["result"]["value"].as_str().map(str::to_string))
+                .and_then(|res| res.into_iter().next())
+                .and_then(|res| {
+                    res["result"]["result"]["value"]
+                        .as_str()
+                        .map(str::to_string)
+                })
                 .map(|v| v == "interactive" || v == "complete")
                 .unwrap_or(false);
             if settled || Instant::now() >= deadline {
@@ -1744,76 +2370,82 @@ pub fn screenshot(chat_id: &str) -> Value {
             // synchronously before the capture).
             tokio::time::sleep(Duration::from_millis(180)).await;
         }
-        // The override MUST ride in this same batch: it is scoped to the CDP
-        // session, and the one an earlier /browser/viewport call set died with
-        // that connection.
-        cdp.send(
-            "Emulation.setDeviceMetricsOverride",
-            viewport_override(w, h),
-        )
-        .await?;
-        let res = cdp
-            .send(
+        let res = cdp_calls(
+            &tab_for_call,
+            vec![(
                 "Page.captureScreenshot",
                 json!({"format": "jpeg", "quality": SCREENSHOT_QUALITY}),
-            )
-            .await?;
-        Ok(res["data"].clone())
+            )],
+        )?;
+        Ok(res
+            .into_iter()
+            .next()
+            .and_then(|v| v["data"].as_str().map(str::to_string))
+            .unwrap_or_default())
     };
     match block_on(fut) {
-        Ok(data) => match data.as_str() {
-            Some(b64) if !b64.is_empty() => json!({
-                "ok": true,
-                "image": format!("data:image/jpeg;base64,{b64}"),
-                "width": w,
-                "height": h,
-            }),
-            _ => json!({"ok": false, "error": "empty screenshot"}),
-        },
+        Ok(b64) if !b64.is_empty() => json!({
+            "ok": true,
+            "image": format!("data:image/jpeg;base64,{b64}"),
+            "width": w,
+            "height": h,
+        }),
+        Ok(_) => json!({"ok": false, "error": "empty screenshot"}),
         Err(e) => json!({"ok": false, "error": e}),
     }
 }
 
 /// Dispatch one mouse event at viewport coordinates.
-fn mouse_event(tab: &Tab, kind: &'static str, x: i64, y: i64, extra: Value) -> Result<(), String> {
-    let tab = tab.clone();
-    let fut = async move {
-        let mut params = json!({"type": kind, "x": x, "y": y});
-        if let (Some(dst), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
-            for (k, v) in extra {
-                dst.insert(k.clone(), v.clone());
-            }
+fn mouse_event(
+    tab: &Tab,
+    kind: &'static str,
+    x: i64,
+    y: i64,
+    extra: Value,
+) -> Result<(), String> {
+    let mut params = json!({"type": kind, "x": x, "y": y});
+    if let (Some(dst), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            dst.insert(k.clone(), v.clone());
         }
-        cdp_calls(&tab, vec![("Input.dispatchMouseEvent", params)]).await?;
-        Ok(Value::Null)
-    };
-    block_on(fut).map(|_| ())
+    }
+    cdp_calls(tab, vec![("Input.dispatchMouseEvent", params)]).map(|_| ())
 }
 
 /// Click at viewport coordinates.
+///
+/// Press and release ride in ONE batch: on the shared, strictly ordered
+/// connection two separate requests could be interleaved by a hover move from
+/// the panel, splitting the click.
 pub fn click(x: i64, y: i64, chat_id: &str) -> Value {
     let chat = normalize_chat(chat_id);
     let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    let press = mouse_event(
+    let press = json!({
+        "type": "mousePressed",
+        "x": x,
+        "y": y,
+        "button": "left",
+        "clickCount": 1,
+        "buttons": 1,
+    });
+    let release = json!({
+        "type": "mouseReleased",
+        "x": x,
+        "y": y,
+        "button": "left",
+        "clickCount": 1,
+        "buttons": 0,
+    });
+    match cdp_calls(
         &tab,
-        "mousePressed",
-        x,
-        y,
-        json!({"button": "left", "clickCount": 1, "buttons": 1}),
-    );
-    if let Err(e) = press {
-        return json!({"ok": false, "error": e});
-    }
-    match mouse_event(
-        &tab,
-        "mouseReleased",
-        x,
-        y,
-        json!({"button": "left", "clickCount": 1, "buttons": 0}),
+        vec![
+            ("Input.dispatchMouseEvent", press),
+            ("Input.dispatchMouseEvent", release),
+        ],
     ) {
-        Ok(()) => json!({"ok": true}),
+        Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
 }
@@ -1836,17 +2468,10 @@ pub fn type_text(text: &str, chat_id: &str) -> Value {
     let Some(tab) = existing_tab(&chat) else {
         return json!({"ok": false, "error": "browser is not running"});
     };
-    let tab_for_call = tab.clone();
-    let text = text.to_string();
-    let fut = async move {
-        cdp_calls(
-            &tab_for_call,
-            vec![("Input.insertText", json!({"text": text}))],
-        )
-        .await?;
-        Ok(Value::Null)
-    };
-    match block_on(fut) {
+    match cdp_calls(
+        &tab,
+        vec![("Input.insertText", json!({"text": text}))],
+    ) {
         Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -1883,29 +2508,23 @@ pub fn press_key(key: &str, chat_id: &str) -> Value {
         // Not a named key: type it as text (matches the Python fallback).
         return type_text(key, &chat);
     };
-    let tab_for_call = tab.clone();
-    let fut = async move {
-        let base = json!({
-            "windowsVirtualKeyCode": code,
-            "nativeVirtualKeyCode": code,
-            "key": name,
-            "code": dom_code,
-        });
-        let mut down = base.clone();
-        down["type"] = json!("keyDown");
-        let mut up = base;
-        up["type"] = json!("keyUp");
-        cdp_calls(
-            &tab_for_call,
-            vec![
-                ("Input.dispatchKeyEvent", down),
-                ("Input.dispatchKeyEvent", up),
-            ],
-        )
-        .await?;
-        Ok(Value::Null)
-    };
-    match block_on(fut) {
+    let base = json!({
+        "windowsVirtualKeyCode": code,
+        "nativeVirtualKeyCode": code,
+        "key": name,
+        "code": dom_code,
+    });
+    let mut down = base.clone();
+    down["type"] = json!("keyDown");
+    let mut up = base;
+    up["type"] = json!("keyUp");
+    match cdp_calls(
+        &tab,
+        vec![
+            ("Input.dispatchKeyEvent", down),
+            ("Input.dispatchKeyEvent", up),
+        ],
+    ) {
         Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -1918,25 +2537,19 @@ pub fn scroll(dx: i64, dy: i64, chat_id: &str) -> Value {
         return json!({"ok": false, "error": "browser is not running"});
     };
     let (w, h) = tab.viewport;
-    let tab_for_call = tab.clone();
-    let fut = async move {
-        cdp_calls(
-            &tab_for_call,
-            vec![(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": w / 2,
-                    "y": h / 2,
-                    "deltaX": dx,
-                    "deltaY": dy,
-                }),
-            )],
-        )
-        .await?;
-        Ok(Value::Null)
-    };
-    match block_on(fut) {
+    match cdp_calls(
+        &tab,
+        vec![(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": w / 2,
+                "y": h / 2,
+                "deltaX": dx,
+                "deltaY": dy,
+            }),
+        )],
+    ) {
         Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -1952,17 +2565,11 @@ pub fn set_viewport(width: u32, height: u32, chat_id: &str) -> Value {
     // Guard against a zero/absurd size from a mid-typing input.
     let w = width.clamp(200, 4096);
     let h = height.clamp(200, 4096);
-    let tab_for_call = tab.clone();
-    let fut = async move {
-        cdp_calls_on(
-            &tab_for_call,
-            vec![("Emulation.setDeviceMetricsOverride", viewport_override(w, h))],
-            false,
-        )
-        .await?;
-        Ok(Value::Null)
-    };
-    match block_on(fut) {
+    match cdp_calls_on(
+        &tab,
+        vec![("Emulation.setDeviceMetricsOverride", viewport_override(w, h))],
+        false,
+    ) {
         Ok(_) => {
             store_viewport(&chat, (w, h));
             json!({"ok": true, "width": w, "height": h})
@@ -1984,18 +2591,14 @@ pub fn history(action: &str, chat_id: &str) -> Value {
         other => return json!({"ok": false, "error": format!("unknown history action: {other}")}),
     };
     let tab_for_call = tab.clone();
-    let fut = async move {
-        cdp_calls(
-            &tab_for_call,
-            vec![(
-                "Runtime.evaluate",
-                json!({"expression": expr, "returnByValue": true}),
-            )],
-        )
-        .await?;
-        Ok(Value::Null)
-    };
-    match block_on(fut) {
+    let expr_owned = expr;
+    match cdp_calls(
+        &tab_for_call,
+        vec![(
+            "Runtime.evaluate",
+            json!({"expression": expr_owned, "returnByValue": true}),
+        )],
+    ) {
         Ok(_) => json!({"ok": true}),
         Err(e) => json!({"ok": false, "error": e}),
     }
@@ -2017,13 +2620,7 @@ pub fn search(query: &str, chat_id: &str) -> Value {
     ];
     let mut last = String::new();
     for (host, url) in engines {
-        let tab_for_call = tab.clone();
-        let url_for_call = url.clone();
-        let fut = async move {
-            navigate(&tab_for_call, &url_for_call).await?;
-            Ok(Value::Null)
-        };
-        if let Err(e) = block_on(fut) {
+        if let Err(e) = navigate(&tab, &url) {
             last = e;
             continue;
         }
@@ -2087,9 +2684,10 @@ pub fn close(chat_id: &str) -> Value {
 /// module, so the process/tab registry stays private to the file that owns it.
 ///
 /// The driver is a SEPARATE module rather than more code in this one because it
-/// needs something this file deliberately does not have: a long-lived WebSocket
-/// whose reader and writer run concurrently. Everything here is request/reply on
-/// a socket that is opened and dropped per call.
+/// needs something this file used to lack: the driver thread OWNS the one
+/// long-lived WebSocket and runs strictly request→reply, so it cannot also
+/// serve the agent's concurrently reading driver. Everything here is
+/// request/reply on that separate, per-driver socket.
 pub(crate) mod driver_hooks {
     /// Normalized chat key.
     pub(crate) fn chat_key(chat: &str) -> String {
@@ -2258,23 +2856,47 @@ mod tests {
         let tab_a = ensure_tab(a).expect("first tab");
         let tab_b = ensure_tab(b).expect("second tab");
         assert_ne!(tab_a.target_id, tab_b.target_id, "chats must not share a tab");
-        assert!(tab_usable_sync(&tab_a.target_id), "first tab must be live");
-        assert!(tab_usable_sync(&tab_b.target_id), "second tab must be live");
+        assert!(tab_usable(&tab_a.target_id), "first tab must be live");
+        assert!(tab_usable(&tab_b.target_id), "second tab must be live");
         // One process, two tabs.
         assert_eq!(BROWSER.lock().unwrap().as_ref().map(|_| 1), Some(1));
         assert_eq!(TABS.lock().unwrap().len(), 2);
+        // The screenshot/url paths read the FIRST COMMAND's reply from a
+        // viewport-override batch — a missing strip of the override's own ack
+        // made every frame come back "empty screenshot" (regression guard).
+        let shot = screenshot(a);
+        assert_eq!(shot["ok"], true, "{shot}");
+        assert!(
+            shot["image"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:image/jpeg"),
+            "{shot}"
+        );
+        let url = current_url(&tab_a);
+        assert_eq!(url, "about:blank", "the fresh tab sits on about:blank");
+        // A warm-socket input path end to end.
+        assert_eq!(type_text("hi", a)["ok"], true);
+        assert_eq!(click(10, 10, a)["ok"], true);
+        // The PUSH pipeline: navigating repaints the page, Chromium pushes a
+        // frame through screencast, and a long-poll with after=0 returns it
+        // (a real JPEG, seq > 0) instead of timing out.
+        let nav = navigate_to("data:text/html,<h1>codifa-live</h1>", a);
+        assert_eq!(nav["ok"], true, "{nav}");
+        let f = block_on(async move {
+            let v = frame(a, 0).await;
+            Ok::<Value, String>(v)
+        })
+        .unwrap_or(Value::Null);
+        assert_eq!(f["ok"], true, "{f}");
+        assert!(
+            f["image"].as_str().unwrap_or_default().starts_with("data:image/jpeg"),
+            "the pushed frame must be a JPEG data URI: {f}"
+        );
         assert!(close_tab(a));
         assert!(close_tab(b));
         let killed = kill_all_sessions();
         assert!(killed >= 1, "the shared browser must be reaped");
-    }
-
-    /// `tab_usable` is async; the live test is sync like every public entry.
-    fn tab_usable_sync(target_id: &str) -> bool {
-        let target = target_id.to_string();
-        block_on(async move { Ok::<Value, String>(json!(tab_usable(&target).await)) })
-            .map(|v| v.as_bool().unwrap_or(false))
-            .unwrap_or(false)
     }
 
     #[test]

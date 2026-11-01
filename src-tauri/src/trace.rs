@@ -49,6 +49,22 @@ pub struct TraceStore {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Launch time of this process in ms, fixed on first use.
+///
+/// `SEQ` restarts at 0 on every launch while the JSONL log survives restarts, so
+/// a bare sequence number reused the ids of earlier runs (`t0`, `t1`, …). The
+/// panel dedups by id, so after a restart every new row that collided with an
+/// old one was silently dropped and the trace stopped being live.
+fn boot_stamp() -> u64 {
+    static BOOT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    })
+}
+
 /// Hard size cap for one chat's trace log.
 ///
 /// The system prompt is re-logged on EVERY LLM call (8-36 KB each), so a busy
@@ -174,7 +190,7 @@ impl TraceStore {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let id = format!("t{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let id = format!("t{}-{}", boot_stamp(), SEQ.fetch_add(1, Ordering::Relaxed));
         let row = json!({
             "id": id,
             // Which run produced this row. Concurrent explore siblings share one
@@ -356,19 +372,30 @@ pub async fn traces_list(
     axum::extract::Path(chat_id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<TracesQuery>,
 ) -> axum::response::Response {
-    let mut counts: TraceCounts = [0; 6];
-    let mut page: Vec<Value> = Vec::new();
     let limit = q.limit.clamp(1, TRACE_LIMIT_MAX);
-    if let Some(dir) = traces_dir() {
-        let path = dir.join(format!("{}.jsonl", sanitize(&chat_id)));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            // Keep empty lines out so `before` counts real entries.
-            let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-            let (p, c) = trace_page(&lines, limit, q.before, &q.kind, q.sub);
-            page = p;
-            counts = c;
+    // Reading and parsing a log of up to TRACE_MAX_BYTES is blocking work, and
+    // the panel asks every second on a router with only two async workers.
+    // Inline, it starved every other request (the panel's own poll included),
+    // so the trace stopped being live. Run it on the blocking pool.
+    let (before, kind, sub) = (q.before, q.kind.clone(), q.sub);
+    let (page, counts) = tokio::task::spawn_blocking(move || {
+        let mut counts: TraceCounts = [0; 6];
+        let mut page: Vec<Value> = Vec::new();
+        if let Some(dir) = traces_dir() {
+            let path = dir.join(format!("{}.jsonl", sanitize(&chat_id)));
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Keep empty lines out so `before` counts real entries.
+                let lines: Vec<&str> =
+                    content.lines().filter(|l| !l.trim().is_empty()).collect();
+                let (p, c) = trace_page(&lines, limit, before, &kind, sub);
+                page = p;
+                counts = c;
+            }
         }
-    }
+        (page, counts)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), [0; 6]));
     axum::Json(json!({
         "traces": page,
         // Total for the ACTIVE filter: the panel compares it with what it holds

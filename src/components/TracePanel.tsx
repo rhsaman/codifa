@@ -279,6 +279,14 @@ function TextBlock({
   );
 }
 
+/** Identity of a row for merging and rendering. Rows written by older builds
+ *  reuse ids across app launches (`t0`, `t1`, … restarted at 0 each time), so
+ *  the id alone treated a NEW row as one already held and dropped it; the
+ *  timestamp tells the runs apart. */
+export function traceKey(entry: TraceEntry): string {
+  return `${entry.id}@${entry.at}`;
+}
+
 /** Step number of an entry (from detail.step) — shown as a chip on the row. */
 export function traceStep(entry: TraceEntry): number | null {
   const s = (entry.detail as Record<string, unknown> | undefined)?.step;
@@ -580,7 +588,7 @@ export function TraceTurnGroup({
         <div className="trace-panel-step-rows">
           {entries.map((entry, i) => (
             <TraceRow
-              key={entry.id}
+              key={traceKey(entry)}
               entry={entry}
               query={query}
               defaultOpen={false}
@@ -727,6 +735,9 @@ export function TracePanel(props?: {
   // 200 entries is minutes of work, and the oldest page boundary is recovered by
   // scrolling up.
   const fetchSeqRef = useRef(0);
+  // True while a silent (timer) poll is in flight. The timer skips a tick instead
+  // of starting an overlapping request.
+  const silentBusyRef = useRef(false);
   const fetchAll = useCallback(
     async (silent: boolean) => {
       if (!activeChatId) {
@@ -736,7 +747,14 @@ export function TracePanel(props?: {
         setReachedStart(false);
         return;
       }
-      const mySeq = ++fetchSeqRef.current;
+      // A silent poll must NOT invalidate the poll still in flight: every call
+      // used to bump the sequence, so any response slower than the 2s timer was
+      // discarded by the next tick and the panel never updated while the server
+      // was busy. Only a real context change (a loud load, or the effect
+      // cleanup) bumps it now.
+      if (silent && silentBusyRef.current) return;
+      const mySeq = silent ? fetchSeqRef.current : ++fetchSeqRef.current;
+      if (silent) silentBusyRef.current = true;
       if (!silent) {
         setLoading(true);
         setError(null);
@@ -755,8 +773,8 @@ export function TracePanel(props?: {
           setEntries((prev) => {
             // A fresh chat, or a poll after a clear: nothing to merge into.
             if (prev.length === 0) return page;
-            const have = new Set(prev.map((e) => e.id));
-            const fresh = page.filter((e) => !have.has(e.id));
+            const have = new Set(prev.map(traceKey));
+            const fresh = page.filter((e) => !have.has(traceKey(e)));
             if (fresh.length === 0) return prev;
             // Trim from the OLDEST end past two pages: off-screen entries above
             // the viewport cost DOM and heap for no benefit, and the user can
@@ -781,6 +799,7 @@ export function TracePanel(props?: {
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
+        if (silent) silentBusyRef.current = false;
         if (mySeq !== fetchSeqRef.current) return;
         if (!silent) setLoading(false);
       }
@@ -815,8 +834,8 @@ export function TracePanel(props?: {
           setReachedStart(true);
         } else {
           setEntries((prev) => {
-            const have = new Set(prev.map((e) => e.id));
-            const fresh = older.filter((e) => !have.has(e.id));
+            const have = new Set(prev.map(traceKey));
+            const fresh = older.filter((e) => !have.has(traceKey(e)));
             if (fresh.length === 0) {
               // Everything in the page is already loaded: the cursor is past
               // the start of the log.
@@ -842,14 +861,16 @@ export function TracePanel(props?: {
     }
     let cancelled = false;
     void fetchAll(false).catch(() => {});
-    // پولینگ زنده هر ۲ ثانیه تا حین اجرای چت، لاگ‌ها لایو اضافه شوند.
+    // پولینگ زنده هر ثانیه تا حین اجرای چت، لاگ‌ها لایو اضافه شوند
+    // (درخواست هم‌پوشان شروع نمی‌شود؛ silentBusyRef).
     const timer = window.setInterval(() => {
       if (!cancelled) void fetchAll(true).catch(() => {});
-    }, 2000);
+    }, 1000);
     return () => {
       cancelled = true;
       // درخواست قدیمی اگر بعداً برگردد نادیده گرفته می‌شود (fetchSeqRef)
       fetchSeqRef.current++;
+      silentBusyRef.current = false;
       window.clearInterval(timer);
     };
   }, [activeChatId, fetchAll]);

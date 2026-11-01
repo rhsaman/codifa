@@ -22,6 +22,11 @@
      from the theme (like --bg-raised) so every palette gets its own lift
      instead of a literal that would stay Rose Pine everywhere. */
   --bg-elev: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
+  /* Sidebar surface: one step off the chat background toward the theme's own
+     text tone — lighter in the dark palettes, slightly deeper in the light
+     one — so the navigation rail reads as its own surface without leaving
+     the theme palette. */
+  --bg-sidebar: color-mix(in srgb, var(--bg-alt) 95%, var(--text) 5%);
   --bg-input: #202020;
   --bg-hover: #262626;
   --border: #2e2e2e;
@@ -300,7 +305,7 @@ textarea {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--bg-alt);
+  background: var(--bg-sidebar);
   border-right: none;
   box-shadow:
     inset -1px 0 0 color-mix(in srgb, var(--text) 5%, transparent),
@@ -3985,8 +3990,8 @@ body.coder-dragging .chat-split-child {
   min-width: 0;
   height: 100%;
   position: relative;
-  /* Same flat surface as the sidebar (--bg-alt == --bg), so the chat and
-     sidebar read as one continuous surface. No accent tint here: with a
+  /* The chat keeps the flat theme background (--bg-alt == --bg); the sidebar
+     sits one step off it (--bg-sidebar). No accent tint here: with a
      saturated accent (one-dark blue, onyx white) a 3% mix visibly washes
      the whole panel off the theme's true background. */
   background: var(--bg-alt);

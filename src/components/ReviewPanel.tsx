@@ -305,16 +305,18 @@ export function ReviewPanel(props?: {
         ?.messages.find((m) => m.id === messageId)?.toolActivity,
   );
 
-  const turn = useMemo(
-    () => (messageId && activities ? buildReviewTurn(messageId, activities) : null),
-    [messageId, activities],
-  );
-
   // ریشه‌ی پروژه برای کوئری‌های گیت — در حالت اسپلیت از چت مالک برگه،
   // وگرنه از چت فعال.
   const ownerChatId = props?.chatId
   const root = useStore(
     (s) => s.chats.find((c) => c.id === (ownerChatId ?? s.activeChatId))?.root ?? s.root,
+  );
+
+  // Only edits INSIDE this root belong here — see `isReviewablePath`.
+  const turn = useMemo(
+    () =>
+      messageId && activities ? buildReviewTurn(messageId, activities, root) : null,
+    [messageId, activities, root],
   );
 
   // ---- Git bar actions (the bar moved here from the composer/app bar) ----

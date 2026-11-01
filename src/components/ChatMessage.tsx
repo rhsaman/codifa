@@ -23,6 +23,7 @@ import {
 import { fixArrowDirections, rehypeArrows } from "../lib/arrowDir";
 import { copyToClipboard } from "../lib/clipboard";
 import { dedupDocPaths, extractInlinePathParts, filePathFromHref, isDocPath, looksLikeFilePath, splitPathLine } from "../lib/fileTypes";
+import { editTargetOf } from "../lib/toolActivity";
 import { FileChip, FileIcon, openWorkspaceFile } from "./FileIcon";
 import { RENDER_CAP, fmtSize } from "../lib/renderCap";
 import { fmtClock, fmtClockFull } from "../lib/time";
@@ -88,7 +89,7 @@ function docPathsFromActivities(list?: ToolActivity[]): string[] {
     const isDocTool =
       tool === "write_document" || tool === "edit_file" || tool === "write_file";
     if (isDocTool) {
-      const raw = (a.args?.path ?? a.args?.filePath) as unknown;
+      const raw = editTargetOf(a.args) || undefined;
       const candidates = [
         typeof raw === "string" ? raw : "",
         typeof a.summary === "string" ? a.summary : "",

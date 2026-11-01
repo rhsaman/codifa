@@ -2196,8 +2196,14 @@ fn read_editable_text(target: &Path) -> Result<String, String> {
 /// Read a file's current content for diffing before an edit. A missing or
 /// unreadable file yields an empty string (a brand-new write_file then diffs
 /// as pure additions).
-pub fn read_pre_edit(root: &str, path: &str) -> Option<String> {
-    let target = resolve_safe(root, path, false, None).ok()?;
+///
+/// `permit` is the turn's out-of-workspace grant, the SAME one the writer itself
+/// resolves with. Without it a write the user explicitly approved outside the
+/// tree snapshotted as `None`, so no diff was ever emitted for it: the chat card
+/// said only "Edited" and the Review panel had no hunk to show. Workspace, temp
+/// and `~/.codifa` still pass with no permit at all.
+pub fn read_pre_edit(root: &str, path: &str, permit: Option<&Value>) -> Option<String> {
+    let target = resolve_safe(root, path, false, permit).ok()?;
     fs::read_to_string(target).ok()
 }
 
@@ -3173,7 +3179,29 @@ into one union — those lines are all above; do NOT re-read them]"
                 Ok(hits.join("\n"))
             }
         }
-        "write_file" => write_file(root, &s("path"), &s("content"), permit),
+        "write_file" => {
+            // `write_file` plans a WHOLE file, so a call that arrives without one
+            // is not a small write — it is the model having dropped the argument.
+            // Answering it with `fs::write(.., "")` truncated the target to zero
+            // bytes and still reported "Successfully wrote … (0 bytes)", which
+            // reads as done. Traced in one chat: 16 identical calls to the same
+            // path, each `{path}` only, each "0 bytes" — the model could not see
+            // that its content never arrived, so it re-sent the same call until
+            // the turn ran out. Refuse instead, and name the argument.
+            // An EXPLICIT empty string stays legal (it empties a file on
+            // purpose); only an ABSENT/short-circuited body is refused.
+            let content = args["content"].as_str();
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    return Err(format!(
+                        "write_file needs `content` and this call sent none (path={:?}). For a brand-new file pass the WHOLE file as `content`; for an existing one use `edit_file` with the exact old_string/new_string instead of rewriting it.",
+                        s("path")
+                    ))
+                }
+            };
+            write_file(root, &s("path"), content, permit)
+        }
         "edit_file" => {
             let path = {
                 let p = s("path");
@@ -3197,6 +3225,19 @@ into one union — those lines are all above; do NOT re-read them]"
             } else {
                 path
             };
+            // A writer needs a FILE. When neither shape named one, the empty
+            // path resolved to the workspace ROOT and died inside
+            // `read_editable_text` as "cannot read <root> for editing: Is a
+            // directory (os error 21)" — a message that names no file, so the
+            // model had to reinterpret the whole call instead of correcting it.
+            // Refuse at the boundary, in the words of the argument it lacked.
+            if path.trim().is_empty() {
+                return Err(
+                    "edit_file: no file named — pass `path`, or a `path` on each entry of \
+                     `edits` ({\"path\": \"src/a.ts\", \"old_string\": …, \"new_string\": …})"
+                        .into(),
+                );
+            }
             // A batch may name a DIFFERENT file per entry (`edits: [{path, …}]`,
             // the shape the schema advertises). The single-file body below
             // presumes one target, so a multi-file batch is applied here, one
@@ -3418,8 +3459,29 @@ ceiling; clamped to {timeout}s (long jobs must use background=true)"
             }
             match resolve_safe(root, &file, false, permit) {
                 Ok(abs) if abs.is_file() => tools_outline(&abs, &s("query")),
+                // A directory is a legitimate thing to name — the model has the
+                // path but not a file in it. Refusing cost a whole round (traced
+                // as `lsp_symbols "src"` → "outlines ONE file — src is a
+                // directory") when the answer it wanted, that folder's entries,
+                // was one read away. Answer it here instead, and name the one
+                // call that DOES outline a file so the next round is exact.
                 Ok(abs) if abs.is_dir() => {
-                    Err(format!("lsp_symbols outlines ONE file — {file} is a directory"))
+                    let listing = list_dir(&abs, DEFAULT_READ_OFFSET, DEFAULT_READ_LIMIT)?;
+                    let files: Vec<&str> = listing
+                        .lines()
+                        .filter(|e| !e.ends_with('/') && !e.starts_with('('))
+                        .take(3)
+                        .collect();
+                    let named = if files.is_empty() {
+                        "none of its entries is a file".to_string()
+                    } else {
+                        format!("pick one (`{}`) and call lsp_symbols on it", files.join("`, `"))
+                    };
+                    Ok(format!(
+                        "{file}/ is a DIRECTORY — lsp_symbols outlines ONE file, so here are its \
+                         entries instead:\n{listing}\n\n{named}, or pass a `query` with a glob-shaped \
+                         `path` to `grep`."
+                    ))
                 }
                 Ok(_) => crate::lsp::symbols(root, &file, &s("query"), permit),
                 Err(e) => Err(e),
@@ -5464,6 +5526,118 @@ token mid 3
         });
         let err = dispatch(root, "edit_file", &args, None).unwrap_err();
         assert!(err.contains("no edit applied"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Naming a DIRECTORY to `lsp_symbols` answers with its entries instead of
+    /// refusing. The model often has the folder but no file in it, and the old
+    /// refusal ("outlines ONE file — src is a directory") spent a whole round
+    /// teaching it nothing the listing does not say.
+    #[test]
+    fn lsp_symbols_on_a_directory_lists_its_entries() {
+        let tmp = std::env::temp_dir().join(format!("codifa-lsp-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        fs::write(tmp.join("one.rs"), "fn a() {}\n").unwrap();
+        fs::write(tmp.join("two.rs"), "fn b() {}\n").unwrap();
+        fs::write(tmp.join("sub/three.rs"), "fn c() {}\n").unwrap();
+        let root = tmp.to_str().unwrap();
+
+        let out = dispatch(root, "lsp_symbols", &json!({ "filePath": "" }), None)
+            .err()
+            .unwrap_or_default();
+        // An empty filePath is still an error — this guards the arm below from
+        // swallowing it.
+        assert!(!out.contains("DIRECTORY"), "empty path is not a listing: {out}");
+
+        let out = dispatch(root, "lsp_symbols", &json!({ "filePath": "." }), None).unwrap();
+        assert!(out.contains("DIRECTORY"), "says what it is: {out}");
+        assert!(out.contains("one.rs") && out.contains("two.rs"), "lists files: {out}");
+        assert!(out.contains("sub/"), "marks subdirectories: {out}");
+        // The next round must be exact: one of the files it just listed.
+        assert!(out.contains("lsp_symbols on it"), "names the follow-up: {out}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A `write_file` that arrives WITHOUT `content` must not report success.
+    ///
+    /// `fs::write(.., "")` truncated the target to zero bytes and the answer was
+    /// still "Successfully wrote … (0 bytes)", which reads as done. One traced
+    /// chat sent the SAME bodiless call 16 times (each args object was `{path}`
+    /// only) because nothing in the result said the body had never arrived.
+    #[test]
+    fn write_file_without_content_is_refused_not_a_silent_truncation() {
+        let tmp = std::env::temp_dir().join(format!("codifa-wf-nocontent-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_str().unwrap();
+        let file = tmp.join("keep.txt");
+        fs::write(&file, "original body\n").unwrap();
+
+        let err = dispatch(root, "write_file", &json!({ "path": "keep.txt" }), None).unwrap_err();
+        assert!(err.contains("content"), "names the missing argument: {err}");
+        assert!(err.contains("keep.txt"), "names the file it refused: {err}");
+        // The refusal must leave the file ALONE — a truncated file is the bug.
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original body\n");
+
+        // An explicit empty body stays legal: it empties the file on purpose.
+        let ok = dispatch(root, "write_file", &json!({ "path": "keep.txt", "content": "" }), None)
+            .unwrap();
+        assert!(ok.contains("(0 bytes)"), "{ok}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A write the user approved OUTSIDE the workspace can still be snapshotted,
+    /// which is what makes its diff (and therefore the card + Review entry)
+    /// possible.
+    ///
+    /// `read_pre_edit` used to resolve with no permit at all. Workspace, temp and
+    /// `~/.codifa` never needed one, so this only ever bit a path in the user's
+    /// HOME (traced: `edit_file ~/local-models-server/stt-server.py`, approved in
+    /// the popup, then reported as a bare "Edited" with no +N/-M anywhere).
+    #[cfg(unix)]
+    #[test]
+    fn a_permitted_out_of_tree_edit_can_still_be_snapshotted_for_its_diff() {
+        // `/etc/hosts` is guaranteed to exist and to sit outside EVERY free root
+        // (workspace, temp, ~/.codifa), so the permit is the only way in.
+        let tmp = std::env::temp_dir().join("codifa-read-pre-edit-permit");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_str().unwrap();
+
+        // No permit: outside every free root, so there is nothing to snapshot.
+        assert!(read_pre_edit(root, "/etc/hosts", None).is_none());
+
+        // The user approved it: the snapshot now exists, which is what lets the
+        // diff be computed at all.
+        let permit = json!({ "outside": true, "folders": [] });
+        let before = read_pre_edit(root, "/etc/hosts", Some(&permit));
+        assert!(before.is_some(), "an approved path must be readable for diffing");
+        let diff = unified_diff("/etc/hosts", &before.unwrap(), "only one line\n");
+        assert!(!diff.is_empty(), "an approved edit must produce a diff");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// An `edit_file` that names NO file refuses in terms of the missing
+    /// argument instead of trying to read the workspace root.
+    #[test]
+    fn edit_file_with_no_file_named_says_so() {
+        let tmp = std::env::temp_dir().join("codifa-edit-no-path");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.to_str().unwrap();
+
+        let err = dispatch(
+            root,
+            "edit_file",
+            &json!({ "edits": [{ "old_string": "a", "new_string": "b" }] }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("no file named"), "says what is missing: {err}");
+        // The old failure leaked the OS error and the ROOT path instead.
+        assert!(!err.contains("Is a directory"), "no errno soup: {err}");
+        assert!(err.contains("`path`"), "names the argument: {err}");
         fs::remove_dir_all(&tmp).ok();
     }
 

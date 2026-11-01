@@ -14,12 +14,14 @@
 }
 
 const { renderToString } = await import('react-dom/server')
-const { TraceRow, TraceTurnGroup, getTraceTabCounts, groupTracesByTurn, traceStep, traceTurn, turnUserPreview, traceEntrySearchParts, formatTraceEntryAsText, formatTracesAsText, formatTurnAsText, filterTraces } = await import(
+const { TraceRow, TraceTurnGroup, getTraceTabCounts, groupTracesByTurn, traceStep, traceTurn, turnUserPreview, traceEntrySearchParts, formatTraceEntryAsText, formatTracesAsText, formatTurnAsText, filterTraces, traceArgsText } = await import(
   '../src/components/TracePanel'
 )
 const { countTraceEntryHits, countTraceHits, stepHitIndex, locateHit } = await import(
   '../src/lib/diffSearch.ts'
 )
+const { editTargetOf } = await import('../src/lib/toolActivity')
+const { reviewPathOf } = await import('../src/lib/reviewTurn')
 
 let failed = 0
 function check(name: string, cond: boolean, extra?: unknown) {
@@ -191,6 +193,38 @@ console.log('8) sub-agent trace view includes its own tools:')
   check('main view hides sub tools', mainCounts.tool === 0, mainCounts)
   const subCounts = getTraceTabCounts(subRows, true)
   check('sub-agent view counts its tools', subCounts.tool === 1, subCounts)
+}
+
+console.log('9) a batch edit names its file per entry (no top-level path):')
+{
+  // `edit_file` advertises TWO shapes. Reading only `path`/`filePath` resolved
+  // EVERY `edits:[{path,…}]` batch to "", which is what rendered such an edit as
+  // a bare "Edited" card with no diff: no review path, no +N/-M, and the diff
+  // event (matched on this same path) attached to nothing.
+  const batch = { edits: [{ path: '/tmp/split_tests.py', old_string: 'a', new_string: 'b' }] }
+  check('editTargetOf reads the entry path', editTargetOf(batch) === '/tmp/split_tests.py')
+  check('editTargetOf still prefers the top level', editTargetOf({ path: 'x.ts', edits: [{ path: 'y.ts' }] }) === 'x.ts')
+  check('editTargetOf accepts filePath', editTargetOf({ filePath: 'z.ts' }) === 'z.ts')
+  check('editTargetOf ignores an empty top level', editTargetOf({ path: '', edits: [{ path: 'w.ts' }] }) === 'w.ts')
+  check('no path at all is empty, never a crash', editTargetOf({}) === '' && editTargetOf(undefined) === '')
+  // A per-entry path with no file in it must not become a review row for a dir.
+  check('editTargetOf skips a blank entry path', editTargetOf({ edits: [{ path: '  ' }, { path: 'ok.ts' }] }) === 'ok.ts')
+
+  // The same resolution backs the review panel and the card row.
+  const act = { tool: 'edit_file', status: 'done', args: batch } as any
+  check('reviewPathOf resolves a batch path', reviewPathOf(act) === '/tmp/split_tests.py')
+}
+
+console.log('10) tool-trace args render as text, not one escaped JSON line:')
+{
+  const raw = JSON.stringify({ edits: [{ new_string: '  k = j\n  while True:', path: '/tmp/x.py' }] })
+  check('raw args hold no real newline', !raw.includes('\n'))
+  const pretty = traceArgsText(raw)
+  check('printed args hold real newlines', pretty.includes('\n'))
+  check('printed args keep the values', pretty.includes('k = j') && pretty.includes('/tmp/x.py'))
+  check('unparseable args fall back to the raw text', traceArgsText('{not json') === '{not json')
+  check('a bare scalar is left alone', traceArgsText('"plain"') === '"plain"')
+  check('empty stays empty', traceArgsText('') === '')
 }
 
 if (failed > 0) {

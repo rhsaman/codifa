@@ -6330,11 +6330,13 @@ your context above. Use that report, or ask a DIFFERENT, narrower question"
             // in this turn." for every edit. A missing file (brand-new
             // write_file) diffs as pure additions.
             let pre_edit = if name == "edit_file" || name == "write_file" {
-                let p = args["path"]
-                    .as_str()
-                    .or_else(|| args["filePath"].as_str())
-                    .unwrap_or_default();
-                Some(crate::tools::read_pre_edit(&root, p).unwrap_or_default())
+                // The SAME target resolution the writer itself uses. Reading a
+                // bare `args["path"]` here made every `edits:[{path,…}]` batch
+                // resolve to "" — the workspace root — so both snapshots were
+                // empty and the edit produced no diff anywhere.
+                writer_target_path(name, &args).map(|p| {
+                    crate::tools::read_pre_edit(&root, &p, permit.as_ref()).unwrap_or_default()
+                })
             } else {
                 None
             };
@@ -7427,13 +7429,17 @@ call fetch_url again with offset={next} for the rest]",
             let mut applied_diff: Option<String> = None;
             if ok {
                 if let Some(old) = pre_edit {
-                    let p = args["path"]
-                        .as_str()
-                        .or_else(|| args["filePath"].as_str())
-                        .unwrap_or_default();
-                    if let Ok(target) = crate::tools::resolve_safe(&root, p, false, None) {
+                    // Same resolution as the snapshot above (and as
+                    // `writer_target_path`'s own doc comment): an `edits[]` shape
+                    // names its file per entry, so a bare `args["path"]` here read
+                    // "" and the whole diff was skipped.
+                    let p = writer_target_path(name, &args).unwrap_or_default();
+                    // `permit` again: an approved out-of-tree write must produce its
+                    // diff too, and `resolve_safe(.., false, None)` refused exactly
+                    // the paths the user had just said yes to.
+                    if let Ok(target) = crate::tools::resolve_safe(&root, &p, false, permit.as_ref()) {
                         let newc = std::fs::read_to_string(target).unwrap_or_default();
-                        let diff = crate::tools::unified_diff(p, &old, &newc);
+                        let diff = crate::tools::unified_diff(&p, &old, &newc);
                         if !diff.is_empty() {
                             emit(&AgentEvent::Diff {
                                 tool: name.clone(),
@@ -9372,15 +9378,36 @@ fn read_window_span(offset: usize, limit: usize) -> (usize, usize) {
 /// The workspace file a WRITER targets, in the same spelling the reader side
 /// records (`filePath`/`path`) — the two must agree character-for-character or
 /// the same-file check below never fires.
+/// The file a WRITER call targets, as the model spelled it.
+///
+/// A batch may name its file ONLY per entry (`edits: [{path, …}]`, the shape the
+/// schema advertises) and leave the top level `path` absent. Reading just
+/// `path`/`filePath` then answered `None`, so the pre-edit snapshot and the
+/// post-edit diff were both taken from an EMPTY path — which resolves to the
+/// workspace ROOT, fails to read as text, and yields `""` on both sides. The
+/// unified diff came out empty, no `diff` event reached the UI, and the edit
+/// card showed a bare "Edited" with no diff while the model got no
+/// `applied change` block at all (traced: every `edits[]`-shaped edit).
 fn writer_target_path(name: &str, args: &Value) -> Option<String> {
     if !matches!(name, "edit_file" | "write_file") {
         return None;
     }
-    args["path"]
+    let named = args["path"]
         .as_str()
         .or_else(|| args["filePath"].as_str())
         .map(str::to_string)
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty());
+    if named.is_some() {
+        return named;
+    }
+    // The schema's batch shape: one path per entry. The FIRST entry is the file
+    // the diff is computed against; a multi-file batch is applied per file by
+    // `edit_file` itself, and this snapshot covers the entry it reports first.
+    args["edits"]
+        .as_array()
+        .and_then(|edits| edits.iter().find_map(|e| e["path"].as_str()))
+        .map(str::to_string)
+        .filter(|p| !p.trim().is_empty())
 }
 
 /// True when EVERY window of a `read` call is already inside a span served

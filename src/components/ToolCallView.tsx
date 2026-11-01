@@ -13,6 +13,7 @@ import type { ToolActivity, SearchResultItem } from "../types";
 import { useStore } from "../lib/store";
 import {
   diffStatsFromUnified,
+  editTargetOf,
   isSkillTool,
   MEMORY_TOOLS,
   terminalOutputText,
@@ -2139,8 +2140,10 @@ function subArgSummary(activity: ToolActivity): string {
     parts.push(shortArg(String(args.command), 80));
   }
 
-  // read/write/edit/list_files: path + real line range (mirrors the card head)
-  const path = String(args.filePath ?? args.path ?? "");
+  // read/write/edit/list_files: path + real line range (mirrors the card head).
+  // A batch edit names its file per `edits[]` entry, so the plain `path` read
+  // left the row blank for exactly the shape the schema advertises.
+  const path = String(args.filePath ?? editTargetOf(args) ?? "");
   if (path) {
     let p = path;
     const startRaw = args.offset ?? args.start;
@@ -3011,7 +3014,7 @@ export const ToolCallView = memo(function ToolCallView({
         }
       }
       if (!activity.diff) return;
-      const path = String(activity.args?.path ?? activity.args?.filePath ?? "");
+    const path = String(activity.args?.filePath ?? editTargetOf(activity.args) ?? "");
       const { content: current } = (await api.fsRead(root, path)) ?? {};
       const oldContent = applyReverseDiff(activity.diff, current ?? "");
       const ok = await api.fsWrite(root, path, oldContent);

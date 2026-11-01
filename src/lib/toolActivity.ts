@@ -1,6 +1,30 @@
 import type { DiffStats, SearchResultItem, SidecarEvent, ToolActivity } from "../types";
 import { isBrowserTool } from "./mcpTools";
 
+/**
+ * The file a writer call targets, as the model spelled it.
+ *
+ * `edit_file` accepts TWO shapes: one top-level `path`, or a batch whose paths
+ * live PER ENTRY (`edits: [{path, old_string, new_string}]`) with no top-level
+ * path at all. Reading only `path`/`filePath` therefore answered "" for every
+ * batch edit — and an empty path is what made such an edit render as a bare
+ * "Edited" card: no review path, so no diff preview, no +N/-M row, and the diff
+ * event (matched on this same path) attached to nothing. Mirrors the backend's
+ * `writer_target_path`, so both sides resolve a batch to the same file.
+ * Pure and shared, so no component re-implements the fallback.
+ */
+export function editTargetOf(args: Record<string, unknown> | undefined): string {
+  const named = args?.path ?? args?.filePath;
+  if (typeof named === "string" && named.trim()) return named;
+  const edits = args?.edits;
+  if (!Array.isArray(edits)) return "";
+  for (const e of edits) {
+    const p = (e as { path?: unknown } | null)?.path;
+    if (typeof p === "string" && p.trim()) return p;
+  }
+  return "";
+}
+
 /** Extract the +N / -M tally from a unified diff string (the `+++` / `---`
  *  file-header lines are skipped). */
 export function diffStatsFromUnified(diff: string): DiffStats {
@@ -20,14 +44,18 @@ export function diffStatsFromUnified(diff: string): DiffStats {
  * counted, so the header total always matches the listed files; activities
  * without a diff are skipped.
  */
-export function aggregateTurnStats(activities: ToolActivity[]): DiffStats {
+export function aggregateTurnStats(
+  activities: ToolActivity[],
+  keep?: (path: string) => boolean,
+): DiffStats {
   let adds = 0;
   let dels = 0;
   const walk = (list: ToolActivity[]) => {
     for (const a of list) {
       if (
         (a.tool === "edit_file" || a.tool === "write_file") &&
-        a.diff
+        a.diff &&
+        (!keep || keep(editTargetOf(a.args)))
       ) {
         const s = a.diffStats ?? diffStatsFromUnified(a.diff);
         adds += s.adds;
@@ -460,7 +488,7 @@ export function filesFromNativeResult(
   const argList: string[] = Array.isArray(args?.filePaths)
     ? (args?.filePaths as unknown[]).map(String)
     : [];
-  const argPath = String(args?.filePath ?? args?.path ?? argList[0] ?? "");
+  const argPath = String(args?.filePath ?? editTargetOf(args) ?? argList[0] ?? "");
   if (tool === "read" || tool === "write_file" || tool === "edit_file") {
     if (argList.length > 1) return argList.map((f) => ({ file: f }));
     return argPath ? [{ file: argPath }] : null;

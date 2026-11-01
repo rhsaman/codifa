@@ -7,6 +7,7 @@
 
 import type { ToolActivity } from "../types"
 import { aggregateTurnStats, diffStatsFromUnified } from "./toolActivity"
+import { buildReviewTurn, isReviewablePath } from "./reviewTurn"
 
 export {}
 
@@ -81,6 +82,36 @@ console.log('۵) aggregateTurnStats داخل children را هم می‌خوان�
   const parent: ToolActivity = ({ tool: "explore", args: {}, status: "done", children: [child] }) as any
   const t = aggregateTurnStats([parent])
   check('adds = 4', t.adds === 4, t)
+}
+
+console.log('۶) ویرایش بیرون ورک‌اسپیس از پنل Review حذف می‌شود:')
+{
+  const root = '/Users/u/proj'
+  check('absolute inside root', isReviewablePath(root, '/Users/u/proj/src/a.ts'))
+  check('relative is always in', isReviewablePath(root, 'src/a.ts'))
+  check('trailing slash on root still matches', isReviewablePath('/Users/u/proj/', '/Users/u/proj/a.ts'))
+  check('outside root is OUT', !isReviewablePath(root, '/tmp/split_tests.py'))
+  check('sibling prefix is not "inside"', !isReviewablePath(root, '/Users/u/proj-two/a.ts'))
+  check('home script is OUT', !isReviewablePath(root, '/Users/u/local-models-server/stt.py'))
+
+  const mk = (path: string, diff: string): ToolActivity =>
+    ({ tool: "edit_file", args: { path }, diff, status: "done" }) as any
+  const inside = mk('src/a.ts', diffOc)
+  const outside = mk('/tmp/split_tests.py', diffOpenai)
+
+  const turn = buildReviewTurn('m', [inside, outside], root)
+  check('only the workspace file is listed', turn?.files.length === 1, turn?.files)
+  check('it is the inside one', turn?.files[0]?.path === 'src/a.ts', turn?.files[0])
+  // The header total must match the list, or it advertises files that are not shown.
+  check('totals exclude the outside edit', turn?.adds === 2 && turn?.dels === 0, turn)
+
+  const onlyOutside = buildReviewTurn('m', [outside], root)
+  check('a turn of only-outside edits has no review', onlyOutside === null, onlyOutside)
+
+  // No root known (first paint, split panel): nothing absolute can be proven
+  // inside, so relative paths still list and absolute ones wait.
+  const noRoot = buildReviewTurn('m', [inside, outside], undefined)
+  check('without a root, relative still lists', noRoot?.files.length === 1, noRoot?.files)
 }
 
 if (failed > 0) {

@@ -54,6 +54,7 @@ import {
   applyToolEvent,
   applyToolOutputEvent,
   diffStatsFromUnified,
+  editTargetOf,
   makeToolActivity,
   resolveStuckActivities,
   resolveToolResult,
@@ -5218,8 +5219,7 @@ export function ChatPanel(props?: { chatId?: string; dimmed?: boolean }) {
         // diff to both cards. The backend sends path, so match on path first
         // and fall back to the legacy tool+running match when no card matches
         // (e.g. mid-turn reconnected stream).
-        const pathOf = (a: ToolActivity) =>
-          String(a.args?.path ?? a.args?.filePath ?? "");
+        const pathOf = (a: ToolActivity) => editTargetOf(a.args);
         const hasPath = typeof event.path === "string" && event.path !== "";
         const isTarget = (a: ToolActivity) =>
           a.tool === event.tool &&

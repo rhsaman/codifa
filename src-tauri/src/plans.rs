@@ -376,13 +376,24 @@ mod tests {
     }
 
     #[test]
-    fn workspace_slug_matches_python_layout() {
-        // Same basename+digest shape as state_db.workspace_slug_for_root so
-        // plans written by the Python sidecar are found by the native reader.
-        // The user's real on-disk plan dir is codifa-73cc528b — the digest must
-        // be a real SHA-1 (Python hashlib), not a custom hash.
-        let slug = workspace_slug_for_root("/Users/saman/Documents/code/codifa");
-        assert_eq!(slug, "codifa-73cc528b");
+    fn sha1_hex_matches_the_reference_digest() {
+        // The slug's `-<8 hex>` half MUST be a real SHA-1 (Python hashlib), or a
+        // plan the Python sidecar wrote is invisible to the native reader. Pinned
+        // on the canonical NIST/FIPS vectors, which are the same on every
+        // machine — NOT on someone's home directory.
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn workspace_slug_matches_the_sidecar_layout() {
+        // Same basename+digest shape as state_db.workspace_slug_for_root so plans
+        // written by the Python sidecar are found by the native reader. The path
+        // is a NEUTRAL fixture that exists on no machine: hard-coding one user's
+        // home directory made this assertion about that person's disk layout
+        // rather than about the slug function.
+        let slug = workspace_slug_for_root("/nonexistent-codifa-fixture/codifa-plan-layout");
+        assert_eq!(slug, "codifa-plan-layout-70917f10");
     }
 
     #[test]

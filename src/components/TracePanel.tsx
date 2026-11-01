@@ -43,6 +43,35 @@ export function getTraceTabCounts(entries: TraceEntry[], includeSub = false): Re
   return c;
 }
 
+/** 
+ * Args of a `tool` trace row, as readable text instead of one JSON line.
+ *
+ * A tool row stores its args as `serde_json::to_string(args)`, so the panel used
+ * to render a single wall of escaped JSON: `{"edits":[{"new_string":"  k = j\n
+ * while True:\n …` — the `\n` shown as two characters, the whole payload on one
+ * 200-char-wide line, and `old_string`/`new_string` indistinguishable from their
+ * keys. Pretty-printing the parsed value puts the real newlines back, so the
+ * change is legible at a glance and selectable line by line.
+ *
+ * A value that does not parse (a truncated or hand-appended payload) is returned
+ * untouched — dropping it would hide the only evidence of what was sent.
+ * Pure, so `tests/tracePanel.ui.test.tsx` can assert it.
+ */
+export function traceArgsText(raw: string): string {
+  const text = raw.trim();
+  if (!text) return raw;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return raw;
+  }
+  // A bare string/number is not worth a re-format: JSON.stringify would wrap it
+  // in quotes that were never in the payload.
+  if (parsed === null || typeof parsed !== "object") return raw;
+  return JSON.stringify(parsed, null, 2);
+}
+
 /** خلاصه تمیز یک ورودی برای ردیف تاشو — fallback وقتی summary خالی است. */
 export function traceRowTitle(entry: TraceEntry): string {
   if ((entry.summary || "").trim()) return entry.summary;
@@ -76,8 +105,7 @@ export function formatTraceEntryAsText(entry: TraceEntry): string {
   const meta: string[] = [];
   if (typeof entry.turn === "number" && Number.isFinite(entry.turn) && Number(entry.turn) > 0)
     meta.push(`turn=${Number(entry.turn)}`);
-  if (entry.model) meta.push(`model=${entry.model}`);
-  if (entry.tokens?.total) meta.push(`tokens=${entry.tokens.total}`);
+  if (entry.model) meta.push(`model=${entry.model}`);  if (entry.tokens?.total) meta.push(`tokens=${entry.tokens.total}`);
   if (typeof detail.step === "number") meta.push(`step=${Number(detail.step)}`);
   const status = String(detail.status || (entry.error ? "error" : "") || "");
   if (status) meta.push(`status=${status}`);
@@ -499,7 +527,14 @@ export function TraceRow({
                     ? "Prompt (sent to model)"
                     : "Prompt"
               }
-              text={prompt}
+              // A tool row stores its args as ONE JSON line, so the escaped `\n`
+              // inside an `edits[]` payload rendered as two literal characters.
+              // Pretty-printing restores the real newlines. Skipped while a
+              // search is active: the hit offsets were counted on the RAW text,
+              // and re-formatting would shift them.
+              text={
+                entry.kind === "tool" && !q ? traceArgsText(prompt) : prompt
+              }
               query={query}
               kind="prompt"
               hitBase={promptBase}

@@ -12,6 +12,7 @@ import { diffStatsFromUnified } from "../lib/toolActivity";
 import { providerApiKeys, useStore } from "../lib/store";
 import { useReviewPanel, type ReviewSource } from "../lib/reviewPanel";
 import { useViewerTabs } from "../lib/viewerTabs";
+import { useDiffScrollbars } from "../lib/useDiffScrollbars";
 import { onGitChange } from "../lib/liveEvents";
 import { ViewerFullscreenButton } from "./ViewerFullscreenButton";
 import { ComposerDiffBar } from "./ComposerDiffBar";
@@ -132,8 +133,12 @@ export function ReviewFileAccordion({
   wide?: boolean;
   root?: string;
 }) {
+  // This list is the diff pane's scroller (it owns both axes — see the
+  // `.review-files` comment), so it gets the animated overlay bars.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useDiffScrollbars(listRef, files.length);
   return (
-    <div className="review-files">
+    <div className="review-files" ref={listRef}>
       {files.map((f) => {
         const isOpen = f.path === selectedPath;
         return (

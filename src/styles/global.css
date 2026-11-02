@@ -545,58 +545,56 @@ body.coder-resizing .terminal-panel {
 }
 
 /* Hover-only scrollbars for the sidebar chat list, the side panel and every
-   right-docked viewer pane (file/text viewer, plan, git diff, trace, browser, the viewer tab strip, nested trace JSON, the schedule inbox's
-   message column and stacked body): the bars stay invisible until the pointer
-   is over the surface (keyboard and touch scrolling still work while hidden). */
+   right-docked viewer pane: SUPERSEDED by the app-wide drawn overlay bars
+   (installOverlayScrollbars) — the native bars stay hidden permanently so
+   they never fight the drawn thumb, and the drawn bar's hover widening does
+   the work. Diff surfaces were already on the drawn bars before this. */
 .sidebar-list,
 .right-panel-body,
-.diff-side,
 .schedule-inbox-list,
 .schedule-inbox-chat,
 .schedule-inbox-body,
 .trace-panel-list,
 .file-viewer-body,
 .plan-panel-body,
-.review-files,
 .files-list,
 .browser-stage,
 .codemap-tree,
 .tab-bar.viewer-tabs,
 .trace-detail-json,
 .panel-pane,
-.tab-list-menu {
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
+.tab-list-menu,
+.chat-scroll {
+  scrollbar-width: none;
 }
-.sidebar-list:hover,
-.right-panel-body:hover,
-.diff-side:hover,
-.schedule-inbox-list:hover,
-.schedule-inbox-chat:hover,
-.schedule-inbox-body:hover,
-.trace-panel-list:hover,
-.file-viewer-body:hover,
-.plan-panel-body:hover,
-.review-files:hover,
-.files-list:hover,
-.browser-stage:hover,
-.codemap-tree:hover,
-.tab-bar.viewer-tabs:hover,
-.trace-detail-json:hover,
-.panel-pane:hover,
-.tab-list-menu:hover {
-  scrollbar-color: var(--border) transparent;
+.sidebar-list::-webkit-scrollbar,
+.right-panel-body::-webkit-scrollbar,
+.schedule-inbox-list::-webkit-scrollbar,
+.schedule-inbox-chat::-webkit-scrollbar,
+.schedule-inbox-body::-webkit-scrollbar,
+.trace-panel-list::-webkit-scrollbar,
+.file-viewer-body::-webkit-scrollbar,
+.plan-panel-body::-webkit-scrollbar,
+.files-list::-webkit-scrollbar,
+.browser-stage::-webkit-scrollbar,
+.codemap-tree::-webkit-scrollbar,
+.tab-bar.viewer-tabs::-webkit-scrollbar,
+.trace-detail-json::-webkit-scrollbar,
+.panel-pane::-webkit-scrollbar,
+.tab-list-menu::-webkit-scrollbar,
+.chat-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .sidebar-list::-webkit-scrollbar-thumb,
 .right-panel-body::-webkit-scrollbar-thumb,
-.diff-side::-webkit-scrollbar-thumb,
 .schedule-inbox-list::-webkit-scrollbar-thumb,
 .schedule-inbox-chat::-webkit-scrollbar-thumb,
 .schedule-inbox-body::-webkit-scrollbar-thumb,
 .trace-panel-list::-webkit-scrollbar-thumb,
 .file-viewer-body::-webkit-scrollbar-thumb,
 .plan-panel-body::-webkit-scrollbar-thumb,
-.review-files::-webkit-scrollbar-thumb,
 .files-list::-webkit-scrollbar-thumb,
 .browser-stage::-webkit-scrollbar-thumb,
 .codemap-tree::-webkit-scrollbar-thumb,
@@ -608,14 +606,12 @@ body.coder-resizing .terminal-panel {
 }
 .sidebar-list:hover::-webkit-scrollbar-thumb,
 .right-panel-body:hover::-webkit-scrollbar-thumb,
-.diff-side:hover::-webkit-scrollbar-thumb,
 .schedule-inbox-list:hover::-webkit-scrollbar-thumb,
 .schedule-inbox-chat:hover::-webkit-scrollbar-thumb,
 .schedule-inbox-body:hover::-webkit-scrollbar-thumb,
 .trace-panel-list:hover::-webkit-scrollbar-thumb,
 .file-viewer-body:hover::-webkit-scrollbar-thumb,
 .plan-panel-body:hover::-webkit-scrollbar-thumb,
-.review-files:hover::-webkit-scrollbar-thumb,
 .files-list:hover::-webkit-scrollbar-thumb,
 .browser-stage:hover::-webkit-scrollbar-thumb,
 .codemap-tree:hover::-webkit-scrollbar-thumb,
@@ -15207,8 +15203,9 @@ body.coder-dragging .chat-split-child {
   border-radius: 8px;
   max-height: 360px;
   overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
+  /* The real bar is hidden — the drawn thumb eases 4px → 10px on its own
+     lane (useDiffScrollbars / the .sp-* rules), so it never reflows code. */
+  scrollbar-width: none;
   /* Two independent columns (before | after) laid out side-by-side with flex.
      Each column is its own block context, so selecting text in one can never
      drag the other along. `min-width: max-content` lets a column grow to fit
@@ -15220,28 +15217,122 @@ body.coder-dragging .chat-split-child {
     0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-/* اسکرول‌بار دیف توی چت: رنگ پررنگ‌تر تا روی بک‌گراند دیده بشه */
-.diff-side::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+/* ---- diff scrollbars: thin at rest, wider on BAR hover, theme-coloured ----
+   A native ::-webkit-scrollbar cannot be animated (Chromium reports the new
+   width/colour at once), so these scrollers hide theirs and useDiffScrollbars
+   paints a real lane + thumb on top (see that file). The palette is the global
+   scrollbar one (14% text at rest, 26% on hover) so a diff bar matches every
+   other bar in the app, including the thumb's 2px transparent inset. */
+.diff-unified,
+.diff-columns,
+.diff-col-code,
+.diff-preview-body {
+  scrollbar-width: none;
 }
 
-.diff-side::-webkit-scrollbar-track {
-  background: transparent;
+.diff-unified::-webkit-scrollbar,
+.diff-columns::-webkit-scrollbar,
+.diff-col-code::-webkit-scrollbar,
+.diff-preview-body::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
-.diff-side::-webkit-scrollbar-thumb {
-  background: transparent;
-  border-radius: 5px;
-  border: 2px solid var(--bg-raised);
+/* A scroller carrying drawn bars: its own bar is hidden — the drawn lanes
+   replace it. It stays the lanes' containing block (position: relative).
+   NO padding is reserved: the content scrolls under the thumb, macOS overlay
+   style. A dynamic inset here WAS the earlier flicker loop — it shrank
+   clientWidth, made the other axis look scrollable, re-showed its bar. */
+.sp-scroll {
+  position: relative;
+  scrollbar-width: none;
 }
 
-.diff-side:hover::-webkit-scrollbar-thumb {
-  background: var(--text-dim);
+.sp-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
-.diff-side::-webkit-scrollbar-thumb:hover {
-  background: var(--text);
+/* The bar's hit lane: it owns the pointer, the thumb only paints. It sits
+   BELOW the diff's hover popovers (copy/reply selection toolbar, comment box)
+   so a lane never blocks a press inside the diff.
+
+   place() sets every lane's left/top/width/height from JS each frame — these
+   defaults only keep the first paint sane. */
+.sp-bar {
+  position: absolute;
+  z-index: 3;
+  pointer-events: auto;
+  contain: layout style;
+}
+
+/* Defaults only — `place()` sets left/top/width/height for real. */
+.sp-bar[data-axis="y"] {
+  top: 0;
+  width: 12px;
+}
+
+.sp-bar[data-axis="x"] {
+  left: 0;
+  height: 12px;
+}
+
+/* The thumb, in the global scrollbar's exact palette (see the app-wide
+   `::-webkit-scrollbar-thumb`): a translucent sliver of --text with a 2px
+   transparent inset, i.e. a 4px pill inside the bar's own thickness. */
+.sp-thumb {
+  position: absolute;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  transition:
+    background-color 0.18s ease,
+    border-width 0.18s ease,
+    width 0.18s ease,
+    height 0.18s ease,
+    margin 0.18s ease;
+}
+
+.sp-thumb[data-axis="y"] {
+  width: 8px;
+  height: 0;
+  top: 0;
+  left: 50%;
+  margin-left: -4px;
+}
+
+.sp-thumb[data-axis="x"] {
+  height: 8px;
+  width: 0;
+  left: 0;
+  top: 50%;
+  margin-top: -4px;
+}
+
+/* Hovering the bar's own lane (never the window) widens the thumb to fill
+   its whole lane — a much bigger grab target — and brightens it to the
+   global hover tone; grabbing goes one step brighter. Its LENGTH never
+   changes: a longer thumb would poke out of the lane and drop the pointer
+   mid-drag. All steps are the app-wide scrollbar colours. */
+.sp-bar:hover .sp-thumb {
+  background: color-mix(in srgb, var(--text) 26%, transparent);
+}
+
+.sp-bar[data-axis="y"]:hover .sp-thumb {
+  width: 12px;
+  margin-left: -6px;
+}
+
+.sp-bar[data-axis="x"]:hover .sp-thumb {
+  height: 12px;
+  margin-top: -6px;
+}
+
+.sp-bar:active .sp-thumb {
+  background: color-mix(in srgb, var(--text) 40%, transparent);
 }
 
 /* Each column is a flex child: its rows stack vertically (one per line) and
@@ -19509,7 +19600,9 @@ body.coder-dragging .chat-split-child {
 }
 
 /* لیست آکاردئونی فایل‌ها — هر ردیف دیف خودش را زیر همان ردیف باز می‌کند، پس
-   خودِ لیست کل ارتفاع پنل را می‌گیرد و اسکرول عمودی می‌شود. */
+   خودِ لیست کل ارتفاع پنل را می‌گیرد و اسکرول عمودی می‌شود. اسکرول‌بارش را
+   useDiffScrollbars می‌کشد (نوار باریکِ هم‌رنگ تم که فقط با هاورِ خودِ نوار، روی
+   هر دو محور، نرم پهن می‌شود). */
 .review-files {
   flex: 1 1 auto;
   min-width: 0;
@@ -19520,6 +19613,10 @@ body.coder-dragging .chat-split-child {
      box is height-bounded, so its bar always sits on the visible bottom edge
      instead of at the end of a long diff. */
   overflow-x: auto;
+  /* The drawn bars (useDiffScrollbars) are absolute children of this box;
+     the hook also adds .sp-scroll in JS, this repeats it in CSS so the frame
+     exists from the first paint. */
+  position: relative;
 }
 
 .review-file-block {
@@ -19697,10 +19794,45 @@ body.coder-dragging .chat-split-child {
 /* Where the pane around the diff already scrolls (the right-docked Review list
    and the chat preview card), sideways scrolling lives THERE, not on the diff.
    A scroller as tall as the whole diff draws its bar at the diff's bottom
-   edge — below the fold for any long diff — so the bar looked missing. */
+   edge — below the fold for any long diff — so the bar looked missing.
+
+   The pane must then really be WIDER than it was: `overflow-x: visible` keeps
+   painting the long row but leaves it out of the pane's scrollable width (the
+   pane's scrollWidth stops at its own box), so the drawn horizontal bar had
+   nothing to travel and the code simply ran off the right edge with
+   scrollLeft pinned at 0. `min-width: max-content` (collapse the box to its
+   widest row, ancestor width still a floor) hands that width back — and it is
+   what the bar's scrollWidth/clientWidth maths measures. */
 .review-diff .diff-unified,
-.diff-preview-body .diff-unified {
+.diff-preview-body .diff-unified,
+.review-diff .diff-unified .diff-u-row,
+.diff-preview-body .diff-unified .diff-u-row {
   overflow-x: visible;
+  width: max-content;
+  min-width: 100%;
+}
+
+/* A single very long line must not stretch the whole Review list (the pane
+   around it) to its width: with the host scrollbar hidden the room a real bar
+   would take cannot be reclaimed by 100% descendants, so the row is capped to
+   the pane's visible width — the code scrolls under the drawn bar instead of
+   being clipped by an outer `overflow: hidden`. */
+.review-diff {
+  container-type: inline-size;
+}
+/* A host never grows for the drawn bars (see .sp-scroll): the diff scrolls
+   under the thumb, so the row box and its underline must span the FULL pane
+   width, bar or not. */
+.review-diff .diff-unified .diff-u-row {
+  max-width: none;
+}
+
+/* The Review list still owns both axes (the `.review-diff` rows never scroll
+   themselves); its real bar is hidden — the drawn overlay thumb in
+   useDiffScrollbars replaces it, so the bar can animate AND match the theme. */
+.review-files {
+  overflow: auto;
+  scrollbar-width: none;
 }
 
 /* گاتر علامت +/− با نوار رنگی کناری */

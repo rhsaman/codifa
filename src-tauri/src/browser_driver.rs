@@ -1448,7 +1448,7 @@ fn op_evaluate(d: &mut Driver, args: &Value) -> Result<Value, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "evaluate needs `expression`".to_string())?;
-    let value = d.eval(expr, true)?;
+    let value = d.eval(expr, true).map_err(evaluate_error_hint)?;
     let rendered = match &value {
         Value::String(s) => s.clone(),
         Value::Null => "(null)".to_string(),
@@ -1461,6 +1461,37 @@ fn op_evaluate(d: &mut Driver, args: &Value) -> Result<Value, String> {
         rendered
     };
     Ok(json!({"text": rendered}))
+}
+
+/// Turn a page-scope evaluation failure into a message that steers the NEXT step.
+///
+/// Traced (`mvyy1qf7`): nine consecutive `browser_evaluate` rounds died on
+/// `React is not defined` / `h is not a function` / `window.__ui.renderDiffPreview
+/// is not a function`, each a paid round-trip, because the raw CDP text named the
+/// symptom but never the cheaper path. The note names it, and only for the
+/// module-scope class of failure — a genuine page bug keeps its own error.
+fn evaluate_error_hint(err: String) -> String {
+    const MODULE_SCOPE_SIGNALS: [&str; 5] = [
+        "is not defined",
+        "is not a function",
+        "Cannot use import statement",
+        "Unexpected token '<'",
+        "jsx",
+    ];
+    let lower = err.to_lowercase();
+    if !MODULE_SCOPE_SIGNALS
+        .iter()
+        .any(|sig| lower.contains(&sig.to_lowercase()))
+    {
+        return err;
+    }
+    format!(
+        "{err}\n\n[note] `browser_evaluate` runs in PAGE scope, not the app's module scope: React, \
+         JSX, imported components and dev-server globals are NOT reachable from it. Do not try to \
+         build or import elements here — drive the real DOM instead (browser_snapshot → \
+         browser_click/browser_type/browser_fill_form), or read plain JS values \
+         (`getComputedStyle`, `querySelector(...).getBoundingClientRect()`, `innerText`)."
+    )
 }
 
 fn op_wait_for(d: &mut Driver, args: &Value) -> Result<Value, String> {
@@ -1955,7 +1986,15 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("browser_fill_form", "Fill several fields in one call: `fields: [{ref, value}]`."),
     ("browser_select_option", "Pick an option in a `<select>` by `ref` and `value`."),
     ("browser_press_key", "Press a key or combo, e.g. `Enter`, `Tab`, `Meta+A`."),
-    ("browser_evaluate", "Run JavaScript in the page and return its value."),
+    (
+        "browser_evaluate",
+        // Page scope, NOT a module scope: a `React is not defined` / `h is not a
+        // function` evaluation is a failed round, and a traced turn spent NINE of
+        // them hand-building React elements before giving up. The driver cannot
+        // import the page's bundler, so say so here — the cheap path is driving
+        // the real DOM (browser_click/browser_type) and reading plain JS values.
+        "Run plain JavaScript in the page and return its value. It runs in page scope: React, JSX and the app's own imports are NOT available, so never hand-build elements here — drive the real DOM with browser_click/browser_type/browser_fill_form and use this only to read values or check computed style.",
+    ),
     ("browser_wait_for", "Wait for text to appear/disappear, or a number of seconds."),
     ("browser_console_messages", "Console logs and uncaught exceptions."),
     ("browser_network_requests", "Requests the page made, with status codes."),
@@ -2123,6 +2162,25 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), total);
+    }
+
+    #[test]
+    fn browser_evaluate_says_it_cannot_reach_the_apps_modules() {
+        // Traced: nine consecutive `browser_evaluate` rounds died on
+        // `React is not defined` / `h is not a function`, because the model tried
+        // to hand-build elements inside an eval that runs in PAGE scope. Naming
+        // the limit in the tool description is what stops that loop before its
+        // first round.
+        let (_, desc) = ACTIONS
+            .iter()
+            .find(|(name, _)| *name == "browser_evaluate")
+            .expect("browser_evaluate must exist");
+        let lower = desc.to_lowercase();
+        assert!(lower.contains("page scope"), "{desc}");
+        assert!(lower.contains("not available"), "{desc}");
+        // ...and it must point at the DOM tools instead of leaving the model
+        // with no alternative.
+        assert!(lower.contains("browser_click"), "{desc}");
     }
 
     #[test]

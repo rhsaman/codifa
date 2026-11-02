@@ -28,6 +28,7 @@ import {
   splitCommentSegments,
   type CommentSpan,
 } from "../lib/diffComments";
+import { useDiffScrollbars } from "../lib/useDiffScrollbars";
 import { highlightSideLines, languageOfPath } from "../lib/highlight";
 import { copyToClipboard } from "../lib/clipboard";
 import { useViewerTabs } from "../lib/viewerTabs";
@@ -1283,6 +1284,12 @@ const DiffPreview = memo(function DiffPreview({
   // type or go nowhere (bug: "در پاپاپ دیف با lkjh اسکرول نمیشه").
   const cardRef = useRef<HTMLDivElement>(null);
   useVimScroll(cardRef);
+  // The card body owns BOTH axes (the diff inside is unified and wraps), so it
+  // gets the theme-coloured bars that ease wider on bar-hover.
+  const previewBodyRef = useRef<HTMLDivElement | null>(null);
+  useDiffScrollbars(previewBodyRef, diff);
+  // The drawn bar runs down the card's inner edge: keep the head clear of it
+  // (the body's own inset is CSS, see `.sp-scroll`).
   // The portal opens over the chat while the caret still sits in the composer;
   // useVimScroll treats a caret in an editable field as TYPING and never
   // scrolls. Same fix as the Review popup: take the caret into the card on
@@ -1338,7 +1345,7 @@ const DiffPreview = memo(function DiffPreview({
           and the comment editor are portaled to document.body, i.e. OUTSIDE
           this card: the hook that owns it keeps presses on them from closing
           it (see `useDiffPreview`). */}
-      <div className="diff-preview-body">
+      <div className="diff-preview-body" ref={previewBodyRef}>
         <DiffView diff={diff} path={path} layout="unified" />
       </div>
     </div>
@@ -1450,14 +1457,16 @@ export function DiffView({
   // Forced side-by-side still respects a measured narrow container (SSR
   // falls back to true until the first measure) so the view stays
   // responsive instead of locking two columns in a narrow panel.
-  const showSide =
-    layout === "unified"
-      ? false
-      : layout === "side-by-side"
-        ? measuredWidth > 0
-          ? shouldShowSideBySide(measuredWidth, threshold)
-          : true
-        : shouldShowSideBySide(measuredWidth, threshold);
+  const showSide = layout === "unified"
+    ? false
+    : layout === "side-by-side"
+      ? measuredWidth > 0
+        ? shouldShowSideBySide(measuredWidth, threshold)
+        : true
+      : shouldShowSideBySide(measuredWidth, threshold);
+  // The drawn bars follow the layout that is actually on screen, so switching
+  // unified/side-by-side re-measures instead of keeping the old insets.
+  useDiffScrollbars(measureRef, showSide ? `${diff}|side` : diff);
   // Syntax highlighting for the diff: each file side is highlighted as ONE
   // text (not line by line), so a token that spans lines — doc comment,
   // template literal, docstring — keeps its colour on all of its lines. The
@@ -1810,7 +1819,7 @@ export function DiffView({
   return (
     <div
       ref={measureRef}
-      className="diff-responsive"
+      className="diff-responsive sp-scroll"
       data-layout={showSide ? "side-by-side" : "unified"}
       onMouseUp={refreshHighlight}
       onKeyUp={refreshHighlight}

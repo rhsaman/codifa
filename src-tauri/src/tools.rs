@@ -60,6 +60,15 @@ const SKILL_LIST_MAX: usize = 30;
 /// How many search hits `load_skill query=` lists before asking the model to
 /// name one.
 const SKILL_SEARCH_MAX: usize = 8;
+
+/// Score a hit must reach, and beat the runner-up by MORE THAN double, before
+/// `load_skill query=` answers with its body instead of a candidate list.
+///
+/// Traced (`mvyy1qf7`): a query that named the right skill in several words
+/// still listed it beside three skills matching one filler word, so the model
+/// spent a SECOND call naming what the first call already knew — twice in one
+/// turn. A strict 2× lead is what separates "this is the one" from "a tie".
+const SKILL_DOMINANT_MIN_SCORE: usize = 2;
 const MAX_GREP_ALTERNATIVES: usize = 3;
 
 /// Identifiers are what `find_symbol` takes; anything else is grep-only.
@@ -1855,14 +1864,35 @@ fn format_rg_output(
     // ---- select: definitions first, then a fair spread ---------------------
     let mut selected: Vec<Vec<usize>> = files.iter().map(|_| Vec::new()).collect();
     let mut taken = 0usize;
-    'defs: for f in 0..files.len() {
-        let defs: Vec<usize> = files[f]
-            .matches
-            .iter()
-            .copied()
-            .filter(|i| looks_like_definition(&files[f].lines[*i].2))
-            .collect();
-        for i in defs.into_iter().take(3) {
+    // Declaration lines per file, computed once so both passes below agree on
+    // what counts as a definition.
+    let defs: Vec<Vec<usize>> = files
+        .iter()
+        .map(|f| {
+            f.matches
+                .iter()
+                .copied()
+                .filter(|i| looks_like_definition(&f.lines[*i].2))
+                .collect()
+        })
+        .collect();
+    // Pass 1 — ONE declaration per file. A single declaration-heavy file used to
+    // spend the whole budget here (up to three per file, in rg's walk order), so
+    // a later file's declaration never made the cut and the model re-grepped to
+    // find it. A share each guarantees the file that DEFINES the thing is never
+    // the one that gets cut.
+    for (f, list) in defs.iter().enumerate() {
+        if taken >= cap {
+            break;
+        }
+        if let Some(&i) = list.first() {
+            selected[f].push(i);
+            taken += 1;
+        }
+    }
+    // Pass 2 — the remaining declarations, still ahead of every call site.
+    'defs: for (f, list) in defs.iter().enumerate() {
+        for &i in list.iter().skip(1).take(2) {
             if taken >= cap {
                 break 'defs;
             }
@@ -3045,6 +3075,18 @@ fn search_skills(store_base: &str, query: &str) -> Result<String, String> {
     // Best hit first; `sort_by` is stable, so ties keep the store's own order
     // and the same query always answers the same thing.
     scored.sort_by(|a, b| b.0.cmp(&a.0));
+    // A CLEARLY dominant hit answers here: when the best score beats the runner-up
+    // outright, listing candidates and waiting for a second call is a wasted
+    // round. Traced (`mvyy1qf7`): `load_skill(query:"Test UI live browser harness
+    // renderer")` listed Test UI beside three skills that matched one filler word,
+    // and the model then spent the SECOND call naming it — twice in one turn.
+    let dominant = scored
+        .first()
+        .map(|(best, _)| {
+            *best >= SKILL_DOMINANT_MIN_SCORE
+                && scored.get(1).map(|(next, _)| next * 2 < *best).unwrap_or(true)
+        })
+        .unwrap_or(false);
     match scored.len() {
         0 => Err(format!(
             "no skill matches {query:?}. Available: {}",
@@ -3052,7 +3094,8 @@ fn search_skills(store_base: &str, query: &str) -> Result<String, String> {
         )),
         // Exactly one skill fits the words: returning its body saves the model
         // the second call it would have spent naming it.
-        1 => Ok(skill_body(scored[0].1)),
+        1 => Ok(skill_body(&scored[0].1)),
+        _ if dominant => Ok(skill_body(&scored[0].1)),
         _ => {
             let mut out = String::from(
                 "Several skills match — call load_skill again with the `name` of the right one:\n",
@@ -4232,6 +4275,76 @@ fn is_outline_line(line: &str) -> bool {
     OUTLINE_KEYWORDS.contains(&word)
 }
 
+/// Rows a landmark map may spend. A landmark map spans the whole file, so its
+/// size is capped apart from the declaration cap: measured on this repo's
+/// `global.css`, 120 rows came to 8.8K chars — too much to rider on a read
+/// result, while 64 rows still name every ~470 lines.
+const LANDMARK_MAP_ROWS: usize = 64;
+
+/// A column-0 COMMENT: the strongest navigation landmark a stylesheet or markup
+/// file has, because it names a whole section rather than one rule inside it.
+fn is_section_banner(line: &str) -> bool {
+    if line.chars().next().is_some_and(char::is_whitespace) {
+        return false;
+    }
+    let t = line.trim_start();
+    t.starts_with("/*") || t.starts_with("//") || t.starts_with("#")
+}
+
+/// Column-0 line that names WHERE the reader is: a comment banner, a stylesheet
+/// selector, an `@rule`, a markup tag or a markdown heading.
+///
+/// This is the stylesheet/markup counterpart of a declaration line: such a file
+/// has no functions to list, so the only thing a map can say about it is which
+/// section starts where.
+fn is_landmark_line(line: &str) -> bool {
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
+    if first.is_whitespace() {
+        return false;
+    }
+    let t = line.trim_start();
+    is_section_banner(line) || t.starts_with('@') || t.starts_with('<') || t.ends_with('{')
+}
+
+/// A map for a file that declares NOTHING (stylesheets, markup, data files).
+///
+/// Advances in equal shares of the file and reports the first landmark inside
+/// each, so the map SPANS the whole thing instead of naming its first 120 lines
+/// and stopping. Returns the rows and the stride used, so the header can say how
+/// coarse the map is.
+fn landmark_rows(lines: &[&str], budget: usize, query: &str) -> (Vec<(usize, String)>, usize) {
+    const ROW_CHARS: usize = 100;
+    if lines.is_empty() || budget == 0 {
+        return (Vec::new(), 0);
+    }
+    let stride = lines.len().div_ceil(budget).max(1);
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() && rows.len() < budget {
+        let stop = (start + stride).min(lines.len());
+        let share = &lines[start..stop];
+        // A share is named by its BANNER when it has one (a comment marks a new
+        // section, a selector only marks one rule inside it); otherwise by its
+        // first landmark, and failing that by its first non-blank line — so the
+        // map never develops a hole it cannot name.
+        let hit = share
+            .iter()
+            .position(|l| is_section_banner(l))
+            .or_else(|| share.iter().position(|l| is_landmark_line(l)))
+            .or_else(|| share.iter().position(|l| !l.trim().is_empty()));
+        if let Some(i) = hit {
+            let text: String = share[i].trim_end().chars().take(ROW_CHARS).collect();
+            if query.is_empty() || text.to_lowercase().contains(query) {
+                rows.push((start + i + 1, text));
+            }
+        }
+        start = stop;
+    }
+    (rows, stride)
+}
+
 /// Definition lines of ONE file, without a language server.
 ///
 /// `lsp_symbols` needs a WARM server, and on the languages that matter most here
@@ -4271,6 +4384,23 @@ pub(crate) fn native_outline(abs: &Path, query: &str) -> Result<String, String> 
         }
     }
     let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    // A stylesheet or markup file declares no functions, so the scan above finds
+    // nothing — yet those are exactly the files that get walked window by window.
+    // MEASURED (trace `mvyy1qf7`): ONE turn took 30 separate `read` windows of
+    // `src/styles/global.css` (67_639 chars) and the file never once carried a
+    // map, because this outline answered "no definition lines". A landmark map
+    // costs one call's worth of chars and spans the whole file.
+    let mut stride = 0usize;
+    let mut landmark = false;
+    if rows.is_empty() {
+        let (sampled, step) = landmark_rows(&lines, LANDMARK_MAP_ROWS, &q);
+        if !sampled.is_empty() {
+            rows = sampled;
+            total_rows = rows.len();
+            stride = step;
+            landmark = true;
+        }
+    }
     if rows.is_empty() {
         return Ok(format!(
             "No definition lines in {name} ({} lines) — this outline sees no functions, types \
@@ -4278,11 +4408,19 @@ pub(crate) fn native_outline(abs: &Path, query: &str) -> Result<String, String> 
             lines.len()
         ));
     }
-    let mut out = format!(
-        "OUTLINE {name} — {} definition line(s) of {} total (native: no language server started)\n",
-        rows.len(),
-        lines.len()
-    );
+    let mut out = if landmark {
+        format!(
+            "OUTLINE {name} — landmark map, one row per ~{stride} lines of {} total \
+             (this file declares no functions, so there is no language-server outline)\n",
+            lines.len()
+        )
+    } else {
+        format!(
+            "OUTLINE {name} — {} definition line(s) of {} total (native: no language server started)\n",
+            rows.len(),
+            lines.len()
+        )
+    };
     for (n, text) in &rows {
         out.push_str(&format!("{n}: {text}\n"));
     }
@@ -4293,10 +4431,13 @@ pub(crate) fn native_outline(abs: &Path, query: &str) -> Result<String, String> 
             total_rows - rows.len()
         ));
     }
-    out.push_str(
+    out.push_str(if landmark {
+        "\nNow `read` the section you need by its line number (offset/limit) — a stylesheet is \
+         navigated by section, not by declaration.\n"
+    } else {
         "\nNow `read` ONLY the window you need (offset/limit) — do not walk the file. \
-         `lsp_definition` still starts a language server when exact cross-file precision matters.\n",
-    );
+         `lsp_definition` still starts a language server when exact cross-file precision matters.\n"
+    });
     Ok(out)
 }
 
@@ -4351,13 +4492,30 @@ fn outline_note_once(abs: &Path, path_label: &str) -> String {
     let key = fs::canonicalize(abs)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| abs.to_string_lossy().into_owned());
+    if let Ok(seen) = OUTLINE_CLAIMED.lock() {
+        if seen.iter().any(|s| s == &key) {
+            return String::new();
+        }
+    }
+    // Claim AFTER the map exists, never before. Traced (`mvyy1qf7`): one turn took
+    // 30 `read` windows of `src/styles/global.css` and only the LAST one carried a
+    // map — the earlier attempt returned an empty note (no declarations to name at
+    // that moment) yet had already consumed the file's one claim, so every later
+    // window of the largest file in the repo stayed blind for the rest of the turn.
+    // An attempt that attached nothing must leave the claim open.
+    let note = outline_note(abs, path_label);
+    if note.is_empty() {
+        return note;
+    }
     if let Ok(mut seen) = OUTLINE_CLAIMED.lock() {
+        // Another read of the same file may have won the race while this map was
+        // being built; sending it twice is the cost this claim exists to avoid.
         if seen.iter().any(|s| s == &key) {
             return String::new();
         }
         seen.push(key);
     }
-    outline_note(abs, path_label)
+    note
 }
 
 /// Forgets which files already carried their outline.
@@ -4369,6 +4527,25 @@ pub(crate) fn reset_outline_claims() {
     if let Ok(mut seen) = OUTLINE_CLAIMED.lock() {
         seen.clear();
     }
+}
+
+/// Serializes the tests that mutate [`OUTLINE_CLAIMED`].
+///
+/// The set is process-global and production resets it per turn, so two tests
+/// calling `reset_outline_claims` in parallel clear each other's claim mid-run —
+/// MEASURED: `a_grep_hit_carries_the_outline_of_the_file_it_found` failed in 5
+/// of 10 full-suite runs while passing alone every time. A shared guard makes
+/// those tests observe their own claim; it costs nothing outside `cfg(test)`.
+#[cfg(test)]
+static OUTLINE_CLAIM_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold this for the whole body of any test that claims or resets an outline.
+#[cfg(test)]
+fn outline_claim_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A poisoned guard means an earlier claimant panicked; the state it guarded
+    // is a plain set that the next `reset_outline_claims` clears, so recovering
+    // is correct here and keeps one failure from cascading into the others.
+    OUTLINE_CLAIM_GUARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Definition(s) with their bodies plus the usages of ONE identifier, in a
@@ -4668,6 +4845,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
+        let _claim = outline_claim_lock();
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         // Larger than READ_OUTLINE_MIN_LINES, or a window IS the outline.
@@ -4944,6 +5122,46 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A file that declares nothing still gets a map that SPANS it.
+    ///
+    /// Traced (`mvyy1qf7`): one turn took 30 separate `read` windows of
+    /// `src/styles/global.css` because the outline answered "no definition
+    /// lines" — the model had no map of a 30k-line stylesheet and walked it.
+    #[test]
+    fn native_outline_maps_a_stylesheet_by_landmarks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codifa-landmark-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let css = tmp.join("a.css");
+        let mut body = String::from("/* \u{2500}\u{2500} tokens \u{2500}\u{2500} */\n:root {\n  --bg: #000;\n}\n");
+        // Far more lines than the row budget, so the map must SAMPLE rather than
+        // spend every row on the top of the file.
+        for i in 0..2_000 {
+            body.push_str(&format!(".rule-{i} {{\n  color: red;\n}}\n"));
+        }
+        body.push_str("/* \u{2500}\u{2500} the very last section \u{2500}\u{2500} */\n.tail {\n  color: blue;\n}\n");
+        fs::write(&css, &body).unwrap();
+
+        let out = native_outline(&css, "").unwrap();
+        assert!(out.contains("landmark map"), "must say what kind of map: {out}");
+        // Spans the file: a row near the end proves it is not the first-N cap.
+        assert!(out.contains("the very last section"), "map stops early: {out}");
+        let rows = out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count();
+        assert!(rows > 20, "too coarse to navigate: {rows} rows");
+
+        // A real declaration file is unaffected: definitions win over landmarks.
+        let rs = tmp.join("b.rs");
+        fs::write(&rs, "pub fn only() {}\n").unwrap();
+        let r = native_outline(&rs, "").unwrap();
+        assert!(!r.contains("landmark map"), "{r}");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
     /// The map is claimed ONCE per file per turn: the first window carries it,
     /// every later window of that same file stays plain.
     #[test]
@@ -4953,6 +5171,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
+        let _claim = outline_claim_lock();
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let big = tmp.join("big.rs");
@@ -4976,6 +5195,46 @@ mod tests {
         fs::write(&small, "pub fn only() {}\n").unwrap();
         reset_outline_claims();
         assert!(outline_note_once(&small, "small.rs").is_empty());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// An attempt that attaches NO map must leave the file's one claim open.
+    ///
+    /// Traced (`mvyy1qf7`): one turn took 30 windows of `src/styles/global.css`
+    /// and only the last carried a map — the earlier attempt answered empty (the
+    /// file declares nothing) but had already consumed the claim, so every window
+    /// after it stayed blind for the rest of the turn.
+    #[test]
+    fn an_empty_outline_does_not_consume_the_file_claim() {
+        let tmp = std::env::temp_dir().join(format!(
+            "codifa-outline-claim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _claim = outline_claim_lock();
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("blank.css");
+        // Big enough to earn an outline, but nothing to name yet: the map is empty.
+        let blank: String = (0..(READ_OUTLINE_MIN_LINES + 20)).map(|_| "\n").collect();
+        fs::write(&f, blank).unwrap();
+
+        reset_outline_claims();
+        assert!(outline_note_once(&f, "blank.css").is_empty());
+        // The file gains real sections. The claim must still be open, so THIS call
+        // is the one that carries the map.
+        let real: String = (0..(READ_OUTLINE_MIN_LINES + 20))
+            .map(|i| format!(".rule-{i} {{\n  color: red;\n}}\n"))
+            .collect();
+        fs::write(&f, real).unwrap();
+        let after = outline_note_once(&f, "blank.css");
+        assert!(
+            after.contains(READ_OUTLINE_MARK),
+            "an empty attempt must not burn the claim: {after:?}"
+        );
+        // And the claim IS spent once a map actually went out.
+        assert!(outline_note_once(&f, "blank.css").is_empty());
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -5530,22 +5789,87 @@ token mid 3
         // Walk-order LAST file: the target declaration.
         fs::write(tmp.join("z_late.rs"), "let token = 1;\nstruct token_target;\n").unwrap();
         let out = grep_scope(&tmp, "", "token", "", 3, 0, false).unwrap();
-        // The buried declaration in the first file made the cut...
+        // rg's file walk order is NOT stable, so these assertions are written
+        // order-independently: they hold whichever file rg emits first.
+        //
+        // Both declarations made the budget: one file carrying a declaration can
+        // no longer spend the whole allowance and starve the file that DEFINES
+        // the symbol the model is hunting.
         assert!(
             out.contains("struct token_def"),
             "definition line must beat call sites inside the budget:\n{out}"
         );
-        // ...AND the late file's declaration got a share (fair spread)...
         assert!(
             out.contains("struct token_target"),
             "a later file's definition must not be eaten by the first file:\n{out}"
         );
-        // ...AND the unseen mass is announced instead of silently cut.
+        // Every matching file is ACCOUNTED FOR: it either shows a block or is
+        // named with its hit count. A file silently dropped is a round trip the
+        // model spends re-grepping to discover it existed.
+        for name in ["a_noise.rs", "m_mid.rs", "z_late.rs"] {
+            assert!(
+                out.contains(name),
+                "{name} vanished from the budget report:\n{out}"
+            );
+        }
         assert!(
-            out.contains("not shown"),
-            "files past the budget must be named with their hit count:\n{out}"
+            out.contains("not shown") || !out.contains("truncated"),
+            "a truncated budget must say what it hid:\n{out}"
         );
-        assert!(out.contains("truncated"), "{out}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Whatever the budget cuts must still be NAMED with its hit count.
+    ///
+    /// A file silently dropped from the display is a round trip the model spends
+    /// re-grepping to learn it existed. Cap 1 with two declaring files makes the
+    /// cut unavoidable, so the announcement is asserted without depending on
+    /// rg's file order.
+    #[test]
+    fn a_file_the_budget_cannot_reach_is_named_with_its_mass() {
+        let tmp = std::env::temp_dir().join(format!("codifa-grep-mass-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("one.rs"), "struct token_one;\n").unwrap();
+        fs::write(tmp.join("two.rs"), "struct token_two;\n").unwrap();
+        let out = grep_scope(&tmp, "", "struct token_", "", 1, 0, false).unwrap();
+        // Exactly one of the two fits; the other must be announced, not hidden.
+        let hidden = out.matches("not shown").count();
+        assert_eq!(hidden, 1, "exactly one file must be reported unseen:\n{out}");
+        let shown = out.matches("struct token_").count();
+        assert_eq!(shown, 1, "the budget of 1 must show exactly one hit:\n{out}");
+        for name in ["one.rs", "two.rs"] {
+            assert!(out.contains(name), "{name} vanished from the report:\n{out}");
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// One declaration-heavy file must not starve every other file's.
+    ///
+    /// Traced (`mvyy1qf7`, 74 rounds): refinement chains re-grepped with a
+    /// narrower pattern because the first file's declarations filled the budget
+    /// and the file defining the symbol was cut. Pass 1 now gives every
+    /// declaring file a share before ANY file takes a second line.
+    #[test]
+    fn one_declaration_heavy_file_cannot_starve_the_others() {
+        let tmp = std::env::temp_dir().join(format!("codifa-grep-starve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Many declarations, so a per-file allowance of several would fill a
+        // small budget with this file alone.
+        let mut heavy = String::new();
+        for i in 0..8 {
+            heavy.push_str(&format!("struct token_heavy_{i} {{ x: u8 }}\n"));
+        }
+        fs::write(tmp.join("a_heavy.rs"), heavy).unwrap();
+        fs::write(tmp.join("z_only.rs"), "struct token_only { y: u8 }\n").unwrap();
+        let out = grep_scope(&tmp, "", "token_", "", 3, 0, false).unwrap();
+        // Whichever file rg walked first, the single-declaration file keeps a
+        // slot: the fair share is decided BEFORE any file gets a second line.
+        assert!(
+            out.contains("struct token_only"),
+            "the only declaration of a second file must survive a heavy neighbour:\n{out}"
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 

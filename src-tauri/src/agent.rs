@@ -3177,23 +3177,30 @@ fn tool_schemas(allow_create: bool, allow_browser: bool) -> Vec<Value> {
         ),
         (
             "edit_file",
-            "Replace exact strings in existing files. Put EVERY replacement you know in ONE call via `edits`, and an entry may name its own `path` — a batch across files still costs ONE call, run IN ORDER.",
+            // A batch MUST name its file per entry. The schema used to say only
+            // "an entry MAY name its own path", and the model duly sent
+            // `{edits:[{old_string,new_string}]}` with no path anywhere — refused
+            // as "no file named" and a whole round was spent relearning that.
+            // The rule is now stated in the description AND enforced by `required`,
+            // so the nameless shape is not constructible in the first place.
+            "Replace exact strings in existing files. Put EVERY replacement you know in ONE call via `edits`, and give `path` on EVERY entry — a batch across files still costs ONE call, run IN ORDER. A call with neither a top-level `path` nor a `path` per entry names no file and is refused.",
             json!({
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": "The file to edit — required for the single-edit form; when using `edits`, put `path` on every entry instead."},
                 "old_string": {"type": "string"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean"},
                 "edits": {
                     "type": "array",
+                    "description": "Independent replacements, all applied IN ORDER in this one step.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string"},
+                            "path": {"type": "string", "description": "File this entry targets — required on every entry."},
                             "old_string": {"type": "string"},
                             "new_string": {"type": "string"},
                             "replace_all": {"type": "boolean"}
                         },
-                        "required": ["old_string", "new_string"]
+                        "required": ["path", "old_string", "new_string"]
                     }
                 }
             }),
@@ -7557,7 +7564,7 @@ call fetch_url again with offset={next} for the rest]",
         // of them (wallpaper, exactly as the 423-of-863 corpus measurement
         // predicted). Sub-agent and explore shapes are unchanged — they are
         // already rare and correctly worded.
-        if single_call_is_serial(&req.mode, &tool_calls) {
+        if single_call_is_serial(&req.mode, &tool_calls, &root) {
             lone_mutating_rounds += 1;
         } else {
             lone_mutating_rounds = 0;
@@ -7585,14 +7592,14 @@ call fetch_url again with offset={next} for the rest]",
         let hint: Option<Cow<'_, str>> = if hints_are_quiet {
             discovery_streak_hint(&req.mode, discovery_streak)
                 .map(Cow::Borrowed)
-                .or_else(|| single_call_hint(&req.mode, &tool_calls, lone_mutating_rounds))
+                .or_else(|| single_call_hint(&req.mode, &tool_calls, lone_mutating_rounds, &root))
         } else {
             // The escalating form keeps this slot for the WHOLE turn. It used to
             // yield to `discovery_streak_hint` once its cap was spent — and that
             // hint returns `None` unless the streak sits exactly on 3 or 7, so
             // the round went silent in the one state the counter proves is
             // wasteful: a long run of lone shell rounds.
-            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds)
+            round_hint(&req.mode, &tool_calls, discovery_streak, lone_mutating_rounds, &root)
         };
         // Which lever spoke, counted apart: `hints_delivered` sums both, so it
         // rose on rounds where the model had in fact batched (traced:
@@ -9752,16 +9759,34 @@ fn round_hint(
     calls: &[(String, String, String)],
     streak: usize,
     lone_rounds: usize,
+    root: &str,
 ) -> Option<Cow<'static, str>> {
     discovery_streak_hint(mode, streak)
         .map(Cow::Borrowed)
-        .or_else(|| single_call_hint(mode, calls, lone_rounds))
+        .or_else(|| single_call_hint(mode, calls, lone_rounds, root))
+}
+
+/// True when a lone `run_terminal` command is a pure READ, i.e. one the backend
+/// already runs inside the CONCURRENT read-only batch (see the `is_shell_read_only`
+/// split in the step runner).
+///
+/// Traced (`mvxsy14e`): 80 lone `run_terminal` rounds, 39 of them pure reads
+/// (`git log`, `du`, `ls`, a `python3` script over trace JSON). The batching
+/// levers skipped `run_terminal` wholesale on the "probe chain" argument, so
+/// those 39 cost a full round-trip each and were never named. What makes a shell
+/// round a chain is MUTATION, not the shell: a read-only command's arguments do
+/// not come from the previous result, so it is exactly as batchable as a `grep`.
+fn shell_read_is_batchable(raw_args: &str, root: &str) -> bool {
+    let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
+    let cmd = args["command"].as_str().unwrap_or_default();
+    !cmd.trim().is_empty() && is_shell_read_only(cmd, root)
 }
 
 fn single_call_hint(
     mode: &str,
     calls: &[(String, String, String)],
     lone_rounds: usize,
+    root: &str,
 ) -> Option<Cow<'static, str>> {
     if calls.len() != 1 {
         return None;
@@ -9829,6 +9854,20 @@ fn single_call_hint(
     // ~350 chars each, all of which stayed in the re-sent history and moved the
     // model zero times. Left in the list only the shapes where a batch is
     // actually possible — the file writes, which are independent by nature.
+    // A READ-ONLY shell command is the largest batchable group the whitelist
+    // missed: it runs in the same concurrent batch as the lookups, yet the
+    // "probe chain" rule silenced the hint for every `run_terminal` round. The
+    // wording must therefore promise CONCURRENCY here, never ordering.
+    if name == "run_terminal" && shell_read_is_batchable(&calls[0].2, root) {
+        if lone_rounds <= 1 {
+            return Some(Cow::Borrowed(
+                "[hint] That step had ONE call. This command only READS, so it runs in the SAME concurrent batch as other lookups — and every step re-sends the whole conversation. Put the remaining commands, reads and greps you already know you need in the SAME step.",
+            ));
+        }
+        return Some(Cow::Owned(format!(
+            "[hint] {lone_rounds} rounds in a row have now delivered ONE call each. A read-only command runs in the same concurrent batch as the lookups, so the commands, reads and greps you already know you need belong in the SAME step — every extra step re-sends the whole conversation."
+        )));
+    }
     if matches!(name, "edit_file" | "write_file" | "artifact") {
         return Some(Cow::Owned(single_call_hint_text(lone_rounds)));
     }
@@ -9851,9 +9890,15 @@ fn single_call_hint(
 /// call is a probe CHAIN whose arguments come from the previous result — there
 /// is nothing to batch, so counting it would grow the streak while the hint
 /// stays silent and the field would report waste that was never addressable.
-fn single_call_is_serial(mode: &str, calls: &[(String, String, String)]) -> bool {
+fn single_call_is_serial(mode: &str, calls: &[(String, String, String)], root: &str) -> bool {
     if mode == "subagent" || calls.len() != 1 {
         return false;
+    }
+    // A shell round is a CHAIN only when it MUTATES. A read-only command shares
+    // the concurrent lookup batch, so a lone one is as batchable as a lone
+    // `grep` and must grow the streak (see `shell_read_is_batchable`).
+    if calls[0].1 == "run_terminal" {
+        return shell_read_is_batchable(&calls[0].2, root);
     }
     // The whole read-only family, because that is the set that really runs as one
     // concurrent batch (`READONLY_NATIVE_TOOLS`). The four LSP lookups were
@@ -13086,8 +13131,14 @@ mod tests {
             // is those field declarations, and it lands on the PLAIN budgets too
             // because `tool_schemas` always holds the full form — the compact
             // swap happens at request assembly (`compact_plugin_schema`).
-            ("main", tool_schemas(false, false), 15_700usize),
-            ("main+browser", tool_schemas(false, true), 21_400),
+            // Re-based when `edit_file`'s batch shape and `browser_evaluate`'s
+            // description started stating their own rules: a batch entry MUST
+            // carry `path` (a nameless batch cost a traced round), and an eval
+            // runs in page scope (nine traced rounds died trying to reach React
+            // from it). Both are one-time prose, paid on every round, so the
+            // ceilings move with the measurement as usual.
+            ("main", tool_schemas(false, false), 15_800usize),
+            ("main+browser", tool_schemas(false, true), 21_900),
             // Raised when the `plugin` tool learned `scripts`/`run`: a capability
             // addition is exactly what this ceiling exists to make deliberate.
             // Raised again for the `artifact` schema's `files` field: an artifact
@@ -13098,8 +13149,8 @@ mod tests {
             // EAGER inlining of every connector's whole catalogue. That trade is
             // the point: +243 chars of native schema bought back ~236K chars of
             // connector schemas on a trace where one connector was switched on.
-            ("main+authoring", tool_schemas(true, false), 22_900),
-            ("main+authoring+browser", tool_schemas(true, true), 28_700),
+            ("main+authoring", tool_schemas(true, false), 23_100),
+            ("main+authoring+browser", tool_schemas(true, true), 28_900),
             ("explore", research_schemas(), 8_800),
         ] {
             let got = chars(&schemas);
@@ -13230,6 +13281,33 @@ mod tests {
         assert!(
             files.contains("keeps the files already stored"),
             "an update without files must be documented as non-destructive: {files}"
+        );
+    }
+
+    #[test]
+    fn edit_file_schema_forbids_a_nameless_batch() {
+        // Traced: the model sent `{edits:[{old_string,new_string}]}` — no `path`
+        // anywhere — because the schema said an entry MAY carry one. The call was
+        // refused as "no file named" and the correction cost a whole round. The
+        // nameless shape must not be constructible, so the requirement is in the
+        // JSON schema itself, not only in the handler's message.
+        let schemas = tool_schemas(false, false);
+        let edit = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "edit_file")
+            .expect("edit_file must be advertised");
+        let params = &edit["function"]["parameters"];
+        let required: Vec<&str> = params["properties"]["edits"]["items"]["required"]
+            .as_array()
+            .expect("every edits entry declares its required fields")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(required.contains(&"path"), "a batch entry must name its file: {required:?}");
+        let desc = edit["function"]["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.to_lowercase().contains("every entry"),
+            "the prose must match the schema: {desc}"
         );
     }
 
@@ -13389,21 +13467,22 @@ mod tests {
 
     #[test]
     fn single_call_steps_get_a_batching_hint() {
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = |name: &str| vec![("c1".to_string(), name.to_string(), "{}".to_string())];
         // The explore sub-agent: one lookup per step burns rounds.
-        assert!(single_call_hint("subagent", &one("grep"), 1)
+        assert!(single_call_hint("subagent", &one("grep"), 1, root)
             .unwrap()
             .contains("NEXT step"));
         // The main agent: a single broad explore wastes the concurrent fan-out
         // (a traced turn fired one wide explore and got a 4-round report).
-        let main = single_call_hint("agent", &one("explore"), 1).unwrap();
+        let main = single_call_hint("agent", &one("explore"), 1, root).unwrap();
         assert!(main.contains("CONCURRENTLY") && main.contains("2-4 focused explores"), "{main}");
         // Batched steps are left alone, and so is a single non-explore call.
         let two = vec![
             ("a".to_string(), "grep".to_string(), "{}".to_string()),
             ("b".to_string(), "read".to_string(), "{}".to_string()),
         ];
-        assert!(single_call_hint("subagent", &two, 1).is_none());
+        assert!(single_call_hint("subagent", &two, 1, root).is_none());
         // Native WRITE tools still get the hint: a lone file write is precisely
         // the shape a batch fixes, so the wording promises ordering, not
         // parallelism. `run_terminal` and the browser act-then-observe tools were
@@ -13411,28 +13490,54 @@ mod tests {
         // arguments come from the previous result, so the hint is an instruction
         // the model cannot obey (59 such rounds, 50 firings, zero effect).
         for name in ["edit_file", "write_file"] {
-            let hint = single_call_hint("agent", &one(name), 1).unwrap();
+            let hint = single_call_hint("agent", &one(name), 1, root).unwrap();
             assert!(hint.contains("IN ORDER"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
-        for name in ["run_terminal", "browser_evaluate", "browser_navigate"] {
+        // A SHELL round is a chain only when its command MUTATES, so a bare
+        // `run_terminal` with no command carries nothing to batch and stays silent.
+        assert!(single_call_hint("agent", &one("run_terminal"), 1, root).is_none());
+        for name in ["browser_evaluate", "browser_navigate"] {
             assert!(
-                single_call_hint("agent", &one(name), 1).is_none(),
+                single_call_hint("agent", &one(name), 1, root).is_none(),
                 "{name} is a probe chain, not a missed batch — it must stay silent"
             );
         }
+        let mutating = |cmd: &str| {
+            vec![(
+                "c1".to_string(),
+                "run_terminal".to_string(),
+                json!({"command": cmd}).to_string(),
+            )]
+        };
+        for cmd in ["rm -rf /tmp/x", "mv a b", "touch new.rs", "echo hi > f.txt"] {
+            assert!(
+                single_call_hint("agent", &mutating(cmd), 1, root).is_none(),
+                "{cmd} mutates and must stay silent"
+            );
+        }
+        // A READ-ONLY command is the one shell shape that IS a missed batch: the
+        // backend already runs it in the concurrent lookup batch.
+        let read_hint = single_call_hint("agent", &mutating("git status --porcelain"), 1, root)
+            .expect("a read-only command must be named as batchable");
+        assert!(read_hint.contains("concurrent"), "{read_hint}");
+        assert!(read_hint.contains("SAME step"), "{read_hint}");
+        assert!(
+            !read_hint.contains("IN ORDER"),
+            "a read is concurrent, never ordered: {read_hint}"
+        );
         // A whole-artifact write is a file write and stays in the set; the
         // browser viewport/emulation calls are act-then-observe like the rest of
         // the browser group and must stay silent.
         for name in ["artifact"] {
-            let hint = single_call_hint("agent", &one(name), 1)
+            let hint = single_call_hint("agent", &one(name), 1, root)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
             assert!(hint.contains("IN ORDER"), "{name}: {hint}");
             assert!(!hint.contains("parallel"), "{name} must not promise parallelism: {hint}");
         }
         for name in ["browser_resize", "browser_emulate_media"] {
             assert!(
-                single_call_hint("agent", &one(name), 1).is_none(),
+                single_call_hint("agent", &one(name), 1, root).is_none(),
                 "{name} acts on one shared page in a chain — it must stay silent"
             );
         }
@@ -13444,7 +13549,7 @@ mod tests {
         for name in [
             "read", "grep", "glob", "fetch_url", "load_skill", "find_symbol", "lsp_symbols",
         ] {
-            let hint = single_call_hint("agent", &one(name), 1)
+            let hint = single_call_hint("agent", &one(name), 1, root)
                 .unwrap_or_else(|| panic!("{name} has no hint"));
             assert!(hint.contains("CONCURRENTLY"), "{name}: {hint}");
         }
@@ -13453,7 +13558,7 @@ mod tests {
         // second full checklist rewrite in one step, so they stay silent.
         for name in ["ask_user", "update_plan"] {
             assert!(
-                single_call_hint("agent", &one(name), 1).is_none(),
+                single_call_hint("agent", &one(name), 1, root).is_none(),
                 "{name} must stay silent"
             );
         }
@@ -13464,11 +13569,12 @@ mod tests {
         // A fixed string fired on 16 consecutive rounds of one fresh chat and the
         // model batched on ZERO of them: past the second delivery the text must
         // carry the accumulated price, not the same instruction again.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
-        let first = single_call_hint("agent", &one, 1).unwrap();
+        let first = single_call_hint("agent", &one, 1, root).unwrap();
         assert!(first.contains("That step had ONE call"), "{first}");
         assert!(!first.contains("rounds in a row"), "{first}");
-        let fifth = single_call_hint("agent", &one, 5).unwrap();
+        let fifth = single_call_hint("agent", &one, 5, root).unwrap();
         assert!(fifth.contains("5 rounds in a row"), "{fifth}");
         assert!(fifth.contains("IN ORDER"), "{fifth}");
         assert_ne!(first, fifth, "the text must change as the streak grows");
@@ -13483,17 +13589,22 @@ mod tests {
         // batched on 2 rounds out of 59. A shell round must therefore stay silent
         // and must not grow the streak either, or the counter would report waste
         // that was never addressable.
-        let shell = vec![("c1".to_string(), "run_terminal".to_string(), "{}".to_string())];
-        assert!(single_call_hint("agent", &shell, 1).is_none());
-        assert!(single_call_hint("agent", &shell, 5).is_none());
-        assert!(!single_call_is_serial("agent", &shell));
+        let root = env!("CARGO_MANIFEST_DIR");
+        // A genuinely MUTATING command is a probe chain and stays silent.
+        let mutating = vec![(
+            "c1".to_string(),
+            "run_terminal".to_string(),
+            json!({"command": "rm -rf /tmp/codifa-nope"}).to_string(),
+        )];
+        assert!(single_call_hint("agent", &mutating, 3, root).is_none());
+        assert!(!single_call_is_serial("agent", &mutating, root));
         // The act-then-observe browser tools are the same chain and stay silent.
         let browser = vec![("c1".to_string(), "browser_evaluate".to_string(), "{}".to_string())];
-        assert!(single_call_hint("agent", &browser, 1).is_none());
-        assert!(!single_call_is_serial("agent", &browser));
+        assert!(single_call_hint("agent", &browser, 1, root).is_none());
+        assert!(!single_call_is_serial("agent", &browser, root));
         // A lone file write is the shape a batch CAN fix, so it still counts.
         let write = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
-        assert!(single_call_is_serial("agent", &write));
+        assert!(single_call_is_serial("agent", &write, root));
         // A lone read-only lookup is the OTHER batchable shape and the most
         // common one: it must grow the streak, or the escalating text never
         // escalates on the rounds that dominate the wire cost. The whole
@@ -13516,18 +13627,101 @@ mod tests {
         ] {
             let lookup = vec![("c1".to_string(), name.to_string(), "{}".to_string())];
             assert!(
-                single_call_is_serial("agent", &lookup),
+                single_call_is_serial("agent", &lookup, root),
                 "a lone {name} must count as a batchable round"
             );
             // Same set on BOTH sides: a name the counter accepts but the hint
             // refuses would grow the streak while the round stays silent.
             assert!(
-                single_call_hint("agent", &lookup, 2).is_some(),
+                single_call_hint("agent", &lookup, 2, root).is_some(),
                 "a lone {name} must deliver the batching hint"
             );
         }
         // The sub-agent's rounds are governed by its own report, not this lever.
-        assert!(!single_call_is_serial("subagent", &write));
+        assert!(!single_call_is_serial("subagent", &write, root));
+    }
+
+    /// A lone READ-ONLY shell round is batchable and must be named as such.
+    ///
+    /// Traced (`mvxsy14e`): 80 lone `run_terminal` rounds, 39 of them pure reads
+    /// (`git log`, `du -sh`, a `python3` script over trace JSON). They ran in the
+    /// same concurrent batch as the lookups, yet the "probe chain" rule silenced
+    /// every `run_terminal` round — 39 full round-trips, each re-sending the whole
+    /// conversation, with nothing said. What makes a shell round a chain is
+    /// MUTATION, not the shell.
+    #[test]
+    fn a_lone_read_only_shell_round_is_told_it_runs_concurrently() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let read = vec![(
+            "c1".to_string(),
+            "run_terminal".to_string(),
+            json!({"command": "git log --oneline -5"}).to_string(),
+        )];
+        assert!(
+            single_call_is_serial("agent", &read, root),
+            "a read-only command shares the concurrent batch, so it is batchable"
+        );
+        let first = single_call_hint("agent", &read, 1, root).expect("must speak");
+        assert!(first.contains("CONCURRENT") || first.contains("concurrent"), "{first}");
+        // Escalates off the streak instead of repeating itself.
+        let later = single_call_hint("agent", &read, 4, root).expect("must speak");
+        assert!(later.contains("4 rounds in a row"), "{later}");
+        // The wording must never promise ordering for a read, and never promise
+        // concurrency for a MUTATING command — that one stays silent.
+        let mutating = vec![(
+            "c1".to_string(),
+            "run_terminal".to_string(),
+            json!({"command": "mv a.rs b.rs"}).to_string(),
+        )];
+        assert!(single_call_hint("agent", &mutating, 3, root).is_none());
+        assert!(!single_call_is_serial("agent", &mutating, root));
+    }
+
+    /// The hint and the step runner must classify a shell round the SAME way.
+    ///
+    /// The executor decides what runs in the concurrent batch (`is_shell_read_only`),
+    /// while this lever decides what the model is told it can batch. Drift between
+    /// them is silent in both directions: a command the runner batches but the hint
+    /// ignores is a round-trip nobody named (traced: 39 of them in `mvxsy14e`), and
+    /// a command the hint names but the runner serializes tells the model to fire a
+    /// batch that silently becomes an ordered chain.
+    #[test]
+    fn the_batching_hint_agrees_with_the_step_runner_on_every_shell_shape() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // Reads the runner batches concurrently, and mutators it always serializes.
+        for cmd in [
+            "git status --porcelain",
+            "du -sh src",
+            "git log --oneline -5",
+            "ls -l src-tauri/src",
+            "rm -rf /tmp/codifa-nope",
+            "mv a.rs b.rs",
+            "sed -i '' s/a/b/ x.txt",
+            "touch src/new.rs",
+            "echo hi > out.txt",
+        ] {
+            let call = vec![(
+                "c1".to_string(),
+                "run_terminal".to_string(),
+                json!({"command": cmd}).to_string(),
+            )];
+            let executor_batches = shell_read_is_batchable(&call[0].2, root);
+            assert_eq!(
+                executor_batches,
+                is_shell_read_only(cmd, root),
+                "the helper must not invent its own rule for {cmd:?}"
+            );
+            let told = single_call_hint("agent", &call, 1, root).is_some();
+            assert_eq!(
+                told, executor_batches,
+                "{cmd:?}: hint says batchable={told} but the runner says {executor_batches}"
+            );
+            assert_eq!(
+                single_call_is_serial("agent", &call, root),
+                executor_batches,
+                "{cmd:?}: a batchable round must grow the streak, a chain must not"
+            );
+        }
     }
 
     #[test]
@@ -13536,11 +13730,12 @@ mod tests {
         // read-only call and 91% of the turn's wire tokens, but the streak
         // counter ignored them, so the hint said "That step had ONE call" on
         // every one of them and never named the accumulated price.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
-        let first = single_call_hint("agent", &one, 1).unwrap();
+        let first = single_call_hint("agent", &one, 1, root).unwrap();
         assert!(first.contains("ONE call"), "{first}");
         assert!(first.contains("ranges:"), "{first}");
-        let ninth = single_call_hint("agent", &one, 9).unwrap();
+        let ninth = single_call_hint("agent", &one, 9, root).unwrap();
         assert!(ninth.contains("9 rounds in a row"), "{ninth}");
         assert!(ninth.contains("CONCURRENTLY"), "{ninth}");
         assert_ne!(first, ninth, "the wording must change as the streak grows");
@@ -13588,20 +13783,21 @@ mod tests {
         // measured boundary on its side. The streak hint wins there, the
         // per-round hint still fires everywhere else, and a round never carries
         // both.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
         for boundary in [STREAK_NUDGE_AT, STREAK_NUDGE_LATE] {
-            let got = round_hint("agent", &one, boundary, 1).unwrap();
+            let got = round_hint("agent", &one, boundary, 1, root).unwrap();
             assert_eq!(&*got, discovery_streak_hint("agent", boundary).unwrap());
         }
         // Off the boundaries the per-round hint keeps its slot.
-        let off = round_hint("agent", &one, 1, 1).unwrap();
-        assert_eq!(&*off, &*single_call_hint("agent", &one, 1).unwrap());
+        let off = round_hint("agent", &one, 1, 1, root).unwrap();
+        assert_eq!(&*off, &*single_call_hint("agent", &one, 1, root).unwrap());
         // A multi-call round off every boundary carries nothing.
         let many = vec![
             ("c1".to_string(), "read".to_string(), "{}".to_string()),
             ("c2".to_string(), "read".to_string(), "{}".to_string()),
         ];
-        assert!(round_hint("agent", &many, 2, 0).is_none());
+        assert!(round_hint("agent", &many, 2, 0, root).is_none());
     }
 
     #[test]
@@ -13611,21 +13807,22 @@ mod tests {
         // `lone_mutating_rounds > 1 && % 3 != 0` and returns `None` whenever the
         // discovery streak is below its boundary. For a lone FILE WRITE — the
         // shape a batch can fix — the fallback keeps it audible.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
         for rounds in 1..=12 {
             let quiet = rounds > 1 && rounds % 3 != 0;
             let hint = if quiet {
                 discovery_streak_hint("agent", 0)
                     .map(std::borrow::Cow::Borrowed)
-                    .or_else(|| single_call_hint("agent", &one, rounds))
+                    .or_else(|| single_call_hint("agent", &one, rounds, root))
             } else {
-                round_hint("agent", &one, 0, rounds)
+                round_hint("agent", &one, 0, rounds, root)
             };
             assert!(hint.is_some(), "round {rounds} (quiet={quiet}) delivered nothing");
         }
         // The quiet rounds that used to go silent now carry the escalating text,
         // which names the price instead of repeating the same instruction.
-        let text = single_call_hint("agent", &one, 4).unwrap();
+        let text = single_call_hint("agent", &one, 4, root).unwrap();
         assert!(text.contains("4 rounds in a row"), "{text}");
     }
 
@@ -13640,6 +13837,7 @@ mod tests {
         // This replays the loop guard over a long lone streak and pins the two
         // properties that matter: the counter keeps climbing past the old cap,
         // and the lever still speaks on the escalating rounds.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "edit_file".to_string(), "{}".to_string())];
         let mut lone_call_hints: usize = 0;
         let mut escalating_after_cap = 0;
@@ -13648,9 +13846,9 @@ mod tests {
             let hint = if hints_are_quiet {
                 discovery_streak_hint("agent", 0)
                     .map(std::borrow::Cow::Borrowed)
-                    .or_else(|| single_call_hint("agent", &one, rounds))
+                    .or_else(|| single_call_hint("agent", &one, rounds, root))
             } else {
-                round_hint("agent", &one, 0, rounds)
+                round_hint("agent", &one, 0, rounds, root)
             };
             if let Some(h) = hint.as_deref() {
                 if h.contains("ONE call") || h.contains("rounds in a row") {
@@ -13676,8 +13874,9 @@ mod tests {
         // Both hints ride on the SAME slot (the step's last tool result), and the
         // streak hint is the `or_else` fallback: a lone `read` in round 3 of a
         // streak carries the single-call hint only, never both.
+        let root = env!("CARGO_MANIFEST_DIR");
         let one = vec![("c1".to_string(), "read".to_string(), "{}".to_string())];
-        assert!(single_call_hint("agent", &one, 1).is_some());
+        assert!(single_call_hint("agent", &one, 1, root).is_some());
         assert!(discovery_streak_hint("agent", STREAK_NUDGE_AT).is_some());
         let batched = vec![
             ("a".to_string(), "read".to_string(), "{}".to_string()),
@@ -13685,7 +13884,7 @@ mod tests {
         ];
         // A batched discovery round: no single-call hint, so the streak nudge is
         // the one that lands — the case the batching lever alone cannot catch.
-        assert!(single_call_hint("agent", &batched, 1).is_none());
+        assert!(single_call_hint("agent", &batched, 1, root).is_none());
         assert!(discovery_streak_hint("agent", STREAK_NUDGE_AT).is_some());
     }
 
@@ -14283,6 +14482,28 @@ mod tests {
         let many = dispatch(root, "load_skill", &json!({"query": "filler"}), None).unwrap();
         assert!(many.contains("Bulk Skill 0"), "{many}");
         assert!(!many.contains("BODY OF"), "an ambiguous query must not inline a body: {many}");
+        // A query that names its skill in SEVERAL words beats the filler matches
+        // outright, so it answers on the FIRST call. Traced (`mvyy1qf7`): such a
+        // query listed the right skill beside three one-word matches and the model
+        // then spent a second call naming it — twice in one turn. Three distinctive
+        // words against a single shared one is that lead; two against one is a tie
+        // and must keep listing candidates.
+        let dominant = dispatch(
+            root,
+            "load_skill",
+            &json!({"query": "bewildering xylophone maintenance skill"}),
+            None,
+        )
+        .unwrap();
+        assert!(dominant.contains("BODY OF 39"), "a clear winner answers at once: {dominant}");
+        let tied = dispatch(
+            root,
+            "load_skill",
+            &json!({"query": "maintenance skill"}),
+            None,
+        )
+        .unwrap();
+        assert!(!tied.contains("BODY OF"), "a near-tie must still list candidates: {tied}");
         // A miss answers with a HINT, not with 40 names: a store with hundreds
         // of skills would spend a turn's worth of tokens on a failed lookup.
         let miss = dispatch(root, "load_skill", &json!({"query": "zzzz"}), None).unwrap_err();

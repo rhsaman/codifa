@@ -4,9 +4,15 @@ import { injectThemeStyles } from './lib/themes'
 import { installTauriBridge, recordDroppedPaths } from './lib/tauriBridge'
 import { installWebBridge } from './lib/webBridge'
 import { installInputSuppression } from './lib/inputSuppress'
+import { installOverlayScrollbars } from './lib/useDiffScrollbars'
 import './styles/global.css'
 
 injectThemeStyles()
+
+// Every scroller in the app (sidebar, panels, chat, popups, menus) gets the
+// same animated, theme-coloured overlay bars the diff surfaces use — one
+// installer sweeps the DOM instead of touching each component.
+installOverlayScrollbars()
 
 // Stop macOS/WebKit autocomplete, autocorrect, inline predictions and
 // spell-check from rewriting what is typed into the app (Settings → General →
